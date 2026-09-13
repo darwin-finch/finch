@@ -1,3 +1,122 @@
+#[tokio::test]
+async fn agent_lifecycle_lag_resnapshots_authoritative_active_tasks_before_new_events() {
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct NeverCompletes;
+
+    #[async_trait]
+    impl crate::generators::Generator for NeverCompletes {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            std::future::pending().await
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: true,
+                    supports_conversation: true,
+                    max_context_messages: Some(10),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "never-completes"
+        }
+    }
+
+    let scheduler = crate::scheduler::AgentScheduler::new(
+        crate::scheduler::ProviderResolver::new(Arc::new(NeverCompletes)),
+        Arc::new(crate::runtime::ProgramRuntime::new()),
+    );
+    // Subscribe before overflowing the scheduler's 256-event broadcast ring.
+    let events = scheduler.subscribe();
+    let mut identities = Vec::new();
+    for index in 0..260 {
+        identities.push(
+            scheduler
+                .spawn(
+                    crate::scheduler::AgentTaskSpec {
+                        task: format!("lag child {index}"),
+                        role: crate::scheduler::AgentRole::Explore,
+                        background: None,
+                        provider: None,
+                        model: None,
+                        context: Vec::new(),
+                        capability_grant_ids: None,
+                        budget: crate::scheduler::AgentBudget::default(),
+                    },
+                    None,
+                )
+                .await
+                .expect("lag fixture child must spawn"),
+        );
+    }
+    let completed = identities.remove(0);
+    scheduler
+        .cancel(completed.task_id)
+        .await
+        .expect("the stale terminal fixture must accept cancellation");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        scheduler.wait(completed.task_id),
+    )
+    .await
+    .expect("the terminal event used to force stale state must settle")
+    .expect("the cancelled fixture must retain its terminal result");
+
+    let (target_tx, mut target_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bridge = tokio::spawn(super::forward_agent_events(
+        Arc::clone(&scheduler),
+        events,
+        target_tx,
+    ));
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), target_rx.recv())
+        .await
+        .expect("lag recovery must not stall")
+        .expect("lag recovery channel must remain open");
+    let super::ReplEvent::AgentLifecycle(crate::scheduler::AgentEvent::Resnapshot { active }) =
+        first
+    else {
+        panic!("lag must resnapshot before presenting retained transitions as current; first_event={first:?}");
+    };
+    assert_eq!(active.len(), identities.len(), "authoritative recovery must contain every still-active child; active_count={} spawned_count={}", active.len(), identities.len());
+    assert!(active.iter().all(|entry| entry.task.identity.task_id != completed.task_id), "a child whose terminal event may have been lost must not survive the authoritative snapshot; completed_task={} active={active:?}", completed.task_id);
+
+    bridge.abort();
+    for identity in &identities {
+        scheduler
+            .cancel(identity.task_id)
+            .await
+            .expect("every active lag fixture must accept cleanup cancellation");
+    }
+    for identity in identities {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scheduler.wait(identity.task_id),
+        )
+        .await
+        .expect("cancelled lag fixture must settle")
+        .expect("cancelled lag fixture must retain its terminal result");
+    }
+}
+
 /// Every systemic condition this runner can report must declare itself with
 /// `RUNNER_UNAVAILABLE_PREFIX`, so a replay pass aborts instead of paying a
 /// round trip per completed run. #254.

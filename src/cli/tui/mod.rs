@@ -1015,6 +1015,36 @@ pub(crate) struct LiveFrameInputs<'a> {
     pub live_rendered: &'a [RenderedTranscriptLine],
 }
 
+fn aggregate_agent_usage<'a>(
+    usage: impl Iterator<Item = &'a activity::ActivityUsage>,
+) -> activity::ActivityUsage {
+    use activity::{ActivityUsage, ActivityUsageState};
+
+    let mut aggregate = ActivityUsage::default();
+    let mut all_complete = true;
+    for task in usage {
+        aggregate.started_attempts += task.started_attempts;
+        aggregate.reported_attempts += task.reported_attempts;
+        if let Some(tokens) = task.input_tokens {
+            let total = aggregate.input_tokens.get_or_insert(0);
+            *total = total.saturating_add(tokens);
+        }
+        if let Some(tokens) = task.output_tokens {
+            let total = aggregate.output_tokens.get_or_insert(0);
+            *total = total.saturating_add(tokens);
+        }
+        all_complete &= task.state == ActivityUsageState::Complete;
+    }
+    aggregate.state = if aggregate.reported_attempts == 0 {
+        ActivityUsageState::Unavailable
+    } else if all_complete {
+        ActivityUsageState::Complete
+    } else {
+        ActivityUsageState::Partial
+    };
+    aggregate
+}
+
 /// One live-area frame: the exact logical lines to paint, and where the cursor
 /// lands once they are painted.
 ///
@@ -1380,6 +1410,7 @@ pub struct TuiRenderer {
 
     // Rows that arrive as a stream rather than by polling, keyed by identity.
     tracked_rows: HashMap<uuid::Uuid, activity::ActivityRow>,
+    tracked_agent_usage: HashMap<uuid::Uuid, activity::ActivityUsage>,
 
     // Output of the user-defined `check` word — shown in the corner if set.
     pub corner: Arc<std::sync::Mutex<Option<String>>>,
@@ -1453,6 +1484,7 @@ impl TuiRenderer {
             image_counter: 0,
             task_rows: None,
             tracked_rows: HashMap::new(),
+            tracked_agent_usage: HashMap::new(),
             corner: Arc::new(std::sync::Mutex::new(None)),
             stack: None,
             poset: None,
@@ -1562,6 +1594,7 @@ impl TuiRenderer {
 
             task_rows: None,
             tracked_rows: HashMap::new(),
+            tracked_agent_usage: HashMap::new(),
             corner: Arc::new(std::sync::Mutex::new(None)),
             stack: None,
             poset: None,
@@ -1586,7 +1619,7 @@ impl TuiRenderer {
     pub fn apply_activity(&mut self, update: activity::ActivityUpdate) {
         use activity::ActivityUpdate;
         match update {
-            ActivityUpdate::Upsert { id, row } => {
+            ActivityUpdate::Upsert { id, row, usage } => {
                 // A row that reappears keeps the detail already shown against it, so a status
                 // change does not blank the tool a task is in the middle of running.
                 let detail = self
@@ -1600,6 +1633,12 @@ impl TuiRenderer {
                         ..row
                     },
                 );
+                self.tracked_agent_usage.entry(id).or_insert(usage);
+            }
+            ActivityUpdate::SetUsage { id, usage } => {
+                if self.tracked_rows.contains_key(&id) {
+                    self.tracked_agent_usage.insert(id, usage);
+                }
             }
             ActivityUpdate::SetDetail { id, detail } => {
                 if let Some(row) = self.tracked_rows.get_mut(&id) {
@@ -1608,8 +1647,21 @@ impl TuiRenderer {
             }
             ActivityUpdate::Remove { id } => {
                 self.tracked_rows.remove(&id);
+                self.tracked_agent_usage.remove(&id);
+            }
+            ActivityUpdate::Resnapshot { rows } => {
+                self.tracked_rows.clear();
+                self.tracked_agent_usage.clear();
+                for (id, row, usage) in rows {
+                    self.tracked_rows.insert(id, row);
+                    self.tracked_agent_usage.insert(id, usage);
+                }
             }
         }
+        self.status_bar.update_agent_activity(
+            self.tracked_rows.len(),
+            &aggregate_agent_usage(self.tracked_agent_usage.values()),
+        );
         self.live_area_dirty = true;
     }
 
@@ -5168,6 +5220,153 @@ mod tests {
             .rposition(|row| !row.is_empty())
             .map(|index| index + 1)
             .unwrap_or(0)
+    }
+
+    fn reported_usage(
+        state: activity::ActivityUsageState,
+        input: Option<u64>,
+        output: Option<u64>,
+        reported: usize,
+        started: usize,
+    ) -> activity::ActivityUsage {
+        activity::ActivityUsage {
+            state,
+            input_tokens: input,
+            output_tokens: output,
+            reported_attempts: reported,
+            started_attempts: started,
+        }
+    }
+
+    #[test]
+    fn test_child_aggregate_updates_shadow_buffer_without_console_duplication() {
+        use activity::ActivityUsageState;
+
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::clone(&status), colors);
+        assert_eq!(
+            status.get_line(&StatusLineType::AgentActivity),
+            None,
+            "zero children must consume no status row"
+        );
+        let input = vec![String::new()];
+        let mut autocomplete = AutocompleteState::new();
+        let zero_rows = plan_live_frame(&live_inputs(160, 20, &input, ""), &mut autocomplete)
+            .to_shadow_buffer(160, 20)
+            .rows_as_text();
+        assert!(
+            zero_rows.iter().all(|row| !row.contains("Children:")),
+            "zero-child shadow frame must not paint an aggregate; rows={zero_rows:?}"
+        );
+
+        let first_id = uuid::Uuid::new_v4();
+        renderer.apply_activity(activity::ActivityUpdate::Upsert {
+            id: first_id,
+            row: activity::ActivityRow::new("first child", activity::ActivityState::Active),
+            usage: reported_usage(ActivityUsageState::Unavailable, None, None, 0, 1),
+        });
+        let unavailable = status
+            .get_line(&StatusLineType::AgentActivity)
+            .expect("one active child must create the aggregate status cell");
+        assert!(
+            unavailable.contains("unavailable input, unavailable output")
+                && unavailable.contains("unavailable (0/1 attempts reported)"),
+            "unreported provider usage must remain visibly unavailable; aggregate={unavailable:?}"
+        );
+        renderer.apply_activity(activity::ActivityUpdate::SetUsage {
+            id: first_id,
+            usage: reported_usage(ActivityUsageState::Complete, Some(12), Some(7), 1, 1),
+        });
+        let one = status.get_status();
+        let one_rows = plan_live_frame(&live_inputs(160, 20, &input, &one), &mut autocomplete)
+            .to_shadow_buffer(160, 20)
+            .rows_as_text();
+        assert!(
+            one_rows.iter().any(|row| row.contains("Children: 1 active")
+                && row.contains("12 input, 7 output")
+                && row.contains("complete (1/1 attempts reported)")),
+            "one-child aggregate must be fully speakable in the shadow buffer; rows={one_rows:?}"
+        );
+
+        let second_id = uuid::Uuid::new_v4();
+        renderer.apply_activity(activity::ActivityUpdate::Upsert {
+            id: second_id,
+            row: activity::ActivityRow::new("second child", activity::ActivityState::Pending),
+            usage: reported_usage(ActivityUsageState::Partial, Some(5), None, 1, 2),
+        });
+        let multiple = status.get_status();
+        let multiple_rows =
+            plan_live_frame(&live_inputs(160, 20, &input, &multiple), &mut autocomplete)
+                .to_shadow_buffer(160, 20)
+                .rows_as_text();
+        assert!(multiple_rows.iter().any(|row| row.contains("Children: 2 active") && row.contains("17 input, 7 output") && row.contains("partial (2/3 attempts reported)")), "mixed running/queued children must sum only known usage in one status row; rows={multiple_rows:?}");
+
+        renderer.apply_activity(activity::ActivityUpdate::Remove { id: first_id });
+        renderer.apply_activity(activity::ActivityUpdate::Remove { id: second_id });
+        assert_eq!(
+            status.get_line(&StatusLineType::AgentActivity),
+            None,
+            "final child cleanup must remove the aggregate status cell"
+        );
+        assert!(output.get_messages().is_empty(), "usage refreshes belong only to live status and must not append console or scrollback messages; messages={:?}", output.get_messages().len());
+    }
+
+    #[test]
+    fn test_child_resnapshot_replaces_stale_rows_and_usage_authoritatively() {
+        use activity::ActivityUsageState;
+
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output), Arc::clone(&status), colors);
+        renderer.apply_activity(activity::ActivityUpdate::Upsert {
+            id: uuid::Uuid::new_v4(),
+            row: activity::ActivityRow::new("stale child", activity::ActivityState::Active),
+            usage: reported_usage(ActivityUsageState::Complete, Some(999), Some(999), 1, 1),
+        });
+        let current_id = uuid::Uuid::new_v4();
+        renderer.apply_activity(activity::ActivityUpdate::Resnapshot {
+            rows: vec![(
+                current_id,
+                activity::ActivityRow::new("current child", activity::ActivityState::Active),
+                reported_usage(ActivityUsageState::Partial, Some(3), None, 1, 1),
+            )],
+        });
+        // A transition queued after the fresh subscription but already
+        // represented by the snapshot may arrive next. It may refresh the row,
+        // but cannot roll authoritative usage back to the event's empty default.
+        renderer.apply_activity(activity::ActivityUpdate::Upsert {
+            id: current_id,
+            row: activity::ActivityRow::new("current child", activity::ActivityState::Active),
+            usage: activity::ActivityUsage::default(),
+        });
+        assert_eq!(
+            renderer.tracked_rows.len(),
+            1,
+            "authoritative recovery must discard stale child rows; rows={:?}",
+            renderer.tracked_rows
+        );
+        assert!(
+            renderer.tracked_rows.contains_key(&current_id),
+            "authoritative recovery must retain the current child; rows={:?}",
+            renderer.tracked_rows
+        );
+        let aggregate = status
+            .get_line(&StatusLineType::AgentActivity)
+            .expect("the authoritative current child must retain an aggregate status cell");
+        assert!(
+            aggregate.contains("3 input, unavailable output") && aggregate.contains("partial"),
+            "resnapshot must replace stale usage rather than add to it; aggregate={aggregate:?}"
+        );
+        assert!(
+            output.get_messages().is_empty(),
+            "resnapshot is a live projection and must not append console history; message_count={}",
+            output.get_messages().len()
+        );
     }
 
     #[test]

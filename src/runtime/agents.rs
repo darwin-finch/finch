@@ -158,6 +158,57 @@ pub enum AgentTaskStatus {
     Cancelled,
 }
 
+/// Truthfulness of provider-reported token usage across a child's attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentUsageState {
+    /// Every started provider attempt reported both input and output tokens.
+    Complete,
+    /// Some usage was reported, but at least one attempt or token direction is missing.
+    Partial,
+    /// No started provider attempt reported token usage.
+    Unavailable,
+}
+
+/// Provider-reported usage for a child task. Token fields are absent when that
+/// direction has never been reported; Finch never estimates a missing value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentUsage {
+    /// Whether the known totals cover every started provider attempt.
+    pub state: AgentUsageState,
+    /// Sum of provider-reported input tokens, absent when never reported.
+    pub input_tokens: Option<u64>,
+    /// Sum of provider-reported output tokens, absent when never reported.
+    pub output_tokens: Option<u64>,
+    /// Attempts that reported at least one token direction.
+    pub reported_attempts: usize,
+    /// Provider invocations that actually began.
+    pub started_attempts: usize,
+}
+
+impl Default for AgentUsage {
+    fn default() -> Self {
+        Self {
+            state: AgentUsageState::Unavailable,
+            input_tokens: None,
+            output_tokens: None,
+            reported_attempts: 0,
+            started_attempts: 0,
+        }
+    }
+}
+
+/// One authoritative active-task entry used to rebuild a lagged frontend projection.
+#[derive(Debug, Clone)]
+pub struct AgentActivitySnapshot {
+    /// Current task identity, description, role, and lifecycle state.
+    pub task: AgentTaskSnapshot,
+    /// Provider-reported usage known when the snapshot was taken.
+    pub usage: AgentUsage,
+    /// Tool currently executing, if any.
+    pub active_tool: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTaskResult {
     pub identity: AgentIdentity,
@@ -180,11 +231,21 @@ pub struct AgentTaskSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    /// Authoritative active children used to replace a lagged frontend projection.
+    #[serde(skip)]
+    Resnapshot {
+        active: Vec<AgentActivitySnapshot>,
+    },
     TaskQueued {
         snapshot: AgentTaskSnapshot,
     },
     TaskStarted {
         snapshot: AgentTaskSnapshot,
+    },
+    /// Provider-attempt or reported-usage progress for an active child.
+    UsageUpdated {
+        task_id: Uuid,
+        usage: AgentUsage,
     },
     ToolStarted {
         task_id: Uuid,
@@ -197,6 +258,7 @@ pub enum AgentEvent {
     },
     TaskFinished {
         result: AgentTaskResult,
+        usage: AgentUsage,
     },
 }
 

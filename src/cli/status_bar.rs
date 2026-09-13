@@ -30,6 +30,8 @@ pub enum StatusLineType {
     BrainContextLine(usize),
     /// Live query statistics (tokens, latency, model)
     LiveStats,
+    /// Active child count and provider-reported child token usage.
+    AgentActivity,
     /// Training statistics (queries, local%, quality)
     TrainingStats,
     /// Model download progress
@@ -89,8 +91,8 @@ impl StatusBar {
     pub fn get_lines(&self) -> Vec<StatusLine> {
         let lines = self.lines.read().unwrap();
 
-        // Order: SessionLabel, MemoryContext, LiveStats, TrainingStats, DownloadProgress,
-        //        OperationStatus, then Custom
+        // Order: session/context lines, training stats, child activity,
+        // download/operation lines, suggestions, compaction, then custom.
         let mut result = Vec::new();
 
         // Add in preferred order
@@ -161,6 +163,13 @@ impl StatusBar {
         if let Some(content) = lines.get(&StatusLineType::TrainingStats) {
             result.push(StatusLine {
                 line_type: StatusLineType::TrainingStats,
+                content: content.clone(),
+            });
+        }
+
+        if let Some(content) = lines.get(&StatusLineType::AgentActivity) {
+            result.push(StatusLine {
+                line_type: StatusLineType::AgentActivity,
                 content: content.clone(),
             });
         }
@@ -359,6 +368,39 @@ impl StatusBar {
     /// Clear live stats (shorthand)
     pub fn clear_live_stats(&self) {
         self.remove_line(&StatusLineType::LiveStats);
+    }
+
+    /// Replace the child activity aggregate in place. With no active children
+    /// the bounded live status disappears instead of becoming session history.
+    pub fn update_agent_activity(
+        &self,
+        active_children: usize,
+        usage: &crate::cli::tui::activity::ActivityUsage,
+    ) {
+        if active_children == 0 {
+            self.remove_line(&StatusLineType::AgentActivity);
+            return;
+        }
+        let input = usage
+            .input_tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "unavailable".to_string());
+        let output = usage
+            .output_tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "unavailable".to_string());
+        let state = match usage.state {
+            crate::cli::tui::activity::ActivityUsageState::Complete => "complete",
+            crate::cli::tui::activity::ActivityUsageState::Partial => "partial",
+            crate::cli::tui::activity::ActivityUsageState::Unavailable => "unavailable",
+        };
+        self.update_line(
+            StatusLineType::AgentActivity,
+            format!(
+                "Children: {active_children} active | Tokens: {input} input, {output} output | Usage: {state} ({}/{} attempts reported)",
+                usage.reported_attempts, usage.started_attempts
+            ),
+        );
     }
 }
 

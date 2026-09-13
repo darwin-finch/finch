@@ -5,8 +5,9 @@ use crate::generators::Generator;
 use crate::runtime::ProgramRuntime;
 // The boundary vocabulary lives below this module; re-exported so existing callers keep working.
 pub use crate::runtime::agents::{
-    AgentBudget, AgentContextReference, AgentEvent, AgentIdentity, AgentRole, AgentSpawning,
-    AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec, AgentTaskStatus,
+    AgentActivitySnapshot, AgentBudget, AgentContextReference, AgentEvent, AgentIdentity,
+    AgentRole, AgentSpawning, AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec, AgentTaskStatus,
+    AgentUsage, AgentUsageState,
 };
 pub(crate) use crate::runtime::agents::{
     MAX_CONTEXT_ARTIFACT_BYTES, MAX_CONTEXT_FIELD_BYTES, MAX_CONTEXT_REFERENCES,
@@ -315,8 +316,68 @@ pub struct AgentBrainContext {
 
 struct TaskRecord {
     snapshot: AgentTaskSnapshot,
+    usage: AgentUsage,
+    active_tool: Option<String>,
     cancellation: CancellationToken,
     notify: Arc<Notify>,
+}
+
+fn active_task_snapshot(tasks: &HashMap<Uuid, TaskRecord>) -> Vec<AgentActivitySnapshot> {
+    tasks
+        .values()
+        .filter(|record| {
+            matches!(
+                record.snapshot.status,
+                AgentTaskStatus::Queued | AgentTaskStatus::Running
+            )
+        })
+        .map(|record| AgentActivitySnapshot {
+            task: record.snapshot.clone(),
+            usage: record.usage.clone(),
+            active_tool: record.active_tool.clone(),
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct UsageAccumulator {
+    usage: AgentUsage,
+    complete_attempts: usize,
+}
+
+impl UsageAccumulator {
+    fn start_attempt(&mut self) {
+        self.usage.started_attempts += 1;
+        self.refresh_state();
+    }
+
+    fn report(&mut self, input_tokens: Option<u32>, output_tokens: Option<u32>) {
+        if input_tokens.is_some() || output_tokens.is_some() {
+            self.usage.reported_attempts += 1;
+        }
+        if input_tokens.is_some() && output_tokens.is_some() {
+            self.complete_attempts += 1;
+        }
+        if let Some(tokens) = input_tokens {
+            let total = self.usage.input_tokens.get_or_insert(0);
+            *total = total.saturating_add(u64::from(tokens));
+        }
+        if let Some(tokens) = output_tokens {
+            let total = self.usage.output_tokens.get_or_insert(0);
+            *total = total.saturating_add(u64::from(tokens));
+        }
+        self.refresh_state();
+    }
+
+    fn refresh_state(&mut self) {
+        self.usage.state = if self.usage.reported_attempts == 0 {
+            AgentUsageState::Unavailable
+        } else if self.complete_attempts == self.usage.started_attempts {
+            AgentUsageState::Complete
+        } else {
+            AgentUsageState::Partial
+        };
+    }
 }
 
 pub struct AgentScheduler {
@@ -523,6 +584,8 @@ impl AgentScheduler {
             task_id,
             TaskRecord {
                 snapshot,
+                usage: AgentUsage::default(),
+                active_tool: None,
                 cancellation: cancellation.clone(),
                 notify: Arc::new(Notify::new()),
             },
@@ -556,6 +619,16 @@ impl AgentScheduler {
             .get(&task_id)
             .map(|record| record.snapshot.clone())
             .ok_or_else(|| anyhow::anyhow!("unknown agent task: {task_id}"))
+    }
+
+    /// Subscribe to future lifecycle changes and capture the active state under
+    /// the same task lock. A frontend recovering from lag cannot then receive
+    /// a state update older than the snapshot it just installed.
+    pub async fn subscribe_with_active_task_snapshot(
+        &self,
+    ) -> (broadcast::Receiver<AgentEvent>, Vec<AgentActivitySnapshot>) {
+        let tasks = self.tasks.read().await;
+        (self.events.subscribe(), active_task_snapshot(&tasks))
     }
 
     /// Root callers may inspect all tasks. Child callers may only address their
@@ -656,7 +729,7 @@ impl AgentScheduler {
         // handle owned by `run_task` is what lets every terminal arm - success,
         // provider error, cancellation, deadline, and turn exhaustion - report
         // the attempts the provider actually started.
-        let mut attempts = 0usize;
+        let mut usage = UsageAccumulator::default();
         let execution = tokio::time::timeout(
             std::time::Duration::from_millis(spec.budget.timeout_ms),
             self.agent_loop(
@@ -665,7 +738,7 @@ impl AgentScheduler {
                 &resolved_context,
                 provider,
                 &cancellation,
-                &mut attempts,
+                &mut usage,
             ),
         )
         .await;
@@ -687,8 +760,8 @@ impl AgentScheduler {
                 AgentTaskStatus::Failed,
                 String::new(),
                 vec![format!(
-                    "agent deadline exceeded: configured timeout_ms={}, consumed provider attempts={attempts}",
-                    spec.budget.timeout_ms
+                    "agent deadline exceeded: configured timeout_ms={}, consumed provider attempts={}",
+                    spec.budget.timeout_ms, usage.usage.started_attempts
                 )],
             ),
         };
@@ -697,30 +770,33 @@ impl AgentScheduler {
             status,
             final_message: truncate(message, spec.budget.max_output_bytes),
             diagnostics,
-            turns: attempts,
+            turns: usage.usage.started_attempts,
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         };
-        self.store_result(result).await;
+        self.store_result(result, usage.usage).await;
     }
 
     async fn finish_cancelled(&self, identity: AgentIdentity, started: Instant) {
-        self.store_result(AgentTaskResult {
-            identity,
-            status: AgentTaskStatus::Cancelled,
-            final_message: String::new(),
-            // Zero is the contract here, not a placeholder: this path is only
-            // reached when cancellation won the concurrency-permit race, so no
-            // provider invocation was ever started.
-            diagnostics: vec![
-                "cancelled before execution: consumed provider attempts=0".to_string()
-            ],
-            turns: 0,
-            elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-        })
+        self.store_result(
+            AgentTaskResult {
+                identity,
+                status: AgentTaskStatus::Cancelled,
+                final_message: String::new(),
+                // Zero is the contract here, not a placeholder: this path is only
+                // reached when cancellation won the concurrency-permit race, so no
+                // provider invocation was ever started.
+                diagnostics: vec![
+                    "cancelled before execution: consumed provider attempts=0".to_string()
+                ],
+                turns: 0,
+                elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            },
+            AgentUsage::default(),
+        )
         .await;
     }
 
-    async fn store_result(&self, mut result: AgentTaskResult) {
+    async fn store_result(&self, mut result: AgentTaskResult, usage: AgentUsage) {
         if let Some(run_id) = result.identity.brain_run_id {
             let status = match result.status {
                 AgentTaskStatus::Completed => crate::brain::store::BrainRunStatus::Completed,
@@ -769,9 +845,10 @@ impl AgentScheduler {
             };
             record.snapshot.status = result.status;
             record.snapshot.result = Some(result.clone());
+            record.usage = usage.clone();
             Arc::clone(&record.notify)
         };
-        let _ = self.events.send(AgentEvent::TaskFinished { result });
+        let _ = self.events.send(AgentEvent::TaskFinished { result, usage });
         notify.notify_waiters();
     }
 
@@ -782,7 +859,7 @@ impl AgentScheduler {
         resolved_context: &[ResolvedAgentContext],
         provider: Arc<dyn Generator>,
         cancellation: &CancellationToken,
-        attempts: &mut usize,
+        usage: &mut UsageAccumulator,
     ) -> Result<String> {
         let tools = self.child_tools(identity);
         let definitions = tools
@@ -839,19 +916,27 @@ impl AgentScheduler {
             let response = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
-                    bail!("agent cancelled after consuming {attempts} provider attempts")
+                    bail!("agent cancelled after consuming {} provider attempts", usage.usage.started_attempts)
                 }
                 response = async {
-                    *attempts += 1;
+                    usage.start_attempt();
+                    self.publish_usage(identity.task_id, &usage.usage).await;
                     provider.generate(messages.clone(), Some(definitions.clone())).await
                 } => response?,
             };
+            usage.report(
+                response.metadata.input_tokens,
+                response.metadata.output_tokens,
+            );
+            self.publish_usage(identity.task_id, &usage.usage).await;
             if response.tool_uses.is_empty() {
                 return Ok(response.text);
             }
             messages.push(Message::with_content("assistant", response.content_blocks));
             let mut results = Vec::with_capacity(response.tool_uses.len());
             for tool_use in response.tool_uses {
+                self.set_active_tool(identity.task_id, Some(tool_use.name.clone()))
+                    .await;
                 let _ = self.events.send(AgentEvent::ToolStarted {
                     task_id: identity.task_id,
                     name: tool_use.name.clone(),
@@ -861,6 +946,7 @@ impl AgentScheduler {
                     Ok(content) => (content, false),
                     Err(error) => (format!("Error: {error}"), true),
                 };
+                self.set_active_tool(identity.task_id, None).await;
                 let _ = self.events.send(AgentEvent::ToolCompleted {
                     task_id: identity.task_id,
                     name: tool_use.name,
@@ -875,8 +961,27 @@ impl AgentScheduler {
             messages.push(Message::with_content("user", results));
         }
         bail!(
-            "agent reached its turn limit without a final response: configured max_turns={turn_limit}, consumed provider attempts={attempts}"
+            "agent reached its turn limit without a final response: configured max_turns={turn_limit}, consumed provider attempts={}",
+            usage.usage.started_attempts
         )
+    }
+
+    async fn publish_usage(&self, task_id: Uuid, usage: &AgentUsage) {
+        let mut tasks = self.tasks.write().await;
+        let Some(record) = tasks.get_mut(&task_id) else {
+            return;
+        };
+        record.usage = usage.clone();
+        let _ = self.events.send(AgentEvent::UsageUpdated {
+            task_id,
+            usage: usage.clone(),
+        });
+    }
+
+    async fn set_active_tool(&self, task_id: Uuid, active_tool: Option<String>) {
+        if let Some(record) = self.tasks.write().await.get_mut(&task_id) {
+            record.active_tool = active_tool;
+        }
     }
 
     fn child_tools(self: &Arc<Self>, identity: &AgentIdentity) -> Vec<Box<dyn Tool>> {
@@ -2045,6 +2150,8 @@ mod tests {
                     status: AgentTaskStatus::Running,
                     result: None,
                 },
+                usage: AgentUsage::default(),
+                active_tool: None,
                 cancellation: CancellationToken::new(),
                 notify: Arc::new(Notify::new()),
             },
@@ -2060,14 +2167,17 @@ mod tests {
         });
         checked.notified().await;
         scheduler
-            .store_result(AgentTaskResult {
-                identity,
-                status: AgentTaskStatus::Completed,
-                final_message: "completed before notification registration".into(),
-                diagnostics: Vec::new(),
-                turns: 1,
-                elapsed_ms: 1,
-            })
+            .store_result(
+                AgentTaskResult {
+                    identity,
+                    status: AgentTaskStatus::Completed,
+                    final_message: "completed before notification registration".into(),
+                    diagnostics: Vec::new(),
+                    turns: 1,
+                    elapsed_ms: 1,
+                },
+                AgentUsage::default(),
+            )
             .await;
         resume.notify_one();
 
@@ -2590,8 +2700,12 @@ mod tests {
     enum AttemptAction {
         /// Answer with a tool call, forcing the loop to consume another turn.
         ToolTurn,
+        /// Answer with a tool call and provider-reported usage.
+        ToolTurnUsage(Option<u32>, Option<u32>),
         /// Answer with a final message and no tool calls.
         Final(&'static str),
+        /// Answer finally with provider-reported usage.
+        FinalUsage(&'static str, Option<u32>, Option<u32>),
         /// Fail this provider invocation.
         Fail(&'static str),
         /// Enter the invocation, announce that it started, and never return.
@@ -2620,7 +2734,12 @@ mod tests {
         }
     }
 
-    fn attempt_response(text: String, tool_use: Option<ToolUse>) -> GeneratorResponse {
+    fn attempt_response(
+        text: String,
+        tool_use: Option<ToolUse>,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+    ) -> GeneratorResponse {
         let (content_blocks, tool_uses) = match tool_use {
             Some(tool_use) => (vec![tool_use.to_content_block()], vec![tool_use]),
             None => (vec![ContentBlock::text("done")], Vec::new()),
@@ -2634,8 +2753,8 @@ mod tests {
                 model: "attempt-script".to_string(),
                 confidence: None,
                 stop_reason: None,
-                input_tokens: None,
-                output_tokens: None,
+                input_tokens,
+                output_tokens,
                 latency_ms: None,
                 primary_allowance_used_percent: None,
                 secondary_allowance_used_percent: None,
@@ -2659,10 +2778,28 @@ mod tests {
                         name: "unavailable-test-tool".to_string(),
                         input: serde_json::json!({}),
                     }),
+                    None,
+                    None,
+                )),
+                Some(AttemptAction::ToolTurnUsage(input, output)) => Ok(attempt_response(
+                    String::new(),
+                    Some(ToolUse {
+                        id: format!("attempt-{attempt}"),
+                        name: "unavailable-test-tool".to_string(),
+                        input: serde_json::json!({}),
+                    }),
+                    *input,
+                    *output,
                 )),
                 Some(AttemptAction::Final(message)) => {
-                    Ok(attempt_response((*message).to_string(), None))
+                    Ok(attempt_response((*message).to_string(), None, None, None))
                 }
+                Some(AttemptAction::FinalUsage(message, input, output)) => Ok(attempt_response(
+                    (*message).to_string(),
+                    None,
+                    *input,
+                    *output,
+                )),
                 Some(AttemptAction::Fail(message)) => bail!("{message}"),
                 Some(AttemptAction::BlockForever(entered)) => {
                     entered.notify_one();
@@ -2812,13 +2949,17 @@ mod tests {
 
     fn event_task_id(event: &AgentEvent) -> Uuid {
         match event {
+            AgentEvent::Resnapshot { .. } => {
+                panic!("scheduler broadcasts must not contain frontend resnapshots")
+            }
             AgentEvent::TaskQueued { snapshot } | AgentEvent::TaskStarted { snapshot } => {
                 snapshot.identity.task_id
             }
+            AgentEvent::UsageUpdated { task_id, .. } => *task_id,
             AgentEvent::ToolStarted { task_id, .. } | AgentEvent::ToolCompleted { task_id, .. } => {
                 *task_id
             }
-            AgentEvent::TaskFinished { result } => result.identity.task_id,
+            AgentEvent::TaskFinished { result, .. } => result.identity.task_id,
         }
     }
 
@@ -2840,7 +2981,7 @@ mod tests {
         observed
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::TaskFinished { result } => Some(result),
+                AgentEvent::TaskFinished { result, .. } => Some(result),
                 _ => None,
             })
             .collect()
@@ -2852,6 +2993,114 @@ mod tests {
         for _ in 0..32 {
             tokio::task::yield_now().await;
         }
+    }
+
+    async fn run_usage_script(script: Vec<AttemptAction>) -> (AgentUsage, Vec<AgentEvent>) {
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(AttemptGenerator::new(script)),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let mut events = scheduler.subscribe();
+        let identity = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "measure provider usage".into(),
+                    role: AgentRole::Explore,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: Vec::new(),
+                    capability_grant_ids: None,
+                    budget: AgentBudget::default(),
+                },
+                None,
+            )
+            .await
+            .expect("usage regression child must spawn");
+        scheduler
+            .wait(identity.task_id)
+            .await
+            .expect("usage regression child must reach one terminal result");
+        let mut observed = Vec::new();
+        drain_events(&mut events, &mut observed);
+        let usage = observed
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::TaskFinished { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("terminal lifecycle must carry final usage; events={observed:?}")
+            });
+        (usage, observed)
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_carries_complete_provider_reported_usage_to_terminal_event() {
+        let (usage, events) =
+            run_usage_script(vec![AttemptAction::FinalUsage("done", Some(12), Some(7))]).await;
+        assert_eq!(
+            usage,
+            AgentUsage {
+                state: AgentUsageState::Complete,
+                input_tokens: Some(12),
+                output_tokens: Some(7),
+                reported_attempts: 1,
+                started_attempts: 1,
+            },
+            "provider-reported usage must reach the terminal lifecycle unchanged; events={events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_marks_one_direction_provider_usage_partial_without_estimating() {
+        let (usage, events) =
+            run_usage_script(vec![AttemptAction::FinalUsage("done", Some(9), None)]).await;
+        assert_eq!(
+            usage.state,
+            AgentUsageState::Partial,
+            "missing output usage must be explicit; usage={usage:?} events={events:?}"
+        );
+        assert_eq!(
+            usage.input_tokens,
+            Some(9),
+            "reported input must remain known; usage={usage:?} events={events:?}"
+        );
+        assert_eq!(usage.output_tokens, None, "missing output must remain unavailable rather than estimated; usage={usage:?} events={events:?}");
+        assert_eq!((usage.reported_attempts, usage.started_attempts), (1, 1), "attempt provenance must distinguish a partial report; usage={usage:?} events={events:?}");
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_marks_unreported_provider_usage_unavailable() {
+        let (usage, events) = run_usage_script(vec![AttemptAction::Final("done")]).await;
+        assert_eq!(usage.state, AgentUsageState::Unavailable, "an unreported response must not become a zero-token report; usage={usage:?} events={events:?}");
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens),
+            (None, None),
+            "unreported token directions must remain absent; usage={usage:?} events={events:?}"
+        );
+        assert_eq!(
+            (usage.reported_attempts, usage.started_attempts),
+            (0, 1),
+            "the provider attempt started but returned no usage; usage={usage:?} events={events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_sums_known_usage_and_attempts_across_multiple_turns() {
+        let (usage, events) = run_usage_script(vec![
+            AttemptAction::ToolTurnUsage(Some(10), Some(2)),
+            AttemptAction::FinalUsage("done", Some(15), None),
+        ])
+        .await;
+        assert_eq!(usage.state, AgentUsageState::Partial, "one incomplete turn makes multi-attempt usage partial; usage={usage:?} events={events:?}");
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens),
+            (Some(25), Some(2)),
+            "only known provider values may be summed; usage={usage:?} events={events:?}"
+        );
+        assert_eq!((usage.reported_attempts, usage.started_attempts), (2, 2), "reported and started attempt counts must survive aggregation; usage={usage:?} events={events:?}");
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::UsageUpdated { usage, .. } if usage.started_attempts == 2 && usage.reported_attempts == 1)), "starting the second attempt must be observable before its metadata returns; events={events:?}");
     }
 
     #[tokio::test]
