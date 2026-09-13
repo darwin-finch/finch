@@ -4,8 +4,8 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 
 **Owns** `src/programs/`: the durable identity and metadata of a stored program, the script
 envelope (`parse_finch_script`), the wire corpus capture and audit, and Co-Forth token helpers.
-The typed machine that runs a program is `src/vm/`; the service that schedules and authorizes one
-is `src/runtime/`.
+The typed machine that runs a program is `crates/finch-vm/`; the service that schedules and
+authorizes one is `src/runtime/`.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
 modules are private, so the `pub use` list in `src/programs/mod.rs` is the whole public surface,

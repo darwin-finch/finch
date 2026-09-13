@@ -23,7 +23,7 @@ CURRENT_DOCS = (
     Path("CONTRIBUTING.md"),
     Path("CLAUDE.md"),
     Path("DESIGN.md"),
-    Path("src/vm/AGENTS.md"),
+    Path("crates/finch-vm/AGENTS.md"),
     Path("src/memory/AGENTS.md"),
     Path("src/programs/AGENTS.md"),
     Path("docs/README.md"),
@@ -362,11 +362,12 @@ def local_links(document: Path, text: str) -> list[tuple[str, str]]:
 
 
 def capsule_paths(root: Path) -> list[str]:
-    """Every source directory that carries a capsule, deepest path last."""
-    return sorted(
-        path.relative_to(root).as_posix()
-        for path in (root / "src").rglob("AGENTS.md")
-    )
+    """Every root-package or workspace-crate source directory that carries a capsule."""
+    capsules = list((root / "src").rglob("AGENTS.md"))
+    crates = root / "crates"
+    if crates.is_dir():
+        capsules.extend(crates.rglob("AGENTS.md"))
+    return sorted(path.relative_to(root).as_posix() for path in capsules)
 
 
 def check_design_index(design: str, capsules: list[str], docs_map: str) -> list[str]:
@@ -419,6 +420,18 @@ def design_index_self_test(root: Path) -> list[str]:
 def self_test() -> int:
     """Exercise the important positive and negative controls for this gate."""
     errors: list[str] = design_index_self_test(ROOT)
+    with tempfile.TemporaryDirectory() as temporary:
+        fixture = Path(temporary)
+        (fixture / "src/example").mkdir(parents=True)
+        (fixture / "crates/example/src").mkdir(parents=True)
+        (fixture / "src/example/AGENTS.md").touch()
+        (fixture / "crates/example/AGENTS.md").touch()
+        observed = capsule_paths(fixture)
+        expected = ["crates/example/AGENTS.md", "src/example/AGENTS.md"]
+        if observed != expected:
+            errors.append(
+                f"workspace-crate capsule discovery failed: expected={expected!r} observed={observed!r}"
+            )
     if TRANSPORT_DOCUMENT not in CURRENT_DOCS:
         errors.append("native ChatGPT transport guide is not enrolled in CURRENT_DOCS")
 

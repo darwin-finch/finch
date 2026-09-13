@@ -1,12 +1,10 @@
-use crate::vm::diagnostic::{
-    DiagnosticPhase, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
-};
-use crate::vm::effects::EffectSet;
-use crate::vm::interpreter::UiOperation;
-use crate::vm::ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
-use crate::vm::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
-use crate::vm::types::{Type, TypedValue};
-use crate::vm::verifier::{
+use crate::diagnostic::{DiagnosticPhase, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic};
+use crate::effects::EffectSet;
+use crate::interpreter::UiOperation;
+use crate::ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
+use crate::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
+use crate::types::{Type, TypedValue};
+use crate::verifier::{
     apply_signature_types, instantiate_signature_types, VerifiedModule, Verifier, Vocabulary,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -2328,7 +2326,7 @@ fn lower_forth_ast_body_with_locals(
                             format!("unknown Co-Forth word '{word}'"),
                             Some(origin),
                         );
-                        let nearest = crate::vm::diagnostic::nearest_names(
+                        let nearest = crate::diagnostic::nearest_names(
                             &word,
                             vocabulary.keys().map(String::as_str),
                         );
@@ -3421,10 +3419,8 @@ fn line_column(source: &str, byte: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::interpreter::{
-        CapabilityHandler, DenyCapabilities, Interpreter, InterpreterConfig,
-    };
-    use crate::vm::{
+    use crate::interpreter::{CapabilityHandler, DenyCapabilities, Interpreter, InterpreterConfig};
+    use crate::{
         core_vocabulary, CapabilityKind, CapabilityRequirement, ResourceSelector, TypedValue,
     };
 
@@ -3496,7 +3492,7 @@ mod tests {
         let mut stack = Vec::new();
         #[derive(Default)]
         struct EmitHandler(String);
-        impl crate::vm::interpreter::CapabilityHandler for EmitHandler {
+        impl crate::interpreter::CapabilityHandler for EmitHandler {
             fn request(
                 &mut self,
                 requirement: &CapabilityRequirement,
@@ -3555,7 +3551,7 @@ mod tests {
         .expect("typed Co-Forth accepts standard output literal");
         #[derive(Default)]
         struct EmitHandler(String);
-        impl crate::vm::interpreter::CapabilityHandler for EmitHandler {
+        impl crate::interpreter::CapabilityHandler for EmitHandler {
             fn request(
                 &mut self,
                 requirement: &CapabilityRequirement,

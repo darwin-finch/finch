@@ -1177,8 +1177,14 @@ fn tree_list_is_sorted_bounded_and_structural() {
 async fn typed_tree_list_has_identical_lisp_and_forth_results() {
     let mut results = Vec::new();
     for (language, source) in [
-        (ProgramLanguage::Lisp, "(tree-list (path \"src/vm\") 5)"),
-        (ProgramLanguage::Forth, "s\"src/vm\" path 5 tree-list"),
+        (
+            ProgramLanguage::Lisp,
+            "(tree-list (path \"crates/finch-vm/src\") 5)",
+        ),
+        (
+            ProgramLanguage::Forth,
+            "s\"crates/finch-vm/src\" path 5 tree-list",
+        ),
     ] {
         let runtime = ProgramRuntime::new();
         runtime

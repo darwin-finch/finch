@@ -1900,8 +1900,8 @@ impl TypedRuntime {
             )
         })?;
         match snapshot.status {
-            crate::vm::fiber::CpuFiberStatus::Running => Ok(None),
-            crate::vm::fiber::CpuFiberStatus::Completed => {
+            crate::fiber::CpuFiberStatus::Running => Ok(None),
+            crate::fiber::CpuFiberStatus::Completed => {
                 let values = snapshot.result.ok_or_else(|| {
                     VmDiagnostic::error(
                         "E-FIBER-014",
@@ -1927,17 +1927,15 @@ impl TypedRuntime {
                 }
                 Ok(Some(values))
             }
-            crate::vm::fiber::CpuFiberStatus::Failed => {
-                Err(snapshot.diagnostic.unwrap_or_else(|| {
-                    VmDiagnostic::error(
-                        "E-FIBER-016",
-                        DiagnosticPhase::HostCall,
-                        "CPU task failed without a diagnostic",
-                        Some(origin.clone()),
-                    )
-                }))
-            }
-            crate::vm::fiber::CpuFiberStatus::Cancelled => Err(VmDiagnostic::error(
+            crate::fiber::CpuFiberStatus::Failed => Err(snapshot.diagnostic.unwrap_or_else(|| {
+                VmDiagnostic::error(
+                    "E-FIBER-016",
+                    DiagnosticPhase::HostCall,
+                    "CPU task failed without a diagnostic",
+                    Some(origin.clone()),
+                )
+            })),
+            crate::fiber::CpuFiberStatus::Cancelled => Err(VmDiagnostic::error(
                 "E-FIBER-017",
                 DiagnosticPhase::Cancellation,
                 "CPU task was cancelled",
@@ -2691,7 +2689,7 @@ mod tests {
     #[test]
     fn core_language_conformance_fixtures_match_across_frontends() {
         let suite: LanguageConformanceSuite = serde_json::from_str(include_str!(
-            "../../vocabulary/language/conformance/core.json"
+            "../../../vocabulary/language/conformance/core.json"
         ))
         .expect("language conformance fixtures must be valid JSON");
         assert_eq!(suite.version, 1, "unsupported fixture version");
@@ -3159,11 +3157,11 @@ mod tests {
         else {
             panic!("defer :cpu must leave exactly one typed task handle");
         };
-        assert_eq!(*result_type, crate::vm::types::Type::Int);
-        assert_eq!(*kind, crate::vm::types::TaskKind::CpuFiber);
+        assert_eq!(*result_type, crate::types::Type::Int);
+        assert_eq!(*kind, crate::types::TaskKind::CpuFiber);
         let id = uuid::Uuid::parse_str(id).expect("CPU task id must be a UUID");
         let result = runtime.cpu_fibers.scheduler.join(id).unwrap();
-        assert_eq!(result.status, crate::vm::fiber::CpuFiberStatus::Completed);
+        assert_eq!(result.status, crate::fiber::CpuFiberStatus::Completed);
         assert_eq!(result.result, Some(vec![TypedValue::Int(42)]));
     }
 
@@ -3471,7 +3469,7 @@ mod tests {
         let [TypedValue::Task { id, kind, .. }] = deferred.values.as_slice() else {
             panic!("defer :cpu must leave a task handle on the persistent stack");
         };
-        assert_eq!(*kind, crate::vm::types::TaskKind::CpuFiber);
+        assert_eq!(*kind, crate::types::TaskKind::CpuFiber);
         let id = uuid::Uuid::parse_str(id).unwrap();
         runtime.cpu_fibers.scheduler.join(id).unwrap();
         let concurrent_snapshot = runtime.clone();
@@ -3512,7 +3510,7 @@ mod tests {
                     TypedValue::Task {
                         id: id.clone(),
                         result_type: Type::Int,
-                        kind: crate::vm::types::TaskKind::CpuFiber,
+                        kind: crate::types::TaskKind::CpuFiber,
                     },
                 ),
                 (

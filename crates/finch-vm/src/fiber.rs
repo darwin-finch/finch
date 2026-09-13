@@ -6,8 +6,8 @@
 //! explicit captures/arguments, and a private VM stack. It never aliases the
 //! parent Brain stack or executes a host capability.
 
-use crate::vm::interpreter::InterpreterConfig;
-use crate::vm::{EffectSet, TypedValue, VerifiedModule, VmDiagnostic, VmStep, VmTrampoline};
+use crate::interpreter::InterpreterConfig;
+use crate::{EffectSet, TypedValue, VerifiedModule, VmDiagnostic, VmStep, VmTrampoline};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -335,12 +335,12 @@ fn run_fiber(
                     None,
                     Some(VmDiagnostic::error(
                         "E-YIELD-003",
-                        crate::vm::DiagnosticPhase::Interpretation,
+                        crate::DiagnosticPhase::Interpretation,
                         format!(
                             "CPU task cannot discard yielded {}; use a producer fiber",
                             value.value_type()
                         ),
-                        Some(crate::vm::SourceOrigin::generated("yield")),
+                        Some(crate::SourceOrigin::generated("yield")),
                     )),
                 );
                 return;
@@ -359,7 +359,7 @@ fn run_fiber(
                     None,
                     Some(VmDiagnostic::error(
                         "E-FIBER-001",
-                        crate::vm::DiagnosticPhase::HostCall,
+                        crate::DiagnosticPhase::HostCall,
                         "pure CPU fiber emitted a host event",
                         Some(effect.origin),
                     )),
@@ -372,7 +372,7 @@ fn run_fiber(
                     None,
                     Some(VmDiagnostic::error(
                         "E-FIBER-002",
-                        crate::vm::DiagnosticPhase::HostCall,
+                        crate::DiagnosticPhase::HostCall,
                         "pure CPU fiber requested a host capability",
                         Some(effect.origin),
                     )),
@@ -388,7 +388,7 @@ fn run_fiber(
                     None,
                     Some(VmDiagnostic::error(
                         "E-FIBER-033",
-                        crate::vm::DiagnosticPhase::HostCall,
+                        crate::DiagnosticPhase::HostCall,
                         "a CPU task cannot own or operate a cooperative producer",
                         Some(origin),
                     )),
@@ -401,7 +401,7 @@ fn run_fiber(
                     None,
                     Some(VmDiagnostic::error(
                         "E-FIBER-007",
-                        crate::vm::DiagnosticPhase::HostCall,
+                        crate::DiagnosticPhase::HostCall,
                         "a CPU fiber cannot spawn another CPU fiber",
                         Some(origin),
                     )),
@@ -416,7 +416,7 @@ fn run_fiber(
                     None,
                     Some(VmDiagnostic::error(
                         "E-FIBER-018",
-                        crate::vm::DiagnosticPhase::HostCall,
+                        crate::DiagnosticPhase::HostCall,
                         "a CPU fiber cannot operate on task handles",
                         Some(origin),
                     )),
@@ -430,7 +430,7 @@ fn run_fiber(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::{core_vocabulary, frontend::forth::compile_forth};
+    use crate::{core_vocabulary, frontend::forth::compile_forth};
 
     #[test]
     fn pure_cpu_fiber_has_a_private_stack_and_returns_a_typed_result() {
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn deferred_closure_copies_captures_into_a_private_frame() {
-        let module = crate::vm::frontend::lisp::compile_lisp(
+        let module = crate::frontend::lisp::compile_lisp(
             "fiber.lisp",
             "(let ((value 42)) (lambda () value))",
             Vec::new(),
@@ -481,10 +481,10 @@ mod tests {
         )
         .unwrap();
         let mut closure_stack = Vec::new();
-        crate::vm::interpreter::Interpreter::new(
+        crate::interpreter::Interpreter::new(
             &module,
-            crate::vm::interpreter::DenyCapabilities,
-            crate::vm::interpreter::InterpreterConfig::default(),
+            crate::interpreter::DenyCapabilities,
+            crate::interpreter::InterpreterConfig::default(),
         )
         .execute(&mut closure_stack)
         .unwrap();

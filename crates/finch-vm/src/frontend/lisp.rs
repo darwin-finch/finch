@@ -1,16 +1,13 @@
-use crate::lisp::reader::SpannedVal;
-use crate::lisp::Val;
-use crate::vm::diagnostic::{
-    DiagnosticPhase, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
-};
-use crate::vm::effects::{CapabilityKind, CapabilityRequirement, EffectSet, ResourceSelector};
-use crate::vm::interpreter::UiOperation;
-use crate::vm::ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
-use crate::vm::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
-use crate::vm::types::{Type, TypedValue};
-use crate::vm::verifier::{
+use crate::diagnostic::{DiagnosticPhase, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic};
+use crate::effects::{CapabilityKind, CapabilityRequirement, EffectSet, ResourceSelector};
+use crate::interpreter::UiOperation;
+use crate::ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
+use crate::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
+use crate::types::{Type, TypedValue};
+use crate::verifier::{
     apply_signature_types, instantiate_signature_types, VerifiedModule, Verifier, Vocabulary,
 };
+use crate::{SpannedVal, Val};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
@@ -250,7 +247,7 @@ pub fn compile_lisp_with_functions(
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
-    let parsed_forms = crate::lisp::reader::parse_str_spanned(source).map_err(|error| {
+    let parsed_forms = crate::parse_str_spanned(source).map_err(|error| {
         vec![VmDiagnostic::error(
             "E-READ-002",
             DiagnosticPhase::Reader,
@@ -342,7 +339,7 @@ pub fn compile_lisp_with_functions(
     let main = builder.finish(output);
     compiler.functions.insert("main".into(), main);
     let module = Module {
-        version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+        version: crate::VM_TYPE_SYSTEM_VERSION,
         name: source_id.to_string(),
         entry: "main".into(),
         functions: {
@@ -3623,10 +3620,8 @@ impl Compiler<'_> {
                 format!("unknown Lisp function '{operator}'"),
                 Some(origin),
             );
-            let nearest = crate::vm::diagnostic::nearest_names(
-                word,
-                self.vocabulary.keys().map(String::as_str),
-            );
+            let nearest =
+                crate::diagnostic::nearest_names(word, self.vocabulary.keys().map(String::as_str));
             if !nearest.is_empty() {
                 diagnostic.hints.push(format!(
                     "did you mean {}?",
@@ -4379,8 +4374,8 @@ fn source_position(source: &str, byte: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::interpreter::{DenyCapabilities, Interpreter, InterpreterConfig};
-    use crate::vm::{core_vocabulary, TypedValue};
+    use crate::interpreter::{DenyCapabilities, Interpreter, InterpreterConfig};
+    use crate::{core_vocabulary, TypedValue};
 
     fn run(source: &str) -> Result<Vec<TypedValue>, Vec<VmDiagnostic>> {
         let module = compile_lisp("input.lisp", source, Vec::new(), &core_vocabulary())?;
@@ -5416,7 +5411,7 @@ mod tests {
     #[test]
     fn finds_top_level_forms_through_comments_quotes_and_json_literals() {
         let source = "; lead\n'(say \"quoted\") #| ignored ( ) |#\n[1, {\"x\": \"y\"}]\n$2*x$";
-        let forms = crate::lisp::reader::parse_str_spanned(source)
+        let forms = crate::parse_str_spanned(source)
             .expect("reader-compatible top-level forms")
             .iter()
             .map(|form| &source[form.span.clone()])
@@ -5425,9 +5420,6 @@ mod tests {
             forms,
             vec!["'(say \"quoted\")", "[1, {\"x\": \"y\"}]", "$2*x$"]
         );
-        assert_eq!(
-            crate::lisp::reader::parse_str(source).unwrap().len(),
-            forms.len()
-        );
+        assert_eq!(crate::parse_str(source).unwrap().len(), forms.len());
     }
 }

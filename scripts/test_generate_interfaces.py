@@ -195,6 +195,37 @@ class InterfaceGeneratorTests(unittest.TestCase):
         self.assertEqual(first, self.fixture.interface(), "generation must be deterministic")
         self.assertEqual(0, self.fixture.run().returncode, "a freshly generated interface must pass")
 
+    def test_workspace_crate_capsule_generates_from_package_relative_sources(self) -> None:
+        self.fixture.write("src/lib.rs", "pub use finch_vm as vm;\n")
+        self.fixture.write("crates/finch-vm/AGENTS.md", "# finch-vm capsule\n")
+        self.fixture.write(
+            "crates/finch-vm/src/lib.rs",
+            "mod types;\npub use types::Value;\n",
+        )
+        self.fixture.write(
+            "crates/finch-vm/src/types.rs",
+            "/// A package-local value.\npub struct Value;\n",
+        )
+        self.fixture.edit(
+            "src/app/mod.rs",
+            "pub struct Shared;",
+            "pub struct Shared;\n/// A different package's value.\npub struct Value;",
+        )
+        self.fixture.edit(
+            "src/vm/mod.rs",
+            "pub use interpreter::{inspect, run, Handler};",
+            "pub use crate::vm::Value;\npub use interpreter::{inspect, run, Handler};",
+        )
+        result = self.fixture.run("--write")
+        self.assertEqual(0, result.returncode, result.stderr)
+        interface = (self.fixture.root / "crates/finch-vm/INTERFACE.md").read_text()
+        self.assertIn("# finch-vm — public interface", interface)
+        self.assertIn("[`crates/finch-vm/src/lib.rs`](src/lib.rs)", interface)
+        self.assertIn("pub struct Value;", interface)
+        vm_interface = (self.fixture.root / "src/vm/INTERFACE.md").read_text()
+        self.assertIn("package-local value", vm_interface)
+        self.assertNotIn("different package's value", vm_interface)
+
     def test_interface_carries_signatures_docs_variants_and_trait_methods(self) -> None:
         text = self.fixture.interface()
         for expected in (

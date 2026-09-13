@@ -12,7 +12,14 @@ description = "Experimental terminal coding assistant with provider-backed chat,
 license = "LicenseRef-PolyForm-Noncommercial-1.0"
 repository = "https://github.com/darwin-finch/finch"
 
+[workspace]
+members = ["crates/finch-vm"]
+default-members = [".", "crates/finch-vm"]
+resolver = "2"
+
 [dependencies]
+finch-vm = { path = "crates/finch-vm" }
+
 # CLI
 clap = { version = "4.4", features = ["derive"] }
 crossterm = "0.28"

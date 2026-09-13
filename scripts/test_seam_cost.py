@@ -30,6 +30,12 @@ SOURCES = {
     ),
     "src/app/mod.rs": "pub mod codec;\npub struct Shared;\nuse crate::tools::mcp::Client;\n",
     "src/vm/mod.rs": "pub struct Value;\nuse crate::tools::mcp::Client;\n",
+    # Workspace-crate `crate::` paths are relative to that package, even when a root module has
+    # the same name.
+    "crates/finch-vm/AGENTS.md": "# finch-vm capsule\n",
+    "crates/finch-vm/src/lib.rs": "mod codec;\nmod vm;\n",
+    "crates/finch-vm/src/codec.rs": "use crate::vm::Value;\n",
+    "crates/finch-vm/src/vm.rs": "pub struct Value;\n",
 }
 
 
@@ -84,6 +90,11 @@ class SeamCostTests(unittest.TestCase):
     def test_an_empty_path_says_so_rather_than_reporting_zeroes(self) -> None:
         report = self.report("src/nowhere/")
         self.assertIn("no tracked Rust files", report, report)
+
+    def test_workspace_crate_sources_use_their_own_crate_namespace(self) -> None:
+        report = self.report("crates/finch-vm/")
+        self.assertIn("3 files", report, report)
+        self.assertIn("outgoing: 0 subsystem(s)", report, report)
 
 
 if __name__ == "__main__":

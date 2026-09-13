@@ -556,7 +556,7 @@ impl ApprovalPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::effects::{FileOperation, FileSelector};
+    use crate::effects::{FileOperation, FileSelector};
 
     fn request(requirement: CapabilityRequirement) -> CapabilityRequest {
         CapabilityRequest {

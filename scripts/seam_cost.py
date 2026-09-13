@@ -34,14 +34,31 @@ def rust_sources(root: Path, files: list[str]) -> dict[str, str]:
     return {
         path: (root / path).read_text(errors="replace")
         for path in files
-        if path.startswith("src/") and path.endswith(".rs")
+        if path.endswith(".rs") and (
+            path.startswith("src/")
+            or (path.startswith("crates/") and "/src/" in path)
+        )
     }
 
 
+def package_source_path(path: str) -> tuple[str, str] | None:
+    """Return the package identity and package-relative Rust source path."""
+    if path.startswith("src/"):
+        return ".", path[len("src/"):]
+    parts = path.split("/")
+    if len(parts) >= 4 and parts[0] == "crates" and parts[2] == "src":
+        return "/".join(parts[:2]), "/".join(parts[3:])
+    return None
+
+
 def module_path_of(path: str) -> str:
-    """The `crate::` path a source file is reachable at."""
-    parts = path[len("src/"):].removesuffix(".rs").split("/")
-    if parts and parts[-1] == "mod":
+    """The package-relative `crate::` path a source file is reachable at."""
+    packaged = package_source_path(path)
+    if packaged is None:
+        return ""
+    _, relative = packaged
+    parts = relative.removesuffix(".rs").split("/")
+    if parts and parts[-1] in ("mod", "lib"):
         parts.pop()
     return "::".join(parts)
 
@@ -57,13 +74,21 @@ def report(root: Path, candidate: str, directories: list[str], files: list[str],
     lines = sum(sources[path].count("\n") for path in inside)
     owners = {owner_of(path) for path in inside}
 
-    file_by_module = {module_path_of(path): path for path in sources}
+    file_by_module = {
+        (package_source_path(path)[0], module_path_of(path)): path
+        for path in sources
+        if package_source_path(path) is not None
+    }
 
-    def owner_of_module(module: str) -> tuple[str | None, str | None]:
+    def owner_of_module(source: str, module: str) -> tuple[str | None, str | None]:
+        packaged = package_source_path(source)
+        if packaged is None:
+            return None, None
+        package, _ = packaged
         parts = module.split("::")
         for depth in range(len(parts), 0, -1):
             prefix = "::".join(parts[:depth])
-            path = file_by_module.get(prefix)
+            path = file_by_module.get((package, prefix))
             if path:
                 return owner_of(path), path
         return None, None
@@ -71,21 +96,30 @@ def report(root: Path, candidate: str, directories: list[str], files: list[str],
     outgoing: Counter[str] = Counter()
     for path in inside:
         for _, module in crate_references(strip_comments_and_tests(sources[path])):
-            owner, target = owner_of_module(module)
+            owner, target = owner_of_module(path, module)
             if target and not target.startswith(candidate) and owner:
                 outgoing[owner] += 1
 
     incoming: dict[str, Counter[str]] = defaultdict(Counter)
     # A candidate may be a directory or a single file; both name a module, but only a directory
     # reaches its module through a `mod.rs`.
-    prefix = module_path_of(
-        candidate if candidate.endswith(".rs") else candidate.rstrip("/") + "/mod.rs"
-    )
+    if candidate.endswith(".rs"):
+        prefix = module_path_of(candidate)
+        candidate_package = package_source_path(candidate)
+    elif candidate.startswith("crates/") and candidate.count("/") == 2:
+        prefix = ""
+        candidate_package = (candidate.rstrip("/"), "")
+    else:
+        prefix = module_path_of(candidate.rstrip("/") + "/mod.rs")
+        candidate_package = package_source_path(candidate.rstrip("/") + "/mod.rs")
     for path, text in sources.items():
         if path.startswith(candidate):
             continue
+        packaged = package_source_path(path)
+        if candidate_package is None or packaged is None or packaged[0] != candidate_package[0]:
+            continue
         for _, module in crate_references(strip_comments_and_tests(text)):
-            if module == prefix or module.startswith(f"{prefix}::"):
+            if prefix and (module == prefix or module.startswith(f"{prefix}::")):
                 incoming[owner_of(path)][path] += 1
 
     print(f"\n{candidate}  —  {len(inside)} files, {lines} lines, currently owned by {sorted(owners)}")

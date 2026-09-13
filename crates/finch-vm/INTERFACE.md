@@ -1,8 +1,8 @@
-# vm — public interface
+# finch-vm — public interface
 
-Generated from [`src/vm/mod.rs`](mod.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
+Generated from [`crates/finch-vm/src/lib.rs`](src/lib.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
 
-- **Facade:** `src/vm/mod.rs`
+- **Facade:** `crates/finch-vm/src/lib.rs`
 - **Capsule:** [`AGENTS.md`](AGENTS.md)
 
 Everything below is what callers outside this module can reach. Implementation modules are private; their contents are deliberately absent.
@@ -112,6 +112,7 @@ pub enum Instruction { Constant, MakeList, MakeMap, MakeRecord, MakeVariant, Var
 impl Instruction {
     pub fn is_terminator(&self) -> bool;
 }
+pub struct InterpreterConfig { … }
 pub struct LocatedInstruction { … }
 impl LocatedInstruction {
     pub fn generated(instruction: Instruction, word: impl Into<String>) -> Self;
@@ -165,6 +166,8 @@ pub struct SourceSpan { … }
 impl SourceSpan {
     pub fn bytes(source_id: impl Into<String>, start_byte: usize, end_byte: usize) -> Self;
 }
+/// A reader value paired with the exact byte range that produced it.
+pub struct SpannedVal { … }
 /// A typed stack row.
 pub struct StackRow { … }
 impl StackRow {
@@ -239,6 +242,18 @@ impl TypedValue {
 pub enum UiOperation { Create, Append, Replace, Status, Progress, Complete, Fail }
 /// Bounded or indeterminate progress metadata carried as data, rather than terminal control codes.
 pub struct UiProgress { … }
+pub enum Val { Nil, Bool, Int, Float, Str, Symbol, Bytes, List }
+impl Val {
+    pub fn as_bytes(&self) -> anyhow::Result<&[u8]>;
+    pub fn as_float(&self) -> anyhow::Result<f64>;
+    pub fn as_int(&self) -> anyhow::Result<i64>;
+    pub fn as_list(&self) -> anyhow::Result<&[Val]>;
+    pub fn as_str(&self) -> anyhow::Result<&str>;
+    pub fn is_truthy(&self) -> bool;
+    /// Like Display but wraps strings in quotes (for printing inside lists).
+    pub fn repr(&self) -> String;
+    pub fn type_name(&self) -> &'static str;
+}
 pub struct VerifiedFunction { … }
 /// A verified module is immutable execution data.
 pub struct VerifiedModule { … }
@@ -320,6 +335,12 @@ pub fn core_word_registry() -> &'static BTreeMap<String, CoreWordSpec> { … }
 pub fn core_word_spec(name: &str) -> Option<CoreWordSpec> { … }
 /// Instantiate a selector template in a declared capability requirement against the arguments of a call.
 pub fn instantiate_requirement(requirement: &CapabilityRequirement, arguments: &[TypedValue]) -> Result<CapabilityRequirement, String> { … }
+/// Parse a full math expression from `src` into a Lisp Val tree.
+pub fn parse_math(src: &str) -> Result<Val> { … }
+/// Parse all top-level expressions from `src`.
+pub fn parse_str(src: &str) -> Result<Vec<Val>> { … }
+/// Parse all top-level expressions while retaining their source structure.
+pub fn parse_str_spanned(src: &str) -> Result<Vec<SpannedVal>> { … }
 pub fn tree_entry_type() -> Type { … }
 pub fn tree_listing_type() -> Type { … }
 ```
@@ -330,7 +351,3 @@ pub fn tree_listing_type() -> Type { … }
 /// Version of the typed VM contract and serialized IR family.
 pub const VM_TYPE_SYSTEM_VERSION: u32 = 5;
 ```
-
-## Referenced but not exported
-
-These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `InterpreterConfig`

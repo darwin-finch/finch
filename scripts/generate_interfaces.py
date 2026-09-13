@@ -19,6 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CAPSULE = "AGENTS.md"
 FACADE = "mod.rs"
+CRATE_FACADE = "src/lib.rs"
 GENERATED_BY = "scripts/generate_interfaces.py"
 
 # `pub use path::{A, B};` or `pub use path::Name;`, possibly spanning lines.
@@ -343,12 +344,25 @@ def subsystem_sources(root: Path, files: list[str], record: dict) -> dict[str, s
 
 
 def resolve_definition(
-    module: str, defined: str, candidates: list[tuple[str, str, str, str]], problems: list[str],
+    module: str,
+    defined: str,
+    candidates: list[tuple[str, str, str, str]],
+    problems: list[str],
+    package_aliases: dict[str, str] | None = None,
 ) -> tuple[str, str, str, str] | None:
     """Pick the definition the `use` path names; ambiguity is an error, not a guess."""
     if len(candidates) == 1:
         return candidates[0]
     hint = module.rstrip(":").rsplit("::", 1)[-1]
+    package = (package_aliases or {}).get(hint)
+    if package:
+        packaged = [
+            candidate for candidate in candidates
+            if candidate[3].startswith("crates/")
+            and candidate[3].split("/", 2)[1].replace("-", "_") == package
+        ]
+        if len(packaged) == 1:
+            return packaged[0]
     matched = [
         candidate for candidate in candidates
         if hint and (f"/{hint}/" in candidate[3] or candidate[3].endswith(f"/{hint}.rs"))
@@ -363,7 +377,7 @@ def resolve_definition(
 
 
 def module_directories(files: list[str]) -> list[str]:
-    """Directories that are modules with a stated interface: an AGENTS.md beside a mod.rs.
+    """Directories that are modules with a stated interface and facade.
 
     The tree is the record. A directory says it is a module by carrying a capsule, so there is
     nothing to keep in sync with a manifest and no way for the two to disagree.
@@ -374,8 +388,30 @@ def module_directories(files: list[str]) -> list[str]:
         for path in files
         if Path(path).name == CAPSULE
         and Path(path).parent != Path(".")
-        and (Path(path).parent / FACADE).as_posix() in tracked
+        and any(
+            (Path(path).parent / facade).as_posix() in tracked
+            for facade in (FACADE, CRATE_FACADE)
+        )
     )
+
+
+def facade_path(files: list[str], directory: str) -> str:
+    """Return the tracked facade for a source module or workspace library crate."""
+    tracked = set(files)
+    for relative in (FACADE, CRATE_FACADE):
+        candidate = f"{directory}{relative}"
+        if candidate in tracked:
+            return candidate
+    raise ValueError(f"module directory has no facade: {directory}")
+
+
+def module_identifier(directory: str) -> str:
+    """Name a source module or workspace crate as its callers do."""
+    if directory.startswith("src/"):
+        return directory.removeprefix("src/").rstrip("/").replace("/", "::")
+    if directory.startswith("crates/"):
+        return Path(directory.rstrip("/")).name
+    return directory.rstrip("/").replace("/", "::")
 
 
 def owning_module(directories: list[str], path: str) -> str | None:
@@ -386,7 +422,7 @@ def owning_module(directories: list[str], path: str) -> str | None:
     """
     best = max((d for d in directories if path.startswith(d)), key=len, default=None)
     if best:
-        return best.removeprefix("src/").rstrip("/").replace("/", "::")
+        return module_identifier(best)
     parts = path.split("/")
     return parts[1].removesuffix(".rs") if len(parts) > 1 and parts[0] == "src" else None
 
@@ -403,15 +439,16 @@ def definitions_in(root: Path, sources: dict[str, str]) -> dict[str, list[tuple[
 def interface_text(
     root: Path, files: list[str], directories: list[str], directory: str, problems: list[str],
 ) -> str:
-    identifier = directory.removeprefix("src/").rstrip("/").replace("/", "::")
-    facade_path = f"{directory}{FACADE}"
-    facade = (root / facade_path).read_text()
+    identifier = module_identifier(directory)
+    facade = facade_path(files, directory)
+    facade_source = (root / facade).read_text()
+    source_prefix = f"{directory}src/" if facade.endswith(CRATE_FACADE) else directory
     # A nested module states its own interface, so its files belong to it, not to its parent.
-    nested = [other for other in directories if other != directory and other.startswith(directory)]
+    nested = [other for other in directories if other != directory and other.startswith(source_prefix)]
     sources = {
         path: (root / path).read_text(errors="replace")
         for path in files
-        if path.startswith(directory)
+        if path.startswith(source_prefix)
         and path.endswith(".rs")
         and not any(path.startswith(child) for child in nested)
     }
@@ -419,17 +456,30 @@ def interface_text(
     # A facade may re-export another subsystem's type; resolve it and say where it comes from.
     elsewhere = definitions_in(
         root, {path: (root / path).read_text(errors="replace") for path in files
-               if path.endswith(".rs") and path.startswith("src/")}
+               if path.endswith(".rs") and (
+                   path.startswith("src/") or (
+                       path.startswith("crates/") and "/src/" in path
+                   )
+               )}
     )
+    root_facade = (root / "src/lib.rs").read_text() if (root / "src/lib.rs").is_file() else ""
+    package_aliases = {
+        alias: package
+        for package, alias in re.findall(
+            r"^pub\s+use\s+([A-Za-z_][A-Za-z0-9_]*)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
+            without_comments(root_facade),
+            re.M,
+        )
+    }
 
     rendered: list[tuple[str, str, str]] = []
     missing: list[str] = []
-    for module, defined, name in exported_names(facade, problems):
+    for module, defined, name in exported_names(facade_source, problems):
         candidates = definitions.get(defined) or elsewhere.get(defined)
         if not candidates:
             missing.append(defined)
             continue
-        resolved = resolve_definition(module, defined, candidates, problems)
+        resolved = resolve_definition(module, defined, candidates, problems, package_aliases)
         if resolved is None:
             continue
         kind, signature, doc, path = resolved
@@ -439,12 +489,12 @@ def interface_text(
         if name != defined:
             doc = f"{doc} Exported as `{name}`." if doc else f"Exported as `{name}`."
         rendered.append((kind, name, with_methods(kind, defined, name, render(signature, doc), sources)))
-    rendered.extend(local_items(facade, sources))
+    rendered.extend(local_items(facade_source, sources))
 
     # Both names count: a renamed export is reachable, under the name the facade publishes.
     exported = {
-        item for _, defined, name in exported_names(facade) for item in (defined, name)
-    } | {name for _, name, _ in local_items(facade)}
+        item for _, defined, name in exported_names(facade_source) for item in (defined, name)
+    } | {name for _, name, _ in local_items(facade_source)}
     problems.extend(f"{identifier}: no definition found for exported `{name}`" for name in missing)
     referenced = {
         word for _, _, text in rendered
@@ -457,10 +507,10 @@ def interface_text(
     lines = [
         f"# {identifier} — public interface",
         "",
-        f"Generated from [`{facade_path}`]({Path(facade_path).name}) by `{GENERATED_BY}`; "
+        f"Generated from [`{facade}`]({Path(facade).relative_to(Path(directory)).as_posix()}) by `{GENERATED_BY}`; "
         "CI fails if it drifts. Edit the code, then regenerate.",
         "",
-        f"- **Facade:** `{facade_path}`",
+        f"- **Facade:** `{facade}`",
     ]
     lines.append(f"- **Capsule:** [`{CAPSULE}`]({CAPSULE})")
     lines.append("")
