@@ -27,6 +27,11 @@ Order by:
 Work the top of that list. A five-minute high-certainty fix and anything that releases a queue both
 outrank a large uncertain rewrite, which is the intended effect.
 
+Do not re-score merely because a new session or worker picked up the queue. Reuse the recorded score
+while its facts remain current. Re-score only when new evidence materially changes scope, value,
+cost, certainty, or unblocking, including when actual cost crosses the guard below. Token usage may
+inform cost, but never overrides user value, correctness, readiness, or blocking relationships.
+
 ## Two guards, because the score is gameable
 
 - **Record the four numbers and one sentence of justification.** A score without justification is a
@@ -46,6 +51,9 @@ Nothing enters the ready queue without:
 An item missing those is not low priority, it is **not ready**. Making it ready is itself a cheap,
 high-unblocking task that usually scores well — so do that rather than leaving it to rot at the
 bottom of a list it was never really on.
+
+When investigating an unready item, perform only the smallest action needed to resolve its missing
+decision or evidence, or to identify the named blocker and owner. Do not implement speculatively.
 
 ## Measure, or the stopping rule is a feeling
 

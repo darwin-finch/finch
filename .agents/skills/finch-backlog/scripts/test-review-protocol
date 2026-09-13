@@ -31,6 +31,7 @@ for path in \
     .agents/skills/finch-backlog/references/review-protocol.md \
     .agents/skills/finch-backlog/references/solution-contract.md \
     .agents/skills/finch-backlog/references/issue-readiness.md \
+    .agents/skills/finch-backlog/references/execution-efficiency.md \
     .agents/skills/finch-backlog/references/task-packet.md \
     .agents/skills/finch-backlog/references/work-claims.md \
     .github/workflows/docs.yml

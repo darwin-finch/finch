@@ -19,6 +19,10 @@ recorded on the item. Cheap, certain, unblocking changes merge first; review att
 scarce resource. See [picking the next item](references/queue.md) for the axes, the two guards that
 keep the score honest, what makes an item ready, and the five numbers to record per change.
 
+Do not re-score an item while its recorded facts remain current. Re-evaluate only after material
+evidence changes value, cost, certainty, scope, or unblocking. Token cost alone never overrides user
+value, correctness, or dependency order.
+
 ## Say the tier out loud, then run only that tier
 
 Proportionality fails by being thorough. Name the tier in the first message about a change, and run
@@ -46,6 +50,13 @@ event, and frontier tracking only when selecting or coordinating shared issue wo
 already-specified user request, the request plus a short plan is the contract; do not invent issue
 or claim ceremony. When the backlog wrapper is active, preserve its procedural collision and claim
 rules.
+
+## Keep execution evidence-dense
+
+Read [efficient execution](references/execution-efficiency.md) for communication, bounded tool
+output, durable records, delegation, and CI cadence. Apply it without weakening the required proof,
+review tier, safety rules, or accepted outcome. Use compact task packets for independent workers and
+keep useful coordinator work moving while they run.
 
 ## Backlog wrapper: prepare shared issue
 
@@ -94,48 +105,18 @@ code gets a concrete separate deletion ticket and pull request, naming the exact
 that it is dead; it does not widen the current review. A prerequisite deletion is valid only when
 the code is already dead and independently safe to remove before the new system exists.
 
-## Replace architecture completely
-
-Use this sequence when replacing a subsystem or representation:
-
-1. Create the replacement with focused tests and behavioral-equivalence proof.
-2. Switch its production integration points and prove the real application path uses it.
-3. Delete the predecessor, obsolete adapters, compatibility scaffolding, and old-only tests; prove
-   no unintended references or duplicate behavior remain.
-
-The stages may be commits in one coherent change or safe dependent pull requests. Every staged pull
-request must build, pass its affected tests, and be safe to merge. An initially unused replacement
-is acceptable only with an owned immediate integration successor. Any temporary coexistence records
-its owner, successor, removal trigger, and deletion proof; the parent outcome remains incomplete
-until deletion. Code newly obviated by the change is deleted in that change or an explicitly
-dependent post-integration cleanup, never left as an indefinite dual architecture.
-
-Prefer a hierarchy of cohesive composed subsystems that can be understood and tested independently
-where practical. Give each a narrow deliberate facade, private internals, explicit dependency
-direction, co-located documentation/tests/context, and integration tests at its boundaries. Do not
-force hierarchy onto trivial code or create a generic contracts junk drawer.
+When replacing a subsystem or representation, use the staged replacement contract in
+[solution contracts](references/solution-contract.md) and its checks in the
+[review protocol](references/review-protocol.md). Those references also define when cohesive
+subsystem boundaries improve local reasoning and when not to force hierarchy.
 
 ## Review to improve the change
 
-Use the [review protocol](references/review-protocol.md). A reviewer is a find-and-help partner:
-identify a concrete failure, explain its impact, suggest the simplest coherent repair, and name a
-deterministic check. Finding confidence, severity, locality, obligation, and lifecycle are
-independent axes.
-
-Repair confirmed same-contract blockers and required regression debt on the same change. Split
-only genuinely separable work with its own owner and proof; never use a split to discard an
-acceptance obligation. Counts and severity help prioritize but never cancel or resolve findings.
-
-Review the current candidate with risk-derived perspectives. Repair confirmed in-scope blockers,
-rerun affected tests, and review again after any material repair. Merge after the first complete
-round with zero confirmed in-scope blockers and relevant tests passing; stop then rather than adding
-confidence rounds. Speculative or optional items are nonblocking follow-ups. Findings remain bounded
-to behavior introduced, changed, relied upon, or made obsolete by the patch.
-
-If the patch relies on a defective out-of-scope prerequisite, create and claim a separate focused
-prerequisite change, land it first, then resume the original. Do not absorb unrelated code.
-If the same defect repeats, change strategy or narrow the change rather than repeating identical
-review.
+Use the [review protocol](references/review-protocol.md). Review the current candidate from
+risk-derived perspectives, repair confirmed same-contract product blockers, rerun affected tests,
+and review a materially repaired tip. Merge after the first complete clean round; record test-only
+gaps as owned follow-ups rather than starting confidence rounds. Split only independently provable
+work and never discard an acceptance obligation.
 
 ## Merge and finish
 
@@ -175,16 +156,5 @@ failed on a move that was clean locally, and the fix was one `#[cfg(any(...))]` 
 session's server, another worktree's daemon, or the user's own editor. Kill a recorded PID or a
 named container, or let the supervisor in `scripts/test_brains.sh` reap its own process group.
 
-## Workspace cleanup
-
-The coordinator owns cleanup; workers never remove another worker's workspace. Create workspaces
-outside the system temporary directory so a reboot cannot discard uncommitted work.
-
-- Remove a verification, mutant, or probe workspace as soon as its verdict is recorded. Its
-  evidence is the recorded result, not the checkout.
-- Remove a worker's workspace, and delete its branch, once `main` contains its accepted change.
-  Squashed integration hides ancestry, so use the recorded integration evidence or a tree
-  comparison against `main` rather than `git branch --merged`.
-- Before removing a workspace that has uncommitted changes or a commit no ref reaches, record that
-  state under `refs/salvage/`.
-- Stop disposable databases and containers with the workspace that created them.
+Workspace ownership, terminal events, and cleanup are defined with the claim lifecycle in
+[work claims](references/work-claims.md).
