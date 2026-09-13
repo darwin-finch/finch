@@ -285,8 +285,8 @@ bytes            immutable or uniquely owned byte sequence
 path<R>          normalized path proven relative to root R
 list<T>          persistent or managed sequence
 map<K,V>         managed mapping
-option<T>        none or some(T)
-result<T,E>      ok(T) or err(E)
+option<T>        standard-library closed variant: none or some(T)
+result<T,E>      standard-library closed variant: ok(T) or err(E)
 record{...}      named product type
 variant{...}     tagged sum type
 word<S,E>        callable word with stack signature S and effects E
@@ -312,6 +312,42 @@ dynamic dispatch cost merely because the Lisp frontend exists.
 The serialized `ProgramValue` form is the wire/checkpoint representation, not necessarily the
 in-memory stack layout.
 
+`option<T>` and `result<T,E>` are ordinary standard-library definitions over the general closed
+variant facility. The compiler privileges neither their names nor their constructors. They gain
+exhaustive destructuring from normal pattern matching and may expose ordinary `map`, `and-then`,
+collection, and traversal operations through concepts. Constructing or returning `err(E)` does not
+throw, propagate, attach diagnostic context, or alter control flow unless source explicitly converts
+that value into an exception.
+
+### Closed variants, representation, and destructuring
+
+Pattern matching narrows and destructures a value; it does not imply heap boxing. A closed variant
+logically has a discriminant and storage large/aligned enough for its largest payload. The matcher
+tests that discriminant, proves which constructor is active on the selected edge, and binds fields
+at their statically known offsets and types. Matching a borrowed variant borrows its selected
+payload. Matching an owned variant moves non-copyable bindings or copies explicitly copyable ones
+as the pattern requests, disarms moved fields, and preserves exactly-once cleanup for every
+unselected or unbound field.
+Field-moving patterns are rejected for a type with a user-defined whole-value destructor unless an
+explicit consuming decomposition operation transfers both its fields and cleanup obligations;
+borrowed matching remains valid. This prevents a destructor from observing moved storage without
+silently skipping deterministic cleanup.
+
+Physical layout is an optimization contract separate from logical matching. The compiler may store
+an explicit compact tag, fold tags shared by nested variants, or use an invalid payload bit pattern
+as a niche. For example, a non-null owning/borrowed pointer has a null niche that can represent the
+empty arm of an option without increasing its size. This optimization applies to any eligible
+library-defined closed variant, not specially to `option` or `result`. User-defined validity/niche
+claims are unsafe layout contracts and must be verified at their declaration boundary.
+
+Ordinary statically typed primitives, records, owners, and static concept arguments carry no
+runtime type tag merely because pattern matching exists. Closed variants carry only the evidence
+needed to select their constructor. Explicitly erased `dyn` values carry their versioned evidence
+table and runtime type identity; thrown values carry type identity in the exceptional-transfer
+envelope. FFI, persisted, and wire types choose a declared stable representation instead of relying
+on compiler-private niche/layout choices. The independent verifier rejects an invalid discriminant
+or payload state before safe code can destructure it.
+
 ### Typed stack signatures
 
 Signatures use row polymorphism so a word states what it consumes while preserving unknown values
@@ -321,7 +357,7 @@ beneath it:
 dup          forall A: Copy, S. (S A -- S A A) ! CopyEffects<A>
 drop         forall A: Drop, S. (S A -- S) ! DropEffects<A>
 +            forall S.   (S int int -- S int) ! pure
-file.read    forall R S. (S path<R> -- S bytes) ! fs.read<R> | throws<IoError>
+file.read    forall R S. (S path<R> -- S bytes) ! fs.read<R>
 agent.await  forall T S. (S task<T> -- S result<T,agent-error>) ! agent.await
 yield        forall Y Resume S. (S Y -- S Resume) ! yields<Y,Resume>
 ```
@@ -332,38 +368,46 @@ consumes that owner. `dup` therefore requires explicit `Copy` evidence (and reta
 is its copy operation); it cannot duplicate a `Unique<T>`. The surface signature grammar must make
 those modes visible rather than relying on a word's spelling or implementation.
 
-`!` introduces one canonical typed effect row. Capability requirements, exceptions, suspension,
-mutation, nondeterminism, and other observable behavior are distinct tagged members of that row,
-not unrelated annotation systems. The broker selects capability-bearing members for authorization;
-the verifier, optimizer, scheduler, handlers, and generic reflection inspect the whole row. Omitted
-`!` means the inferred row is empty. `pure` is not itself a row member or an alias for emptiness: it
-is a verifier-derived predicate over the resolved row and body. A deterministic function with only
-`throws<E>` may be pure but partial; a function may separately be total, deterministic, and
-non-suspending. Generic constraints can require those predicates explicitly. A yielding callable
-remains a scheduling barrier even when it performs no mutation or host operation.
+`!` introduces one canonical typed effect row. Capability requirements, suspension, mutation,
+nondeterminism, and other observable behavior are distinct tagged members of that row, not
+unrelated annotation systems. The broker selects capability-bearing members for authorization; the
+verifier, optimizer, scheduler, and generic reflection inspect the whole row. Omitted `!` requests
+inference rather than asserting an empty row. `pure` is not itself a row member or an alias for
+emptiness: it is a verifier-derived predicate over the resolved row and body. A deterministic
+function may throw and remain pure but partial; a function may separately be total, `nothrow`,
+deterministic, and non-suspending. Generic constraints can require those predicates explicitly. A
+yielding callable remains a scheduling barrier even when it performs no mutation or host operation.
 Optimizers treat `yields<Y,Resume>` as a control barrier, while the scheduler uses its typed payload
 and resumption contract. Source spells row union with `|`, for example
-`! fs.read<R> | throws<IoError> | yields<Progress,unit>`. Within a signature this pipe belongs to the
+`! fs.read<R> | yields<Progress,unit>`. Within a signature this pipe belongs to the
 effect-row grammar, not general control flow. The reader canonicalizes member order immediately so
 spelling order does not affect type identity. Separate readable clauses may be accepted as surface
 sugar only if they normalize into that same row value.
+
+Exceptions are not value types or source-written members of this effect row. `throw` is a control-
+flow edge carrying an ordinary typed value. The compiler infers the set of values that may escape
+each callable and records a compact exception summary in HIR, IR, and compiled module interfaces for
+handler checking, diagnostics, and optimization. Ordinary source does not declare `throws<E>` lists.
+Only an explicit `nothrow` guarantee requires proof that no exceptional edge escapes the callable.
 
 The signature includes:
 
 - input and output stack rows;
 - generic type parameters and constraints;
-- control-flow behavior such as return, throw, or suspend;
+- inferred control-flow behavior such as return, exceptional exit, or suspend;
 - a capability/effect row;
-- optional determinism, allocation, and numeric-overflow properties useful to optimization.
+- optional `nothrow`, determinism, allocation, and numeric-overflow guarantees useful to callers and
+  optimization.
 
 Declaration attributes are separate compile-time metadata, uniformly spelled `@name(...)` for both
 core and user definitions. Core attributes live in explicit namespaces and may be imported into
 short names; user attributes have the same typed reflection and bounded `syntax -> syntax`
 transformation contract. Callable inputs/outputs and `! EffectRow` are type structure rather than
 attributes. There is no D-style mixture of magic bare attributes and second-class user annotations.
-Reflection derives `pure`, `total`, `deterministic`, and `non-suspending` as separate properties.
-They are ordinary constraints over a callable/effect row, not `@` annotations: `throws<E>` may
-satisfy `pure` while failing `total`, and `yields<Y,Resume>` prevents non-suspending transformations.
+Reflection derives `pure`, `total`, `nothrow`, `deterministic`, and `non-suspending` as separate
+properties. They are ordinary callable constraints, not `@` annotations: an inferred exceptional
+exit may satisfy `pure` while failing `total` and `nothrow`, and `yields<Y,Resume>` prevents
+non-suspending transformations.
 
 Capability requirements should likewise become ordinary versioned typed descriptors rather than a
 permanent closed compiler enum. A host registry supplies the stable unforgeable capability identity,
@@ -778,26 +822,101 @@ fallthrough) now lower to verified branch edges. The next control-flow extension
 expression-valued named breaks, where a break target declares its
 result stack row and every reachable break must produce exactly that row. This permits nested-loop
 exits and useful expression-valued loops without allowing a branch to strand intermediate values
-on a caller stack. `for` may be added only as a bounded desugaring to these loop blocks. `try` handles
-typed `result` values today; future exception handlers follow the separate statically typed unwind
-contract below and never catch authorization, replay, or verifier diagnostics indiscriminately.
+on a caller stack. `for` may be added only as a bounded desugaring to these loop blocks.
+`FINCH-LISP/1` currently uses `try` as result-propagation syntax; that remains implementation
+history, not the target exception contract. A future version reserves `try` for a dynamically
+scoped exception handler and uses ordinary matching/library operations for `result` values. The
+version transition requires an explicit source migration rather than silently reinterpreting stored
+`/1` programs. Target handlers follow the contract below and never catch authorization, replay,
+cancellation, or verifier diagnostics indiscriminately.
 
 ### Typed failures and scope guards
 
-Finch keeps three distinct failure shapes because they communicate different contracts:
+Finch separates a failure value from the mechanism used to transport it. `option<T>` represents
+ordinary absence and `result<T,E>` represents an expected domain alternative the program wants to
+store, transform, return, or match. Both are library variants. `throw value` instead creates an
+exceptional control-flow edge carrying an ordinary typed value toward the nearest dynamically
+enclosing compatible handler. An `ExceptionValue` concept may map that value to a stable code and
+human diagnostic, but there is no exception class hierarchy and conformance is never inferred from
+member names.
 
-```text
-option<T>       ordinary absence
-result<T,E>     expected recoverable alternative
-throws<E>       exceptional control transfer to an actual recovery policy
+`throw` must acquire an owned payload before unwinding. A unique value moves into the exception
+transfer and disarms its former cleanup; an eligible copy/shared value is copied or retained under
+its ordinary lifecycle evidence. A borrow may be thrown only when copying its referent produces an
+independent owned value; otherwise the compiler rejects the escaping borrow. Exception transfers
+that survive suspension, migration, or checkpointing obey the same ownership and serialization
+rules as every other continuation value.
+
+Calls propagate exceptional exits automatically. The compiler infers their possible value types
+through the call graph, recursive strongly connected components, generics, and dynamic evidence; it
+does not require source annotations or `result` plumbing in intermediary functions. Private and
+recursive inference remains bounded and monotonic. Published module interfaces freeze the inferred
+summary for downstream checking without requiring the author to repeat it in source. A dynamic call
+without stronger evidence is conservatively considered capable of throwing any permitted exception
+value.
+
+`nothrow` is the explicit checked guarantee. A default callable may propagate an exception. A
+`nothrow` callable may call such code, but every possible exceptional edge must be caught and
+consumed before leaving the callable; a partial handler, rethrow, or throwing handler leaves an edge
+and is diagnosed at the operation that introduced it. A `nothrow` callable is usable where a
+possibly throwing callable is accepted, but not conversely. Copy and drop hooks are implicitly
+`nothrow`: they may call throwing code internally only when an exhaustive handler consumes it.
+
+The target Lisp handler syntax makes the dynamic extent visible while reusing ordinary patterns:
+
+```lisp
+(try
+  (begin
+    (load-config path)
+    (initialize-services))
+  (catch
+    ((ConfigError.NotFound missing-path)
+      (create-default missing-path))
+    ((as error (ConfigError.InvalidSyntax problem))
+      (log-with-context error)
+      (recover problem))))
 ```
 
-`throws<E>` is a tagged member of the callable's canonical effect row. Throwing propagates
-transitively through ordinary calls; a typed handler removes only the variants it handles and leaves
-the remainder in the outward row. There are no unchecked Java-style exceptions. Cancellation uses
-the same internal unwind machinery but is not catchable by ordinary source unless a future
-explicitly privileged control API requires it. A verifier/runtime trap remains a diagnostic, not a
-convenient exception for source to swallow.
+`try` installs its handler before evaluating the expression or `begin` block. Success bypasses the
+handler. On throw, scopes between the throw point and handler boundary unwind first, then `catch`
+pattern-matches the thrown value. Pattern fields bind normally; an identifier binds the whole value;
+an `as` pattern binds both the whole value and its narrowed fields. `catch` is shorthand for the
+fully explicit `(catch error (match error ...))` form, plus a compiler-supplied final arm that
+propagates an unmatched transfer, rather than a second matching engine. The selected handler is
+inactive while its arm executes, so `rethrow` or a newly thrown value targets an enclosing handler
+instead of recursively entering the same catch.
+Handler selection only inspects or borrows the envelope and payload. It does not move payload fields
+until an arm has been selected, so an unmatched catch can resume the original unwind with the same
+owned value, type identity, and provenance intact.
+
+After selection, ordinary move rules apply to bindings. An `as` pattern may borrow the whole value
+while moving a field, but it cannot create two owners: moving a non-copyable field marks that portion
+of the whole binding unavailable, and later whole-value use or `rethrow` is rejected unless the
+pattern retained an independent owner. Unmoved initialized fields retain exactly-once cleanup.
+
+An ordinary value `match` must be exhaustive. A catch matcher may be partial: an unmatched value
+continues unwinding automatically without reboxing or losing provenance. Inside `nothrow`, inferred
+exception types make effective catch coverage exhaustive. All successful and handled branches must
+produce compatible values; an arm that explicitly rethrows has bottom type `never` and is compatible
+with every result type.
+
+Disjoint constructor patterns may appear in any order. If patterns overlap and one strictly
+subsumes another, the more specific pattern must appear first; a broader-before-narrower or fully
+shadowed arm is a compile error with both spans. Overlapping incomparable patterns are ambiguous and
+must be rewritten. Structural patterns, declared subtype edges, and immutable variance determine
+specificity; arbitrary predicate guards do not. The compiler lowers the checked matrix to a bounded
+decision tree, memoizes repeated submatrices, and diagnoses rather than expanding a pathological
+open pattern set without limit. Runtime matching therefore remains tag/type tests and branches, not
+sequential reflection or dynamic duck typing.
+
+Explicit library/macro operations may convert between the two policies at the point intent changes:
+`result-or-throw(result)` throws its `err` payload, while `attempt(expression)` catches a declared
+set and returns `result<T,E>`. Mapping a result remains useful for genuine value transformation, but
+is not required merely to propagate failure or attach call context.
+
+Cancellation uses the same internal unwind machinery but is not catchable by ordinary source unless
+a future explicitly privileged control API requires it. Authorization outcomes and verifier/runtime
+traps remain protected diagnostics, not convenient exceptions for source to swallow.
 
 Every execution frame may retain lexical guard records containing a trigger (`exit`, `success`, or
 `failure`), a typed closure, source origin, and once-only state. Guards run in reverse registration
@@ -806,19 +925,46 @@ workers, or serializing a continuation does not fire them; the continuation carr
 normal return, exception propagation, cancellation, or trap unwinds the scope. Explicit dismissal
 supports commit-style compensation. Guards may invoke separately authorized compensating effects,
 but they cannot erase an execute-once journal entry or claim that an external mutation rolled back.
-If a guard fails while another exception is active, retain both with deterministic primary and
-suppressed diagnostics rather than losing the original cause.
+All intervening guards and drops finish before a thrown value enters its matching catch arm. If a
+guard throws while an exception, cancellation, trap, authorization failure, or resource-limit
+termination is active, retain that protected outcome as primary, attach the guard failure as
+suppressed, and continue unwinding rather than losing or replacing the cause. The suppressed value
+is diagnostic context and cannot become an ordinary catchable replacement for the protected
+outcome. A guard throw on a previously successful exit becomes the primary exception and changes
+the remaining cleanup reason to failure.
 
 Implicit drops and explicit guards occupy one lexical cleanup stack. Constructing an owned value
 registers its drop at that point; registering a later guard places that guard above the drop. Scope
 exit runs eligible cleanup records in reverse registration order, so a guard may use values that
 were alive when it was registered and every owned value is still destroyed exactly once. Suspension
-preserves this stack without running it. Drop itself cannot suspend or replace an active diagnostic.
+preserves this stack without running it. Drop itself is `nothrow`, cannot suspend, and cannot replace
+an active diagnostic; its implementation may call throwing code only behind an exhaustive internal
+handler.
 A move transfers the source's cleanup obligation to the destination and disarms the source record;
 it never registers a second drop for the same owner. Partially initialized records drop only their
 initialized fields, in reverse field-initialization order. A guard that borrows a value holds a
 checked loan until it runs or is dismissed, preventing that owner from moving or dropping first; an
 escaping guard must instead move or retain its captures under the ordinary closure rules.
+
+Trigger meanings are exact: `exit` runs for every structured scope exit; `success` runs only for a
+normal value/return edge; `failure` runs for a thrown exception, cancellation, or defined runtime
+trap. Returning `err(E)` is an ordinary value edge and does not trigger failure unless source
+explicitly throws it. A throw caught entirely inside the same lexical scope does not exit that scope
+and therefore does not fire its guards; guards in inner scopes unwound on the way to the handler do
+fire before catch matching begins.
+
+Illustrative Lisp spellings are `(scope exit cleanup)`, `(scope success publish)`, and
+`(scope failure compensate)`; Co-Forth receives equivalent typed guard words. The precise reader
+spelling may change, but all three lower to the same IR cleanup record rather than separate language
+features.
+
+Guards are expressible as nested `try`/`finally` behavior but should not be implemented by repeatedly
+rewriting the source AST. Elaboration registers one cleanup action and trigger at its lexical point;
+CFG construction shares cleanup blocks across return, throw, cancellation, and trap edges. A
+statically registered non-escaping guard normally needs no heap closure or dynamic handler record.
+Conditional registration/dismissal requires only a local active bit, and runtime work occurs at
+scope exit. Compilation and IR growth should be linear in lexical guards; the compiler must share
+equivalent cleanup suffixes rather than duplicating every nested exit path.
 
 ### Dynamic and unsafe boundaries
 
@@ -903,7 +1049,7 @@ only a small, general lifecycle kernel:
 
 - definite initialization, moves, borrows, and last use;
 - whether a type is movable, copyable, or immovable;
-- non-suspending, non-throwing copy and drop hooks with declared effect rows;
+- non-suspending `nothrow` copy and drop hooks with declared effect rows;
 - exactly-once reverse-order destruction on normal scope exit and structured unwind;
 - the standard borrow projection used to lend a contained value.
 
@@ -939,7 +1085,7 @@ allocation primitives, but ordinary code sees its checked lifecycle behavior.
 
 Copy and drop effects are part of generic evidence and every callable's inferred effect row,
 including implicit cleanup edges. They may perform bounded deterministic lifecycle work but cannot
-suspend, throw, acquire ambient authority, or hide an externally fallible mutation. Resource
+suspend, allow an exception to escape, acquire ambient authority, or hide an externally fallible mutation. Resource
 release authority travels with the owner that acquired the resource. General I/O, commit, flush,
 and protocol shutdown belong in explicit `close`/`finish` operations or scope guards. Dynamic owner
 evidence binds a fixed compatible cleanup effect row; erasure cannot conceal it.
@@ -1009,9 +1155,13 @@ Subtyping follows capability and mutation rather than class layout. Function inp
 contravariant and results covariant. Readonly borrows and readonly owner views may be covariant;
 mutable borrows and mutable ownership containers are invariant. A dynamic implementation may upcast
 to a concept whose requirements are a subset, immutable records may support explicit width
-subtyping, and a callable with fewer effects is a subtype of one permitting more. Core CoLisp and
-Co-Forth have no class inheritance, implicit implementation inheritance, or storage-layout diamond.
-Composition, explicit delegation, variants, and concept evidence provide reuse and polymorphism.
+subtyping, and immutable closed variants such as the library `result<T,E>` are covariant in their
+payload types. A handler accepting a broader exception value can handle a narrower thrown value;
+handler input is contravariant. A callable with fewer effects, no escaping exception edges, or a
+verified `nothrow` guarantee is usable where a less restrictive callable is accepted. Core CoLisp
+and Co-Forth have no class inheritance, implicit implementation inheritance, or storage-layout
+diamond. Composition, explicit delegation, variants, and concept evidence provide reuse and
+polymorphism.
 
 `Shared<T>` lends readonly access by default. Possessing one handle can never prove alias-wide
 exclusive access, so it does not directly provide a mutable borrow of `T`. Mutation requires a
@@ -1067,9 +1217,11 @@ invisible snapshot copy.
 
 Every ownership construct exposed by CoLisp must have a direct typed Co-Forth spelling or word:
 borrowing, taking, unique/shared/weak construction, promotion, static/dynamic owner evidence, drop,
-and unsafe boundaries. Co-Forth stack effects record whether an input is borrowed or consumed, so
-its direct operation mapping to typed IR loses no source-level guarantee. CoLisp lowers the same
-semantics rather than routing through Co-Forth text.
+unsafe boundaries, variant construction/destructuring, `throw`, handler regions, catch patterns,
+and `nothrow` guarantees. Co-Forth stack effects record whether an input is borrowed or consumed,
+and its handler syntax lowers to the same exceptional edges and match decision trees, so its direct
+operation mapping to typed IR loses no source-level guarantee. CoLisp lowers the same semantics
+rather than routing through Co-Forth text.
 
 The common IR records moves, owner/evidence erasure, borrows where relevant to verification, and
 cleanup edges. Its verifier rejects use-after-move, double drop, leaked required ownership, escaping
@@ -1122,10 +1274,13 @@ definition that allocates mutable state, captures a capability, suspends, or oth
 observable effect remains monomorphic unless its type parameters are explicit. Recursive and
 public definitions, effect and capability-selector boundaries, refinements, and FFI require
 declared signatures; publication validates and freezes the declaration rather than exporting an
-accidentally inferred contract. Concepts, parameter packs, ranges, overload resolution, and bounded
-CTFE should make routine code feel as direct as Python or JavaScript while retaining a static,
-optimizable execution path. Do not achieve convenience by silently inserting `dynamic`, unchecked
-coercions, or an interpreter-only fallback.
+accidentally inferred contract. Exception sets are the exception to that source-annotation rule:
+the compiler infers and freezes their interface summary without requiring a declared list. A source
+`nothrow` qualifier is an optional stronger guarantee that publication verifies against the inferred
+control-flow graph. Concepts, parameter packs, ranges, overload resolution, and bounded CTFE should
+make routine code feel as direct as Python or JavaScript while retaining a static, optimizable
+execution path. Do not achieve convenience by silently inserting `dynamic`, unchecked coercions, or
+an interpreter-only fallback.
 
 Rust's inference is Hindley-Milner-derived but extends it with traits, regions, coercions, and other
 constraints. CoLisp deliberately chooses a smaller boundary: inference proceeds forward between
@@ -1322,6 +1477,7 @@ Module
   imports by immutable ProgramRef
   functions
     signature
+    inferred exception summary and optional nothrow guarantee
     locals/captures
     basic blocks
     instructions with SourceOrigin
@@ -1331,8 +1487,8 @@ Instruction examples
   LocalGet, LocalSet, CaptureGet
   RecordNew, FieldGet, VariantNew
   BorrowShared, BorrowExclusive, OwnerErase, OwnerRetain
-  Call, CallClosure, TailCall, Return
-  Branch, CondBranch, Match
+  Call, CallClosure, TailCall, Return, Throw
+  Branch, CondBranch, Match, HandlerEnter, HandlerExit, Rethrow
   CheckedAdd, CheckedDiv, Convert
   HeapAllocate
   CapabilityRequest
@@ -1355,6 +1511,10 @@ The verifier proves:
 - exactly-once destruction of owned values and absence of use after move;
 - no escaping borrow, mutable alias, or borrow live across suspension;
 - signature agreement on every return;
+- inferred exceptional successors cover every throw and throwing call edge;
+- catch patterns are well ordered and narrow/bind only valid payload layouts;
+- cleanup edges run before handler entry and an unmatched catch resumes the original unwind;
+- no exceptional successor escapes a callable declared `nothrow`;
 - transitive effects and capability selector containment;
 - valid immutable dependency versions;
 - bounded static limits where available;
@@ -1377,9 +1537,16 @@ that state returns exactly one of:
 Continue(thunk)                 execute the next bounded VM slice
 Emit(event, thunk)              publish one structured side-effect event, then continue
 Await(request, resume_thunk)    persist/schedule the request; do not block a VM or UI thread
+Raise(value, provenance)        unwind cleanup to a compatible handler or terminal failure
 Complete(values, journal)       commit the transaction
 Fail(diagnostic)                discard uncommitted VM-local mutation
 ```
+
+`Raise` is internal typed control transfer, not automatically a terminal outcome. The VM runs the
+verified cleanup path and resumes at a matching handler when one exists. Only an uncaught thrown
+value is rendered into a terminal `Fail` diagnostic and aborts the transaction. Traps,
+authorization outcomes, cancellation, and resource limits use their protected paths rather than
+being converted into catchable thrown values.
 
 `thunk` is the runtime's implementation term for a zero-argument continuation. In memory it may
 be a compact frame object; for a durable Brain it must serialize as VM data rather than an opaque
@@ -1758,11 +1925,26 @@ Diagnostic
 stored program versions, model message/tool calls, and native instruction ranges. Sensitive values
 are redacted according to type and policy; secrets are never copied into diagnostics by default.
 
+A thrown value travels in a compact runtime-owned `ExceptionTransfer` envelope containing its
+stable type identity, original throw origin, propagation call/inline origins, task/program identity,
+causal link, and suppressed cleanup failures. The payload remains the ordinary source value; error
+records do not need to carry compiler spans or repeatedly wrap themselves merely to add context.
+Propagation appends compact source-map/frame IDs and formats them only when inspected or rendered.
+`rethrow` preserves the original envelope. Throwing a new value from a handler creates a new primary
+transfer and retains the handled transfer's causal metadata. It retains the old payload itself only
+when source performs a valid copy, retain, or move that leaves an owned value available; provenance
+must never implicitly clone a unique payload already consumed by handler bindings.
+
 ### Error propagation
 
-- Expected operational failure is a typed `result<T,E>` when callers commonly recover.
-- `throw`/trap is for exceptional failure and unwinds typed frames to the nearest compatible handler.
-- Uncaught errors abort the VM transaction and become a failed `ExecutionOutcome`.
+- Expected operational alternatives use an ordinary library `result<T,E>` when callers commonly
+  inspect or transform them.
+- `throw` carries an ordinary typed value and unwinds cleanup to the nearest compatible handler;
+  intermediary callers propagate it without result conversion or source annotations.
+- A trap is a distinct protected diagnostic and never enters ordinary catch matching.
+- An uncaught thrown value aborts the VM transaction and becomes a failed `ExecutionOutcome`; a
+  caught value resumes with the handler's compatible result.
+- `nothrow` is verified from inferred exceptional successors after handler subtraction.
 - Child failures remain structured inside `agent-result`; the master may inspect, retry, summarize,
   or propagate them without scraping text.
 - Cancellation and fuel/time/memory exhaustion are distinct stable error kinds.
@@ -1892,6 +2074,10 @@ every valid instantiation by default.
 - Lower verified move/borrow state directly; do not rerun source lifetime inference in the backend.
 - Emit cleanup blocks and stable borrow/drop/retain/release runtime hooks for owner carriers whose
   operations cannot be inlined, preserving exactly-once destruction across return and unwind.
+- Lower verified exceptional successors to explicit native side exits and handler landing blocks;
+  handler activation must cover the protected expression before its first call. Preserve the typed
+  payload, runtime type identity, and compact provenance envelope without turning every call into a
+  source-level `result` value.
 - Lower checked arithmetic with explicit overflow/division side exits according to language policy.
 - Call stable Rust runtime shims for allocation, capability requests, task operations, and complex
   managed-value operations.
@@ -1902,9 +2088,15 @@ every valid instantiation by default.
 ### Errors and deoptimization
 
 Every native code range maps to module/function/IR offset, Forth origin, Lisp origin, and inline
-frames. Guards branch to shared typed trap stubs. If speculative specialization is later added,
+frames. Native and interpreted calls use the same inferred exception summaries and `nothrow`
+certificates; the backend consumes those verified facts and does not reinfer them. Thrown values
+take exceptional edges into the typed unwinder, while guards and invalid runtime states branch to
+separate protected trap stubs. If speculative specialization is later added,
 failed guards reconstruct an interpreter frame at a declared deoptimization point. Native and
-interpreted execution must produce equivalent diagnostics and transaction outcomes.
+interpreted execution must produce equivalent handler selection, cleanup ordering, provenance,
+diagnostics, and transaction outcomes. The ABI may use a shared side-exit convention or platform
+unwind support, but that choice cannot change source semantics and must keep the successful path
+small enough to measure against ordinary returns.
 
 ### Cache and invalidation
 
@@ -2099,6 +2291,12 @@ serialized capability object.
 ### Phase 5: Structured error and transaction pipeline
 
 - Introduce diagnostic codes, phases, origins, traces, redaction, and nested causes.
+- Implement ordinary library `option`/`result` variants on the general closed-variant matcher;
+  neither receives compiler-owned propagation behavior.
+- Add thrown-value envelopes, bounded exception inference, `nothrow` verification, handler regions,
+  pattern-binding catch shorthand, and automatic unmatched propagation.
+- Add `exit`, `success`, and `failure` scope guards on the same lexical cleanup stack as deterministic
+  drops, with shared cleanup-block lowering and primary/suppressed failure preservation.
 - Change `ExecutionOutcome` and agent results to structured diagnostics.
 - Guarantee rollback of VM-local changes on uncaught error/cancellation/conflict.
 - Journal external effects separately and expose partial-effect failures honestly.
@@ -2175,6 +2373,15 @@ Every phase adds tests at the layer where its invariant is enforced:
 - effect derivation, selector normalization, containment, intersection, and adversarial path tests;
 - compile-fail fixtures with stable diagnostic codes, primary spans, expansion ancestry, and
   constraint/specialization related spans;
+- closed-variant layout/destructuring tests for explicit tags, niche encoding, borrowed payloads,
+  moved payloads, invalid discriminants, and stable FFI/persistence representations;
+- error-model tests proving `result` remains an ordinary value, exception sets are inferred,
+  default callers propagate without annotations, `nothrow` rejects only escaping exceptional
+  edges, and exhaustive handlers satisfy it;
+- match/catch tests for disjoint-arm reordering, specific-before-general diagnostics, ambiguous and
+  shadowed patterns, `as` binding, partial catch propagation, and ordinary-match exhaustiveness;
+- unwind tests for cleanup-before-catch, reverse scope-guard/drop order, moved cleanup obligations,
+  handler-thrown errors, and primary/suppressed diagnostic preservation;
 - transaction rollback, stale revision, suspension/resumption, and external-effect journal tests;
 - child authority attenuation and cross-branch authorization tests;
 - serialization compatibility and corrupted IR/manifest rejection tests;
@@ -2182,7 +2389,8 @@ Every phase adds tests at the layer where its invariant is enforced:
 - fuzzing for readers, IR decoder, verifier, selectors, and capability request decoding;
 - provider conformance tasks using only the supplied language package;
 - interpreter/Lisp-lowering differential tests during migration;
-- interpreter/JIT differential tests when the JIT exists, including cleanup and unwind paths;
+- interpreter/JIT differential tests when the JIT exists, including handler selection, thrown-value
+  provenance, cleanup/unwind paths, `nothrow`, and trap/exception separation;
 - UI snapshots for approval, denial, compile error, runtime trap, child failure, and revocation;
 - platform security tests for symlinks, races, Unicode paths, case sensitivity, and root changes.
 
