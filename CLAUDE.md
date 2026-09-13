@@ -220,6 +220,19 @@ Two related habits, for the same reason:
 - **Name the file or symbol, not just the layer.** `src/brain/store.rs:1528`
   (`BrainStore::list`) is checkable; "the store" is not.
 
+### Use context economically
+
+Report outcomes, decisions, blockers, failures, review findings, and integrations; omit routine
+narration and successful intermediate steps. Search and read narrowly, bound tool output, retain
+actionable failure context, and start with the smallest relevant gate. Record durable evidence in
+an existing issue or pull request instead of repeating it in conversation. Final handoffs contain
+only the change, verification, remaining risk, ownership, and next action.
+
+For multi-step or delegated work, follow
+[efficient execution and evidence](.agents/skills/finch-backlog/references/execution-efficiency.md).
+Parallelism and token efficiency never reduce required proof, testing, review, safety, or user
+value, and hard token budgets must not truncate work or evidence.
+
 ## Release Process
 
 Follow the steps in [`CONTRIBUTING.md`](CONTRIBUTING.md#release-process). Do not describe a release

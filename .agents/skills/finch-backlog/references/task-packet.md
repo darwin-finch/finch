@@ -3,6 +3,11 @@
 Give a collaborator enough context to act safely without making them reconstruct the project plan.
 Keep the packet proportional to the delegated change.
 
+Send the packet, not the coordinator's conversation history. Include only the files, interfaces,
+base revision, constraints, and proof relevant to the worker's bounded scope. Do not assign
+duplicate investigations or overlapping file or semantic scopes. Ask for conclusions and
+actionable diagnostics, not raw exploration logs, and keep independent coordinator work moving.
+
 ## Minimum packet
 
 - Issue and accepted outcome, including whether it is user-facing, refactoring, deletion, or
@@ -21,6 +26,9 @@ Keep the packet proportional to the delegated change.
   closure, claim termination, and cleanup.
 - Expected handoff: commit, changed files, **the gate matrix** (below), failures, residual risks,
   and next action.
+
+The handoff does not repeat the issue or pull request history. Link durable evidence and report only
+the change, verification, remaining risk, ownership, and next action.
 
 ## Name a gate stage, never a recipe
 
