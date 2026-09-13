@@ -328,7 +328,7 @@ pub fn spawn_input_task(
                                     {
                                         // Ctrl+G: Good feedback
                                         tui.pending_feedback =
-                                            Some(crate::feedback::FeedbackRating::Good);
+                                            Some(crate::cli::tui::activity::Verdict::Approve);
                                         Ok(None)
                                     }
                                     (KeyCode::Char('b'), m)
@@ -336,7 +336,7 @@ pub fn spawn_input_task(
                                     {
                                         // Ctrl+B: Bad feedback
                                         tui.pending_feedback =
-                                            Some(crate::feedback::FeedbackRating::Bad);
+                                            Some(crate::cli::tui::activity::Verdict::Reject);
                                         Ok(None)
                                     }
                                     (KeyCode::Char('z'), m)

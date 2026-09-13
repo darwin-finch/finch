@@ -2557,10 +2557,15 @@ impl EventLoop {
                         self.try_present_remote_brain_approval().await?;
                     }
 
-                    if let Some(rating) = pending_feedback {
-                        let (weight, label) = match rating {
-                            FeedbackRating::Good => (1.0_f64, "👍 Good"),
-                            FeedbackRating::Bad  => (10.0_f64, "👎 Bad"),
+                    if let Some(verdict) = pending_feedback {
+                        // The terminal reports the gesture; the weight and the rating are Finch's.
+                        let (rating, weight, label) = match verdict {
+                            crate::cli::tui::activity::Verdict::Approve => {
+                                (FeedbackRating::Good, 1.0_f64, "👍 Good")
+                            }
+                            crate::cli::tui::activity::Verdict::Reject => {
+                                (FeedbackRating::Bad, 10.0_f64, "👎 Bad")
+                            }
                         };
                         self.handle_feedback_command(weight, rating, None).await?;
                         tracing::debug!("[EVENT_LOOP] Quick feedback recorded: {}", label);
