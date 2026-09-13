@@ -26,6 +26,10 @@ impl EventLoop {
 }
 /// What produces tokens, and which provider is currently chosen.
 pub struct GenerationParts { … }
+/// Where requests arrive and events are published.
+pub struct LlmChannels { … }
+/// What produces tokens, and how a request is routed between them.
+pub struct LlmGeneration { … }
 /// LLM worker loop — owns AI generation concerns, runs as its own Tokio task.
 pub struct LlmLoop { … }
 impl LlmLoop {
@@ -36,6 +40,14 @@ impl LlmLoop {
 }
 /// Requests sent from the TUI event loop to the LLM worker loop.
 pub enum LlmRequest { Query }
+/// What executes programs, what remembers, and what records.
+pub struct LlmRuntime { … }
+/// Who is talking, as what, from where.
+pub struct LlmSession { … }
+/// Tools the model may call, and what is in flight.
+pub struct LlmTools { … }
+/// Everything the loop draws through.
+pub struct LlmUi { … }
 /// Metadata for a query
 pub struct QueryMetadata { … }
 /// State of an in-flight query
@@ -119,4 +131,4 @@ pub mod tool_execution;
 
 ## Referenced but not exported
 
-These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `BrainTurnProvenance`, `LlmChannels`, `LlmGeneration`, `LlmRuntime`, `LlmSession`, `LlmTools`, `LlmUi`
+These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `BrainTurnProvenance`
