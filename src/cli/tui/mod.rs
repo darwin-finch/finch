@@ -856,13 +856,6 @@ fn completion_row_budget(
         .min(autocomplete_widget::MAX_VISIBLE_SUGGESTIONS + 1)
 }
 
-fn write_completion_pane(out: &mut impl Write, lines: &[String]) -> Result<usize> {
-    for line in lines {
-        execute!(out, Print("\r\n"), Print(line))?;
-    }
-    Ok(lines.len())
-}
-
 fn write_live_area_erase(
     out: &mut impl Write,
     active_rows: usize,
@@ -987,6 +980,319 @@ fn plan_live_content_frame(
         live_lines,
         completion_lines,
     }
+}
+
+// ─── Live-area frame ──────────────────────────────────────────────────────────
+
+/// Columns the input prompt (`❯ `) and its continuation (`  `) both occupy.
+const PROMPT_COLUMNS: usize = 2;
+
+/// Everything [`plan_live_frame`] reads.
+///
+/// Gathering the renderer's state into one borrowed struct is the whole point:
+/// a frame becomes computable, and therefore assertable, without a terminal.
+/// `TuiRenderer::new` enables raw mode and installs a global panic hook, so no
+/// test can construct a renderer — before this, nothing about the live area's
+/// layout could be checked at all.
+pub(crate) struct LiveFrameInputs<'a> {
+    pub terminal_width: usize,
+    pub terminal_height: usize,
+    pub input_lines: &'a [String],
+    pub input_cursor: (usize, usize),
+    pub ghost_text: Option<&'a str>,
+    pub effective_status: &'a str,
+    pub cwd_label: &'a str,
+    pub session_label: &'a str,
+    pub dialog: Option<&'a Dialog>,
+    /// A render error, like a dialog, owns the viewport and suppresses
+    /// completions.
+    pub render_error: bool,
+    /// Polled session task list, including `Done` rows: the layout reserves a
+    /// row for each, and the draw skips the finished ones.
+    pub task_rows: &'a [activity::ActivityRow],
+    /// Child-agent rows, already ordered by depth then identity.
+    pub tracked_rows: &'a [activity::ActivityRow],
+    pub live_rendered: &'a [RenderedTranscriptLine],
+}
+
+/// One live-area frame: the exact logical lines to paint, and where the cursor
+/// lands once they are painted.
+///
+/// The renderer used to count the rows it was drawing *while* it drew them, in
+/// six separate places, and those counts fed `erase_live_area`. A line that
+/// wrapped further than its own counter believed therefore left a row on the
+/// screen that nothing would ever clear. A frame is measured once, from the
+/// lines actually emitted, so the count and the paint cannot disagree.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiveFrame {
+    /// Logical lines, painted separated by `\r\n`. Any of them may wrap.
+    pub lines: Vec<String>,
+    /// Physical rows between the top of the live area and the cursor's row.
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+    pub cursor_visible: bool,
+    /// True when the paint ends with a newline, parking the cursor on the row
+    /// *below* the last painted one. Dialogs do this; the input area does not.
+    pub trailing_newline: bool,
+    /// The live transcript lines that survived the viewport budget, carried so
+    /// the caller can rebuild mouse hit regions against what was really drawn.
+    pub visible_live: Vec<RenderedTranscriptLine>,
+}
+
+impl LiveFrame {
+    /// Physical terminal rows this frame occupies — the number of rows the
+    /// next erase must clear.
+    pub fn physical_rows(&self, terminal_width: usize) -> usize {
+        self.lines
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(line, terminal_width))
+            .sum()
+    }
+
+    /// Render this frame into a shadow buffer of the given size, so a test can
+    /// assert on the cells a terminal would end up holding.
+    pub fn to_shadow_buffer(&self, width: usize, height: usize) -> shadow_buffer::ShadowBuffer {
+        let mut buffer = shadow_buffer::ShadowBuffer::new(width.max(1), height);
+        buffer.render_lines(&self.lines);
+        buffer
+    }
+
+    fn push(&mut self, line: impl Into<String>) {
+        self.lines.push(line.into());
+    }
+}
+
+/// Paint a planned frame and return the physical rows it consumed.
+///
+/// The cursor arithmetic lives here and nowhere else: after the last line the
+/// cursor sits on a known row, and moving to `frame.cursor_row` is a
+/// subtraction rather than a running tally kept by the drawing code.
+fn write_live_frame(
+    out: &mut impl Write,
+    frame: &LiveFrame,
+    terminal_width: usize,
+) -> Result<usize> {
+    if frame.cursor_visible {
+        // Dialogs hide the cursor; the next editable frame must restore it.
+        execute!(out, cursor::Show)?;
+    } else {
+        execute!(out, cursor::Hide)?;
+    }
+    for (index, line) in frame.lines.iter().enumerate() {
+        if index > 0 {
+            execute!(out, Print("\r\n"))?;
+        }
+        execute!(out, Print(line))?;
+    }
+    let rows = frame.physical_rows(terminal_width);
+    if rows == 0 {
+        return Ok(0);
+    }
+    if frame.trailing_newline {
+        execute!(out, Print("\r\n"))?;
+    }
+    // Row the cursor is actually on once the paint finishes.
+    let landed = if frame.trailing_newline {
+        rows
+    } else {
+        rows - 1
+    };
+    let up = landed.saturating_sub(frame.cursor_row);
+    if up > 0 {
+        execute!(out, cursor::MoveUp(up as u16))?;
+    }
+    execute!(out, cursor::MoveToColumn(frame.cursor_col as u16))?;
+    Ok(rows)
+}
+
+/// Lay out one live-area frame.
+///
+/// Sections, top to bottom: live message lines, session task list, child-agent
+/// tree, the workspace/session separator, then either a dialog or the input
+/// area with its completion pane and status lines.
+pub(crate) fn plan_live_frame(
+    inputs: &LiveFrameInputs<'_>,
+    autocomplete: &mut AutocompleteState,
+) -> LiveFrame {
+    let width = inputs.terminal_width.max(1);
+    let height = inputs.terminal_height;
+    let dialog_active = inputs.dialog.is_some();
+    let mut frame = LiveFrame::default();
+
+    // ── Row budget ────────────────────────────────────────────────────────────
+    // Budget actual physical rows after reserving the separator, input, status,
+    // TODOs and child tasks. A fixed reserve overflows the viewport when
+    // context lines wrap, which permanently duplicates live rows.
+    let status_rows = 1 + inputs
+        .effective_status
+        .lines()
+        .map(|line| shadow_buffer::physical_rows(line, width))
+        .sum::<usize>();
+    let input_rows =
+        input_line_physical_rows_with_ghost(inputs.input_lines, width, inputs.ghost_text)
+            .into_iter()
+            .sum::<usize>();
+    let base_reserved_rows = if dialog_active {
+        // A critical dialog owns the viewport. Streaming, tasks, draft, status
+        // and completion stay in structured state but cannot compete with the
+        // bounded approval/error surface.
+        height
+    } else {
+        1 // upper separator
+            + input_rows
+            + status_rows
+            + inputs.task_rows.len()
+            + inputs.tracked_rows.len()
+    };
+
+    // ── 1. Live message lines ────────────────────────────────────────────────
+    let all_live_lines = inputs
+        .live_rendered
+        .iter()
+        .map(|line| line.text.clone())
+        .collect::<Vec<_>>();
+    let mut content_frame = plan_live_content_frame(
+        autocomplete,
+        height,
+        width,
+        base_reserved_rows,
+        &all_live_lines,
+        dialog_active || inputs.render_error,
+    );
+    pin_live_disclosure_header(inputs.live_rendered, &mut content_frame, width);
+    frame.visible_live =
+        rendered_metadata_for_visible(inputs.live_rendered, &content_frame.live_lines);
+    // A Brain can have more than one live work unit (a streamed VM program
+    // alongside a child task or output handle). Rendering only the newest made
+    // earlier source appear and then vanish on the next redraw.
+    for line in &content_frame.live_lines {
+        frame.push(line.trim_end_matches('\r'));
+    }
+
+    // ── 1b. Session task list (active items only) ────────────────────────────
+    if !dialog_active {
+        for row in inputs.task_rows {
+            let (symbol, color) = match row.state {
+                activity::ActivityState::Active => ("●", CYAN),
+                activity::ActivityState::Pending => ("○", DIM_GRAY),
+                activity::ActivityState::Done => continue,
+            };
+            let urgent_tag = if row.urgent { " [!]" } else { "" };
+            // "● " prefix plus the optional " [!]" suffix, measured in columns.
+            let max_content = width.saturating_sub(2 + urgent_tag.len());
+            let content = shadow_buffer::truncate_to_columns(&row.text, max_content);
+            frame.push(format!("{color}{symbol} {content}{urgent_tag}{RESET}"));
+        }
+    }
+
+    // ── 1c. Child-agent task tree ────────────────────────────────────────────
+    if !dialog_active {
+        for row in inputs.tracked_rows {
+            let indent = "  ".repeat(row.depth);
+            let symbol = match row.state {
+                activity::ActivityState::Pending => "○",
+                activity::ActivityState::Active => "●",
+                activity::ActivityState::Done => "✓",
+            };
+            let color = if row.state == activity::ActivityState::Active {
+                CYAN
+            } else {
+                DIM_GRAY
+            };
+            let detail = row.detail.clone().unwrap_or_default();
+            let prefix_width = indent.chars().count() + 2;
+            let available =
+                width.saturating_sub(prefix_width + shadow_buffer::visible_length(&detail) + 3);
+            let task_text = shadow_buffer::truncate_to_columns(&row.text, available);
+            frame.push(format!(
+                "{color}{indent}{symbol}{RESET} {task_text}{DIM_GRAY}{detail}{RESET}"
+            ));
+        }
+    }
+
+    // ── 1d. Co-Forth panel ───────────────────────────────────────────────────
+    // Drawn as a floating overlay by draw_poset_overlay(), which saves and
+    // restores the cursor and so owns no rows here.
+
+    // ── 2. Separator: "──  ~/repos/finch ──────── jade-river ──" ─────────────
+    let separator = session_separator_line(width, inputs.cwd_label, inputs.session_label);
+    if frame.physical_rows(width) < height {
+        frame.push(format!("{DIM_GRAY}{separator}{RESET}"));
+    }
+
+    // ── 3. Dialog or input ───────────────────────────────────────────────────
+    if let Some(dialog) = inputs.dialog {
+        let budget = height.saturating_sub(frame.physical_rows(width));
+        for line in TuiRenderer::dialog_lines(dialog, width, budget) {
+            frame.push(line);
+        }
+        // A dialog has no editable text cursor. Leaving it visible after the
+        // final newline leaves a stray black cell below the modal.
+        frame.cursor_visible = false;
+        // Dialog lines each end with a newline, so the cursor parks on the row
+        // past the last one. erase_live_area() walks up by cursor_row to reach
+        // the top, so this must be the row count, not the last row index.
+        frame.trailing_newline = true;
+        frame.cursor_row = frame.physical_rows(width);
+        return frame;
+    }
+
+    frame.cursor_visible = true;
+    let (cursor_row, cursor_col) = inputs.input_cursor;
+    let rows_before_input = frame.physical_rows(width);
+    let input_phys_rows =
+        input_line_physical_rows_with_ghost(inputs.input_lines, width, inputs.ghost_text);
+
+    // ── 4. Input area, with the dim ghost suffix on its last row ─────────────
+    let prompt = format!("{CYAN}❯{RESET} ");
+    let ghost = inputs
+        .ghost_text
+        .map(|ghost| format!("{DIM_GRAY}{ghost}{RESET}"))
+        .unwrap_or_default();
+    if inputs.input_lines.is_empty() {
+        frame.push(format!("{prompt}{ghost}"));
+    } else {
+        let last = inputs.input_lines.len() - 1;
+        for (index, line) in inputs.input_lines.iter().enumerate() {
+            let prefix = if index == 0 { prompt.as_str() } else { "  " };
+            let suffix = if index == last { ghost.as_str() } else { "" };
+            frame.push(format!("{prefix}{line}{suffix}"));
+        }
+    }
+
+    // ── 4c. Slash-command completion pane ────────────────────────────────────
+    // Plain text is deliberate: the raw/no-colour path stays fully speakable,
+    // and every line is width-bounded before it reaches the terminal.
+    for line in &content_frame.completion_lines {
+        frame.push(line.clone());
+    }
+
+    // ── 5. Status separator and status line(s) ───────────────────────────────
+    // Session identity is projected into the upper separator; repeating it here
+    // wasted a row and made the Brain appear twice.
+    frame.push(format!("{DIM_GRAY}{}{RESET}", "─".repeat(width)));
+    for line in inputs.effective_status.lines() {
+        frame.push(format!("{DIM_GRAY}{line}{RESET}"));
+    }
+
+    // ── 6. Cursor position inside the input area ─────────────────────────────
+    let cursor_text_width = inputs
+        .input_lines
+        .get(cursor_row)
+        .map(|line| {
+            let prefix: String = line.chars().take(cursor_col).collect();
+            shadow_buffer::visible_length(&prefix)
+        })
+        .unwrap_or(0);
+    let cursor_column = PROMPT_COLUMNS + cursor_text_width;
+    // Which physical sub-row of its own logical line the cursor sits on.
+    let cursor_sub_row = cursor_column / width;
+    frame.cursor_col = cursor_column % width;
+    let cursor_phys_above: usize = input_phys_rows[..cursor_row.min(input_phys_rows.len())]
+        .iter()
+        .sum();
+    frame.cursor_row = rows_before_input + cursor_phys_above + cursor_sub_row;
+    frame
 }
 
 // ─── Poset panel view mode ─────────────────────────────────────────────────────
@@ -1482,17 +1788,16 @@ impl TuiRenderer {
     }
 
     /// Draw the live area from scratch and track `active_rows`.
+    ///
+    /// Layout is decided by [`plan_live_frame`], which needs no terminal;
+    /// this function only gathers renderer state, paints the result, and
+    /// records the frame's measured height so the next erase clears exactly
+    /// the rows that were drawn.
     pub fn draw_live_area(&mut self) -> Result<()> {
         let mut stdout = io::stdout();
+        let (term_width, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let (term_width, term_h) = (term_width as usize, term_h as usize);
 
-        let mut rows: usize = 0;
-
-        // ── 1. Active WorkUnit ────────────────────────────────────────────────
-        // Budget actual physical rows after reserving the separator, input,
-        // status, TODOs, and child tasks. A fixed reserve can overflow the
-        // viewport when context lines wrap, permanently duplicating live rows.
-        let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
-        let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
         let input_lines = self.input_textarea.lines().to_vec();
         let raw_status = self
             .status_bar
@@ -1504,6 +1809,7 @@ impl TuiRenderer {
             &current_input,
             &self.command_registry,
         );
+
         if term_h <= 3 && self.active_dialog.is_none() {
             completion_pane_lines(&mut self.autocomplete_state, term_width, 0);
             let frame = plan_tiny_live_frame(
@@ -1521,320 +1827,55 @@ impl TuiRenderer {
             self.accordion.rebuild_hit_regions(&[], 0, term_width);
             return Ok(());
         }
-        let todo_rows = self
+
+        let task_rows = self
             .task_rows
             .as_ref()
-            .map(|source| source.rows().len())
-            .unwrap_or(0);
-        let status_rows = 1 + effective_status
-            .lines()
-            .map(|line| shadow_buffer::physical_rows(line, term_width))
-            .sum::<usize>();
-        let input_rows = input_line_physical_rows_with_ghost(
-            &input_lines,
-            term_width,
-            self.ghost_text.as_deref(),
-        )
-        .into_iter()
-        .sum::<usize>();
-        let dialog_active = self.active_dialog.is_some();
-        let base_reserved_rows = if dialog_active {
-            // A critical dialog owns the viewport. Streaming, tasks, draft,
-            // status, and completion remain retained in structured state but
-            // cannot compete with the bounded approval/error surface.
-            term_h
-        } else {
-            1 // upper separator
-                + input_rows
-                + status_rows
-                + todo_rows
-                + self.tracked_rows.len()
-        };
-        let live_messages = self.find_live_messages();
-        let all_live_rendered = self.projected_lines(live_messages);
-        let all_live_lines = all_live_rendered
-            .iter()
-            .map(|line| line.text.clone())
-            .collect::<Vec<_>>();
-        let mut content_frame = plan_live_content_frame(
-            &mut self.autocomplete_state,
-            term_h,
-            term_width,
-            base_reserved_rows,
-            &all_live_lines,
-            dialog_active || self.last_render_error.is_some(),
-        );
-        pin_live_disclosure_header(&all_live_rendered, &mut content_frame, term_width);
-        let visible_live_rendered =
-            rendered_metadata_for_visible(&all_live_rendered, &content_frame.live_lines);
-        if !content_frame.live_lines.is_empty() {
-            // A Brain can have more than one live work unit (for example a
-            // streamed VM program alongside a child task or output handle).
-            // Rendering only the newest one made earlier source appear, then
-            // vanish on the next redraw. Keep the uncommitted suffix ordered.
-            for line in &content_frame.live_lines {
-                let line = line.trim_end_matches('\r');
-                execute!(stdout, Print(line), Print("\r\n"))?;
-                rows += shadow_buffer::physical_rows(line, term_width);
-            }
-        }
-
-        // ── 1b. Session task list (active items only) ─────────────────────────
-        if !dialog_active {
-            if let Some(source) = self.task_rows.as_ref() {
-                for row in source.rows() {
-                    let (symbol, color) = match row.state {
-                        activity::ActivityState::Active => ("●", CYAN),
-                        activity::ActivityState::Pending => ("○", DIM_GRAY),
-                        activity::ActivityState::Done => continue,
-                    };
-                    let urgent_tag = if row.urgent { " [!]" } else { "" };
-                    // Truncate: "● " prefix (2 chars) + optional " [!]" suffix
-                    let max_content = term_width.saturating_sub(2 + urgent_tag.len());
-                    let content: String = row.text.chars().take(max_content).collect();
-                    execute!(
-                        stdout,
-                        Print(format!(
-                            "{}{} {}{}{}\r\n",
-                            color, symbol, content, urgent_tag, RESET
-                        ))
-                    )?;
-                    rows += shadow_buffer::physical_rows(&content, term_width);
-                }
-            }
-        }
-
-        // ── 1c. Child-agent task tree ─────────────────────────────────────────
-        let mut tracked = if dialog_active {
-            Vec::new()
-        } else {
-            self.tracked_rows.iter().collect::<Vec<_>>()
-        };
-        // Depth first, then identity, so sibling rows keep a stable order between frames.
+            .map(|source| source.rows())
+            .unwrap_or_default();
+        // Depth first, then identity, so sibling rows keep a stable order
+        // between frames.
+        let mut tracked = self.tracked_rows.iter().collect::<Vec<_>>();
         tracked.sort_by_key(|(id, row)| (row.depth, **id));
-        for (_, row) in tracked {
-            let indent = "  ".repeat(row.depth);
-            let symbol = match row.state {
-                activity::ActivityState::Pending => "○",
-                activity::ActivityState::Active => "●",
-                activity::ActivityState::Done => "✓",
-            };
-            let detail = row.detail.clone().unwrap_or_default();
-            let prefix_width = indent.chars().count() + 2;
-            let available = term_width.saturating_sub(prefix_width + detail.chars().count() + 3);
-            let task_text = row.text.chars().take(available).collect::<String>();
-            execute!(
-                stdout,
-                SetForegroundColor(if row.state == activity::ActivityState::Active {
-                    Color::Cyan
-                } else {
-                    Color::DarkGrey
-                }),
-                Print(&indent),
-                Print(symbol),
-                ResetColor,
-                Print(" "),
-                Print(task_text),
-                SetForegroundColor(Color::DarkGrey),
-                Print(detail),
-                ResetColor,
-                Print("\r\n")
-            )?;
-            rows += 1;
-        }
+        let tracked = tracked
+            .into_iter()
+            .map(|(_, row)| row.clone())
+            .collect::<Vec<_>>();
 
-        // ── 1d. Co-Forth panel ────────────────────────────────────────────────
-        // The panel is rendered as a floating overlay in draw_poset_overlay()
-        // (top-right corner of the viewport) — not inline here.  This avoids
-        // all cursor-row-counting issues; the overlay uses SavePosition /
-        // RestorePosition and has no effect on `rows` or erase_live_area().
-
-        // ── 2. Separator: "──  ~/repos/finch ──────── jade-river ──" ──────────
-        // CWD is left-anchored; session name is right-anchored.
         let cwd_label = tilde_cwd();
         let session_label = self
             .status_bar
             .get_line(&StatusLineType::SessionLabel)
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| self.session_label.clone());
-        let separator = session_separator_line(term_width, &cwd_label, &session_label);
-        if rows < term_h {
-            execute!(
-                stdout,
-                Print(format!("{}{}{}\r\n", DIM_GRAY, separator, RESET))
-            )?;
-            rows += 1;
-        }
 
-        // ── 3. Dialog or input ────────────────────────────────────────────────
-        let cursor_row_from_top;
-        if let Some(dialog) = &self.active_dialog {
-            // A dialog has no editable text cursor. Leaving the terminal cursor
-            // visible after its final `\r\n` produces a stray black cursor cell
-            // on the row below the modal on dark terminals.
-            execute!(stdout, cursor::Hide)?;
-            let dialog_rows = Self::draw_dialog_inline_bounded(
-                &mut stdout,
-                dialog,
-                term_width,
-                term_h.saturating_sub(rows),
-            )?;
-            rows += dialog_rows;
-            // Dialog drawing ends each line with \r\n, so the cursor is one row
-            // PAST the last drawn row (at row `rows`, 0-indexed from the start of
-            // the live area).  erase_live_area() moves up by cursor_row_from_top to
-            // reach row 0, so we need cursor_row_from_top = rows (not rows - 1).
-            // Using rows - 1 caused the top row to be skipped on every erase, making
-            // the dialog shift down by one row on each render tick and producing the
-            // cascading duplicate dialog boxes the user sees.
-            cursor_row_from_top = rows;
-        } else {
-            execute!(stdout, cursor::Show)?;
-            // ── 4. Input area ─────────────────────────────────────────────────
-            let (cursor_row, cursor_col) = self.input_textarea.cursor();
-            let lines = self.input_textarea.lines().to_vec();
+        let live_messages = self.find_live_messages();
+        let live_rendered = self.projected_lines(live_messages);
 
-            let prompt = format!("{}❯{} ", CYAN, RESET);
-            let prompt_vis_len: usize = 2; // visible chars: "❯ "
-            let continuation = "  ";
-            let cont_vis_len: usize = 2;
+        let inputs = LiveFrameInputs {
+            terminal_width: term_width,
+            terminal_height: term_h,
+            input_lines: &input_lines,
+            input_cursor: self.input_textarea.cursor(),
+            ghost_text: self.ghost_text.as_deref(),
+            effective_status: &effective_status,
+            cwd_label: &cwd_label,
+            session_label: &session_label,
+            dialog: self.active_dialog.as_ref(),
+            render_error: self.last_render_error.is_some(),
+            task_rows: &task_rows,
+            tracked_rows: &tracked,
+            live_rendered: &live_rendered,
+        };
+        let frame = plan_live_frame(&inputs, &mut self.autocomplete_state);
 
-            // Record the rows count just before input so we know where input starts.
-            let rows_before_input = rows;
-
-            // Track physical terminal rows consumed by each input line (accounts for wrapping).
-            let input_phys_rows =
-                input_line_physical_rows_with_ghost(&lines, term_width, self.ghost_text.as_deref());
-
-            if lines.is_empty() {
-                execute!(stdout, Print(&prompt))?;
-            } else {
-                for (i, line) in lines.iter().enumerate() {
-                    if i == 0 {
-                        execute!(stdout, Print(format!("{}{}", prompt, line)))?;
-                    } else {
-                        execute!(stdout, Print(format!("{}{}", continuation, line)))?;
-                    }
-                    if i < lines.len() - 1 {
-                        execute!(stdout, Print("\r\n"))?;
-                    }
-                }
-            }
-
-            let total_input_phys: usize = input_phys_rows.iter().sum();
-            rows += total_input_phys;
-
-            // ── 4b. Ghost text (dim suffix for command completions) ───────────
-            if let Some(ref ghost) = self.ghost_text {
-                execute!(stdout, Print(format!("{}{}{}", DIM_GRAY, ghost, RESET)))?;
-                // ghost text is on the same row as the last input line — no extra row
-            }
-
-            // ── 4c. Slash-command completion pane ────────────────────────────
-            // Plain text is deliberate: the raw/no-color path remains fully
-            // speakable, and every line is width-bounded before it reaches the
-            // terminal so it cannot wrap and corrupt live-row accounting.
-            rows += write_completion_pane(&mut stdout, &content_frame.completion_lines)?;
-
-            // ── 5. Status line(s) (smart: command hint > live stats > idle hint)
-            //
-            // Priority:
-            //   1. While typing a /command with ghost text → show its description
-            //   2. Live stats / operation are set         → show those
-            //   3. Idle (nothing set)                     → show keyboard shortcuts
-            //
-            // effective_status may contain multiple lines (joined with '\n') when
-            // the status bar has several active entries (e.g. operation + compaction
-            // + plan-mode indicator).  Each must be printed with \r\n so that raw
-            // mode does not leave the cursor at the wrong column.
-            // Session identity is projected into the upper separator. Keeping it
-            // here as well wastes a row and makes the Brain appear twice.
-            // Thin separator between input area and status line(s) — full terminal width
-            let status_sep: String = "─".repeat(term_width);
-            execute!(
-                stdout,
-                Print(format!("\r\n{}{}{}", DIM_GRAY, status_sep, RESET))
-            )?;
-
-            // Count physical terminal rows consumed by status lines.  Long lines wrap,
-            // so we must use the *visible* length (ANSI codes stripped) divided by the
-            // terminal width — not just the number of '\n'-delimited logical lines.
-            // Using logical line count here was the cause of the "separator spam on open"
-            // bug: wrapped context lines were undercounted, leaving the cursor too low
-            // after MoveUp, which caused erase_live_area() to miss the separator row and
-            // draw a new one on every render tick.
-            let mut status_phys_rows: usize = 1; // 1 for the separator line itself
-            for line in effective_status.lines() {
-                execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, line, RESET)))?;
-                let phys = shadow_buffer::physical_rows(line, term_width);
-                status_phys_rows += phys;
-            }
-            rows += status_phys_rows;
-
-            // ── 6. Reposition cursor inside the input area ────────────────────
-            //
-            // After drawing all input lines and status lines the cursor is at the
-            // very bottom of the live area.  We compute how many physical terminal
-            // rows are below the cursor's current logical position and move up by
-            // that amount.  This correctly handles lines that wrap across multiple
-            // terminal rows.
-
-            let cursor_prefix_vis = if cursor_row == 0 {
-                prompt_vis_len
-            } else {
-                cont_vis_len
-            };
-
-            // Which physical sub-row within cursor_row's logical line is the cursor on?
-            let cursor_text_width = lines
-                .get(cursor_row)
-                .map(|line| {
-                    let prefix: String = line.chars().take(cursor_col).collect();
-                    shadow_buffer::visible_length(&prefix)
-                })
-                .unwrap_or(0);
-            let cursor_sub_row = if term_width > 0 {
-                (cursor_prefix_vis + cursor_text_width) / term_width
-            } else {
-                0
-            };
-
-            // Physical rows remaining in the cursor's logical line after the cursor.
-            let phys_in_cursor_line = input_phys_rows.get(cursor_row).copied().unwrap_or(1);
-            let rows_in_cursor_line_below = phys_in_cursor_line.saturating_sub(1 + cursor_sub_row);
-
-            // Physical rows in input lines that come after cursor_row.
-            let input_below_phys: usize =
-                input_phys_rows.iter().skip(cursor_row + 1).sum::<usize>()
-                    + rows_in_cursor_line_below;
-
-            let rows_below_cursor =
-                input_below_phys + content_frame.completion_lines.len() + status_phys_rows;
-            if rows_below_cursor > 0 {
-                execute!(stdout, cursor::MoveUp(rows_below_cursor as u16))?;
-            }
-
-            // Column within the current physical sub-row (accounts for wrapping).
-            let col = if term_width > 0 {
-                (cursor_prefix_vis + cursor_text_width) % term_width
-            } else {
-                cursor_prefix_vis + cursor_text_width
-            };
-            execute!(stdout, cursor::MoveToColumn(col as u16))?;
-
-            // Compute cursor_row_from_top: physical rows from top of live area to cursor.
-            let cursor_phys_above: usize = input_phys_rows[..cursor_row.min(input_phys_rows.len())]
-                .iter()
-                .sum();
-            cursor_row_from_top = rows_before_input + cursor_phys_above + cursor_sub_row;
-        }
-
+        let rows = write_live_frame(&mut stdout, &frame, term_width.max(1))?;
         execute!(stdout, EndSynchronizedUpdate)?;
         stdout.flush()?;
 
         self.active_rows = rows;
-        self.cursor_row_from_top = cursor_row_from_top;
-        self.rebuild_transcript_hit_regions(&visible_live_rendered, rows, term_width, term_h);
+        self.cursor_row_from_top = frame.cursor_row;
+        self.rebuild_transcript_hit_regions(&frame.visible_live, rows, term_width, term_h);
         Ok(())
     }
 
@@ -3229,27 +3270,63 @@ impl TuiRenderer {
         width: usize,
         max_rows: usize,
     ) -> Result<usize> {
-        if max_rows == 0 {
-            return Ok(0);
+        let lines = Self::dialog_lines(dialog, width, max_rows);
+        for line in &lines {
+            execute!(out, Print(line), Print("\r\n"))?;
         }
+        Ok(lines
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(line, width.max(1)))
+            .sum())
+    }
+
+    /// The dialog's lines, clipped to `max_rows` **physical** terminal rows.
+    ///
+    /// The row count returned to the live area was previously a count of
+    /// logical lines. Four dialog rows are built from caller data that is never
+    /// wrapped or is truncated by character count rather than display width —
+    /// a long option label, long text input, the custom "Other" row, and a CJK
+    /// preview line — so each could occupy two rows while reporting one. That
+    /// count reaches `cursor_row_from_top`, which the erase walks up by, so an
+    /// undercount left the top of the dialog unerased and the box redrew one
+    /// row lower on every tick: the cascading duplicate dialogs. Measuring the
+    /// emitted lines removes the possibility of the two disagreeing.
+    fn dialog_lines(dialog: &Dialog, width: usize, max_rows: usize) -> Vec<String> {
+        if max_rows == 0 {
+            return Vec::new();
+        }
+        let width = width.max(1);
         let mut rendered = Vec::new();
-        let total_rows =
-            Self::draw_dialog_inline_static_with_width(&mut rendered, dialog, width.max(1))?;
-        if total_rows <= max_rows {
-            out.write_all(&rendered)?;
-            return Ok(total_rows);
+        if Self::draw_dialog_inline_static_with_width(&mut rendered, dialog, width).is_err() {
+            return Vec::new();
+        }
+        let text = String::from_utf8_lossy(&rendered).into_owned();
+        let all = text
+            .split_terminator("\r\n")
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let rows_of = |line: &str| shadow_buffer::physical_rows(line, width);
+        if all.iter().map(|line| rows_of(line)).sum::<usize>() <= max_rows {
+            return all;
         }
 
-        let retained_rows = max_rows.saturating_sub(1);
-        for line in rendered
-            .split_inclusive(|byte| *byte == b'\n')
-            .take(retained_rows)
-        {
-            out.write_all(line)?;
+        // Keep whole lines while they fit, reserving one row for the marker.
+        let budget = max_rows.saturating_sub(1);
+        let mut kept = Vec::new();
+        let mut used = 0;
+        for line in all {
+            let rows = rows_of(&line);
+            if used + rows > budget {
+                break;
+            }
+            used += rows;
+            kept.push(line);
         }
-        let marker = ellipsize("… dialog clipped to viewport; use navigation keys …", width);
-        execute!(out, Print(marker), Print("\r\n"))?;
-        Ok(max_rows)
+        kept.push(ellipsize(
+            "… dialog clipped to viewport; use navigation keys …",
+            width,
+        ));
+        kept
     }
 
     /// Show a blocking dialog (used when no async event loop is running).
@@ -4908,6 +4985,78 @@ mod tests {
     }
 
     #[test]
+    fn test_dialog_row_count_is_physical_rows_not_logical_lines() {
+        // Regression: the dialog reported one row per logical line it emitted.
+        // An option label is caller data and is never wrapped or truncated, so
+        // a long one painted two terminal rows and was counted as one. That
+        // count becomes `cursor_row_from_top`, which the erase walks up by, so
+        // the undercount left the top of the box unerased and redrew it one row
+        // lower every tick — the cascading duplicate dialogs.
+        let width = 40;
+        let dialog = Dialog::select(
+            "Approve",
+            vec![DialogOption::new(
+                "run the migration against the production database and then report back",
+            )],
+        );
+        let mut output = Vec::new();
+
+        let rows =
+            TuiRenderer::draw_dialog_inline_bounded(&mut output, &dialog, width, 60).unwrap();
+
+        let raw = String::from_utf8(output).unwrap();
+        let painted = raw
+            .split_terminator("\r\n")
+            .map(|line| shadow_buffer::physical_rows(line, width))
+            .sum::<usize>();
+        let logical = raw.matches("\r\n").count();
+        assert!(
+            painted > logical,
+            "this case must actually exercise a wrapping option label: {logical} logical lines \
+             occupying {painted} rows at width {width}"
+        );
+        assert_eq!(
+            painted, rows,
+            "the row count handed to cursor_row_from_top must be the rows the dialog paints, \
+             not its {logical} logical lines; dialog painted:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn test_dialog_clipping_budget_counts_wrapped_rows() {
+        // The clip guard also counted logical lines, so a dialog whose lines
+        // wrapped could be "clipped to five rows" and still paint more than
+        // five, overflowing the viewport it was bounded to protect.
+        let width = 40;
+        let options = (0..24)
+            .map(|index| {
+                DialogOption::new(format!(
+                    "approval choice {index} with a label long enough to wrap the terminal"
+                ))
+            })
+            .collect();
+        let dialog = Dialog::select("Critical approval", options);
+        let mut output = Vec::new();
+
+        let rows = TuiRenderer::draw_dialog_inline_bounded(&mut output, &dialog, width, 5).unwrap();
+
+        let raw = String::from_utf8(output).unwrap();
+        let painted = raw
+            .split_terminator("\r\n")
+            .map(|line| shadow_buffer::physical_rows(line, width))
+            .sum::<usize>();
+        assert!(
+            painted <= 5,
+            "a dialog bounded to 5 rows must paint at most 5; it painted {painted}:\n{raw}"
+        );
+        assert_eq!(
+            painted, rows,
+            "the returned count must match the painted height; dialog painted:\n{raw}"
+        );
+        assert!(raw.contains("dialog clipped to viewport"));
+    }
+
+    #[test]
     fn test_stream_resize_reconnect_and_dialog_repaint_preserve_selection() {
         let registry = CommandRegistry::new();
         let mut autocomplete = AutocompleteState::new();
@@ -4949,23 +5098,255 @@ mod tests {
         let registry = CommandRegistry::new();
         let mut autocomplete = AutocompleteState::new();
         autocomplete.show_matches(registry.match_prefix("/brain list"));
-        let lines = completion_pane_lines(&mut autocomplete, 100, 9);
+        autocomplete.visible = true;
+        let input = vec!["/brain list".to_string()];
+        let frame = plan_live_frame(&live_inputs(100, 30, &input, "ready"), &mut autocomplete);
+
         let mut output = Vec::new();
-
-        let rows = write_completion_pane(&mut output, &lines).unwrap();
-
+        write_live_frame(&mut output, &frame, 100).unwrap();
         let raw = String::from_utf8(output).unwrap();
-        assert_eq!(rows, lines.len());
+
+        let completion_rows = frame
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("Commands ") || line.starts_with("> /"))
+            .collect::<Vec<_>>();
+        assert!(
+            !completion_rows.is_empty(),
+            "the completion pane must reach the painted frame; frame was {:?}",
+            frame.lines
+        );
+        assert!(
+            completion_rows.iter().all(|line| !line.contains('\x1b')),
+            "completion rows must stay plain text so the no-colour path is speakable, got {:?}",
+            completion_rows
+        );
         assert!(raw.contains("\r\nCommands 1-1 of 1"));
         assert!(raw.contains("\r\n> /brain list - List named Brain sessions"));
-        assert!(
-            !raw.contains('\x1b'),
-            "no-color output must contain no ANSI"
-        );
         assert!(!raw.contains("\x1b[3J"), "must not clear native scrollback");
         assert!(
             !raw.contains("\n\n"),
             "must not emit committed-message spacing"
+        );
+    }
+
+    // ── Live-area frame: rendering made assertable without a terminal ────────
+
+    /// Minimal inputs for an idle live area at the given size.
+    ///
+    /// `TuiRenderer::new` enables raw mode and installs a global panic hook, so
+    /// no test can construct a renderer. Planning a frame from borrowed state
+    /// is what makes the live area reachable from a test at all.
+    fn live_inputs<'a>(
+        width: usize,
+        height: usize,
+        input_lines: &'a [String],
+        status: &'a str,
+    ) -> LiveFrameInputs<'a> {
+        LiveFrameInputs {
+            terminal_width: width,
+            terminal_height: height,
+            input_lines,
+            input_cursor: (0, 0),
+            ghost_text: None,
+            effective_status: status,
+            cwd_label: "~/repos/finch",
+            session_label: "jade-river",
+            dialog: None,
+            render_error: false,
+            task_rows: &[],
+            tracked_rows: &[],
+            live_rendered: &[],
+        }
+    }
+
+    /// Rows the buffer actually holds content on.
+    fn occupied_rows(buffer: &shadow_buffer::ShadowBuffer) -> usize {
+        buffer
+            .rows_as_text()
+            .iter()
+            .rposition(|row| !row.is_empty())
+            .map(|index| index + 1)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_live_frame_renders_into_a_shadow_buffer_with_no_terminal() {
+        let input = vec!["hello".to_string()];
+        let mut autocomplete = AutocompleteState::new();
+        let frame = plan_live_frame(&live_inputs(40, 20, &input, "idle"), &mut autocomplete);
+
+        let buffer = frame.to_shadow_buffer(40, 20);
+        let rows = buffer.rows_as_text();
+
+        let prompt_row = rows
+            .iter()
+            .position(|row| row.contains("hello"))
+            .unwrap_or_else(|| panic!("input row must be painted; frame rows were {rows:?}"));
+        assert_eq!(
+            "❯ hello", rows[prompt_row],
+            "the input row is the prompt plus the draft, with no ANSI left in the cells; \
+             frame lines were {:?}",
+            frame.lines
+        );
+        assert_eq!(
+            Some('❯'),
+            buffer.get(0, prompt_row).map(|cell| cell.ch),
+            "the prompt glyph must land in column 0 of its row; row read back as {:?}",
+            rows[prompt_row]
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("jade-river")),
+            "the session separator must be part of the frame; frame rows were {rows:?}"
+        );
+    }
+
+    #[test]
+    fn test_live_frame_measured_height_equals_the_rows_it_paints() {
+        // A status line wider than the terminal wraps. The frame's own row
+        // count is what erase_live_area() clears, so it must equal the rows the
+        // painted bytes actually occupy — not the number of logical lines.
+        let width = 30;
+        let status = "a".repeat(95);
+        let input = vec![String::new()];
+        let mut autocomplete = AutocompleteState::new();
+        let frame = plan_live_frame(&live_inputs(width, 40, &input, &status), &mut autocomplete);
+
+        let buffer = frame.to_shadow_buffer(width, 40);
+
+        assert_eq!(
+            frame.physical_rows(width),
+            occupied_rows(&buffer),
+            "the height the renderer records must equal the height it paints, or the next \
+             erase leaves a row behind; frame lines were {:?}",
+            frame.lines
+        );
+        assert!(
+            frame.physical_rows(width) > frame.lines.len(),
+            "this case must actually exercise wrapping: {} logical lines occupying {} rows",
+            frame.lines.len(),
+            frame.physical_rows(width)
+        );
+    }
+
+    #[test]
+    fn test_live_frame_cursor_lands_on_the_input_row_it_reports() {
+        let width = 20;
+        let input = vec!["abc".to_string(), "defgh".to_string()];
+        let mut autocomplete = AutocompleteState::new();
+        let mut inputs = live_inputs(width, 24, &input, "idle");
+        inputs.input_cursor = (1, 3);
+        let frame = plan_live_frame(&inputs, &mut autocomplete);
+
+        let rows = frame.to_shadow_buffer(width, 24).rows_as_text();
+        assert_eq!(
+            "  defgh", rows[frame.cursor_row],
+            "cursor_row must index the continuation row holding the cursor; frame rows were {rows:?}"
+        );
+        assert_eq!(
+            PROMPT_COLUMNS + 3,
+            frame.cursor_col,
+            "the cursor sits after the continuation prefix and three typed columns; \
+             frame lines were {:?}",
+            frame.lines
+        );
+    }
+
+    #[test]
+    fn test_consecutive_live_frames_differ_only_where_content_changed() {
+        let width = 40;
+        let input = vec!["draft".to_string()];
+        let mut autocomplete = AutocompleteState::new();
+        let before = plan_live_frame(&live_inputs(width, 20, &input, "idle"), &mut autocomplete);
+        let after = plan_live_frame(&live_inputs(width, 20, &input, "busy"), &mut autocomplete);
+
+        let previous = before.to_shadow_buffer(width, 20);
+        let current = after.to_shadow_buffer(width, 20);
+        let changes = shadow_buffer::diff_buffers(&current, &previous);
+
+        assert!(
+            !changes.is_empty(),
+            "a changed status line must produce changed cells; frames were {:?} then {:?}",
+            before.lines,
+            after.lines
+        );
+        let changed_rows = changes.iter().map(|(_, y, _)| *y).collect::<HashSet<_>>();
+        assert_eq!(
+            1,
+            changed_rows.len(),
+            "only the status row changed, so the diff must touch exactly one row; it touched \
+             rows {changed_rows:?} across frames {:?} then {:?}",
+            before.lines,
+            after.lines
+        );
+    }
+
+    #[test]
+    fn test_wide_character_task_row_is_truncated_to_one_painted_row() {
+        // Regression: the session task row truncated `row.text` with
+        // `chars().take(n)` and then counted the row with a measurement that
+        // omitted the "● " prefix. Twenty fullwidth characters are twenty
+        // chars and forty columns, so at width 40 the row painted two terminal
+        // rows while the renderer recorded one. The missing row was never
+        // erased.
+        let width = 40;
+        let task = activity::ActivityRow::new("作".repeat(20), activity::ActivityState::Active);
+        let task_rows = vec![task];
+        let input = vec![String::new()];
+        let mut autocomplete = AutocompleteState::new();
+        let mut inputs = live_inputs(width, 24, &input, "idle");
+        inputs.task_rows = &task_rows;
+        let frame = plan_live_frame(&inputs, &mut autocomplete);
+
+        let task_line = frame
+            .lines
+            .iter()
+            .find(|line| line.contains('作'))
+            .unwrap_or_else(|| panic!("the task row must be painted; frame was {:?}", frame.lines));
+        assert_eq!(
+            1,
+            shadow_buffer::physical_rows(task_line, width),
+            "an activity row must occupy exactly one terminal row; it measured {} columns at \
+             width {width} and read {task_line:?}",
+            shadow_buffer::visible_length(task_line)
+        );
+        assert_eq!(
+            frame.physical_rows(width),
+            occupied_rows(&frame.to_shadow_buffer(width, 24)),
+            "recorded height must equal painted height; frame lines were {:?}",
+            frame.lines
+        );
+    }
+
+    #[test]
+    fn test_wide_character_child_task_row_is_truncated_to_one_painted_row() {
+        // Regression: the child-agent tree added `rows += 1` per row while
+        // truncating by character count and measuring `detail` with
+        // `chars().count()`. Both understate fullwidth text, so the row wrapped
+        // and the undercount survived into `active_rows`.
+        let width = 40;
+        let mut row = activity::ActivityRow::new("業".repeat(20), activity::ActivityState::Active);
+        row.detail = Some("模型".to_string());
+        let tracked = vec![row];
+        let input = vec![String::new()];
+        let mut autocomplete = AutocompleteState::new();
+        let mut inputs = live_inputs(width, 24, &input, "idle");
+        inputs.tracked_rows = &tracked;
+        let frame = plan_live_frame(&inputs, &mut autocomplete);
+
+        let child_line = frame
+            .lines
+            .iter()
+            .find(|line| line.contains('業'))
+            .unwrap_or_else(|| {
+                panic!("the child row must be painted; frame was {:?}", frame.lines)
+            });
+        assert_eq!(
+            1,
+            shadow_buffer::physical_rows(child_line, width),
+            "a child-agent row must occupy exactly one terminal row; it measured {} columns at \
+             width {width} and read {child_line:?}",
+            shadow_buffer::visible_length(child_line)
         );
     }
 
@@ -5952,7 +6333,10 @@ mod draw_dialog_tests {
                 continue;
             }
             let visible: String = strip_ansi(line);
-            let w = visible.chars().count();
+            // Display columns, not characters: a fullwidth character is one
+            // char and two columns, so a char count let CJK content overflow
+            // the box and wrap while this guard reported it as fitting.
+            let w = shadow_buffer::visible_length(&visible);
             assert!(
                 w <= box_width,
                 "line {i} has visual width {w}, exceeds box_width {box_width}:\n  raw:     {:?}\n  visible: {:?}",

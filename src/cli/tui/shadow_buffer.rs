@@ -253,6 +253,45 @@ impl ShadowBuffer {
         }
     }
 
+    /// Render already-formatted terminal lines into the buffer, top-aligned.
+    ///
+    /// This is the entry point the live area uses: a frame is a list of logical
+    /// lines that the renderer would print separated by `\r\n`, and the buffer
+    /// wraps each one at the column boundary exactly as the terminal does.
+    /// Returns the number of physical rows consumed, which is the number of
+    /// rows the renderer must later erase.
+    ///
+    /// Lines beyond the buffer height are clipped, mirroring a terminal whose
+    /// viewport has run out of rows, so the returned count never exceeds
+    /// `height`.
+    pub fn render_lines(&mut self, lines: &[String]) -> usize {
+        self.clear();
+        let mut y = 0;
+        for line in lines {
+            if y >= self.height {
+                break;
+            }
+            y += self.write_line(y, line, Style::default());
+        }
+        y.min(self.height)
+    }
+
+    /// The rows of this buffer as plain text, ANSI stripped and trailing blanks
+    /// removed, so a test can assert on what a reader would actually see.
+    pub fn rows_as_text(&self) -> Vec<String> {
+        self.cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.ch)
+                    .filter(|ch| *ch != '\u{200B}')
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
     /// Get all cells as a 2D vector (for diffing)
     pub fn get_cells(&self) -> &Vec<Vec<Cell>> {
         &self.cells
@@ -353,6 +392,50 @@ pub fn visible_length(s: &str) -> usize {
     }
 
     len
+}
+
+/// Truncate `s` to at most `columns` display columns.
+///
+/// Truncating with `chars().take(n)` is wrong wherever the result is then
+/// assumed to occupy one terminal row: a CJK or fullwidth character is one
+/// `char` and two columns, so `n` characters can be `2n` columns and wrap.
+/// A wide character straddling the boundary is dropped rather than split.
+/// ANSI escape sequences are copied through and cost no columns.
+pub fn truncate_to_columns(s: &str, columns: usize) -> String {
+    if columns == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut used = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            // Copy the sequence verbatim; it occupies no columns.
+            if chars.peek() == Some(&'[') {
+                out.push(chars.next().unwrap_or('['));
+                for ch in chars.by_ref() {
+                    out.push(ch);
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else if let Some(next) = chars.next() {
+                out.push(next);
+            }
+            continue;
+        }
+        if matches!(c, '\r' | '\x08' | '\x7f') {
+            continue;
+        }
+        let width = char_display_width(c);
+        if used + width > columns {
+            break;
+        }
+        used += width;
+        out.push(c);
+    }
+    out
 }
 
 /// Number of physical terminal rows occupied by one logical line.
