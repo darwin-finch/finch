@@ -10,6 +10,44 @@
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Completeness of token usage attached to live activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityUsageState {
+    /// Every started attempt reported both token directions.
+    Complete,
+    /// Some usage is known, but the report is incomplete.
+    Partial,
+    /// No provider usage is known.
+    Unavailable,
+}
+
+/// Token usage attached to one live activity row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityUsage {
+    /// Completeness of the provider reports.
+    pub state: ActivityUsageState,
+    /// Known input-token sum, if any input count was reported.
+    pub input_tokens: Option<u64>,
+    /// Known output-token sum, if any output count was reported.
+    pub output_tokens: Option<u64>,
+    /// Attempts reporting at least one token direction.
+    pub reported_attempts: usize,
+    /// Provider attempts known to have started.
+    pub started_attempts: usize,
+}
+
+impl Default for ActivityUsage {
+    fn default() -> Self {
+        Self {
+            state: ActivityUsageState::Unavailable,
+            input_tokens: None,
+            output_tokens: None,
+            reported_attempts: 0,
+            started_attempts: 0,
+        }
+    }
+}
+
 /// How far along a row's work is. The renderer chooses a glyph and colour from this and nothing
 /// else, so a caller never decides how activity looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +100,12 @@ pub enum ActivityUpdate {
     Upsert {
         id: Uuid,
         row: ActivityRow,
+        usage: ActivityUsage,
+    },
+    /// Replace token accounting for a row without changing its presentation.
+    SetUsage {
+        id: Uuid,
+        usage: ActivityUsage,
     },
     /// Replace a row's trailing detail without disturbing the rest of it.
     SetDetail {
@@ -70,6 +114,10 @@ pub enum ActivityUpdate {
     },
     Remove {
         id: Uuid,
+    },
+    /// Replace all streamed rows after the event receiver reports lag.
+    Resnapshot {
+        rows: Vec<(Uuid, ActivityRow, ActivityUsage)>,
     },
 }
 

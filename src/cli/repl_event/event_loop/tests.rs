@@ -1,3 +1,269 @@
+struct NeverCompletes;
+
+#[async_trait::async_trait]
+impl crate::generators::Generator for NeverCompletes {
+    async fn generate(
+        &self,
+        _messages: Vec<crate::claude::Message>,
+        _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+    ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+        std::future::pending().await
+    }
+
+    async fn generate_stream(
+        &self,
+        _messages: Vec<crate::claude::Message>,
+        _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+    ) -> anyhow::Result<
+        Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+    > {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(10),
+            };
+        &CAPABILITIES
+    }
+
+    fn name(&self) -> &str {
+        "never-completes"
+    }
+}
+
+#[tokio::test]
+async fn agent_lifecycle_lag_resnapshots_authoritative_active_tasks_before_new_events() {
+    use std::sync::Arc;
+
+    let scheduler = crate::scheduler::AgentScheduler::new(
+        crate::scheduler::ProviderResolver::new(Arc::new(NeverCompletes)),
+        Arc::new(crate::runtime::ProgramRuntime::new()),
+    );
+    // Subscribe before overflowing the scheduler's 256-event broadcast ring.
+    let events = scheduler.subscribe();
+    let mut identities = Vec::new();
+    for index in 0..260 {
+        identities.push(
+            scheduler
+                .spawn(
+                    crate::scheduler::AgentTaskSpec {
+                        task: format!("lag child {index}"),
+                        role: crate::scheduler::AgentRole::Explore,
+                        background: None,
+                        provider: None,
+                        model: None,
+                        context: Vec::new(),
+                        capability_grant_ids: None,
+                        budget: crate::scheduler::AgentBudget::default(),
+                    },
+                    None,
+                )
+                .await
+                .expect("lag fixture child must spawn"),
+        );
+    }
+    let completed = identities.remove(0);
+    scheduler
+        .cancel(completed.task_id)
+        .await
+        .expect("the stale terminal fixture must accept cancellation");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        scheduler.wait(completed.task_id),
+    )
+    .await
+    .expect("the terminal event used to force stale state must settle")
+    .expect("the cancelled fixture must retain its terminal result");
+
+    let (target_tx, mut target_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bridge = tokio::spawn(super::forward_agent_events(
+        Arc::clone(&scheduler),
+        events,
+        target_tx,
+    ));
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), target_rx.recv())
+        .await
+        .expect("lag recovery must not stall")
+        .expect("lag recovery channel must remain open");
+    let super::ReplEvent::AgentLifecycle(crate::scheduler::AgentEvent::Resnapshot { active }) =
+        first
+    else {
+        panic!("lag must resnapshot before presenting retained transitions as current; first_event={first:?}");
+    };
+    assert_eq!(active.len(), identities.len(), "authoritative recovery must contain every still-active child; active_count={} spawned_count={}", active.len(), identities.len());
+    assert!(active.iter().all(|entry| entry.task.identity.task_id != completed.task_id), "a child whose terminal event may have been lost must not survive the authoritative snapshot; completed_task={} active={active:?}", completed.task_id);
+
+    bridge.abort();
+    for identity in &identities {
+        scheduler
+            .cancel(identity.task_id)
+            .await
+            .expect("every active lag fixture must accept cleanup cancellation");
+    }
+    for identity in identities {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scheduler.wait(identity.task_id),
+        )
+        .await
+        .expect("cancelled lag fixture must settle")
+        .expect("cancelled lag fixture must retain its terminal result");
+    }
+}
+
+fn lifecycle_snapshot(
+    runtime: &crate::runtime::ProgramRuntime,
+    task_id: uuid::Uuid,
+    status: crate::scheduler::AgentTaskStatus,
+) -> crate::scheduler::AgentTaskSnapshot {
+    crate::scheduler::AgentTaskSnapshot {
+        identity: crate::scheduler::AgentIdentity {
+            agent_id: uuid::Uuid::new_v4(),
+            task_id,
+            parent_agent_id: None,
+            root_agent_id: uuid::Uuid::new_v4(),
+            depth: 0,
+            provider_model: "test-provider".into(),
+            vm_revision: runtime.revision(),
+            manifest_generation: runtime.manifest_generation(),
+            starting_context_hash: "test-context".into(),
+            grant_ceiling: crate::vm::EffectSet::pure(),
+            brain_run_id: None,
+        },
+        task: format!("child {task_id}"),
+        role: crate::scheduler::AgentRole::Explore,
+        status,
+        result: None,
+    }
+}
+
+#[tokio::test]
+async fn test_boundary_01_real_event_loop_dispatch_keeps_usage_refreshes_out_of_scrollback() {
+    tokio::task::LocalSet::new()
+        .run_until(boundary_01_dispatch_scenario())
+        .await;
+}
+
+async fn boundary_01_dispatch_scenario() {
+    use std::sync::Arc;
+
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let tempdir = tempfile::tempdir().expect("TEST-BOUNDARY-01: create isolated tool state");
+    let executor = crate::tools::executor::ToolExecutor::new(
+        crate::tools::registry::ToolRegistry::new(),
+        crate::tools::permissions::PermissionManager::new(),
+        tempdir.path().join("patterns.json"),
+    )
+    .expect("TEST-BOUNDARY-01: construct inert tool executor");
+    let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+    let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+        generator,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        Arc::clone(&runtime),
+    );
+    let first_id = uuid::Uuid::new_v4();
+    event_loop
+        .handle_event(super::ReplEvent::AgentLifecycle(
+            crate::scheduler::AgentEvent::TaskQueued {
+                snapshot: lifecycle_snapshot(
+                    &runtime,
+                    first_id,
+                    crate::scheduler::AgentTaskStatus::Queued,
+                ),
+            },
+        ))
+        .await
+        .expect("TEST-BOUNDARY-01: queued lifecycle dispatch must succeed");
+    event_loop
+        .handle_event(super::ReplEvent::AgentLifecycle(
+            crate::scheduler::AgentEvent::UsageUpdated {
+                task_id: first_id,
+                usage: crate::scheduler::AgentUsage {
+                    state: crate::scheduler::AgentUsageState::Complete,
+                    input_tokens: Some(12),
+                    output_tokens: Some(7),
+                    reported_attempts: 1,
+                    started_attempts: 1,
+                },
+            },
+        ))
+        .await
+        .expect("TEST-BOUNDARY-01: usage lifecycle dispatch must succeed");
+    assert!(event_loop.output_manager.get_messages().is_empty(), "TEST-BOUNDARY-01: queued and usage refreshes must update only live projection, not scrollback; message_count={}", event_loop.output_manager.get_messages().len());
+    let usage_line = event_loop
+        .status_bar
+        .get_line(&crate::cli::status_bar::StatusLineType::AgentActivity)
+        .expect("TEST-BOUNDARY-01: usage dispatch must reach the status projection");
+    assert!(
+        usage_line.contains("12 input, 7 output")
+            && usage_line.contains("complete (1/1 attempts reported)"),
+        "TEST-BOUNDARY-01: real dispatch must render truthful usage text; line={usage_line:?}"
+    );
+
+    let second_id = uuid::Uuid::new_v4();
+    let second = lifecycle_snapshot(
+        &runtime,
+        second_id,
+        crate::scheduler::AgentTaskStatus::Running,
+    );
+    event_loop
+        .handle_event(super::ReplEvent::AgentLifecycle(
+            crate::scheduler::AgentEvent::Resnapshot {
+                active: vec![crate::scheduler::AgentActivitySnapshot {
+                    task: second.clone(),
+                    usage: crate::scheduler::AgentUsage::default(),
+                    active_tool: None,
+                }],
+            },
+        ))
+        .await
+        .expect("TEST-BOUNDARY-01: authoritative resnapshot dispatch must succeed");
+    assert!(event_loop.output_manager.get_messages().is_empty(), "TEST-BOUNDARY-01: lag recovery must replace live state without appending scrollback; message_count={}", event_loop.output_manager.get_messages().len());
+    let resnapshot_line = event_loop
+        .status_bar
+        .get_line(&crate::cli::status_bar::StatusLineType::AgentActivity)
+        .expect("TEST-BOUNDARY-01: resnapshot must retain one current child");
+    assert!(resnapshot_line.contains("Children: 1 active") && resnapshot_line.contains("unavailable input, unavailable output"), "TEST-BOUNDARY-01: resnapshot must replace stale usage with authoritative state; line={resnapshot_line:?}");
+
+    let result = crate::scheduler::AgentTaskResult {
+        identity: second.identity,
+        status: crate::scheduler::AgentTaskStatus::Completed,
+        final_message: "done".into(),
+        diagnostics: Vec::new(),
+        turns: 1,
+        elapsed_ms: 1,
+    };
+    event_loop
+        .handle_event(super::ReplEvent::AgentLifecycle(
+            crate::scheduler::AgentEvent::TaskFinished {
+                result,
+                usage: crate::scheduler::AgentUsage {
+                    state: crate::scheduler::AgentUsageState::Complete,
+                    input_tokens: Some(3),
+                    output_tokens: Some(2),
+                    reported_attempts: 1,
+                    started_attempts: 1,
+                },
+            },
+        ))
+        .await
+        .expect("TEST-BOUNDARY-01: terminal lifecycle dispatch must succeed");
+    assert_eq!(event_loop.output_manager.get_messages().len(), 1, "TEST-BOUNDARY-01: only the existing terminal summary may append history; message_count={} messages={:?}", event_loop.output_manager.get_messages().len(), event_loop.output_manager.get_messages().iter().map(|message| message.format(&crate::theme::ColorScheme::default())).collect::<Vec<_>>());
+    assert_eq!(
+        event_loop
+            .status_bar
+            .get_line(&crate::cli::status_bar::StatusLineType::AgentActivity),
+        None,
+        "TEST-BOUNDARY-01: terminal projection must clean up the final active status cell"
+    );
+}
+
 /// Every systemic condition this runner can report must declare itself with
 /// `RUNNER_UNAVAILABLE_PREFIX`, so a replay pass aborts instead of paying a
 /// round trip per completed run. #254.

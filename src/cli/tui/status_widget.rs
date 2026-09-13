@@ -48,7 +48,7 @@ impl<'a> StatusWidget<'a> {
                 // Current focus: de-emphasised relative to the topic line
                 Style::default().fg(Color::DarkGray)
             }
-            StatusLineType::LiveStats => {
+            StatusLineType::LiveStats | StatusLineType::AgentActivity => {
                 // Live stats: from color scheme
                 Style::default()
                     .fg(self.colors.status.live_stats.to_color())

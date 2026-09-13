@@ -430,7 +430,9 @@ impl EventLoop {
 
             ReplEvent::AgentLifecycle(event) => {
                 let finished = match &event {
-                    crate::scheduler::AgentEvent::TaskFinished { result } => Some(result.clone()),
+                    crate::scheduler::AgentEvent::TaskFinished { result, .. } => {
+                        Some(result.clone())
+                    }
                     _ => None,
                 };
                 self.tui_renderer.lock().await.apply_activity(

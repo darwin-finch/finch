@@ -7,8 +7,25 @@
 use std::sync::Arc;
 
 use crate::cli::tui::activity::{ActivityRow, ActivityRows, ActivityState, ActivityUpdate};
-use crate::scheduler::{AgentEvent, AgentTaskSnapshot, AgentTaskStatus};
+use crate::scheduler::{AgentActivitySnapshot, AgentEvent, AgentTaskSnapshot, AgentTaskStatus};
 use crate::tools::todo::{TodoList, TodoPriority, TodoStatus};
+
+fn activity_usage(
+    usage: &crate::scheduler::AgentUsage,
+) -> crate::cli::tui::activity::ActivityUsage {
+    use crate::cli::tui::activity::{ActivityUsage, ActivityUsageState};
+    ActivityUsage {
+        state: match usage.state {
+            crate::scheduler::AgentUsageState::Complete => ActivityUsageState::Complete,
+            crate::scheduler::AgentUsageState::Partial => ActivityUsageState::Partial,
+            crate::scheduler::AgentUsageState::Unavailable => ActivityUsageState::Unavailable,
+        },
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        reported_attempts: usage.reported_attempts,
+        started_attempts: usage.started_attempts,
+    }
+}
 
 /// The session todo list, presented as rows the renderer can poll.
 pub struct TodoRows(Arc<tokio::sync::RwLock<TodoList>>);
@@ -61,12 +78,18 @@ fn agent_row(snapshot: &AgentTaskSnapshot) -> ActivityRow {
 /// A scheduler event as a change to the rows on screen.
 pub fn agent_activity(event: &AgentEvent) -> ActivityUpdate {
     match event {
+        AgentEvent::Resnapshot { active } => agent_activity_snapshot(active.clone()),
         AgentEvent::TaskQueued { snapshot } | AgentEvent::TaskStarted { snapshot } => {
             ActivityUpdate::Upsert {
                 id: snapshot.identity.task_id,
                 row: agent_row(snapshot),
+                usage: Default::default(),
             }
         }
+        AgentEvent::UsageUpdated { task_id, usage } => ActivityUpdate::SetUsage {
+            id: *task_id,
+            usage: activity_usage(usage),
+        },
         // A running tool is shown after the model, and clearing it restores the model alone.
         AgentEvent::ToolStarted { task_id, name } => ActivityUpdate::SetDetail {
             id: *task_id,
@@ -76,9 +99,26 @@ pub fn agent_activity(event: &AgentEvent) -> ActivityUpdate {
             id: *task_id,
             detail: None,
         },
-        AgentEvent::TaskFinished { result } => ActivityUpdate::Remove {
+        AgentEvent::TaskFinished { result, .. } => ActivityUpdate::Remove {
             id: result.identity.task_id,
         },
+    }
+}
+
+/// Replace the live child projection from the scheduler's authoritative state.
+fn agent_activity_snapshot(snapshot: Vec<AgentActivitySnapshot>) -> ActivityUpdate {
+    ActivityUpdate::Resnapshot {
+        rows: snapshot
+            .into_iter()
+            .map(|entry| {
+                let id = entry.task.identity.task_id;
+                let mut row = agent_row(&entry.task);
+                if let Some(tool) = entry.active_tool {
+                    row.detail = Some(format!(" · {tool}"));
+                }
+                (id, row, activity_usage(&entry.usage))
+            })
+            .collect(),
     }
 }
 

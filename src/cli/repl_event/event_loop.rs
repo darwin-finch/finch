@@ -1616,6 +1616,31 @@ mod dispatch;
 
 mod input;
 
+async fn forward_agent_events(
+    scheduler: Arc<crate::scheduler::AgentScheduler>,
+    mut events: tokio::sync::broadcast::Receiver<crate::scheduler::AgentEvent>,
+    target: mpsc::UnboundedSender<ReplEvent>,
+) {
+    loop {
+        let event = match events.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // Subscribe to the new tail before reading authoritative state.
+                // Events after this point are represented by the snapshot or
+                // queued behind it, so stale buffered transitions cannot
+                // reappear after the replacement.
+                let (fresh_events, active) = scheduler.subscribe_with_active_task_snapshot().await;
+                events = fresh_events;
+                crate::scheduler::AgentEvent::Resnapshot { active }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        if target.send(ReplEvent::AgentLifecycle(event)).is_err() {
+            return;
+        }
+    }
+}
+
 impl EventLoop {
     fn start_llm_worker(&mut self) {
         let llm_rx = self.llm_rx.take().expect("LlmLoop already started");
@@ -1735,24 +1760,13 @@ impl EventLoop {
         todo_journal_receiver.spawn();
         let (llm_tx, llm_rx) = mpsc::unbounded_channel::<LlmRequest>();
 
-        let mut agent_events = agent_scheduler.subscribe();
+        let agent_events = agent_scheduler.subscribe();
         let agent_event_tx = event_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match agent_events.recv().await {
-                    Ok(event) => {
-                        if agent_event_tx
-                            .send(ReplEvent::AgentLifecycle(event))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+        tokio::spawn(forward_agent_events(
+            Arc::clone(&agent_scheduler),
+            agent_events,
+            agent_event_tx,
+        ));
 
         // Create Co-Forth shared stack before TUI so both hold the same Arc.
         let stack: Arc<tokio::sync::Mutex<Vec<String>>> =
