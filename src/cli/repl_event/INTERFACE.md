@@ -32,7 +32,7 @@ impl LlmLoop {
     /// Run the LLM worker loop.
     pub async fn run(mut self);
     /// Construct the LLM loop.
-    pub fn new(llm_rx: mpsc::UnboundedReceiver<LlmRequest>, event_tx: mpsc::UnboundedSender<ReplEvent>, cloud_gen: Arc<RwLock<Arc<dyn Generator>>>, qwen_gen: Arc<dyn Generator>, router: Arc<Router>, generator_state: Arc<RwLock<GeneratorState>>, tool_definitions: Arc<RwLock<Vec<ToolDefinition>>>, tool_coordinator: ToolExecutionCoordinator, program_runtime: Arc<crate::runtime::ProgramRuntime>, tool_call_history: Arc< RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>, >, conversation: Arc<RwLock<ConversationHistory>>, query_states: Arc<QueryStateManager>, mode: Arc<RwLock<ReplMode>>, output_manager: Arc<OutputManager>, status_bar: Arc<StatusBar>, tui_renderer: Arc<Mutex<TuiRenderer>>, active_tool_uses: ActiveToolUsesMap, memory_system: Option<Arc<crate::memory::MemorySystem>>, current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>, active_persona: Arc<RwLock<crate::config::Persona>>, session_label: String, cwd: String, context_lines: usize, max_verbatim_messages: usize, context_recall_k: usize, streaming_enabled: bool, enable_summarization: bool, auto_compact_enabled: bool, wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>) -> Self;
+    pub fn new(channels: crate::cli::repl_event::parts::LlmChannels, generation: crate::cli::repl_event::parts::LlmGeneration, tools: crate::cli::repl_event::parts::LlmTools, ui: crate::cli::repl_event::parts::LlmUi, session: crate::cli::repl_event::parts::LlmSession, runtime: crate::cli::repl_event::parts::LlmRuntime, limits: crate::cli::repl_event::parts::ContextLimits) -> Self;
 }
 /// Requests sent from the TUI event loop to the LLM worker loop.
 pub enum LlmRequest { Query }
@@ -119,4 +119,4 @@ pub mod tool_execution;
 
 ## Referenced but not exported
 
-These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `ActiveToolUsesMap`, `BrainTurnProvenance`
+These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `BrainTurnProvenance`, `LlmChannels`, `LlmGeneration`, `LlmRuntime`, `LlmSession`, `LlmTools`, `LlmUi`

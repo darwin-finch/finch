@@ -85,3 +85,63 @@ pub struct RuntimeParts {
     pub agent_scheduler: Arc<crate::scheduler::AgentScheduler>,
     pub memory_system: Option<Arc<crate::memory::MemorySystem>>,
 }
+
+// ---------------------------------------------------------------------------
+// The LLM loop's parts.
+//
+// `LlmLoop` runs on its own task, so it holds shared handles where `EventLoop` owns values:
+// `Arc<RwLock<TuiRenderer>>` rather than a `TuiRenderer`, `Arc<RwLock<Vec<ToolDefinition>>>`
+// rather than a `Vec`. The groups mean the same things; only the sharing differs, which is why
+// these are separate types rather than a reuse that would force one side into the other's shape.
+//
+// `ContextLimits` is shared, because those five values are identical on both sides.
+// ---------------------------------------------------------------------------
+
+/// Where requests arrive and events are published.
+pub struct LlmChannels {
+    pub requests: tokio::sync::mpsc::UnboundedReceiver<super::LlmRequest>,
+    pub events: tokio::sync::mpsc::UnboundedSender<super::ReplEvent>,
+}
+
+/// What produces tokens, and how a request is routed between them.
+pub struct LlmGeneration {
+    pub cloud: Arc<RwLock<Arc<dyn crate::generators::Generator>>>,
+    pub local: Arc<dyn crate::generators::Generator>,
+    pub router: Arc<crate::router::Router>,
+    pub state: Arc<RwLock<GeneratorState>>,
+}
+
+/// Tools the model may call, and what is in flight.
+pub struct LlmTools {
+    pub definitions: Arc<RwLock<Vec<crate::tools::types::ToolDefinition>>>,
+    pub coordinator: super::tool_execution::ToolExecutionCoordinator,
+    pub call_history:
+        Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
+    pub active_uses: super::query_processor::ActiveToolUsesMap,
+}
+
+/// Everything the loop draws through.
+pub struct LlmUi {
+    pub output: Arc<OutputManager>,
+    pub status_bar: Arc<StatusBar>,
+    pub renderer: Arc<Mutex<TuiRenderer>>,
+    pub streaming_enabled: bool,
+}
+
+/// Who is talking, as what, from where.
+pub struct LlmSession {
+    pub conversation: Arc<RwLock<ConversationHistory>>,
+    pub active_persona: Arc<RwLock<crate::config::Persona>>,
+    pub mode: Arc<RwLock<ReplMode>>,
+    pub query_states: Arc<super::query_state::QueryStateManager>,
+    pub label: String,
+    pub cwd: String,
+}
+
+/// What executes programs, what remembers, and what records.
+pub struct LlmRuntime {
+    pub program_runtime: Arc<crate::runtime::ProgramRuntime>,
+    pub memory_system: Option<Arc<crate::memory::MemorySystem>>,
+    pub current_graph: Arc<Mutex<crate::graph::ExecutionGraph>>,
+    pub wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
+}

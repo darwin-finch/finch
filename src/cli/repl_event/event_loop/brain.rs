@@ -1,4 +1,6 @@
 use super::*;
+// Used only by the test runner below, which is `cfg(test)`.
+#[cfg(test)]
 use crate::tools::executor::ToolExecutor;
 
 impl EventLoop {

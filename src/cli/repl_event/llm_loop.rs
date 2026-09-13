@@ -85,38 +85,59 @@ impl LlmLoop {
     /// set it from the process working directory.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        llm_rx: mpsc::UnboundedReceiver<LlmRequest>,
-        event_tx: mpsc::UnboundedSender<ReplEvent>,
-        cloud_gen: Arc<RwLock<Arc<dyn Generator>>>,
-        qwen_gen: Arc<dyn Generator>,
-        router: Arc<Router>,
-        generator_state: Arc<RwLock<GeneratorState>>,
-        tool_definitions: Arc<RwLock<Vec<ToolDefinition>>>,
-        tool_coordinator: ToolExecutionCoordinator,
-        program_runtime: Arc<crate::runtime::ProgramRuntime>,
-        tool_call_history: Arc<
-            RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
-        >,
-        conversation: Arc<RwLock<ConversationHistory>>,
-        query_states: Arc<QueryStateManager>,
-        mode: Arc<RwLock<ReplMode>>,
-        output_manager: Arc<OutputManager>,
-        status_bar: Arc<StatusBar>,
-        tui_renderer: Arc<Mutex<TuiRenderer>>,
-        active_tool_uses: ActiveToolUsesMap,
-        memory_system: Option<Arc<crate::memory::MemorySystem>>,
-        current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>,
-        active_persona: Arc<RwLock<crate::config::Persona>>,
-        session_label: String,
-        cwd: String,
-        context_lines: usize,
-        max_verbatim_messages: usize,
-        context_recall_k: usize,
-        streaming_enabled: bool,
-        enable_summarization: bool,
-        auto_compact_enabled: bool,
-        wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
+        channels: crate::cli::repl_event::parts::LlmChannels,
+        generation: crate::cli::repl_event::parts::LlmGeneration,
+        tools: crate::cli::repl_event::parts::LlmTools,
+        ui: crate::cli::repl_event::parts::LlmUi,
+        session: crate::cli::repl_event::parts::LlmSession,
+        runtime: crate::cli::repl_event::parts::LlmRuntime,
+        limits: crate::cli::repl_event::parts::ContextLimits,
     ) -> Self {
+        // Unpacked to the names the body already uses, so the grouping is visible at the boundary
+        // and invisible below it.
+        let crate::cli::repl_event::parts::LlmChannels {
+            requests: llm_rx,
+            events: event_tx,
+        } = channels;
+        let crate::cli::repl_event::parts::LlmGeneration {
+            cloud: cloud_gen,
+            local: qwen_gen,
+            router,
+            state: generator_state,
+        } = generation;
+        let crate::cli::repl_event::parts::LlmTools {
+            definitions: tool_definitions,
+            coordinator: tool_coordinator,
+            call_history: tool_call_history,
+            active_uses: active_tool_uses,
+        } = tools;
+        let crate::cli::repl_event::parts::LlmUi {
+            output: output_manager,
+            status_bar,
+            renderer: tui_renderer,
+            streaming_enabled,
+        } = ui;
+        let crate::cli::repl_event::parts::LlmSession {
+            conversation,
+            active_persona,
+            mode,
+            query_states,
+            label: session_label,
+            cwd,
+        } = session;
+        let crate::cli::repl_event::parts::LlmRuntime {
+            program_runtime,
+            memory_system,
+            current_graph,
+            wire_metrics_logger,
+        } = runtime;
+        let crate::cli::repl_event::parts::ContextLimits {
+            lines: context_lines,
+            max_verbatim_messages,
+            recall_k: context_recall_k,
+            enable_summarization,
+            auto_compact: auto_compact_enabled,
+        } = limits;
         Self {
             llm_rx,
             event_tx,
