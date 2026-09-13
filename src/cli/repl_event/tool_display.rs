@@ -1294,3 +1294,24 @@ mod tests {
         );
     }
 }
+
+/// Build a file-tool approval dialog from a tool call.
+///
+/// This lives here, not on `Dialog`, because it is assembly from Finch's own vocabulary: a
+/// `ToolUse` and a diff colour mode. The terminal framework offers `Dialog::tool_approval` and
+/// `with_body`, and knows nothing about tools.
+pub fn tool_approval_dialog(
+    tool_use: &crate::tools::types::ToolUse,
+    summary: &str,
+    colors: &crate::theme::ColorScheme,
+    mode: crate::cli::diff::DiffColorMode,
+) -> crate::cli::tui::Dialog {
+    let mut dialog = crate::cli::tui::Dialog::tool_approval(&tool_use.name, summary);
+    if let Some(preview) = tool_approval_diff_preview(tool_use, colors, mode) {
+        // Assign directly rather than through `with_body`, which sanitizes. FileDiff has already
+        // sanitized the untrusted content and then applied its own SGR theme sequences; sanitizing
+        // again strips those, and the preview renders identically in every colour mode.
+        dialog.body = Some(preview);
+    }
+    dialog
+}

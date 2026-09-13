@@ -229,24 +229,6 @@ impl Dialog {
         Dialog::select(format!("{}\n{}", tool_name, summary), options)
     }
 
-    /// Build a file-tool approval using the shared structured diff renderer.
-    pub fn tool_approval_for_use(
-        tool_use: &crate::tools::types::ToolUse,
-        summary: &str,
-        colors: &crate::theme::ColorScheme,
-        mode: crate::cli::diff::DiffColorMode,
-    ) -> Self {
-        let mut dialog = Self::tool_approval(&tool_use.name, summary);
-        if let Some(preview) =
-            crate::cli::repl_event::tool_display::tool_approval_diff_preview(tool_use, colors, mode)
-        {
-            // FileDiff sanitizes untrusted content before applying its own SGR
-            // theme sequences. Keep those trusted sequences intact here.
-            dialog.body = Some(preview);
-        }
-        dialog
-    }
-
     /// Set the help message for this dialog
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help_message = Some(help.into());
@@ -1814,7 +1796,7 @@ mod tests {
                 "new_string": "new\n"
             }),
         );
-        let dialog = Dialog::tool_approval_for_use(
+        let dialog = crate::cli::repl_event::tool_display::tool_approval_dialog(
             &tool,
             "File: src/\u{1b}[31mhostile.rs",
             &crate::theme::ColorTheme::Dark.to_scheme(),
@@ -1840,13 +1822,13 @@ mod tests {
                 "new_string": "new\n"
             }),
         );
-        let dark = Dialog::tool_approval_for_use(
+        let dark = crate::cli::repl_event::tool_display::tool_approval_dialog(
             &tool,
             "File: src/theme.rs",
             &crate::theme::ColorTheme::Dark.to_scheme(),
             crate::cli::diff::DiffColorMode::Theme,
         );
-        let light = Dialog::tool_approval_for_use(
+        let light = crate::cli::repl_event::tool_display::tool_approval_dialog(
             &tool,
             "File: src/theme.rs",
             &crate::theme::ColorTheme::Light.to_scheme(),
