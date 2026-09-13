@@ -1,15 +1,14 @@
-use super::diagnostic::{DiagnosticPhase, SourceOrigin, VmDiagnostic};
-use super::effects::{CapabilityKind, CapabilityRequirement, EffectSet};
 use super::fiber::CpuFiberScheduler;
 use super::frontend::{forth::compile_forth_with_functions, lisp::compile_lisp_with_functions};
 use super::interpreter::{
     CapabilityHandler, HostSideEffect, InterpreterConfig, VmContinuation, VmSideEffect, VmStep,
     VmTrampoline,
 };
-use super::ir::{Function, Module};
-use super::types::{Type, TypedValue};
-use super::ProgramLanguage;
-use super::{core_vocabulary, VerifiedModule, Verifier, Vocabulary, VM_TYPE_SYSTEM_VERSION};
+use finch_vm_core::{
+    core_vocabulary, CapabilityKind, CapabilityRequirement, DiagnosticPhase, EffectSet, Function,
+    Module, ProgramLanguage, SourceOrigin, StackSignature, TaskKind, Type, TypedValue,
+    VerifiedModule, Verifier, VmDiagnostic, Vocabulary, VM_TYPE_SYSTEM_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -303,7 +302,7 @@ impl TypedRuntime {
     pub fn replace_host_vocabulary(
         &mut self,
         previous_names: impl IntoIterator<Item = String>,
-        replacements: &BTreeMap<String, super::signature::StackSignature>,
+        replacements: &BTreeMap<String, StackSignature>,
     ) -> Result<(), VmDiagnostic> {
         let core = core_vocabulary();
         for name in replacements.keys() {
@@ -489,11 +488,11 @@ impl TypedRuntime {
     pub fn intrinsic_grants() -> EffectSet {
         EffectSet::from_requirement(CapabilityRequirement {
             capability: CapabilityKind::SessionEmit,
-            selector: super::effects::ResourceSelector::None,
+            selector: finch_vm_core::ResourceSelector::None,
         })
         .union(&EffectSet::from_requirement(CapabilityRequirement {
             capability: CapabilityKind::VmRead,
-            selector: super::effects::ResourceSelector::None,
+            selector: finch_vm_core::ResourceSelector::None,
         }))
     }
 
@@ -1335,7 +1334,7 @@ impl TypedRuntime {
                         .values
                         .last()
                         .cloned()
-                        .unwrap_or(super::types::Type::Unit);
+                        .unwrap_or(Type::Unit);
                     let scheduler = Arc::clone(&self.cpu_fibers.scheduler);
                     let owner = self.cpu_fibers.owner;
                     let id = match scheduler.spawn_closure_owned(
@@ -1373,7 +1372,7 @@ impl TypedRuntime {
                         vec![TypedValue::Task {
                             id: id.to_string(),
                             result_type,
-                            kind: super::types::TaskKind::CpuFiber,
+                            kind: TaskKind::CpuFiber,
                         }],
                     )
                 }
@@ -1873,7 +1872,7 @@ impl TypedRuntime {
         let TypedValue::Task {
             id,
             result_type,
-            kind: super::types::TaskKind::CpuFiber,
+            kind: TaskKind::CpuFiber,
         } = task
         else {
             return Err(VmDiagnostic::error(
@@ -1951,7 +1950,7 @@ impl TypedRuntime {
     ) -> Result<(), VmDiagnostic> {
         let TypedValue::Task {
             id,
-            kind: super::types::TaskKind::CpuFiber,
+            kind: TaskKind::CpuFiber,
             ..
         } = task
         else {
@@ -2170,7 +2169,7 @@ fn collect_cpu_fiber_ids(value: &TypedValue, ids: &mut BTreeSet<Uuid>) {
     match value {
         TypedValue::Task {
             id,
-            kind: super::types::TaskKind::CpuFiber,
+            kind: TaskKind::CpuFiber,
             ..
         } => {
             if let Ok(id) = Uuid::parse_str(id) {
@@ -2218,7 +2217,7 @@ fn collect_cpu_fiber_ids(value: &TypedValue, ids: &mut BTreeSet<Uuid>) {
         | TypedValue::Json(_)
         | TypedValue::Path { .. }
         | TypedValue::Task {
-            kind: super::types::TaskKind::Agent,
+            kind: TaskKind::Agent,
             ..
         }
         | TypedValue::Fiber { .. }
@@ -2635,19 +2634,19 @@ mod tests {
         assert_eq!(host.ui_events.len(), 4);
         assert!(matches!(
             host.ui_events[0].event,
-            HostSideEffect::Ui { operation: super::super::interpreter::UiOperation::Status, ref target, ref text, progress: None }
+            HostSideEffect::Ui { operation: crate::UiOperation::Status, ref target, ref text, progress: None }
                 if matches!(target, Some(TypedValue::Resource { kind, handle, .. }) if kind == "output-handle" && handle == "test-output")
                     && text.as_deref() == Some("starting")
         ));
         assert!(matches!(
             host.ui_events[1].event,
-            HostSideEffect::Ui { operation: super::super::interpreter::UiOperation::Progress, progress: Some(ref progress), .. }
+            HostSideEffect::Ui { operation: crate::UiOperation::Progress, progress: Some(ref progress), .. }
                 if progress.completed == 2 && progress.total == Some(5)
         ));
         assert!(matches!(
             host.ui_events[3].event,
             HostSideEffect::Ui {
-                operation: super::super::interpreter::UiOperation::Complete,
+                operation: crate::UiOperation::Complete,
                 text: None,
                 progress: None,
                 ..
@@ -2670,14 +2669,14 @@ mod tests {
             [
                 VmSideEffect {
                     event: HostSideEffect::Ui {
-                        operation: super::super::interpreter::UiOperation::Append,
+                        operation: crate::UiOperation::Append,
                         ..
                     },
                     ..
                 },
                 VmSideEffect {
                     event: HostSideEffect::Ui {
-                        operation: super::super::interpreter::UiOperation::Complete,
+                        operation: crate::UiOperation::Complete,
                         ..
                     },
                     ..
@@ -2797,8 +2796,8 @@ mod tests {
             .expect("an ungranted resume must retain the host call");
 
         runtime.grant(CapabilityRequirement::file(
-            super::super::effects::FileOperation::Read,
-            super::super::effects::FileSelector::parse("./**").unwrap(),
+            crate::FileOperation::Read,
+            crate::FileSelector::parse("./**").unwrap(),
         ));
         let completed = runtime.resume_with_handler(suspension, Vec::new(), &mut host);
         assert_eq!(completed.status, TypedExecutionStatus::Completed);
@@ -2890,8 +2889,8 @@ mod tests {
             vec![Type::Bytes]
         );
         runtime.grant(CapabilityRequirement::file(
-            super::super::effects::FileOperation::Read,
-            super::super::effects::FileSelector::parse("./**").unwrap(),
+            crate::FileOperation::Read,
+            crate::FileSelector::parse("./**").unwrap(),
         ));
 
         let complete = runtime.resume_with_effect_result(
@@ -2929,8 +2928,8 @@ mod tests {
         let suspension = pending.suspension.expect("file read must suspend");
         let sequence = suspension.event_journal.last().unwrap().sequence;
         runtime.grant(CapabilityRequirement::file(
-            super::super::effects::FileOperation::Read,
-            super::super::effects::FileSelector::parse("./**").unwrap(),
+            crate::FileOperation::Read,
+            crate::FileSelector::parse("./**").unwrap(),
         ));
 
         let stale = runtime.resume_with_effect_result(
@@ -2969,7 +2968,7 @@ mod tests {
 
         runtime.grant(CapabilityRequirement {
             capability: CapabilityKind::MemoryWrite,
-            selector: super::super::effects::ResourceSelector::Memory {
+            selector: crate::ResourceSelector::Memory {
                 tree: "session".into(),
                 path: "**".into(),
             },
@@ -3004,8 +3003,8 @@ mod tests {
         ));
         let suspension = pending.suspension.expect("file read must suspend");
         runtime.grant(CapabilityRequirement::file(
-            super::super::effects::FileOperation::Read,
-            super::super::effects::FileSelector::parse("./**").unwrap(),
+            crate::FileOperation::Read,
+            crate::FileSelector::parse("./**").unwrap(),
         ));
 
         let failed = runtime.resume_with_handler(suspension, Vec::new(), &mut host);
@@ -3157,8 +3156,8 @@ mod tests {
         else {
             panic!("defer :cpu must leave exactly one typed task handle");
         };
-        assert_eq!(*result_type, crate::types::Type::Int);
-        assert_eq!(*kind, crate::types::TaskKind::CpuFiber);
+        assert_eq!(*result_type, crate::Type::Int);
+        assert_eq!(*kind, crate::TaskKind::CpuFiber);
         let id = uuid::Uuid::parse_str(id).expect("CPU task id must be a UUID");
         let result = runtime.cpu_fibers.scheduler.join(id).unwrap();
         assert_eq!(result.status, crate::fiber::CpuFiberStatus::Completed);
@@ -3469,7 +3468,7 @@ mod tests {
         let [TypedValue::Task { id, kind, .. }] = deferred.values.as_slice() else {
             panic!("defer :cpu must leave a task handle on the persistent stack");
         };
-        assert_eq!(*kind, crate::types::TaskKind::CpuFiber);
+        assert_eq!(*kind, crate::TaskKind::CpuFiber);
         let id = uuid::Uuid::parse_str(id).unwrap();
         runtime.cpu_fibers.scheduler.join(id).unwrap();
         let concurrent_snapshot = runtime.clone();
@@ -3510,7 +3509,7 @@ mod tests {
                     TypedValue::Task {
                         id: id.clone(),
                         result_type: Type::Int,
-                        kind: crate::types::TaskKind::CpuFiber,
+                        kind: crate::TaskKind::CpuFiber,
                     },
                 ),
                 (

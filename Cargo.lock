@@ -1712,6 +1712,17 @@ name = "finch-vm"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "finch-vm-core",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "finch-vm-core"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
  "once_cell",
  "serde",
  "serde_json",

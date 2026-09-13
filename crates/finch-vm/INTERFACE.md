@@ -10,25 +10,35 @@ Everything below is what callers outside this module can reach. Implementation m
 ## Types
 
 ```rust
+/// Re-exported from `finch-vm-core`.
 pub enum ApprovalChoice { Deny, AllowOnce, AllowTask, AllowSession, AllowProjectExact, AllowProjectPattern, AllowGlobal }
+/// Re-exported from `finch-vm-core`.
 pub struct ApprovalPrompt { … }
 impl ApprovalPrompt {
     pub fn for_request(request: CapabilityRequest) -> Self;
 }
+/// Re-exported from `finch-vm-core`.
 pub struct AuthorizationContext { … }
+/// Re-exported from `finch-vm-core`.
 pub enum AuthorizationDecision { Allowed, ApprovalRequired, Denied }
+/// Re-exported from `finch-vm-core`.
 pub struct BasicBlock { … }
+/// Re-exported from `finch-vm-core`.
 pub enum CapabilityAuditAction { Granted, Revoked, Consumed }
+/// Re-exported from `finch-vm-core`.
 pub struct CapabilityAuditEntry { … }
-/// Source-free record of one authorization decision.
+/// Source-free record of one authorization decision. Re-exported from `finch-vm-core`.
 pub struct CapabilityAuthorizationAuditEntry { … }
+/// Re-exported from `finch-vm-core`.
 pub enum CapabilityAvailability { Disabled, Unsupported, PermissionRequired, Available, Degraded }
+/// Re-exported from `finch-vm-core`.
 pub struct CapabilityGrant { … }
 impl CapabilityGrant {
     pub fn is_active(&self, now_unix_ms: u64) -> bool;
 }
+/// Re-exported from `finch-vm-core`.
 pub enum CapabilityKind { VmRead, VmWrite, FileRead, FileWrite, NetworkConnect, AutomationInspect, AutomationWrite, AgentSpawn, AgentAwait, AgentPoll, AgentCancel, ProcessRun, SessionEmit, MemoryRead, MemoryWrite, MemoryConsolidate, ScheduleCreate, ScheduleRead, ScheduleManage, ProgramInvoke, McpCall, UnsafeMemory }
-/// Application-owned authority records.
+/// Application-owned authority records. Re-exported from `finch-vm-core`.
 pub struct CapabilityLedger { … }
 impl CapabilityLedger {
     /// Authorize and audit one concrete request.
@@ -42,27 +52,32 @@ impl CapabilityLedger {
     /// Remove an authorization attempt which provably reached no host use.
     pub fn rollback_authorization(&mut self, request: &CapabilityRequest) -> bool;
 }
-/// Host-owned approval policy.
+/// Host-owned approval policy. Re-exported from `finch-vm-core`.
 pub struct CapabilityPolicy { … }
 impl CapabilityPolicy {
     pub fn permits(&self, requirement: &CapabilityRequirement) -> bool;
     pub fn validate(&self) -> Result<(), String>;
 }
+/// Re-exported from `finch-vm-core`.
 pub struct CapabilityRequest { … }
+/// Re-exported from `finch-vm-core`.
 pub struct CapabilityRequirement { … }
 impl CapabilityRequirement {
     /// Whether this grant covers the requested capability.
     pub fn covers(&self, requested: &Self) -> bool;
     pub fn file(operation: FileOperation, selector: FileSelector) -> Self;
 }
+/// Re-exported from `finch-vm-core`.
 pub enum ControlEffect { Returns, MayThrow, MaySuspend, NeverReturns }
-/// The executable destination of a built-in word after verification.
+/// The executable destination of a built-in word after verification. Re-exported from `finch-vm-core`.
 pub enum CoreHostBinding { SessionEmit, VmVocabulary, CapabilityList, FileRead, FileHash, TreeList, TreeMerkle, FileSize, FileSlice, FileLinesOpen, FileLinesNext, FileLinesClose, CsvOpen, CsvSummary, CsvNext, CsvClose, WorkbookOpen, WorkbookSheetOpen, WorkbookSheets, WorkbookRange, WorkbookSummary, StreamNext, StreamClose, FileWrite, ProcessRun, McpCall, ProposalOpen, NetworkConnect, NetworkSend, MemoryRecall, MemoryIndexStatus, MemoryStore, ScheduleCreate, ScheduleGet, ScheduleCancel, AgentSpawn, AgentSpawnWith, AgentAwait, AgentPoll, AgentCancel, AutomationAvailability, AutomationDisplays, AutomationWindows, AutomationClick, AutomationType }
-/// Provider-facing protocol documentation for an executable core word.
+/// Provider-facing protocol documentation for an executable core word. Re-exported from `finch-vm-core`.
 pub struct CoreWordDocumentation { … }
+/// Re-exported from `finch-vm-core`.
 pub enum CoreWordImplementation { Interpreter, VmInstruction, HostEffect }
-/// One inspectable production core-word contract.
+/// One inspectable production core-word contract. Re-exported from `finch-vm-core`.
 pub struct CoreWordSpec { … }
+/// Re-exported from `finch-vm-core`.
 pub enum DiagnosticPhase { Reader, MacroExpansion, NameResolution, TypeInference, Verification, Linking, Authorization, Availability, Approval, Interpretation, HostCall, NativeExecution, TransactionCommit, ChildExecution, Cancellation, ResourceLimit }
 impl DiagnosticPhase {
     /// The phase as a reader would name it, matching the serialised form.
@@ -71,6 +86,7 @@ impl DiagnosticPhase {
 /// One durable, idempotently-addressable host-effect record.
 pub struct EffectJournalEntry { … }
 pub enum EffectJournalState { Proposed, AwaitingApproval, AwaitingHostResult, Acknowledged, Denied, Cancelled, Failed }
+/// Re-exported from `finch-vm-core`.
 pub struct EffectSet(pub BTreeSet<CapabilityRequirement>);
 impl EffectSet {
     pub fn from_requirement(requirement: CapabilityRequirement) -> Self;
@@ -79,8 +95,9 @@ impl EffectSet {
     pub fn pure() -> Self;
     pub fn union(&self, other: &Self) -> Self;
 }
+/// Re-exported from `finch-vm-core`.
 pub enum FileOperation { Read, Write }
-/// A normalized pattern relative to an immutable resource root.
+/// A normalized pattern relative to an immutable resource root. Re-exported from `finch-vm-core`.
 pub struct FileSelector { … }
 impl FileSelector {
     /// Returns true only when containment is proven by the restricted selector algebra.
@@ -89,14 +106,18 @@ impl FileSelector {
     pub fn matches(&self, relative_path: &str) -> bool;
     pub fn parse(input: &str) -> Result<Self, SelectorError>;
 }
-/// A deliberately small expression language for argument-dependent file capabilities.
+/// A deliberately small expression language for argument-dependent file capabilities. Re-exported from `finch-vm-core`.
 pub struct FileSelectorTemplate { … }
 impl FileSelectorTemplate {
     pub fn instantiate(&self, arguments: &[super::types::TypedValue]) -> Result<FileSelector, SelectorError>;
 }
+/// Re-exported from `finch-vm-core`.
 pub enum FileSelectorTemplatePart { Literal, Argument }
+/// Re-exported from `finch-vm-core`.
 pub struct Function { … }
+/// Re-exported from `finch-vm-core`.
 pub enum GrantScope { Once, Task, Session, Project, Global }
+/// Re-exported from `finch-vm-core`.
 pub struct GrantSet { … }
 impl GrantSet {
     pub fn active_global_requirements(&self, now_unix_ms: u64) -> impl Iterator<Item = &CapabilityRequirement>;
@@ -108,38 +129,41 @@ impl GrantSet {
     pub fn revoke(&mut self, grant_id: Uuid, now_unix_ms: u64) -> bool;
 }
 pub enum HostSideEffect { Emit, Ui, Request }
+/// Re-exported from `finch-vm-core`.
 pub enum Instruction { Constant, MakeList, MakeMap, MakeRecord, MakeVariant, VariantGet, RecordGet, RecordSet, Dup, Drop, Swap, LocalGet, LocalSet, CaptureGet, MakeClosure, Call, CallClosure, CapabilityRequest, OutputOpen, UiEffect, Yield, DeferFiber, NextFiber, JoinFiber, CancelFiber, DeferCpu, PollCpuFiber, JoinCpuFiber, CancelCpuFiber, PropagateResult, Jump, Branch, Return, Trap }
 impl Instruction {
     pub fn is_terminator(&self) -> bool;
 }
 pub struct InterpreterConfig { … }
+/// Re-exported from `finch-vm-core`.
 pub struct LocatedInstruction { … }
 impl LocatedInstruction {
     pub fn generated(instruction: Instruction, word: impl Into<String>) -> Self;
 }
-/// Argument-dependent MCP authority.
+/// Argument-dependent MCP authority. Re-exported from `finch-vm-core`.
 pub struct McpSelectorTemplate { … }
 impl McpSelectorTemplate {
     pub fn instantiate(&self, arguments: &[super::types::TypedValue]) -> Result<(String, String), SelectorError>;
 }
+/// Re-exported from `finch-vm-core`.
 pub struct Module { … }
 impl Module {
     pub fn single(function: Function) -> Self;
 }
-/// Argument-dependent network authority.
+/// Argument-dependent network authority. Re-exported from `finch-vm-core`.
 pub struct NetworkSelectorTemplate { … }
 impl NetworkSelectorTemplate {
     pub fn instantiate(&self, arguments: &[super::types::TypedValue]) -> Result<(String, u16), SelectorError>;
 }
 pub struct PendingHostCall { … }
-/// Argument-dependent process authority.
+/// Argument-dependent process authority. Re-exported from `finch-vm-core`.
 pub struct ProcessSelectorTemplate { … }
 impl ProcessSelectorTemplate {
     pub fn instantiate(&self, arguments: &[super::types::TypedValue]) -> Result<String, SelectorError>;
 }
 pub struct ProducerFiberRecord { … }
 pub enum ProducerFiberState { Ready, Completed, Failed, Cancelled }
-/// Language in which a stored program's canonical source is written.
+/// Language in which a stored program's canonical source is written. Re-exported from `finch-vm-core`.
 pub enum ProgramLanguage { Forth, Lisp }
 impl ProgramLanguage {
     pub fn as_str(self) -> &'static str;
@@ -148,45 +172,52 @@ impl ProgramLanguage {
     /// Resolve the compact provider wire form before parsing.
     pub fn infer_wire_source(source: &str) -> Result<Self>;
 }
-/// Argument-dependent proposal authority.
+/// Argument-dependent proposal authority. Re-exported from `finch-vm-core`.
 pub struct ProgramSelectorTemplate { … }
 impl ProgramSelectorTemplate {
     pub fn instantiate(&self, arguments: &[super::types::TypedValue]) -> Result<String, SelectorError>;
 }
+/// Re-exported from `finch-vm-core`.
 pub enum ResourceRoot { Workspace, Project, TaskOutput, HostMachine, Named }
+/// Re-exported from `finch-vm-core`.
 pub enum ResourceSelector { None, File, FileTemplate, NetworkTemplate, Network, Automation, Agent, Process, ProcessTemplate, Program, ProgramTemplate, Mcp, McpTemplate, Memory, Schedule }
+/// Re-exported from `finch-vm-core`.
 pub enum SelectorError { Empty, AbsolutePath, ParentTraversal, UnknownRoot, InvalidRecursiveWildcard, DifferentRoots, IndeterminateIntersection, InvalidTemplateArgument, TemplateArgumentOutOfBounds, WildcardInRuntimePath, InvalidSeparator, InvalidNetworkTemplateArgument, NetworkTemplateArgumentOutOfBounds, InvalidProcessTemplateArgument, ProcessTemplateArgumentOutOfBounds, InvalidProgramTemplateArgument, ProgramTemplateArgumentOutOfBounds, InvalidMcpTemplateArgument, McpTemplateArgumentOutOfBounds }
+/// Re-exported from `finch-vm-core`.
 pub enum Severity { Note, Warning, Error }
+/// Re-exported from `finch-vm-core`.
 pub enum SourceLanguage { Forth, Lisp, FinchIr, Native, Provider }
+/// Re-exported from `finch-vm-core`.
 pub struct SourceOrigin { … }
 impl SourceOrigin {
     pub fn generated(word: impl Into<String>) -> Self;
 }
+/// Re-exported from `finch-vm-core`.
 pub struct SourceSpan { … }
 impl SourceSpan {
     pub fn bytes(source_id: impl Into<String>, start_byte: usize, end_byte: usize) -> Self;
 }
 /// A reader value paired with the exact byte range that produced it.
 pub struct SpannedVal { … }
-/// A typed stack row.
+/// A typed stack row. Re-exported from `finch-vm-core`.
 pub struct StackRow { … }
 impl StackRow {
     pub fn closed(values: Vec<Type>) -> Self;
     pub fn polymorphic(tail: impl Into<String>, values: Vec<Type>) -> Self;
 }
-/// Complete contract for a callable word or function.
+/// Complete contract for a callable word or function. Re-exported from `finch-vm-core`.
 pub struct StackSignature { … }
 impl StackSignature {
     pub fn pure(input: StackRow, output: StackRow) -> Self;
 }
-/// Typed contract for a callable that may cooperatively suspend.
+/// Typed contract for a callable that may cooperatively suspend. Re-exported from `finch-vm-core`.
 pub struct SuspensionSignature { … }
 impl SuspensionSignature {
     pub fn one_way(yield_type: Type) -> Self;
 }
-/// Portable typed value used at VM, task, suspension, and wire boundaries.
+/// Portable typed value used at VM, task, suspension, and wire boundaries. Re-exported from `finch-vm-core`.
 pub enum TaskKind { Agent, CpuFiber }
-/// A language-level type shared by Co-Forth and Finch Lisp.
+/// A language-level type shared by Co-Forth and Finch Lisp. Re-exported from `finch-vm-core`.
 pub enum Type { Unit, Bool, Int, UInt, Float, Char, Symbol, String, Bytes, Json, Path, List, Map, Option, Result, Record, Variant, Function, Task, Fiber, Stream, Resource, Capability, Variable, Dynamic }
 impl Type {
     /// Non-binding compatibility.
@@ -219,7 +250,7 @@ impl TypedRuntime {
     pub fn intrinsic_grants() -> EffectSet;
     pub fn new() -> Self;
     /// Replace application-supplied host vocabulary without allowing it to shadow a core word or a source-defined function.
-    pub fn replace_host_vocabulary(&mut self, previous_names: impl IntoIterator<Item = String>, replacements: &BTreeMap<String, super::signature::StackSignature>) -> Result<(), VmDiagnostic>;
+    pub fn replace_host_vocabulary(&mut self, previous_names: impl IntoIterator<Item = String>, replacements: &BTreeMap<String, StackSignature>) -> Result<(), VmDiagnostic>;
     /// Resume exactly the host call already captured by `suspension` after the application has independently authorized its concrete request.
     pub fn resume_authorized_host_call_with_handler<H: CapabilityHandler>(&mut self, suspension: TypedSuspension, handler: &mut H) -> TypedExecution;
     /// Acknowledge one already-journaled host effect with values supplied by an external event loop.
@@ -234,11 +265,12 @@ impl TypedRuntime {
 pub struct TypedRuntimeCheckpoint { … }
 /// Durable state for an execution paused at an explicit VM boundary.
 pub struct TypedSuspension { … }
-/// Portable typed value used at VM, task, suspension, and wire boundaries.
+/// Portable typed value used at VM, task, suspension, and wire boundaries. Re-exported from `finch-vm-core`.
 pub enum TypedValue { Unit, Bool, Int, UInt, Float, Char, Symbol, String, Bytes, Json, Path, List, Map, Option, Result, Record, Variant, Closure, Task, Fiber, Stream, Resource, Dynamic }
 impl TypedValue {
     pub fn value_type(&self) -> Type;
 }
+/// A portable mutation requested for a host-owned output surface. Re-exported from `finch-vm-core`.
 pub enum UiOperation { Create, Append, Replace, Status, Progress, Complete, Fail }
 /// Bounded or indeterminate progress metadata carried as data, rather than terminal control codes.
 pub struct UiProgress { … }
@@ -254,9 +286,11 @@ impl Val {
     pub fn repr(&self) -> String;
     pub fn type_name(&self) -> &'static str;
 }
+/// Re-exported from `finch-vm-core`.
 pub struct VerifiedFunction { … }
-/// A verified module is immutable execution data.
+/// A verified module is immutable execution data. Re-exported from `finch-vm-core`.
 pub struct VerifiedModule { … }
+/// Re-exported from `finch-vm-core`.
 pub struct Verifier<'a> { … }
 impl Verifier {
     pub fn new(vocabulary: &'a Vocabulary) -> Self;
@@ -264,6 +298,7 @@ impl Verifier {
 }
 /// The state closed over by an internal zero-argument VM thunk.
 pub struct VmContinuation { … }
+/// Re-exported from `finch-vm-core`.
 pub struct VmDiagnostic { … }
 impl VmDiagnostic {
     pub fn error(code: impl Into<String>, phase: DiagnosticPhase, message: impl Into<String>, primary: Option<SourceOrigin>) -> Self;
@@ -289,6 +324,7 @@ impl VmTrampoline {
     /// Start an isolated invocation of a verified function.
     pub fn start_function(&self, function: &str, captures: Vec<TypedValue>, stack: Vec<TypedValue>) -> Result<VmContinuation, VmDiagnostic>;
 }
+/// Re-exported from `finch-vm-core`.
 pub type Vocabulary = BTreeMap<String, StackSignature>;
 ```
 
@@ -314,10 +350,13 @@ pub trait CapabilityHandler {
 ## Functions
 
 ```rust
+/// Re-exported from `finch-vm-core`.
 pub fn agent_task_result_type() -> Type { … }
+/// Re-exported from `finch-vm-core`.
 pub fn agent_task_snapshot_type() -> Type { … }
-/// Canonical signatures for the first verified core.
+/// Canonical signatures for the first verified core. Re-exported from `finch-vm-core`.
 pub fn agent_task_spec_type() -> Type { … }
+/// Re-exported from `finch-vm-core`.
 pub fn capability_grant_entry_type() -> Type { … }
 /// Compile user/model-entered Co-Forth source text directly into Finch typed stack IR and run the common verifier.
 pub fn compile_forth(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary) -> Result<VerifiedModule, Vec<VmDiagnostic>> { … }
@@ -325,13 +364,13 @@ pub fn compile_forth_with_functions(source_id: &str, source: &str, initial_stack
 /// Parse and compile Finch Lisp directly into the common typed stack IR.
 pub fn compile_lisp(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary) -> Result<VerifiedModule, Vec<VmDiagnostic>> { … }
 pub fn compile_lisp_with_functions(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary, linked_functions: &BTreeMap<String, Function>) -> Result<VerifiedModule, Vec<VmDiagnostic>> { … }
-/// Canonical signatures for verifier-facing consumers.
+/// Canonical signatures for verifier-facing consumers. Re-exported from `finch-vm-core`.
 pub fn core_vocabulary() -> Vocabulary { … }
-/// Return provider-neutral documentation for a registered core word.
+/// Return provider-neutral documentation for a registered core word. Re-exported from `finch-vm-core`.
 pub fn core_word_documentation(name: &str) -> CoreWordDocumentation { … }
-/// Return the immutable production registry.
+/// Return the immutable production registry. Re-exported from `finch-vm-core`.
 pub fn core_word_registry() -> &'static BTreeMap<String, CoreWordSpec> { … }
-/// Return the complete contract for one core word.
+/// Return the complete contract for one core word. Re-exported from `finch-vm-core`.
 pub fn core_word_spec(name: &str) -> Option<CoreWordSpec> { … }
 /// Instantiate a selector template in a declared capability requirement against the arguments of a call.
 pub fn instantiate_requirement(requirement: &CapabilityRequirement, arguments: &[TypedValue]) -> Result<CapabilityRequirement, String> { … }
@@ -341,13 +380,15 @@ pub fn parse_math(src: &str) -> Result<Val> { … }
 pub fn parse_str(src: &str) -> Result<Vec<Val>> { … }
 /// Parse all top-level expressions while retaining their source structure.
 pub fn parse_str_spanned(src: &str) -> Result<Vec<SpannedVal>> { … }
+/// Re-exported from `finch-vm-core`.
 pub fn tree_entry_type() -> Type { … }
+/// Re-exported from `finch-vm-core`.
 pub fn tree_listing_type() -> Type { … }
 ```
 
 ## Constants
 
 ```rust
-/// Version of the typed VM contract and serialized IR family.
+/// Version of the typed VM contract and serialized IR family. Re-exported from `finch-vm-core`.
 pub const VM_TYPE_SYSTEM_VERSION: u32 = 5;
 ```

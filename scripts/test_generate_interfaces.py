@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 GENERATOR = ROOT / "scripts/generate_interfaces.py"
 sys.path.insert(0, str(ROOT / "scripts"))
-from generate_interfaces import interfaces  # noqa: E402
+from generate_interfaces import exported_names, interfaces, local_items  # noqa: E402
 
 MANIFEST = """\
 version = 1
@@ -189,6 +189,21 @@ class InterfaceGeneratorTests(unittest.TestCase):
             self.assertIn(fragment, result.stderr, f"missing diagnostic {fragment!r} in: {result.stderr}")
         self.assertIn("--write", result.stderr, "the diagnostic must name the command that fixes it")
 
+    def test_finch_vm_public_export_manifest_matches_pre_core_extraction(self) -> None:
+        facade = (ROOT / "crates/finch-vm/src/lib.rs").read_text()
+        observed = sorted(
+            {name for _, _, name in exported_names(facade)}
+            | {name for _, name, _ in local_items(facade)}
+        )
+        expected = (
+            ROOT / "crates/finch-vm/tests/fixtures/public_exports.txt"
+        ).read_text().splitlines()
+        self.assertEqual(
+            expected,
+            observed,
+            "finch-vm must remain the exact pre-extraction public compatibility facade",
+        )
+
     def test_generated_interface_is_stable_and_matches(self) -> None:
         first = self.fixture.interface()
         self.fixture.generate()
@@ -225,6 +240,32 @@ class InterfaceGeneratorTests(unittest.TestCase):
         vm_interface = (self.fixture.root / "src/vm/INTERFACE.md").read_text()
         self.assertIn("package-local value", vm_interface)
         self.assertNotIn("different package's value", vm_interface)
+
+    def test_workspace_crate_direct_reexport_resolves_duplicate_name_to_dependency(self) -> None:
+        self.fixture.write("crates/finch-vm-core/AGENTS.md", "# core capsule\n")
+        self.fixture.write(
+            "crates/finch-vm-core/src/lib.rs",
+            "mod types;\npub use types::Value;\n",
+        )
+        self.fixture.write(
+            "crates/finch-vm-core/src/types.rs",
+            "/// The shared core value.\npub struct Value;\n",
+        )
+        self.fixture.write("crates/finch-vm/AGENTS.md", "# facade capsule\n")
+        self.fixture.write(
+            "crates/finch-vm/src/lib.rs",
+            "pub use finch_vm_core::Value;\n",
+        )
+        self.fixture.write(
+            "crates/unrelated/src/lib.rs",
+            "/// A different value.\npub struct Value;\n",
+        )
+
+        result = self.fixture.run("--write")
+        self.assertEqual(0, result.returncode, result.stderr)
+        interface = (self.fixture.root / "crates/finch-vm/INTERFACE.md").read_text()
+        self.assertIn("shared core value", interface)
+        self.assertNotIn("different value", interface)
 
     def test_interface_carries_signatures_docs_variants_and_trait_methods(self) -> None:
         text = self.fixture.interface()

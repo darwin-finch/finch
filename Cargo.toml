@@ -13,8 +13,8 @@ license = "LicenseRef-PolyForm-Noncommercial-1.0"
 repository = "https://github.com/darwin-finch/finch"
 
 [workspace]
-members = ["crates/finch-vm"]
-default-members = [".", "crates/finch-vm"]
+members = ["crates/finch-vm", "crates/finch-vm-core"]
+default-members = [".", "crates/finch-vm", "crates/finch-vm-core"]
 resolver = "2"
 
 [dependencies]

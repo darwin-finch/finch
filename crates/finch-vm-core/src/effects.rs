@@ -4,6 +4,19 @@ use std::fmt;
 use std::path::{Component, Path};
 use thiserror::Error;
 
+/// A portable mutation requested for a host-owned output surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiOperation {
+    Create,
+    Append,
+    Replace,
+    Status,
+    Progress,
+    Complete,
+    Fail,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileOperation {

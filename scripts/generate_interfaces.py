@@ -349,12 +349,17 @@ def resolve_definition(
     candidates: list[tuple[str, str, str, str]],
     problems: list[str],
     package_aliases: dict[str, str] | None = None,
+    package_reexports: dict[tuple[str, str], str] | None = None,
 ) -> tuple[str, str, str, str] | None:
     """Pick the definition the `use` path names; ambiguity is an error, not a guess."""
     if len(candidates) == 1:
         return candidates[0]
     hint = module.rstrip(":").rsplit("::", 1)[-1]
-    package = (package_aliases or {}).get(hint)
+    # A facade may name a workspace dependency directly (`finch_vm_core::Type`)
+    # or through a root facade alias (`finch_vm as vm`). Normalize either form
+    # to its package directory before resolving duplicate public type names.
+    package = (package_aliases or {}).get(hint, hint)
+    package = (package_reexports or {}).get((package, defined), package)
     if package:
         packaged = [
             candidate for candidate in candidates
@@ -454,14 +459,15 @@ def interface_text(
     }
     definitions = definitions_in(root, sources)
     # A facade may re-export another subsystem's type; resolve it and say where it comes from.
-    elsewhere = definitions_in(
-        root, {path: (root / path).read_text(errors="replace") for path in files
-               if path.endswith(".rs") and (
-                   path.startswith("src/") or (
-                       path.startswith("crates/") and "/src/" in path
-                   )
-               )}
-    )
+    all_sources = {
+        path: (root / path).read_text(errors="replace") for path in files
+        if path.endswith(".rs") and (
+            path.startswith("src/") or (
+                path.startswith("crates/") and "/src/" in path
+            )
+        )
+    }
+    elsewhere = definitions_in(root, all_sources)
     root_facade = (root / "src/lib.rs").read_text() if (root / "src/lib.rs").is_file() else ""
     package_aliases = {
         alias: package
@@ -471,6 +477,21 @@ def interface_text(
             re.M,
         )
     }
+    workspace_packages = {
+        match.group(1).replace("-", "_")
+        for path in all_sources
+        if (match := re.fullmatch(r"crates/([^/]+)/src/lib\.rs", path))
+    }
+    package_reexports: dict[tuple[str, str], str] = {}
+    for path, text in all_sources.items():
+        match = re.fullmatch(r"crates/([^/]+)/src/lib\.rs", path)
+        if not match:
+            continue
+        package = match.group(1).replace("-", "_")
+        for module, _, name in exported_names(text):
+            dependency = module.split("::", 1)[0]
+            if dependency in workspace_packages:
+                package_reexports[(package, name)] = dependency
 
     rendered: list[tuple[str, str, str]] = []
     missing: list[str] = []
@@ -479,7 +500,9 @@ def interface_text(
         if not candidates:
             missing.append(defined)
             continue
-        resolved = resolve_definition(module, defined, candidates, problems, package_aliases)
+        resolved = resolve_definition(
+            module, defined, candidates, problems, package_aliases, package_reexports
+        )
         if resolved is None:
             continue
         kind, signature, doc, path = resolved
@@ -488,7 +511,19 @@ def interface_text(
             doc = f"{doc} Re-exported from `{owner}`." if doc else f"Re-exported from `{owner}`."
         if name != defined:
             doc = f"{doc} Exported as `{name}`." if doc else f"Exported as `{name}`."
-        rendered.append((kind, name, with_methods(kind, defined, name, render(signature, doc), sources)))
+        if path in sources:
+            method_sources = sources
+        elif path.startswith("crates/") and directory.startswith("crates/"):
+            package_prefix = "/".join(path.split("/", 3)[:3]) + "/"
+            method_sources = {
+                source_path: text for source_path, text in all_sources.items()
+                if source_path.startswith(package_prefix)
+            }
+        else:
+            method_sources = sources
+        rendered.append(
+            (kind, name, with_methods(kind, defined, name, render(signature, doc), method_sources))
+        )
     rendered.extend(local_items(facade_source, sources))
 
     # Both names count: a renamed export is reachable, under the name the facade publishes.

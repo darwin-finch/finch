@@ -1,11 +1,14 @@
 use super::diagnostic::SourceOrigin;
 use super::effects::CapabilityRequirement;
-use super::interpreter::UiOperation;
+use super::effects::UiOperation;
 use super::signature::StackSignature;
 use super::types::{Type, TypedValue};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Compiler-support identifier for a basic block in shared typed IR.
+///
+/// This unpublished workspace seam is not stable application API.
 pub type BlockId = u32;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1,13 +1,11 @@
-use crate::diagnostic::{DiagnosticPhase, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic};
-use crate::effects::{CapabilityKind, CapabilityRequirement, EffectSet, ResourceSelector};
-use crate::interpreter::UiOperation;
-use crate::ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
-use crate::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
-use crate::types::{Type, TypedValue};
-use crate::verifier::{
-    apply_signature_types, instantiate_signature_types, VerifiedModule, Verifier, Vocabulary,
-};
 use crate::{SpannedVal, Val};
+use finch_vm_core::{
+    apply_signature_types, instantiate_signature_types, nearest_names, BasicBlock, BlockId,
+    CapabilityKind, CapabilityRequirement, ControlEffect, DiagnosticPhase, EffectSet, Function,
+    Instruction, LocatedInstruction, Module, ResourceSelector, SourceLanguage, SourceOrigin,
+    SourceSpan, StackRow, StackSignature, SuspensionSignature, Type, TypedValue, UiOperation,
+    VerifiedModule, Verifier, VmDiagnostic, Vocabulary, VM_TYPE_SYSTEM_VERSION,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
@@ -339,7 +337,7 @@ pub fn compile_lisp_with_functions(
     let main = builder.finish(output);
     compiler.functions.insert("main".into(), main);
     let module = Module {
-        version: crate::VM_TYPE_SYSTEM_VERSION,
+        version: VM_TYPE_SYSTEM_VERSION,
         name: source_id.to_string(),
         entry: "main".into(),
         functions: {
@@ -3620,8 +3618,7 @@ impl Compiler<'_> {
                 format!("unknown Lisp function '{operator}'"),
                 Some(origin),
             );
-            let nearest =
-                crate::diagnostic::nearest_names(word, self.vocabulary.keys().map(String::as_str));
+            let nearest = nearest_names(word, self.vocabulary.keys().map(String::as_str));
             if !nearest.is_empty() {
                 diagnostic.hints.push(format!(
                     "did you mean {}?",
