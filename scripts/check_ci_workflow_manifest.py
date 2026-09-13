@@ -68,11 +68,10 @@ ISOLATION_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned",
         "install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned",
     )),
-    ("Reject self-issued proof authority", (
-        "./scripts/test_brains.sh cargo test --lib brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority -- --nocapture",
-    )),
-    ("Validate offset-independent concurrent proof reads", (
-        "./scripts/test_brains.sh cargo test --lib brain::isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency -- --nocapture",
+    # The module, not two of its tests: a name list leaves anything added to the module scheduled
+    # nowhere, and a test that never runs under the contract reports pass without asserting (#614).
+    ("Brain isolation boundaries under the supervisor contract", (
+        "./scripts/test_brains.sh cargo test --lib brain::isolation_tests:: -- --nocapture",
     )),
     ("Reject rewritten proof at the production constructor", (
         "./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore -- --nocapture",
