@@ -723,6 +723,36 @@ mod script_tests {
     }
 
     #[test]
+    fn test_contraction_with_emphasis_is_not_executed_as_forth() {
+        // `don't!` contains `!`, which is a Forth operator character, so before #571 the operator
+        // test claimed it and the typed runtime failed on an unknown word. The apostrophe has to
+        // disqualify the line first.
+        for prose in ["don't!", "can't!", "won't!", "it's >50"] {
+            assert!(
+                !is_clearly_forth(prose),
+                "prose with a contraction must route to natural language: {prose:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_forth_line_with_an_operator_still_runs() {
+        // The guard above must not swallow real programs: `!` is how Co-Forth stores.
+        for program in ["42 counter !", "1 2 +", "dup @"] {
+            assert!(
+                is_clearly_forth(program),
+                "a typed program must still be recognised: {program:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_forth_string_may_still_contain_an_apostrophe() {
+        // A string opener is matched before any disqualifier, so quoting prose still works.
+        assert!(is_clearly_forth("s\"it's fine\" say"));
+    }
+
+    #[test]
     fn prose_about_a_forth_string_opener_is_not_executed_as_forth() {
         assert!(!is_clearly_forth(
             "Return only a raw Co-Forth program that uses standard .\" output shorthand."
@@ -2045,6 +2075,12 @@ fn is_clearly_forth(s: &str) -> bool {
     // Natural language disqualifiers: question marks, apostrophes (contractions),
     // commas, or an uppercase-starting word that isn't a standalone token of digits.
     if t.contains('?') || t.contains(',') {
+        return false;
+    }
+    // An apostrophe is a contraction, and no Co-Forth word contains one. This has to be tested
+    // before the operator characters below, not after: `don't!` contains `!`, so without this the
+    // operator test claims it as a program and the typed runtime fails on an unknown word (#571).
+    if t.contains('\'') {
         return false;
     }
     if t.starts_with(|c: char| c.is_uppercase()) {
