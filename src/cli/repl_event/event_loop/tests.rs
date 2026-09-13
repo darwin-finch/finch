@@ -254,7 +254,16 @@ async fn boundary_01_dispatch_scenario() {
         ))
         .await
         .expect("TEST-BOUNDARY-01: terminal lifecycle dispatch must succeed");
-    assert_eq!(event_loop.output_manager.get_messages().len(), 1, "TEST-BOUNDARY-01: only the existing terminal summary may append history; message_count={} messages={:?}", event_loop.output_manager.get_messages().len(), event_loop.output_manager.get_messages().iter().map(|message| message.format(&crate::theme::ColorScheme::default())).collect::<Vec<_>>());
+    let messages = event_loop.output_manager.get_messages();
+    assert_eq!(messages.len(), 1, "TEST-BOUNDARY-01: one unbound child terminal must append one structured activity unit; message_count={} messages={:?}", messages.len(), messages.iter().map(|message| message.format(&crate::theme::ColorScheme::default())).collect::<Vec<_>>());
+    assert_eq!(
+        messages[0]
+            .transcript_row(&crate::theme::ColorScheme::default())
+            .expect("TEST-BOUNDARY-01: terminal child activity must be structured")
+            .kind,
+        crate::cli::messages::TranscriptRowKind::Activity,
+        "TEST-BOUNDARY-01: the terminal child summary must not regress to a loose information line"
+    );
     assert_eq!(
         event_loop
             .status_bar
@@ -743,6 +752,592 @@ fn remote_tool_approval_round_trips_edited_input() {
 }
 
 use super::*;
+
+fn lifecycle_test_event_loop() -> (EventLoop, Arc<crate::cli::output_manager::OutputManager>) {
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let patterns = tempfile::tempdir().unwrap().path().join("patterns.json");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        patterns,
+    )
+    .unwrap();
+    let event_loop = EventLoop::new_named_brain_test_runner(
+        Arc::new(NeverCompletes),
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        runtime,
+    );
+    let output = Arc::clone(&event_loop.output_manager);
+    (event_loop, output)
+}
+
+fn lifecycle_identity(
+    agent_id: uuid::Uuid,
+    task_id: uuid::Uuid,
+    parent_agent_id: Option<uuid::Uuid>,
+    root_agent_id: uuid::Uuid,
+    depth: usize,
+) -> crate::scheduler::AgentIdentity {
+    crate::scheduler::AgentIdentity {
+        agent_id,
+        task_id,
+        parent_agent_id,
+        root_agent_id,
+        depth,
+        provider_model: "test/model".into(),
+        vm_revision: 1,
+        manifest_generation: 1,
+        starting_context_hash: "test-context".into(),
+        grant_ceiling: crate::vm::EffectSet::default(),
+        brain_run_id: None,
+    }
+}
+
+fn lifecycle_task_snapshot(
+    identity: crate::scheduler::AgentIdentity,
+    task: &str,
+    status: crate::scheduler::AgentTaskStatus,
+) -> crate::scheduler::AgentTaskSnapshot {
+    crate::scheduler::AgentTaskSnapshot {
+        identity,
+        task: task.into(),
+        role: crate::scheduler::AgentRole::Code,
+        status,
+        result: None,
+    }
+}
+
+fn lifecycle_task_finished(
+    identity: crate::scheduler::AgentIdentity,
+    status: crate::scheduler::AgentTaskStatus,
+    message: &str,
+) -> crate::scheduler::AgentEvent {
+    crate::scheduler::AgentEvent::TaskFinished {
+        result: crate::scheduler::AgentTaskResult {
+            identity,
+            status,
+            final_message: message.into(),
+            diagnostics: Vec::new(),
+            turns: 2,
+            elapsed_ms: 12,
+        },
+        usage: crate::scheduler::AgentUsage::default(),
+    }
+}
+
+#[test]
+fn test_issue_652_lifecycle_provider_spawn_stays_in_originating_work_unit() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(tokio::task::LocalSet::new().run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            let query_id = event_loop
+                .query_states
+                .create_query(Vec::new())
+                .await;
+            let tool_id = "spawn-1".to_string();
+            let round_token = event_loop
+                .conversation
+                .write()
+                .await
+                .stage_assistant(
+                    query_id,
+                    crate::claude::Message {
+                        role: "assistant".into(),
+                        content: vec![crate::claude::ContentBlock::ToolUse {
+                            id: tool_id.clone(),
+                            name: "spawn_agent".into(),
+                            input: serde_json::json!({"task": "inspect lifecycle grouping"}),
+                        }],
+                    },
+                )
+                .unwrap();
+            let unit = output.start_work_unit("Tools");
+            let row = unit.add_row("spawn_agent(inspect lifecycle grouping)");
+            event_loop.active_tool_uses.write().await.insert(
+                tool_id.clone(),
+                (
+                    "spawn_agent".into(),
+                    serde_json::json!({"task": "inspect lifecycle grouping"}),
+                    Arc::clone(&unit),
+                    row,
+                ),
+            );
+
+            let agent_id = uuid::Uuid::new_v4();
+            let task_id = uuid::Uuid::new_v4();
+            let identity = lifecycle_identity(agent_id, task_id, None, agent_id, 0);
+            let snapshot = crate::scheduler::AgentTaskSnapshot {
+                identity: identity.clone(),
+                task: "inspect lifecycle grouping".into(),
+                role: crate::scheduler::AgentRole::Code,
+                status: crate::scheduler::AgentTaskStatus::Running,
+                result: None,
+            };
+            let mut queued = snapshot.clone();
+            queued.status = crate::scheduler::AgentTaskStatus::Queued;
+            event_loop
+                .handle_event(ReplEvent::AgentLifecycle(
+                    crate::scheduler::AgentEvent::TaskQueued { snapshot: queued },
+                ))
+                .await
+                .unwrap();
+            event_loop
+                .handle_event(ReplEvent::AgentLifecycle(
+                    crate::scheduler::AgentEvent::TaskStarted {
+                        snapshot: snapshot.clone(),
+                    },
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                output.get_messages().len(),
+                1,
+                "pre-result lifecycle delivery must remain pending while the provider spawn row can still claim it"
+            );
+            event_loop
+                .handle_event(ReplEvent::AgentLifecycle(
+                    crate::scheduler::AgentEvent::ToolStarted {
+                        task_id,
+                        name: "read".into(),
+                    },
+                ))
+                .await
+                .unwrap();
+            event_loop
+                .handle_event(ReplEvent::AgentLifecycle(
+                    crate::scheduler::AgentEvent::ToolCompleted {
+                        task_id,
+                        name: "read".into(),
+                        is_error: false,
+                    },
+                ))
+                .await
+                .unwrap();
+            event_loop
+                .handle_event(ReplEvent::AgentLifecycle(
+                    crate::scheduler::AgentEvent::TaskFinished {
+                        result: crate::scheduler::AgentTaskResult {
+                            identity: identity.clone(),
+                            status: crate::scheduler::AgentTaskStatus::Completed,
+                            final_message: "grouping inspected".into(),
+                            diagnostics: Vec::new(),
+                            turns: 2,
+                            elapsed_ms: 12,
+                        },
+                        usage: crate::scheduler::AgentUsage::default(),
+                    },
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                output.get_messages().len(),
+                1,
+                "even a terminal child delivered before its spawn result must wait for the active provider row binding"
+            );
+            event_loop
+                .handle_event(ReplEvent::ToolResult {
+                    query_id,
+                    round_token,
+                    tool_id,
+                    result: Ok(serde_json::to_string(&identity).unwrap()),
+                })
+                .await
+                .unwrap();
+            for late in [
+                crate::scheduler::AgentEvent::ToolStarted {
+                    task_id,
+                    name: "late-read".into(),
+                },
+                lifecycle_task_finished(
+                    identity,
+                    crate::scheduler::AgentTaskStatus::Completed,
+                    "grouping inspected",
+                ),
+            ] {
+                event_loop
+                    .handle_event(ReplEvent::AgentLifecycle(late))
+                    .await
+                    .unwrap();
+            }
+
+            let messages = output.get_messages();
+            assert_eq!(
+                messages.len(),
+                1,
+                "the spawn lifecycle must update its originating WorkUnit and append no loose terminal message; rendered={:?}",
+                messages
+                    .iter()
+                    .map(|message| message.format(&crate::theme::ColorScheme::default()))
+                    .collect::<Vec<_>>()
+            );
+            let rendered = messages[0].complete_transcript(&crate::theme::ColorScheme::default());
+            for expected in ["spawn_agent", "inspect lifecycle grouping", "read", "grouping inspected"] {
+                assert!(
+                    rendered.contains(expected),
+                    "the originating WorkUnit must retain {expected:?}; rendered={rendered:?}"
+                );
+            }
+            assert_eq!(rendered.matches("grouping inspected").count(), 1);
+            assert!(!rendered.contains("late-read"));
+        }));
+}
+
+#[test]
+fn test_issue_652_lifecycle_nested_interleaved_roots_keep_ownership() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(tokio::task::LocalSet::new().run_until(async {
+            use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
+
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            let query_id = event_loop.query_states.create_query(Vec::new()).await;
+            let first_tool_id = "spawn-first".to_string();
+            let second_tool_id = "spawn-second".to_string();
+            let round_token = event_loop
+                .conversation
+                .write()
+                .await
+                .stage_assistant(
+                    query_id,
+                    crate::claude::Message {
+                        role: "assistant".into(),
+                        content: vec![
+                            crate::claude::ContentBlock::ToolUse {
+                                id: first_tool_id.clone(),
+                                name: "spawn_agent".into(),
+                                input: serde_json::json!({"task": "first root task"}),
+                            },
+                            crate::claude::ContentBlock::ToolUse {
+                                id: second_tool_id.clone(),
+                                name: "spawn_agent".into(),
+                                input: serde_json::json!({"task": "second root task"}),
+                            },
+                        ],
+                    },
+                )
+                .unwrap();
+            let unit = output.start_work_unit("Tools");
+            let first_spawn = unit.add_row("spawn_agent(first root)");
+            let second_spawn = unit.add_row("spawn_agent(second root)");
+
+            let first_agent = uuid::Uuid::new_v4();
+            let first = lifecycle_identity(
+                first_agent,
+                uuid::Uuid::new_v4(),
+                None,
+                first_agent,
+                0,
+            );
+            let second_agent = uuid::Uuid::new_v4();
+            let second = lifecycle_identity(
+                second_agent,
+                uuid::Uuid::new_v4(),
+                None,
+                second_agent,
+                0,
+            );
+            let nested = lifecycle_identity(
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                Some(first.agent_id),
+                first.agent_id,
+                1,
+            );
+            event_loop.active_tool_uses.write().await.insert(
+                first_tool_id.clone(),
+                (
+                    "spawn_agent".into(),
+                    serde_json::json!({"task": "first root task"}),
+                    Arc::clone(&unit),
+                    first_spawn,
+                ),
+            );
+            event_loop.active_tool_uses.write().await.insert(
+                second_tool_id.clone(),
+                (
+                    "spawn_agent".into(),
+                    serde_json::json!({"task": "second root task"}),
+                    Arc::clone(&unit),
+                    second_spawn,
+                ),
+            );
+            for (tool_id, identity) in [
+                (first_tool_id, first.clone()),
+                (second_tool_id, second.clone()),
+            ] {
+                event_loop
+                    .handle_event(ReplEvent::ToolResult {
+                        query_id,
+                        round_token,
+                        tool_id,
+                        result: Ok(serde_json::to_string(&identity).unwrap()),
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                unit.status(),
+                MessageStatus::InProgress,
+                "successful spawn results must bind running child rows before retiring the provider tool round"
+            );
+
+            for event in [
+                crate::scheduler::AgentEvent::TaskQueued {
+                    snapshot: lifecycle_task_snapshot(
+                        first.clone(),
+                        "first root task",
+                        crate::scheduler::AgentTaskStatus::Queued,
+                    ),
+                },
+                crate::scheduler::AgentEvent::TaskQueued {
+                    snapshot: lifecycle_task_snapshot(
+                        second.clone(),
+                        "second root task",
+                        crate::scheduler::AgentTaskStatus::Queued,
+                    ),
+                },
+                crate::scheduler::AgentEvent::TaskQueued {
+                    snapshot: lifecycle_task_snapshot(
+                        nested.clone(),
+                        "nested task",
+                        crate::scheduler::AgentTaskStatus::Queued,
+                    ),
+                },
+                crate::scheduler::AgentEvent::TaskStarted {
+                    snapshot: lifecycle_task_snapshot(
+                        nested.clone(),
+                        "nested task",
+                        crate::scheduler::AgentTaskStatus::Running,
+                    ),
+                },
+                crate::scheduler::AgentEvent::ToolStarted {
+                    task_id: nested.task_id,
+                    name: "grep".into(),
+                },
+                crate::scheduler::AgentEvent::ToolCompleted {
+                    task_id: nested.task_id,
+                    name: "grep".into(),
+                    is_error: true,
+                },
+            ] {
+                event_loop
+                    .handle_event(ReplEvent::AgentLifecycle(event))
+                    .await
+                    .unwrap();
+            }
+
+            unit.set_complete();
+            assert_eq!(
+                unit.status(),
+                MessageStatus::InProgress,
+                "a provider completion must not retire scrollback while bound children can still update it"
+            );
+
+            event_loop
+                .handle_event(ReplEvent::AgentLifecycle(lifecycle_task_finished(
+                    nested.clone(),
+                    crate::scheduler::AgentTaskStatus::Failed,
+                    "nested failed cleanly",
+                )))
+                .await
+                .unwrap();
+            let after_nested_terminal =
+                unit.complete_transcript(&crate::theme::ColorScheme::default());
+            for late_nested in [
+                crate::scheduler::AgentEvent::TaskQueued {
+                    snapshot: lifecycle_task_snapshot(
+                        nested.clone(),
+                        "late nested queued",
+                        crate::scheduler::AgentTaskStatus::Queued,
+                    ),
+                },
+                crate::scheduler::AgentEvent::TaskStarted {
+                    snapshot: lifecycle_task_snapshot(
+                        nested.clone(),
+                        "late nested started",
+                        crate::scheduler::AgentTaskStatus::Running,
+                    ),
+                },
+            ] {
+                event_loop
+                    .handle_event(ReplEvent::AgentLifecycle(late_nested))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                unit.complete_transcript(&crate::theme::ColorScheme::default()),
+                after_nested_terminal,
+                "terminal child B must reject late queued/started delivery while sibling A remains active"
+            );
+
+            for event in [
+                lifecycle_task_finished(
+                    first.clone(),
+                    crate::scheduler::AgentTaskStatus::Failed,
+                    "first failed cleanly",
+                ),
+                lifecycle_task_finished(
+                    second.clone(),
+                    crate::scheduler::AgentTaskStatus::Cancelled,
+                    "second cancelled cleanly",
+                ),
+                // Duplicate terminal and late child-tool delivery are both no-ops.
+                lifecycle_task_finished(
+                    second.clone(),
+                    crate::scheduler::AgentTaskStatus::Cancelled,
+                    "second cancelled cleanly",
+                ),
+                crate::scheduler::AgentEvent::ToolStarted {
+                    task_id: nested.task_id,
+                    name: "late-tool".into(),
+                },
+                crate::scheduler::AgentEvent::TaskQueued {
+                    snapshot: lifecycle_task_snapshot(
+                        first.clone(),
+                        "late queued root",
+                        crate::scheduler::AgentTaskStatus::Queued,
+                    ),
+                },
+            ] {
+                event_loop
+                    .handle_event(ReplEvent::AgentLifecycle(event))
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(unit.status(), MessageStatus::Complete);
+            assert_eq!(output.get_messages().len(), 1);
+            let projected = unit
+                .transcript_row(&crate::theme::ColorScheme::default())
+                .unwrap();
+            assert_eq!(projected.kind, TranscriptRowKind::ToolGroup);
+            assert_eq!(projected.children.len(), 2);
+            let first_agent_row = projected.children[first_spawn]
+                .children
+                .iter()
+                .find(|row| row.label.contains("first root task"))
+                .expect("first spawn row must own the first root lifecycle");
+            assert!(first_agent_row
+                .children
+                .iter()
+                .any(|row| row.label.contains("nested task")));
+            assert!(!projected.children[second_spawn]
+                .children
+                .iter()
+                .any(|row| row.label.contains("nested task")));
+
+            let rendered = unit.complete_transcript(&crate::theme::ColorScheme::default());
+            for expected in [
+                "first root task",
+                "second root task",
+                "nested task",
+                "tool grep — failed",
+                "first failed cleanly",
+                "second cancelled cleanly",
+            ] {
+                assert!(
+                    rendered.contains(expected),
+                    "interleaved lifecycle content must remain in its originating group; missing={expected:?} rendered={rendered:?}"
+                );
+            }
+            assert_eq!(rendered.matches("second cancelled cleanly").count(), 1);
+            assert!(!rendered.contains("late-tool"));
+            assert!(!rendered.contains("late queued root"));
+            assert!(!rendered.contains("late nested"));
+            assert!(
+                !event_loop
+                    .active_agent_root_tasks
+                    .contains_key(&first.root_agent_id),
+                "late queued delivery must not repopulate ownership for a terminal root"
+            );
+            assert!(
+                event_loop.agent_lifecycle_bindings.is_empty()
+                    && event_loop.agent_task_roots.is_empty()
+                    && event_loop.active_agent_root_tasks.is_empty()
+                    && event_loop.terminal_agent_tasks.is_empty(),
+                "all lifecycle ownership maps and per-task tombstones must drain after sibling A terminalizes: bindings={:?} task_roots={:?} active={:?} terminal_tasks={:?}",
+                event_loop.agent_lifecycle_bindings.keys().collect::<Vec<_>>(),
+                event_loop.agent_task_roots,
+                event_loop.active_agent_root_tasks,
+                event_loop.terminal_agent_tasks,
+            );
+
+            for label in ["await_agent(second)", "cancel_agent(second)"] {
+                let separate = output.start_work_unit("Tools");
+                let row = separate.add_row(label);
+                separate.complete_row(row, "complete");
+                separate.set_complete();
+            }
+            assert_eq!(
+                output.get_messages().len(),
+                3,
+                "await/cancel remain independent normal tool WorkUnits and never replace spawn lifecycle ownership"
+            );
+        }));
+}
+
+#[test]
+fn test_issue_652_lifecycle_unbound_events_form_one_structured_activity_unit() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(tokio::task::LocalSet::new().run_until(async {
+            use crate::cli::messages::TranscriptRowKind;
+
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            let agent_id = uuid::Uuid::new_v4();
+            let identity = lifecycle_identity(agent_id, uuid::Uuid::new_v4(), None, agent_id, 0);
+            for event in [
+                crate::scheduler::AgentEvent::TaskQueued {
+                    snapshot: lifecycle_task_snapshot(
+                        identity.clone(),
+                        "typed-program child",
+                        crate::scheduler::AgentTaskStatus::Queued,
+                    ),
+                },
+                crate::scheduler::AgentEvent::TaskStarted {
+                    snapshot: lifecycle_task_snapshot(
+                        identity.clone(),
+                        "typed-program child",
+                        crate::scheduler::AgentTaskStatus::Running,
+                    ),
+                },
+                lifecycle_task_finished(
+                    identity.clone(),
+                    crate::scheduler::AgentTaskStatus::Completed,
+                    "typed child done",
+                ),
+                lifecycle_task_finished(
+                    identity,
+                    crate::scheduler::AgentTaskStatus::Completed,
+                    "typed child done",
+                ),
+            ] {
+                event_loop
+                    .handle_event(ReplEvent::AgentLifecycle(event))
+                    .await
+                    .unwrap();
+            }
+
+            let messages = output.get_messages();
+            assert_eq!(messages.len(), 1);
+            let projected = messages[0]
+                .transcript_row(&crate::theme::ColorScheme::default())
+                .unwrap();
+            assert_eq!(projected.kind, TranscriptRowKind::Activity);
+            assert_eq!(projected.children.len(), 1);
+            assert!(projected.children[0].label.contains("typed-program child"));
+            let rendered = messages[0].complete_transcript(&crate::theme::ColorScheme::default());
+            assert_eq!(rendered.matches("typed child done").count(), 1);
+        }));
+}
 
 #[test]
 fn initialization_command_distinguishes_completed_one_shot() {

@@ -59,6 +59,8 @@ type PendingApprovalsMap = Arc<
     >,
 >;
 
+const MAX_TERMINAL_AGENT_ROOTS: usize = 1024;
+
 async fn commit_tool_round_and_continue(
     conversation: &Arc<RwLock<ConversationHistory>>,
     query_id: Uuid,
@@ -339,6 +341,17 @@ pub struct EventLoop {
     /// All tools in one generation turn share the same WorkUnit; each
     /// tool occupies one row identified by its index.
     active_tool_uses: ActiveToolUsesMap,
+
+    /// Root child identity to the provider `spawn_agent` row that owns its
+    /// lifecycle transcript. Task roots let nested/tool-only events inherit
+    /// that same binding without claiming later await/cancel rows.
+    agent_lifecycle_bindings: std::collections::HashMap<Uuid, AgentLifecycleBinding>,
+    agent_task_roots: std::collections::HashMap<Uuid, Uuid>,
+    active_agent_root_tasks: std::collections::HashMap<Uuid, std::collections::HashSet<Uuid>>,
+    terminal_agent_tasks: std::collections::HashSet<Uuid>,
+    terminal_agent_roots: std::collections::HashSet<Uuid>,
+    terminal_agent_root_order: std::collections::VecDeque<Uuid>,
+    pending_agent_lifecycle: Vec<crate::scheduler::AgentEvent>,
 
     /// Feedback logger — writes rated responses to ~/.finch/feedback.jsonl
     feedback_logger: Option<FeedbackLogger>,
@@ -942,6 +955,12 @@ struct PendingVmApproval {
     choices: Vec<crate::vm::ApprovalChoice>,
     query_id: Option<Uuid>,
     approval_id: String,
+}
+
+#[derive(Clone)]
+struct AgentLifecycleBinding {
+    unit: Arc<crate::cli::messages::WorkUnit>,
+    owner_row: Option<usize>,
 }
 
 struct RemoteBrainRunProjection {
@@ -1916,6 +1935,13 @@ impl EventLoop {
             memtree_handler,
             view_mode: Arc::new(RwLock::new(ViewMode::List)), // Start in list view
             active_tool_uses: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            agent_lifecycle_bindings: std::collections::HashMap::new(),
+            agent_task_roots: std::collections::HashMap::new(),
+            active_agent_root_tasks: std::collections::HashMap::new(),
+            terminal_agent_tasks: std::collections::HashSet::new(),
+            terminal_agent_roots: std::collections::HashSet::new(),
+            terminal_agent_root_order: std::collections::VecDeque::new(),
+            pending_agent_lifecycle: Vec::new(),
             feedback_logger: FeedbackLogger::new().ok(),
             metrics_logger: dirs::home_dir()
                 .map(|h| h.join(".finch").join("metrics"))

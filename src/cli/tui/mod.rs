@@ -5501,6 +5501,99 @@ mod tests {
     }
 
     #[test]
+    fn test_issue_652_lifecycle_vt_oracle_keeps_hierarchy_after_wrapping() {
+        let width = 34;
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let renderer = TuiRenderer::new_headless(Arc::clone(&output), status, colors.clone());
+        let unit = output.start_work_unit("Tools");
+        let spawn_row = unit.add_row("spawn_agent(root)");
+        unit.complete_row(spawn_row, "spawned");
+        let root_agent = uuid::Uuid::new_v4();
+        let root_task = uuid::Uuid::new_v4();
+        unit.queue_agent_activity(
+            Some(spawn_row),
+            root_agent,
+            root_task,
+            None,
+            "root task · test/model",
+        );
+        let nested_task = uuid::Uuid::new_v4();
+        unit.queue_agent_activity(
+            Some(spawn_row),
+            uuid::Uuid::new_v4(),
+            nested_task,
+            Some(root_agent),
+            "nested task · test/model",
+        );
+        unit.start_agent_activity(nested_task);
+        unit.start_agent_tool(nested_task, "read");
+
+        let message = output
+            .get_messages()
+            .into_iter()
+            .next()
+            .expect("lifecycle work unit must be present");
+        let live = renderer
+            .accordion
+            .render_message_fully_expanded(&message, &colors);
+        let input = vec![String::new()];
+        let mut inputs = live_inputs(width, 20, &input, "idle");
+        inputs.live_rendered = &live;
+        let mut autocomplete = AutocompleteState::new();
+        let frame = plan_live_frame(&inputs, &mut autocomplete);
+        let mut bytes = Vec::new();
+        write_live_frame(&mut bytes, &frame, width).unwrap();
+        let mut terminal = VtOracle::new(width, 24);
+        terminal.feed(&bytes);
+
+        let root_row = terminal.find_row("root task").unwrap_or_else(|| {
+            panic!(
+                "root lifecycle row must reach terminal cells\n{}",
+                terminal.diagnostic()
+            )
+        });
+        let nested_row = terminal.find_row("nested task").unwrap_or_else(|| {
+            panic!(
+                "nested lifecycle row must reach terminal cells\n{}",
+                terminal.diagnostic()
+            )
+        });
+        let tool_row = terminal.find_row("tool read").unwrap_or_else(|| {
+            panic!(
+                "child tool row must reach terminal cells\n{}",
+                terminal.diagnostic()
+            )
+        });
+        assert_vt(
+            root_row < nested_row && nested_row < tool_row,
+            "spawn, nested child, and child tool must retain semantic order",
+            &terminal,
+        );
+        let root_indent = terminal
+            .row(root_row)
+            .chars()
+            .take_while(|ch| *ch == ' ')
+            .count();
+        let nested_indent = terminal
+            .row(nested_row)
+            .chars()
+            .take_while(|ch| *ch == ' ')
+            .count();
+        let tool_indent = terminal
+            .row(tool_row)
+            .chars()
+            .take_while(|ch| *ch == ' ')
+            .count();
+        assert_vt(
+            root_indent < nested_indent && nested_indent < tool_indent,
+            "terminal-cell indentation must preserve spawn > nested child > child tool hierarchy",
+            &terminal,
+        );
+    }
+
+    #[test]
     fn test_vt_oracle_live_writer_expands_horizontal_tab_to_eight_column_stop() {
         let width = 16;
         let frame = LiveFrame {
