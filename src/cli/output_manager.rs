@@ -263,12 +263,12 @@ pub struct OutputManager {
     /// Trait-based message storage (reactive updates)
     messages: Arc<RwLock<Vec<MessageRef>>>,
     /// Color scheme for message formatting
-    colors: crate::config::ColorScheme,
+    colors: crate::theme::ColorScheme,
 }
 
 impl OutputManager {
     /// Create a new OutputManager
-    pub fn new(colors: crate::config::ColorScheme) -> Self {
+    pub fn new(colors: crate::theme::ColorScheme) -> Self {
         Self {
             write_to_stdout: Arc::new(RwLock::new(true)), // Enabled by default, but main.rs disables immediately for TUI
             buffering_mode: Arc::new(RwLock::new(false)), // Default: immediate write
@@ -502,7 +502,7 @@ impl OutputManager {
 
 impl Default for OutputManager {
     fn default() -> Self {
-        Self::new(crate::config::ColorScheme::default())
+        Self::new(crate::theme::ColorScheme::default())
     }
 }
 
@@ -524,7 +524,7 @@ mod tests {
     use crate::cli::messages::Message;
 
     fn silent_manager() -> OutputManager {
-        let m = OutputManager::new(crate::config::ColorScheme::default());
+        let m = OutputManager::new(crate::theme::ColorScheme::default());
         m.disable_stdout();
         m
     }
@@ -637,7 +637,7 @@ mod tests {
             messages[1].status(),
             crate::cli::messages::MessageStatus::Complete
         );
-        let rendered = messages[1].format(&crate::config::ColorScheme::default());
+        let rendered = messages[1].format(&crate::theme::ColorScheme::default());
         assert!(rendered.contains("Download"));
         assert!(rendered.contains("2 / 5"));
         assert!(

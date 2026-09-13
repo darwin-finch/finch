@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use super::tui::TuiRenderer;
 use super::{OutputManager, StatusBar};
-use crate::config::ColorScheme;
+use crate::theme::ColorScheme;
 
 /// Global singleton OutputManager (swappable - set by main())
 /// Starts with a minimal default, replaced with the real instance in main()

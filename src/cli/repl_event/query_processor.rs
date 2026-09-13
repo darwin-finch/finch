@@ -2101,13 +2101,13 @@ mod tests {
         runtime: Arc<crate::runtime::ProgramRuntime>,
         events: mpsc::UnboundedReceiver<ReplEvent>,
         task: tokio::task::JoinHandle<()>,
-        colors: crate::config::ColorScheme,
+        colors: crate::theme::ColorScheme,
         _tempdir: tempfile::TempDir,
     }
 
     impl StreamingQueryHarness {
         async fn spawn(query: &str) -> Self {
-            let colors = crate::config::ColorScheme::default();
+            let colors = crate::theme::ColorScheme::default();
             let output = Arc::new(OutputManager::new(colors.clone()));
             output.disable_stdout();
             let status = Arc::new(StatusBar::new());
@@ -3218,7 +3218,7 @@ mod tests {
             "source, failed output, repaired source/output"
         );
         assert!(messages.iter().all(|message| !message
-            .format(&crate::config::ColorScheme::default())
+            .format(&crate::theme::ColorScheme::default())
             .contains("must not run")));
     }
 
@@ -3298,7 +3298,7 @@ mod tests {
         assert!(execution.response.contains("E-WIRE-002"));
         assert!(event_rx.try_recv().is_err(), "no repaired VM continuation");
         assert!(output.get_messages().iter().all(|message| !message
-            .format(&crate::config::ColorScheme::default())
+            .format(&crate::theme::ColorScheme::default())
             .contains("VM program repair")));
     }
 

@@ -101,7 +101,7 @@ pub trait Message: Send + Sync {
     fn id(&self) -> MessageId;
 
     /// Format this message for display (with ANSI colors and styling)
-    fn format(&self, colors: &crate::config::ColorScheme) -> String;
+    fn format(&self, colors: &crate::theme::ColorScheme) -> String;
 
     /// Get the current status of this message
     fn status(&self) -> MessageStatus;
@@ -111,12 +111,12 @@ pub trait Message: Send + Sync {
 
     /// Complete canonical text for permanent terminal scrollback and copying.
     /// Presentation-only disclosure state must never affect this value.
-    fn complete_transcript(&self, colors: &crate::config::ColorScheme) -> String {
+    fn complete_transcript(&self, colors: &crate::theme::ColorScheme) -> String {
         self.format(colors)
     }
 
     /// Optional semantic retained-row projection for interactive disclosure.
-    fn transcript_row(&self, _colors: &crate::config::ColorScheme) -> Option<TranscriptRow> {
+    fn transcript_row(&self, _colors: &crate::theme::ColorScheme) -> Option<TranscriptRow> {
         None
     }
 
@@ -124,7 +124,7 @@ pub trait Message: Send + Sync {
     /// Returns None for default (no background)
     fn background_style(
         &self,
-        _colors: &crate::config::ColorScheme,
+        _colors: &crate::theme::ColorScheme,
     ) -> Option<ratatui::style::Style> {
         None // Default: no background
     }
@@ -134,7 +134,7 @@ pub trait Message: Send + Sync {
     /// override this without embedding presentation codes in copied text.
     fn background_style_for_line(
         &self,
-        colors: &crate::config::ColorScheme,
+        colors: &crate::theme::ColorScheme,
         _line_index: usize,
         _line_count: usize,
     ) -> Option<ratatui::style::Style> {

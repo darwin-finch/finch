@@ -13,7 +13,7 @@ use ratatui::{
 };
 
 use crate::cli::{StatusBar, StatusLineType};
-use crate::config::ColorScheme;
+use crate::theme::ColorScheme;
 
 /// Widget for rendering the status area
 pub struct StatusWidget<'a> {

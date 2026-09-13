@@ -1396,12 +1396,12 @@ mod tests {
         };
         let dark = format_row_collapsed(
             &row,
-            &crate::config::ColorTheme::Dark.to_scheme(),
+            &crate::theme::ColorTheme::Dark.to_scheme(),
             DiffColorMode::Theme,
         );
         let light = format_row_collapsed(
             &row,
-            &crate::config::ColorTheme::Light.to_scheme(),
+            &crate::theme::ColorTheme::Light.to_scheme(),
             DiffColorMode::Theme,
         );
         let plain = format_row_collapsed(&row, &colors(), DiffColorMode::NoColor);
@@ -1527,7 +1527,7 @@ mod tests {
 
     #[test]
     fn presentation_and_tool_state_choose_distinct_semantic_bands() {
-        let colors = crate::config::ColorTheme::Dark.to_scheme();
+        let colors = crate::theme::ColorTheme::Dark.to_scheme();
         let assistant = WorkUnit::new("assistant");
         let source = WorkUnit::new("source");
         source.set_program_source("forth");
@@ -1549,7 +1549,7 @@ mod tests {
 
     #[test]
     fn completed_response_and_collapsed_tools_keep_separate_bands() {
-        let colors = crate::config::ColorTheme::Dark.to_scheme();
+        let colors = crate::theme::ColorTheme::Dark.to_scheme();
         let unit = WorkUnit::new("mixed");
         unit.set_response("assistant prose");
         let row = unit.add_row("bash(test)");

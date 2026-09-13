@@ -888,7 +888,7 @@ fn paint(text: String, colors: &ColorScheme, mode: DiffColorMode, tone: Tone) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ColorTheme;
+    use crate::theme::ColorTheme;
     const SAMPLE: &str =
         "--- a/src/old.rs\n+++ b/src/new.rs\n@@ -2,2 +2,3 @@ fn x\n keep\n-old\n+new\n+more\n";
     #[test]

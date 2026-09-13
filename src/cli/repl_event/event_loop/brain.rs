@@ -8,7 +8,7 @@ impl EventLoop {
         tool_executor: Arc<Mutex<ToolExecutor>>,
         program_runtime: Arc<crate::runtime::ProgramRuntime>,
     ) -> Self {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let output_manager = Arc::new(OutputManager::new(colors.clone()));
         let status_bar = Arc::new(StatusBar::new());
         let tui_renderer =

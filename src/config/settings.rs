@@ -1,9 +1,9 @@
 // Configuration structs
 
 use super::backend::{BackendConfig, CoreMlConfig};
-use super::colors::ColorScheme;
 use super::provider::ProviderEntry;
 use super::ProviderCredential;
+use crate::theme::ColorScheme;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

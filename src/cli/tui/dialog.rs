@@ -233,7 +233,7 @@ impl Dialog {
     pub fn tool_approval_for_use(
         tool_use: &crate::tools::types::ToolUse,
         summary: &str,
-        colors: &crate::config::ColorScheme,
+        colors: &crate::theme::ColorScheme,
         mode: crate::cli::diff::DiffColorMode,
     ) -> Self {
         let mut dialog = Self::tool_approval(&tool_use.name, summary);
@@ -1817,7 +1817,7 @@ mod tests {
         let dialog = Dialog::tool_approval_for_use(
             &tool,
             "File: src/\u{1b}[31mhostile.rs",
-            &crate::config::ColorTheme::Dark.to_scheme(),
+            &crate::theme::ColorTheme::Dark.to_scheme(),
             crate::cli::diff::DiffColorMode::NoColor,
         );
         let body = dialog.body.as_deref().unwrap();
@@ -1843,13 +1843,13 @@ mod tests {
         let dark = Dialog::tool_approval_for_use(
             &tool,
             "File: src/theme.rs",
-            &crate::config::ColorTheme::Dark.to_scheme(),
+            &crate::theme::ColorTheme::Dark.to_scheme(),
             crate::cli::diff::DiffColorMode::Theme,
         );
         let light = Dialog::tool_approval_for_use(
             &tool,
             "File: src/theme.rs",
-            &crate::config::ColorTheme::Light.to_scheme(),
+            &crate::theme::ColorTheme::Light.to_scheme(),
             crate::cli::diff::DiffColorMode::Theme,
         );
         let dark_body = dark.body.unwrap();

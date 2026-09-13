@@ -2,7 +2,6 @@
 // Public interface for configuration loading
 
 mod backend;
-mod colors;
 mod constants;
 mod credential;
 mod loader;
@@ -48,7 +47,10 @@ mod settings;
 #[allow(deprecated)]
 pub use backend::BackendDevice; // Deprecated alias for ExecutionTarget
 pub use backend::{BackendConfig, CoreMlComputeUnits, CoreMlConfig, ExecutionTarget};
-pub use colors::{
+// Colours are a rendering vocabulary, not a configuration one: `crate::theme` defines what a
+// scheme is and this module's job is turning a config file into one. Re-exported so callers that
+// think of it as configuration keep working.
+pub use crate::theme::{
     ColorScheme, ColorSpec, ColorTheme, DialogColors, MessageBand, MessageColors, StatusColors,
     UiColors,
 };

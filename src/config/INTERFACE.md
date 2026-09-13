@@ -40,30 +40,12 @@ impl BackendConfig {
 pub type BackendDevice = ExecutionTarget;
 /// Client configuration for connecting to daemon
 pub struct ClientConfig { … }
-/// Color scheme for TUI elements
+/// Color scheme for TUI elements Re-exported from `theme`.
 pub struct ColorScheme { … }
-impl ColorScheme {
-    /// Return a subtle, contrast-safe full-row style for a transcript role.
-    pub fn message_band_style(&self, band: MessageBand) -> Style;
-}
-/// Color specification - supports named colors and RGB
+/// Color specification - supports named colors and RGB Re-exported from `theme`.
 pub enum ColorSpec { Named, Rgb }
-impl ColorSpec {
-    /// Convert to ratatui Color
-    pub fn to_color(&self) -> Color;
-}
-/// Predefined color themes for different terminal backgrounds
+/// Predefined color themes for different terminal backgrounds Re-exported from `theme`.
 pub enum ColorTheme { Dark, Light, HighContrast, Solarized }
-impl ColorTheme {
-    /// Get all available themes
-    pub fn all() -> Vec<Self>;
-    /// Get theme description
-    pub fn description(&self) -> &str;
-    /// Get theme name for display
-    pub fn name(&self) -> &str;
-    /// Convert theme to color scheme
-    pub fn to_scheme(&self) -> ColorScheme;
-}
 pub struct Config { … }
 impl Config {
     /// Get the active provider (first in the unified providers list).
@@ -111,7 +93,7 @@ pub enum CredentialProvider { Anthropic, OpenaiPlatform, ChatgptSubscription, Xa
 impl CredentialProvider {
     pub fn as_str(self) -> &'static str;
 }
-/// Dialog color configuration
+/// Dialog color configuration Re-exported from `theme`.
 pub struct DialogColors { … }
 /// Normalized service family.
 pub enum EndpointFamily { AnthropicApi, OpenaiPlatform, ChatgptSubscription, XaiApi, GeminiAiStudio, GoogleVertex, MistralApi, GroqApi, Custom }
@@ -140,9 +122,9 @@ pub struct LicenseConfig { … }
 /// Whether this installation has a commercial license key
 pub enum LicenseType { Noncommercial, Commercial }
 pub(crate) struct LifecycleRevocation(Arc<AtomicBool>);
-/// Semantic full-row bands used by the transcript renderer.
+/// Semantic full-row bands used by the transcript renderer. Re-exported from `theme`.
 pub enum MessageBand { LocalUser, Participant, Assistant, ProgramSource, Tool, ProgramOutput }
-/// Message display colors
+/// Message display colors Re-exported from `theme`.
 pub struct MessageColors { … }
 /// A persona defines how the AI should behave
 pub struct Persona { … }
@@ -214,11 +196,11 @@ impl ResolvedSecret {
 }
 /// Server configuration for daemon mode
 pub struct ServerConfig { … }
-/// Status bar color configuration
+/// Status bar color configuration Re-exported from `theme`.
 pub struct StatusColors { … }
 /// A single teacher entry with provider and settings
 pub struct TeacherEntry { … }
-/// UI element colors
+/// UI element colors Re-exported from `theme`.
 pub struct UiColors { … }
 ```
 

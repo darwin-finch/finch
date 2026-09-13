@@ -12,7 +12,7 @@ use ratatui::{
 };
 use tui_textarea::TextArea;
 
-use crate::config::ColorScheme;
+use crate::theme::ColorScheme;
 
 /// Render a TextArea with a colored prompt prefix and optional ghost text
 #[allow(dead_code)]

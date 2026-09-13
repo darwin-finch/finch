@@ -83,7 +83,7 @@ pub fn emergency_restore_terminal() {
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
 // Re-export ColorScheme so callers can use `crate::cli::tui::ColorScheme`.
-pub use crate::config::ColorScheme;
+pub use crate::theme::ColorScheme;
 
 const RESET: SetAttribute = SetAttribute(Attribute::Reset);
 const CYAN: SetForegroundColor = SetForegroundColor(Color::Cyan);
