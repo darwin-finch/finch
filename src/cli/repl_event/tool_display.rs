@@ -292,7 +292,7 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
 /// sanitized renderer as completed transcript rows.
 pub(crate) fn tool_approval_diff_preview(
     tool_use: &crate::tools::types::ToolUse,
-    colors: &crate::config::ColorScheme,
+    colors: &crate::theme::ColorScheme,
     mode: crate::cli::diff::DiffColorMode,
 ) -> Option<String> {
     let path = tool_use.input.get("file_path")?.as_str()?;
@@ -976,7 +976,7 @@ mod tests {
         );
         assert!(tool_approval_diff_preview(
             &tool,
-            &crate::config::ColorScheme::default(),
+            &crate::theme::ColorScheme::default(),
             crate::cli::diff::DiffColorMode::NoColor,
         )
         .is_none());
@@ -995,7 +995,7 @@ mod tests {
         );
         let rendered = tool_approval_diff_preview(
             &tool,
-            &crate::config::ColorScheme::default(),
+            &crate::theme::ColorScheme::default(),
             crate::cli::diff::DiffColorMode::NoColor,
         )
         .unwrap();

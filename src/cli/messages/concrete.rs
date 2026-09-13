@@ -633,7 +633,7 @@ impl Message for LiveToolMessage {
         self.id
     }
 
-    fn format(&self, _colors: &crate::config::ColorScheme) -> String {
+    fn format(&self, _colors: &crate::theme::ColorScheme) -> String {
         let content = self.content.read().map(|c| c.clone()).unwrap_or_default();
         let status = self
             .status
@@ -767,7 +767,7 @@ impl Message for OperationMessage {
         self.id
     }
 
-    fn format(&self, _colors: &crate::config::ColorScheme) -> String {
+    fn format(&self, _colors: &crate::theme::ColorScheme) -> String {
         let rows = self.rows.read().unwrap_or_else(|p| p.into_inner());
         let status = *self.status.read().unwrap_or_else(|p| p.into_inner());
 
@@ -1113,7 +1113,7 @@ mod tests {
 
     #[test]
     fn brain_participant_messages_distinguish_prompt_from_relay() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let prompt = BrainParticipantMessage::new("alice@box", "please inspect", true);
         let relay = BrainParticipantMessage::new("alice@box", "I agree", false);
 
@@ -1145,7 +1145,7 @@ mod tests {
         let _ = handle.join(); // Let thread panic
 
         // Now the lock is poisoned - format() should NOT panic
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let result = msg.format(&colors);
 
         // Should recover and return some string (not panic)
@@ -1166,7 +1166,7 @@ mod tests {
                 if i % 2 == 0 {
                     msg_clone.append_chunk(&format!("chunk {}", i));
                 } else {
-                    let colors = crate::config::ColorScheme::default();
+                    let colors = crate::theme::ColorScheme::default();
                     let _ = msg_clone.format(&colors);
                 }
             }));
@@ -1195,7 +1195,7 @@ mod tests {
         let _ = handle.join();
 
         // format() should NOT panic
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let result = msg.format(&colors);
 
         // Should recover and return formatted output
@@ -1215,7 +1215,7 @@ mod tests {
         let _ = handle.join();
 
         // format() should NOT panic
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let result = msg.format(&colors);
 
         // Should recover and show progress bar
@@ -1228,7 +1228,7 @@ mod tests {
 
     #[test]
     fn test_live_tool_message_inprogress_empty_shows_ellipsis() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let msg = LiveToolMessage::new("⏺ bash(echo hi)");
         let formatted = msg.format(&colors);
         // InProgress + empty content → header with trailing "…" on same line
@@ -1248,7 +1248,7 @@ mod tests {
 
     #[test]
     fn test_live_tool_message_inprogress_with_content() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let msg = LiveToolMessage::new("⏺ bash(echo hi)");
         msg.append_line("hello world");
         let formatted = msg.format(&colors);
@@ -1267,7 +1267,7 @@ mod tests {
 
     #[test]
     fn test_live_tool_message_complete_with_output() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let msg = LiveToolMessage::new("⏺ bash(echo hi)");
         msg.set_content("  ⎿ hello world\n");
         msg.set_complete();
@@ -1287,7 +1287,7 @@ mod tests {
 
     #[test]
     fn test_live_tool_message_complete_no_output() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let msg = LiveToolMessage::new("⏺ bash(true)");
         msg.set_complete();
         let formatted = msg.format(&colors);
@@ -1312,7 +1312,7 @@ mod tests {
 
     #[test]
     fn test_live_tool_message_failed_state() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let msg = LiveToolMessage::new("⏺ bash(bad_cmd)");
         msg.set_content("command not found\n");
         msg.set_failed();
@@ -1333,7 +1333,7 @@ mod tests {
 
     #[test]
     fn test_operation_message_uses_correct_unicode() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let msg = OperationMessage::new("Generating");
         let idx = msg.add_row("bash(echo hi)");
         msg.complete_row(idx, "hi");
@@ -1365,7 +1365,7 @@ mod tests {
 
     #[test]
     fn test_operation_message_inprogress_shows_ellipsis() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let msg = OperationMessage::new("Generating");
         let formatted = msg.format(&colors);
         // InProgress: header ends with ellipsis
@@ -1378,7 +1378,7 @@ mod tests {
 
     #[test]
     fn test_operation_message_complete_no_ellipsis() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let msg = OperationMessage::new("Generating");
         msg.set_complete();
         let formatted = msg.format(&colors);
@@ -1397,7 +1397,7 @@ mod tests {
 
     #[test]
     fn test_operation_message_row_running_shows_ellipsis() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let msg = OperationMessage::new("Generating");
         msg.add_row("bash(ls)");
         let formatted = msg.format(&colors);
@@ -1416,7 +1416,7 @@ mod tests {
 
     #[test]
     fn test_operation_message_row_error_shows_error() {
-        let colors = crate::config::ColorScheme::default();
+        let colors = crate::theme::ColorScheme::default();
         let msg = OperationMessage::new("Generating");
         let idx = msg.add_row("bash(bad)");
         msg.fail_row(idx, "permission denied");

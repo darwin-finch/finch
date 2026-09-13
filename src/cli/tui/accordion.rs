@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::cli::messages::{MessageRef, TranscriptRow, TranscriptRowId};
-use crate::config::ColorScheme;
+use crate::theme::ColorScheme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedTranscriptLine {

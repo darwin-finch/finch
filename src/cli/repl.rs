@@ -213,7 +213,7 @@ mod disabled_training_tests {
             client: crate::config::ClientConfig::default(),
             providers: vec![provider],
             teachers: vec![teacher],
-            colors: crate::config::ColorScheme::default(),
+            colors: crate::theme::ColorScheme::default(),
             features,
             mcp_servers: HashMap::new(),
             memory: crate::memory::MemoryConfig {

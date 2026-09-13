@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use super::dialog::{Dialog, DialogOption, DialogType};
-use crate::config::ColorScheme;
+use crate::theme::ColorScheme;
 
 /// Widget for rendering dialogs
 pub struct DialogWidget<'a> {
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn test_widget_creation() {
-        use crate::config::ColorScheme;
+        use crate::theme::ColorScheme;
 
         let dialog = Dialog::select(
             "Test",
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_select_render() {
-        use crate::config::ColorScheme;
+        use crate::theme::ColorScheme;
 
         let dialog = Dialog::select(
             "Test",
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_multiselect_render() {
-        use crate::config::ColorScheme;
+        use crate::theme::ColorScheme;
         use std::collections::HashSet;
 
         let dialog = Dialog::select(
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_text_input_render() {
-        use crate::config::ColorScheme;
+        use crate::theme::ColorScheme;
 
         let dialog = Dialog::select("Test", vec![DialogOption::new("Option 1")]);
 
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_confirm_render() {
-        use crate::config::ColorScheme;
+        use crate::theme::ColorScheme;
 
         let dialog = Dialog::select("Test", vec![DialogOption::new("Option 1")]);
 
@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_text_input_cursor_at_end_does_not_panic() {
-        use crate::config::ColorScheme;
+        use crate::theme::ColorScheme;
 
         let dialog = Dialog::select("Test", vec![DialogOption::new("Option 1")]);
         let colors = ColorScheme::default();
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_text_input_cursor_with_unicode_does_not_panic() {
-        use crate::config::ColorScheme;
+        use crate::theme::ColorScheme;
 
         let dialog = Dialog::select("Test", vec![DialogOption::new("Option 1")]);
         let colors = ColorScheme::default();
@@ -702,7 +702,7 @@ mod tests {
     /// The "Other" row must be numbered N+1 (where N = options count).
     #[test]
     fn test_select_render_other_is_numbered() {
-        use crate::config::ColorScheme;
+        use crate::theme::ColorScheme;
 
         let dialog = Dialog::select_with_custom(
             "T",
@@ -748,7 +748,7 @@ mod tests {
     /// selected_index == options.len() and custom_mode_active is false.
     #[test]
     fn test_select_render_other_highlighted_when_navigated_to() {
-        use crate::config::ColorScheme;
+        use crate::theme::ColorScheme;
         use ratatui::style::Modifier;
 
         let dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);

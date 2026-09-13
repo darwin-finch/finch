@@ -108,8 +108,8 @@ where
     F: FnOnce(Vec<ProviderEntry>) -> Config,
 {
     use super::backend::BackendConfig;
-    use super::colors::ColorScheme;
     use super::settings::{ClientConfig, FeaturesConfig, ServerConfig, TeacherEntry};
+    use crate::theme::ColorScheme;
 
     let contents = fs::read_to_string(config_path).map_err(|_e| {
         anyhow::anyhow!(errors::file_not_found_error(

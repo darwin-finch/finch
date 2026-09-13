@@ -870,8 +870,8 @@ impl WizardState {
         existing_config: Option<&crate::config::Config>,
         catalog_cache_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        use crate::config::ColorTheme;
         use crate::config::Persona;
+        use crate::theme::ColorTheme;
 
         let mut sections = HashMap::new();
 
@@ -2303,7 +2303,7 @@ fn handle_themes_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
     if let Some(SectionState::Themes { selected_theme }) =
         state.sections.get_mut(&WizardSection::Themes)
     {
-        use crate::config::ColorTheme;
+        use crate::theme::ColorTheme;
         let themes = ColorTheme::all();
 
         match key.code {
@@ -3836,7 +3836,7 @@ fn handle_review_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
 
 /// Build the final SetupResult from wizard state
 fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
-    use crate::config::ColorTheme;
+    use crate::theme::ColorTheme;
 
     // Extract theme
     let active_theme = if let Some(SectionState::Themes { selected_theme }) =
@@ -4417,7 +4417,7 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState, permis
 
 /// Render Themes section
 fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
-    use crate::config::ColorTheme;
+    use crate::theme::ColorTheme;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -5973,7 +5973,7 @@ fn render_features_section(
 
 /// Render Review section
 fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
-    use crate::config::ColorTheme;
+    use crate::theme::ColorTheme;
 
     let title = Paragraph::new("Ready to go!")
         .style(

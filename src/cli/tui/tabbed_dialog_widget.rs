@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use super::tabbed_dialog::TabbedDialog;
-use crate::config::ColorScheme;
+use crate::theme::ColorScheme;
 
 /// Widget for rendering tabbed dialogs
 pub struct TabbedDialogWidget<'a> {
@@ -240,7 +240,7 @@ mod tests {
     use super::*;
     use crate::cli::llm_dialogs::{Question, QuestionOption};
     use crate::cli::tui::tabbed_dialog::TabbedDialog;
-    use crate::config::ColorScheme;
+    use crate::theme::ColorScheme;
 
     fn make_q(text: &str, opts: &[&str]) -> Question {
         Question {

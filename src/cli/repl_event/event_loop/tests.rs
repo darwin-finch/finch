@@ -813,7 +813,7 @@ fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
     use crate::cli::messages::{Message, TranscriptRowKind};
 
     let output =
-        crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
+        crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
     output.disable_stdout();
     let run_id = RunId(uuid::Uuid::new_v4());
     let mut projections = std::collections::HashMap::new();
@@ -861,7 +861,7 @@ fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
 
     let unit = projections.get(&run_id).unwrap().unit.clone();
     let projected = unit
-        .transcript_row(&crate::config::ColorScheme::default())
+        .transcript_row(&crate::theme::ColorScheme::default())
         .unwrap();
     assert_eq!(projected.kind, TranscriptRowKind::Activity);
     assert!(projected.label.contains("Speculative run"));
@@ -878,7 +878,7 @@ fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
     assert!(projected.children[0].label.contains("status"));
     assert!(projected.children[1].label.starts_with("result"));
 
-    let canonical = unit.complete_transcript(&crate::config::ColorScheme::default());
+    let canonical = unit.complete_transcript(&crate::theme::ColorScheme::default());
     assert!(canonical.contains("Speculative run"));
     assert!(canonical.contains("result"));
     assert!(canonical.contains("catalog unavailable"));
@@ -892,7 +892,7 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     use crate::cli::messages::{Message, TranscriptRowKind};
 
     let output =
-        crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
+        crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
     output.disable_stdout();
     let run_id = RunId(uuid::Uuid::new_v4());
     let run = BrainRun {
@@ -940,7 +940,7 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
 
     let unit = projections.get(&run_id).unwrap().unit.clone();
     let projected = unit
-        .transcript_row(&crate::config::ColorScheme::default())
+        .transcript_row(&crate::theme::ColorScheme::default())
         .unwrap();
     assert_eq!(projected.kind, TranscriptRowKind::Activity);
     assert!(!projected.default_expanded);
@@ -963,7 +963,7 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     assert_eq!(tool.children[1].id.path, vec![1, 1, 1]);
     assert!(tool.children[1].body.iter().any(|line| line == "value=7"));
 
-    let canonical = unit.complete_transcript(&crate::config::ColorScheme::default());
+    let canonical = unit.complete_transcript(&crate::theme::ColorScheme::default());
     assert!(canonical.contains("read_cache"));
     assert!(canonical.contains("cache hit"));
     assert!(canonical.contains("value=7"));
@@ -977,7 +977,7 @@ fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
     };
 
     let output =
-        crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
+        crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
     output.disable_stdout();
     let run_id = RunId(uuid::Uuid::new_v4());
     let run = BrainRun {
@@ -1101,7 +1101,7 @@ fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
 
     let messages = output.get_messages();
     assert_eq!(messages.len(), 1);
-    let rendered = messages[0].format(&crate::config::ColorScheme::default());
+    let rendered = messages[0].format(&crate::theme::ColorScheme::default());
     for expected in [
         &format!("Speculative run {}", run_id.0),
         "inspect the cache",
@@ -1154,7 +1154,7 @@ fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
     };
 
     let output =
-        crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
+        crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
     output.disable_stdout();
     let run_id = RunId(uuid::Uuid::new_v4());
     let run = BrainRun {
@@ -1319,7 +1319,7 @@ fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
 
     let messages = output.get_messages();
     assert_eq!(messages.len(), 1);
-    let rendered = messages[0].format(&crate::config::ColorScheme::default());
+    let rendered = messages[0].format(&crate::theme::ColorScheme::default());
     for expected in [
         "tool-one",
         "tool-two",

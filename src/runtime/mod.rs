@@ -13142,7 +13142,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             crate::cli::messages::MessageStatus::Complete
         );
         assert!(messages[1]
-            .format(&crate::config::ColorScheme::default())
+            .format(&crate::theme::ColorScheme::default())
             .contains("download"));
     }
 

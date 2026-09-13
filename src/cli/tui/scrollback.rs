@@ -141,7 +141,7 @@ impl ScrollbackBuffer {
             .iter()
             .map(|m| {
                 calculate_display_height(
-                    &m.format(&crate::config::ColorScheme::default()),
+                    &m.format(&crate::theme::ColorScheme::default()),
                     self.terminal_width,
                 )
             })
@@ -184,7 +184,7 @@ impl ScrollbackBuffer {
             .iter()
             .map(|m| {
                 calculate_display_height(
-                    &m.format(&crate::config::ColorScheme::default()),
+                    &m.format(&crate::theme::ColorScheme::default()),
                     self.terminal_width,
                 )
             })
@@ -222,7 +222,7 @@ impl ScrollbackBuffer {
             .iter()
             .map(|m| {
                 calculate_display_height(
-                    &m.format(&crate::config::ColorScheme::default()),
+                    &m.format(&crate::theme::ColorScheme::default()),
                     self.terminal_width,
                 )
             })
@@ -250,7 +250,7 @@ impl ScrollbackBuffer {
             .iter()
             .map(|m| {
                 calculate_display_height(
-                    &m.format(&crate::config::ColorScheme::default()),
+                    &m.format(&crate::theme::ColorScheme::default()),
                     self.terminal_width,
                 )
             })
@@ -326,7 +326,7 @@ impl ScrollbackBuffer {
                 (
                     msg.id(),
                     calculate_display_height(
-                        &msg.format(&crate::config::ColorScheme::default()),
+                        &msg.format(&crate::theme::ColorScheme::default()),
                         self.terminal_width,
                     ),
                 )
