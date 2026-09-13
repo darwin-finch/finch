@@ -401,6 +401,10 @@ pub struct AgentScheduler {
     /// provider never observed.
     #[cfg(test)]
     wait_before_provider_poll: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    /// Test-only signal after the provider select arm wins but before it waits
+    /// for the task write lock used to publish the started attempt.
+    #[cfg(test)]
+    notify_before_attempt_lock: tokio::sync::Mutex<Option<Arc<Notify>>>,
 }
 
 #[async_trait::async_trait]
@@ -455,6 +459,8 @@ impl AgentScheduler {
             wait_after_initial_check: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             wait_before_provider_poll: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            notify_before_attempt_lock: tokio::sync::Mutex::new(None),
         });
         runtime.attach_agent_scheduler(&scheduler);
         scheduler
@@ -919,8 +925,11 @@ impl AgentScheduler {
                     bail!("agent cancelled after consuming {} provider attempts", usage.usage.started_attempts)
                 }
                 response = async {
-                    usage.start_attempt();
-                    self.publish_usage(identity.task_id, &usage.usage).await;
+                    #[cfg(test)]
+                    if let Some(waiting) = self.notify_before_attempt_lock.lock().await.take() {
+                        waiting.notify_one();
+                    }
+                    self.begin_provider_attempt(identity.task_id, usage).await?;
                     provider.generate(messages.clone(), Some(definitions.clone())).await
                 } => response?,
             };
@@ -976,6 +985,24 @@ impl AgentScheduler {
             task_id,
             usage: usage.clone(),
         });
+    }
+
+    async fn begin_provider_attempt(
+        &self,
+        task_id: Uuid,
+        usage: &mut UsageAccumulator,
+    ) -> Result<()> {
+        let mut tasks = self.tasks.write().await;
+        let record = tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("agent task disappeared before provider dispatch"))?;
+        usage.start_attempt();
+        record.usage = usage.usage.clone();
+        let _ = self.events.send(AgentEvent::UsageUpdated {
+            task_id,
+            usage: usage.usage.clone(),
+        });
+        Ok(())
     }
 
     async fn set_active_tool(&self, task_id: Uuid, active_tool: Option<String>) {
@@ -3273,6 +3300,71 @@ mod tests {
     /// never issued" back in. Repeating the whole cycle against a fresh
     /// scheduler drives the false-pass probability to about 2^-N.
     const CANCEL_BEFORE_PROVIDER_POLL_CYCLES: usize = 24;
+
+    #[tokio::test]
+    async fn test_su_02_cancel_during_attempt_lock_contention_bills_no_provider_attempt() {
+        let provider = AttemptGenerator::new(vec![AttemptAction::Final("must never run")]);
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(provider.clone()),
+            Arc::clone(&runtime),
+        );
+        let at_turn_boundary = Arc::new(Notify::new());
+        let resume_turn = Arc::new(Notify::new());
+        *scheduler.wait_before_provider_poll.lock().await =
+            Some((Arc::clone(&at_turn_boundary), Arc::clone(&resume_turn)));
+        let before_attempt_lock = Arc::new(Notify::new());
+        *scheduler.notify_before_attempt_lock.lock().await = Some(Arc::clone(&before_attempt_lock));
+        let mut events = scheduler.subscribe();
+        let submission = tokio::spawn(submit_typed_agent_await(Arc::clone(&runtime), 4, 60_000));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            at_turn_boundary.notified(),
+        )
+        .await
+        .expect("SU-02: child never reached the pre-provider turn boundary");
+        let tasks = scheduler.tasks.write().await;
+        let record = tasks
+            .values()
+            .next()
+            .expect("SU-02: typed spawn must register one child before provider dispatch");
+        let task_id = record.snapshot.identity.task_id;
+        let cancellation = record.cancellation.clone();
+        resume_turn.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            before_attempt_lock.notified(),
+        )
+        .await
+        .expect("SU-02: provider select arm never reached the contended task lock");
+        cancellation.cancel();
+        drop(tasks);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), submission)
+            .await
+            .expect("SU-02: child never terminalized after contention cancellation")
+            .expect("SU-02: typed agent-await task panicked");
+        assert_typed_child_accounting(
+            &outcome,
+            "cancelled",
+            0,
+            &["agent cancelled after consuming 0 provider attempts"],
+        );
+        assert_eq!(provider.provider_calls(), 0, "SU-02: an attempt blocked before provider dispatch must not be billed; task_id={task_id} provider_calls={} outcome={outcome:?}", provider.provider_calls());
+        let mut observed = Vec::new();
+        drain_events(&mut events, &mut observed);
+        let terminal_usage = observed.iter().find_map(|event| match event {
+            AgentEvent::TaskFinished { result, usage }
+                if result.identity.task_id == task_id =>
+            {
+                Some(usage)
+            }
+            _ => None,
+        }).unwrap_or_else(|| panic!("SU-02: terminal lifecycle must carry usage; task_id={task_id} events={observed:?}"));
+        assert_eq!((terminal_usage.started_attempts, terminal_usage.reported_attempts), (0, 0), "SU-02: terminal usage, typed turns, and provider calls must agree after contention cancellation; task_id={task_id} usage={terminal_usage:?} events={observed:?}");
+    }
 
     /// One spawn, park-at-the-boundary, cancel, resume cycle against a freshly
     /// built runtime, provider, and scheduler. `iteration` is carried into every

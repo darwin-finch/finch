@@ -1033,7 +1033,9 @@ fn aggregate_agent_usage<'a>(
             let total = aggregate.output_tokens.get_or_insert(0);
             *total = total.saturating_add(tokens);
         }
-        all_complete &= task.state == ActivityUsageState::Complete;
+        if task.started_attempts > 0 {
+            all_complete &= task.state == ActivityUsageState::Complete;
+        }
     }
     aggregate.state = if aggregate.reported_attempts == 0 {
         ActivityUsageState::Unavailable
@@ -5236,6 +5238,27 @@ mod tests {
             reported_attempts: reported,
             started_attempts: started,
         }
+    }
+
+    #[test]
+    fn test_su_01_zero_started_child_does_not_downgrade_complete_usage() {
+        use activity::ActivityUsageState;
+
+        let aggregate = aggregate_agent_usage(
+            [
+                reported_usage(ActivityUsageState::Complete, Some(12), Some(7), 1, 1),
+                activity::ActivityUsage::default(),
+            ]
+            .iter(),
+        );
+        assert_eq!(aggregate.state, ActivityUsageState::Complete, "SU-01: a queued child with zero started attempts has no missing report and must not contradict the fully reported running child; aggregate={aggregate:?}");
+
+        let status = StatusBar::new();
+        status.update_agent_activity(2, &aggregate);
+        let line = status
+            .get_line(&StatusLineType::AgentActivity)
+            .expect("SU-01: two active children must produce an aggregate status line");
+        assert!(line.contains("complete (1/1 attempts reported)") && !line.contains("partial"), "SU-01: status text must agree with reported-versus-started attempts; line={line:?} aggregate={aggregate:?}");
     }
 
     #[test]
