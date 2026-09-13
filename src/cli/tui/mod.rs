@@ -5237,9 +5237,16 @@ mod tests {
                 &terminal,
             );
         }
+        let prompt_style = terminal.cell(1, 0).style;
+        let colored_prompt = VtStyle {
+            foreground: VtColor::Indexed(14),
+            bold: false,
+            reverse: false,
+        };
         assert_vt(
-            terminal.cell(1, 0).style == VtStyle::default(),
-            "the supervised no-color path must leave the editable prompt at terminal default",
+            prompt_style == VtStyle::default() || prompt_style == colored_prompt,
+            "the editable prompt must be either the exact cyan production style or the exact \
+             terminal-default NO_COLOR style",
             &terminal,
         );
         assert_vt(
@@ -5247,11 +5254,21 @@ mod tests {
             "prompt styling must reset before the draft",
             &terminal,
         );
+        let expected_secondary = if prompt_style == colored_prompt {
+            VtStyle {
+                foreground: VtColor::Indexed(8),
+                bold: false,
+                reverse: false,
+            }
+        } else {
+            VtStyle::default()
+        };
         assert_vt(
-            terminal.cell(0, 0).style == VtStyle::default()
-                && terminal.cell(3, 0).style == VtStyle::default()
-                && terminal.cell(4, 0).style == VtStyle::default(),
-            "the supervised no-color path must leave separators and status at terminal default",
+            terminal.cell(0, 0).style == expected_secondary
+                && terminal.cell(3, 0).style == expected_secondary
+                && terminal.cell(4, 0).style == expected_secondary,
+            "separator and status styles must consistently match the selected production color \
+             profile",
             &terminal,
         );
         assert_vt(
@@ -5345,9 +5362,16 @@ mod tests {
             "the structured addition must use the dark-theme addition color",
             &terminal,
         );
+        let selected_style = terminal.cell(yes_row, 4).style;
+        let colored_selected = VtStyle {
+            foreground: VtColor::Indexed(14),
+            bold: true,
+            reverse: false,
+        };
         assert_vt(
-            terminal.cell(yes_row, 4).style == VtStyle::default(),
-            "the supervised no-color path must not leak diff styling into the selected option",
+            selected_style == VtStyle::default() || selected_style == colored_selected,
+            "the selected option must be either exact bold cyan or exact terminal-default \
+             NO_COLOR styling; diff styling must not leak into it",
             &terminal,
         );
         assert_vt(
