@@ -18,6 +18,7 @@ Usage: seam_cost.py src/tools/mcp/ [more/paths ...]
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -63,6 +64,47 @@ def module_path_of(path: str) -> str:
     return "::".join(parts)
 
 
+def workspace_package_facades(sources: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Return Rust crate names and source-package identities for workspace library facades."""
+    facades: dict[str, str] = {}
+    crates: dict[str, str] = {}
+    for path in sources:
+        packaged = package_source_path(path)
+        if packaged is None or module_path_of(path) != "":
+            continue
+        package, _ = packaged
+        facades[package] = path
+        if package != ".":
+            crates[Path(package).name.replace("-", "_")] = package
+    return facades, crates
+
+
+def workspace_package_aliases(
+    sources: dict[str, str], facades: dict[str, str], crates: dict[str, str]
+) -> dict[str, dict[str, str]]:
+    """Map facade re-export aliases such as root `vm` to their workspace package."""
+    aliases: dict[str, dict[str, str]] = defaultdict(dict)
+    for package, facade in facades.items():
+        text = strip_comments_and_tests(sources[facade])
+        for dependency, alias in re.findall(
+            r"\bpub\s+use\s+([a-z_][a-z0-9_]*)\s+as\s+([a-z_][a-z0-9_]*)\s*;",
+            text,
+        ):
+            target = crates.get(dependency)
+            if target:
+                aliases[package][alias] = target
+    return aliases
+
+
+def direct_package_references(text: str, crates: dict[str, str]) -> list[str]:
+    """Workspace packages named directly, rather than through a local `crate::` alias."""
+    return [
+        package
+        for name, package in crates.items()
+        for _ in re.finditer(rf"(?<![:A-Za-z0-9_]){re.escape(name)}\s*::", text)
+    ]
+
+
 def report(root: Path, candidate: str, directories: list[str], files: list[str], sources: dict[str, str]) -> None:
     def owner_of(path: str) -> str:
         return owning_module(directories, path) or "?"
@@ -79,6 +121,8 @@ def report(root: Path, candidate: str, directories: list[str], files: list[str],
         for path in sources
         if package_source_path(path) is not None
     }
+    package_facades, workspace_crates = workspace_package_facades(sources)
+    package_aliases = workspace_package_aliases(sources, package_facades, workspace_crates)
 
     def owner_of_module(source: str, module: str) -> tuple[str | None, str | None]:
         packaged = package_source_path(source)
@@ -91,35 +135,34 @@ def report(root: Path, candidate: str, directories: list[str], files: list[str],
             path = file_by_module.get((package, prefix))
             if path:
                 return owner_of(path), path
+        alias = module.split("::", 1)[0]
+        target_package = package_aliases.get(package, {}).get(alias)
+        if target_package:
+            target = package_facades[target_package]
+            return owner_of(target), target
         return None, None
+
+    def references_from(path: str) -> list[tuple[str | None, str | None]]:
+        text = strip_comments_and_tests(sources[path])
+        references = [owner_of_module(path, module) for _, module in crate_references(text)]
+        references.extend(
+            (owner_of(package_facades[package]), package_facades[package])
+            for package in direct_package_references(text, workspace_crates)
+        )
+        return references
 
     outgoing: Counter[str] = Counter()
     for path in inside:
-        for _, module in crate_references(strip_comments_and_tests(sources[path])):
-            owner, target = owner_of_module(path, module)
+        for owner, target in references_from(path):
             if target and not target.startswith(candidate) and owner:
                 outgoing[owner] += 1
 
     incoming: dict[str, Counter[str]] = defaultdict(Counter)
-    # A candidate may be a directory or a single file; both name a module, but only a directory
-    # reaches its module through a `mod.rs`.
-    if candidate.endswith(".rs"):
-        prefix = module_path_of(candidate)
-        candidate_package = package_source_path(candidate)
-    elif candidate.startswith("crates/") and candidate.count("/") == 2:
-        prefix = ""
-        candidate_package = (candidate.rstrip("/"), "")
-    else:
-        prefix = module_path_of(candidate.rstrip("/") + "/mod.rs")
-        candidate_package = package_source_path(candidate.rstrip("/") + "/mod.rs")
-    for path, text in sources.items():
+    for path in sources:
         if path.startswith(candidate):
             continue
-        packaged = package_source_path(path)
-        if candidate_package is None or packaged is None or packaged[0] != candidate_package[0]:
-            continue
-        for _, module in crate_references(strip_comments_and_tests(text)):
-            if prefix and (module == prefix or module.startswith(f"{prefix}::")):
+        for _, target in references_from(path):
+            if target and target.startswith(candidate):
                 incoming[owner_of(path)][path] += 1
 
     print(f"\n{candidate}  —  {len(inside)} files, {lines} lines, currently owned by {sorted(owners)}")
