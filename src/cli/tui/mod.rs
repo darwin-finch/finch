@@ -5262,6 +5262,39 @@ mod tests {
     }
 
     #[test]
+    fn test_vt_oracle_live_writer_expands_horizontal_tab_to_eight_column_stop() {
+        let width = 16;
+        let frame = LiveFrame {
+            lines: vec!["a\tb".to_string()],
+            cursor_row: 0,
+            cursor_col: 9,
+            cursor_visible: true,
+            trailing_newline: false,
+            visible_live: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        write_live_frame(&mut bytes, &frame, width).unwrap();
+
+        let mut terminal = VtOracle::new(width, 2);
+        terminal.feed(&bytes);
+        assert_vt(
+            terminal.row(0) == "a       b",
+            "HT must advance from column 1 to the standard column-8 tab stop before painting b",
+            &terminal,
+        );
+        assert_vt(
+            terminal.cell(0, 8).character == 'b',
+            "the character after HT must occupy display column 8",
+            &terminal,
+        );
+        assert_vt(
+            terminal.cursor() == (0, 9, true),
+            "the writer's input cursor must land one cell after b at display column 9",
+            &terminal,
+        );
+    }
+
+    #[test]
     fn test_vt_oracle_structured_file_diff_approval_reaches_terminal_cells_and_styles() {
         let width = 48;
         let height = 20;

@@ -245,6 +245,10 @@ impl Perform for VtOracle {
         match byte {
             b'\r' => self.move_to(self.cursor_row, 0),
             b'\n' => self.linefeed(),
+            b'\t' => {
+                let next_tab_stop = (self.cursor_col / 8 + 1) * 8;
+                self.move_to(self.cursor_row, next_tab_stop.min(self.width - 1));
+            }
             0x08 => self.move_to(self.cursor_row, self.cursor_col.saturating_sub(1)),
             _ => {}
         }
