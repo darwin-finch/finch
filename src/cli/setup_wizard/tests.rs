@@ -3,6 +3,7 @@
 //! Declared by `setup_wizard.rs` as `#[cfg(test)] mod tests;`, so this is the same module:
 //! `use super::*` still reaches the wizard's private items.
 
+use super::chatgpt_recovery::*;
 use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
