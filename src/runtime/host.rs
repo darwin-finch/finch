@@ -2681,19 +2681,19 @@ pub(super) fn validate_restored_process_authority(ledger: &CapabilityLedger) -> 
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct ProcessExecutableIdentity {
-    path: String,
+    pub(super) path: String,
     sha256: String,
     device: u64,
     inode: u64,
-    arguments: Vec<String>,
+    pub(super) arguments: Vec<String>,
     environment_sha256: String,
-    cwd_path: String,
+    pub(super) cwd_path: String,
     cwd_device: u64,
     cwd_inode: u64,
 }
 
 pub(super) struct OpenedProcessExecutable {
-    identity: ProcessExecutableIdentity,
+    pub(super) identity: ProcessExecutableIdentity,
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
@@ -2711,14 +2711,14 @@ pub(super) struct OpenedProcessExecutable {
 }
 
 impl ProcessExecutableIdentity {
-    fn encode(&self) -> String {
+    pub(super) fn encode(&self) -> String {
         format!(
             "{PROCESS_IDENTITY_PREFIX}{}",
             serde_json::to_string(self).expect("process identity is serializable")
         )
     }
 
-    fn decode(encoded: &str) -> std::result::Result<Self, String> {
+    pub(super) fn decode(encoded: &str) -> std::result::Result<Self, String> {
         let json = encoded
             .strip_prefix(PROCESS_IDENTITY_PREFIX)
             .ok_or_else(|| "process selector is not a stable executable identity".to_string())?;
