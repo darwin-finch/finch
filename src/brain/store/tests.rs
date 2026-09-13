@@ -1,4 +1,3 @@
-
 use super::*;
 // The two shared fixtures live at module scope so the `src/server/handlers.rs`
 // boundary tests can use the same ones; aliased back to their local names here.
