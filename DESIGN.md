@@ -311,7 +311,9 @@ Design intent, not current fact. The program, its phases, and its measurable gat
   unique value or retaining a shared value. Unique/shared/weak heap policies remain library-defined
   types over compiler-enforced move, copy, borrow, and deterministic-drop hooks. Static and dynamic
   ownership/concept dispatch stay explicit so compilation remains bounded and native lowering does
-  not depend on source-language inference.
+  not depend on source-language inference. `Result`/`Option` remain ordinary library variants;
+  thrown values propagate through compiler-inferred exceptional edges, while an explicit `nothrow`
+  guarantee requires handlers to consume every edge that could escape.
 - **No junk drawer.** Each port or data type belongs to its consuming domain; there is no generic
   contracts crate, and not every directory becomes a crate.
 - **Mechanical moves.** Code moves never carry behavior, wire, persistence, checkpoint, or schema
