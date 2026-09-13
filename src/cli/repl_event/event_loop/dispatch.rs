@@ -88,6 +88,11 @@ impl EventLoop {
         if self.terminal_agent_roots.contains(&root_agent_id) {
             return;
         }
+        if agent_lifecycle_task_id(event)
+            .is_some_and(|task_id| self.terminal_agent_tasks.contains(&task_id))
+        {
+            return;
+        }
         self.track_agent_lifecycle(event);
         if self.agent_lifecycle_bindings.contains_key(&root_agent_id) {
             self.apply_bound_agent_lifecycle(event, root_agent_id);
@@ -156,6 +161,11 @@ impl EventLoop {
         event: &crate::scheduler::AgentEvent,
         root_agent_id: Uuid,
     ) {
+        if agent_lifecycle_task_id(event)
+            .is_some_and(|task_id| self.terminal_agent_tasks.contains(&task_id))
+        {
+            return;
+        }
         let Some(binding) = self.agent_lifecycle_bindings.get(&root_agent_id).cloned() else {
             return;
         };
@@ -188,6 +198,7 @@ impl EventLoop {
                 is_error,
             } => binding.unit.complete_agent_tool(*task_id, name, *is_error),
             crate::scheduler::AgentEvent::TaskFinished { result, .. } => {
+                self.terminal_agent_tasks.insert(result.identity.task_id);
                 binding.unit.queue_agent_activity(
                     binding.owner_row,
                     result.identity.agent_id,
@@ -226,6 +237,9 @@ impl EventLoop {
                 if active.is_empty() {
                     self.active_agent_root_tasks.remove(&root_agent_id);
                     self.agent_lifecycle_bindings.remove(&root_agent_id);
+                    self.terminal_agent_tasks.retain(|task_id| {
+                        self.agent_task_roots.get(task_id).copied() != Some(root_agent_id)
+                    });
                     self.agent_task_roots
                         .retain(|_, task_root| *task_root != root_agent_id);
                     if self.terminal_agent_roots.insert(root_agent_id) {
@@ -1093,5 +1107,17 @@ impl EventLoop {
         }
 
         Ok(())
+    }
+}
+
+fn agent_lifecycle_task_id(event: &crate::scheduler::AgentEvent) -> Option<Uuid> {
+    match event {
+        crate::scheduler::AgentEvent::TaskQueued { snapshot }
+        | crate::scheduler::AgentEvent::TaskStarted { snapshot } => Some(snapshot.identity.task_id),
+        crate::scheduler::AgentEvent::ToolStarted { task_id, .. }
+        | crate::scheduler::AgentEvent::ToolCompleted { task_id, .. }
+        | crate::scheduler::AgentEvent::UsageUpdated { task_id, .. } => Some(*task_id),
+        crate::scheduler::AgentEvent::TaskFinished { result, .. } => Some(result.identity.task_id),
+        crate::scheduler::AgentEvent::Resnapshot { .. } => None,
     }
 }

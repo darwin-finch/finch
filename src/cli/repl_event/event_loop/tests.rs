@@ -1139,12 +1139,44 @@ fn test_issue_652_lifecycle_nested_interleaved_roots_keep_ownership() {
                 "a provider completion must not retire scrollback while bound children can still update it"
             );
 
-            for event in [
-                lifecycle_task_finished(
+            event_loop
+                .handle_event(ReplEvent::AgentLifecycle(lifecycle_task_finished(
                     nested.clone(),
                     crate::scheduler::AgentTaskStatus::Failed,
                     "nested failed cleanly",
-                ),
+                )))
+                .await
+                .unwrap();
+            let after_nested_terminal =
+                unit.complete_transcript(&crate::theme::ColorScheme::default());
+            for late_nested in [
+                crate::scheduler::AgentEvent::TaskQueued {
+                    snapshot: lifecycle_task_snapshot(
+                        nested.clone(),
+                        "late nested queued",
+                        crate::scheduler::AgentTaskStatus::Queued,
+                    ),
+                },
+                crate::scheduler::AgentEvent::TaskStarted {
+                    snapshot: lifecycle_task_snapshot(
+                        nested.clone(),
+                        "late nested started",
+                        crate::scheduler::AgentTaskStatus::Running,
+                    ),
+                },
+            ] {
+                event_loop
+                    .handle_event(ReplEvent::AgentLifecycle(late_nested))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                unit.complete_transcript(&crate::theme::ColorScheme::default()),
+                after_nested_terminal,
+                "terminal child B must reject late queued/started delivery while sibling A remains active"
+            );
+
+            for event in [
                 lifecycle_task_finished(
                     first.clone(),
                     crate::scheduler::AgentTaskStatus::Failed,
@@ -1217,11 +1249,23 @@ fn test_issue_652_lifecycle_nested_interleaved_roots_keep_ownership() {
             assert_eq!(rendered.matches("second cancelled cleanly").count(), 1);
             assert!(!rendered.contains("late-tool"));
             assert!(!rendered.contains("late queued root"));
+            assert!(!rendered.contains("late nested"));
             assert!(
                 !event_loop
                     .active_agent_root_tasks
                     .contains_key(&first.root_agent_id),
                 "late queued delivery must not repopulate ownership for a terminal root"
+            );
+            assert!(
+                event_loop.agent_lifecycle_bindings.is_empty()
+                    && event_loop.agent_task_roots.is_empty()
+                    && event_loop.active_agent_root_tasks.is_empty()
+                    && event_loop.terminal_agent_tasks.is_empty(),
+                "all lifecycle ownership maps and per-task tombstones must drain after sibling A terminalizes: bindings={:?} task_roots={:?} active={:?} terminal_tasks={:?}",
+                event_loop.agent_lifecycle_bindings.keys().collect::<Vec<_>>(),
+                event_loop.agent_task_roots,
+                event_loop.active_agent_root_tasks,
+                event_loop.terminal_agent_tasks,
             );
 
             for label in ["await_agent(second)", "cancel_agent(second)"] {
