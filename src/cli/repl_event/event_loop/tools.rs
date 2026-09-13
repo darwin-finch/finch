@@ -33,6 +33,28 @@ impl EventLoop {
                 false
             };
 
+        // The scheduler may publish queued/started events before the tool
+        // result reaches this loop. Parse and bind the returned identity while
+        // the originating tool row is still active, then replay those events
+        // into that exact WorkUnit instead of losing their owner on removal.
+        let spawn_binding = if let Ok(content) = &result {
+            self.active_tool_uses
+                .read()
+                .await
+                .get(&tool_id)
+                .filter(|(name, _, _, _)| name == "spawn_agent")
+                .and_then(|(_, _, unit, row_idx)| {
+                    serde_json::from_str::<crate::scheduler::AgentIdentity>(content)
+                        .ok()
+                        .map(|identity| (identity, Arc::clone(unit), *row_idx))
+                })
+        } else {
+            None
+        };
+        if let Some((identity, unit, row_idx)) = spawn_binding {
+            self.bind_agent_spawn_lifecycle(&identity, unit, row_idx);
+        }
+
         let recorded_result = {
             let mut history = self.conversation.write().await;
             history.record_tool_result(query_id, round_token, &tool_id, &result)
@@ -51,6 +73,7 @@ impl EventLoop {
                 {
                     work_unit.fail_row(row_idx, "discarded after closed tool round");
                 }
+                self.flush_genuinely_unbound_agent_lifecycle().await;
                 if named_turn_finished {
                     self.finish_named_brain_turn(query_id, String::new()).await;
                 }
@@ -104,6 +127,7 @@ impl EventLoop {
                 work_unit.fail_row(row_idx, short_err);
             }
         }
+        self.flush_genuinely_unbound_agent_lifecycle().await;
 
         // Record tool execution in the graph
         {

@@ -1,6 +1,248 @@
 use super::*;
 
 impl EventLoop {
+    pub(super) fn bind_agent_spawn_lifecycle(
+        &mut self,
+        identity: &crate::scheduler::AgentIdentity,
+        unit: Arc<crate::cli::messages::WorkUnit>,
+        owner_row: usize,
+    ) {
+        unit.queue_agent_activity(
+            Some(owner_row),
+            identity.agent_id,
+            identity.task_id,
+            identity.parent_agent_id,
+            format!("child {} · {}", identity.agent_id, identity.provider_model),
+        );
+        self.agent_task_roots
+            .insert(identity.task_id, identity.root_agent_id);
+        self.agent_lifecycle_bindings.insert(
+            identity.root_agent_id,
+            AgentLifecycleBinding {
+                unit,
+                owner_row: Some(owner_row),
+            },
+        );
+        self.replay_pending_agent_lifecycle(identity.root_agent_id);
+    }
+
+    fn replay_pending_agent_lifecycle(&mut self, root_agent_id: Uuid) {
+        let pending = std::mem::take(&mut self.pending_agent_lifecycle);
+        for event in pending {
+            if self.agent_lifecycle_root(&event) == Some(root_agent_id) {
+                self.apply_bound_agent_lifecycle(&event, root_agent_id);
+            } else {
+                self.pending_agent_lifecycle.push(event);
+            }
+        }
+    }
+
+    pub(super) async fn flush_genuinely_unbound_agent_lifecycle(&mut self) {
+        if self
+            .active_tool_uses
+            .read()
+            .await
+            .values()
+            .any(|(name, _, _, _)| name == "spawn_agent")
+        {
+            return;
+        }
+        let terminal_roots = self
+            .pending_agent_lifecycle
+            .iter()
+            .filter_map(|event| match event {
+                crate::scheduler::AgentEvent::TaskFinished { result, .. } => {
+                    Some(result.identity.root_agent_id)
+                }
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let pending = std::mem::take(&mut self.pending_agent_lifecycle);
+        for event in pending {
+            let Some(root_agent_id) = self.agent_lifecycle_root(&event) else {
+                continue;
+            };
+            if self.terminal_agent_roots.contains(&root_agent_id) {
+                continue;
+            }
+            if !terminal_roots.contains(&root_agent_id) {
+                self.pending_agent_lifecycle.push(event);
+                continue;
+            }
+            self.ensure_unbound_agent_lifecycle(root_agent_id);
+            self.apply_bound_agent_lifecycle(&event, root_agent_id);
+        }
+    }
+
+    async fn project_agent_lifecycle(&mut self, event: &crate::scheduler::AgentEvent) {
+        if matches!(
+            event,
+            crate::scheduler::AgentEvent::Resnapshot { .. }
+                | crate::scheduler::AgentEvent::UsageUpdated { .. }
+        ) {
+            return;
+        }
+        let Some(root_agent_id) = self.agent_lifecycle_root(event) else {
+            return;
+        };
+        if self.terminal_agent_roots.contains(&root_agent_id) {
+            return;
+        }
+        self.track_agent_lifecycle(event);
+        if self.agent_lifecycle_bindings.contains_key(&root_agent_id) {
+            self.apply_bound_agent_lifecycle(event, root_agent_id);
+            return;
+        }
+        self.pending_agent_lifecycle.push(event.clone());
+        self.flush_genuinely_unbound_agent_lifecycle().await;
+    }
+
+    fn agent_lifecycle_root(&self, event: &crate::scheduler::AgentEvent) -> Option<Uuid> {
+        match event {
+            crate::scheduler::AgentEvent::TaskQueued { snapshot }
+            | crate::scheduler::AgentEvent::TaskStarted { snapshot } => {
+                Some(snapshot.identity.root_agent_id)
+            }
+            crate::scheduler::AgentEvent::ToolStarted { task_id, .. }
+            | crate::scheduler::AgentEvent::ToolCompleted { task_id, .. }
+            | crate::scheduler::AgentEvent::UsageUpdated { task_id, .. } => {
+                self.agent_task_roots.get(task_id).copied()
+            }
+            crate::scheduler::AgentEvent::TaskFinished { result, .. } => {
+                Some(result.identity.root_agent_id)
+            }
+            crate::scheduler::AgentEvent::Resnapshot { .. } => None,
+        }
+    }
+
+    fn track_agent_lifecycle(&mut self, event: &crate::scheduler::AgentEvent) {
+        match event {
+            crate::scheduler::AgentEvent::TaskQueued { snapshot }
+            | crate::scheduler::AgentEvent::TaskStarted { snapshot } => {
+                self.agent_task_roots
+                    .insert(snapshot.identity.task_id, snapshot.identity.root_agent_id);
+                self.active_agent_root_tasks
+                    .entry(snapshot.identity.root_agent_id)
+                    .or_default()
+                    .insert(snapshot.identity.task_id);
+            }
+            crate::scheduler::AgentEvent::TaskFinished { result, .. } => {
+                self.agent_task_roots
+                    .insert(result.identity.task_id, result.identity.root_agent_id);
+            }
+            crate::scheduler::AgentEvent::ToolStarted { .. }
+            | crate::scheduler::AgentEvent::ToolCompleted { .. }
+            | crate::scheduler::AgentEvent::UsageUpdated { .. }
+            | crate::scheduler::AgentEvent::Resnapshot { .. } => {}
+        }
+    }
+
+    fn ensure_unbound_agent_lifecycle(&mut self, root_agent_id: Uuid) {
+        self.agent_lifecycle_bindings
+            .entry(root_agent_id)
+            .or_insert_with(|| {
+                let title = format!("Agent activity {root_agent_id}");
+                let unit = self.output_manager.start_work_unit(&title);
+                unit.set_activity_presentation(title);
+                AgentLifecycleBinding {
+                    unit,
+                    owner_row: None,
+                }
+            });
+    }
+
+    fn apply_bound_agent_lifecycle(
+        &mut self,
+        event: &crate::scheduler::AgentEvent,
+        root_agent_id: Uuid,
+    ) {
+        let Some(binding) = self.agent_lifecycle_bindings.get(&root_agent_id).cloned() else {
+            return;
+        };
+        match event {
+            crate::scheduler::AgentEvent::TaskQueued { snapshot } => {
+                binding.unit.queue_agent_activity(
+                    binding.owner_row,
+                    snapshot.identity.agent_id,
+                    snapshot.identity.task_id,
+                    snapshot.identity.parent_agent_id,
+                    format!("{} · {}", snapshot.task, snapshot.identity.provider_model),
+                );
+            }
+            crate::scheduler::AgentEvent::TaskStarted { snapshot } => {
+                binding.unit.queue_agent_activity(
+                    binding.owner_row,
+                    snapshot.identity.agent_id,
+                    snapshot.identity.task_id,
+                    snapshot.identity.parent_agent_id,
+                    format!("{} · {}", snapshot.task, snapshot.identity.provider_model),
+                );
+                binding.unit.start_agent_activity(snapshot.identity.task_id);
+            }
+            crate::scheduler::AgentEvent::ToolStarted { task_id, name } => {
+                binding.unit.start_agent_tool(*task_id, name);
+            }
+            crate::scheduler::AgentEvent::ToolCompleted {
+                task_id,
+                name,
+                is_error,
+            } => binding.unit.complete_agent_tool(*task_id, name, *is_error),
+            crate::scheduler::AgentEvent::TaskFinished { result, .. } => {
+                binding.unit.queue_agent_activity(
+                    binding.owner_row,
+                    result.identity.agent_id,
+                    result.identity.task_id,
+                    result.identity.parent_agent_id,
+                    format!("child {}", result.identity.agent_id),
+                );
+                let status = format!("{:?}", result.status).to_lowercase();
+                let summary = if result.status == crate::scheduler::AgentTaskStatus::Failed {
+                    format!("{} turns, {} ms", result.turns, result.elapsed_ms)
+                } else {
+                    format!(
+                        "{status} ({} turns, {} ms)",
+                        result.turns, result.elapsed_ms
+                    )
+                };
+                let mut body = Vec::new();
+                if !result.final_message.trim().is_empty() {
+                    body.extend(result.final_message.lines().map(str::to_owned));
+                }
+                body.extend(result.diagnostics.iter().cloned());
+                binding.unit.finish_agent_activity(
+                    result.identity.task_id,
+                    summary,
+                    body,
+                    result.status == crate::scheduler::AgentTaskStatus::Failed,
+                );
+                if binding.owner_row.is_none() {
+                    binding.unit.set_complete();
+                }
+                let active = self
+                    .active_agent_root_tasks
+                    .entry(root_agent_id)
+                    .or_default();
+                active.remove(&result.identity.task_id);
+                if active.is_empty() {
+                    self.active_agent_root_tasks.remove(&root_agent_id);
+                    self.agent_lifecycle_bindings.remove(&root_agent_id);
+                    self.agent_task_roots
+                        .retain(|_, task_root| *task_root != root_agent_id);
+                    if self.terminal_agent_roots.insert(root_agent_id) {
+                        self.terminal_agent_root_order.push_back(root_agent_id);
+                    }
+                    while self.terminal_agent_root_order.len() > MAX_TERMINAL_AGENT_ROOTS {
+                        if let Some(expired) = self.terminal_agent_root_order.pop_front() {
+                            self.terminal_agent_roots.remove(&expired);
+                        }
+                    }
+                }
+            }
+            crate::scheduler::AgentEvent::Resnapshot { .. }
+            | crate::scheduler::AgentEvent::UsageUpdated { .. } => {}
+        }
+    }
+
     /// Handle an event from the event channel
     pub(super) async fn handle_event(&mut self, event: ReplEvent) -> Result<()> {
         match event {
@@ -429,30 +671,10 @@ impl EventLoop {
             }
 
             ReplEvent::AgentLifecycle(event) => {
-                let finished = match &event {
-                    crate::scheduler::AgentEvent::TaskFinished { result, .. } => {
-                        Some(result.clone())
-                    }
-                    _ => None,
-                };
                 self.tui_renderer.lock().await.apply_activity(
                     crate::cli::repl_event::activity_view::agent_activity(&event),
                 );
-                if let Some(result) = finished {
-                    let summary = if result.final_message.trim().is_empty() {
-                        result.diagnostics.join("; ")
-                    } else {
-                        result.final_message
-                    };
-                    self.output_manager.write_info(format!(
-                        "child {} {:?} ({} turns, {} ms)\n{}",
-                        result.identity.agent_id,
-                        result.status,
-                        result.turns,
-                        result.elapsed_ms,
-                        summary
-                    ));
-                }
+                self.project_agent_lifecycle(&event).await;
                 self.render_tui().await?;
             }
 

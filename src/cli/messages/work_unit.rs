@@ -145,6 +145,24 @@ pub struct WorkRow {
     diffs: Option<Vec<FileDiff>>,
 }
 
+#[derive(Clone, Debug)]
+struct AgentActivityTool {
+    name: String,
+    status: WorkRowStatus,
+}
+
+#[derive(Clone, Debug)]
+struct AgentActivityRow {
+    owner_row: Option<usize>,
+    agent_id: uuid::Uuid,
+    task_id: uuid::Uuid,
+    parent_agent_id: Option<uuid::Uuid>,
+    label: String,
+    status: WorkRowStatus,
+    body_lines: Vec<String>,
+    tools: Vec<AgentActivityTool>,
+}
+
 // ============================================================================
 // WorkUnitInner (behind RwLock)
 // ============================================================================
@@ -160,6 +178,9 @@ struct WorkUnitInner {
     rows: Vec<WorkRow>,
     /// Overall status of this unit
     status: MessageStatus,
+    /// A provider turn may end before a spawned child does. Keep the unit
+    /// mutable until every child lifecycle row reaches a terminal state.
+    requested_terminal: Option<MessageStatus>,
     /// Elapsed time captured when the unit completed (stable for scrollback display)
     elapsed_at_finish: Option<std::time::Duration>,
     presentation: WorkUnitPresentation,
@@ -169,6 +190,8 @@ struct WorkUnitInner {
     /// Bounded or indeterminate progress reported by an explicit output
     /// handle. Plain `say` output never uses this field.
     progress: Option<(u64, Option<u64>)>,
+    /// Child-agent lifecycle rows, optionally owned by one spawn tool row.
+    agent_activity: Vec<AgentActivityRow>,
 }
 
 // ============================================================================
@@ -220,10 +243,12 @@ impl WorkUnit {
                 thinking: false,
                 rows: Vec::new(),
                 status: MessageStatus::InProgress,
+                requested_terminal: None,
                 elapsed_at_finish: None,
                 presentation: WorkUnitPresentation::Assistant,
                 transient_status: None,
                 progress: None,
+                agent_activity: Vec::new(),
             })),
         }
     }
@@ -469,10 +494,156 @@ impl WorkUnit {
         }
     }
 
+    pub(crate) fn queue_agent_activity(
+        &self,
+        owner_row: Option<usize>,
+        agent_id: uuid::Uuid,
+        task_id: uuid::Uuid,
+        parent_agent_id: Option<uuid::Uuid>,
+        label: impl Into<String>,
+    ) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let label = crate::cli::diff::sanitize_terminal(&label.into());
+        if let Some(row) = inner
+            .agent_activity
+            .iter_mut()
+            .find(|row| row.task_id == task_id)
+        {
+            if matches!(row.status, WorkRowStatus::Running)
+                && row.label.starts_with("child ")
+                && !label.starts_with("child ")
+            {
+                row.owner_row = owner_row;
+                row.parent_agent_id = parent_agent_id;
+                row.label = label;
+            }
+            return;
+        }
+        inner.agent_activity.push(AgentActivityRow {
+            owner_row,
+            agent_id,
+            task_id,
+            parent_agent_id,
+            label,
+            status: WorkRowStatus::Running,
+            body_lines: vec!["queued".to_string()],
+            tools: Vec::new(),
+        });
+    }
+
+    pub(crate) fn start_agent_activity(&self, task_id: uuid::Uuid) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let Some(row) = inner
+            .agent_activity
+            .iter_mut()
+            .find(|row| row.task_id == task_id)
+        else {
+            return;
+        };
+        if !matches!(row.status, WorkRowStatus::Running) {
+            return;
+        }
+        if !row.body_lines.iter().any(|line| line == "started") {
+            row.body_lines.push("started".to_string());
+        }
+    }
+
+    pub(crate) fn start_agent_tool(&self, task_id: uuid::Uuid, name: impl Into<String>) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let Some(row) = inner
+            .agent_activity
+            .iter_mut()
+            .find(|row| row.task_id == task_id)
+        else {
+            return;
+        };
+        if !matches!(row.status, WorkRowStatus::Running) {
+            return;
+        }
+        let name = crate::cli::diff::sanitize_terminal(&name.into());
+        if row
+            .tools
+            .iter()
+            .any(|tool| tool.name == name && matches!(tool.status, WorkRowStatus::Running))
+        {
+            return;
+        }
+        row.tools.push(AgentActivityTool {
+            name,
+            status: WorkRowStatus::Running,
+        });
+    }
+
+    pub(crate) fn complete_agent_tool(&self, task_id: uuid::Uuid, name: &str, is_error: bool) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let Some(row) = inner
+            .agent_activity
+            .iter_mut()
+            .find(|row| row.task_id == task_id)
+        else {
+            return;
+        };
+        if !matches!(row.status, WorkRowStatus::Running) {
+            return;
+        }
+        let Some(tool) = row
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name == name && matches!(tool.status, WorkRowStatus::Running))
+        else {
+            return;
+        };
+        tool.status = if is_error {
+            WorkRowStatus::Error("child tool reported an error".to_string())
+        } else {
+            WorkRowStatus::Complete("complete".to_string())
+        };
+    }
+
+    pub(crate) fn finish_agent_activity(
+        &self,
+        task_id: uuid::Uuid,
+        summary: impl Into<String>,
+        body_lines: Vec<String>,
+        failed: bool,
+    ) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let Some(row) = inner
+            .agent_activity
+            .iter_mut()
+            .find(|row| row.task_id == task_id)
+        else {
+            return;
+        };
+        if !matches!(row.status, WorkRowStatus::Running) {
+            return;
+        }
+        let summary = crate::cli::diff::sanitize_terminal(&summary.into());
+        row.status = if failed {
+            WorkRowStatus::Error(summary)
+        } else {
+            WorkRowStatus::Complete(summary)
+        };
+        row.body_lines.extend(
+            body_lines
+                .into_iter()
+                .map(|line| crate::cli::diff::sanitize_terminal(&line)),
+        );
+        finish_requested_terminal(&mut inner, self.started_at.elapsed());
+    }
+
     /// Mark the whole WorkUnit complete (stops animation, shows final content).
     pub fn set_complete(&self) {
         let elapsed = self.started_at.elapsed();
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner
+            .agent_activity
+            .iter()
+            .any(|row| matches!(row.status, WorkRowStatus::Running))
+        {
+            inner.requested_terminal = Some(MessageStatus::Complete);
+            return;
+        }
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Complete;
     }
@@ -481,9 +652,32 @@ impl WorkUnit {
     pub fn set_failed(&self) {
         let elapsed = self.started_at.elapsed();
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner
+            .agent_activity
+            .iter()
+            .any(|row| matches!(row.status, WorkRowStatus::Running))
+        {
+            inner.requested_terminal = Some(MessageStatus::Failed);
+            return;
+        }
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Failed;
     }
+}
+
+fn finish_requested_terminal(inner: &mut WorkUnitInner, elapsed: std::time::Duration) {
+    if inner
+        .agent_activity
+        .iter()
+        .any(|row| matches!(row.status, WorkRowStatus::Running))
+    {
+        return;
+    }
+    let Some(status) = inner.requested_terminal.take() else {
+        return;
+    };
+    inner.elapsed_at_finish = Some(elapsed);
+    inner.status = status;
 }
 
 // ============================================================================
@@ -545,10 +739,12 @@ impl Message for WorkUnit {
                         fmt_elapsed(secs),
                         RESET
                     );
-                    for row in &inner.rows {
+                    for (row_index, row) in inner.rows.iter().enumerate() {
                         out.push('\n');
                         out.push_str(&format_row_themed(row, colors, DiffColorMode::production()));
+                        append_agent_activity_text(&mut out, &inner, Some(row_index));
                     }
+                    append_agent_activity_text(&mut out, &inner, None);
                     return out;
                 }
 
@@ -566,10 +762,12 @@ impl Message for WorkUnit {
                         fmt_elapsed(secs),
                         RESET
                     );
-                    for row in &inner.rows {
+                    for (row_index, row) in inner.rows.iter().enumerate() {
                         out.push('\n');
                         out.push_str(&format_row_themed(row, colors, DiffColorMode::production()));
+                        append_agent_activity_text(&mut out, &inner, Some(row_index));
                     }
+                    append_agent_activity_text(&mut out, &inner, None);
                     return out;
                 }
 
@@ -593,10 +791,12 @@ impl Message for WorkUnit {
                     CYAN, icon, RESET, self.verb, stats, RESET
                 );
 
-                for row in &inner.rows {
+                for (row_index, row) in inner.rows.iter().enumerate() {
                     out.push('\n');
                     out.push_str(&format_row_themed(row, colors, DiffColorMode::production()));
+                    append_agent_activity_text(&mut out, &inner, Some(row_index));
                 }
+                append_agent_activity_text(&mut out, &inner, None);
 
                 out
             }
@@ -655,14 +855,16 @@ impl Message for WorkUnit {
                 };
 
                 // Collapsed sub-rows: show what tools ran (label + summary + body lines)
-                for row in &inner.rows {
+                for (row_index, row) in inner.rows.iter().enumerate() {
                     out.push('\n');
                     out.push_str(&format_row_collapsed(
                         row,
                         colors,
                         DiffColorMode::production(),
                     ));
+                    append_agent_activity_text(&mut out, &inner, Some(row_index));
                 }
+                append_agent_activity_text(&mut out, &inner, None);
 
                 out
             }
@@ -684,26 +886,41 @@ impl Message for WorkUnit {
     fn complete_transcript(&self, colors: &ColorScheme) -> String {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let mut out = format_work_unit_header(&inner);
-        for row in &inner.rows {
+        for (row_index, row) in inner.rows.iter().enumerate() {
             out.push('\n');
             out.push_str(&format_row_themed(row, colors, DiffColorMode::production()));
+            append_agent_activity_text(&mut out, &inner, Some(row_index));
         }
+        append_agent_activity_text(&mut out, &inner, None);
         out
     }
 
     fn transcript_row(&self, colors: &ColorScheme) -> Option<TranscriptRow> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
-        let children = inner
+        let mut children = inner
             .rows
             .iter()
             .enumerate()
-            .map(|(index, row)| match row.presentation {
-                WorkRowPresentation::Activity => {
-                    transcript_activity_row(self.id, index, row, colors)
-                }
-                WorkRowPresentation::Tool => transcript_tool_row(self.id, index, row, colors),
+            .map(|(index, row)| {
+                let mut projected = match row.presentation {
+                    WorkRowPresentation::Activity => {
+                        transcript_activity_row(self.id, index, row, colors)
+                    }
+                    WorkRowPresentation::Tool => transcript_tool_row(self.id, index, row, colors),
+                };
+                projected.children.extend(agent_activity_transcript_roots(
+                    self.id,
+                    &inner.agent_activity,
+                    Some(index),
+                ));
+                projected
             })
-            .collect();
+            .collect::<Vec<_>>();
+        children.extend(agent_activity_transcript_roots(
+            self.id,
+            &inner.agent_activity,
+            None,
+        ));
         let (kind, label, body, default_expanded) = match &inner.presentation {
             WorkUnitPresentation::Assistant if !inner.rows.is_empty() => {
                 let actionable = inner.rows.iter().any(tool_row_requires_default_expansion);
@@ -810,7 +1027,12 @@ impl Message for WorkUnit {
                     .lines()
                     .count()
             })
-            .sum::<usize>();
+            .sum::<usize>()
+            + inner
+                .agent_activity
+                .iter()
+                .map(|row| 1 + row.body_lines.len() + row.tools.len())
+                .sum::<usize>();
         let band = if line_index >= line_count.saturating_sub(tool_line_count) {
             MessageBand::Tool
         } else {
@@ -838,6 +1060,150 @@ fn program_output_has_visible_state(inner: &WorkUnitInner) -> bool {
             &inner.presentation,
             WorkUnitPresentation::ProgramOutput { title: Some(_) }
         )
+}
+
+fn append_agent_activity_text(out: &mut String, inner: &WorkUnitInner, owner_row: Option<usize>) {
+    for (index, _) in inner.agent_activity.iter().enumerate().filter(|(_, row)| {
+        row.owner_row == owner_row
+            && row.parent_agent_id.is_none_or(|parent| {
+                !inner.agent_activity.iter().any(|candidate| {
+                    candidate.owner_row == owner_row && candidate.agent_id == parent
+                })
+            })
+    }) {
+        append_agent_activity_row_text(out, inner, owner_row, index, 2);
+    }
+}
+
+fn append_agent_activity_row_text(
+    out: &mut String,
+    inner: &WorkUnitInner,
+    owner_row: Option<usize>,
+    index: usize,
+    depth: usize,
+) {
+    let row = &inner.agent_activity[index];
+    let (glyph, summary) = match &row.status {
+        WorkRowStatus::Running => ("○", "running".to_string()),
+        WorkRowStatus::Complete(summary) => ("✓", summary.clone()),
+        WorkRowStatus::Error(error) => ("✗", error.clone()),
+    };
+    out.push('\n');
+    out.push_str(&format!(
+        "{}{} {} — {}",
+        "  ".repeat(depth),
+        glyph,
+        row.label,
+        summary
+    ));
+    for line in &row.body_lines {
+        out.push('\n');
+        out.push_str(&format!("{}{}", "  ".repeat(depth + 1), line));
+    }
+    for tool in &row.tools {
+        let tool_summary = match &tool.status {
+            WorkRowStatus::Running => "running".to_string(),
+            WorkRowStatus::Complete(summary) => summary.clone(),
+            WorkRowStatus::Error(error) => format!("failed: {error}"),
+        };
+        out.push('\n');
+        out.push_str(&format!(
+            "{}↳ tool {} — {}",
+            "  ".repeat(depth + 1),
+            tool.name,
+            tool_summary
+        ));
+    }
+    for (child_index, _) in inner
+        .agent_activity
+        .iter()
+        .enumerate()
+        .filter(|(_, child)| {
+            child.owner_row == owner_row && child.parent_agent_id == Some(row.agent_id)
+        })
+    {
+        append_agent_activity_row_text(out, inner, owner_row, child_index, depth + 1);
+    }
+}
+
+fn agent_activity_transcript_roots(
+    message_id: MessageId,
+    activities: &[AgentActivityRow],
+    owner_row: Option<usize>,
+) -> Vec<TranscriptRow> {
+    activities
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.owner_row == owner_row
+                && row.parent_agent_id.is_none_or(|parent| {
+                    !activities.iter().any(|candidate| {
+                        candidate.owner_row == owner_row && candidate.agent_id == parent
+                    })
+                })
+        })
+        .map(|(index, _)| agent_activity_transcript_row(message_id, activities, owner_row, index))
+        .collect()
+}
+
+fn agent_activity_transcript_row(
+    message_id: MessageId,
+    activities: &[AgentActivityRow],
+    owner_row: Option<usize>,
+    index: usize,
+) -> TranscriptRow {
+    let row = &activities[index];
+    let summary = match &row.status {
+        WorkRowStatus::Running => "running".to_string(),
+        WorkRowStatus::Complete(summary) => summary.clone(),
+        WorkRowStatus::Error(error) => format!("failed: {error}"),
+    };
+    let owner_segment = owner_row.map_or(u32::MAX, |owner| owner as u32);
+    let mut children = row
+        .tools
+        .iter()
+        .enumerate()
+        .map(|(tool_index, tool)| {
+            let tool_summary = match &tool.status {
+                WorkRowStatus::Running => "running".to_string(),
+                WorkRowStatus::Complete(summary) => summary.clone(),
+                WorkRowStatus::Error(error) => format!("failed: {error}"),
+            };
+            TranscriptRow {
+                id: TranscriptRowId {
+                    message_id,
+                    path: vec![2, owner_segment, index as u32, 0, tool_index as u32],
+                },
+                kind: TranscriptRowKind::Activity,
+                label: format!("tool {} — {tool_summary}", tool.name),
+                body: Vec::new(),
+                children: Vec::new(),
+                default_expanded: matches!(tool.status, WorkRowStatus::Running),
+            }
+        })
+        .collect::<Vec<_>>();
+    children.extend(
+        activities
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| {
+                child.owner_row == owner_row && child.parent_agent_id == Some(row.agent_id)
+            })
+            .map(|(child_index, _)| {
+                agent_activity_transcript_row(message_id, activities, owner_row, child_index)
+            }),
+    );
+    TranscriptRow {
+        id: TranscriptRowId {
+            message_id,
+            path: vec![2, owner_segment, index as u32],
+        },
+        kind: TranscriptRowKind::Activity,
+        label: format!("{} — {summary}", row.label),
+        body: row.body_lines.clone(),
+        children,
+        default_expanded: matches!(row.status, WorkRowStatus::Running),
+    }
 }
 
 /// Compact activity glyph standing in for a plain assistant prose row.
@@ -1297,6 +1663,68 @@ mod tests {
         assert_eq!(wu.verb, "Channeling");
         assert_eq!(wu.status(), MessageStatus::InProgress);
         assert_eq!(wu.content(), "");
+    }
+
+    #[test]
+    fn test_issue_652_lifecycle_rows_are_nested_idempotent_and_delay_terminal() {
+        let unit = WorkUnit::new("Tools");
+        let spawn = unit.add_row("spawn_agent(root)");
+        unit.complete_row(spawn, "spawned");
+        let root_agent = uuid::Uuid::new_v4();
+        let root_task = uuid::Uuid::new_v4();
+        let nested_task = uuid::Uuid::new_v4();
+        unit.queue_agent_activity(
+            Some(spawn),
+            root_agent,
+            root_task,
+            None,
+            "root task · model",
+        );
+        unit.queue_agent_activity(
+            Some(spawn),
+            uuid::Uuid::new_v4(),
+            nested_task,
+            Some(root_agent),
+            "nested task · model",
+        );
+        unit.start_agent_activity(nested_task);
+        unit.start_agent_tool(nested_task, "read");
+        unit.start_agent_tool(nested_task, "read");
+        unit.complete_agent_tool(nested_task, "read", false);
+        unit.set_complete();
+        assert_eq!(
+            unit.status(),
+            MessageStatus::InProgress,
+            "the WorkUnit must remain mutable until every child lifecycle row is terminal"
+        );
+        unit.finish_agent_activity(nested_task, "completed", vec!["nested done".into()], false);
+        unit.finish_agent_activity(root_task, "completed", vec!["root done".into()], false);
+        unit.finish_agent_activity(root_task, "duplicate", vec!["duplicate".into()], false);
+        assert_eq!(unit.status(), MessageStatus::Complete);
+
+        let projected = unit.transcript_row(&colors()).unwrap();
+        let root = projected.children[spawn]
+            .children
+            .iter()
+            .find(|row| row.label.contains("root task"))
+            .expect("spawn row must own its root child");
+        let nested = root
+            .children
+            .iter()
+            .find(|row| row.label.contains("nested task"))
+            .expect("root child must own its nested child");
+        assert_eq!(
+            nested
+                .children
+                .iter()
+                .filter(|row| row.label.contains("tool read"))
+                .count(),
+            1,
+            "duplicate lifecycle delivery must not duplicate a child-tool row: {nested:?}"
+        );
+        let rendered = unit.complete_transcript(&colors());
+        assert_eq!(rendered.matches("root done").count(), 1);
+        assert!(!rendered.contains("duplicate"));
     }
 
     #[test]
