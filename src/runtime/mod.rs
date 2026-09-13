@@ -2475,6 +2475,24 @@ impl ProgramRuntime {
         })
     }
 
+    /// The agent binding a typed program would be handed, built the same way the execution paths
+    /// build it.
+    ///
+    /// Exists so the agent capability can be tested against a fake `AgentSpawning` rather than a
+    /// real scheduler, which needs a provider resolver, a generator and a Brain client to exist at
+    /// all. The production paths construct this inline; this returns the same thing.
+    #[cfg(test)]
+    pub(crate) fn agent_binding_for_test(
+        &self,
+        caller: Option<agents::AgentIdentity>,
+    ) -> Option<agent_vm::AgentVmBinding> {
+        self.agent_scheduler
+            .read()
+            .expect("agent scheduler lock poisoned")
+            .upgrade()
+            .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, caller))
+    }
+
     pub fn attach_agent_scheduler<S: agents::AgentSpawning + 'static>(&self, scheduler: &Arc<S>) {
         *self
             .agent_scheduler

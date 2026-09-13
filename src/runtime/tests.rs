@@ -7353,3 +7353,189 @@ fn authority_restart_rejects_incomplete_resource_root_lifecycle_audit() {
         .expect_err("audit replay must detect an omitted revocation");
     assert!(format!("{error:#}").contains("replayed audit state"));
 }
+
+/// Tests that the capability inversion made possible.
+///
+/// Before the runtime took its scheduler as `AgentSpawning`, exercising any of this meant building
+/// a real `AgentScheduler`, which needs a provider resolver, a generator, and a Brain client. None
+/// of that is required to check what the runtime does with a child-agent request, so none of it is
+/// here: the fake below records what it was asked and answers immediately.
+#[cfg(test)]
+mod agent_capability {
+    use super::*;
+    use crate::runtime::agents::{
+        AgentIdentity, AgentSpawning, AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec,
+        AgentTaskStatus,
+    };
+    use std::sync::Mutex as StdMutex;
+
+    /// Answers every request without running anything, and remembers what it was asked.
+    struct RecordingSpawner {
+        spawned: StdMutex<Vec<String>>,
+        cancelled: StdMutex<Vec<uuid::Uuid>>,
+        authorized: StdMutex<Vec<(uuid::Uuid, Option<uuid::Uuid>)>>,
+    }
+
+    impl RecordingSpawner {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                spawned: StdMutex::new(Vec::new()),
+                cancelled: StdMutex::new(Vec::new()),
+                authorized: StdMutex::new(Vec::new()),
+            })
+        }
+
+        fn identity(task_id: uuid::Uuid) -> AgentIdentity {
+            AgentIdentity {
+                agent_id: uuid::Uuid::new_v4(),
+                task_id,
+                parent_agent_id: None,
+                root_agent_id: uuid::Uuid::new_v4(),
+                depth: 0,
+                provider_model: "fake/model".into(),
+                vm_revision: 0,
+                manifest_generation: 0,
+                starting_context_hash: String::new(),
+                grant_ceiling: Default::default(),
+                brain_run_id: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSpawning for RecordingSpawner {
+        async fn spawn(
+            &self,
+            spec: AgentTaskSpec,
+            _parent: Option<&AgentIdentity>,
+        ) -> Result<AgentIdentity> {
+            self.spawned.lock().unwrap().push(spec.task.clone());
+            Ok(Self::identity(uuid::Uuid::new_v4()))
+        }
+
+        async fn authorize(
+            &self,
+            task_id: uuid::Uuid,
+            parent: Option<&AgentIdentity>,
+        ) -> Result<()> {
+            self.authorized
+                .lock()
+                .unwrap()
+                .push((task_id, parent.map(|identity| identity.agent_id)));
+            Ok(())
+        }
+
+        async fn poll(&self, task_id: uuid::Uuid) -> Result<AgentTaskSnapshot> {
+            Ok(AgentTaskSnapshot {
+                identity: Self::identity(task_id),
+                task: "recorded".into(),
+                role: Default::default(),
+                status: AgentTaskStatus::Running,
+                result: None,
+            })
+        }
+
+        async fn wait(&self, task_id: uuid::Uuid) -> Result<AgentTaskResult> {
+            Ok(AgentTaskResult {
+                identity: Self::identity(task_id),
+                status: AgentTaskStatus::Completed,
+                final_message: "done".into(),
+                diagnostics: Vec::new(),
+                turns: 1,
+                elapsed_ms: 0,
+            })
+        }
+
+        async fn cancel(&self, task_id: uuid::Uuid) -> Result<()> {
+            self.cancelled.lock().unwrap().push(task_id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unattached_runtime_refuses_a_child_agent_and_says_why() {
+        // The empty slot is a real implementation, not an `Option` every caller unwraps, so the
+        // refusal carries a reason instead of a panic or a silent `None`.
+        let runtime = ProgramRuntime::new();
+        let binding = runtime.agent_binding_for_test(None);
+        assert!(
+            binding.is_none(),
+            "a runtime with no spawner attached must not hand out an agent binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_runtime_routes_a_spawn_to_whatever_was_attached() {
+        // The point of the inversion: this exercises the runtime's agent path with no provider,
+        // no generator and no Brain client anywhere in the test.
+        let runtime = Arc::new(ProgramRuntime::new());
+        let spawner = RecordingSpawner::new();
+        runtime.attach_agent_scheduler(&spawner);
+
+        let binding = runtime
+            .agent_binding_for_test(None)
+            .expect("an attached spawner must produce a binding");
+        let identity = binding
+            .spawn("summarise the log".into())
+            .await
+            .expect("the fake spawner accepts every task");
+
+        assert_eq!(
+            vec!["summarise the log".to_string()],
+            spawner.spawned.lock().unwrap().clone(),
+            "the runtime must pass the task through unchanged"
+        );
+        assert_eq!(
+            "fake/model", identity.provider_model,
+            "the identity returned is the spawner's, not one the runtime invented"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_authorizes_before_it_cancels() {
+        // Order matters: a task the caller does not own must be refused before anything changes.
+        let runtime = Arc::new(ProgramRuntime::new());
+        let spawner = RecordingSpawner::new();
+        runtime.attach_agent_scheduler(&spawner);
+        let binding = runtime.agent_binding_for_test(None).expect("binding");
+
+        let identity = binding.spawn("work".into()).await.expect("spawn");
+        binding.cancel(identity.task_id).await.expect("cancel");
+
+        assert_eq!(
+            vec![identity.task_id],
+            spawner.cancelled.lock().unwrap().clone(),
+            "the cancel must reach the spawner"
+        );
+        assert!(
+            spawner
+                .authorized
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(task, _)| *task == identity.task_id),
+            "cancel must authorize the task first; authorized={:?}",
+            spawner.authorized.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_spawner_is_reported_rather_than_panicking() {
+        // The runtime holds a `Weak`, so a host that shuts its scheduler down mid-session must
+        // produce an error the caller can act on.
+        let runtime = Arc::new(ProgramRuntime::new());
+        let spawner = RecordingSpawner::new();
+        runtime.attach_agent_scheduler(&spawner);
+        let binding = runtime.agent_binding_for_test(None).expect("binding");
+        drop(spawner);
+
+        let refused = binding.spawn("work".into()).await;
+        let message = refused
+            .expect_err("a dropped spawner cannot accept work")
+            .to_string();
+        assert!(
+            message.contains("unavailable"),
+            "the error must name the cause, got {message:?}"
+        );
+    }
+}
