@@ -133,7 +133,9 @@ Declared -> SignatureReady -> BodyTyped -> Lowered
 A job that requires another symbol at a particular phase yields an explicit compiler continuation
 such as `Needs(symbol_id, SignatureReady)`. The scheduler advances the dependency and resumes the
 requester. Generic instantiation creates or reuses a synthetic job keyed by immutable module and
-definition identity plus its type/value arguments. Phase-aware dependency traces distinguish legal
+definition identity, type/value arguments, and resolved concept evidence. That job may emit shared
+evidence-passing IR or a selected concrete specialization; semantic resolution does not require
+code multiplication. Phase-aware dependency traces distinguish legal
 mutual recursion, whose declared signatures break the cycle, from impossible compile-time value or
 layout cycles and report the complete chain with source origins.
 
@@ -439,8 +441,9 @@ generator/coroutine code `dynamic`. `Resume = unit` is the present generator pro
 `require(name, phase) -> Symbol` can later yield a structured compiler request and receive the
 resolved symbol through the same channel. `defer`, `next`, `resume`, `join`, scheduler registration,
 and event-loop handling remain ordinary generated vocabulary/library policies over one runtime
-record, not privileged multi-return conventions. Cursor-backed `stream<T>` remains the simpler
-range abstraction; a resumable producer can be adapted to it through visible library code.
+record, not privileged multi-return conventions. A resumable producer can be adapted to the
+future effectful stream/range concepts through visible library code; it is not the definition of a
+pure synchronous range.
 
 Fibers are not the subagent protocol. A subagent is a separate child `ProgramRun`/agent turn with
 its own private stack, verified module, capability attenuation, budget, ancestry, event journal,
@@ -477,17 +480,48 @@ Definitions may declare signatures, but the compiler derives and validates them.
 signatures are stored in the vocabulary manifest. Unresolved calls, stack-dependent parsing, or
 unsafe reflection prevent proof and require an explicit dynamic/unsafe boundary.
 
+### Future ranges, cursors, and explicit erasure
+
+Ranges are a future source-language/library facility, not a compatibility constraint on the
+current scheduler-owned `stream<T>` handle. Keep a pure synchronous `Range`/`Cursor` family
+separate from `Stream` or `AsyncRange`, whose advancement may suspend, fail, consume a resource, or
+perform host effects. A range adaptor should be an ordinary composed value; it need not allocate a
+producer, own a scheduler record, or erase its concrete type merely because the type is inconvenient
+to spell.
+
+An adaptor may therefore return an opaque existential such as `some Range<Item=T>`. This
+"Voldemort type" hides the private concrete adaptor name from source and module consumers while
+retaining that one concrete type and its static evidence for optimization. It is distinct from
+`dyn Range<Item=T>`, which intentionally erases the concrete type and dispatches through runtime
+evidence. Runtime factories are a primary reason to return `dyn Range<Item=T>` when the selected
+range implementation depends on configuration, a plugin, or another runtime choice.
+
+Start with the smallest useful contracts and add refinements only when algorithms can exploit
+them: forward traversal first, then bidirectional, random-access, sized, or contiguous guarantees
+as independently stated concepts. An adaptor explicitly derives the evidence it preserves. For
+example, `map` may preserve sizing and traversal direction but not contiguity; `filter` may preserve
+forward traversal but not exact size. These derivations use ordinary concept rules and named
+operation mappings, not forests of D-style `static if`, `is(...)`, or
+`__traits(compiles)` probes. Here a range "capability" means refinement evidence, never a Finch
+host capability or authority grant.
+
+Adaptor pipelines can create deeply nested static types and excessive specialization even when no
+individual adaptor is expensive. Provide an explicit erasure/materialization checkpoint that turns
+such a pipeline into a chosen collection, shared cursor representation, or `dyn Range`. Erasure is
+visible in the type and dispatch model; the compiler must not introduce it silently merely to make
+type growth or compilation cost disappear.
+
 ### No privileged collection or iteration overloads
 
 Surface convenience must never create a standard-library-only fast path. A future `for`/`foreach`
-form may be compiler-owned syntax that selects an indexed loop, range loop, fiber pull loop, or
-collection-specific loop during lowering. Each selection must be justified by a public structural
-contract, conceptually `empty?`, `front`, and `pop-front` (or the equivalent `next` contract). A
-user-defined range supplies the same visible typed words and resolves to the same concrete word IDs
-as a built-in range. The optimizer may inline, specialize, fuse, or eliminate allocations after
-that resolution, but it may not recognize only `list`, `map`, or a compiler-owned iterator type
-while treating an equivalent user definition as dynamic dispatch. A user-written `foreach`,
-traversal, or adapter must remain eligible for the same optimizations as syntax supplied by Finch.
+form may be compiler-owned syntax that selects an indexed loop, synchronous range loop, effectful
+stream pull loop, or collection-specific loop during lowering. Each selection must be justified by
+public concept evidence for the required cursor operations and refinements. A user-defined range
+maps those operations to the same stable word identities as a built-in range. The optimizer may
+inline, specialize, fuse, or eliminate allocations after that resolution, but it may not recognize
+only `list`, `map`, or a compiler-owned iterator type while treating equivalent user evidence as
+dynamic dispatch. A user-written `foreach`, traversal, or adaptor must remain eligible for the same
+optimizations as syntax supplied by Finch.
 There is one staged `foreach`, not a separate `static foreach`: when its range and pure body are
 compile-time values, bounded CTFE executes it; when the range is a runtime value, lowering emits the
 ordinary verified range loop. Partial evaluation may specialize known structure and leave residual
@@ -812,23 +846,29 @@ Illustrative syntax:
 
 The intended experience is *statically safe scripting*, not annotation-heavy systems programming.
 Infer literals, locals, parameters, results, stack rows, effects, yields, and generic
-instantiations whenever the program determines them. Private Lisp and Co-Forth definitions should
-normally need no annotations; publication freezes an inferred or explicitly declared stable
-signature. Require annotations at genuinely ambiguous or recursive module interfaces, refinement
-and capability-selector boundaries, and FFI—not merely because the compiler implementation has
-not yet propagated information. Concepts, parameter packs, ranges, overload resolution, and
-bounded CTFE should make routine code feel as direct as Python or JavaScript while retaining one
-static, optimizable execution path. Do not achieve convenience by silently inserting `dynamic`,
-unchecked coercions, or an interpreter-only fallback.
+instantiations whenever the program determines them. Private, non-recursive pure definitions may
+generalize their locally inferred type variables. Apply an effect-aware value restriction: a
+definition that allocates mutable state, captures a capability, suspends, or otherwise has an
+observable effect remains monomorphic unless its type parameters are explicit. Recursive and
+public definitions, effect and capability-selector boundaries, refinements, and FFI require
+declared signatures; publication validates and freezes the declaration rather than exporting an
+accidentally inferred contract. Concepts, parameter packs, ranges, overload resolution, and bounded
+CTFE should make routine code feel as direct as Python or JavaScript while retaining a static,
+optimizable execution path. Do not achieve convenience by silently inserting `dynamic`, unchecked
+coercions, or an interpreter-only fallback.
 
-Inference is deliberately directional rather than global Hindley-Milner constraint solving. An
-initializer or literal establishes a local binding's type; subsequent calls check that known type
-against their parameter contracts. For example, `let foo = 3; bar(foo)` with `bar : string -> ...`
-must diagnose the argument at `bar(foo)`, not infer `foo` backward as `string` and blame `3`.
-Generic type/value arguments are inferred forward from the supplied arguments into one bounded
-specialization. Expected result types may select among already-valid results but must not rewrite
-earlier bindings or cause distant diagnostic locations. This keeps inference incremental, fast,
-and explainable to both humans and models.
+Rust's inference is Hindley-Milner-derived but extends it with traits, regions, coercions, and other
+constraints. CoLisp deliberately chooses a smaller boundary: inference proceeds forward between
+bindings, while expected types flow inward only while checking the current expression. An
+initializer or literal therefore establishes a local binding's type; subsequent calls check that
+known type against their parameter contracts. Expression-local expectations may type an empty
+collection constructor, lambda parameter, or branch when all choices are within that expression.
+They do not select an overload or dispatch mode from its expected result and may not use a later
+statement to revise an earlier binding. For example,
+`let foo = 3; bar(foo)` with `bar : string -> ...` diagnoses the argument at `bar(foo)`, not `3`,
+and does not solve `foo` backward as `string`. Generic type/value arguments likewise flow from
+explicit arguments and supplied values into a bounded instantiation. This keeps inference
+incremental and gives both humans and models a stable primary blame location.
 
 ### Lowering
 
@@ -887,6 +927,117 @@ syntax-as-ordinary-data, not a mandate that every surface syntax look homoiconic
 must pair every convenience spelling with its canonical S-expression and prove structural syntax
 equivalence after ignoring spelling-specific source origins, followed by identical elaborated
 HIR/IR. This is reader notation, not a third `FinchScript` language or frontend.
+
+## Generics, concepts, dispatch, and metaprogramming
+
+Lisp and Co-Forth expose the same facility and equivalent uses lower to equivalent typed IR.
+Concept satisfaction, generic code generation, and call dispatch are separate decisions. A concept
+states required operations and associated types, values, and effects. An implementation explicitly
+maps each requirement to a stable member or free-function identity rather than relying on matching
+source spellings:
+
+```text
+implementation MyListRange<T> : Range {
+    associated Item = T
+    associated Effects = {}
+    operation empty?    = my-list-empty?#41
+    operation front     = my-list-front#73
+    operation pop-front = my-list-pop-front#74
+    dynamic-evidence-version = 1
+}
+```
+
+These spellings are illustrative until the surface grammar is frozen. The declaration is evidence,
+not inherited implementation or an implicit method search. It may publish only static evidence, or
+additionally publish a versioned dynamic evidence table when the concept has a fixed runtime ABI. A
+derive tool may generate the declaration, but the compiler still consumes an explicit mapping
+rather than silently treating matching names as conformance. Exported evidence is named and stable.
+Each requirement has exactly one selected mapping in a compilation context; competing equally valid
+evidence is an ambiguity error, never an import-order decision.
+
+Dispatch mode is explicit in each template or function type contract, independently for every
+argument. `R : Range<Item=T>` has one defined mode—static evidence; `static Range<Item=T>` (or
+concise anonymous-static sugar) spells the same intent directly. `dyn Range<Item=T>` is a distinct
+runtime existential type, while `some Range<Item=T>` is an opaque return whose concrete type is
+hidden but statically fixed. A mixed function may accept one static and one dynamic concept
+argument without generating every static/dynamic combination. The compiler never implicitly cracks
+a `dyn` value to satisfy a static parameter or silently erases a concrete/static value, so one
+argument cannot match both forms; static-to-dynamic erasure is an explicit conversion. A generic
+caller propagates each dispatch mode in its own signature or performs that erasure at its boundary.
+There is no ambient specialization choice.
+
+A generic body is type-checked once, before instantiation, against its declared concepts and
+associated outputs. Its retained parametric HIR records the required evidence operations. A call
+then infers forward from explicit and ordinary arguments, resolves immutable cacheable evidence,
+binds associated types/values/effects, validates remaining arguments, and reuses the checked body.
+Candidate selection must not compile arbitrary bodies to see which one succeeds. D-style
+`static if`, `is(...)`, and `__traits(compiles)` probes, C++-style SFINAE, and unconstrained
+"does this expression compile?" reflection are not the concept-resolution model.
+
+Generic parameters marked `infer` are outputs of evidence resolution rather than variables in a
+global back-solving system. For example, `T : Map<K,V>, infer K, infer V` derives `K` and `V` from
+the selected `Map` implementation, while callable evidence may similarly derive an argument pack,
+result, and effect row.
+
+Static evidence does not require unconditional Rust-style monomorphization. The baseline generic
+body uses one uniform evidence/dictionary ABI: a static argument supplies a constant evidence table
+and a dynamic argument supplies its runtime table. This avoids eagerly producing up to `2^n`
+static/dynamic variants for mixed arguments. The compiler selectively specializes static,
+layout-dependent, or hot combinations when there is a proven benefit; direct calls and constant
+evidence may still be inlined. Cache keys include the generic definition, type/value arguments,
+evidence identities, effects, target, and ABI so identical uses do not repeat semantic work or
+native compilation.
+
+A dynamic concept packages an existential value or generation-checked resource handle with a
+versioned evidence table. Associated types needed by callers are bound, and every exposed operation
+has a dyn-compatible fixed ABI; generic methods, unbound `Self`, or compile-time-layout-dependent
+operations remain static unless explicitly reified through that ABI. Dynamic dispatch is the right
+tool for heterogeneous collections, plugins, and especially runtime factories whose concrete
+result depends on configuration or runtime input. Runtime acquisition such as
+`as-concept(value, Reader<Item=bytes>)` performs an identity-based registry lookup and returns
+`option` or `result`; it never scans method names or treats a failed call as conformance.
+
+Keep three terms distinct. An **overload** is a compile-time choice among declared signatures; a
+concept **implementation** is the explicit requirement-to-callable mapping that produces evidence;
+an **override** is the concrete callable occupying a slot in dynamic evidence. Overload ranking is
+finite and deterministic, using explicit generic/dispatch arguments and already-known argument
+types only; import order and an expected return type never break ties. A concrete value cannot make
+an exact `dyn` signature compete with a static generic because erasure is explicit. Overloads may
+not differ only by result representation or dispatch. If identical inputs support a static adaptor
+returning `some Range` and an erased adaptor or runtime factory returning `dyn Range`, require an
+explicit dispatch argument/type application such as `(map :dispatch static ...)` versus
+`(map :dispatch dyn ...)`, or give the operations distinct names.
+
+Concept evidence conveys behavior, not authority. Possessing a table whose operation eventually
+requests `fs.read<R>` neither creates a capability nor bypasses the broker; its declared effect and
+the caller's actual grant are still independently verified at the host boundary.
+
+Prefer composition in this order: records and functions, modules, closed variants for known
+alternatives, explicit delegation, static concepts, and then dynamic concepts for intentionally
+open runtime sets. Core CoLisp has no class or implementation inheritance. Object identity,
+storage, code reuse, subtyping, construction, and dispatch remain independent facilities, avoiding
+layout diamonds and brittle base-class contracts.
+
+Compile-time reflection exposes immutable `type`, schema, syntax, symbol/module-reference, and
+constraint-evidence values to pure bounded Finch functions. Generics, concepts, compile-time
+branching/traversal, derive operations, and hygienic macros use this one staged evaluation model.
+Generated definitions are structured syntax with expansion provenance and are verified normally;
+string mixins and overlapping special-purpose metaprogramming subsystems are not part of the
+design.
+
+Type-safe variadics follow from this template model rather than using a privileged calling
+convention. A generic definition may bind a type/value parameter pack, inspect or destructure it,
+and traverse its ordered pairs with bounded compile-time `foreach`. Instantiation yields an
+ordinary fixed-arity signature, or explicitly lowers a homogeneous pack to a typed list/range, so
+verification and effect inference see every argument. This is distinct from C ABI `...`, which
+remains an explicitly unsafe FFI boundary behind a typed wrapper.
+
+Constraint construction retains the source span that introduced it, macro invocation and
+definition ancestry, generic definition, chosen evidence, and specialization or dynamic-erasure
+site. A failure reports the nearest actionable expression as primary blame and the shortest
+relevant chain as related spans. Together with span-bearing syntax, expansion ancestry, retained
+typed HIR/IR, and stable diagnostic codes, this makes expanded Lisp debuggable without dumping raw
+macro output or blaming a distant generic declaration.
 
 ## Common typed IR
 
@@ -1419,9 +1570,11 @@ native code
 
 Finch IR is the durable semantic and verification boundary. CLIF is target/backend-oriented and
 normally a rebuildable compilation artifact. Do not serialize CLIF as the program-exchange ABI or
-ask models to generate it. Capability authority is already validated before lowering, but every
-runtime shim call remains capability-bound so malformed or stale native artifacts cannot bypass the
-broker.
+ask models to generate it. Cranelift consumes only verified concrete typed IR or verified shared
+typed IR with explicit evidence parameters; it does not infer source types, resolve concepts, choose
+evidence, or repair an invalid generic instantiation. Capability authority is already validated
+before lowering, but every runtime shim call remains capability-bound so malformed or stale native
+artifacts cannot bypass the broker.
 
 Lowering emits a side metadata table that CLIF alone cannot represent completely. It maps CLIF
 blocks/instructions and resulting native ranges to Finch IR offsets, Lisp/Forth source origins,
@@ -1451,7 +1604,9 @@ tier 2: optional optimized recompilation using profiles and proven specializatio
 Collect per-word call counts, loop back-edge counts, type specialization observations only at
 `dynamic` boundaries, execution time, and deoptimization/trap counts. Compilation happens off the
 execution fast path when practical. Cold, reflective, unsupported, or rapidly changing code stays
-interpreted.
+interpreted. Shared evidence-passing generics remain eligible for tier 1; tier 2 may selectively
+monomorphize layout-dependent or hot evidence/type combinations rather than multiplying code for
+every valid instantiation by default.
 
 ### Native ABI and lowering
 
@@ -1517,7 +1672,7 @@ optimizer work; it is not a Finch Runtime, Brain, or initial Cranelift acceptanc
 distributions over representative programs and never claim parity from one arithmetic benchmark.
 
 The source-language expressiveness target is comparable to TypeScript for ordinary application
-modeling—structural records, closed variants, closures, parametric functions, structural concepts,
+modeling—structural records, closed variants, closures, parametric functions, evidence-based concepts,
 modules, reflection/derivation, asynchronous resources, and ergonomic collection/range composition—
 without JavaScript prototype mutation or `dynamic` as the routine escape hatch. Both Lisp and
 Co-Forth must expose that same typed semantic surface even when Lisp is the more ergonomic human
@@ -1554,8 +1709,9 @@ After the interpreter contract and JIT differential gates are stable, the same v
 may expose a separate `finchc` target. Pure programs may link a minimal runtime and produce ordinary
 standalone executables. Programs with host effects instead link the portable
 `VmSideEffect`/`VmResume` ABI and require a capability-providing embedder. Both modes consume the
-same span-preserving AST/parametric HIR, dependency scheduler, CTFE/monomorphization cache, verified
-stack IR, and source maps; there is no AOT-only source language or trusted model-authored CLIF.
+same span-preserving AST/parametric HIR, dependency scheduler, CTFE/evidence/specialization cache,
+verified stack IR, and source maps; there is no AOT-only source language or trusted model-authored
+CLIF.
 Host selection is explicit. A `none` profile rejects any inferred effect it cannot satisfy; a small
 terminal wrapper may project `session.emit` to stdout/stderr and implement a declared bounded host
 surface; portable or object/library output exposes or leaves unresolved the effect/resume shims for
@@ -1586,46 +1742,6 @@ effects; opaque C pointers remain generation-checked resources. Calling an unver
 passing a raw pointer/integer descriptor, variadic calls, and unchecked shared-memory access require
 an explicit unsafe-FFI capability. The same declarations feed interpreter bindings and Cranelift
 AOT lowering so FFI does not become a second language semantic path.
-
-Compile-time reflection should make immutable `type`, schema, syntax, symbol/module-reference, and
-constraint-evidence values available to pure bounded Finch functions. Generics, concepts,
-compile-time branching/traversal, derive operations, and hygienic macros must all use this one staged
-evaluation model. Generated definitions are structured syntax with expansion provenance and are
-verified normally; string mixins and overlapping special-purpose metaprogramming subsystems are not
-part of the design.
-
-Structural concept resolution produces immutable evidence rather than repeatedly asking the
-compiler whether candidate expressions happen to compile. Once a concrete type's interface is
-resolved, matching a concept yields a cacheable value such as:
-
-```text
-ConceptEvidence {
-    concept: List,
-    concrete: MyList<int>,
-    derived: { R = int },
-    operations: { empty = word#41, front = word#73, pop-front = word#74 }
-}
-```
-
-The evidence gives specialization and inlining concrete word identities and makes ambiguity a
-stable diagnostic rather than an import-order-dependent choice. Generic variables marked `infer`
-are outputs of structural matching over compile-time values, not independent inputs to global type
-deduction. Thus `T : Map<K,V>, infer K, infer V` derives key/value types from `T`, while
-`F : fn(Args...) -> R ! E, infer Args, infer R, infer E` derives a callable's parameter pack,
-return type, and effects. Directional resolution is: apply explicit generic arguments, infer from
-ordinary arguments, resolve and cache concept evidence plus derived outputs, validate remaining
-arguments, then memoize the concrete specialization. It never back-propagates a later call-site
-expectation into an earlier concrete binding.
-
-Type-safe variadics are a required consequence of that general template model, not a privileged
-calling convention. A generic definition may bind a type/value parameter pack, inspect its length,
-index or destructure it, and traverse its ordered type/value pairs with ordinary bounded compile-time
-`foreach`. Instantiation produces an ordinary concrete fixed-arity signature (or deliberately lowers
-a homogeneous pack to a typed list/range), so verification, specialization, inlining, and effect
-inference see every argument. Both Lisp and Co-Forth must be able to define and consume the same pack
-abstraction; built-ins do not receive a variadic facility unavailable to user code. This is distinct
-from C ABI `...`: an `extern` declaration for untyped `va_list`/raw variadics remains an explicitly
-unsafe FFI boundary, while a typed wrapper may use CTFE packs to present a safe Finch interface.
 
 ## Implementation work packages
 
@@ -1768,9 +1884,14 @@ without changing language behavior.
 Every phase adds tests at the layer where its invariant is enforced:
 
 - parser and source-span golden tests for both syntaxes;
-- type inference, unification, stack-row, branch-merge, and loop-invariant tests;
+- type inference, value-restriction, no-cross-binding-back-solving, stack-row, branch-merge, and
+  loop-invariant tests;
+- concept mapping, associated-output, coherence, shared/static-specialized/dynamic dispatch
+  equivalence, and runtime-factory tests;
+- range-refinement preservation, opaque adaptor result, and explicit-erasure tests;
 - effect derivation, selector normalization, containment, intersection, and adversarial path tests;
-- compile-fail fixtures with stable diagnostic codes and spans;
+- compile-fail fixtures with stable diagnostic codes, primary spans, expansion ancestry, and
+  constraint/specialization related spans;
 - transaction rollback, stale revision, suspension/resumption, and external-effect journal tests;
 - child authority attenuation and cross-branch authorization tests;
 - serialization compatibility and corrupted IR/manifest rejection tests;
@@ -1786,6 +1907,16 @@ CI must test the typed runtime with automation unavailable, enabled-but-ungrante
 revoked. JIT-enabled and interpreter-only configurations run the same conformance corpus.
 
 ## Migration and compatibility policy
+
+Before the language reaches a declared stable release, remove discovered semantic warts rather
+than preserving them solely for source compatibility. Most early programs are expected to be
+model-generated, so evolve the specification against a checked-in corpus of LLM-produced programs,
+compile failures, macro expansions, and diagnostic expectations; use that evidence to improve both
+the language and its provider-facing definitions. Release the language as an independently stable
+contract only after that corpus and the conformance gates support stabilization. This freedom does
+not permit silent reinterpretation: stored programs, checkpoints, IR/native caches, module
+interfaces, and provider wire contracts carry explicit language/compiler versions and receive a
+defined migration, rejection, or invalidation path whenever semantics change.
 
 1. Assign every existing builtin a generated typed registry entry before changing execution.
 2. Treat unknown legacy stack signatures/effects as dynamic and unclassified, never pure.
