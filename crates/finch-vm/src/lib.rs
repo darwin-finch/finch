@@ -10,6 +10,7 @@ mod frontend;
 mod interpreter;
 mod ir;
 mod language;
+mod lisp;
 #[cfg(test)]
 mod migration;
 mod runtime;
@@ -37,11 +38,12 @@ pub use frontend::forth::{compile_forth, compile_forth_with_functions};
 pub use frontend::lisp::{compile_lisp, compile_lisp_with_functions};
 pub use interpreter::instantiate_requirement;
 pub use interpreter::{
-    CapabilityHandler, HostSideEffect, UiOperation, UiProgress, VmContinuation, VmFrame,
-    VmSideEffect, VmStep, VmTrampoline,
+    CapabilityHandler, HostSideEffect, InterpreterConfig, UiOperation, UiProgress, VmContinuation,
+    VmFrame, VmSideEffect, VmStep, VmTrampoline,
 };
 pub use ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
 pub use language::ProgramLanguage;
+pub use lisp::{parse_math, parse_str, parse_str_spanned, SpannedVal, Val};
 pub use runtime::{
     EffectJournalEntry, EffectJournalState, PendingHostCall, ProducerFiberRecord,
     ProducerFiberState, TypedExecution, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,

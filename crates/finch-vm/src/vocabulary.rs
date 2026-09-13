@@ -1723,7 +1723,7 @@ mod tests {
     #[test]
     fn language_schema_advertises_every_core_capability_kind() {
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../../vocabulary/language/schema.json")).unwrap();
+            serde_json::from_str(include_str!("../../../vocabulary/language/schema.json")).unwrap();
         let advertised = schema["$defs"]["capability"]["properties"]["capability"]["enum"]
             .as_array()
             .unwrap()

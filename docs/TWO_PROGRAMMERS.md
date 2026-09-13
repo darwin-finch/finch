@@ -102,7 +102,7 @@ See `src/tools/permissions.rs` for the implementation. Key invariants are tested
 ## Stack-Effect Proofs
 
 Built-in word contracts are machine-checked by the typed VM's stack-effect
-signatures in `src/vm`. A definition declares its effect and the verifier
+signatures in `crates/finch-vm`. A definition declares its effect and the verifier
 enforces it:
 
 ```forth

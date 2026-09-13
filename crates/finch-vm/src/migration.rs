@@ -1,7 +1,7 @@
 //! Report-only compatibility checks for source written for older Finch runtimes.
 
-use crate::vm::frontend::forth::compile_forth;
-use crate::vm::verifier::Vocabulary;
+use crate::frontend::forth::compile_forth;
+use crate::verifier::Vocabulary;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +61,7 @@ pub fn audit_forth_sources<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::core_vocabulary;
+    use crate::core_vocabulary;
 
     #[test]
     fn audit_is_report_only_and_groups_stable_diagnostic_codes() {

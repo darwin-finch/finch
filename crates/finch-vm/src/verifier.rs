@@ -1362,10 +1362,10 @@ fn describe_stack(stack: &[Type]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::effects::{CapabilityRequirement, FileOperation, FileSelector};
-    use crate::vm::ir::{BasicBlock, LocatedInstruction};
-    use crate::vm::signature::ControlEffect;
-    use crate::vm::types::TypedValue;
+    use crate::effects::{CapabilityRequirement, FileOperation, FileSelector};
+    use crate::ir::{BasicBlock, LocatedInstruction};
+    use crate::signature::ControlEffect;
+    use crate::types::TypedValue;
 
     fn core_vocabulary() -> Vocabulary {
         let stack = |input, output| {
@@ -1714,7 +1714,7 @@ mod tests {
             )]),
         };
         let module = Module {
-            version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            version: crate::VM_TYPE_SYSTEM_VERSION,
             name: "composition".into(),
             entry: "main".into(),
             functions: BTreeMap::from([("main".into(), caller), ("save".into(), callee)]),

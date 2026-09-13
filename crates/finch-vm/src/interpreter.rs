@@ -2473,10 +2473,10 @@ fn runtime_underflow(origin: &SourceOrigin, trace: Vec<String>) -> VmDiagnostic 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::ir::{BasicBlock, Function, LocatedInstruction, Module};
-    use crate::vm::signature::{StackRow, StackSignature};
-    use crate::vm::types::Type;
-    use crate::vm::{core_vocabulary, Verifier};
+    use crate::ir::{BasicBlock, Function, LocatedInstruction, Module};
+    use crate::signature::{StackRow, StackSignature};
+    use crate::types::Type;
+    use crate::{core_vocabulary, Verifier};
     use std::collections::BTreeMap;
 
     #[derive(Default)]
@@ -2647,8 +2647,8 @@ mod tests {
 
     #[test]
     fn every_pure_core_word_has_an_interpreter_implementation() {
-        for (name, spec) in crate::vm::vocabulary::core_word_registry() {
-            if spec.implementation != crate::vm::vocabulary::CoreWordImplementation::Interpreter {
+        for (name, spec) in crate::vocabulary::core_word_registry() {
+            if spec.implementation != crate::vocabulary::CoreWordImplementation::Interpreter {
                 continue;
             }
             let mut stack = Vec::new();
@@ -2706,7 +2706,7 @@ mod tests {
 
     #[test]
     fn trampoline_yields_output_and_keeps_the_rest_as_vm_state() {
-        let module = crate::vm::frontend::forth::compile_forth(
+        let module = crate::frontend::forth::compile_forth(
             "stream.forth",
             "s\"before\" say 2 3 + int-to-string say",
             Vec::new(),
@@ -2744,7 +2744,7 @@ mod tests {
 
     #[test]
     fn trampoline_yields_capability_request_then_resumes_with_typed_values() {
-        let module = crate::vm::frontend::forth::compile_forth(
+        let module = crate::frontend::forth::compile_forth(
             "await.forth",
             "s\"Cargo.toml\" path file-read",
             Vec::new(),
@@ -2780,7 +2780,7 @@ mod tests {
         let network = CapabilityRequirement {
             capability: CapabilityKind::NetworkConnect,
             selector: ResourceSelector::NetworkTemplate {
-                template: crate::vm::effects::NetworkSelectorTemplate {
+                template: crate::effects::NetworkSelectorTemplate {
                     host_argument: 0,
                     port_argument: 1,
                     allowed_hosts: vec!["example.test".into()],
@@ -2807,7 +2807,7 @@ mod tests {
         let process = CapabilityRequirement {
             capability: CapabilityKind::ProcessRun,
             selector: ResourceSelector::ProcessTemplate {
-                template: crate::vm::effects::ProcessSelectorTemplate {
+                template: crate::effects::ProcessSelectorTemplate {
                     executable_argument: 0,
                     allowed_executables: vec!["git".into()],
                 },
@@ -2825,7 +2825,7 @@ mod tests {
 
     #[test]
     fn source_yield_suspends_without_exposing_a_continuation_value() {
-        let module = crate::vm::frontend::forth::compile_forth(
+        let module = crate::frontend::forth::compile_forth(
             "yield.forth",
             "1 unit yield 2 +",
             Vec::new(),
@@ -2850,7 +2850,7 @@ mod tests {
 
     #[test]
     fn lisp_yield_is_a_statement_expression_with_unit_type() {
-        let module = crate::vm::frontend::lisp::compile_lisp(
+        let module = crate::frontend::lisp::compile_lisp(
             "yield.lisp",
             "(begin (yield nil) (+ 1 2))",
             Vec::new(),
@@ -2873,14 +2873,14 @@ mod tests {
 
     #[test]
     fn both_frontends_publish_the_same_typed_yield_payload() {
-        let forth = crate::vm::frontend::forth::compile_forth(
+        let forth = crate::frontend::forth::compile_forth(
             "producer.forth",
             "7 yield 8",
             Vec::new(),
             &core_vocabulary(),
         )
         .unwrap();
-        let lisp = crate::vm::frontend::lisp::compile_lisp(
+        let lisp = crate::frontend::lisp::compile_lisp(
             "producer.lisp",
             "(begin (yield 7) 8)",
             Vec::new(),
