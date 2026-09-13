@@ -2686,7 +2686,7 @@ pub(super) struct ProcessExecutableIdentity {
     device: u64,
     inode: u64,
     pub(super) arguments: Vec<String>,
-    environment_sha256: String,
+    pub(super) environment_sha256: String,
     pub(super) cwd_path: String,
     cwd_device: u64,
     cwd_inode: u64,
