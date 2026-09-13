@@ -184,6 +184,37 @@ When explicitly enabled, remote Brain collaboration uses a distinct TLS listener
 default is `0.0.0.0:11436`. That listener exposes a restricted Brain route set; it is not the
 OpenAI-compatible endpoint.
 
+#### Using the daemon as a local provider proxy
+
+`POST /v1/chat/completions` accepts OpenAI-shaped requests and answers them through whichever
+provider Finch is configured to use, so any tool that speaks that shape can reach every provider
+Finch can reach, without running a second service.
+
+That translation is not built for the proxy. Finch already converts between provider wire formats
+because it drives several from one interface; the endpoint is that existing code with a different
+front door. It is the same job a standalone proxy such as LiteLLM does, and the reason it is nearly
+free here is that the hard part already had to exist.
+
+Point a client at the daemon's address — `127.0.0.1:8000` for `finch daemon`, `127.0.0.1:11435` for
+the background daemon, or whatever `server.bind_address` says.
+
+**It is unauthenticated by default.** `server.auth_enabled` is `false` out of the box, which means
+any caller that can reach the port can spend your provider quota. To require a key, set this in
+`~/.finch/config.toml`:
+
+```toml
+[server]
+auth_enabled = true
+api_keys = ["your-key-here"]
+```
+
+Exactly one non-empty key is accepted; the daemon refuses to start with zero or several. Callers
+send it as `Authorization: Bearer your-key-here`. The key is stored in plaintext in that file, so
+its protection is the file's permissions and nothing more.
+
+The endpoint is a compatible surface, not the complete OpenAI API, and provider coverage through it
+is exactly Finch's provider coverage — which is configuration, not conformance evidence.
+
 ### MCP client
 
 Finch can start configured stdio MCP servers and import their tools. It does not expose an MCP
