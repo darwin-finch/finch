@@ -110,8 +110,7 @@ see the [release process](CONTRIBUTING.md#release-process) and open work on sign
 [#144](https://github.com/darwin-finch/finch/issues/144)), the Brain test launchers and isolation
 harness, and the [Cargo slot wrapper](.agents/skills/finch-backlog/scripts/with-cargo-slot).
 
-**Excluded**: `docs/archive/` (history) and `src/evolution/`, which is tracked but never compiled
-([#471](https://github.com/darwin-finch/finch/issues/471)).
+**Excluded**: `docs/archive/` (history).
 
 ## Dependencies
 
