@@ -1343,6 +1343,19 @@ Macro execution has explicit fuel, recursion, and allocation limits. Expansion p
 generated forms back to both macro invocation and macro definition. A macro cannot hide effects:
 the expanded IR is what the verifier analyzes.
 
+An expansion may emit ordinary type, callable, and concept-implementation declarations. This is
+how a derive macro can generate serialization code *and* publish the explicit evidence that the
+record satisfies `JsonSerializable`; generating methods with familiar names is never sufficient.
+Generated implementations enter the same post-expansion name-resolution, coherence, visibility,
+effect, and verification passes as handwritten ones. Hygiene gives generated helper callables stable
+private identities, so two derives may both implement an operation spelled `serialize` without
+creating a global-name collision. Diagnostics retain both the derive invocation and generated
+implementation origins.
+Each generated implementation/evidence binding also receives a stable module-qualified identity.
+Two expansions that publish the same evidence identity are a duplicate-definition error; differently
+named implementations for the same concept and concrete type remain distinct and make unqualified
+ambient resolution ambiguous. Expansion or import order never replaces or selects evidence.
+
 Classic S-expressions remain one exact, canonical structural reader, not a requirement that every
 human-facing Lisp spelling pay the full parenthesis cost. Later expression/indentation/call sugar
 may provide forms such as `foo(a, b + c)`, but the reader must convert each convenience spelling
@@ -1379,6 +1392,27 @@ derive tool may generate the declaration, but the compiler still consumes an exp
 rather than silently treating matching names as conformance. Exported evidence is named and stable.
 Each requirement has exactly one selected mapping in a compilation context; competing equally valid
 evidence is an ambiguity error, never an import-order decision.
+
+Operation names live in their concept evidence rather than one shared method namespace. For
+example, independent derives may map both `JsonSerializable.serialize` and
+`BinarySerializable.serialize` for the same record to different hygienic callables. Static code
+selects the intended evidence explicitly with a concept-qualified operation or a named evidence
+argument; it does not need to erase or cast the value merely to disambiguate a name:
+
+```text
+JsonSerializable.serialize(user) using UserJson
+BinarySerializable.serialize(user) using UserBinary
+```
+
+Erasing `user` as `dyn JsonSerializable using UserJson` is the corresponding deliberate runtime-
+dispatch choice: the erasure site names the evidence, policy, or wrapper type, and the resulting
+existential carries `UserJson`'s evidence table, so its `serialize` slot is
+unambiguous. A runtime checked `as-concept` lookup serves an already erased/dynamic value whose
+concrete evidence is not statically known; it is not ordinary static overload resolution. If a type
+has several implementations of the *same* concept (for example canonical and compact JSON), none is
+ambiently preferred: the caller must supply a named implementation, policy value, or wrapper type,
+including at a dynamic-erasure site. The expected result type, generated helper spelling, and import
+order never choose between them.
 
 Dispatch mode is explicit in each template or function type contract, independently for every
 argument. `R : Range<Item=T>` has one defined mode—static evidence; `static Range<Item=T>` (or
@@ -2366,6 +2400,9 @@ Every phase adds tests at the layer where its invariant is enforced:
   loop-invariant tests;
 - concept mapping, associated-output, coherence, shared/static-specialized/dynamic dispatch
   equivalence, and runtime-factory tests;
+- derive-macro tests proving generated explicit concept evidence, hygienic same-named operations,
+  concept-qualified static selection, named same-concept ambiguity resolution, and equivalent
+  `dyn` evidence-table dispatch;
 - paired CoLisp/Co-Forth ownership cases for borrowing, unique moves, use-after-move diagnostics,
   shared retain/final release, weak upgrade, destructor ordering, owner variance, and static/dynamic
   carrier evidence;
