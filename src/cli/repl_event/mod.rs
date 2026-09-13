@@ -39,8 +39,12 @@ pub mod query_state;
 pub mod tool_display;
 pub mod tool_execution;
 
+// `EventLoop::new` takes these, so a caller outside this module has to be able to name them.
 pub use event_loop::EventLoop;
 pub use events::{ConfirmationResult, LlmRequest, ReplEvent};
 pub use llm_loop::LlmLoop;
+pub use parts::{
+    ContextLimits, DaemonParts, GenerationParts, RuntimeParts, SessionParts, ToolParts, UiParts,
+};
 pub use query_state::{QueryMetadata, QueryState, QueryStateManager};
 pub use tool_execution::ToolExecutionCoordinator;

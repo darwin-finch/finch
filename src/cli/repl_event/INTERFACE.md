@@ -12,6 +12,10 @@ Everything below is what callers outside this module can reach. Implementation m
 ```rust
 /// Result of a tool execution confirmation prompt
 pub enum ConfirmationResult { ApproveOnce, ApproveExactSession, ApprovePatternSession, ApproveExactPersistent, ApprovePatternPersistent, ApproveWithInput, Deny }
+/// How much history to carry, and when to compact it.
+pub struct ContextLimits { … }
+/// How this frontend reaches a daemon, and why it could not.
+pub struct DaemonParts { … }
 /// Main event loop for concurrent REPL
 pub struct EventLoop { … }
 impl EventLoop {
@@ -20,6 +24,8 @@ impl EventLoop {
     /// Create a new event loop with unified generators
     pub fn new(session: crate::cli::repl_event::parts::SessionParts, generation: crate::cli::repl_event::parts::GenerationParts, ui: crate::cli::repl_event::parts::UiParts, tools: crate::cli::repl_event::parts::ToolParts, daemon: crate::cli::repl_event::parts::DaemonParts, limits: crate::cli::repl_event::parts::ContextLimits, runtime: crate::cli::repl_event::parts::RuntimeParts) -> Self;
 }
+/// What produces tokens, and which provider is currently chosen.
+pub struct GenerationParts { … }
 /// LLM worker loop — owns AI generation concerns, runs as its own Tokio task.
 pub struct LlmLoop { … }
 impl LlmLoop {
@@ -73,6 +79,10 @@ impl QueryStateManager {
 }
 /// Events that flow through the REPL event loop
 pub enum ReplEvent { UserInput, QueryComplete, QueryFailed, ToolResult, ToolCallsStarted, ToolApprovalNeeded, VmApprovalNeeded, OutputReady, VmEffect, VmOutputComplete, VmEffectJournalComplete, TypedProgramComplete, StreamingComplete, StatsUpdate, AgentLifecycle, CancelQuery, Shutdown, ShowDialog, PosetComplete, LispResult, RemoteBrainMessage, RemoteBrainError, RemoteBrainDisconnected, HomeBrainMessage, HomeBrainWatchFailed, ReconnectHomeBrain, ReconnectHomeRunner, RunnerLeaseStatus, NamedBrainProgramRequested, NamedBrainTurnRequested, NamedBrainMemoryProjectionRequested, NamedBrainRunCancelRequested, NamedBrainProgramFinished, FrontendRestartReady }
+/// What executes typed programs and remembers.
+pub struct RuntimeParts { … }
+/// Who is talking, as what, and in which mode.
+pub struct SessionParts { … }
 /// Coordinates concurrent tool execution for the event loop
 pub struct ToolExecutionCoordinator { … }
 impl ToolExecutionCoordinator {
@@ -85,6 +95,10 @@ impl ToolExecutionCoordinator {
     /// Wire the Co-Forth poset so every tool call auto-records a trace node.
     pub fn with_poset(mut self, poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>) -> Self;
 }
+/// Tools the model may call, and the task list it keeps.
+pub struct ToolParts { … }
+/// Everything that draws.
+pub struct UiParts { … }
 ```
 
 ## Modules
