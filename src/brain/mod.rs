@@ -2334,9 +2334,18 @@ mod isolation_tests {
         let proof = isolated_test_proof().unwrap();
         let outside = proof.socket_root.join("outside.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&outside).unwrap();
-        let socket = proof.ipc_socket.clone();
+        // Not `proof.ipc_socket`: the supervisor binds that path before this process starts, so
+        // `symlink` there fails with `AlreadyExists` and the assertion below never runs. The
+        // validator accepts any path inside the socket root, so a name this test owns proves the
+        // same thing — that a socket path which is really a symlink is refused.
+        let socket = proof.socket_root.join("candidate.sock");
         std::os::unix::fs::symlink(&outside, &socket).unwrap();
-        assert!(validate_isolated_test_socket(&proof, &socket).is_err());
+        let rejected = validate_isolated_test_socket(&proof, &socket);
+        assert!(
+            rejected.is_err(),
+            "a symlinked socket path must be refused, got {:?}",
+            rejected.map(|identity| format!("{identity:?}"))
+        );
     }
 
     #[test]
