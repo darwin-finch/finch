@@ -312,7 +312,7 @@ cp \"$1\" \"$FINCH_WRITE_CAPTURE\"\n\
 test ! -x \"$1\"\n\
 case \"$FINCH_WRITE_ACTION\" in\n\
   accept) : ;;\n\
-  cancel) sed 's/# finch: action=execute/# finch: action=cancel/' \"$1\" > \"$1.next\"; cp \"$1.next\" \"$1\" ;;\n\
+  cancel|ambiguous-header-line) sed 's/# finch: action=execute/# finch: action=cancel/' \"$1\" > \"$1.next\"; cp \"$1.next\" \"$1\" ;;\n\
   chat) printf '# finch: action=chat\\n# ---- Finch proposal body ----\\nprintf owned > %s\\n' \"$FINCH_WRITE_CANARY\" > \"$1\" ;;\n\
   body-change) printf '\\n+not-reviewed\\n' >> \"$1\" ;;\n\
   concurrent-change) printf 'somebody else changed it\\n' > \"$FINCH_WRITE_TARGET\" ;;\n\
@@ -571,13 +571,7 @@ fn test_write_tool_reviews_plaintext_and_never_executes_editor_text() {
         });
         let fidelity_refusal = matches!(
             case,
-            "tab"
-                | "control"
-                | "crlf"
-                | "binary"
-                | "long-line"
-                | "oversized"
-                | "ambiguous-header-line"
+            "tab" | "control" | "crlf" | "binary" | "long-line" | "oversized"
         );
         let artifact = if fidelity_refusal {
             assert!(
@@ -592,13 +586,15 @@ fn test_write_tool_reviews_plaintext_and_never_executes_editor_text() {
                     String::from_utf8_lossy(&output.stderr)
                 )
             });
-            assert!(
-                artifact.contains("--- ")
-                    && artifact.contains("+++ ")
-                    && artifact.contains("+model content")
-                    && artifact.contains("+# finch: action=cancel"),
-                "{case}: reviewer must receive the model's exact content as a readable diff.\nArtifact:\n{artifact}"
-            );
+            if case != "ambiguous-header-line" {
+                assert!(
+                    artifact.contains("--- ")
+                        && artifact.contains("+++ ")
+                        && artifact.contains("+model content")
+                        && artifact.contains("+# finch: action=cancel"),
+                    "{case}: reviewer must receive the model's exact content as a readable diff.\nArtifact:\n{artifact}"
+                );
+            }
             assert!(
                 !artifact.contains("base64")
                     && !artifact.contains("python3")
@@ -705,15 +701,27 @@ fn test_write_tool_reviews_plaintext_and_never_executes_editor_text() {
                 );
             }
             "ambiguous-header-line" => {
-                assert_eq!(
-                    result["ok"], false,
-                    "{case}: an incomplete diff must fail: {result}"
+                let artifact = artifact.unwrap_or_else(|| {
+                    panic!("{case}: editor must open for a faithful header-looking removal")
+                });
+                assert!(
+                    artifact.contains("--- ") && artifact.contains("+++ "),
+                    "{case}: file-header --- / +++ must still be present.\nArtifact:\n{artifact}"
                 );
-                assert!(detail.contains("review would"), "{case}: {detail}");
+                assert!(
+                    artifact.contains("-- removed source comment"),
+                    "{case}: the removed '-- ' line must appear in the review; FileDiff used to \
+                     drop it as a second file header.\nArtifact:\n{artifact}"
+                );
+                assert_eq!(
+                    result["ok"], true,
+                    "{case}: cancelling a faithful header-looking review should return normally: {result}"
+                );
+                assert!(detail.contains("aborted by user"), "{case}: {detail}");
                 assert_eq!(
                     fs::read_to_string(&target).unwrap(),
                     "keep\n-- removed source comment\nend\n",
-                    "{case}: refusing an ambiguous diff must preserve the source"
+                    "{case}: cancelling must preserve the source, including the '-- ' line"
                 );
             }
             "tab" | "control" | "crlf" | "binary" => {
