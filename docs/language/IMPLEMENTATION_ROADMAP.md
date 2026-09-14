@@ -123,6 +123,14 @@ Goal: freeze the semantic shapes on which later features depend.
 
 - Implement #66 (typed modules and immutable interfaces), #68 (bounded directional inference), and
   #67 (dependency-driven semantic jobs) on the shared pipeline.
+- Make imports ordinary lexical declarations with whole-module, namespace-alias, selective, and
+  renamed forms; local visibility begins at the declaration and never creates runtime loading or
+  ambient authority.
+- Intern immutable module identities and deduplicate parse/semantic jobs and verified artifacts by
+  versioned content/dependency keys; repeated scoped imports create binding views, not recompilation.
+- Keep modules immutable and make runtime state an explicit owned instance; provide at-most-once
+  initialization through a library `Once<T>`/service policy with explicit lifetime, failure,
+  cancellation, effect, and suspension semantics.
 - Establish nominal records, variants, tuples, callable contracts, layouts, sequence/text values,
   patterns, structured diagnostics, and module compatibility hashes.
 - Implement [#674 (ownership, placement, deterministic drop, and safety profiles)](https://github.com/darwin-finch/finch/issues/674)

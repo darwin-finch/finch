@@ -169,6 +169,144 @@ a module links its declared interface/IR; it does not paste source, execute ambi
 or confer capabilities. Self-contained model-authored scripts remain the default when an import
 would make an artifact harder to audit.
 
+An import is an ordinary lexical declaration wherever declarations are allowed, including inside a
+function, quotation body, compile-time function, or nested block. It is not restricted to a special
+module header and is never a runtime call. A local import affects only the containing lexical scope
+and its descendants, beginning after the declaration appears; it cannot be forward-referenced from
+an earlier expression. A declaration inside a conditional branch is still an unconditional
+compile-time dependency whose names are visible only in that branch's lexical block—it does not
+perform conditional runtime loading. Module-level imports participate in the module declaration
+frontier and may be resolved without source-order significance.
+
+Imports have three explicit binding forms:
+
+```text
+whole module       import codec.json
+namespace alias    import codec.json as json
+selected names     from codec.json import encode, decode as decode-json
+```
+
+A whole-module import makes its public names available as imported candidates and retains a
+qualified module binding. A namespace alias exposes only the qualified alias. A selective import
+binds only the listed exported symbol identities or overload groups, optionally renamed. Selection
+can name functions, types, concepts, evidence, syntax transforms, or compile-time values; their
+phase and type remain those published by the immutable interface. There is no textual wildcard
+expansion, runtime reflection search, or import inferred merely because an unresolved spelling
+happens to exist in a dependency.
+
+Name resolution searches direct lexical declarations before imported candidates, and searches
+imports from the innermost lexical scope outward. Two imported candidates in the same selected
+scope are an ambiguity regardless of import order; qualification, selection, or renaming resolves
+it. An inner scoped import may hide an outer imported candidate but never silently replaces a direct
+local binding. Operator/concept coherence remains stricter: loading a module does not make all of
+its evidence ambient, and operator-default evidence still requires the explicit/default selection
+rules described below.
+
+Every reached import records the exact immutable module/interface identity and phase dependency in
+the semantic job graph and sealed module. Local scope reduces name pollution and compiler working
+context; it does not hide a dependency from hashing, cycle detection, reproducibility, capability
+review, or diagnostics. An imported binding captured by a closure is a stable symbol/module
+reference, not a runtime captured module object. Local imports cannot be re-exported; public
+re-export is an explicit module-scope interface declaration.
+
+Import resolution never behaves like textual `#include`. The compiler service interns one module
+identity and deduplicates concurrent requests for it. Source bytes are read into a parsed module at
+most once per `(content hash, source language, reader version)` cache key; elaborated interfaces,
+verified parametric artifacts, and `ModuleVerified` results use successively stronger keys that also
+include compiler semantics, dependency interfaces/evidence, target-independent policy, and relevant
+feature versions. Ten whole, aliased, or selective imports therefore create ten scoped binding views
+over one immutable module artifact, not ten copies, parses, semantic jobs, allocations, or module
+instances.
+
+An in-flight module job is shared: later importers await its declared phase rather than starting a
+duplicate parse or compiler pipeline. A completed artifact may be memory-resident, memory-mapped, or
+reloaded from a content-addressed cache without changing identity. Eviction affects performance only.
+Changed source, compiler semantics, dependency interface, or evidence invalidates the appropriate
+downstream artifact; it never mutates an old imported module in place. A remote or persisted
+`ModuleVerified` artifact is independently validated before reuse. Scoped import is therefore a
+name-reachability operation over cached immutable compilation data, not ownership of an allocated
+runtime module.
+
+Canonical paired spellings are:
+
+```lisp
+(define (encode-user user)
+  (begin
+    (import codec.json :as json)
+    (json/encode user)))
+
+(define (read-user text)
+  (begin
+    (from codec.json :import (decode (JsonError :as DecodeError)))
+    (decode text)))
+```
+
+```forth
+: encode-user ( S borrow User -- S string )
+  import: codec.json as json ;
+  json.encode
+;
+
+: read-user ( S borrow string -- S User ) throws DecodeError
+  from: codec.json import{ decode JsonError as DecodeError } ;
+  decode
+;
+```
+
+Both frontends construct the same scoped `ImportDeclaration` semantic node. The exact surface may
+be refined with the grammar, but must preserve whole-module, alias, selective, renamed, lexical
+scope, source-order, and phase behavior without source-to-source rewriting.
+
+An imported module is immutable code and interface identity, not an implicitly created process
+singleton. Module constants whose initializers are pure, bounded, and compile-time-known are folded
+into the sealed artifact. Mutable or effectful runtime state is constructed explicitly and has an
+ordinary owner. A module can export `new-state`, a service constructor, or functions accepting a
+borrowed/shared state record; importing those functions at ten lexical sites neither constructs ten
+states nor secretly selects one global state.
+
+At-most-once initialization is a standard-library ownership/synchronization policy rather than an
+import side effect. Conceptually:
+
+```lisp
+(record CodecState
+  (:service (Once CodecService)))
+
+(define (new-codec-state)
+  (CodecState :service (once-cell)))
+
+(define (codec (state : (borrow CodecState)))
+  (once-get-or-init (. state service)
+    (lambda () (open-codec-service))))
+```
+
+```forth
+record: CodecState fields{ service: Once<CodecService> } ;
+
+: new-codec-state ( S -- S CodecState )
+  Once<CodecService>{} CodecState{ service: }
+;
+
+: codec ( S borrow CodecState -- S borrow CodecService )
+  .service [ open-codec-service ] once-get-or-init
+;
+```
+
+The application, actor, test, or explicit module-instance record owns `codec-state` and shares that
+owner with the functions that require the same initialization domain. A host may offer an explicit
+runtime service registry keyed by immutable module/service identity when process- or Brain-scoped
+singleton behavior is genuinely required, but acquiring it is a typed host effect and dependency,
+not a consequence of name lookup. This makes “once per process,” “once per Brain,” “once per task,”
+and “once per explicit instance” distinguishable rather than accidental.
+
+`Once<T>` has a specified concurrent state machine: empty, initializing, ready, or terminal under a
+chosen failure policy. Waiters park through the resumable scheduler rather than spin; recursive
+initialization reports a dependency cycle. Retry-after-failure, memoized failure, cancellation
+handoff, and suspending versus non-suspending initializers are explicit policies. The initializer's
+effects, exceptions, capabilities, and suspension remain visible in the calling contract. The
+stored value drops when its owning cell/service instance drops, not at an unspecified module-unload
+phase. `Once<T>` can therefore be implemented as a library owner/synchronization type over the
+language's atomics, drop, and suspension primitives without compiler-owned module constructors.
+
 Semantic analysis should be dependency-driven rather than implemented as repeated whole-module
 passes. As soon as the parser publishes a stable declaration/body node, its symbol may own a bounded
 semantic job even while later source is still being parsed. A job blocked on a later declaration
@@ -1444,7 +1582,7 @@ the same nodes without source-to-source CoLisp generation.
 | Semantic form | CoLisp | Co-Forth | Semantic construction / IR family |
 |---|---|---|---|
 | module identity | `(module name ...)` | `module: name ... ;` | module declaration, no runtime instruction |
-| immutable import/export | `(import ref ...)`, `(export ...)` | `import: ref { ... } ;`, `export: ... ;` | resolved module/symbol identity |
+| immutable import/export | lexical `(import ref ...)`, `(from ref :import ...)`, `(export ...)` | lexical `import: ref ;`, `from: ref import{ ... } ;`, `export: ... ;` | scoped import declaration and resolved module/symbol identity |
 | record/layout | `(record Foo ...)` | `record: Foo repr(...) fields{ ... } ;` | record schema/layout |
 | record construction/projection | `(Foo :x a :y b)`, `(. value x)` | `Foo{ x: a y: b }`, `value .x` | `RecordNew`, `FieldGet`/borrow projection |
 | closed variant | `(variant Result ...)`, `(ok value)` | `variant: Result cases{ ... } ;`, `value Ok{}` | `VariantNew` |
@@ -3791,6 +3929,16 @@ Every phase adds tests at the layer where its invariant is enforced:
 - foreign-frontend tests that use the versioned builder protocol without source-to-source text or
   direct HIR construction, preserve original spans through diagnostics, and produce IR equivalent
   to native frontends;
+- module-import tests for module/function/block scope, visibility only after a local declaration,
+  whole/qualified/selective/renamed bindings, direct-local precedence, same-scope ambiguity,
+  explicit evidence selection, macro/CTFE phases, branch lexical scope, non-reexport of local
+  imports, immutable dependency hashing/cycles, one parse/job under repeated and concurrent imports,
+  cache eviction/reload equivalence, precise invalidation, independent artifact validation, and
+  absence of runtime initialization or authority;
+- initialization tests proving repeated imports construct no runtime state, explicit instances have
+  independent lifetimes, shared `Once<T>` owners initialize exactly once under contention, recursive
+  initialization diagnoses a cycle, each failure/cancellation policy is deterministic, effects and
+  suspension remain visible, and final state drops with its owner rather than module unloading;
 - type inference, value-restriction, no-cross-binding-back-solving, stack-row, branch-merge, and
   loop-invariant tests;
 - paired CoLisp/Co-Forth grammar fixtures for every parity-ledger row, each comparing semantic nodes,
