@@ -1,9 +1,9 @@
 use super::fiber::CpuFiberScheduler;
-use super::frontend::{forth::compile_forth_with_functions, lisp::compile_lisp_with_functions};
 use super::interpreter::{
     CapabilityHandler, HostSideEffect, InterpreterConfig, VmContinuation, VmSideEffect, VmStep,
     VmTrampoline,
 };
+use crate::{compile_forth_with_functions, compile_lisp_with_functions};
 use finch_vm_core::{
     core_vocabulary, CapabilityKind, CapabilityRequirement, DiagnosticPhase, EffectSet, Function,
     Module, ProgramLanguage, SourceOrigin, StackSignature, TaskKind, Type, TypedValue,

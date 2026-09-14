@@ -1,9 +1,10 @@
-# vm capsule: typed VM, CoForth, CoLisp
+# vm capsule: typed VM execution and compatibility facade
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `crates/finch-vm/src/` (the interpreter, typed runtime, fibers, Co-Forth and Co-Lisp
-frontends, plus the Lisp reader), and the repository-root `vocabulary/` and `examples/finch/`.
+**Owns** `crates/finch-vm/src/` (the interpreter, typed runtime, fibers, and compatibility
+facade), and the shared repository-root `vocabulary/` and `examples/finch/` integration corpus.
+The CoLisp and CoForth source frontends live in sibling crates.
 Shared typed IR, verification, capability/effect descriptions, and vocabulary contracts live in
 [`finch-vm-core`](../finch-vm-core/AGENTS.md). The program runtime service is `src/runtime/`; the
 program catalog is `src/programs/`.
@@ -14,17 +15,20 @@ modules are private, so reaching past it is a compile error. To expose something
 deliberately. The root crate provides compatibility namespaces for the former `finch::lisp`
 reader and types paths.
 
-**Dependencies:** `finch-vm` depends downward on the unpublished `finch-vm-core` contract crate and
-never on the root `finch` crate. Co-Lisp and Co-Forth reach only the core crate's documented,
-restricted compiler-support seam for shared verifier helpers. The pure CPU fiber scheduler remains
-here; `programs` re-exports the core-owned `ProgramLanguage` through this compatibility facade.
+**Dependencies:** `finch-vm` depends downward on the unpublished `finch-vm-core`, `finch-colisp`,
+and `finch-coforth` crates and never on the root `finch` crate. Each frontend reaches only the core
+crate's documented, restricted compiler-support seam. Frontends never depend on each other or back
+on this execution crate. The pure CPU fiber scheduler remains here; `programs` re-exports the
+core-owned `ProgramLanguage` through this compatibility facade.
 
 **Effects** go through the capability broker, never around it
 ([capability boundaries](../../CLAUDE.md#key-principles)).
 
 **Focused tests:** `./scripts/test_brains.sh cargo test -p finch-vm --lib` and
+`./scripts/test_brains.sh cargo test -p finch-colisp --lib`,
+`./scripts/test_brains.sh cargo test -p finch-coforth --lib`, and
 `./scripts/test_brains.sh cargo test -p finch-vm-core --lib`. Run the full suite when changing a
-re-exported `pub` item, the IR, the verifier, or `vocabulary/`.
+re-exported `pub` item, frontend boundary, IR, verifier, or `vocabulary/`.
 
 **Reference, not required:** the language contracts in `vocabulary/language/` are compiled into
 the binary and shown to the model, so editing them changes model-facing behavior.

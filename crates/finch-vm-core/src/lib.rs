@@ -10,6 +10,7 @@ mod effects;
 mod ir;
 mod language;
 mod signature;
+mod surface_types;
 mod types;
 mod verifier;
 mod vocabulary;
@@ -33,6 +34,7 @@ pub use effects::{
 pub use ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
 pub use language::ProgramLanguage;
 pub use signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
+pub use surface_types::parse_type_name;
 pub use types::{TaskKind, Type, TypedValue};
 pub use verifier::{
     apply_signature_types, instantiate_signature_types, VerifiedFunction, VerifiedModule, Verifier,

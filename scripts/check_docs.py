@@ -23,6 +23,8 @@ CURRENT_DOCS = (
     Path("CONTRIBUTING.md"),
     Path("CLAUDE.md"),
     Path("DESIGN.md"),
+    Path("crates/finch-coforth/AGENTS.md"),
+    Path("crates/finch-colisp/AGENTS.md"),
     Path("crates/finch-vm-core/AGENTS.md"),
     Path("crates/finch-vm/AGENTS.md"),
     Path("src/memory/AGENTS.md"),

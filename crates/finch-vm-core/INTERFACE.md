@@ -236,6 +236,8 @@ pub fn core_word_spec(name: &str) -> Option<CoreWordSpec> { … }
 pub fn instantiate_signature_types(signature: &StackSignature, stack: &[Type], origin: &SourceOrigin) -> Result<StackSignature, VmDiagnostic> { … }
 /// Names close enough to `target` to be what the author meant, nearest first.
 pub fn nearest_names<'a>(target: &str, candidates: impl Iterator<Item = &'a str>) -> Vec<String> { … }
+/// Parse the compact type spelling shared by CoLisp annotations and Co-Forth stack signatures.
+pub fn parse_type_name(name: &str) -> Result<Type, Vec<VmDiagnostic>> { … }
 pub fn tree_entry_type() -> Type { … }
 pub fn tree_listing_type() -> Type { … }
 ```
