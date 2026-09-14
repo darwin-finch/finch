@@ -76,6 +76,52 @@ pub(super) const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+/// Return the setup editor registered for an exact persisted provider identity.
+///
+/// Persisted provider tags are not editor identifiers: for example, a ChatGPT
+/// subscription is stored as `chatgpt_subscription` but edited by `chatgpt`.
+/// Keeping this translation beside the editor registry prevents row creation
+/// and edit confirmation from independently guessing that relationship.
+pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static str> {
+    match provider {
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::Anthropic,
+            ..
+        }
+        | ProviderEntry::Claude { .. } => Some("claude"),
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::OpenaiPlatform,
+            ..
+        }
+        | ProviderEntry::Openai { .. } => Some("openai"),
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::ChatgptSubscription,
+            ..
+        } => Some("chatgpt"),
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::Xai,
+            ..
+        }
+        | ProviderEntry::Grok { .. } => Some("grok"),
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::GeminiAiStudio,
+            ..
+        }
+        | ProviderEntry::Gemini { .. } => Some("gemini"),
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::Mistral,
+            ..
+        }
+        | ProviderEntry::Mistral { .. } => Some("mistral"),
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::Groq,
+            ..
+        }
+        | ProviderEntry::Groq { .. } => Some("groq"),
+        _ => None,
+    }
+}
+
 /// Whether a provider authenticates with an inline API key held in the config.
 ///
 /// Three do not. A ChatGPT subscription authenticates through a named credential
@@ -398,17 +444,9 @@ pub(super) fn model_config_from_provider(provider: &ProviderEntry) -> Option<Mod
             name,
             ..
         } => Some(ModelConfig::Remote {
-            provider: match credential_provider {
-                crate::config::CredentialProvider::Anthropic => "claude",
-                crate::config::CredentialProvider::OpenaiPlatform => "openai",
-                crate::config::CredentialProvider::ChatgptSubscription => "chatgpt",
-                crate::config::CredentialProvider::Xai => "grok",
-                crate::config::CredentialProvider::GeminiAiStudio => "gemini",
-                crate::config::CredentialProvider::Mistral => "mistral",
-                crate::config::CredentialProvider::Groq => "groq",
-                _ => credential_provider.as_str(),
-            }
-            .to_string(),
+            provider: registered_editor_id(provider)
+                .unwrap_or_else(|| credential_provider.as_str())
+                .to_string(),
             name: name
                 .clone()
                 .unwrap_or_else(|| credential_provider.as_str().to_string()),

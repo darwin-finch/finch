@@ -3879,6 +3879,241 @@ fn test_provider_dialog_is_titled_add_when_adding_and_edit_when_editing() {
 }
 
 #[test]
+fn test_provider_editor_identity_table_matches_catalog() {
+    let cases = [
+        (crate::config::CredentialProvider::Anthropic, "claude"),
+        (crate::config::CredentialProvider::OpenaiPlatform, "openai"),
+        (
+            crate::config::CredentialProvider::ChatgptSubscription,
+            "chatgpt",
+        ),
+        (crate::config::CredentialProvider::Xai, "grok"),
+        (crate::config::CredentialProvider::GeminiAiStudio, "gemini"),
+        (crate::config::CredentialProvider::Mistral, "mistral"),
+        (crate::config::CredentialProvider::Groq, "groq"),
+    ];
+
+    for (credential_provider, expected_editor) in cases {
+        let provider = ProviderEntry::Credentialed {
+            provider: credential_provider,
+            credential: crate::config::CredentialBinding {
+                credential_ref: format!("{expected_editor}:work"),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: std::collections::BTreeSet::new(),
+            },
+            model: Some("model-work".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some(format!("{expected_editor} work")),
+            reasoning_effort: None,
+        };
+        assert_eq!(
+            registered_editor_id(&provider),
+            Some(expected_editor),
+            "persisted {credential_provider:?} must select its registered editor"
+        );
+        assert!(
+            CLOUD_PROVIDERS
+                .iter()
+                .any(|(editor_id, ..)| *editor_id == expected_editor),
+            "mapped editor {expected_editor} must exist in CLOUD_PROVIDERS"
+        );
+        assert!(
+            matches!(model_config_from_provider(&provider), Some(ModelConfig::Remote { provider, .. }) if provider == expected_editor),
+            "the rendered model row and edit path must use the same identity mapping for {credential_provider:?}"
+        );
+    }
+
+    let mapped: std::collections::BTreeSet<_> =
+        cases.into_iter().map(|(_, editor)| editor).collect();
+    let registered: std::collections::BTreeSet<_> =
+        CLOUD_PROVIDERS.iter().map(|(editor, ..)| *editor).collect();
+    assert_eq!(
+        mapped, registered,
+        "every registered cloud editor must have exactly one credentialed-provider identity mapping"
+    );
+}
+
+#[tokio::test]
+async fn test_provider_editor_preserves_chatgpt_named_credential_through_save_and_reload() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut subscription = chatgpt_subscription_provider();
+    let mut credential = chatgpt_subscription_credential();
+    if let ProviderEntry::Credentialed {
+        credential: binding,
+        name,
+        ..
+    } = &mut subscription
+    {
+        binding.credential_ref = "chatgpt:work".into();
+        *name = Some("ChatGPT Work".into());
+    }
+    credential.name = "chatgpt:work".into();
+    credential.secret_ref = "oauth-store:chatgpt:work".into();
+    credential.account = Some("account-work".into());
+    let claude = ProviderEntry::Claude {
+        api_key: "sk-ant-test-preserved".into(),
+        model: Some("claude-sonnet-4-5".into()),
+        base_url: Some("https://api.anthropic.test".into()),
+        chat_path: None,
+        models_path: None,
+        name: Some("Claude Review".into()),
+    };
+    let original_providers = vec![
+        expected_grok_provider(),
+        subscription.clone(),
+        claude.clone(),
+    ];
+
+    let original_path = directory.path().join("original.toml");
+    let metrics_dir = directory.path().join("metrics");
+    crate::config::Config::with_providers_and_paths(
+        original_providers.clone(),
+        metrics_dir.clone(),
+        None,
+    )
+    .with_credentials(vec![credential.clone()])
+    .save_to(&original_path)
+    .unwrap();
+    let original =
+        crate::config::load_config_from_path_with_paths(&original_path, metrics_dir.clone(), None)
+            .unwrap();
+    let mut state = WizardState::new_with_catalog_cache_dir(Some(&original), None);
+    state.current_section = WizardSection::Models;
+    handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+
+    handle_models_input(&mut state, key(KeyCode::Char('e'))).unwrap();
+    assert!(
+        matches!(get_step(&state), Some(AddProviderStep::ConfigureRemote { provider_idx, editing_idx: Some(1), .. }) if CLOUD_PROVIDERS[*provider_idx].0 == "chatgpt"),
+        "the stored ChatGPT subscription identity must open the ChatGPT editor; step={:?}",
+        get_step(&state)
+    );
+    handle_models_input(&mut state, key(KeyCode::Char('!'))).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    let result = build_setup_result(&state).unwrap();
+    let diagnostics = provider_graph_diagnostics(
+        "edited ChatGPT subscription",
+        &result.providers,
+        &result.credentials,
+    );
+    let mut expected = subscription;
+    if let ProviderEntry::Credentialed { name, .. } = &mut expected {
+        *name = Some("ChatGPT Work!".into());
+    }
+    let mut expected_providers = original_providers;
+    expected_providers[1] = expected.clone();
+    assert_eq!(
+        result.providers,
+        expected_providers,
+        "editing only the profile name must preserve the provider namespace, chatgpt:work binding, model, endpoint and reasoning effort. {diagnostics}"
+    );
+    assert_eq!(
+        result.credentials,
+        vec![credential.clone()],
+        "editing must preserve the exact credential record. {diagnostics}"
+    );
+
+    let authenticator = FakeChatGptSetupAuthenticator::default();
+    let mut editor = ScriptedRecoveryEditor::new([]);
+    let (saved, committed, compensations) = run_chatgpt_setup_recovery_loop(
+        SetupInvocation::Command,
+        &result,
+        &authenticator,
+        &mut editor,
+    )
+    .await
+    .unwrap()
+    .expect("the preserved credential graph must require no recovery");
+    assert!(
+        authenticator.calls.lock().unwrap().is_empty(),
+        "editing a profile with a usable chatgpt:work credential must not start device authorization"
+    );
+    assert!(editor.recoveries.is_empty());
+    assert!(compensations.is_empty());
+    assert_eq!(committed.providers, result.providers);
+
+    let saved_path = directory.path().join("edited.toml");
+    save_chatgpt_setup_config(&saved, &compensations, &authenticator, |config| {
+        config.save_to(&saved_path)
+    })
+    .unwrap();
+    let reloaded =
+        crate::config::load_config_from_path_with_paths(&saved_path, metrics_dir, None).unwrap();
+    assert_eq!(
+        reloaded.providers, expected_providers,
+        "the edited provider graph must survive save/reload without defaulting its identity"
+    );
+    assert_eq!(reloaded.credentials(), &[credential]);
+}
+
+#[test]
+fn test_provider_editor_refuses_unsupported_rows_without_mutation() {
+    let unsupported = [
+        ProviderEntry::Ollama {
+            model: "qwen2.5:7b".into(),
+            base_url: "http://127.0.0.1:11434".into(),
+            name: Some("Local Ollama".into()),
+        },
+        ProviderEntry::RemoteDaemon {
+            address: "127.0.0.1:11435".into(),
+            name: Some("Remote Finch".into()),
+        },
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::GoogleVertex,
+            credential: crate::config::CredentialBinding {
+                credential_ref: "vertex:work".into(),
+                audience: None,
+                tenant: None,
+                project: Some("project-work".into()),
+                account: None,
+                required_scopes: std::collections::BTreeSet::new(),
+            },
+            model: Some("gemini-2.5-pro".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("Vertex Work".into()),
+            reasoning_effort: None,
+        },
+    ];
+
+    for provider in unsupported {
+        let label = provider.display_name().to_string();
+        let config = crate::config::Config::with_providers(vec![provider.clone()]);
+        let mut state = WizardState::new_with_catalog_cache_dir(Some(&config), None);
+        state.current_section = WizardSection::Models;
+        let before = build_setup_result(&state).unwrap();
+
+        handle_models_input(&mut state, key(KeyCode::Char('e'))).unwrap();
+
+        let after = build_setup_result(&state).unwrap();
+        let rendered = render_wizard_text(&state);
+        assert!(
+            get_step(&state).is_none(),
+            "unsupported {label} must not fall back to the first registered editor; step={:?}",
+            get_step(&state)
+        );
+        assert_eq!(
+            after.providers, before.providers,
+            "refusing the unsupported {label} editor must not mutate providers; rendered={rendered}"
+        );
+        assert_eq!(
+            after.credentials, before.credentials,
+            "refusing the unsupported {label} editor must not mutate credentials; rendered={rendered}"
+        );
+        assert!(
+            rendered.contains("is not available in setup") && rendered.contains(&label),
+            "the refusal must name {label} and remain visible; rendered={rendered}"
+        );
+    }
+}
+
+#[test]
 fn test_genuinely_empty_setup_alone_renders_unconfigured_claude_default() {
     use ratatui::backend::TestBackend;
 

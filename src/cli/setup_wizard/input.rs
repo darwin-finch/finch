@@ -691,7 +691,9 @@ pub(super) fn handle_models_input(
                                             })
                                         }
                                     })
-                                    .filter(|entry| entry.provider_type() == provider_id);
+                                    .filter(|entry| {
+                                        registered_editor_id(entry) == Some(provider_id)
+                                    });
                                 let edited = ModelConfig::Remote {
                                     provider: provider_id.to_string(),
                                     name: if name.trim().is_empty() {
@@ -903,10 +905,20 @@ pub(super) fn handle_models_input(
                         ..
                     }) = selected
                     {
-                        let provider_idx = CLOUD_PROVIDERS
-                            .iter()
-                            .position(|(id, ..)| *id == provider)
-                            .unwrap_or(0);
+                        let provider_idx = persisted.as_ref().map_or_else(
+                            || CLOUD_PROVIDERS.iter().position(|(id, ..)| *id == provider),
+                            |entry| {
+                                registered_editor_id(entry).and_then(|editor_id| {
+                                    CLOUD_PROVIDERS.iter().position(|(id, ..)| *id == editor_id)
+                                })
+                            },
+                        );
+                        let Some(provider_idx) = provider_idx else {
+                            *error = Some(format!(
+                                "Editing provider '{name}' is not available in setup; its configuration was not changed"
+                            ));
+                            return Ok(false);
+                        };
                         *catalog_models = known_models_for(CLOUD_PROVIDERS[provider_idx].0);
                         *catalog_model_provenance = if model.trim().is_empty() {
                             ModelSelectionProvenance::Blank
