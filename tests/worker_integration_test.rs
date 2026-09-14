@@ -108,7 +108,12 @@ fn node_test_router(state: &finch::node::IsolatedNodeTestState) -> Router {
     Router::new()
         .route(
             "/v1/node/info",
-            get(move || handle_node_info_from_state_directory(info_state.clone(), false)),
+            get(move || {
+                handle_node_info_from_state_directory(
+                    info_state.clone(),
+                    finch::node::NodeCapabilities::for_current_host(8, None, false),
+                )
+            }),
         )
         .route(
             "/v1/node/stats",
@@ -429,13 +434,18 @@ fn test_work_stats_defaults_are_zero() {
     assert_eq!(stats.local_pct(), 0.0);
 }
 
-/// NodeCapabilities::detect() produces plausible values on the current host.
+/// NodeCapabilities preserves facts injected by the composition root.
 #[test]
-fn test_node_capabilities_detect_plausible() {
+fn test_node_capabilities_accepts_injected_facts_through_facade() {
     use finch::node::NodeCapabilities;
 
-    let caps = NodeCapabilities::detect(false);
-    assert!(caps.ram_gb >= 1, "ram_gb should be at least 1");
+    let caps = NodeCapabilities::for_current_host(16, Some("test-model".to_string()), false);
+    assert_eq!(caps.ram_gb, 16, "ram_gb must preserve the injected fact");
+    assert_eq!(
+        caps.local_model.as_deref(),
+        Some("test-model"),
+        "local model availability must preserve the injected fact"
+    );
     assert!(!caps.version.is_empty(), "version should not be empty");
     assert!(!caps.os.is_empty(), "os should not be empty");
     // 'os' should be a known platform string
@@ -455,7 +465,9 @@ fn test_node_info_summary_format() {
     let state = IsolatedNodeState::new();
     let info = state
         .state
-        .load_node_info(false)
+        .load_node_info(finch::node::NodeCapabilities::for_current_host(
+            8, None, false,
+        ))
         .expect("isolated NodeInfo load failed");
     let summary = info.summary();
 

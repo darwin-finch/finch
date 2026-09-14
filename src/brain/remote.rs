@@ -429,7 +429,7 @@ impl RemoteBrainClient {
         }
         let certificate_der = super::credential::invitation_tls_certificate_der(&claims)?;
         let (http, websocket_connector) = if target.secure {
-            crate::node::tls::install_crypto_provider()?;
+            crate::node::install_crypto_provider()?;
             let certificate = reqwest::Certificate::from_der(&certificate_der)
                 .context("Brain invitation contains an invalid TLS certificate")?;
             let http = Client::builder()
@@ -2769,12 +2769,11 @@ mod tests {
                 }
             }),
         );
-        let node = crate::node::identity::NodeSigningIdentity::from_secret(secret);
-        let tls =
-            crate::node::tls::NodeTlsIdentity::from_signing_identity(&node, "localhost").unwrap();
+        let node = crate::node::NodeSigningIdentity::from_secret(secret);
+        let tls = crate::node::NodeTlsIdentity::from_signing_identity(&node, "localhost").unwrap();
         let invitation_certificate =
             super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
-        crate::node::tls::install_crypto_provider().unwrap();
+        crate::node::install_crypto_provider().unwrap();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
             vec![invitation_certificate],
             tls.private_key_der().to_vec(),
@@ -2843,7 +2842,7 @@ mod tests {
                 unix_epoch_millis(),
             )
             .unwrap();
-        crate::node::tls::install_crypto_provider().unwrap();
+        crate::node::install_crypto_provider().unwrap();
         let tls_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
@@ -3047,7 +3046,7 @@ mod tests {
                 unix_epoch_millis(),
             )
             .unwrap();
-        crate::node::tls::install_crypto_provider().unwrap();
+        crate::node::install_crypto_provider().unwrap();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
             vec![
                 super::super::credential::invitation_tls_certificate_der(&invitation_claims)
@@ -3162,7 +3161,7 @@ mod tests {
             .unwrap();
         let invitation_certificate =
             super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
-        crate::node::tls::install_crypto_provider().unwrap();
+        crate::node::install_crypto_provider().unwrap();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
             vec![invitation_certificate],
             authority
@@ -3301,12 +3300,11 @@ mod tests {
                 async move { Redirect::temporary(&redirect_url) }
             }),
         );
-        let node = crate::node::identity::NodeSigningIdentity::from_secret(secret);
-        let tls =
-            crate::node::tls::NodeTlsIdentity::from_signing_identity(&node, "localhost").unwrap();
+        let node = crate::node::NodeSigningIdentity::from_secret(secret);
+        let tls = crate::node::NodeTlsIdentity::from_signing_identity(&node, "localhost").unwrap();
         let invitation_certificate =
             super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
-        crate::node::tls::install_crypto_provider().unwrap();
+        crate::node::install_crypto_provider().unwrap();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
             vec![invitation_certificate],
             tls.private_key_der().to_vec(),
@@ -3385,7 +3383,7 @@ mod tests {
             .unwrap()
             .signed_by(&leaf_key, &root, &root_key)
             .unwrap();
-        crate::node::tls::install_crypto_provider().unwrap();
+        crate::node::install_crypto_provider().unwrap();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
             vec![leaf.der().to_vec(), root.der().to_vec()],
             leaf_key.serialize_der(),
@@ -3485,7 +3483,7 @@ mod tests {
             .unwrap();
 
         let tls = authority.invitation_tls_identity();
-        crate::node::tls::install_crypto_provider().unwrap();
+        crate::node::install_crypto_provider().unwrap();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
             vec![tls.certificate_der().to_vec()],
             tls.private_key_der().to_vec(),

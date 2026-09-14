@@ -31,7 +31,12 @@ fn node_test_router(state: &IsolatedNodeTestState) -> Router {
     Router::new()
         .route(
             "/v1/node/info",
-            get(move || handle_node_info_from_state_directory(info_state.clone(), false)),
+            get(move || {
+                handle_node_info_from_state_directory(
+                    info_state.clone(),
+                    finch::node::NodeCapabilities::for_current_host(8, None, false),
+                )
+            }),
         )
         .route(
             "/v1/node/stats",

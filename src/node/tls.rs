@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 
-use super::identity::NodeSigningIdentity;
+use super::NodeSigningIdentity;
 
 #[derive(Clone)]
 pub struct NodeTlsIdentity {

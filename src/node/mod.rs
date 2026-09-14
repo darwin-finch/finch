@@ -8,14 +8,14 @@
 // This is the foundation for the distributed worker network where old
 // laptops accept delegated work and earn reputation.
 
-pub mod identity;
-pub mod stats;
-pub mod tls;
+mod identity;
+mod stats;
+mod tls;
 
-pub use identity::NodeIdentity;
+pub use identity::{NodeIdentity, NodeSigningIdentity};
 pub use stats::{WorkStats, WorkTracker};
+pub use tls::{install_crypto_provider, NodeTlsIdentity};
 
-use crate::models::model_selector::{ModelSelection, ModelSelector};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::sync::Arc;
@@ -88,12 +88,12 @@ impl IsolatedNodeTestState {
         })
     }
 
-    pub fn load_node_info(&self, has_teacher_api: bool) -> anyhow::Result<NodeInfo> {
+    pub fn load_node_info(&self, capabilities: NodeCapabilities) -> anyhow::Result<NodeInfo> {
         let _guard = self
             .identity_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("isolated node identity lock poisoned"))?;
-        NodeInfo::load_from_state_directory(has_teacher_api, &self.descriptor)
+        NodeInfo::load_from_state_directory(capabilities, &self.descriptor)
     }
 
     pub fn node_id_exists(&self) -> anyhow::Result<bool> {
@@ -288,13 +288,14 @@ pub struct NodeCapabilities {
 }
 
 impl NodeCapabilities {
-    pub fn detect(has_teacher_api: bool) -> Self {
-        let ram_gb = ModelSelector::get_total_ram_gb();
-        let local_model = match ModelSelector::select_for_system() {
-            Ok(ModelSelection::Local(size)) => Some(size.description().to_string()),
-            _ => None,
-        };
-
+    /// Describe the current host using model availability supplied by the
+    /// composition root. Constructing node metadata never inspects or loads a
+    /// model implementation.
+    pub fn for_current_host(
+        ram_gb: usize,
+        local_model: Option<String>,
+        has_teacher_api: bool,
+    ) -> Self {
         Self {
             ram_gb,
             local_model,
@@ -310,21 +311,21 @@ impl NodeCapabilities {
 }
 
 impl NodeInfo {
-    pub fn load(has_teacher_api: bool) -> anyhow::Result<Self> {
+    pub fn load(capabilities: NodeCapabilities) -> anyhow::Result<Self> {
         Ok(Self {
             identity: NodeIdentity::load_or_create()?,
-            capabilities: NodeCapabilities::detect(has_teacher_api),
+            capabilities,
         })
     }
 
     /// Load node information using an explicit Finch state directory.
     pub(crate) fn load_from_state_directory(
-        has_teacher_api: bool,
+        capabilities: NodeCapabilities,
         directory: &std::fs::File,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             identity: NodeIdentity::load_or_create_in(directory)?,
-            capabilities: NodeCapabilities::detect(has_teacher_api),
+            capabilities,
         })
     }
 
@@ -350,11 +351,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_node_capabilities_detect() {
-        let caps = NodeCapabilities::detect(false);
-        assert!(caps.ram_gb >= 1);
-        assert!(!caps.version.is_empty());
-        assert!(!caps.os.is_empty());
+    fn test_node_capabilities_preserve_injected_model_facts() {
+        let caps = NodeCapabilities::for_current_host(32, Some("test-model".to_string()), false);
+        assert_eq!(
+            caps.ram_gb, 32,
+            "node metadata must retain the supplied RAM"
+        );
+        assert_eq!(
+            caps.local_model.as_deref(),
+            Some("test-model"),
+            "node metadata must retain the supplied model description"
+        );
+        assert!(
+            !caps.version.is_empty(),
+            "node metadata must carry the Finch version"
+        );
+        assert!(!caps.os.is_empty(), "node metadata must carry the host OS");
     }
 
     #[test]
