@@ -130,7 +130,7 @@ pub async fn handle_node_info() -> Result<Json<serde_json::Value>, AppError> {
     let has_teacher = load_config()
         .map(|c| c.active_teacher().is_some())
         .unwrap_or(false);
-    let info = NodeInfo::load(has_teacher)?;
+    let info = NodeInfo::load(current_node_capabilities(has_teacher))?;
     Ok(Json(serde_json::to_value(&info)?))
 }
 
@@ -142,10 +142,21 @@ pub async fn handle_node_info() -> Result<Json<serde_json::Value>, AppError> {
 #[cfg(unix)]
 pub async fn handle_node_info_from_state_directory(
     state: crate::node::IsolatedNodeTestState,
-    has_teacher_api: bool,
+    capabilities: crate::node::NodeCapabilities,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let info = state.load_node_info(has_teacher_api)?;
+    let info = state.load_node_info(capabilities)?;
     Ok(Json(serde_json::to_value(&info)?))
+}
+
+pub(super) fn current_node_capabilities(has_teacher_api: bool) -> crate::node::NodeCapabilities {
+    use crate::models::model_selector::{ModelSelection, ModelSelector};
+
+    let ram_gb = ModelSelector::get_total_ram_gb();
+    let local_model = match ModelSelector::select_for_system() {
+        Ok(ModelSelection::Local(size)) => Some(size.description().to_string()),
+        _ => None,
+    };
+    crate::node::NodeCapabilities::for_current_host(ram_gb, local_model, has_teacher_api)
 }
 
 /// Handle GET /v1/node/stats — return this node's work statistics

@@ -2702,13 +2702,24 @@ fn command_cancellation() -> tokio_util::sync::CancellationToken {
     cancel
 }
 
+fn current_node_capabilities(has_teacher_api: bool) -> finch::node::NodeCapabilities {
+    use finch::models::model_selector::{ModelSelection, ModelSelector};
+
+    let ram_gb = ModelSelector::get_total_ram_gb();
+    let local_model = match ModelSelector::select_for_system() {
+        Ok(ModelSelection::Local(size)) => Some(size.description().to_string()),
+        _ => None,
+    };
+    finch::node::NodeCapabilities::for_current_host(ram_gb, local_model, has_teacher_api)
+}
+
 /// Show this node's identity and capabilities
 async fn run_node_info() -> Result<()> {
     use finch::node::NodeInfo;
 
     let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
     let has_teacher = !config.cloud_providers().is_empty();
-    let info = NodeInfo::load(has_teacher)?;
+    let info = NodeInfo::load(current_node_capabilities(has_teacher))?;
 
     println!("╔══════════════════════════════════════╗");
     println!("║           finch node info            ║");
@@ -2779,7 +2790,7 @@ fn run_wire_corpus_command(cmd: WireCorpusCommand) -> Result<()> {
 async fn run_network_command(cmd: NetworkCommand) -> Result<()> {
     use finch::network::client::RegisterDeviceRequest;
     use finch::network::{DeviceMembership, LotusClient, MembershipStatus};
-    use finch::node::identity::NodeIdentity;
+    use finch::node::NodeIdentity;
 
     let identity = NodeIdentity::load_or_create()?;
     let mut membership = DeviceMembership::load_or_create(identity.id)?;
@@ -2917,7 +2928,7 @@ async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
 
     let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
     let has_teacher = !config.cloud_providers().is_empty();
-    let info = NodeInfo::load(has_teacher)?;
+    let info = NodeInfo::load(current_node_capabilities(has_teacher))?;
 
     // Always show node identity when starting as worker
     println!("╔══════════════════════════════════════╗");

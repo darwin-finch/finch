@@ -80,7 +80,7 @@ pub(super) async fn get_named_brain_capabilities(
         brain: snapshot.name,
         environment: snapshot.environment,
         node_public_key: hex::encode(server.brain_credentials().invitation_public_key()),
-        node: crate::node::NodeCapabilities::detect(server.primary_provider().is_some()),
+        node: super::node::current_node_capabilities(server.primary_provider().is_some()),
     }))
 }
 

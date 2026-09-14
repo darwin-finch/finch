@@ -279,8 +279,8 @@ impl ConsumedInvitations {
 #[derive(Clone)]
 pub struct BrainCredentialAuthority {
     signing_key: Arc<[u8; 32]>,
-    invitation_signer: Arc<crate::node::identity::NodeSigningIdentity>,
-    invitation_tls: Arc<crate::node::tls::NodeTlsIdentity>,
+    invitation_signer: Arc<crate::node::NodeSigningIdentity>,
+    invitation_tls: Arc<crate::node::NodeTlsIdentity>,
     revoked: Arc<Mutex<BTreeSet<uuid::Uuid>>>,
     revocations_path: Option<Arc<PathBuf>>,
     consumed_invitations: Arc<Mutex<ConsumedInvitations>>,
@@ -292,7 +292,7 @@ impl BrainCredentialAuthority {
         self.invitation_signer.public_key_bytes()
     }
 
-    pub(crate) fn invitation_tls_identity(&self) -> &crate::node::tls::NodeTlsIdentity {
+    pub(crate) fn invitation_tls_identity(&self) -> &crate::node::NodeTlsIdentity {
         &self.invitation_tls
     }
 
@@ -303,16 +303,13 @@ impl BrainCredentialAuthority {
             .with_context(|| format!("create {}", state_directory.display()))?;
         let key_path = state_directory.join(SIGNING_KEY_FILE);
         let signing_key = load_or_create_signing_key(&key_path)?;
-        let invitation_signer =
-            crate::node::identity::NodeSigningIdentity::load_or_create(state_directory)?;
+        let invitation_signer = crate::node::NodeSigningIdentity::load_or_create(state_directory)?;
         let hostname = hostname::get()
             .ok()
             .and_then(|name| name.into_string().ok())
             .unwrap_or_else(|| "localhost".to_string());
-        let invitation_tls = crate::node::tls::NodeTlsIdentity::from_signing_identity(
-            &invitation_signer,
-            &hostname,
-        )?;
+        let invitation_tls =
+            crate::node::NodeTlsIdentity::from_signing_identity(&invitation_signer, &hostname)?;
         let revocations_path = state_directory.join(REVOCATIONS_FILE);
         let revoked = load_revocations(&revocations_path)?;
         let consumed_invitations_path = state_directory.join(CONSUMED_INVITATIONS_FILE);
@@ -330,13 +327,10 @@ impl BrainCredentialAuthority {
 
     #[cfg(test)]
     pub(crate) fn ephemeral(signing_key: [u8; 32]) -> Self {
-        let invitation_signer =
-            crate::node::identity::NodeSigningIdentity::from_secret(signing_key);
-        let invitation_tls = crate::node::tls::NodeTlsIdentity::from_signing_identity(
-            &invitation_signer,
-            "localhost",
-        )
-        .expect("test node identity creates TLS material");
+        let invitation_signer = crate::node::NodeSigningIdentity::from_secret(signing_key);
+        let invitation_tls =
+            crate::node::NodeTlsIdentity::from_signing_identity(&invitation_signer, "localhost")
+                .expect("test node identity creates TLS material");
         Self {
             signing_key: Arc::new(signing_key),
             invitation_signer: Arc::new(invitation_signer),
@@ -354,16 +348,14 @@ impl BrainCredentialAuthority {
         not_before: (i32, u8, u8),
         not_after: (i32, u8, u8),
     ) -> Self {
-        let invitation_signer =
-            crate::node::identity::NodeSigningIdentity::from_secret(signing_key);
-        let invitation_tls =
-            crate::node::tls::NodeTlsIdentity::from_signing_identity_with_validity(
-                &invitation_signer,
-                "localhost",
-                not_before,
-                not_after,
-            )
-            .expect("test node identity creates TLS material with custom validity");
+        let invitation_signer = crate::node::NodeSigningIdentity::from_secret(signing_key);
+        let invitation_tls = crate::node::NodeTlsIdentity::from_signing_identity_with_validity(
+            &invitation_signer,
+            "localhost",
+            not_before,
+            not_after,
+        )
+        .expect("test node identity creates TLS material with custom validity");
         Self {
             signing_key: Arc::new(signing_key),
             invitation_signer: Arc::new(invitation_signer),
@@ -749,7 +741,7 @@ pub fn verify_portable_invitation(
                 signature.len()
             )
         })?;
-    crate::node::identity::NodeSigningIdentity::verify(
+    crate::node::NodeSigningIdentity::verify(
         public_key,
         invitation_signature_message(payload).as_slice(),
         supplied,
@@ -1264,7 +1256,7 @@ mod tests {
         assert_eq!(portable_claims, invitation_claims);
         assert_eq!(
             issuer_key,
-            crate::node::identity::NodeSigningIdentity::from_secret([11; 32]).public_key_bytes()
+            crate::node::NodeSigningIdentity::from_secret([11; 32]).public_key_bytes()
         );
         assert_eq!(
             authority.inspect_invitation(&invitation, 10_100).unwrap(),
