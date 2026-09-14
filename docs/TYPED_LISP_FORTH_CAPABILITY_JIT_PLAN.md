@@ -550,13 +550,14 @@ stack or Rust thread/channel handle merely because it shares lifecycle machinery
 
 ### Fibers, streams, deferred work, and repeated yields
 
-`task<T>` remains the existing opaque scheduler handle. Its await/join operation is terminal: it
-returns one final `T`. A lazy `stream<T>` is the simpler multi-value abstraction; it owns a cursor
+`task<T>` remains the existing opaque scheduler handle. Its `join` operation is terminal: it may
+suspend internally and returns one final `T`. A lazy `stream<T>` is the simpler multi-value
+abstraction; it owns a cursor
 and advances only when its consumer asks for the next value:
 
 ```text
 stream-next stream : option<T>  ; bounded pull; none means exhausted
-stream-close stream : unit      ; release cursor/cancel its producer
+stream-close-discarding stream : unit ; cancel producer and drop unread values
 ```
 
 The semantic primitive is a **private resumable execution**, not a generator or scheduler policy:
@@ -569,11 +570,55 @@ ResumableExecution<Y,Resume,R> = verified frames + private operand stack + local
 A coroutine function may create an instance of that state. Suspension propagates normally through
 the entire ordinary call chain until some boundary handles or reifies it. A generator is the
 `Resume = unit` pull contract; a fiber is an owned handle plus explicit call/yield policy; a green
-thread, async task, actor, or compiler semantic job is a scheduling/event policy over the same
+thread, event-loop task, actor, or compiler semantic job is a scheduling/event policy over the same
 instance. None gets an independently implemented continuation format. Creating an independently
 resumable instance always starts a private stack from explicit arguments and immutable captures;
 normal calls remain the way to operate on the current stack. Shared `cell<T>`, atomics, mutexes, or
 channels are separate explicit memory resources, not implicit fiber communication.
+
+Ordinary callers do not acquire `async`/`await` coloring merely because a callee can park on I/O.
+For example, a database call may suspend the current ProgramRun internally and later return its
+ordinary value; `MaySuspend` is inferred and verified like the other effects. Explicit concurrency
+syntax appears only where the programmer creates or takes ownership of concurrent work, such as
+`spawn`, `join-all`, `race`, or cancellation. A caller must not need to know whether an ordinary
+callee parked, exhausted a scheduling quantum, or completed without suspension.
+
+The runtime expresses that separation with a private discriminated drive step. It must not encode
+all suspension as an ambiguous `yielded` state, and every nonterminal step carries the sole
+unforgeable lease for continuing the execution:
+
+```text
+DriveProgress<Y> =
+    SemanticYield { event_id, value: Y }
+  | Parked { wait_id }                         ; host/I/O wait; scheduler-private
+  | Runnable { reason: YieldNow | Fuel }       ; scheduler-private
+
+DriveStep<Y,R> =
+    Continued { progress: DriveProgress<Y>, successor: ExecutionLease }
+  | Terminal { event_id, outcome: Terminal<R> }
+
+Terminal<R> = Returned(R) | Thrown(ExceptionTransfer)
+            | Cancelled(Diagnostic) | Trapped(Diagnostic)
+```
+
+Only `SemanticYield` and `Terminal` may project through a producer-facing policy API. `Parked` and
+`Runnable` are scheduling facts, not values a programmer must interpret. A direct owner receives
+the successor lease; after scheduler registration the registry retains that lease atomically and
+publishes only the policy projection. A consuming drive step therefore either returns/retains the
+sole successor or records one terminal outcome; an exception, trap, or cancellation can never lose
+the execution between those actions.
+
+```text
+PolicyEvent<Source,Y,R> =
+    Yielded { source: Source, event_id, value: Y }
+  | Completed { source: Source, event_id, outcome: PolicyTerminal<R> }
+
+PolicyTerminal<R> = Returned(R) | Thrown(ExceptionTransfer) | Cancelled(Diagnostic)
+```
+
+Single-source wrappers may omit the source field, while multi-source combinators retain it. A
+runtime `Trapped` outcome never becomes an ordinary policy value: the policy first performs its
+ownership-safe sibling cleanup, then preserves the non-catchable trap edge.
 
 The general resumable handle uses linear typestates. Generator, coroutine, fiber, thread, task, and
 custom-scheduler APIs wrap these transitions rather than defining new continuation representations:
@@ -589,7 +634,7 @@ yield        : take Y -> Resume
 fiber-start  : take ready-fiber<Y,Resume,R> -> fiber-step<Y,Resume,R>
 fiber-resume : take suspended-fiber<Y,Resume,R>, take Resume -> fiber-step<Y,Resume,R>
 fiber-next   : take ready-or-suspended<Y,unit,R> -> fiber-step<Y,unit,R>
-fiber-join   : take Done<R> -> R                              ; ordinary library unwrap
+done-value   : take Done<R> -> R                              ; ordinary library unwrap
 fiber-cancel : take ready-or-suspended<Y,Resume,R> -> unit    ; throws CleanupFailure
 fiber-try-join : take dynamic-handle<R> -> fiber-state<dynamic-handle<R>,R>
 ```
@@ -607,8 +652,8 @@ upper bound. Exceptions from the resumed callable itself remain inferred through
 like ordinary calls. Each advance consumes the previous handle and returns either the sole next
 suspended handle with its yielded value or ordinary standard-library `Done<R>`. The caller must
 pattern-match that result.
-Only `Done<R>` is accepted by `fiber-join`, so safe statically typed code cannot pass it incomplete
-work. `Done` is no more compiler-special than `Result`: its library `join` operation simply unwraps
+Only `Done<R>` is accepted by `done-value`, so safe statically typed code cannot pass it incomplete
+work. `Done` is no more compiler-special than `Result`: its library operation simply unwraps
 `R`. Constructing another `Done(value)` cannot forge a continuation because the VM's ready/suspended
 handle has already been consumed separately. An erased/runtime `try-join` consumes its handle and
 returns either `Done<R>` or `pending(handle,status)`, preserving the sole handle on an incomplete
@@ -621,22 +666,105 @@ plus a typed yield-to-resume policy into a scheduler. Yield and resume cross pri
 boundaries: non-copyable values move, copyable/shared values use ordinary copy/retain evidence, and
 an escaping borrow is rejected.
 
+Programmer-facing handles are policy-specific wrappers, not aliases for a raw fiber handle:
+
+| Wrapper | Programmer-visible operations | Meaning |
+|---|---|---|
+| `Task<R>` | `join`, `join-all`, `race`, `select-complete`, `cancel` | one terminal result; internal suspension is invisible |
+| `Generator<Y,R>` | `next`, `collect`, `fold`, `close-discarding` | pull exactly one semantic yield at a time, then terminal `R` |
+| `BufferedProducer<Y,R>` | `next`, `next-any`, `merge`, `close-discarding` | scheduler-owned bounded queue of semantic yields |
+| `Coroutine<Y,Resume,R>` | `start`, `resume`, `cancel` | start needs no reply; each later semantic yield requires a typed reply |
+| `GreenThread<R>` | task-style `join`, `cancel` | scheduler owns cooperative advancement |
+
+The type determines the valid coordination vocabulary. `next task`, `join generator`, or
+`next-any` over a bidirectional coroutine is rejected at compile time with a diagnostic naming the
+required wrapper or explicit adapter. Libraries may define new policies through concepts, but must
+map their public events and ownership transitions explicitly. This is a usability invariant: if a
+caller needs implementation knowledge of a producer's private yields, parking, or scheduling to use
+its handle correctly, the policy interface has failed.
+
+The standard task combinators have deterministic ownership and failure contracts. Their conceptual
+caller-facing signatures are:
+
+```text
+join            : take Task<R> -> R
+join-all        : take Tasks<Results> -> Results
+cancel-on-error : take Tasks<Results> -> Results
+race            : take HomogeneousTasks<Source,R> -> (Source,R)
+select-complete : take HomogeneousTasks<Source,R>
+                  -> (Completed<Source,R>, RemainingTasks<Source,R>)
+```
+
+These operations may suspend internally without source-level `await`. `Returned(R)` supplies the
+value, `Thrown(E)` rethrows the typed value with its original provenance, `Cancelled` throws the
+published `TaskCancelled` value, and `Trapped` remains a non-catchable runtime trap. Aggregate
+operations finish their stated sibling cleanup before propagating the selected primary terminal
+outcome. The explicit `select-complete` result retains source-visible `PolicyTerminal<R>` so
+orchestration code can inspect a returned, thrown, or cancelled completion rather than immediately
+propagate it; a runtime trap remains a trap after cleanup.
+
+- `join-all` consumes every task, waits for every terminal outcome and returns results in input
+  order. A heterogeneous fixed input produces a typed tuple; a homogeneous collection produces a
+  collection. If several tasks do not return, the lowest input position is primary and later
+  positions become ordered suppressed diagnostics, independent of completion timing.
+- `cancel-on-error` records the first journaled failure as primary, requests cancellation of the
+  remaining tasks, awaits their cleanup, and retains later failures as ordered suppressed
+  diagnostics.
+- `race` selects the first terminal outcome, never the first internal park or producer yield, then
+  cancels and reaps every loser before releasing their ownership. A later `race-success` may ignore
+  failures until every candidate fails, but is a distinct operation.
+- `select-complete` returns the next terminal event together with the remaining tasks under one
+  linear composite owner, so unselected handles cannot be lost or advanced concurrently.
+- `next-any` initially requires homogeneous `Y` and `R` and returns the next semantic yield or
+  terminal event from a set of unit-resume buffered producers. Its result identifies the source and
+  stable event ID. Heterogeneous tuples require an explicit tagged sum. Bidirectional coroutines
+  require an explicit response policy and are not accepted initially.
+- `merge` initially requires homogeneous `Y`, `Resume = unit`, and `R = unit`. Heterogeneous sources
+  use an explicit tagged variant rather than runtime guessing.
+
+Simultaneous readiness uses a stable journaled tie-break and a rotating fairness cursor, so replay
+chooses the same winner without permanently favoring the first input. `race` and cancellation do
+not imply rollback of host effects already recorded by a losing task.
+
+Durable composite policies checkpoint child identities and generations, queue contents and retained
+bytes, pending typed resumes, observed terminal outcomes, fairness cursor/epoch, selected winner,
+cancellation-cleanup phase, and delivery/acknowledgement state. Restart restores that ownership
+record before any child advances, preventing a replay from selecting a different winner, repeating
+an acknowledged value, or abandoning an unselected child.
+
+For `Resume = unit`, a scheduler policy may buffer moved `Y` values in a bounded per-producer queue
+and immediately continue the producer while item, retained-byte, fairness, and fuel limits permit.
+This avoids a rendezvous and wakeup for every value. A full queue applies backpressure by suspending
+that producer; an item larger than the byte allowance fails with a structured resource-limit value
+rather than waiting forever. For non-unit `Resume`, every semantic yield suspends until its typed
+reply arrives. `yield-now` is separate: it ends the current scheduling quantum and produces
+`Runnable`, never a semantic item.
+
+Accepted semantic yields remain ordered before that producer's terminal event. Normal consumption
+drains already-accepted values before observing failure. There is no ambiguously named `close` on a
+producer wrapper: explicit `close-discarding` cancels and reaps the producer while dropping queued
+values through their ordinary destructors. Within one VM transaction,
+delivery and acknowledgement are exactly once. Across a non-transactional external boundary,
+delivery is at least once with the stable event ID until acknowledged. Single-threaded schedulers
+may use ordinary deques without locks; cross-worker implementations use per-producer or per-worker
+queues and batched notifications rather than a contended global rendezvous.
+
 The shared primitive supports distinct policies without conflating them:
 
 | Policy | Progress owner | Yield/resume contract | Completion |
 |---|---|---|---|
-| generator | calling consumer | `Y` / `unit` | match `Done`, then join/unwrap |
-| coroutine | calling peer | `Y` / typed `Resume` | match `Done`, then join/unwrap |
-| green thread | cooperative scheduler | scheduling/event yield / policy response | poll or explicitly await task |
-| async task | event-loop scheduler | private await request / event result | typed task result |
+| generator | calling consumer | semantic `Y` / `unit` | match `Done`, then `done-value` |
+| coroutine | calling peer | semantic `Y` / typed `Resume` | match `Done`, then `done-value` |
+| green thread | cooperative scheduler | drive events remain scheduler-private | `join` its typed task surface |
+| event-loop task | event-loop scheduler | host waits remain scheduler-private | `join` its typed task surface |
 | custom fiber scheduler | declared policy implementation | declared `Y` / `Resume` | the same `Done<R>` terminal value |
 
 These policies belong in the standard library wherever semantics permit. The compiler/runtime kernel
 owns only operations that ordinary code cannot safely synthesize: capture verified frames, suspend
 with typed `Y`, resume with typed `Resume`, cancel/unwind the private execution, and mint unforgeable
 linear ready/suspended handles whose terminal transition consumes the handle and returns `R`. The
-standard library defines `Done`, `Generator`, `Coroutine`,
-green-thread and async-task adapters, collection/fold helpers, and scheduler policy concepts as
+standard library defines `Done`, `Task`, `Generator`, `BufferedProducer`, `Coroutine`, green-thread
+adapters, task/producer combinators, collection/fold helpers, and scheduler policy concepts as
 ordinary parameterized types with explicit mappings to those intrinsics. User schedulers may
 implement the same concepts. Selective specialization and JIT inlining follow resolved evidence and
 IR behavior rather than privileged standard-library type names.
@@ -645,9 +773,10 @@ A scheduler policy consumes the direct handle and becomes its only progress owne
 task/observer surface appropriate to that policy; the original binding is unavailable, so two
 callers cannot race to advance it. A `poll` returns status-only `pending`/`complete` or a borrowed
 terminal view; it never moves an owned `R` from a borrowed task.
-`await take task<R>` explicitly consumes the task handle and suspends until the scheduler produces
-terminal `R`; `join` only unwraps an already-produced `Done<R>`. Custom policies map yielded values
-to resume decisions through explicit concept evidence and cannot inspect or forge private
+`join` consumes `Task<R>` and may suspend internally until the scheduler produces
+terminal `R`; ordinary callers do not spell `await`. `done-value` unwraps an already-produced
+`Done<R>` from direct generator/coroutine advancement. Custom policies map yielded values to resume
+decisions through explicit concept evidence and cannot inspect or forge private
 continuation frames. OS worker threads are merely one execution policy for verified resumable state
 and require ordinary cross-worker transfer evidence.
 
@@ -2719,6 +2848,16 @@ Every phase adds tests at the layer where its invariant is enforced:
 - typed-fiber tests for initial start, non-unit resume values, unit-profile `next`/`Done` unwrapping,
   static rejection of raw-handle join, dynamic `try-join` ownership preservation, affine scheduler
   transfer, self/dependency-cycle diagnostics, cancellation, and checkpoint/restart preservation;
+- policy-coherence tests proving task joins hide internal park/yield-now events, generators expose
+  every semantic yield, invalid wrapper/combinator pairs produce actionable compile errors, and an
+  atomic terminal transition never loses or duplicates the consumed handle;
+- combinator tests for ordered heterogeneous and homogeneous `join-all`, deterministic
+  `cancel-on-error`, terminal-only `race`, loser cleanup, linear `select-complete` remainder
+  ownership, `next-any` source identity, homogeneous and explicitly tagged `merge`, stable replay
+  tie-breaks, and rotating fairness;
+- buffered-producer tests for enqueue-without-rendezvous, item/byte backpressure, oversized items,
+  scheduling-quantum fairness, ordered drain-before-terminal behavior, explicit discarding close,
+  exactly-once transactional delivery, and stable-ID redelivery across a non-transactional restart;
 - scheduler-reaper tests for reservation exhaustion/backpressure, create/drop storms, fair per-origin
   progress, bounded suspending cleanup, restart/replay, and exact-once terminalization;
 - child authority attenuation and cross-branch authorization tests;
