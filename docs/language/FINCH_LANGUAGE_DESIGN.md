@@ -941,26 +941,32 @@ Signatures use row polymorphism so a word states what it consumes while preservi
 beneath it:
 
 ```text
-dup          forall A: Copy, S. (S value A -- S A A) ! CopyEffects<A>
+dup          forall A: Copy, S. (S consume-value A -- S A A) ! CopyEffects<A>
 drop         forall A: Drop, S. (S take A -- S) ! DropEffects<A>
-+            forall S.   (S value int value int -- S int) guarantees pure
++            forall S.   (S consume-value int consume-value int -- S int) guarantees pure
 file.read    forall R S. (S borrow path<R> -- S path<R> bytes) ! fs.read<R>
 agent.await  forall T S. (S take task<T> -- S result<T,agent-error>) ! agent.await
-yield        forall Y Resume S. (S value Y -- S Resume) ! yields<Y,Resume>
+yield        forall Y Resume S. (S take Y -- S Resume) ! yields<Y,Resume>
 ```
 
-The stack arrow describes values retained or removed from the logical operand stack. Each input has
-one explicit semantic mode: `borrow T` receives a scoped `&T`; `borrow-mut T` receives an exclusive
-scoped `&mut T`; `take T` consumes an owner; and `value T` consumes an already materialized value
-operand. A source-level ordinary parameter defaults to `borrow`; a `Copy` scalar may use `value`
-without moving the caller's lexical binding because call lowering first materializes a copy. In
-Co-Forth the operand stack itself owns its cells: applying a borrowing callable to an owned top cell
-must retain that owner and create a distinct scoped borrow operand, whereas `take` or `value`
-consumes the indicated cell. The surface transform therefore also shows the borrowed owner in its
-output row; lowering creates a transient borrow cell for the callee and destroys only that cell on
-return. There is no word-specific implicit choice based on spelling. `dup`
-therefore requires explicit `Copy` evidence (and retaining a `Shared<T>` is its copy operation); it
-cannot duplicate a `Unique<T>`.
+The stack arrow describes values retained or removed from the logical operand stack. Source
+callables expose only the ownership modes programmers act on: `borrow T` receives a scoped `&T`;
+`borrow-mut T` receives an exclusive scoped `&mut T`; and `take T` consumes ownership. An ordinary
+source parameter defaults to `borrow`. Typed stack signatures additionally use `consume-value T`
+as a lowering-level cell mode: the instruction pops an independent value already materialized on
+the operand stack. It is deliberately not named merely `value`, because it describes consumption,
+not the value's nominal type or storage placement.
+
+Call lowering may satisfy `consume-value T` by copying a `Copy` binding, so arithmetic need not move
+the caller's lexical scalar. A non-`Copy` binding cannot be silently materialized this way; an
+ownership transfer is written and typed as `take`. Yield likewise takes its payload because the
+resumable execution may retain it beyond the current activation. In Co-Forth the operand stack owns
+its cells: applying a borrowing callable to an owned top cell retains that owner and creates a
+distinct scoped borrow operand, whereas `take` or `consume-value` consumes the indicated cell. The
+surface transform therefore also shows the borrowed owner in its output row; lowering creates a
+transient borrow cell for the callee and destroys only that cell on return. There is no word-specific
+implicit choice based on spelling. `dup` therefore requires explicit `Copy` evidence (and retaining
+a `Shared<T>` is its copy operation); it cannot duplicate a `Unique<T>`.
 
 `!` introduces one canonical typed effect row. Capability requirements, suspension, mutation,
 nondeterminism, and other observable behavior are distinct tagged members of that row, not
@@ -1557,7 +1563,7 @@ following constructs.
 Illustrative syntax:
 
 ```forth
-: square ( S value int -- S int ) guarantees pure
+: square ( S consume-value int -- S int ) guarantees pure
   dup *
 ;
 
@@ -1665,7 +1671,7 @@ Provide explicit locals for generated code and readable handwritten definitions:
 Quotations are typed callable values:
 
 ```forth
-[ value int -- int guarantees pure | 1 + ]
+[ consume-value int -- int guarantees pure | 1 + ]
 ```
 
 An escaping quotation is closure-converted into an immutable code reference plus an owner-carrying
@@ -1701,8 +1707,8 @@ The corresponding Co-Forth quotation header is structured syntax before `|`, not
 on the operand stack:
 
 ```forth
-[ ( S value int -- S int ) | ... ]
-[ captures: move ( S value int -- S int ) | ... ]
+[ ( S consume-value int -- S int ) | ... ]
+[ captures: move ( S consume-value int -- S int ) | ... ]
 [ captures: {
     borrow config
     take socket
@@ -1747,9 +1753,9 @@ origins are omitted here):
 ```text
 main:
   const.int 10
-  make-closure lambda$0 captures=1 : (S value int -- S int) guarantees pure
+  make-closure lambda$0 captures=1 : (S consume-value int -- S int) guarantees pure
   const.int 5
-  call-closure (S value int -- S int) guarantees pure
+  call-closure (S consume-value int -- S int) guarantees pure
   return
 
 lambda$0 captures: [int], locals: [int] # n is capture[0], x is local[0]
@@ -2068,7 +2074,14 @@ concept StableAddressOwner<T> : Owner<T> {
 
 concept PinnableOwner<T> : Owner<T> {
     associated Pinned : StableAddressOwner<T>
+    # Guaranteed nothrow and non-suspending: no allocation or reservation may newly fail.
     operation pin = take Self -> Pinned
+}
+
+concept TryPinnableOwner<T> : Owner<T> {
+    associated Pinned : StableAddressOwner<T>
+    # Failure returns the still-owned original carrier with the diagnostic.
+    operation try-pin = take Self -> result<Pinned, PinFailure<Self>>
 }
 
 Unique<T> : Owner<T>                 # movable, not copyable
@@ -2084,7 +2097,14 @@ allocation primitives, but ordinary code sees its checked lifecycle behavior.
 Every `Owner<T>` keeps the pointee valid and at one address for the duration of each active borrow.
 An ordinary owner may relocate its pointee only between borrows, when no derived address or view
 survives. `StableAddressOwner<T>` strengthens that promise across the owner's whole live storage
-generation, while `PinnableOwner<T>` can consume a relocatable owner and return such a stable owner.
+generation. `PinnableOwner<T>` is the narrower guarantee: it consumes a relocatable owner and
+returns a stable owner without a fallible allocation, reservation, exception, or suspension.
+`TryPinnableOwner<T>` is used when promotion may relocate, allocate, reserve scarce pinned storage,
+or otherwise fail. Its failure value contains the original live owner so a failed attempt never
+silently destroys or strands ownership. Both operations require that no borrow or derived address
+is active while pinning occurs, and any effects of fallible promotion remain explicit in the
+callable contract.
+
 Moving the owner handle need not move the pointee. Self-referential values, retained native
 callbacks, asynchronous FFI buffers, and APIs that store an address require stable-address evidence;
 ordinary borrowing does not acquire it accidentally. A raw address derived from a borrow remains
@@ -2107,6 +2127,21 @@ trivial-drop    no cleanup action; it may be erased completely
 local-drop      deterministic memory-local release such as freeing or decrementing an owner
 ordered-drop    bounded local cleanup with observable sequencing, such as unlocking a guard
 ```
+
+They form the ordered lattice `trivial-drop < local-drop < ordered-drop`. The drop class of a record,
+variant, closure environment, collection, or owner carrier is the join of every possibly live
+field's class, the carrier's own bookkeeping, and its custom hook. Unused or provably uninhabited
+storage contributes nothing; branch-dependent finality does not lower the conservative public
+class. Generic code carries this derived class in lifecycle evidence rather than assuming a class
+from the carrier's name.
+
+In particular, `drop-class(Shared<T>)` joins memory-local reference-count release with
+`drop-class(T)`, because the final strong release may destroy `T`; a non-final decrement being
+cheaper does not change the callable contract. `Weak<T>` similarly includes its control-block
+release but not `T`'s destructor, since a weak release cannot be the last strong owner. Fixed arrays
+and homogeneous containers join the element class with their storage owner's class. This
+composition rule makes nested cleanup and optimizer barriers predictable without pessimistically
+classifying all reference counting as ordered.
 
 All three preserve the language's exactly-once, reverse-construction destruction rules. The class
 only tells optimization and generic code what is unobservable: a trivial drop may disappear, and a
@@ -3993,11 +4028,14 @@ Every phase adds tests at the layer where its invariant is enforced:
   shared retain/final release, weak upgrade, destructor ordering, owner variance, and static/dynamic
   carrier evidence, plus explicit `Cow<T>` uniqueness/clone behavior and non-cloneable exclusions;
 - owner-address tests proving ordinary carriers cannot relocate during a borrow, stable/pinned
-  evidence is required for retained native addresses and self-references, and derived raw addresses
-  cannot outlive their borrow or cross suspension merely because storage is pinned;
-- lifecycle tests deriving trivial/local/ordered drop classes, preserving exact-once reverse-order
-  destruction through optimization and unwind, rejecting fallible or suspending hooks, and warning
-  on obvious strong-owner cycles without imposing tracing on acyclic `Shared` values;
+  evidence is required for retained native addresses and self-references, infallible pinning cannot
+  allocate or suspend, failed fallible pinning returns the original live owner, and derived raw
+  addresses cannot outlive their borrow or cross suspension merely because storage is pinned;
+- lifecycle tests deriving and joining trivial/local/ordered drop classes through nested fields,
+  variants, arrays, collections, and owner carriers; conservatively including final-pointee cleanup
+  in `Shared<T>`; preserving exact-once reverse-order destruction through optimization and unwind;
+  rejecting fallible or suspending hooks; and warning on obvious strong-owner cycles without
+  imposing tracing on acyclic `Shared` values;
 - safety-profile tests proving hosted admission rejects reachable and unreachable unsafe instructions
   and transitive unsafe calls with no approval path, while an unhosted build still requires lexical
   unsafe boundaries and explicit profile admission and cannot infer unrelated host authority;
