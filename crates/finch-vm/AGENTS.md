@@ -17,7 +17,8 @@ reader and types paths.
 
 **Documentation:** [`docs/README.md`](docs/README.md) owns implemented interpreter, fiber,
 checkpoint, and execution reference material. Cross-frontend planned semantics remain in the shared
-[language design](../../docs/language/README.md).
+[language design](../../docs/language/README.md); source-compilation separation follows the shared
+[implementation roadmap](../../docs/language/IMPLEMENTATION_ROADMAP.md).
 
 **Dependencies:** `finch-vm` depends downward on the unpublished `finch-vm-core`, `finch-colisp`,
 and `finch-coforth` crates and never on the root `finch` crate. Each frontend reaches only the core

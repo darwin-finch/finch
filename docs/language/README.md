@@ -2,8 +2,11 @@
 
 This directory owns design that crosses the CoLisp frontend, Co-Forth frontend, shared typed IR,
 and VM runtime. The current canonical design is the
-[typed Lisp/Forth capability and JIT plan](TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md). It is intended
-direction, not evidence that every described feature is implemented.
+[Finch language design](FINCH_LANGUAGE_DESIGN.md). It is intended direction, not evidence that
+every described feature is implemented.
+
+The [language implementation roadmap](IMPLEMENTATION_ROADMAP.md) maps that design onto the current
+workspace, staged issues, integration gates, and the bounded file set for a language-focused agent.
 
 Documentation follows the same semantic waist as the workspace:
 
@@ -23,6 +26,7 @@ crate capsules remain the fastest authoritative map of current ownership, and ge
 
 The long-term documentation split should remain coarse: one shared language specification, one
 syntax reference per frontend, one IR/verifier reference, and one execution reference. Avoid a file
-per feature. As sections become stable and implemented, extract them from the planning document
-into the appropriate reference and replace them with links, leaving this plan as the roadmap and
-cross-cutting rationale.
+per feature. As sections become stable and implemented, extract their reference material from the
+design into the appropriate crate document and replace detailed implementation notes with links.
+Keep design rationale here and implementation status in the roadmap rather than mixing either with
+current API evidence.

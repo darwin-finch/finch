@@ -1,9 +1,12 @@
-# Typed Lisp, Co-Forth, Capabilities, and Error Pipeline Plan
+# Finch Language Design
 
 ## Status and relationship to existing plans
 
-This document is the implementation plan for a single typed Finch language runtime with two
-source syntaxes:
+This document specifies the intended design of one typed Finch language runtime with two initial
+source syntaxes. It deliberately describes future semantics so early implementation choices do not
+make the coherent version prohibitively expensive. Implementation order, current gaps, crate
+transitions, and deletion gates live in the separate
+[language implementation roadmap](IMPLEMENTATION_ROADMAP.md).
 
 ```text
 typed Lisp source ────┐

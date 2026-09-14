@@ -138,7 +138,7 @@ Illustrative Lisp vocabulary:
 The exact names may follow existing vocabulary conventions, but the operations, values,
 effects, errors, and permission behavior must be equivalent. Do not implement the Lisp layer
 by generating Forth text, or the Forth layer by generating Lisp text. This plan's earlier direct-
-registry wording is superseded by `language/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md`: both frontends
+registry wording is superseded by `language/FINCH_LANGUAGE_DESIGN.md`: both frontends
 resolve the shared vocabulary and lower identical ownership/effect semantics into the common typed
 IR, whose verified host operations bind to the capability registry.
 

@@ -155,7 +155,7 @@ model. Direct legacy tools should be removed after compatibility tests pass.
 
 This was an implementation-staging proposal. The target architecture supersedes its separate-
 evaluator endpoint: CoLisp and Co-Forth now lower independently into the same verified typed stack
-IR, as specified in `language/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md`. The shared ABI and effect
+IR, as specified in `language/FINCH_LANGUAGE_DESIGN.md`. The shared ABI and effect
 work below remains useful migration history, not permission to retain two production semantic
 engines.
 

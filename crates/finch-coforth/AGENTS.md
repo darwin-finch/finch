@@ -12,7 +12,8 @@ only the two source-compilation entry points. Application callers continue to us
 
 **Documentation:** [`docs/README.md`](docs/README.md) owns implemented Co-Forth syntax and lowering
 reference material. Cross-frontend planned semantics remain in the shared
-[language design](../../docs/language/README.md).
+[language design](../../docs/language/README.md); boundary changes follow the shared
+[implementation roadmap](../../docs/language/IMPLEMENTATION_ROADMAP.md).
 
 **Dependencies:** `finch-coforth` depends only on [`finch-vm-core`](../finch-vm-core/AGENTS.md)
 inside the workspace. Shared type-spelling grammar comes from core's restricted compiler-support

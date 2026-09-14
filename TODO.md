@@ -4,7 +4,7 @@ GitHub Issues are the authoritative queue for actionable work. This file is the 
 roadmap and discoverable index; mutable implementation status belongs on the linked issue. The
 remaining unchecked backlog is being triaged under
 [#54](https://github.com/darwin-finch/finch/issues/54). Detailed rationale and protocol sketches live in
-[`docs/language/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md`](docs/language/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md),
+[`docs/language/FINCH_LANGUAGE_DESIGN.md`](docs/language/FINCH_LANGUAGE_DESIGN.md),
 [`docs/SHARED_PROGRAM_RUNTIME_PLAN.md`](docs/SHARED_PROGRAM_RUNTIME_PLAN.md), and
 [`docs/BRAIN_CONVERGENCE_PLAN.md`](docs/BRAIN_CONVERGENCE_PLAN.md).
 

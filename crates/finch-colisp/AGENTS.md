@@ -11,7 +11,8 @@ to use the `finch-vm` compatibility facade; this unpublished crate is the downwa
 
 **Documentation:** [`docs/README.md`](docs/README.md) owns implemented CoLisp syntax and lowering
 reference material. Cross-frontend planned semantics remain in the shared
-[language design](../../docs/language/README.md).
+[language design](../../docs/language/README.md); boundary changes follow the shared
+[implementation roadmap](../../docs/language/IMPLEMENTATION_ROADMAP.md).
 
 **Dependencies:** `finch-colisp` depends only on `finch-vm-core` plus reader serialization and
 error-support crates. It never depends on `finch-vm` or the root `finch` crate. Shared surface-type

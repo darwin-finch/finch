@@ -288,9 +288,12 @@ Design intent, not current fact. The program, its phases, and its measurable gat
   implementation children, co-located instructions and documentation, and boundary tests.
   Reverse and cross-subsystem implementation imports are removed before code moves between
   crates.
-- **Extraction order.** The shared typed contract is `finch-vm-core`; the coarse `finch-colisp` and
-  `finch-coforth` frontends depend only on that Finch crate; `finch-vm` composes them with the
-  interpreter and CPU fiber scheduler. Next is `finch-programs`
+- **Extraction order.** The shared typed contract is currently `finch-vm-core`; the coarse
+  `finch-colisp` and `finch-coforth` frontends depend only on that Finch crate; `finch-vm` currently
+  composes them with the interpreter and CPU fiber scheduler. The next language boundary introduces
+  a syntax-neutral semantic-construction/compiler facade and moves frontend selection out of VM
+  execution, as staged in the [language implementation roadmap](docs/language/IMPLEMENTATION_ROADMAP.md).
+  After that boundary is proven, the broader extraction sequence continues with `finch-programs`
   (depends only on `finch-vm`), then `finch-memory` (MemTree, retrieval, TF-IDF fallback, and an
   embedding port, without ONNX, Candle, tokenizer, Hugging Face, HTTP, or TUI stacks).
   Application subsystems follow only after their cycles are removed and the VM and memory
@@ -298,9 +301,10 @@ Design intent, not current fact. The program, its phases, and its measurable gat
 - **Target dependency direction**, refined during facade work:
 
   ```text
-  vm-core → colisp ┐
-      ├──→ coforth ├→ vm → programs → brain
-      └────────────┘
+  language-core → colisp ┐
+         ├──────→ coforth ├→ language compiler
+         └───────────────┘          ↓
+                    language-core → vm → programs → brain
 
   memory          tools-api
      ↓                ↓
@@ -331,7 +335,7 @@ Related design documents, intent rather than evidence:
 [shared program runtime](docs/SHARED_PROGRAM_RUNTIME_PLAN.md),
 [Brain convergence](docs/BRAIN_CONVERGENCE_PLAN.md),
 [VM-native agent runtime](docs/VM_NATIVE_AGENT_RUNTIME_PLAN.md),
-[typed Lisp/Forth capabilities and JIT](docs/language/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md).
+[Finch language design](docs/language/FINCH_LANGUAGE_DESIGN.md).
 
 ## Open questions
 
