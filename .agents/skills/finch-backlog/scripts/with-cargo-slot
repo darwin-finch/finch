@@ -15,12 +15,42 @@ if [[ $# -eq 0 && "$verify_only" -eq 0 ]]; then
     exit 64
 fi
 
-if ! git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+capture_record_line() {
+    local destination="$1" record marker='finch-cargo-slot-path-record-v1'
+    shift
+    if ! record="$("$@"; command_status=$?; printf '%s' "$marker"; exit "$command_status")"; then
+        return 1
+    fi
+    [[ "$record" == *"$marker" ]] || return 1
+    record="${record%"$marker"}"
+    [[ "$record" == *$'\n' ]] || return 1
+    record="${record%$'\n'}"
+    printf -v "$destination" '%s' "$record"
+}
+
+canonical_directory() {
+    cd -- "$1" 2>/dev/null && pwd -P
+}
+
+# Command substitution normally removes every trailing newline, including
+# bytes which belong to a valid pathname. Keep a non-newline sentinel through
+# capture, then remove the sentinel and exactly one command-record newline.
+if ! capture_record_line git_common_dir \
+    git rev-parse --path-format=absolute --git-common-dir 2>/dev/null; then
     echo "with-cargo-slot: run from a Finch Git worktree" >&2
     exit 69
 fi
-if ! git_common_dir="$(cd "$git_common_dir" 2>/dev/null && pwd -P)"; then
+if ! capture_record_line git_common_dir canonical_directory "$git_common_dir"; then
     echo "with-cargo-slot: could not canonicalize the Git common directory" >&2
+    exit 69
+fi
+if ! capture_record_line worktree_root \
+    git rev-parse --path-format=absolute --show-toplevel 2>/dev/null; then
+    echo "with-cargo-slot: could not resolve the Git worktree root" >&2
+    exit 69
+fi
+if ! capture_record_line worktree_root canonical_directory "$worktree_root"; then
+    echo "with-cargo-slot: could not canonicalize the Git worktree root" >&2
     exit 69
 fi
 
@@ -28,12 +58,12 @@ lock_path="$git_common_dir/finch-cargo-slot.lock"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
 # Shell startup files are not reliably loaded by local agents. Choose one
-# deterministic mutable target for every linked worktree unless the caller
-# explicitly selected one. CI already owns its workspace/cache target layout,
-# so leave an unset target untouched there instead of bypassing restored build
-# artifacts. The Git common directory is already the local lock domain, so
-# hashing its canonical identity also keeps unrelated clones from racing on
-# the same target artifacts by default.
+# deterministic mutable target for this worktree unless the caller explicitly
+# selected one. CI already owns its workspace/cache target layout, so leave an
+# unset target untouched there instead of bypassing restored build artifacts.
+# The repository namespace groups related targets for accounting; the
+# worktree namespace prevents Cargo freshness metadata from selecting an
+# executable built from another checkout. The lock remains repository-wide.
 if [[ "${CARGO_TARGET_DIR+x}" != x && -z "${CI:-}" ]]; then
     if [[ -n "${XDG_CACHE_HOME:-}" && "$XDG_CACHE_HOME" == /* ]]; then
         cargo_cache_root="$XDG_CACHE_HOME"
@@ -44,12 +74,17 @@ if [[ "${CARGO_TARGET_DIR+x}" != x && -z "${CI:-}" ]]; then
         fi
         cargo_cache_root="$HOME/.cache"
     fi
-    if ! target_namespace="$(perl -MDigest::SHA=sha256_hex -e \
+    if ! repository_namespace="$(perl -MDigest::SHA=sha256_hex -e \
         'print sha256_hex($ARGV[0])' "$git_common_dir")"; then
-        echo "with-cargo-slot: could not derive the Cargo target namespace" >&2
+        echo "with-cargo-slot: could not derive the Cargo repository namespace" >&2
         exit 69
     fi
-    CARGO_TARGET_DIR="$cargo_cache_root/cargo-target/$target_namespace"
+    if ! worktree_namespace="$(perl -MDigest::SHA=sha256_hex -e \
+        'print sha256_hex($ARGV[0])' "$worktree_root")"; then
+        echo "with-cargo-slot: could not derive the Cargo worktree namespace" >&2
+        exit 69
+    fi
+    CARGO_TARGET_DIR="$cargo_cache_root/cargo-target/$repository_namespace/$worktree_namespace"
     if ! mkdir -p -- "$CARGO_TARGET_DIR"; then
         echo "with-cargo-slot: could not create Cargo target directory: path=$CARGO_TARGET_DIR" >&2
         exit 69

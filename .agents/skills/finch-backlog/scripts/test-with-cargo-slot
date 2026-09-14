@@ -140,17 +140,50 @@ assert_no_file() {
 
 repo="$fixture_root/repo"
 worktree="$fixture_root/worktree"
-mkdir -p "$repo/.agents/skills/finch-backlog/scripts" "$repo/scripts/lib"
+newline_worktree="$fixture_root/worktree"$'\n'
+mkdir -p "$repo/.agents/skills/finch-backlog/scripts" "$repo/scripts/lib" "$repo/src/bin"
 cp "$source_wrapper" "$repo/.agents/skills/finch-backlog/scripts/with-cargo-slot"
 cp "$source_root/.agents/skills/finch-backlog/scripts/test-with-cargo-slot" \
     "$repo/.agents/skills/finch-backlog/scripts/test-with-cargo-slot"
 cp "$source_root/scripts/test_brains.sh" "$repo/scripts/test_brains.sh"
 cp "$source_root/scripts/lib/brain_test_isolation.sh" "$repo/scripts/lib/brain_test_isolation.sh"
+cat >"$repo/Cargo.toml" <<'REAL_CARGO_MANIFEST'
+[package]
+name = "finch-slot-fixture"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "finch-test-supervisor"
+path = "src/bin/finch-test-supervisor.rs"
+REAL_CARGO_MANIFEST
+cat >"$repo/src/lib.rs" <<'REAL_CARGO_INITIAL_LIB'
+// Each linked worktree replaces this with a checkout-specific test.
+REAL_CARGO_INITIAL_LIB
+cat >"$repo/src/bin/finch-test-supervisor.rs" <<'REAL_CARGO_SUPERVISOR'
+use std::process::{exit, Command};
+
+fn main() {
+    let mut arguments = std::env::args_os().skip(1);
+    let Some(command) = arguments.next() else {
+        exit(64);
+    };
+    if command == "--verify-inherited-proof" {
+        exit(1);
+    }
+    let status = Command::new(command)
+        .args(arguments)
+        .status()
+        .expect("fixture supervisor must execute its command");
+    exit(status.code().unwrap_or(1));
+}
+REAL_CARGO_SUPERVISOR
 printf 'fixture\n' >"$repo/README"
 git -C "$repo" init -q
 git -C "$repo" add .
 git -C "$repo" -c user.name=Finch -c user.email=finch@example.invalid commit -qm fixture
 git -C "$repo" worktree add -q "$worktree" -b second-worktree
+git -C "$repo" worktree add -q "$newline_worktree" -b newline-worktree
 
 wrapper="$repo/.agents/skills/finch-backlog/scripts/with-cargo-slot"
 launcher="$repo/scripts/test_brains.sh"
@@ -162,19 +195,83 @@ mkdir -p "$cache_root"
 export XDG_CACHE_HOME="$cache_root"
 
 # The wrapper, rather than shell startup configuration, owns the default target
-# selection. Linked worktrees share the canonical Git common directory and must
-# therefore share one absolute target and lock domain.
+# selection. Linked worktrees share one canonical Git lock identity, while
+# each checkout receives a different mutable target identity.
 default_identity="$(cd "$repo" && env -u CARGO_TARGET_DIR "$wrapper" sh -c \
     'printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_TARGET_DIR"')"
 worktree_identity="$(cd "$worktree" && env -u CARGO_TARGET_DIR "$wrapper" sh -c \
     'printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_TARGET_DIR"')"
-[[ "$default_identity" == "$worktree_identity" ]] || fail \
-    "linked worktrees selected different lock/target identities: primary=$default_identity linked=$worktree_identity"
+newline_worktree_identity="$(cd "$newline_worktree" && env -u CARGO_TARGET_DIR "$wrapper" sh -c \
+    'printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_TARGET_DIR"')"
+[[ "${default_identity%%|*}" == "${worktree_identity%%|*}" ]] || fail \
+    "linked worktrees selected different lock identities: primary=$default_identity linked=$worktree_identity"
+[[ "${worktree_identity%%|*}" == "${newline_worktree_identity%%|*}" ]] || fail \
+    "newline-suffixed worktree selected a different lock identity: ordinary=$worktree_identity newline=$newline_worktree_identity"
 default_target="${default_identity#*|}"
+worktree_target="${worktree_identity#*|}"
+newline_worktree_target="${newline_worktree_identity#*|}"
+[[ "$worktree_target" != "$newline_worktree_target" ]] || fail \
+    "trailing-newline worktree path collided with its unsuffixed target identity: ordinary=$worktree_target newline=$newline_worktree_target"
 [[ "$default_target" == "$cache_root/cargo-target/"* ]] || fail \
     "default target is not namespaced below the absolute cache root: cache_root=$cache_root actual=$default_target"
+[[ "$(dirname "$default_target")" == "$(dirname "$worktree_target")" ]] || fail \
+    "linked-worktree targets were not grouped under one repository namespace: primary=$default_target linked=$worktree_target"
 [[ -d "$default_target" ]] || fail \
     "wrapper did not create its selected target directory: target=$default_target"
+[[ -d "$worktree_target" ]] || fail \
+    "wrapper did not create its linked-worktree target directory: target=$worktree_target"
+
+# Exercise Cargo's real freshness logic through the repository wrapper and
+# Brain supervisor. Both checkout-specific source files predate checkout A's
+# first build, so a shared target can incorrectly accept A's test executable
+# as fresh when B runs. Each invocation must execute exactly one named test
+# and print that checkout's sentinel; a successful zero-match run is a failure.
+cat >"$repo/src/lib.rs" <<'CHECKOUT_A_TEST'
+#[test]
+fn checkout_a_identity() {
+    println!("checkout-a-executed");
+}
+CHECKOUT_A_TEST
+git -C "$repo" add src/lib.rs
+git -C "$repo" -c user.name=Finch -c user.email=finch@example.invalid \
+    commit -qm checkout-a
+cat >"$worktree/src/lib.rs" <<'CHECKOUT_B_TEST'
+#[test]
+fn checkout_b_identity() {
+    println!("checkout-b-executed");
+}
+CHECKOUT_B_TEST
+git -C "$worktree" add src/lib.rs
+git -C "$worktree" -c user.name=Finch -c user.email=finch@example.invalid \
+    commit -qm checkout-b
+touch -t 202001010000 "$repo/Cargo.toml" "$repo/src/lib.rs" \
+    "$repo/src/bin/finch-test-supervisor.rs" \
+    "$worktree/Cargo.toml" "$worktree/src/lib.rs" \
+    "$worktree/src/bin/finch-test-supervisor.rs"
+
+assert_checkout_test() {
+    local checkout="$1" launcher_path="$2" test_name="$3" sentinel="$4" output="$5"
+    if ! (cd "$checkout" && env -u CARGO_TARGET_DIR "$launcher_path" \
+        cargo test --lib "$test_name" -- --exact --nocapture >"$output" 2>&1); then
+        sed -n '1,120p' "$output" >&2
+        fail "real Cargo checkout test failed: checkout=$checkout test=$test_name"
+    fi
+    assert_contains "$output" 'running 1 test' \
+        "real Cargo did not execute exactly one requested checkout test: checkout=$checkout test=$test_name"
+    assert_contains "$output" "$sentinel" \
+        "real Cargo executed an artifact from another checkout: checkout=$checkout test=$test_name"
+}
+
+assert_checkout_test "$repo" "$launcher" checkout_a_identity checkout-a-executed \
+    "$fixture_root/real-cargo-a-first.out"
+assert_checkout_test "$worktree" "$worktree_launcher" checkout_b_identity checkout-b-executed \
+    "$fixture_root/real-cargo-b.out"
+assert_checkout_test "$repo" "$launcher" checkout_a_identity checkout-a-executed \
+    "$fixture_root/real-cargo-a-second.out"
+[[ "$default_target" != "$worktree_target" ]] || fail \
+    "linked worktrees selected the same mutable target: primary=$default_target linked=$worktree_target"
+[[ "$(basename "$default_target")" != "$(basename "$worktree_target")" ]] || fail \
+    "linked-worktree target leaves did not identify their checkout: primary=$default_target linked=$worktree_target"
 
 # Hosted CI owns and restores its target layout separately. An unset target
 # must remain unset there, or supervised/nested commands bypass the restored
@@ -186,7 +283,7 @@ ci_identity="$(cd "$repo" && CI=true XDG_CACHE_HOME="$ci_cache_root" \
 [[ "$ci_identity" == "$common_dir|" ]] || fail \
     "CI without an explicit target should retain Cargo workspace-default selection: expected=$common_dir| actual=$ci_identity"
 [[ ! -e "$ci_cache_root/cargo-target" ]] || fail \
-    "CI unexpectedly created the local shared target root: path=$ci_cache_root/cargo-target"
+    "CI unexpectedly created the local target root: path=$ci_cache_root/cargo-target"
 
 # A separate clone has a different Git common directory. Its default mutable
 # artifacts and lock must not collide with this repository's worktrees.
@@ -780,7 +877,7 @@ IFS= read -r ready <"$holder_ready"
 [[ "$ready" == ready ]] || fail "launcher holder readiness handshake was corrupted: actual=$ready"
 
 case_dir="$fixture_root/cases/contender"
-case_target="$default_target"
+case_target="$worktree_target"
 case_cargo_log="$case_dir/cargo.log"
 case_supervisor_log="$case_dir/supervisor.args"
 case_artifacts="$case_dir/artifacts"
@@ -1067,4 +1164,4 @@ status=$?
 set -e
 [[ "$status" -eq 69 ]] || fail "unsupported platform should fail closed with 69: actual=$status"
 
-echo 'with-cargo-slot and shared-target launcher regressions passed'
+echo 'with-cargo-slot and worktree-target launcher regressions passed'
