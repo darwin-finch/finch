@@ -4,19 +4,21 @@ use finch_vm_core::{
     SourceLanguage, SourceOrigin, SourceSpan, StackRow, StackSignature, SuspensionSignature, Type,
     TypedValue, UiOperation, VerifiedModule, Verifier, VmDiagnostic, Vocabulary,
 };
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Debug, Clone)]
-struct LocalBinding {
-    name: String,
+struct LocalBinding<'source> {
+    name: &'source str,
     ty: Type,
-    origin: SourceOrigin,
+    start: usize,
+    end: usize,
 }
 
 #[derive(Debug, Clone)]
-struct Token {
-    value: TokenValue,
+struct Token<'source> {
+    value: TokenValue<'source>,
     start: usize,
     end: usize,
 }
@@ -64,59 +66,65 @@ fn split_variant_constructor_arguments(source: &str) -> Option<(&str, &str)> {
 /// The source-preserving Co-Forth module syntax tree. This is deliberately a
 /// frontend representation rather than typed IR: definition boundaries and
 /// body nodes are retained with their original byte spans, and lowering never
-/// serializes or reparses a definition body. Structured control/literal nodes
-/// can replace unresolved words incrementally without changing the IR boundary.
+/// serializes or reparses a definition body. Source spellings borrow the
+/// immutable input; decoded literals and semantic type information own data.
 #[derive(Debug, Clone)]
-struct ForthModuleAst {
-    definitions: Vec<ForthDefinitionAst>,
-    body: ForthBodyAst,
+struct ForthModuleAst<'source> {
+    definitions: Vec<ForthDefinitionAst<'source>>,
+    body: ForthBodyAst<'source>,
 }
 
 #[derive(Debug, Clone)]
-struct ForthBodyAst {
-    nodes: Vec<ForthBodyNode>,
+struct ForthBodyAst<'source> {
+    nodes: Vec<ForthBodyNode<'source>>,
 }
 
 #[derive(Debug, Clone)]
-enum ForthBodyNode {
-    Word(ForthWordAst),
-    Literal(ForthLiteralAst),
-    Quotation(ForthQuotationAst),
+enum ForthBodyNode<'source> {
+    Word(ForthWordAst<'source>),
+    Literal(ForthLiteralAst<'source>),
+    Quotation(ForthQuotationAst<'source>),
+    Group(ForthBodyAst<'source>),
 }
 
-impl ForthBodyNode {
-    fn leading_token(&self) -> &Token {
+impl ForthBodyNode<'_> {
+    fn leading_token(&self) -> &Token<'_> {
         match self {
             Self::Word(word) => &word.token,
             Self::Literal(literal) => &literal.token,
             Self::Quotation(quotation) => &quotation.open,
+            Self::Group(body) => body.nodes[0].leading_token(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct ForthWordAst {
-    token: Token,
-    name: String,
+struct ForthWordAst<'source> {
+    token: Token<'source>,
+    syntax: ForthSyntax,
+    operand: Option<Token<'source>>,
+    field: Option<Cow<'source, str>>,
+    control_valid: bool,
+    next_is_terminal: bool,
 }
 
 #[derive(Debug, Clone)]
-struct ForthLiteralAst {
-    token: Token,
+struct ForthLiteralAst<'source> {
+    token: Token<'source>,
     value: TypedValue,
 }
 
 #[derive(Debug, Clone)]
-struct ForthQuotationAst {
-    open: Token,
-    signature: Vec<Token>,
-    body: ForthBodyAst,
+struct ForthQuotationAst<'source> {
+    open: Token<'source>,
+    signature: Result<(StackSignature, bool), Vec<VmDiagnostic>>,
+    body: ForthBodyAst<'source>,
     end: usize,
 }
 
 #[derive(Debug, Clone)]
-enum TokenValue {
-    Word(String),
+enum TokenValue<'source> {
+    Word(&'source str),
     String(String),
     /// A pasted JSON object literal. It is deliberately retained as managed
     /// JSON rather than guessed to be a typed record or map.
@@ -205,6 +213,91 @@ enum ControlKind {
     Case,
 }
 
+/// Syntax is classified once by the parser. Group children retain the exact
+/// source order, including malformed closers, so lowering reports the original
+/// first diagnostic without searching for delimiters or adjacent operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForthSyntax {
+    Word,
+    QuoteTarget,
+    RecordField,
+    RecordGetNamed,
+    RecordGet,
+    RecordSet,
+    ListOpen,
+    ListClose,
+    MapOpen,
+    MapClose,
+    RecordOpen,
+    RecordClose,
+    Case,
+    Of,
+    EndOf,
+    Otherwise,
+    EndCase,
+    If,
+    MatchOption,
+    MatchResult,
+    Else,
+    Then,
+    Begin,
+    NamedBegin,
+    Break,
+    Continue,
+    While,
+    Repeat,
+    Until,
+}
+
+impl ForthSyntax {
+    fn parse(word: &str) -> Self {
+        match word {
+            "[']" => Self::QuoteTarget,
+            "record-get" => Self::RecordGet,
+            "record-set" => Self::RecordSet,
+            "[" | "list{" => Self::ListOpen,
+            "]" | "}list" => Self::ListClose,
+            "map{" => Self::MapOpen,
+            "}map" => Self::MapClose,
+            "{" | "record{" => Self::RecordOpen,
+            "}" | "}record" => Self::RecordClose,
+            "case" => Self::Case,
+            "of" => Self::Of,
+            "endof" => Self::EndOf,
+            "otherwise" => Self::Otherwise,
+            "endcase" => Self::EndCase,
+            "if" => Self::If,
+            "if-some" => Self::MatchOption,
+            "if-ok" => Self::MatchResult,
+            "else" => Self::Else,
+            "then" => Self::Then,
+            "begin" => Self::Begin,
+            "begin:" => Self::NamedBegin,
+            "break" => Self::Break,
+            "continue" => Self::Continue,
+            "while" => Self::While,
+            "repeat" => Self::Repeat,
+            "until" => Self::Until,
+            _ => Self::Word,
+        }
+    }
+}
+
+impl<'source> ForthBodyAst<'source> {
+    fn visit(
+        &self,
+        lower: &mut impl FnMut(&ForthBodyNode<'source>) -> Result<(), Vec<VmDiagnostic>>,
+    ) -> Result<(), Vec<VmDiagnostic>> {
+        for node in &self.nodes {
+            match node {
+                ForthBodyNode::Group(body) => body.visit(lower)?,
+                _ => lower(node)?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Distinguish `[ signature | body ]` from the ordinary `[ values ]` list
 /// literal without introducing a second lexer mode. Only a top-level `|`
 /// following a top-level `--` selects quotation syntax.
@@ -216,7 +309,7 @@ fn anonymous_quotation_bounds(tokens: &[Token], start: usize) -> Option<(usize, 
         let TokenValue::Word(word) = &token.value else {
             continue;
         };
-        match word.as_str() {
+        match *word {
             "[" => depth += 1,
             "]" => {
                 depth = depth.checked_sub(1)?;
@@ -241,7 +334,7 @@ fn parse_quotation_signature(
 ) -> Result<(StackSignature, bool), Vec<VmDiagnostic>> {
     let Some(separator) = header
         .iter()
-        .position(|token| matches!(&token.value, TokenValue::Word(word) if word == "--"))
+        .position(|token| matches!(&token.value, TokenValue::Word(word) if *word == "--"))
     else {
         return Err(vec![control_error(
             "E-FORTH-QUOTE-003",
@@ -251,7 +344,7 @@ fn parse_quotation_signature(
     };
     let effect = header
         .iter()
-        .position(|token| matches!(&token.value, TokenValue::Word(word) if word == "!"))
+        .position(|token| matches!(&token.value, TokenValue::Word(word) if *word == "!"))
         .unwrap_or(header.len());
     if effect < separator {
         return Err(vec![control_error(
@@ -274,11 +367,11 @@ fn parse_quotation_signature(
     } else {
         let annotation = &header[effect + 1..];
         if annotation.len() == 1
-            && matches!(&annotation[0].value, TokenValue::Word(word) if word == "pure")
+            && matches!(&annotation[0].value, TokenValue::Word(word) if *word == "pure")
         {
             true
         } else if annotation.len() == 1
-            && matches!(&annotation[0].value, TokenValue::Word(word) if word == "infer")
+            && matches!(&annotation[0].value, TokenValue::Word(word) if *word == "infer")
         {
             false
         } else {
@@ -346,15 +439,15 @@ pub fn compile_forth_with_functions(
     let mut local_vocabulary = vocabulary.clone();
     let mut definition_names = BTreeSet::new();
     for definition in &definitions {
-        if vocabulary.contains_key(&definition.name)
-            || functions.contains_key(&definition.name)
+        if vocabulary.contains_key(definition.name)
+            || functions.contains_key(definition.name)
             || definition.name == "main"
-            || !definition_names.insert(definition.name.clone())
+            || !definition_names.insert(definition.name.to_owned())
         {
             return Err(vec![control_error(
                 "E-FORTH-DEF-001",
                 format!("word '{}' is already defined", definition.name),
-                definition.origin.clone(),
+                origin(source_id, source, definition.start, definition.end),
             )]);
         }
         // A declared-pure signature is complete authority information, so it
@@ -363,11 +456,11 @@ pub fn compile_forth_with_functions(
         // `! infer` words intentionally remain sequential: their effects are
         // learned from their body and must not be guessed for a sibling call.
         if definition.declares_pure {
-            local_vocabulary.insert(definition.name.clone(), definition.signature.clone());
+            local_vocabulary.insert(definition.name.to_owned(), definition.signature.clone());
         }
     }
     for definition in definitions {
-        local_vocabulary.insert(definition.name.clone(), definition.signature.clone());
+        local_vocabulary.insert(definition.name.to_owned(), definition.signature.clone());
         let compiled = lower_forth_ast_body_with_locals(
             source_id,
             source,
@@ -395,7 +488,7 @@ pub fn compile_forth_with_functions(
                     "word '{}' declares output {:?} but its body leaves {:?}",
                     definition.name, definition.signature.output.values, actual_output
                 ),
-                definition.origin,
+                origin(source_id, source, definition.start, definition.end),
             );
             diagnostic.expected_types = definition.signature.output.values;
             diagnostic.found_types = actual_output;
@@ -408,13 +501,13 @@ pub fn compile_forth_with_functions(
                     "word '{}' declares {{}} but requires {}",
                     definition.name, verified.inferred_effects
                 ),
-                definition.origin,
+                origin(source_id, source, definition.start, definition.end),
             );
             diagnostic.found_effects = verified.inferred_effects.clone();
             return Err(vec![diagnostic]);
         }
-        function.name = definition.name.clone();
-        function.documentation = definition.documentation;
+        function.name = definition.name.to_owned();
+        function.documentation = definition.documentation.map(str::to_owned);
         function.signature = definition.signature;
         function.signature.effects = verified.inferred_effects.clone();
         function.signature.suspension = verified.inferred_suspension.clone();
@@ -423,8 +516,8 @@ pub fn compile_forth_with_functions(
         } else {
             ControlEffect::Returns
         };
-        local_vocabulary.insert(definition.name.clone(), function.signature.clone());
-        functions.insert(definition.name, function);
+        local_vocabulary.insert(definition.name.to_owned(), function.signature.clone());
+        functions.insert(definition.name.to_owned(), function);
     }
 
     compile_forth_ast_body_with_functions(
@@ -471,11 +564,6 @@ fn lower_forth_ast_body_with_locals(
     captures: &[LocalBinding],
     expected_return: Option<&[Type]>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
-    let tokens = body
-        .nodes
-        .iter()
-        .map(|node| node.leading_token().clone())
-        .collect::<Vec<_>>();
     let mut stack = initial_stack.clone();
     let mut effects = EffectSet::pure();
     let mut suspension: Option<SuspensionSignature> = None;
@@ -494,16 +582,16 @@ fn lower_forth_ast_body_with_locals(
     let mut map_literals: Vec<MapLiteralFrame> = Vec::new();
     let mut list_literals: Vec<ListLiteralFrame> = Vec::new();
     let mut record_literals: Vec<RecordLiteralFrame> = Vec::new();
-    let mut control = Vec::new();
+
     let local_indexes = locals
         .iter()
         .enumerate()
-        .map(|(index, local)| (local.name.as_str(), (index as u32, local.ty.clone())))
+        .map(|(index, local)| (local.name, (index as u32, local.ty.clone())))
         .collect::<BTreeMap<_, _>>();
     let capture_indexes = captures
         .iter()
         .enumerate()
-        .map(|(index, capture)| (capture.name.as_str(), (index as u32, capture.ty.clone())))
+        .map(|(index, capture)| (capture.name, (index as u32, capture.ty.clone())))
         .collect::<BTreeMap<_, _>>();
     let mut available_functions = linked_functions.clone();
 
@@ -529,7 +617,6 @@ fn lower_forth_ast_body_with_locals(
         });
     };
 
-    let mut token_index = 0;
     // Signature names store declared inputs in bottom-to-top order. Store the
     // top value first, exactly as a Lisp parameter prologue does, so the body
     // begins with a clean shared stack and values live in this activation.
@@ -538,7 +625,7 @@ fn lower_forth_ast_body_with_locals(
             vec![control_error(
                 "E-FORTH-LOCAL-003",
                 "named signature input requires a corresponding typed value",
-                local.origin.clone(),
+                origin(source_id, source, local.start, local.end),
             )]
         })?;
         if found != local.ty {
@@ -546,7 +633,7 @@ fn lower_forth_ast_body_with_locals(
                 &stack,
                 local.ty.clone(),
                 found,
-                Some(local.origin.clone()),
+                Some(origin(source_id, source, local.start, local.end)),
             )]);
         }
         emit(
@@ -555,32 +642,32 @@ fn lower_forth_ast_body_with_locals(
             Instruction::LocalSet {
                 index: index as u32,
             },
-            local.origin.clone(),
+            origin(source_id, source, local.start, local.end),
         );
     }
-    while token_index < tokens.len() {
-        let token = tokens[token_index].clone();
-        if let ForthBodyNode::Quotation(quotation) = &body.nodes[token_index] {
+    body.visit(&mut |node| {
+        let token = node.leading_token().clone();
+        if let ForthBodyNode::Quotation(quotation) = node {
             let origin = origin(source_id, source, token.start, quotation.end);
             let (declared_signature, declares_pure) =
-                parse_quotation_signature(source_id, source, &quotation.signature, &origin)?;
+                quotation.signature.clone()?;
 
             // Locals shadow captures. Capturing all visible immutable
             // bindings matches Lisp's deterministic initial lowering;
             // later escape analysis may remove unused captures.
             let local_names = locals
                 .iter()
-                .map(|local| local.name.as_str())
+                .map(|local| local.name)
                 .collect::<BTreeSet<_>>();
             let mut visible = captures
                 .iter()
-                .filter(|capture| !local_names.contains(capture.name.as_str()))
+                .filter(|capture| !local_names.contains(capture.name))
                 .cloned()
                 .collect::<Vec<_>>();
             visible.extend_from_slice(locals);
 
             for capture in &visible {
-                if let Some((index, _)) = local_indexes.get(capture.name.as_str()) {
+                if let Some((index, _)) = local_indexes.get(capture.name) {
                     stack.push(capture.ty.clone());
                     emit(
                         &mut blocks,
@@ -588,7 +675,7 @@ fn lower_forth_ast_body_with_locals(
                         Instruction::LocalGet { index: *index },
                         origin.clone(),
                     );
-                } else if let Some((index, _)) = capture_indexes.get(capture.name.as_str()) {
+                } else if let Some((index, _)) = capture_indexes.get(capture.name) {
                     stack.push(capture.ty.clone());
                     emit(
                         &mut blocks,
@@ -663,10 +750,9 @@ fn lower_forth_ast_body_with_locals(
                 },
                 origin,
             );
-            token_index += 1;
-            continue;
+            return Ok(());
         }
-        if let ForthBodyNode::Literal(literal) = &body.nodes[token_index] {
+        if let ForthBodyNode::Literal(literal) = node {
             let origin = origin(source_id, source, literal.token.start, literal.token.end);
             stack.push(literal.value.value_type());
             emit(
@@ -677,14 +763,13 @@ fn lower_forth_ast_body_with_locals(
                 },
                 origin,
             );
-            token_index += 1;
-            continue;
+            return Ok(());
         }
         let origin = origin(source_id, source, token.start, token.end);
-        if let ForthBodyNode::Word(word_node) = &body.nodes[token_index] {
-            let word = &word_node.name;
-            if word == "[']" {
-                let Some(target) = tokens.get(token_index + 1) else {
+        if let ForthBodyNode::Word(word_node) = node {
+            let TokenValue::Word(word) = word_node.token.value else { unreachable!("word node has a word token") };
+            if word_node.syntax == ForthSyntax::QuoteTarget {
+                let Some(target) = word_node.operand.as_ref() else {
                     return Err(vec![control_error(
                         "E-FORTH-QUOTE-001",
                         "['] requires a persistent typed word name",
@@ -698,7 +783,7 @@ fn lower_forth_ast_body_with_locals(
                         origin,
                     )]);
                 };
-                let Some(function) = available_functions.get(target_name) else {
+                let Some(function) = available_functions.get(*target_name) else {
                     return Err(vec![control_error(
                         "E-FORTH-QUOTE-002",
                         format!("quotation target '{target_name}' is not a typed word"),
@@ -723,14 +808,13 @@ fn lower_forth_ast_body_with_locals(
                     &mut blocks,
                     current,
                     Instruction::MakeClosure {
-                        function: target_name.clone(),
+                        function: (*target_name).to_owned(),
                         capture_count: 0,
                         signature,
                     },
                     origin,
                 );
-                token_index += 2;
-                continue;
+                return Ok(());
             }
             if word == "execute" {
                 let Type::Function {
@@ -773,8 +857,7 @@ fn lower_forth_ast_body_with_locals(
                     Instruction::CallClosure { signature },
                     origin,
                 );
-                token_index += 1;
-                continue;
+                return Ok(());
             }
             if let Some(arguments) = word
                 .strip_prefix("empty-map<")
@@ -803,8 +886,7 @@ fn lower_forth_ast_body_with_locals(
                     },
                     origin,
                 );
-                token_index += 1;
-                continue;
+                return Ok(());
             }
             if let Some(element) = word
                 .strip_prefix("empty-list<")
@@ -827,8 +909,7 @@ fn lower_forth_ast_body_with_locals(
                     },
                     origin,
                 );
-                token_index += 1;
-                continue;
+                return Ok(());
             }
             if word.starts_with("variant<") {
                 let Some((variants, tag, payload_type)) = parse_variant_constructor_name(word)
@@ -867,8 +948,7 @@ fn lower_forth_ast_body_with_locals(
                     },
                     origin,
                 );
-                token_index += 1;
-                continue;
+                return Ok(());
             }
             if let Some(tag) = word
                 .strip_prefix("variant-get<")
@@ -910,13 +990,10 @@ fn lower_forth_ast_body_with_locals(
                     },
                     origin,
                 );
-                token_index += 1;
-                continue;
+                return Ok(());
             }
-            if let Some(field) = word
-                .strip_prefix("field:")
-                .or_else(|| record_literals.last().and_then(|_| word.strip_suffix(':')))
-            {
+            if word_node.syntax == ForthSyntax::RecordField {
+                let field = word_node.field.as_deref().expect("parsed record field");
                 if field.is_empty()
                     || !field.chars().all(|character| {
                         character.is_ascii_alphanumeric() || character == '_' || character == '-'
@@ -950,10 +1027,10 @@ fn lower_forth_ast_body_with_locals(
                     )]);
                 }
                 frame.fields.push(field.to_owned());
-                token_index += 1;
-                continue;
+                return Ok(());
             }
-            if let Some(field) = word.strip_prefix("record-get:") {
+            if word_node.syntax == ForthSyntax::RecordGetNamed {
+                let field = word_node.field.as_deref().expect("parsed record accessor");
                 let Some(Type::Record(fields)) = stack.last() else {
                     return Err(vec![control_error(
                         "E-RECORD-004",
@@ -990,14 +1067,10 @@ fn lower_forth_ast_body_with_locals(
                     },
                     origin,
                 );
-                token_index += 1;
-                continue;
+                return Ok(());
             }
-            if word == "record-get" {
-                let Some(Token {
-                    value: TokenValue::String(field),
-                    ..
-                }) = tokens.get(token_index.wrapping_sub(1))
+            if word_node.syntax == ForthSyntax::RecordGet {
+                let Some(field) = word_node.field.as_deref()
                 else {
                     return Err(vec![control_error(
                         "E-RECORD-004",
@@ -1035,19 +1108,15 @@ fn lower_forth_ast_body_with_locals(
                     &mut blocks,
                     current,
                     Instruction::RecordGet {
-                        field: field.clone(),
+                        field: field.to_owned(),
                         value_type,
                     },
                     origin,
                 );
-                token_index += 1;
-                continue;
+                return Ok(());
             }
-            if word == "record-set" {
-                let Some(Token {
-                    value: TokenValue::String(field),
-                    ..
-                }) = tokens.get(token_index.wrapping_sub(1))
+            if word_node.syntax == ForthSyntax::RecordSet {
+                let Some(field) = word_node.field.as_deref()
                 else {
                     return Err(vec![control_error(
                         "E-RECORD-007",
@@ -1096,25 +1165,23 @@ fn lower_forth_ast_body_with_locals(
                     &mut blocks,
                     current,
                     Instruction::RecordSet {
-                        field: field.clone(),
+                        field: field.to_owned(),
                         value_type,
                         record_type,
                     },
                     origin,
                 );
-                token_index += 1;
-                continue;
+                return Ok(());
             }
-            match word.as_str() {
-                "[" | "list{" => {
+            match word_node.syntax {
+                ForthSyntax::ListOpen => {
                     list_literals.push(ListLiteralFrame {
                         stack_start: stack.len(),
                         origin,
                     });
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "]" | "}list" => {
+                ForthSyntax::ListClose => {
                     let Some(frame) = list_literals.pop() else {
                         return Err(vec![control_error(
                             "E-LIST-002",
@@ -1152,18 +1219,16 @@ fn lower_forth_ast_body_with_locals(
                         },
                         origin,
                     );
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "map{" => {
+                ForthSyntax::MapOpen => {
                     map_literals.push(MapLiteralFrame {
                         stack_start: stack.len(),
                         origin,
                     });
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "}map" => {
+                ForthSyntax::MapClose => {
                     let Some(frame) = map_literals.pop() else {
                         return Err(vec![control_error(
                             "E-MAP-002",
@@ -1206,19 +1271,17 @@ fn lower_forth_ast_body_with_locals(
                         },
                         origin,
                     );
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "record{" | "{" => {
+                ForthSyntax::RecordOpen => {
                     record_literals.push(RecordLiteralFrame {
                         stack_start: stack.len(),
                         fields: Vec::new(),
                         origin,
                     });
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "}record" | "}" => {
+                ForthSyntax::RecordClose => {
                     let Some(frame) = record_literals.pop() else {
                         return Err(vec![control_error(
                             "E-RECORD-002",
@@ -1247,10 +1310,9 @@ fn lower_forth_ast_body_with_locals(
                         Instruction::MakeRecord { fields },
                         origin,
                     );
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "case" => {
+                ForthSyntax::Case => {
                     let selector = stack.last().cloned().ok_or_else(|| {
                         vec![control_error(
                             "E-FORTH-CASE-001",
@@ -1287,12 +1349,11 @@ fn lower_forth_ast_body_with_locals(
                         in_default: false,
                         origin,
                     });
-                    control.push(ControlKind::Case);
-                    token_index += 1;
-                    continue;
+
+                    return Ok(());
                 }
-                "of" => {
-                    if control.last() != Some(&ControlKind::Case) {
+                ForthSyntax::Of => {
+                    if !word_node.control_valid {
                         return Err(vec![control_error(
                             "E-FORTH-CASE-002",
                             "of has no matching case",
@@ -1355,11 +1416,10 @@ fn lower_forth_ast_body_with_locals(
                     // stack row, exactly like an `if` branch.
                     emit(&mut blocks, current, Instruction::Drop, origin.clone());
                     stack.pop();
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "endof" => {
-                    if control.last() != Some(&ControlKind::Case) {
+                ForthSyntax::EndOf => {
+                    if !word_node.control_valid {
                         return Err(vec![control_error(
                             "E-FORTH-CASE-004",
                             "endof has no matching case",
@@ -1398,19 +1458,14 @@ fn lower_forth_ast_body_with_locals(
                     current = frame.next_else.take().expect("open arm has else block");
                     stack = frame.selector_stack.clone();
                     frame.arm_open = false;
-                    let next_is_terminal = matches!(
-                        tokens.get(token_index + 1).map(|token| &token.value),
-                        Some(TokenValue::Word(next)) if next == "otherwise" || next == "endcase"
-                    );
-                    if !next_is_terminal {
+                    if !word_node.next_is_terminal {
                         emit(&mut blocks, current, Instruction::Dup, origin.clone());
                         stack.push(Type::Int);
                     }
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "otherwise" => {
-                    if control.last() != Some(&ControlKind::Case) {
+                ForthSyntax::Otherwise => {
+                    if !word_node.control_valid {
                         return Err(vec![control_error(
                             "E-FORTH-CASE-006",
                             "otherwise has no matching case",
@@ -1430,11 +1485,10 @@ fn lower_forth_ast_body_with_locals(
                     emit(&mut blocks, current, Instruction::Drop, origin.clone());
                     stack.pop();
                     frame.in_default = true;
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "endcase" => {
-                    if control.last() != Some(&ControlKind::Case) {
+                ForthSyntax::EndCase => {
+                    if !word_node.control_valid {
                         return Err(vec![control_error(
                             "E-FORTH-CASE-008",
                             "endcase has no matching case",
@@ -1444,7 +1498,7 @@ fn lower_forth_ast_body_with_locals(
                     let Some(frame) = cases.pop() else {
                         unreachable!("case control has a case frame");
                     };
-                    control.pop();
+
                     if frame.arm_open {
                         return Err(vec![control_error(
                             "E-FORTH-CASE-009",
@@ -1491,10 +1545,9 @@ fn lower_forth_ast_body_with_locals(
                     );
                     current = frame.end_block;
                     stack = arm_output;
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "if" => {
+                ForthSyntax::If => {
                     let condition = stack.pop().ok_or_else(|| {
                         vec![control_error(
                             "E-STACK-001",
@@ -1541,12 +1594,11 @@ fn lower_forth_ast_body_with_locals(
                         else_payload: None,
                         origin,
                     });
-                    control.push(ControlKind::If);
+
                     current = then_block;
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "if-some" | "if-ok" => {
+                ForthSyntax::MatchOption | ForthSyntax::MatchResult => {
                     let option = stack.pop().ok_or_else(|| {
                         vec![control_error(
                             "E-STACK-001",
@@ -1622,7 +1674,7 @@ fn lower_forth_ast_body_with_locals(
                         else_payload: else_type,
                         origin: origin.clone(),
                     });
-                    control.push(ControlKind::If);
+
                     current = then_block;
                     emit(
                         &mut blocks,
@@ -1637,11 +1689,10 @@ fn lower_forth_ast_body_with_locals(
                         origin,
                     );
                     stack.push(then_type);
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "else" => {
-                    if control.last() != Some(&ControlKind::If) {
+                ForthSyntax::Else => {
+                    if !word_node.control_valid {
                         return Err(vec![control_error(
                             "E-FORTH-CONTROL-001",
                             "else crosses an unclosed loop or has no matching if",
@@ -1696,11 +1747,10 @@ fn lower_forth_ast_body_with_locals(
                             }
                         }
                     }
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "then" => {
-                    if control.last() != Some(&ControlKind::If) {
+                ForthSyntax::Then => {
+                    if !word_node.control_valid {
                         return Err(vec![control_error(
                             "E-FORTH-CONTROL-001",
                             "then crosses an unclosed loop or has no matching if",
@@ -1714,7 +1764,7 @@ fn lower_forth_ast_body_with_locals(
                             origin,
                         )]);
                     };
-                    control.pop();
+
                     let merged_stack = if let Some(then_stack) = frame.then_stack {
                         if stack != then_stack {
                             return Err(vec![control_error(
@@ -1759,15 +1809,14 @@ fn lower_forth_ast_body_with_locals(
                     );
                     current = frame.merge_block;
                     stack = merged_stack;
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "begin" | "begin:" => {
+                ForthSyntax::Begin | ForthSyntax::NamedBegin => {
                     let label = if word == "begin:" {
                         let Some(Token {
                             value: TokenValue::Word(label),
                             ..
-                        }) = tokens.get(token_index + 1)
+                        }) = word_node.operand.as_ref()
                         else {
                             return Err(vec![control_error(
                                 "E-FORTH-LOOP-006",
@@ -1777,12 +1826,12 @@ fn lower_forth_ast_body_with_locals(
                         };
                         if label.is_empty()
                             || matches!(
-                                label.as_str(),
+                                *label,
                                 "if" | "else" | "then" | "while" | "repeat" | "until"
                             )
                             || loops
                                 .iter()
-                                .any(|frame| frame.label.as_deref() == Some(label))
+                                .any(|frame| frame.label.as_deref() == Some(*label))
                         {
                             return Err(vec![control_error(
                                 "E-FORTH-LOOP-006",
@@ -1790,7 +1839,7 @@ fn lower_forth_ast_body_with_locals(
                                 origin,
                             )]);
                         }
-                        Some(label.clone())
+                        Some((*label).to_owned())
                     } else {
                         None
                     };
@@ -1817,15 +1866,14 @@ fn lower_forth_ast_body_with_locals(
                         stack: stack.clone(),
                         origin,
                     });
-                    control.push(ControlKind::Loop);
-                    token_index += if word == "begin:" { 2 } else { 1 };
-                    continue;
+
+                    return Ok(());
                 }
-                "break" | "continue" => {
+                ForthSyntax::Break | ForthSyntax::Continue => {
                     let Some(Token {
                         value: TokenValue::Word(label),
                         ..
-                    }) = tokens.get(token_index + 1)
+                    }) = word_node.operand.as_ref()
                     else {
                         return Err(vec![control_error(
                             "E-FORTH-LOOP-007",
@@ -1836,7 +1884,7 @@ fn lower_forth_ast_body_with_locals(
                     let Some(frame) = loops
                         .iter()
                         .rev()
-                        .find(|frame| frame.label.as_deref() == Some(label.as_str()))
+                        .find(|frame| frame.label.as_deref() == Some(*label))
                     else {
                         return Err(vec![control_error(
                             "E-FORTH-LOOP-007",
@@ -1871,11 +1919,10 @@ fn lower_forth_ast_body_with_locals(
                         frame.header
                     };
                     emit(&mut blocks, current, Instruction::Jump { target }, origin);
-                    token_index += 2;
-                    continue;
+                    return Ok(());
                 }
-                "while" => {
-                    if control.last() != Some(&ControlKind::Loop) {
+                ForthSyntax::While => {
+                    if !word_node.control_valid {
                         return Err(vec![control_error(
                             "E-FORTH-CONTROL-001",
                             "while crosses an unclosed conditional or has no matching begin",
@@ -1946,11 +1993,10 @@ fn lower_forth_ast_body_with_locals(
                     );
                     frame.exit = Some(exit);
                     current = body;
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "repeat" => {
-                    if control.last() != Some(&ControlKind::Loop) {
+                ForthSyntax::Repeat => {
+                    if !word_node.control_valid {
                         return Err(vec![control_error(
                             "E-FORTH-CONTROL-001",
                             "repeat crosses an unclosed conditional or has no matching begin",
@@ -1964,7 +2010,7 @@ fn lower_forth_ast_body_with_locals(
                             origin,
                         )]);
                     };
-                    control.pop();
+
                     let Some(exit) = frame.exit else {
                         return Err(vec![control_error(
                             "E-FORTH-LOOP-003",
@@ -1989,11 +2035,10 @@ fn lower_forth_ast_body_with_locals(
                     );
                     current = exit;
                     stack = frame.stack;
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
-                "until" => {
-                    if control.last() != Some(&ControlKind::Loop) {
+                ForthSyntax::Until => {
+                    if !word_node.control_valid {
                         return Err(vec![control_error(
                             "E-FORTH-CONTROL-001",
                             "until crosses an unclosed conditional or has no matching begin",
@@ -2007,7 +2052,7 @@ fn lower_forth_ast_body_with_locals(
                             origin,
                         )]);
                     };
-                    control.pop();
+
                     if frame.exit.is_some() {
                         return Err(vec![control_error(
                             "E-FORTH-LOOP-004",
@@ -2057,8 +2102,7 @@ fn lower_forth_ast_body_with_locals(
                     );
                     current = exit;
                     stack = frame.stack;
-                    token_index += 1;
-                    continue;
+                    return Ok(());
                 }
                 _ => {}
             }
@@ -2352,21 +2396,21 @@ fn lower_forth_ast_body_with_locals(
                         return_ok_type: (**return_ok_type).clone(),
                         error_type: (**return_error_type).clone(),
                     }
-                } else if let Some((index, ty)) = local_indexes.get(word.as_str()) {
+                } else if let Some((index, ty)) = local_indexes.get(word) {
                     stack.push(ty.clone());
                     Instruction::LocalGet { index: *index }
-                } else if let Some((index, ty)) = capture_indexes.get(word.as_str()) {
+                } else if let Some((index, ty)) = capture_indexes.get(word) {
                     stack.push(ty.clone());
                     Instruction::CaptureGet { index: *index }
                 } else {
-                    let Some(signature) = vocabulary.get(&word) else {
+                    let Some(signature) = vocabulary.get(word) else {
                         let mut diagnostic = VmDiagnostic::error(
                             "E-LINK-002",
                             DiagnosticPhase::NameResolution,
                             format!("unknown Co-Forth word '{word}'"),
                             Some(origin),
                         );
-                        let nearest = nearest_names(&word, vocabulary.keys().map(String::as_str));
+                        let nearest = nearest_names(word, vocabulary.keys().map(String::as_str));
                         if !nearest.is_empty() {
                             diagnostic.hints.push(format!(
                                 "did you mean {}?",
@@ -2400,7 +2444,7 @@ fn lower_forth_ast_body_with_locals(
                         Instruction::Yield { value_type }
                     } else if word == "output-open" {
                         Instruction::OutputOpen
-                    } else if let Some(operation) = output_operation(&word) {
+                    } else if let Some(operation) = output_operation(word) {
                         Instruction::UiEffect {
                             operation,
                             input: concrete_signature.input.values.clone(),
@@ -2413,7 +2457,7 @@ fn lower_forth_ast_body_with_locals(
                             output: concrete_signature.output.values.clone(),
                         }
                     } else {
-                        Instruction::Call { function: word }
+                        Instruction::Call { function: word.to_owned() }
                     }
                 }
             }
@@ -2422,8 +2466,8 @@ fn lower_forth_ast_body_with_locals(
             }
         };
         emit(&mut blocks, current, instruction, origin);
-        token_index += 1;
-    }
+        Ok(())
+    })?;
     if let Some(frame) = loops.last() {
         return Err(vec![control_error(
             "E-FORTH-LOOP-005",
@@ -2548,17 +2592,21 @@ fn merge_suspension_contract(
 }
 
 #[derive(Debug, Clone)]
-struct ForthDefinitionAst {
-    name: String,
-    documentation: Option<String>,
+struct ForthDefinitionAst<'source> {
+    name: &'source str,
+    documentation: Option<&'source str>,
     signature: StackSignature,
     declares_pure: bool,
-    locals: Vec<LocalBinding>,
-    body: ForthBodyAst,
-    origin: SourceOrigin,
+    locals: Vec<LocalBinding<'source>>,
+    body: ForthBodyAst<'source>,
+    start: usize,
+    end: usize,
 }
 
-fn parse_forth_module(source_id: &str, source: &str) -> Result<ForthModuleAst, Vec<VmDiagnostic>> {
+fn parse_forth_module<'source>(
+    source_id: &str,
+    source: &'source str,
+) -> Result<ForthModuleAst<'source>, Vec<VmDiagnostic>> {
     let tokens = tokenize(source_id, source)?;
     let mut definitions = Vec::new();
     let mut main_atoms = Vec::new();
@@ -2637,37 +2685,57 @@ fn parse_forth_module(source_id: &str, source: &str) -> Result<ForthModuleAst, V
         }
         let definition_end = tokens[end].end;
         definitions.push(ForthDefinitionAst {
-            name: name.clone(),
+            name,
             documentation: forth_definition_documentation(source, definition_start),
             signature,
             declares_pure,
             locals,
-            body: parse_forth_body(&tokens[body_start_index..end]),
-            origin: origin(source_id, source, definition_start, definition_end),
+            body: parse_forth_body(source_id, source, &tokens[body_start_index..end]),
+            start: definition_start,
+            end: definition_end,
         });
         cursor = end + 1;
     }
     Ok(ForthModuleAst {
         definitions,
-        body: parse_forth_body(&main_atoms),
+        body: parse_forth_body(source_id, source, &main_atoms),
     })
 }
 
-/// Structure quotation ownership during parsing rather than rediscovering it
-/// while emitting IR. Incomplete or list-shaped brackets deliberately remain
-/// unresolved words so the existing typed-list diagnostics stay authoritative.
-fn parse_forth_body(atoms: &[Token]) -> ForthBodyAst {
+/// Own control pairing, collection delimiters, and reference operands here.
+/// Malformed structure retains its position in the tree: its diagnostic is
+/// emitted when visited, preserving precedence over later semantic failures.
+fn parse_forth_body<'source>(
+    source_id: &str,
+    source: &'source str,
+    atoms: &[Token<'source>],
+) -> ForthBodyAst<'source> {
     let mut nodes = Vec::new();
+    let mut groups: Vec<(ForthSyntax, Vec<ForthBodyNode<'source>>)> = Vec::new();
+    let mut controls = Vec::new();
+    let mut record_depth = 0usize;
+    let mut previous = None;
     let mut cursor = 0;
     while cursor < atoms.len() {
         if token_is(&atoms[cursor], "[") {
             if let Some((pipe_index, close_index)) = anonymous_quotation_bounds(atoms, cursor) {
                 nodes.push(ForthBodyNode::Quotation(ForthQuotationAst {
                     open: atoms[cursor].clone(),
-                    signature: atoms[cursor + 1..pipe_index].to_vec(),
-                    body: parse_forth_body(&atoms[pipe_index + 1..close_index]),
+                    signature: parse_quotation_signature(
+                        source_id,
+                        source,
+                        &atoms[cursor + 1..pipe_index],
+                        &origin(
+                            source_id,
+                            source,
+                            atoms[cursor].start,
+                            atoms[close_index].end,
+                        ),
+                    ),
+                    body: parse_forth_body(source_id, source, &atoms[pipe_index + 1..close_index]),
                     end: atoms[close_index].end,
                 }));
+                previous = Some(cursor);
                 cursor = close_index + 1;
                 continue;
             }
@@ -2678,15 +2746,137 @@ fn parse_forth_body(atoms: &[Token]) -> ForthBodyAst {
                 value,
             }));
         } else {
-            let TokenValue::Word(name) = &atoms[cursor].value else {
+            let TokenValue::Word(name) = atoms[cursor].value else {
                 unreachable!("all non-word token values are parser-owned literals");
             };
+            let mut syntax = ForthSyntax::parse(name);
+            let named_field = name
+                .strip_prefix("field:")
+                .or_else(|| (record_depth > 0).then(|| name.strip_suffix(':')).flatten());
+            let mut field = if let Some(field) = named_field {
+                syntax = ForthSyntax::RecordField;
+                Some(Cow::Borrowed(field))
+            } else if let Some(field) = name.strip_prefix("record-get:") {
+                syntax = ForthSyntax::RecordGetNamed;
+                Some(Cow::Borrowed(field))
+            } else {
+                None
+            };
+            match syntax {
+                ForthSyntax::RecordOpen => record_depth += 1,
+                ForthSyntax::RecordClose => record_depth = record_depth.saturating_sub(1),
+                _ => {}
+            }
+            let opens_control = match syntax {
+                ForthSyntax::If | ForthSyntax::MatchOption | ForthSyntax::MatchResult => {
+                    Some(ControlKind::If)
+                }
+                ForthSyntax::Begin | ForthSyntax::NamedBegin => Some(ControlKind::Loop),
+                ForthSyntax::Case => Some(ControlKind::Case),
+                _ => None,
+            };
+            let expected_control = match syntax {
+                ForthSyntax::Else | ForthSyntax::Then => Some(ControlKind::If),
+                ForthSyntax::While | ForthSyntax::Repeat | ForthSyntax::Until => {
+                    Some(ControlKind::Loop)
+                }
+                ForthSyntax::Of
+                | ForthSyntax::EndOf
+                | ForthSyntax::Otherwise
+                | ForthSyntax::EndCase => Some(ControlKind::Case),
+                _ => None,
+            };
+            let control_valid = expected_control.is_none_or(|kind| controls.last() == Some(&kind));
+            if let Some(kind) = opens_control {
+                controls.push(kind);
+            } else if control_valid
+                && matches!(
+                    syntax,
+                    ForthSyntax::Then
+                        | ForthSyntax::Repeat
+                        | ForthSyntax::Until
+                        | ForthSyntax::EndCase
+                )
+            {
+                controls.pop();
+            }
+            let opens_group = match syntax {
+                ForthSyntax::MatchOption | ForthSyntax::MatchResult => Some(ForthSyntax::If),
+                ForthSyntax::NamedBegin => Some(ForthSyntax::Begin),
+                ForthSyntax::If
+                | ForthSyntax::Begin
+                | ForthSyntax::Case
+                | ForthSyntax::ListOpen
+                | ForthSyntax::MapOpen
+                | ForthSyntax::RecordOpen => Some(syntax),
+                _ => None,
+            };
+            if let Some(kind) = opens_group {
+                groups.push((kind, std::mem::take(&mut nodes)));
+            }
+            let consumes_operand = matches!(
+                syntax,
+                ForthSyntax::QuoteTarget
+                    | ForthSyntax::NamedBegin
+                    | ForthSyntax::Break
+                    | ForthSyntax::Continue
+            );
+            let operand = consumes_operand
+                .then(|| atoms.get(cursor + 1).cloned())
+                .flatten();
+            if matches!(syntax, ForthSyntax::RecordGet | ForthSyntax::RecordSet) {
+                field = previous.and_then(|index: usize| match &atoms[index].value {
+                    TokenValue::String(field) => Some(Cow::Owned(field.clone())),
+                    _ => None,
+                });
+            }
             nodes.push(ForthBodyNode::Word(ForthWordAst {
                 token: atoms[cursor].clone(),
-                name: name.clone(),
+                syntax,
+                operand,
+                field,
+                control_valid,
+                next_is_terminal: atoms.get(cursor + 1).is_some_and(|token| {
+                    token_is(token, "otherwise") || token_is(token, "endcase")
+                }),
             }));
+            let closes_group = match syntax {
+                ForthSyntax::Then => Some(ForthSyntax::If),
+                ForthSyntax::Repeat | ForthSyntax::Until => Some(ForthSyntax::Begin),
+                ForthSyntax::EndCase => Some(ForthSyntax::Case),
+                ForthSyntax::ListClose => Some(ForthSyntax::ListOpen),
+                ForthSyntax::MapClose => Some(ForthSyntax::MapOpen),
+                ForthSyntax::RecordClose => Some(ForthSyntax::RecordOpen),
+                _ => None,
+            };
+            if let Some(index) =
+                closes_group.and_then(|kind| groups.iter().rposition(|(open, _)| *open == kind))
+            {
+                while groups.len() > index {
+                    let (_, mut parent) = groups.pop().expect("group index exists");
+                    parent.push(ForthBodyNode::Group(ForthBodyAst { nodes }));
+                    nodes = parent;
+                }
+            }
+            if consumes_operand && cursor + 1 < atoms.len() {
+                cursor += 1;
+                previous = Some(cursor);
+                // A reference consumes one parsed atom, including an anonymous
+                // quotation. Its leading '[' remains the operand spelling.
+                if token_is(&atoms[cursor], "[") {
+                    if let Some((_, close)) = anonymous_quotation_bounds(atoms, cursor) {
+                        cursor = close + 1;
+                        continue;
+                    }
+                }
+            }
         }
+        previous = Some(cursor);
         cursor += 1;
+    }
+    while let Some((_, mut parent)) = groups.pop() {
+        parent.push(ForthBodyNode::Group(ForthBodyAst { nodes }));
+        nodes = parent;
     }
     ForthBodyAst { nodes }
 }
@@ -2700,7 +2890,7 @@ fn forth_literal_value(token: &Token) -> Option<TypedValue> {
             .filter(|symbol| !symbol.is_empty())
             .map(|symbol| TypedValue::Symbol(symbol.to_string()))
             .or_else(|| word.parse::<i64>().ok().map(TypedValue::Int))
-            .or(match word.as_str() {
+            .or(match *word {
                 "true" => Some(TypedValue::Bool(true)),
                 "false" => Some(TypedValue::Bool(false)),
                 _ => None,
@@ -2713,22 +2903,21 @@ fn forth_literal_value(token: &Token) -> Option<TypedValue> {
 /// tokenizer discards the comment and the string never reaches the operand
 /// stack. A blank or non-comment line breaks the association so a doc cannot
 /// accidentally attach across an unrelated form.
-fn forth_definition_documentation(source: &str, definition_start: usize) -> Option<String> {
+fn forth_definition_documentation(source: &str, definition_start: usize) -> Option<&str> {
     let prefix = &source[..definition_start];
     let line = prefix.lines().rev().find(|line| !line.trim().is_empty())?;
     line.trim()
         .strip_prefix("\\ finch-doc:")
         .map(str::trim)
         .filter(|documentation| !documentation.is_empty())
-        .map(str::to_owned)
 }
 
-fn parse_definition_signature(
+fn parse_definition_signature<'source>(
     source_id: &str,
     source: &str,
-    tokens: &[Token],
+    tokens: &[Token<'source>],
     fallback: &Token,
-) -> Result<(StackSignature, bool, Vec<LocalBinding>), Vec<VmDiagnostic>> {
+) -> Result<(StackSignature, bool, Vec<LocalBinding<'source>>), Vec<VmDiagnostic>> {
     let separator = tokens
         .iter()
         .position(|token| token_is(token, "--"))
@@ -2784,11 +2973,11 @@ fn parse_definition_signature(
 /// move that input into the frame at entry.  Either name every input or name
 /// none: partial naming makes the stack contract harder to read than it is
 /// worth.
-fn parse_input_stack_types(
+fn parse_input_stack_types<'source>(
     source_id: &str,
     source: &str,
-    tokens: &[Token],
-) -> Result<(Vec<Type>, Vec<LocalBinding>), Vec<VmDiagnostic>> {
+    tokens: &[Token<'source>],
+) -> Result<(Vec<Type>, Vec<LocalBinding<'source>>), Vec<VmDiagnostic>> {
     let mut types = Vec::with_capacity(tokens.len());
     let mut locals = Vec::new();
     let mut saw_named = false;
@@ -2812,7 +3001,7 @@ fn parse_input_stack_types(
             }
             _ => {
                 saw_unnamed = true;
-                (None, spelling.as_str())
+                (None, *spelling)
             }
         };
         let ty = parse_type_name(type_spelling).map_err(|_| {
@@ -2837,9 +3026,10 @@ fn parse_input_stack_types(
                 )]);
             }
             locals.push(LocalBinding {
-                name: name.to_string(),
+                name,
                 ty: ty.clone(),
-                origin: origin(source_id, source, token.start, token.end),
+                start: token.start,
+                end: token.end,
             });
         }
         types.push(ty);
@@ -2922,7 +3112,7 @@ fn validate_preserved_stack_row(
 }
 
 fn token_is(token: &Token, expected: &str) -> bool {
-    matches!(&token.value, TokenValue::Word(value) if value == expected)
+    matches!(&token.value, TokenValue::Word(value) if *value == expected)
 }
 
 fn definition_error(
@@ -2973,7 +3163,10 @@ fn control_error(code: &str, message: impl Into<String>, origin: SourceOrigin) -
     VmDiagnostic::error(code, DiagnosticPhase::TypeInference, message, Some(origin))
 }
 
-fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnostic>> {
+fn tokenize<'source>(
+    source_id: &str,
+    source: &'source str,
+) -> Result<Vec<Token<'source>>, Vec<VmDiagnostic>> {
     let bytes = source.as_bytes();
     let mut cursor = 0;
     let mut tokens = Vec::new();
@@ -3003,7 +3196,7 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         if source[start..].starts_with("[']") {
             cursor += 3;
             tokens.push(Token {
-                value: TokenValue::Word("[']".to_string()),
+                value: TokenValue::Word("[']"),
                 start,
                 end: cursor,
             });
@@ -3015,7 +3208,7 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         // direct representation of `Type::Record`.
         if let Some(end) = compact_braced_type_end(source, start) {
             tokens.push(Token {
-                value: TokenValue::Word(source[start..end].to_string()),
+                value: TokenValue::Word(&source[start..end]),
                 start,
                 end,
             });
@@ -3028,7 +3221,7 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         // unrelated stack types during definition parsing.
         if let Some(end) = parameterized_type_end(source, start) {
             tokens.push(Token {
-                value: TokenValue::Word(source[start..end].to_string()),
+                value: TokenValue::Word(&source[start..end]),
                 start,
                 end,
             });
@@ -3044,7 +3237,7 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         {
             cursor += word.len();
             tokens.push(Token {
-                value: TokenValue::Word(word.to_string()),
+                value: TokenValue::Word(word),
                 start,
                 end: cursor,
             });
@@ -3064,7 +3257,7 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             };
             cursor = start + close + 1;
             tokens.push(Token {
-                value: TokenValue::Word(source[start..cursor].to_string()),
+                value: TokenValue::Word(&source[start..cursor]),
                 start,
                 end: cursor,
             });
@@ -3089,7 +3282,7 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         if matches!(bytes[start], b'[' | b']' | b'{' | b'}') {
             cursor += 1;
             tokens.push(Token {
-                value: TokenValue::Word(source[start..cursor].to_string()),
+                value: TokenValue::Word(&source[start..cursor]),
                 start,
                 end: cursor,
             });
@@ -3146,7 +3339,7 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             // Attribute the implicit effect to the source literal, rather
             // than inventing an unlocatable synthetic `say` token.
             tokens.push(Token {
-                value: TokenValue::Word("say".to_string()),
+                value: TokenValue::Word("say"),
                 start,
                 end,
             });
@@ -3213,14 +3406,14 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
                 end: cursor,
             });
             tokens.push(Token {
-                value: TokenValue::Word("say".to_string()),
+                value: TokenValue::Word("say"),
                 start,
                 end: cursor,
             });
             continue;
         }
         tokens.push(Token {
-            value: TokenValue::Word(source[start..cursor].to_string()),
+            value: TokenValue::Word(&source[start..cursor]),
             start,
             end: cursor,
         });
@@ -3509,7 +3702,7 @@ mod tests {
             panic!("the word after a quotation should remain the adjacent body node");
         };
         assert_eq!(&source[execute.token.start..execute.token.end], "execute");
-        assert_eq!(execute.name, "execute");
+        assert!(token_is(&execute.token, "execute"));
     }
 
     #[test]
@@ -3540,7 +3733,7 @@ mod tests {
         let ForthBodyNode::Word(dup) = &ast.body.nodes[5] else {
             panic!("non-literal words should remain explicit unresolved word nodes");
         };
-        assert_eq!(dup.name, "dup");
+        assert!(token_is(&dup.token, "dup"));
     }
 
     #[test]
@@ -3808,5 +4001,179 @@ mod tests {
                 ..
             }] if **yield_type == Type::Int && **resume_type == Type::Unit
         ));
+    }
+    #[test]
+    fn test_parser_owns_control_and_delimiter_pairing() {
+        let source = "true if [ 1 2 ] else [ 3 ] then";
+        let ast = parse_forth_module("groups.forth", source).unwrap();
+        let ForthBodyNode::Group(branch) = &ast.body.nodes[1] else {
+            panic!("if must own its complete nested control tree: {ast:?}");
+        };
+        assert_eq!(
+            branch.nodes.len(),
+            5,
+            "if owns both list bodies and its branch markers: {branch:?}"
+        );
+        assert!(
+            matches!(&branch.nodes[1], ForthBodyNode::Group(list) if list.nodes.len() == 4),
+            "then list owns both delimiters and values: {branch:?}"
+        );
+        assert!(
+            matches!(&branch.nodes[3], ForthBodyNode::Group(list) if list.nodes.len() == 3),
+            "else list owns both delimiters and its value: {branch:?}"
+        );
+    }
+
+    #[test]
+    fn test_parser_owns_reference_operands_and_borrows_source_spellings() {
+        let source = String::from("\\ finch-doc: Identity.\n: identity ( S value:int -- S int ! pure ) value ; ['] identity begin: outer continue outer");
+        let ast = parse_forth_module("references.forth", &source).unwrap();
+        let definition = &ast.definitions[0];
+        for spelling in [
+            definition.name,
+            definition.documentation.unwrap(),
+            definition.locals[0].name,
+        ] {
+            assert!(
+                spelling.as_ptr() >= source.as_ptr()
+                    && spelling.as_ptr() < source.as_ptr().wrapping_add(source.len()),
+                "AST spelling must borrow its immutable source buffer: {spelling:?}"
+            );
+        }
+        let ForthBodyNode::Word(quote) = &ast.body.nodes[0] else {
+            panic!("quotation target must be owned by its reference node: {ast:?}");
+        };
+        assert!(
+            quote
+                .operand
+                .as_ref()
+                .is_some_and(|token| token_is(token, "identity")),
+            "quotation target operand is retained: {quote:?}"
+        );
+        let ForthBodyNode::Group(body) = &ast.body.nodes[1] else {
+            panic!("named loop must own its control body: {ast:?}");
+        };
+        assert_eq!(
+            body.nodes.len(),
+            2,
+            "loop labels are operands, never executable sibling words: {body:?}"
+        );
+        for node in &body.nodes {
+            assert!(
+                matches!(node, ForthBodyNode::Word(word) if word.operand.as_ref().is_some_and(|token| token_is(token, "outer"))),
+                "begin and continue each retain their label: {node:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_structured_nodes_preserve_verified_control_and_reference_results() {
+        for (source, output) in [
+            ("true if [ 1 2 ] else [ 3 ] then", Type::list(Type::Int)),
+            ("1 case 1 of 7 endof otherwise 8 endcase", Type::Int),
+            (
+                "0 begin: outer dup 2 < while true if 1 + else 1 + then repeat",
+                Type::Int,
+            ),
+            (
+                "0 begin: outer dup 2 < while 1 + continue outer repeat",
+                Type::Int,
+            ),
+            ("0 begin: outer true while break outer repeat", Type::Int),
+            (
+                "{ name: \"Ada\" } \"Grace\" \"name\" record-set \"name\" record-get",
+                Type::Option(Box::new(Type::String)),
+            ),
+            (
+                "{ name: \"Ada\" } record-get:name",
+                Type::Option(Box::new(Type::String)),
+            ),
+            (
+                ": answer ( S -- S int ! pure ) 42 ; ['] answer execute",
+                Type::Int,
+            ),
+        ] {
+            let verified =
+                compile_forth("structured.forth", source, Vec::new(), &core_vocabulary())
+                    .unwrap_or_else(|diagnostics| {
+                        panic!("structured source must still verify: {source:?}: {diagnostics:?}")
+                    });
+            assert_eq!(
+                verified.module.functions["main"].signature.output.values,
+                vec![output],
+                "structured lowering must preserve its typed output: {source:?}: {verified:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_synthetic_output_retains_the_original_literal_provenance() {
+        let source = ".\" hello\"";
+        let verified = compile_forth("output.forth", source, Vec::new(), &core_vocabulary())
+            .expect("output literal should lower through its synthetic say word");
+        let effect = verified.module.functions["main"]
+            .blocks
+            .values()
+            .flat_map(|block| &block.instructions)
+            .find(|located| matches!(located.instruction, Instruction::CapabilityRequest { .. }))
+            .expect("synthetic say must retain its session output effect");
+        let span = effect
+            .origin
+            .span
+            .as_ref()
+            .expect("synthetic effect has a source span");
+        assert_eq!(
+            (span.start_byte, span.end_byte),
+            (0, source.len()),
+            "synthetic say must point to the original literal: {effect:?}"
+        );
+        assert_eq!(
+            effect.origin.word.as_deref(),
+            Some(source),
+            "synthetic say must preserve original spelling in diagnostic provenance: {effect:?}"
+        );
+    }
+
+    #[test]
+    fn test_structured_diagnostics_keep_exact_original_spans_and_precedence() {
+        for (source, code, spelling) in [
+            ("true if begin then", "E-FORTH-CONTROL-001", "then"),
+            ("0 begin true if repeat", "E-FORTH-CONTROL-001", "repeat"),
+            (
+                "0 begin: outer true while break absent repeat",
+                "E-FORTH-LOOP-007",
+                "break",
+            ),
+            ("begin:", "E-FORTH-LOOP-006", "begin:"),
+            ("[']", "E-FORTH-QUOTE-001", "[']"),
+            ("['] \"name\"", "E-FORTH-QUOTE-001", "[']"),
+            ("['] absent", "E-FORTH-QUOTE-002", "[']"),
+            ("\"λ\" drop\nrecord-get", "E-RECORD-004", "record-get"),
+            (
+                "{ name: \"Ada\" } \"absent\" record-get",
+                "E-RECORD-005",
+                "record-get",
+            ),
+            ("unknown true if", "E-LINK-002", "unknown"),
+        ] {
+            let diagnostics = compile_forth("spans.forth", source, Vec::new(), &core_vocabulary())
+                .expect_err("malformed structured source must report a diagnostic");
+            let diagnostic = &diagnostics[0];
+            assert_eq!(
+                diagnostic.code, code,
+                "first-error precedence must be preserved for {source:?}: {diagnostics:?}"
+            );
+            let span = diagnostic
+                .primary
+                .as_ref()
+                .and_then(|origin| origin.span.as_ref())
+                .expect("diagnostic must retain its original source span");
+            let start = source.find(spelling).unwrap();
+            assert_eq!(
+                (span.start_byte, span.end_byte),
+                (start, start + spelling.len()),
+                "diagnostic must identify the exact original token for {source:?}: {diagnostics:?}"
+            );
+        }
     }
 }
