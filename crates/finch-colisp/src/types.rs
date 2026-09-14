@@ -356,6 +356,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_val_roundtrip_primitives() {
         for val in [
             Val::Nil,

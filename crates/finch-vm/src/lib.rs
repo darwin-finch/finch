@@ -4,13 +4,18 @@
 //! defined here and are checked by the same verifier before execution.
 
 mod fiber;
-mod frontend;
+#[cfg(test)]
+mod frontend_tests;
 mod interpreter;
-mod lisp;
 #[cfg(test)]
 mod migration;
 mod runtime;
 
+pub use finch_coforth::{compile_forth, compile_forth_with_functions};
+pub use finch_colisp::{
+    compile_lisp, compile_lisp_with_functions, parse_math, parse_str, parse_str_spanned,
+    SpannedVal, Val,
+};
 pub use finch_vm_core::{
     agent_task_result_type, agent_task_snapshot_type, agent_task_spec_type,
     capability_grant_entry_type, core_vocabulary, core_word_documentation, core_word_registry,
@@ -27,14 +32,11 @@ pub use finch_vm_core::{
     StackSignature, SuspensionSignature, TaskKind, Type, TypedValue, UiOperation, VerifiedFunction,
     VerifiedModule, Verifier, VmDiagnostic, Vocabulary, VM_TYPE_SYSTEM_VERSION,
 };
-pub use frontend::forth::{compile_forth, compile_forth_with_functions};
-pub use frontend::lisp::{compile_lisp, compile_lisp_with_functions};
 pub use interpreter::instantiate_requirement;
 pub use interpreter::{
     CapabilityHandler, HostSideEffect, InterpreterConfig, UiProgress, VmContinuation, VmFrame,
     VmSideEffect, VmStep, VmTrampoline,
 };
-pub use lisp::{parse_math, parse_str, parse_str_spanned, SpannedVal, Val};
 pub use runtime::{
     EffectJournalEntry, EffectJournalState, PendingHostCall, ProducerFiberRecord,
     ProducerFiberState, TypedExecution, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,

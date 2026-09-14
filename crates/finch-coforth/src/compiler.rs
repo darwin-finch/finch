@@ -1,8 +1,8 @@
 use finch_vm_core::{
-    apply_signature_types, instantiate_signature_types, nearest_names, BasicBlock, ControlEffect,
-    DiagnosticPhase, EffectSet, Function, Instruction, LocatedInstruction, Module, SourceLanguage,
-    SourceOrigin, SourceSpan, StackRow, StackSignature, SuspensionSignature, Type, TypedValue,
-    UiOperation, VerifiedModule, Verifier, VmDiagnostic, Vocabulary,
+    apply_signature_types, instantiate_signature_types, nearest_names, parse_type_name, BasicBlock,
+    ControlEffect, DiagnosticPhase, EffectSet, Function, Instruction, LocatedInstruction, Module,
+    SourceLanguage, SourceOrigin, SourceSpan, StackRow, StackSignature, SuspensionSignature, Type,
+    TypedValue, UiOperation, VerifiedModule, Verifier, VmDiagnostic, Vocabulary,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -19,6 +19,46 @@ struct Token {
     value: TokenValue,
     start: usize,
     end: usize,
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_variant_constructor_name(
+    name: &str,
+) -> Option<(Vec<(String, Option<Type>)>, String, Option<Type>)> {
+    let inner = name.strip_prefix("variant<")?.strip_suffix('>')?;
+    let (variant_type, tag) = split_variant_constructor_arguments(inner)?;
+    let Type::Variant(variants) = parse_type_name(variant_type).ok()? else {
+        return None;
+    };
+    let tag = tag.trim();
+    let (_, payload_type) = variants.iter().find(|(name, _)| name == tag)?;
+    Some((variants.clone(), tag.to_string(), payload_type.clone()))
+}
+
+fn split_variant_constructor_arguments(source: &str) -> Option<(&str, &str)> {
+    let mut angle_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut separator = None;
+    for (index, character) in source.char_indices() {
+        match character {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.checked_sub(1)?,
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.checked_sub(1)?,
+            ',' if angle_depth == 0 && brace_depth == 0 => match separator {
+                None => separator = Some(index),
+                Some(_) => return None,
+            },
+            _ => {}
+        }
+    }
+    if angle_depth != 0 || brace_depth != 0 {
+        return None;
+    }
+    let separator = separator?;
+    let variant_type = source[..separator].trim();
+    let tag = source[separator + 1..].trim();
+    (!variant_type.is_empty() && !tag.is_empty()).then_some((variant_type, tag))
 }
 
 /// The source-preserving Co-Forth module syntax tree. This is deliberately a
@@ -280,6 +320,8 @@ pub fn compile_forth(
     )
 }
 
+/// Compile Co-Forth source with additional already-lowered functions available
+/// for definition calls, then verify the complete typed module.
 pub fn compile_forth_with_functions(
     source_id: &str,
     source: &str,
@@ -416,6 +458,8 @@ fn compile_forth_ast_body_with_functions(
     )
 }
 
+// This is the inherited recursive lowering seam; grouping it is separate from the crate move.
+#[allow(clippy::too_many_arguments)]
 fn lower_forth_ast_body_with_locals(
     source_id: &str,
     source: &str,
@@ -738,7 +782,7 @@ fn lower_forth_ast_body_with_locals(
             {
                 let map_type = format!("map<{arguments}>");
                 let Type::Map(key_type, value_type) =
-                    super::lisp::parse_type_name(&map_type).map_err(|_| {
+                    parse_type_name(&map_type).map_err(|_| {
                         vec![control_error(
                             "E-MAP-005",
                             "empty-map requires two valid type arguments, for example empty-map<string,int>",
@@ -766,7 +810,7 @@ fn lower_forth_ast_body_with_locals(
                 .strip_prefix("empty-list<")
                 .and_then(|value| value.strip_suffix('>'))
             {
-                let element_type = super::lisp::parse_type_name(element).map_err(|_| {
+                let element_type = parse_type_name(element).map_err(|_| {
                     vec![control_error(
                         "E-LIST-005",
                         "empty-list requires one valid type argument, for example empty-list<string>",
@@ -787,8 +831,7 @@ fn lower_forth_ast_body_with_locals(
                 continue;
             }
             if word.starts_with("variant<") {
-                let Some((variants, tag, payload_type)) =
-                    super::lisp::parse_variant_constructor_name(word)
+                let Some((variants, tag, payload_type)) = parse_variant_constructor_name(word)
                 else {
                     return Err(vec![control_error(
                         "E-VARIANT-001",
@@ -1129,7 +1172,7 @@ fn lower_forth_ast_body_with_locals(
                         )]);
                     };
                     let values = &stack[frame.stack_start..];
-                    if values.is_empty() || values.len() % 2 != 0 {
+                    if values.is_empty() || !values.len().is_multiple_of(2) {
                         return Err(vec![control_error(
                             "E-MAP-001",
                             "map{ requires one or more key/value pairs",
@@ -1138,7 +1181,7 @@ fn lower_forth_ast_body_with_locals(
                     }
                     let key_type = values[0].clone();
                     let value_type = values[1].clone();
-                    for pair in values.chunks_exact(2) {
+                    for pair in values.as_chunks::<2>().0 {
                         if !key_type.accepts(&pair[0]) || !value_type.accepts(&pair[1]) {
                             return Err(vec![control_error(
                                 "E-MAP-003",
@@ -2657,7 +2700,7 @@ fn forth_literal_value(token: &Token) -> Option<TypedValue> {
             .filter(|symbol| !symbol.is_empty())
             .map(|symbol| TypedValue::Symbol(symbol.to_string()))
             .or_else(|| word.parse::<i64>().ok().map(TypedValue::Int))
-            .or_else(|| match word.as_str() {
+            .or(match word.as_str() {
                 "true" => Some(TypedValue::Bool(true)),
                 "false" => Some(TypedValue::Bool(false)),
                 _ => None,
@@ -2772,7 +2815,7 @@ fn parse_input_stack_types(
                 (None, spelling.as_str())
             }
         };
-        let ty = super::lisp::parse_type_name(type_spelling).map_err(|_| {
+        let ty = parse_type_name(type_spelling).map_err(|_| {
             vec![definition_error(
                 source_id,
                 source,
@@ -2828,7 +2871,7 @@ fn parse_stack_types(
                     "stack type must be an identifier",
                 )]);
             };
-            super::lisp::parse_type_name(name).map_err(|_| {
+            parse_type_name(name).map_err(|_| {
                 vec![definition_error(
                     source_id,
                     source,
@@ -3413,363 +3456,7 @@ fn line_column(source: &str, byte: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::{CapabilityHandler, DenyCapabilities, Interpreter, InterpreterConfig};
-    use crate::{
-        core_vocabulary, CapabilityKind, CapabilityRequirement, ResourceSelector, TypedValue,
-    };
-
-    #[test]
-    fn compiles_and_executes_user_forth_text() {
-        let module =
-            compile_forth("input.forth", "3 4 2 * +", Vec::new(), &core_vocabulary()).unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(11)]);
-    }
-
-    #[test]
-    fn result_question_mark_returns_error_without_running_the_rest_of_a_word() {
-        let module = compile_forth(
-            "try.forth",
-            ": fail-fast ( S -- S result<dynamic,string> ! pure ) \
-             s\" no\" err ? drop s\" unreachable\" err ; fail-fast",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("typed result propagation compiles");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("error result is an ordinary return, not a VM failure");
-        assert_eq!(
-            stack,
-            vec![TypedValue::Result {
-                ok_type: Type::Dynamic,
-                error_type: Type::String,
-                is_ok: false,
-                value: Box::new(TypedValue::String("no".into())),
-            }]
-        );
-    }
-
-    #[test]
-    fn result_question_mark_continues_with_the_ok_payload() {
-        let module = compile_forth(
-            "try-ok.forth",
-            ": keep-going ( S -- S result<int,dynamic> ! pure ) \
-             7 ok ? 1 + ok ; keep-going",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("successful result propagation compiles");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert!(matches!(
-            stack.as_slice(),
-            [TypedValue::Result { is_ok: true, value, .. }] if **value == TypedValue::Int(8)
-        ));
-    }
-
-    #[test]
-    fn string_literals_are_streamable_through_explicit_say() {
-        let module = compile_forth(
-            "input.forth",
-            "s\"Hello \\\"世界\\\"\" say 3 5 + int-to-string say s\"! \" say",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        #[derive(Default)]
-        struct EmitHandler(String);
-        impl crate::interpreter::CapabilityHandler for EmitHandler {
-            fn request(
-                &mut self,
-                requirement: &CapabilityRequirement,
-                arguments: Vec<TypedValue>,
-                _origin: &SourceOrigin,
-            ) -> Result<Vec<TypedValue>, VmDiagnostic> {
-                assert_eq!(requirement.capability, CapabilityKind::SessionEmit);
-                let [TypedValue::String(text)] = arguments.as_slice() else {
-                    panic!("expected string emission");
-                };
-                self.0.push_str(text);
-                Ok(vec![TypedValue::Unit])
-            }
-            fn output(&self) -> String {
-                self.0.clone()
-            }
-        }
-        let mut handler = EmitHandler::default();
-        Interpreter::new(
-            &module,
-            &mut handler,
-            InterpreterConfig {
-                fuel: 100_000,
-                grants: EffectSet::from_requirement(CapabilityRequirement {
-                    capability: CapabilityKind::SessionEmit,
-                    selector: ResourceSelector::None,
-                }),
-            },
-        )
-        .execute(&mut stack)
-        .unwrap();
-        assert_eq!(handler.output(), "Hello \"世界\"8! ");
-    }
-
-    #[test]
-    fn bare_and_standard_forth_string_literals_push_the_same_typed_value() {
-        for source in ["\"hello there\"", "s\" hello there\""] {
-            let module = compile_forth("strings.forth", source, Vec::new(), &core_vocabulary())
-                .expect("typed string literal should compile");
-            let mut stack = Vec::new();
-            Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-                .execute(&mut stack)
-                .expect("typed string literal should execute");
-            assert_eq!(stack, vec![TypedValue::String("hello there".into())]);
-        }
-    }
-
-    #[test]
-    fn typed_frontend_lowers_standard_output_literal_to_say() {
-        let module = compile_forth(
-            "input.forth",
-            ".\" legacy output\"",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("typed Co-Forth accepts standard output literal");
-        #[derive(Default)]
-        struct EmitHandler(String);
-        impl crate::interpreter::CapabilityHandler for EmitHandler {
-            fn request(
-                &mut self,
-                requirement: &CapabilityRequirement,
-                arguments: Vec<TypedValue>,
-                _origin: &SourceOrigin,
-            ) -> Result<Vec<TypedValue>, VmDiagnostic> {
-                assert_eq!(requirement.capability, CapabilityKind::SessionEmit);
-                let [TypedValue::String(text)] = arguments.as_slice() else {
-                    panic!("expected string emission");
-                };
-                self.0.push_str(text);
-                Ok(vec![TypedValue::Unit])
-            }
-            fn output(&self) -> String {
-                self.0.clone()
-            }
-        }
-        let mut stack = Vec::new();
-        let mut handler = EmitHandler::default();
-        Interpreter::new(
-            &module,
-            &mut handler,
-            InterpreterConfig {
-                fuel: 100_000,
-                grants: EffectSet::from_requirement(CapabilityRequirement {
-                    capability: CapabilityKind::SessionEmit,
-                    selector: ResourceSelector::None,
-                }),
-            },
-        )
-        .execute(&mut stack)
-        .unwrap();
-        assert_eq!(handler.output(), "legacy output");
-    }
-
-    #[test]
-    fn named_break_and_continue_lower_to_typed_loop_edges() {
-        let break_module = compile_forth(
-            "break.forth",
-            "0 begin: search dup 3 < while 1 + dup 2 = if break search then repeat",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut break_stack = Vec::new();
-        Interpreter::new(
-            &break_module,
-            DenyCapabilities,
-            InterpreterConfig::default(),
-        )
-        .execute(&mut break_stack)
-        .unwrap();
-        assert_eq!(break_stack, vec![TypedValue::Int(2)]);
-
-        let continue_module = compile_forth(
-            "continue.forth",
-            "0 begin: count dup 3 < while 1 + dup 2 = if continue count then repeat",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut continue_stack = Vec::new();
-        Interpreter::new(
-            &continue_module,
-            DenyCapabilities,
-            InterpreterConfig::default(),
-        )
-        .execute(&mut continue_stack)
-        .unwrap();
-        assert_eq!(continue_stack, vec![TypedValue::Int(3)]);
-    }
-
-    #[test]
-    fn if_ok_binds_each_result_payload_on_its_selected_edge() {
-        let ok_module = compile_forth(
-            "ok.forth",
-            "5 ok if-ok drop else drop then",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let err_module = compile_forth(
-            "err.forth",
-            "s\"bad\" err if-ok drop else drop then",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        for module in [ok_module, err_module] {
-            let mut stack = Vec::new();
-            Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-                .execute(&mut stack)
-                .unwrap();
-            assert!(stack.is_empty());
-        }
-    }
-
-    #[test]
-    fn typed_integer_case_has_no_fallthrough_and_requires_compatible_arms() {
-        let selected = compile_forth(
-            "case-selected.forth",
-            "2 case 1 of 10 endof 2 of 20 endof otherwise 30 endcase",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("integer case should compile");
-        let defaulted = compile_forth(
-            "case-default.forth",
-            "3 case 1 of 10 endof 2 of 20 endof otherwise 30 endcase",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("integer case with otherwise should compile");
-        for (module, expected) in [(selected, 20), (defaulted, 30)] {
-            let mut stack = Vec::new();
-            Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-                .execute(&mut stack)
-                .unwrap();
-            assert_eq!(stack, vec![TypedValue::Int(expected)]);
-        }
-
-        let effect_only = compile_forth(
-            "case-effect.forth",
-            "1 case 1 of endof endcase",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("a case without otherwise may leave no values on every path");
-        let mut stack = Vec::new();
-        Interpreter::new(&effect_only, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert!(stack.is_empty());
-
-        let mismatch = compile_forth(
-            "case-mismatch.forth",
-            "1 case 1 of 10 endof otherwise endcase",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect_err("every case path must leave the same stack row");
-        assert_eq!(mismatch[0].code, "E-STACK-004");
-
-        let non_integer = compile_forth(
-            "case-string.forth",
-            "s\" selector\" case 1 of 10 endof otherwise 20 endcase",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect_err("case selectors are intentionally integer-only in version 1");
-        assert_eq!(non_integer[0].code, "E-TYPE-002");
-    }
-
-    #[test]
-    fn constructs_and_projects_heterogeneous_typed_records() {
-        let module = compile_forth(
-            "record.forth",
-            "{ name: \"Ada\" age: 37 } \"name\" record-get unwrap",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("record literal should compile");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("record projection should execute");
-        assert_eq!(stack, vec![TypedValue::String("Ada".into())]);
-
-        let invalid = compile_forth(
-            "record-invalid.forth",
-            "{ name: \"Ada\" } \"age\" record-get",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect_err("record fields are statically known");
-        assert_eq!(invalid[0].code, "E-RECORD-005");
-
-        let updated = compile_forth(
-            "record-update.forth",
-            "{ name: \"Ada\" age: 37 } 38 \"age\" record-set \"age\" record-get unwrap",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("record update should compile");
-        let mut stack = Vec::new();
-        Interpreter::new(&updated, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("record update should execute");
-        assert_eq!(stack, vec![TypedValue::Int(38)]);
-
-        let closure_field = compile_forth(
-            "record-closure.forth",
-            ": increment ( S int -- S int ! pure ) 1 + ; { run: ['] increment } \"run\" record-get unwrap 41 swap execute",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("record closure should compile");
-        let mut stack = Vec::new();
-        Interpreter::new(
-            &closure_field,
-            DenyCapabilities,
-            InterpreterConfig::default(),
-        )
-        .execute(&mut stack)
-        .expect("record closure should execute");
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
-    }
-
-    #[test]
-    fn result_error_projects_the_error_of_a_heterogeneous_result() {
-        let module = compile_forth(
-            "result-error.forth",
-            "s\"bad\" err result-error",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::String("bad".into())]);
-    }
-
+    use finch_vm_core::{core_vocabulary, TypedValue};
     #[test]
     fn named_loop_exit_requires_an_active_label_and_preserved_stack() {
         let missing = compile_forth(
@@ -3789,116 +3476,6 @@ mod tests {
         )
         .expect_err("break must preserve its target stack row");
         assert_eq!(mismatch[0].code, "E-STACK-006");
-    }
-
-    #[test]
-    fn compiles_against_preexisting_typed_stack() {
-        let module =
-            compile_forth("input.forth", "2 *", vec![Type::Int], &core_vocabulary()).unwrap();
-        let mut stack = vec![TypedValue::Int(9)];
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(18)]);
-    }
-
-    #[test]
-    fn typed_forth_named_signature_inputs_lower_to_explicit_frame_operations() {
-        let module = compile_forth(
-            "named-signature.forth",
-            ": area ( S width:int height:int -- S int ! pure ) width height * ; 4 3 area",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let area = &module.module.functions["area"];
-        assert_eq!(area.locals, vec![Type::Int, Type::Int]);
-        let instructions = &area.blocks[&area.entry].instructions;
-        assert!(matches!(
-            instructions[0].instruction,
-            Instruction::LocalSet { index: 1 }
-        ));
-        assert!(matches!(
-            instructions[1].instruction,
-            Instruction::LocalSet { index: 0 }
-        ));
-        assert!(matches!(
-            instructions[2].instruction,
-            Instruction::LocalGet { index: 0 }
-        ));
-        assert!(matches!(
-            instructions[3].instruction,
-            Instruction::LocalGet { index: 1 }
-        ));
-
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(12)]);
-    }
-
-    #[test]
-    fn typed_forth_definitions_can_recursively_call_themselves() {
-        let module = compile_forth(
-            "factorial.forth",
-            r#"
-: factorial ( S n:int -- S int ! pure )
-  n 1 <= if
-    1
-  else
-    n n 1 - factorial *
-  then ;
-6 factorial
-"#,
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("a declared-pure Co-Forth word should be able to recurse");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("recursive Co-Forth program should execute");
-        assert_eq!(stack, vec![TypedValue::Int(720)]);
-    }
-
-    #[test]
-    fn typed_forth_quotation_executes_a_persistent_word() {
-        let module = compile_forth(
-            "quotation.forth",
-            ": square ( S int -- S int ! pure ) dup * ; 9 ['] square execute",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("a typed Co-Forth quotation should link to its definition");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("typed Co-Forth execute should call its quotation");
-        assert_eq!(stack, vec![TypedValue::Int(81)]);
-    }
-
-    #[test]
-    fn anonymous_quotation_lowers_to_the_shared_closure_ir() {
-        let module = compile_forth(
-            "anonymous-quotation.forth",
-            "41 [ int -- int ! pure | 1 + ] execute",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("typed anonymous quotation should compile");
-        let quote = module
-            .module
-            .functions
-            .values()
-            .find(|function| function.name.starts_with("quote$"))
-            .expect("quotation lowering creates a typed hidden function");
-        assert!(quote.captures.is_empty());
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("anonymous quotation should execute");
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
     #[test]
@@ -3967,36 +3544,6 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_quotation_captures_immutable_forth_locals() {
-        let source = ": add-offset ( S offset:int value:int -- S int ! pure ) \
-            value [ int -- int ! pure | offset + ] execute ; \
-            3 39 add-offset";
-        let module = compile_forth(
-            "captured-quotation.forth",
-            source,
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("quotation should capture its enclosing typed locals");
-        let quote = module
-            .module
-            .functions
-            .values()
-            .find(|function| function.name.starts_with("quote$"))
-            .expect("captured quotation hidden function");
-        assert_eq!(quote.captures, vec![Type::Int, Type::Int]);
-        assert!(quote.blocks.values().any(|block| block
-            .instructions
-            .iter()
-            .any(|located| matches!(located.instruction, Instruction::CaptureGet { index: 0 }))));
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("captured quotation should execute");
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
-    }
-
-    #[test]
     fn anonymous_quotation_effect_contract_is_inferred_and_checked() {
         let rejected = compile_forth(
             "pure-output-quote.forth",
@@ -4034,25 +3581,6 @@ mod tests {
             .as_ref()
             .expect("quotation body source span");
         assert_eq!(&source[span.start_byte..span.end_byte], "say");
-    }
-
-    #[test]
-    fn captured_anonymous_quotation_can_escape_its_defining_frame() {
-        let source = ": make-adder ( S offset:int -- S fn<int,int> ! pure ) \
-            [ int -- int ! pure | offset + ] ; \
-            39 3 make-adder execute";
-        let module = compile_forth(
-            "escaping-quotation.forth",
-            source,
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("a declared function type should let a closure escape its frame");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("escaped closure owns its immutable capture");
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
     #[test]
@@ -4095,31 +3623,6 @@ mod tests {
                 .expect_err("typed definitions must state their preserved stack row");
             assert_eq!(errors[0].code, "E-FORTH-SIG-001");
         }
-    }
-
-    #[test]
-    fn pure_is_the_only_pure_effect_annotation() {
-        let module = compile_forth(
-            "pure.forth",
-            ": preferred ( S int -- S int ! pure ) 1 + ; 41 preferred",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("pure effect annotation should compile");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("pure word should execute");
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
-
-        let errors = compile_forth(
-            "pure.forth",
-            ": obsolete ( S int -- S int ! {} ) 1 + ;",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect_err("braces are no longer an effect annotation");
-        assert_eq!(errors[0].code, "E-FORTH-SIG-001");
     }
 
     #[test]
@@ -4182,76 +3685,6 @@ mod tests {
     }
 
     #[test]
-    fn constructs_closed_variant_values() {
-        let module = compile_forth(
-            "variant.forth",
-            "42 variant<variant{none|some(int)},some>",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("payload variant constructor should compile");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("payload variant constructor should execute");
-        assert_eq!(
-            stack,
-            vec![TypedValue::Variant {
-                name: "some".into(),
-                value: Some(Box::new(TypedValue::Int(42))),
-            }]
-        );
-
-        let module = compile_forth(
-            "variant-unit.forth",
-            "variant<variant{none|some(int)},none>",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("payload-free variant constructor should compile");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("payload-free variant constructor should execute");
-        assert_eq!(
-            stack,
-            vec![TypedValue::Variant {
-                name: "none".into(),
-                value: None,
-            }]
-        );
-    }
-
-    #[test]
-    fn safely_projects_closed_variant_tags() {
-        let module = compile_forth(
-            "variant-get.forth",
-            "42 variant<variant{none|some(int)},some> variant-get<some> unwrap",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("variant projection should compile");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("variant projection should execute");
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
-
-        let module = compile_forth(
-            "variant-miss.forth",
-            "42 variant<variant{none|some(int)},some> variant-get<none> is-some",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("variant miss should compile");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("variant miss should execute");
-        assert_eq!(stack, vec![TypedValue::Bool(false)]);
-    }
-
-    #[test]
     fn reports_source_location_for_type_error() {
         let errors = compile_forth(
             "input.forth",
@@ -4290,22 +3723,6 @@ mod tests {
     }
 
     #[test]
-    fn compiles_begin_until_loop() {
-        let module = compile_forth(
-            "input.forth",
-            "begin true until 7",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(7)]);
-    }
-
-    #[test]
     fn rejects_loop_with_unstable_stack_shape() {
         let errors = compile_forth(
             "input.forth",
@@ -4315,46 +3732,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(errors.iter().any(|error| error.code == "E-STACK-005"));
-    }
-
-    #[test]
-    fn infinite_loop_exhausts_fuel_and_rolls_back() {
-        let module = compile_forth(
-            "input.forth",
-            "begin false until",
-            vec![Type::Int],
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = vec![TypedValue::Int(42)];
-        let error = Interpreter::new(
-            &module,
-            DenyCapabilities,
-            InterpreterConfig {
-                fuel: 10,
-                ..InterpreterConfig::default()
-            },
-        )
-        .execute(&mut stack)
-        .unwrap_err();
-        assert_eq!(error.code, "E-LIMIT-001");
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
-    }
-
-    #[test]
-    fn compiles_typed_if_else_then() {
-        let module = compile_forth(
-            "input.forth",
-            "true if 10 else 20 then",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(10)]);
     }
 
     #[test]
@@ -4382,77 +3759,6 @@ mod tests {
     }
 
     #[test]
-    fn quoted_word_produces_a_typed_symbol_value() {
-        let module = compile_forth("input.forth", "'bash", Vec::new(), &core_vocabulary()).unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Symbol("bash".into())]);
-    }
-
-    #[test]
-    fn constructs_and_uses_typed_map_literals() {
-        let module = compile_forth(
-            "input.forth",
-            "map{ s\" answer\" 42 s\" other\" 7 }map s\" answer\" map-get unwrap",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
-    }
-
-    #[test]
-    fn constructs_and_appends_typed_list_literals() {
-        let module = compile_forth(
-            "input.forth",
-            "[ 1 2 ] 3 list-append 2 list-get",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(3)]);
-    }
-
-    #[test]
-    fn accepts_comma_separated_lists_and_pasted_json_objects() {
-        let list = compile_forth(
-            "input.forth",
-            "[1, 2, 3] 2 list-get",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&list, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(3)]);
-
-        let json = compile_forth(
-            "input.forth",
-            "{\"first name\":\"Ada\",\"age\":37} \"first name\" json-get unwrap json-as-string unwrap",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&json, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::String("Ada".into())]);
-    }
-
-    #[test]
     fn rejects_mixed_or_unterminated_typed_list_literals() {
         let mixed = compile_forth(
             "input.forth",
@@ -4469,86 +3775,6 @@ mod tests {
     }
 
     #[test]
-    fn constructs_an_explicitly_typed_empty_map() {
-        let module = compile_forth(
-            "input.forth",
-            "empty-map<string,int> s\" answer\" 42 map-set s\" answer\" map-get unwrap",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
-    }
-
-    #[test]
-    fn retains_nested_type_arguments_in_empty_collections() {
-        let module = compile_forth(
-            "input.forth",
-            "empty-list<resource<capability-grant>>",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(
-            stack,
-            vec![TypedValue::List {
-                element_type: Type::Resource("capability-grant".into()),
-                values: Vec::new(),
-            }]
-        );
-    }
-
-    #[test]
-    fn raw_string_literal_preserves_quotes_and_newlines_without_escaping() {
-        let module = compile_forth(
-            "input.forth",
-            "s\"\"\"The user said \"hello\".\nSecond line.\"\"\"",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(
-            stack,
-            vec![TypedValue::String(
-                "The user said \"hello\".\nSecond line.".into()
-            )]
-        );
-    }
-
-    #[test]
-    fn bare_raw_string_literal_preserves_quotes_and_newlines_without_escaping() {
-        let module = compile_forth(
-            "input.forth",
-            "\"\"\"The user said \"hello\".\nSecond line.\"\"\"",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(
-            stack,
-            vec![TypedValue::String(
-                "The user said \"hello\".\nSecond line.".into()
-            )]
-        );
-    }
-
-    #[test]
     fn raw_string_literal_reports_an_unclosed_delimiter() {
         let errors = compile_forth(
             "input.forth",
@@ -4558,35 +3784,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(errors[0].code, "E-READ-004");
-    }
-
-    #[test]
-    fn reads_json_object_fields_through_the_shared_typed_vocabulary() {
-        let module = compile_forth(
-            "input.forth",
-            "s\" {\\\"answer\\\":42}\" json-parse result-unwrap s\" answer\" json-get unwrap json-as-int unwrap",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("typed Co-Forth compiles JSON field access");
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("typed Co-Forth executes JSON field access");
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
-
-        let float = compile_forth(
-            "input.forth",
-            "s\" 3.5\" json-parse result-unwrap json-as-float unwrap",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect("typed Co-Forth compiles JSON float access");
-        let mut stack = Vec::new();
-        Interpreter::new(&float, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("typed Co-Forth executes JSON float access");
-        assert_eq!(stack, vec![TypedValue::Float(3.5)]);
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use crate::{SpannedVal, Val};
 use finch_vm_core::{
-    apply_signature_types, instantiate_signature_types, nearest_names, BasicBlock, BlockId,
-    CapabilityKind, CapabilityRequirement, ControlEffect, DiagnosticPhase, EffectSet, Function,
-    Instruction, LocatedInstruction, Module, ResourceSelector, SourceLanguage, SourceOrigin,
-    SourceSpan, StackRow, StackSignature, SuspensionSignature, Type, TypedValue, UiOperation,
-    VerifiedModule, Verifier, VmDiagnostic, Vocabulary, VM_TYPE_SYSTEM_VERSION,
+    apply_signature_types, instantiate_signature_types, nearest_names, parse_type_name, BasicBlock,
+    BlockId, CapabilityKind, CapabilityRequirement, ControlEffect, DiagnosticPhase, EffectSet,
+    Function, Instruction, LocatedInstruction, Module, ResourceSelector, SourceLanguage,
+    SourceOrigin, SourceSpan, StackRow, StackSignature, SuspensionSignature, Type, TypedValue,
+    UiOperation, VerifiedModule, Verifier, VmDiagnostic, Vocabulary, VM_TYPE_SYSTEM_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -522,22 +522,19 @@ fn reject_template_binding_forms(
     source: &str,
     template: &Val,
 ) -> Result<(), Vec<VmDiagnostic>> {
-    match template {
-        Val::List(items) => {
-            if matches!(items.first(), Some(Val::Symbol(name)) if matches!(name.as_str(), "let" | "lambda" | "define" | "define-syntax"))
-            {
-                return Err(vec![macro_error(
-                    source_id,
-                    source,
-                    "E-LISP-MACRO-004",
-                    "bounded syntax templates cannot introduce lexical bindings; use a function or compose an existing binding form in caller syntax",
-                )]);
-            }
-            for item in items {
-                reject_template_binding_forms(source_id, source, item)?;
-            }
+    if let Val::List(items) = template {
+        if matches!(items.first(), Some(Val::Symbol(name)) if matches!(name.as_str(), "let" | "lambda" | "define" | "define-syntax"))
+        {
+            return Err(vec![macro_error(
+                source_id,
+                source,
+                "E-LISP-MACRO-004",
+                "bounded syntax templates cannot introduce lexical bindings; use a function or compose an existing binding form in caller syntax",
+            )]);
         }
-        _ => {}
+        for item in items {
+            reject_template_binding_forms(source_id, source, item)?;
+        }
     }
     Ok(())
 }
@@ -1546,14 +1543,14 @@ impl Compiler<'_> {
         expressions: &[Val],
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
-        if expressions.is_empty() || expressions.len() % 2 != 0 {
+        if expressions.is_empty() || !expressions.len().is_multiple_of(2) {
             return Err(vec![
                 self.error("E-MAP-001", "map requires one or more key/value pairs")
             ]);
         }
         let key_type = self.compile_expression(&expressions[0], builder)?;
         let value_type = self.compile_expression(&expressions[1], builder)?;
-        for pair in expressions[2..].chunks_exact(2) {
+        for pair in expressions[2..].as_chunks::<2>().0 {
             let found_key = self.compile_expression(&pair[0], builder)?;
             if !key_type.accepts(&found_key) {
                 return Err(vec![VmDiagnostic::type_mismatch(
@@ -4093,233 +4090,6 @@ fn parse_type(value: &Val) -> Result<Type, Vec<VmDiagnostic>> {
     };
     parse_type_name(name)
 }
-
-/// Parse the compact type spelling shared by Lisp annotations and Co-Forth
-/// stack signatures. The reader keeps `list<int>` as one symbol, so this
-/// parser deliberately handles nested angle brackets without adding a second
-/// syntax tree for type expressions.
-pub(crate) fn parse_type_name(name: &str) -> Result<Type, Vec<VmDiagnostic>> {
-    match name {
-        "unit" | "nil" => Ok(Type::Unit),
-        "bool" => Ok(Type::Bool),
-        "int" => Ok(Type::Int),
-        "uint" => Ok(Type::UInt),
-        "float" => Ok(Type::Float),
-        "char" => Ok(Type::Char),
-        "string" | "str" => Ok(Type::String),
-        "bytes" => Ok(Type::Bytes),
-        "json" => Ok(Type::Json),
-        "dynamic" | "any" => Ok(Type::Dynamic),
-        _ => parse_record_type(name)
-            .or_else(|| parse_variant_type(name))
-            .or_else(|| parse_generic_type(name))
-            .ok_or_else(|| {
-                vec![VmDiagnostic::error(
-                    "E-TYPE-009",
-                    DiagnosticPhase::TypeInference,
-                    format!("unknown type '{name}'"),
-                    None,
-                )]
-            }),
-    }
-}
-
-/// Parse a fixed, named product type. Records deliberately use braces rather
-/// than angle brackets so `record{name:string,age:int}` remains visually and
-/// semantically distinct from an open `map<string,string>`.
-fn parse_record_type(name: &str) -> Option<Type> {
-    let fields = name.strip_prefix("record{")?.strip_suffix('}')?;
-    if fields.is_empty() {
-        return Some(Type::Record(Vec::new()));
-    }
-    let mut parsed = Vec::new();
-    for field in split_type_arguments(fields)? {
-        let (field_name, field_type) = field.split_once(':')?;
-        let field_name = field_name.trim();
-        if field_name.is_empty()
-            || !field_name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            || parsed.iter().any(|(existing, _)| existing == field_name)
-        {
-            return None;
-        }
-        parsed.push((
-            field_name.to_string(),
-            parse_type_name(field_type.trim()).ok()?,
-        ));
-    }
-    Some(Type::Record(parsed))
-}
-
-/// Parse a closed tagged sum. A tag either carries no payload (`none`) or one
-/// typed payload (`some(int)`). This is a type spelling only; construction and
-/// matching remain ordinary verified operations rather than parser magic.
-fn parse_variant_type(name: &str) -> Option<Type> {
-    let alternatives = name.strip_prefix("variant{")?.strip_suffix('}')?;
-    if alternatives.is_empty() {
-        return None;
-    }
-    let mut parsed = Vec::new();
-    for alternative in split_variant_alternatives(alternatives)? {
-        let alternative = alternative.trim();
-        let (tag, payload) = if alternative.ends_with(')') {
-            let open = alternative.find('(')?;
-            let tag = alternative[..open].trim();
-            let payload = &alternative[open + 1..alternative.len() - 1];
-            if payload.is_empty() {
-                return None;
-            }
-            (tag, Some(parse_type_name(payload).ok()?))
-        } else {
-            (alternative, None)
-        };
-        if tag.is_empty()
-            || !tag
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            || parsed.iter().any(|(existing, _)| existing == tag)
-        {
-            return None;
-        }
-        parsed.push((tag.to_string(), payload));
-    }
-    Some(Type::Variant(parsed))
-}
-
-pub(crate) fn parse_variant_constructor_name(
-    name: &str,
-) -> Option<(Vec<(String, Option<Type>)>, String, Option<Type>)> {
-    let inner = name.strip_prefix("variant<")?.strip_suffix('>')?;
-    let arguments = split_type_arguments(inner)?;
-    if arguments.len() != 2 {
-        return None;
-    }
-    let Type::Variant(variants) = parse_type_name(arguments[0]).ok()? else {
-        return None;
-    };
-    let tag = arguments[1].trim();
-    let (_, payload_type) = variants.iter().find(|(name, _)| name == tag)?;
-    Some((variants.clone(), tag.to_string(), payload_type.clone()))
-}
-
-fn split_variant_alternatives(source: &str) -> Option<Vec<&str>> {
-    let mut alternatives = Vec::new();
-    let mut angle_depth = 0usize;
-    let mut brace_depth = 0usize;
-    let mut paren_depth = 0usize;
-    let mut start = 0;
-    for (index, character) in source.char_indices() {
-        match character {
-            '<' => angle_depth += 1,
-            '>' => angle_depth = angle_depth.checked_sub(1)?,
-            '{' => brace_depth += 1,
-            '}' => brace_depth = brace_depth.checked_sub(1)?,
-            '(' => paren_depth += 1,
-            ')' => paren_depth = paren_depth.checked_sub(1)?,
-            '|' if angle_depth == 0 && brace_depth == 0 && paren_depth == 0 => {
-                let alternative = source[start..index].trim();
-                if alternative.is_empty() {
-                    return None;
-                }
-                alternatives.push(alternative);
-                start = index + character.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    if angle_depth != 0 || brace_depth != 0 || paren_depth != 0 {
-        return None;
-    }
-    let alternative = source[start..].trim();
-    if alternative.is_empty() {
-        return None;
-    }
-    alternatives.push(alternative);
-    Some(alternatives)
-}
-
-fn parse_generic_type(name: &str) -> Option<Type> {
-    let (head, arguments) = name.split_once('<')?;
-    let inner = arguments.strip_suffix('>')?;
-    let arguments = split_type_arguments(inner)?;
-    let one = || {
-        (arguments.len() == 1)
-            .then(|| parse_type_name(arguments[0]).ok())
-            .flatten()
-    };
-    match head {
-        "list" => one().map(Type::list),
-        "option" => one().map(|inner| Type::Option(Box::new(inner))),
-        "task" => one().map(|inner| Type::Task(Box::new(inner))),
-        "fiber" if arguments.len() == 2 => Some(Type::Fiber(
-            Box::new(parse_type_name(arguments[0]).ok()?),
-            Box::new(parse_type_name(arguments[1]).ok()?),
-        )),
-        "stream" => one().map(|inner| Type::Stream(Box::new(inner))),
-        "resource" => (arguments.len() == 1).then(|| Type::Resource(arguments[0].to_string())),
-        "capability" => (arguments.len() == 1).then(|| Type::Capability(arguments[0].to_string())),
-        "map" if arguments.len() == 2 => Some(Type::Map(
-            Box::new(parse_type_name(arguments[0]).ok()?),
-            Box::new(parse_type_name(arguments[1]).ok()?),
-        )),
-        "result" if arguments.len() == 2 => Some(Type::result(
-            parse_type_name(arguments[0]).ok()?,
-            parse_type_name(arguments[1]).ok()?,
-        )),
-        // `fn<R>` is a pure zero-argument closure and `fn<A,B,R>` is a
-        // pure closure from A,B to R. Effectful/suspending function types are
-        // inferred from quotation bodies and deliberately have no lossy
-        // compact annotation yet.
-        "fn" if !arguments.is_empty() => {
-            let (result, inputs) = arguments.split_last()?;
-            Some(Type::Function {
-                arguments: inputs
-                    .iter()
-                    .map(|input| parse_type_name(input).ok())
-                    .collect::<Option<Vec<_>>>()?,
-                result: Box::new(parse_type_name(result).ok()?),
-                effects: EffectSet::pure(),
-                suspension: None,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn split_type_arguments(source: &str) -> Option<Vec<&str>> {
-    let mut arguments = Vec::new();
-    let mut angle_depth = 0usize;
-    let mut record_depth = 0usize;
-    let mut start = 0;
-    for (index, character) in source.char_indices() {
-        match character {
-            '<' => angle_depth += 1,
-            '>' => angle_depth = angle_depth.checked_sub(1)?,
-            '{' => record_depth += 1,
-            '}' => record_depth = record_depth.checked_sub(1)?,
-            ',' if angle_depth == 0 && record_depth == 0 => {
-                let argument = source[start..index].trim();
-                if argument.is_empty() {
-                    return None;
-                }
-                arguments.push(argument);
-                start = index + character.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    if angle_depth != 0 || record_depth != 0 {
-        return None;
-    }
-    let argument = source[start..].trim();
-    if argument.is_empty() {
-        return None;
-    }
-    arguments.push(argument);
-    Some(arguments)
-}
-
 fn source_origin(source_id: &str, source: &str, word: impl Into<String>) -> SourceOrigin {
     source_origin_in_range(source_id, source, 0..source.len(), word)
 }
@@ -4367,69 +4137,10 @@ fn source_position(source: &str, byte: usize) -> (usize, usize) {
         });
     (line, column)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::{DenyCapabilities, Interpreter, InterpreterConfig};
-    use crate::{core_vocabulary, TypedValue};
-
-    fn run(source: &str) -> Result<Vec<TypedValue>, Vec<VmDiagnostic>> {
-        let module = compile_lisp("input.lisp", source, Vec::new(), &core_vocabulary())?;
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .map_err(|error| vec![error])?;
-        Ok(stack)
-    }
-
-    #[test]
-    fn lowers_nested_lisp_without_generating_forth_text() {
-        assert_eq!(run("(+ 3 (* 4 2))").unwrap(), vec![TypedValue::Int(11)]);
-    }
-
-    #[test]
-    fn lowers_lexical_let_to_typed_locals() {
-        assert_eq!(
-            run("(let ((a 10) (b 5)) (- a b))").unwrap(),
-            vec![TypedValue::Int(5)]
-        );
-    }
-
-    #[test]
-    fn lowers_variadic_lisp_str_cat_to_binary_calls() {
-        assert_eq!(
-            run("(str-cat \"one\" \"-\" \"two\" \"-\" \"three\")").unwrap(),
-            vec![TypedValue::String("one-two-three".into())]
-        );
-    }
-
-    #[test]
-    fn lowers_typed_closure_with_captured_environment() {
-        assert_eq!(
-            run("(let ((n 10)) ((lambda ((x : int)) (+ x n)) 5))").unwrap(),
-            vec![TypedValue::Int(15)]
-        );
-    }
-
-    #[test]
-    fn expands_bounded_capture_free_syntax_templates_before_type_checking() {
-        assert_eq!(
-            run("(define-syntax (when test body) (if test body 0)) (when true 42)").unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-    }
-
-    #[test]
-    fn syntax_templates_compose_with_a_bounded_expansion_budget() {
-        assert_eq!(
-            run("(define-syntax (inc value) (+ value 1)) \
-                 (define-syntax (twice value) (inc (inc value))) \
-                 (twice 40)")
-            .unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-    }
+    use finch_vm_core::{core_vocabulary, TypedValue};
 
     #[test]
     fn syntax_templates_do_not_hide_expanded_capabilities() {
@@ -4595,50 +4306,6 @@ mod tests {
     }
 
     #[test]
-    fn compiles_a_recursively_typed_function() {
-        assert_eq!(
-            run("(define (factorial (n : int)) : int \
-                   (if (<= n 1) 1 (* n (factorial (- n 1))))) \
-                 (factorial 6)")
-            .unwrap(),
-            vec![TypedValue::Int(720)]
-        );
-    }
-
-    #[test]
-    fn top_level_begin_can_group_a_definition_and_its_first_use() {
-        assert_eq!(
-            run("(begin
-                    (define (factorial (n : int)) : int
-                      (if (<= n 1) 1 (* n (factorial (- n 1)))))
-                    (factorial 6))")
-            .unwrap(),
-            vec![TypedValue::Int(720)]
-        );
-    }
-
-    #[test]
-    fn retains_lisp_definition_docstrings_as_non_executable_ir_metadata() {
-        let module = compile_lisp(
-            "input.lisp",
-            "(define (double (n : int)) : int \"Return twice n.\" (* n 2)) (double 21)",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        assert_eq!(
-            module.module.functions["double"].documentation.as_deref(),
-            Some("Return twice n.")
-        );
-
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert_eq!(stack, vec![TypedValue::Int(42)]);
-    }
-
-    #[test]
     fn explains_that_unannotated_recursion_needs_a_return_type() {
         let errors = compile_lisp(
             "input.lisp",
@@ -4740,303 +4407,10 @@ mod tests {
     }
 
     #[test]
-    fn constructs_and_uses_homogeneous_typed_lists() {
-        assert_eq!(
-            run("(list-get (list 4 8 15 16) 2)").unwrap(),
-            vec![TypedValue::Int(15)]
-        );
-        assert_eq!(
-            run("(list-length (list \"a\" \"b\"))").unwrap(),
-            vec![TypedValue::Int(2)]
-        );
-        assert_eq!(
-            run("(unwrap (record-get (unwrap (list-uncons (list 4 8))) \"head\"))").unwrap(),
-            vec![TypedValue::Int(4)]
-        );
-        assert_eq!(
-            run("(list-length (unwrap (record-get (unwrap (list-uncons (list 4 8))) \"tail\")))")
-                .unwrap(),
-            vec![TypedValue::Int(1)]
-        );
-        assert_eq!(
-            run("(is-some (list-uncons (empty-list int)))").unwrap(),
-            vec![TypedValue::Bool(false)]
-        );
-        assert_eq!(
-            run("(match (list 4 8) (empty 0) (cons head tail (+ head (list-length tail))))")
-                .unwrap(),
-            vec![TypedValue::Int(5)]
-        );
-        assert_eq!(
-            run("(match (empty-list int) (empty 42) (cons head tail (begin tail head)))").unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-
-        let mismatched_arms = compile_lisp(
-            "list-pattern.lisp",
-            "(match (list 1) (empty \"empty\") (cons head tail head))",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect_err("list pattern arms must merge to one type");
-        assert!(mismatched_arms
-            .iter()
-            .any(|error| error.code == "E-TYPE-002"));
-    }
-
-    #[test]
-    fn try_returns_an_err_from_the_enclosing_typed_definition() {
-        let stack = run("(define (fail-fast) : result<dynamic,string> \
-                (begin (try (err \"no\")) (err \"unreachable\"))) \
-             (fail-fast)")
-        .expect("try must compile as typed result propagation");
-        assert_eq!(
-            stack,
-            vec![TypedValue::Result {
-                ok_type: Type::Dynamic,
-                error_type: Type::String,
-                is_ok: false,
-                value: Box::new(TypedValue::String("no".into())),
-            }]
-        );
-    }
-
-    #[test]
-    fn try_continues_with_an_ok_payload() {
-        let source = "(define (keep-going) : result<int,string> \
-                      (begin (try (ok 7)) (ok 8))) \
-                      (keep-going)";
-        let module = compile_lisp("try-ok.lisp", source, Vec::new(), &core_vocabulary())
-            .expect("successful try must leave the unwrapped payload for the next expression");
-        assert_eq!(
-            module.module.functions["keep-going"]
-                .signature
-                .output
-                .values,
-            vec![Type::result(Type::Int, Type::String)],
-            "the declared result contract remains visible to callers"
-        );
-        let mut stack = Vec::new();
-        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .unwrap();
-        assert!(matches!(
-            stack.as_slice(),
-            [TypedValue::Result { is_ok: true, value, .. }] if **value == TypedValue::Int(8)
-        ));
-    }
-
-    #[test]
     fn rejects_try_outside_a_typed_result_definition() {
         let errors = compile_lisp("try.lisp", "(try (ok 7))", Vec::new(), &core_vocabulary())
             .expect_err("top-level try has no typed result return target");
         assert!(errors.iter().any(|error| error.code == "E-RESULT-TRY-002"));
-    }
-
-    #[test]
-    fn constructs_and_uses_immutable_typed_maps() {
-        assert_eq!(
-            run("(unwrap (map-get (map \"answer\" 42 \"other\" 7) \"answer\"))").unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-        assert_eq!(
-            run("(unwrap (map-get (map-set (map \"answer\" 42) \"answer\" 99) \"answer\"))")
-                .unwrap(),
-            vec![TypedValue::Int(99)]
-        );
-        assert_eq!(
-            run("(map-length (map \"a\" 1 \"a\" 2))").unwrap(),
-            vec![TypedValue::Int(1)]
-        );
-        assert_eq!(
-            run("(unwrap (map-get (map-set (empty-map string int) \"answer\" 42) \"answer\"))")
-                .unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-    }
-
-    #[test]
-    fn constructs_and_projects_heterogeneous_typed_records() {
-        assert_eq!(
-            run("(unwrap (record-get { :name \"Ada\" :age 37 } \"age\"))").unwrap(),
-            vec![TypedValue::Int(37)]
-        );
-        let missing = compile_lisp(
-            "record.lisp",
-            "(record-get { :name \"Ada\" } \"age\")",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect_err("record fields are statically known");
-        assert_eq!(missing[0].code, "E-RECORD-005");
-        assert_eq!(
-            run("(unwrap (record-get (record-set { :name \"Ada\" :age 37 } \"age\" 38) \"age\"))")
-                .unwrap(),
-            vec![TypedValue::Int(38)]
-        );
-        assert_eq!(
-            run(
-                "(let ((object { :run (lambda ((x : int)) (+ x 1)) })) ((unwrap (record-get object \"run\")) 41))",
-            )
-            .unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-        assert_eq!(
-            run("(match { :name \"Ada\" :age 37 } \
-                   (record ((name who) (age years)) \
-                     (begin who (+ years 5))))",)
-            .unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-
-        let missing_pattern = compile_lisp(
-            "record-pattern.lisp",
-            "(match { :name \"Ada\" } (record ((age years)) years))",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect_err("record patterns may only project statically present fields");
-        assert_eq!(missing_pattern[0].code, "E-RECORD-005");
-    }
-
-    #[test]
-    fn reads_json_object_fields_through_typed_option_boundaries() {
-        assert_eq!(
-            run(
-                "(unwrap (json-as-int (unwrap (json-get (result-unwrap (json-parse \"{\\\"answer\\\":42}\")) \"answer\"))))"
-            )
-            .unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-        assert_eq!(
-            run("(is-some (json-get (result-unwrap (json-parse \"{}\")) \"missing\"))").unwrap(),
-            vec![TypedValue::Bool(false)]
-        );
-        assert_eq!(
-            run(
-                "(unwrap (json-as-string (unwrap (json-index (result-unwrap (json-parse \"[0,\\\"one\\\"]\")) 1))))"
-            )
-            .unwrap(),
-            vec![TypedValue::String("one".into())]
-        );
-        assert_eq!(
-            run("(unwrap (json-as-float (result-unwrap (json-parse \"3.5\"))))").unwrap(),
-            vec![TypedValue::Float(3.5)]
-        );
-        assert_eq!(
-            run("(list-length (json-keys (result-unwrap (json-parse \"{\\\"a\\\":1,\\\"b\\\":2}\"))))")
-                .unwrap(),
-            vec![TypedValue::Int(2)]
-        );
-    }
-
-    #[test]
-    fn matches_typed_result_payloads_without_unsafe_projection() {
-        assert_eq!(
-            run("(match-result (ok 5) (ok value (+ value 1)) (err problem (begin problem 0)))")
-                .unwrap(),
-            vec![TypedValue::Int(6)]
-        );
-        assert_eq!(
-            run("(match-result (err \"bad\") (ok value (begin value 0)) (err problem (begin problem 3)))").unwrap(),
-            vec![TypedValue::Int(3)]
-        );
-    }
-
-    #[test]
-    fn generic_match_selects_the_existing_typed_tagged_lowering() {
-        assert_eq!(
-            run("(match (some 5) (some value (+ value 1)) (none 0))").unwrap(),
-            vec![TypedValue::Int(6)]
-        );
-        assert_eq!(
-            run("(match (err \"bad\") (ok value (begin value 0)) (err problem (begin problem 3)))")
-                .unwrap(),
-            vec![TypedValue::Int(3)]
-        );
-    }
-
-    #[test]
-    fn generic_match_supports_total_boolean_and_integer_literals() {
-        assert_eq!(
-            run("(match true (true 42) (false 0))").unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-        assert_eq!(
-            run("(match 2 (0 100) (2 42) (_ 0))").unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-        assert_eq!(
-            run("(match 9 (0 100) (2 42) (_ 0))").unwrap(),
-            vec![TypedValue::Int(0)]
-        );
-    }
-
-    #[test]
-    fn constructs_closed_variant_values() {
-        assert_eq!(
-            run("(variant variant{none|some(int)} :some 42)").unwrap(),
-            vec![TypedValue::Variant {
-                name: "some".into(),
-                value: Some(Box::new(TypedValue::Int(42))),
-            }]
-        );
-        assert_eq!(
-            run("(variant variant{none|some(int)} :none)").unwrap(),
-            vec![TypedValue::Variant {
-                name: "none".into(),
-                value: None,
-            }]
-        );
-        for source in [
-            "(variant variant{none|some(int)} :missing)",
-            "(variant variant{none|some(int)} :some)",
-            "(variant variant{none|some(int)} :none 1)",
-        ] {
-            assert!(compile_lisp("variant.lisp", source, Vec::new(), &core_vocabulary()).is_err());
-        }
-    }
-
-    #[test]
-    fn safely_projects_closed_variant_tags() {
-        assert_eq!(
-            run("(unwrap (variant-get (variant variant{none|some(int)} :some 42) :some))").unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-        assert_eq!(
-            run("(is-some (variant-get (variant variant{none|some(int)} :some 42) :none))")
-                .unwrap(),
-            vec![TypedValue::Bool(false)]
-        );
-        assert_eq!(
-            run("(is-some (variant-get (variant variant{none|some(int)} :none) :none))").unwrap(),
-            vec![TypedValue::Bool(true)]
-        );
-    }
-
-    #[test]
-    fn exhaustively_matches_closed_variants() {
-        assert_eq!(
-            run("(match (variant variant{none|some(int)} :some 41) \
-                         (none 0) \
-                         (some value (+ value 1)))")
-            .unwrap(),
-            vec![TypedValue::Int(42)]
-        );
-        assert_eq!(
-            run("(match (variant variant{idle|busy(string)} :idle) \
-                         (idle 7) \
-                         (busy message (begin message 0)))")
-            .unwrap(),
-            vec![TypedValue::Int(7)]
-        );
-        assert_eq!(
-            run("(match-variant (variant variant{some(int)|none} :some 21) \
-                                 (some value (* value 2)) \
-                                 (none 0))")
-            .unwrap(),
-            vec![TypedValue::Int(42)]
-        );
     }
 
     #[test]
@@ -5067,88 +4441,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_parameterized_return_annotations() {
-        assert_eq!(
-            run(
-                "(define (singleton (value : int)) : list<int> (list value)) \
-                 (list-get (singleton 7) 0)"
-            )
-            .unwrap(),
-            vec![TypedValue::Int(7)]
-        );
-    }
-
-    #[test]
-    fn accepts_fixed_record_return_annotations() {
-        assert_eq!(
-            run("(define (person) : record{name:string,age:int} \
-                 { :name \"Ada\" :age 37 }) \
-                 (unwrap (record-get (person) \"age\"))")
-            .unwrap(),
-            vec![TypedValue::Int(37)]
-        );
-    }
-
-    #[test]
-    fn parses_compact_pure_function_types_shared_with_forth() {
-        assert_eq!(
-            parse_type_name("fn<int,int>").unwrap(),
-            Type::Function {
-                arguments: vec![Type::Int],
-                result: Box::new(Type::Int),
-                effects: EffectSet::pure(),
-                suspension: None,
-            }
-        );
-        assert_eq!(
-            parse_type_name("fn<int>").unwrap(),
-            Type::Function {
-                arguments: Vec::new(),
-                result: Box::new(Type::Int),
-                effects: EffectSet::pure(),
-                suspension: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_nested_parameterized_type_annotations() {
-        assert_eq!(
-            parse_type_name("result<option<list<int>>,string>").unwrap(),
-            Type::result(Type::Option(Box::new(Type::list(Type::Int))), Type::String,)
-        );
-        assert_eq!(
-            parse_type_name("stream<list<string>>").unwrap(),
-            Type::Stream(Box::new(Type::list(Type::String)))
-        );
-        assert_eq!(
-            parse_type_name("fiber<int,string>").unwrap(),
-            Type::Fiber(Box::new(Type::Int), Box::new(Type::String))
-        );
-        assert_eq!(
-            parse_type_name("record{name:string,meta:map<string,list<int>>}").unwrap(),
-            Type::Record(vec![
-                ("name".into(), Type::String),
-                (
-                    "meta".into(),
-                    Type::Map(Box::new(Type::String), Box::new(Type::list(Type::Int)),),
-                ),
-            ])
-        );
-        assert_eq!(
-            parse_type_name("variant{none|some(int)|metadata(record{name:string})}").unwrap(),
-            Type::Variant(vec![
-                ("none".into(), None),
-                ("some".into(), Some(Type::Int)),
-                (
-                    "metadata".into(),
-                    Some(Type::Record(vec![("name".into(), Type::String)])),
-                ),
-            ])
-        );
-    }
-
-    #[test]
     fn rejects_heterogeneous_list_without_dynamic_boundary() {
         let errors = compile_lisp(
             "input.lisp",
@@ -5158,18 +4450,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(errors[0].code, "E-TYPE-002");
-    }
-
-    #[test]
-    fn quote_produces_a_typed_symbol_value() {
-        assert_eq!(
-            run("(quote bash)").unwrap(),
-            vec![TypedValue::Symbol("bash".into())]
-        );
-        assert_eq!(
-            run("'bash").unwrap(),
-            vec![TypedValue::Symbol("bash".into())]
-        );
     }
 
     #[test]
@@ -5228,30 +4508,6 @@ mod tests {
         )
         .expect_err("one producer must have one stable yield type");
         assert!(errors.iter().any(|error| error.code == "E-YIELD-004"));
-    }
-
-    #[test]
-    fn named_break_and_continue_lower_to_typed_loop_edges() {
-        assert_eq!(
-            run("(while :label outer true (break outer))").unwrap(),
-            Vec::<TypedValue>::new()
-        );
-        let module = compile_lisp(
-            "continue.lisp",
-            "(while :label outer false (continue outer))",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap();
-        assert!(module.module.functions["main"]
-            .blocks
-            .values()
-            .any(|block| {
-                block
-                    .instructions
-                    .iter()
-                    .any(|located| matches!(located.instruction, Instruction::Jump { .. }))
-            }));
     }
 
     #[test]

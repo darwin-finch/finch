@@ -430,7 +430,7 @@ fn run_fiber(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{core_vocabulary, frontend::forth::compile_forth};
+    use crate::{compile_forth, core_vocabulary};
 
     #[test]
     fn pure_cpu_fiber_has_a_private_stack_and_returns_a_typed_result() {
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn deferred_closure_copies_captures_into_a_private_frame() {
-        let module = crate::frontend::lisp::compile_lisp(
+        let module = crate::compile_lisp(
             "fiber.lisp",
             "(let ((value 42)) (lambda () value))",
             Vec::new(),

@@ -695,9 +695,7 @@ fn skip_trivia(source: &str, mut cursor: usize) -> Option<usize> {
             cursor += character.len_utf8();
         }
         if source.get(cursor..)?.starts_with(';') {
-            cursor += source[cursor..]
-                .find('\n')
-                .map_or(source.len() - cursor, |offset| offset);
+            cursor += source[cursor..].find('\n').unwrap_or(source.len() - cursor);
             continue;
         }
         if source.get(cursor..)?.starts_with("#|") {
@@ -1119,6 +1117,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_parse_float() {
         assert_eq!(parse1("3.14"), Val::Float(3.14));
     }

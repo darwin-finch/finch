@@ -7,9 +7,9 @@ diagnostics, capability/effect descriptions, verifier, language identity, and co
 It owns no frontend, interpreter, runtime, fiber scheduler, or checkpoint codec.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`. Application callers
-continue to use `finch-vm`; the four explicitly documented compiler-support exports (`BlockId`,
-`nearest_names`, `apply_signature_types`, and `instantiate_signature_types`) are an intentionally
-restricted workspace seam and are not stable application API.
+continue to use `finch-vm`; the five explicitly documented compiler-support exports (`BlockId`,
+`nearest_names`, `apply_signature_types`, `instantiate_signature_types`, and `parse_type_name`)
+are an intentionally restricted workspace seam and are not stable application API.
 
 **Dependencies:** this unpublished foundation crate depends only on `anyhow`, `once_cell`, `serde`,
 `serde_json`, `thiserror`, and `uuid`. It never depends on `finch-vm` or the root `finch` crate.
