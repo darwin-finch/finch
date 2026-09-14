@@ -1303,3 +1303,119 @@ mod lisp {
             }));
     }
 }
+
+#[test]
+fn public_colisp_facade_retains_unicode_comment_and_reader_sugar_span() {
+    let source = "; π lead comment\n'λ";
+    let module = compile_lisp("reader-span.lisp", source, Vec::new(), &core_vocabulary())
+        .expect("CoLisp reader sugar must compile through the VM facade");
+    let quote = module.module.functions["main"]
+        .blocks
+        .values()
+        .flat_map(|block| block.instructions.iter())
+        .find(|located| {
+            matches!(
+                located.instruction,
+                Instruction::Constant {
+                    value: TypedValue::Symbol(ref symbol)
+                } if symbol == "λ"
+            )
+        })
+        .expect("reader sugar must lower to the quoted symbol constant");
+    let span = quote
+        .origin
+        .span
+        .as_ref()
+        .expect("quoted symbol must retain its source origin");
+    assert_eq!(
+        &source[span.start_byte..span.end_byte],
+        "'λ",
+        "reader-sugar origin must retain the original Unicode source slice: source={source:?}, span={span:?}"
+    );
+    assert_eq!(
+        (span.start_line, span.start_column),
+        (2, 1),
+        "reader-sugar origin must account for the preceding comment and Unicode bytes: source={source:?}, span={span:?}"
+    );
+}
+
+#[test]
+fn public_colisp_facade_retains_typed_record_failure_span() {
+    let source = "; π typed record\n(record-get { :name \"Ada\" } \"age\")";
+    let diagnostics = compile_lisp("record-span.lisp", source, Vec::new(), &core_vocabulary())
+        .expect_err("missing typed-record fields must fail through the VM facade");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E-RECORD-005")
+        .unwrap_or_else(|| {
+            panic!("typed-record failure must retain its specific diagnostic: {diagnostics:?}")
+        });
+    let span = diagnostic
+        .primary
+        .as_ref()
+        .and_then(|origin| origin.span.as_ref())
+        .expect("typed-record failure must retain its source origin");
+    let start = source
+        .find("(record-get")
+        .expect("typed-record expression must be present in its source");
+    assert_eq!(
+        &source[span.start_byte..span.end_byte],
+        &source[start..],
+        "typed-record diagnostic must retain the original expression span: source={source:?}, diagnostic={diagnostic:?}"
+    );
+    assert_eq!(
+        (span.start_line, span.start_column),
+        (2, 1),
+        "typed-record diagnostic must retain line/column after the Unicode comment: source={source:?}, diagnostic={diagnostic:?}"
+    );
+}
+
+#[test]
+fn public_frontend_facade_executes_equivalent_typed_records() {
+    let vocabulary = core_vocabulary();
+    let forth_source = "{ name: \"Ada\" age: 37 } \"age\" record-get unwrap";
+    let lisp_source = "(unwrap (record-get { :name \"Ada\" :age 37 } \"age\"))";
+    let forth = compile_forth(
+        "record-equivalent.forth",
+        forth_source,
+        Vec::new(),
+        &vocabulary,
+    )
+    .unwrap_or_else(|diagnostics| {
+        panic!("Co-Forth typed-record fixture must compile: source={forth_source:?}, diagnostics={diagnostics:?}")
+    });
+    let lisp = compile_lisp(
+        "record-equivalent.lisp",
+        lisp_source,
+        Vec::new(),
+        &vocabulary,
+    )
+    .unwrap_or_else(|diagnostics| {
+        panic!("CoLisp typed-record fixture must compile: source={lisp_source:?}, diagnostics={diagnostics:?}")
+    });
+
+    let mut forth_stack = Vec::new();
+    Interpreter::new(&forth, DenyCapabilities, InterpreterConfig::default())
+        .execute(&mut forth_stack)
+        .unwrap_or_else(|error| {
+            panic!("Co-Forth typed-record fixture must execute: source={forth_source:?}, error={error:?}")
+        });
+    let mut lisp_stack = Vec::new();
+    Interpreter::new(&lisp, DenyCapabilities, InterpreterConfig::default())
+        .execute(&mut lisp_stack)
+        .unwrap_or_else(|error| {
+            panic!(
+                "CoLisp typed-record fixture must execute: source={lisp_source:?}, error={error:?}"
+            )
+        });
+
+    assert_eq!(
+        forth_stack,
+        vec![TypedValue::Int(37)],
+        "Co-Forth typed-record fixture must produce the expected value: source={forth_source:?}, stack={forth_stack:?}"
+    );
+    assert_eq!(
+        lisp_stack, forth_stack,
+        "equivalent typed-record syntax must produce the same facade result: forth_source={forth_source:?}, lisp_source={lisp_source:?}, forth_stack={forth_stack:?}, lisp_stack={lisp_stack:?}"
+    );
+}
