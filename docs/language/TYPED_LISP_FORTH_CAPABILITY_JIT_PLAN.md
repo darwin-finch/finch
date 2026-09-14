@@ -608,12 +608,13 @@ concept Add<L,R> {
 }
 ```
 
-`symmetric` is an explicit concept law and evidence-generation rule, not a guess based on an
-operation's name. One `Equal<A,B>` implementation supplies a compiler-generated `Equal<B,A>`
-adapter that swaps the arguments while retaining the same sealed evidence identity. Defining both
-directions independently is therefore an overlap error unless one is explicitly named non-default
-evidence. Ordered concepts such as `Add<L,R>` and `Compare<L,R>` do not imply their reverse; numeric
-libraries may publish a separately proven commutative derivation where that law is actually valid.
+`symmetric` is the correct law for a relation: `equal(a,b)` implies `equal(b,a)`. It is an explicit
+evidence-generation rule, not a guess based on an operation's name. One `Equal<A,B>` implementation
+supplies a compiler-generated `Equal<B,A>` adapter that swaps the arguments while retaining the same
+sealed evidence identity. Defining both directions independently is therefore an overlap error
+unless one is explicitly named non-default evidence. `commutative` is the distinct law for a binary
+operation: `op(a,b) == op(b,a)`. Ordered concepts such as `Add<L,R>` and `Compare<L,R>` do not imply
+their reverse; a numeric library may declare commutativity only where that law is actually valid.
 `!=` is derived by negating selected equality evidence, and `<`, `<=`, `>`, and `>=` derive from one
 selected comparison operation rather than admitting six unrelated implementations.
 
@@ -626,12 +627,55 @@ maps each operator to named callable evidence and can be selected statically or 
 view like any other concept implementation. Generic algorithms can request the complete algebraic
 bundle when their reasoning needs those coherent laws, or only `Add<T,T>` when it does not.
 
+Law vocabulary distinguishes the shapes involved rather than attaching a vague `algebraic` marker:
+
+- relation laws include reflexivity, symmetry, transitivity, and antisymmetry;
+- one-operation laws include commutativity, associativity, identity, absorption, and idempotence;
+- an involution names a unary operation and states that applying it twice returns the original;
+- distributivity names both operations and the direction of distribution;
+- anticommutativity names the required negation evidence (`op(a,b) == negate(op(b,a))`) rather than
+  treating it as reversed dispatch;
+- anti-homomorphism laws can state, for example, the star-algebra rule
+  `adjoint(mul(a,b)) == mul(adjoint(b),adjoint(a))`.
+
+These laws belong to a particular evidence bundle, not globally to the operator token or record
+type. The same record can participate in several explicitly selected algebras with different
+operations or policies.
+
+Mathematical linearity is named `LinearMap<V,W,Scalar>` (or an equivalently explicit concept), not
+`linear`, because Finch also uses *linear* to describe ownership that must be consumed exactly once.
+Its law relates the selected vector-addition, scalar-multiplication, and application evidence. A
+`HermitianOperator<V,Scalar>` is a linear endomorphism with selected inner-product and adjoint
+evidence and the self-adjoint law. A `UnitaryOperator<V,Scalar>` additionally states the appropriate
+adjoint/inverse or inner-product-preservation law. These are structured multi-operation contracts,
+not callable flags.
+
+Some properties attach to a particular value rather than every value of its representation. A
+general `Matrix<T,M,N>` type is not Hermitian or unitary merely because some instances are. A
+checked constructor such as `try-as-unitary` may validate runtime coefficients and return a refined
+owner/view carrying sealed `UnitaryOperator` evidence; trusted construction from statically proven
+combinators may produce the same refinement without a runtime scan. Mutation invalidates
+value-specific evidence unless the mutating operation proves that it preserves the property.
+
 The compiler enforces the mechanically decidable portion of a law bundle: operation types,
 ownership/effects, associated-type agreement, evidence coherence, and declared derivations such as
 argument reversal. It does not claim to prove arbitrary algebraic identities or analytic properties
-from function bodies. Standard intrinsics may carry trusted certificates; user implementations make
-an auditable contract and should be checked by generated property tests or stronger optional proof
-artifacts. Optimizations may rely only on laws admitted by the active safety/profile policy.
+from function bodies. A law declaration is an auditable API contract that generic code may require,
+but an unchecked declaration is never an optimizer certificate. Optimizer-visible certificates come
+only from compiler-derived structural proofs, proof artifacts checked by a small trusted verifier,
+runtime-validated refined evidence, or explicitly unsafe trusted-library admission outside hosted
+profiles. Property tests remain valuable diagnostics but are not proofs. Consequently, falsely
+marking an arbitrary function `linear` cannot make safe hosted code silently combine inputs and
+miscompile the result.
+
+Optimizations may rely on certified laws admitted by the active safety/profile policy only when the
+rewrite also preserves operand evaluation, exceptions, ownership, and observable destruction.
+Linearity can enable certified map fusion and distribution; Hermiticity and unitarity can select
+specialized kernels, eliminate certified adjoint/inverse pairs, or preserve known norm facts.
+Associativity therefore does not apply to ordinary IEEE floating-point addition, and reassociation
+of checked arithmetic is invalid when it could change which operation traps. A separate approximate
+or fast-math policy may deliberately expose different evidence rather than weakening strict source
+semantics globally.
 
 Operator selection uses only operand types plus lexically explicit or uniquely canonical evidence.
 It never uses the expected result type, import order, receiver/member position, or speculative body
@@ -3711,6 +3755,12 @@ Every phase adds tests at the layer where its invariant is enforced:
 - operator tests proving operand-directed evidence selection, generated symmetric adapters,
   rejection of ambiguous defaults and accidental ordered reversal, derivation of inequality and
   ordering relations, explicit alternate-policy selection, and identical CoLisp/Co-Forth lowering;
+- law-evidence tests distinguishing relational symmetry from operational commutativity, exercising
+  associativity/distributivity/idempotence/involution and anti-homomorphism wiring, and proving an
+  unchecked or false user law cannot authorize an optimization;
+- refined-mathematical-value tests for linear, Hermitian, and unitary operators, including runtime
+  validation failure, property-preserving composition, mutation invalidation, certified specialized
+  lowering, and strict floating-point/checked-arithmetic counterexamples;
 - segmented-text tests comparing every flat/rope/subslice chunking combination without flattening,
   including unequal known lengths, cross-chunk boundaries, identical-owner short circuits,
   allocation-free equality, and segmentation-independent hashes;
