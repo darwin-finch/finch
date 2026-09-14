@@ -3926,6 +3926,34 @@ async fn inspection_exposes_typed_definition_documentation() {
 }
 
 #[tokio::test]
+async fn compiler_context_projects_promoted_functions_into_program_corpus_contract() {
+    let runtime = ProgramRuntime::new();
+    let outcome = runtime
+        .submit(submission(
+            ProgramLanguage::Lisp,
+            "(define (double (n : int)) : int (* n 2))",
+            ExecutionEffect::Pure,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.status,
+        ExecutionStatus::Completed,
+        "the definition must commit before compiler context is captured; diagnostics={:?}",
+        outcome.diagnostics
+    );
+
+    let context = runtime.compiler_context().unwrap();
+    assert_eq!(context.manifest_generation, runtime.manifest_generation());
+    assert_eq!(context.revision, runtime.revision());
+    assert!(
+        context.functions.contains_key("double"),
+        "the runtime projection must carry promoted definitions for source-only corpus replay; functions={:?}",
+        context.functions.keys().collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn typed_vm_can_introspect_its_vocabulary() {
     let runtime = ProgramRuntime::new();
     let outcome = runtime

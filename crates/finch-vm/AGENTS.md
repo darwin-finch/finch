@@ -2,8 +2,9 @@
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `crates/finch-vm/src/` (the interpreter, typed runtime, fibers, and compatibility
-facade), and the shared repository-root `vocabulary/` and `examples/finch/` integration corpus.
+**Owns** `crates/finch-vm/src/` (the interpreter, typed runtime, fibers, compiler-boundary wire
+failure classification, and compatibility facade), and the shared repository-root `vocabulary/`
+and `examples/finch/` integration corpus.
 The CoLisp and CoForth source frontends live in sibling crates.
 Shared typed IR, verification, capability/effect descriptions, and vocabulary contracts live in
 [`finch-vm-core`](../finch-vm-core/AGENTS.md). The program runtime service is `src/runtime/`; the

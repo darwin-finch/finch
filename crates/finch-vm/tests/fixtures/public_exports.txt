@@ -76,10 +76,12 @@ VmSideEffect
 VmStep
 VmTrampoline
 Vocabulary
+WireFailureClass
 agent_task_result_type
 agent_task_snapshot_type
 agent_task_spec_type
 capability_grant_entry_type
+classify_wire_failure
 compile_forth
 compile_forth_with_functions
 compile_lisp
@@ -94,3 +96,4 @@ parse_str
 parse_str_spanned
 tree_entry_type
 tree_listing_type
+wire_diagnostic_code

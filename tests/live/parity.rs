@@ -358,8 +358,8 @@ async fn live_parity_finch_wire_stateful_session() {
         .unwrap_or_else(|_| panic!("{name}: first stateful turn exceeded 60 seconds"))
         .unwrap_or_else(|error| panic!("{name}: first stateful turn failed: {error}"))
         .text();
-        finch::programs::capture_with_runtime_from_env(
-            &runtime,
+        finch::programs::capture_with_compiler_context_from_env(
+            || runtime.compiler_context(),
             name,
             provider.default_model(),
             "live_conformance_stateful",
@@ -392,8 +392,8 @@ async fn live_parity_finch_wire_stateful_session() {
         .unwrap_or_else(|_| panic!("{name}: second stateful turn exceeded 60 seconds"))
         .unwrap_or_else(|error| panic!("{name}: second stateful turn failed: {error}"))
         .text();
-        finch::programs::capture_with_runtime_from_env(
-            &runtime,
+        finch::programs::capture_with_compiler_context_from_env(
+            || runtime.compiler_context(),
             name,
             provider.default_model(),
             "live_conformance_stateful",
@@ -448,8 +448,8 @@ async fn live_parity_finch_wire_diagnostic_repair() {
         .unwrap_or_else(|_| panic!("{name}: diagnostic repair exceeded 60 seconds"))
         .unwrap_or_else(|error| panic!("{name}: diagnostic repair failed: {error}"))
         .text();
-        finch::programs::capture_with_runtime_from_env(
-            &runtime,
+        finch::programs::capture_with_compiler_context_from_env(
+            || runtime.compiler_context(),
             name,
             provider.default_model(),
             "live_conformance_repair",

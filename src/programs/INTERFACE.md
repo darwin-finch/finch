@@ -29,6 +29,8 @@ impl ForthWireBuffer {
 pub struct ForthWireToken { … }
 /// Identity of one normative artifact handed to a provider.
 pub struct LanguagePackageIdentity { … }
+/// Reducible language context needed to compile a captured provider program without retaining a live operand stack or host authority.
+pub struct ProgramCompilerContext { … }
 /// Canonical definition and review metadata for one program version.
 pub struct ProgramDefinition { … }
 impl ProgramDefinition {
@@ -66,6 +68,8 @@ impl VmManifest {
 pub enum WireCorpusAttempt { FirstPass, Repair }
 pub struct WireCorpusAudit { … }
 pub struct WireCorpusCounts { … }
+/// Why a provider's first Finch VM wire submission was not accepted. Re-exported from `finch-vm`.
+pub enum WireFailureClass { RawProse, MarkdownFence, InventedWord, StackOrType, WrongLanguageDispatch, MissingOutputEffect, Capability, Other }
 ```
 
 ## Functions
@@ -74,9 +78,9 @@ pub struct WireCorpusCounts { … }
 /// Compile and verify every retained source without interpreting any module.
 pub fn audit(path: &Path) -> Result<WireCorpusAudit> { … }
 pub fn capture_from_env(provider: &str, model: &str, surface: &str, attempt: WireCorpusAttempt, source: &str) { … }
-pub fn capture_with_runtime_from_env(runtime: &crate::runtime::ProgramRuntime, provider: &str, model: &str, surface: &str, attempt: WireCorpusAttempt, source: &str) { … }
-/// Classify a rejected provider submission for aggregate conformance metrics.
-pub fn classify_wire_failure(source: &str, diagnostic: &str) -> crate::metrics::WireFailureClass { … }
+pub fn capture_with_compiler_context_from_env<F>(compiler_context: F, provider: &str, model: &str, surface: &str, attempt: WireCorpusAttempt, source: &str) where F: FnOnce() -> Result<ProgramCompilerContext>, { … }
+/// Classify a rejected provider submission for aggregate conformance metrics. Re-exported from `finch-vm`.
+pub fn classify_wire_failure(source: &str, diagnostic: &str) -> WireFailureClass { … }
 /// SHA-256 of canonical source or environment material.
 pub fn hash_text(text: &str) -> String { … }
 /// Whether a rejected wire program is eligible for one source-only repair.
@@ -88,7 +92,7 @@ pub fn load_program_files(root: &Path, scope: ProgramScope) -> Result<Vec<Progra
 pub fn parse_finch_script(path: &Path, contents: &str) -> Result<FinchScript> { … }
 /// Locate `<git-root>/vocabulary/programs` for the current project.
 pub fn project_program_root(start: &Path) -> Option<PathBuf> { … }
-/// Return the stable leading diagnostic code without retaining the diagnostic prose in conformance metrics.
+/// Return the stable leading diagnostic code without retaining diagnostic prose. Re-exported from `finch-vm`.
 pub fn wire_diagnostic_code(diagnostic: &str) -> Option<String> { … }
 /// Construct the provider-neutral correction request for a rejected program.
 pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String { … }

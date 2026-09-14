@@ -42,3 +42,74 @@ pub use runtime::{
     ProducerFiberState, TypedExecution, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,
     TypedSuspension,
 };
+
+/// Why a provider's first Finch VM wire submission was not accepted.
+///
+/// Keep this deliberately coarse and source-free: conformance reporting needs
+/// provider/model aggregates, not a second log of user prompts or generated
+/// programs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireFailureClass {
+    RawProse,
+    MarkdownFence,
+    InventedWord,
+    StackOrType,
+    WrongLanguageDispatch,
+    MissingOutputEffect,
+    Capability,
+    Other,
+}
+
+/// Return the stable leading diagnostic code without retaining diagnostic prose.
+pub fn wire_diagnostic_code(diagnostic: &str) -> Option<String> {
+    let head = diagnostic.lines().next()?;
+    let code = match head
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+    {
+        Some((code, _)) => code.trim(),
+        None => head.split_once(':')?.0.trim(),
+    };
+    code.starts_with("E-").then(|| code.to_string())
+}
+
+/// Classify a rejected provider submission for aggregate conformance metrics.
+///
+/// This pure compiler-boundary projection intentionally retains neither source
+/// nor diagnostic text.
+pub fn classify_wire_failure(source: &str, diagnostic: &str) -> WireFailureClass {
+    let trimmed = source.trim_start();
+    let code = wire_diagnostic_code(diagnostic).unwrap_or_default();
+    if trimmed.starts_with("```") || code == "E-WIRE-002" {
+        return WireFailureClass::MarkdownFence;
+    }
+    if (trimmed.starts_with('(') && diagnostic.contains("Co-Forth"))
+        || (!trimmed.starts_with('(') && diagnostic.contains("Lisp"))
+    {
+        return WireFailureClass::WrongLanguageDispatch;
+    }
+    if code.starts_with("E-STACK") || code.starts_with("E-TYPE") || code.starts_with("E-VERIFY") {
+        return WireFailureClass::StackOrType;
+    }
+    if code.starts_with("E-CAP") || code.starts_with("E-EFFECT") || code.starts_with("E-AUTH") {
+        return WireFailureClass::Capability;
+    }
+    if code.starts_with("E-LINK") || code.starts_with("E-NAME") {
+        let first = trimmed.chars().next();
+        let prose_punctuation = trimmed.contains(". ")
+            || trimmed.contains("! ")
+            || trimmed.contains("? ")
+            || trimmed.lines().count() > 1;
+        if first.is_some_and(char::is_uppercase)
+            && (trimmed.contains(char::is_whitespace) || prose_punctuation)
+        {
+            return WireFailureClass::RawProse;
+        }
+        return WireFailureClass::InventedWord;
+    }
+    if code == "E-WIRE-001" {
+        return WireFailureClass::RawProse;
+    }
+    WireFailureClass::Other
+}

@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 mod corpus;
+pub use crate::vm::{classify_wire_failure, wire_diagnostic_code, WireFailureClass};
 pub use corpus::{
-    audit, capture_from_env, capture_with_runtime_from_env, WireCorpusAttempt, WireCorpusAudit,
-    WireCorpusCounts,
+    audit, capture_from_env, capture_with_compiler_context_from_env, ProgramCompilerContext,
+    WireCorpusAttempt, WireCorpusAudit, WireCorpusCounts,
 };
 
 /// Version of the model/runtime vocabulary handshake.
@@ -46,62 +47,6 @@ pub fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
     ]
     .iter()
     .any(|prefix| code.starts_with(prefix))
-}
-
-/// Return the stable leading diagnostic code without retaining the diagnostic
-/// prose in conformance metrics.
-pub fn wire_diagnostic_code(diagnostic: &str) -> Option<String> {
-    let head = diagnostic.lines().next()?;
-    // Both spellings are in use: `E-LINK-002: message` from `Display`, and
-    // `error[E-LINK-002]: message` from the rendered report a model is shown.
-    let code = match head
-        .split_once('[')
-        .and_then(|(_, rest)| rest.split_once(']'))
-    {
-        Some((code, _)) => code.trim(),
-        None => head.split_once(':')?.0.trim(),
-    };
-    code.starts_with("E-").then(|| code.to_string())
-}
-
-/// Classify a rejected provider submission for aggregate conformance metrics.
-/// This intentionally never stores the submitted source or diagnostic text.
-pub fn classify_wire_failure(source: &str, diagnostic: &str) -> crate::metrics::WireFailureClass {
-    use crate::metrics::WireFailureClass;
-
-    let trimmed = source.trim_start();
-    let code = wire_diagnostic_code(diagnostic).unwrap_or_default();
-    if trimmed.starts_with("```") || code == "E-WIRE-002" {
-        return WireFailureClass::MarkdownFence;
-    }
-    if (trimmed.starts_with('(') && diagnostic.contains("Co-Forth"))
-        || (!trimmed.starts_with('(') && diagnostic.contains("Lisp"))
-    {
-        return WireFailureClass::WrongLanguageDispatch;
-    }
-    if code.starts_with("E-STACK") || code.starts_with("E-TYPE") || code.starts_with("E-VERIFY") {
-        return WireFailureClass::StackOrType;
-    }
-    if code.starts_with("E-CAP") || code.starts_with("E-EFFECT") || code.starts_with("E-AUTH") {
-        return WireFailureClass::Capability;
-    }
-    if code.starts_with("E-LINK") || code.starts_with("E-NAME") {
-        let first = trimmed.chars().next();
-        let prose_punctuation = trimmed.contains(". ")
-            || trimmed.contains("! ")
-            || trimmed.contains("? ")
-            || trimmed.lines().count() > 1;
-        if first.is_some_and(char::is_uppercase)
-            && (trimmed.contains(char::is_whitespace) || prose_punctuation)
-        {
-            return WireFailureClass::RawProse;
-        }
-        return WireFailureClass::InventedWord;
-    }
-    if code == "E-WIRE-001" {
-        return WireFailureClass::RawProse;
-    }
-    WireFailureClass::Other
 }
 
 /// Construct the provider-neutral correction request for a rejected program.
@@ -913,11 +858,8 @@ pub fn hash_text(text: &str) -> String {
 }
 
 fn lisp_definition_identity(source: &str) -> Option<(String, Option<String>)> {
-    use crate::lisp::Val;
-    let expression = crate::lisp::reader::parse_str(source)
-        .ok()?
-        .into_iter()
-        .next()?;
+    use crate::vm::Val;
+    let expression = crate::vm::parse_str(source).ok()?.into_iter().next()?;
     let Val::List(parts) = expression else {
         return None;
     };
@@ -941,11 +883,8 @@ fn lisp_definition_identity(source: &str) -> Option<(String, Option<String>)> {
 /// The typed compiler treats the first body string as metadata and omits it
 /// from the emitted IR, so this parser deliberately follows the same rule.
 fn lisp_definition_documentation(source: &str) -> Option<String> {
-    use crate::lisp::Val;
-    let expression = crate::lisp::reader::parse_str(source)
-        .ok()?
-        .into_iter()
-        .next()?;
+    use crate::vm::Val;
+    let expression = crate::vm::parse_str(source).ok()?.into_iter().next()?;
     let Val::List(parts) = expression else {
         return None;
     };
@@ -1422,7 +1361,7 @@ mod tests {
 
     #[test]
     fn wire_failure_classification_is_source_free_and_stable() {
-        use crate::metrics::WireFailureClass;
+        use crate::vm::WireFailureClass;
 
         assert_eq!(
             classify_wire_failure("```lisp\n(say \"hi\")\n```", "E-WIRE-002: fenced"),

@@ -327,6 +327,8 @@ impl VmTrampoline {
 }
 /// Re-exported from `finch-vm-core`.
 pub type Vocabulary = BTreeMap<String, StackSignature>;
+/// Why a provider's first Finch VM wire submission was not accepted.
+pub enum WireFailureClass { RawProse, MarkdownFence, InventedWord, StackOrType, WrongLanguageDispatch, MissingOutputEffect, Capability, Other }
 ```
 
 ## Traits
@@ -359,6 +361,8 @@ pub fn agent_task_snapshot_type() -> Type { … }
 pub fn agent_task_spec_type() -> Type { … }
 /// Re-exported from `finch-vm-core`.
 pub fn capability_grant_entry_type() -> Type { … }
+/// Classify a rejected provider submission for aggregate conformance metrics.
+pub fn classify_wire_failure(source: &str, diagnostic: &str) -> WireFailureClass { … }
 /// Compile user/model-entered Co-Forth source text directly into Finch typed stack IR and run the common verifier. Re-exported from `finch-coforth`.
 pub fn compile_forth(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary) -> Result<VerifiedModule, Vec<VmDiagnostic>> { … }
 /// Compile Co-Forth source with additional already-lowered functions available for definition calls, then verify the complete typed module. Re-exported from `finch-coforth`.
@@ -387,6 +391,8 @@ pub fn parse_str_spanned(src: &str) -> Result<Vec<SpannedVal>> { … }
 pub fn tree_entry_type() -> Type { … }
 /// Re-exported from `finch-vm-core`.
 pub fn tree_listing_type() -> Type { … }
+/// Return the stable leading diagnostic code without retaining diagnostic prose.
+pub fn wire_diagnostic_code(diagnostic: &str) -> Option<String> { … }
 ```
 
 ## Constants

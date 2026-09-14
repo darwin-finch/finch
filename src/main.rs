@@ -2184,8 +2184,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             &guard,
         )
         .await?;
-    finch::programs::capture_with_runtime_from_env(
-        &program_runtime,
+    finch::programs::capture_with_compiler_context_from_env(
+        || program_runtime.compiler_context(),
         "daemon",
         "daemon-selected",
         "one_shot",
@@ -2233,8 +2233,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                     &guard,
                 )
                 .await?;
-            finch::programs::capture_with_runtime_from_env(
-                &program_runtime,
+            finch::programs::capture_with_compiler_context_from_env(
+                || program_runtime.compiler_context(),
                 "daemon",
                 "daemon-selected",
                 "one_shot",
@@ -2261,8 +2261,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                     &guard,
                 )
                 .await?;
-            finch::programs::capture_with_runtime_from_env(
-                &program_runtime,
+            finch::programs::capture_with_compiler_context_from_env(
+                || program_runtime.compiler_context(),
                 "daemon",
                 "daemon-selected",
                 "one_shot",
@@ -2360,8 +2360,8 @@ async fn run_query_teacher_only(
         // as though it were an ordinary chat response.
         if !response.has_tool_uses() {
             let source = response.text();
-            finch::programs::capture_with_runtime_from_env(
-                &program_runtime,
+            finch::programs::capture_with_compiler_context_from_env(
+                || program_runtime.compiler_context(),
                 &provider,
                 &model,
                 "one_shot",
