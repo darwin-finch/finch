@@ -953,8 +953,14 @@ pub(super) fn handle_models_input(
                     *adding_provider = Some(AddProviderStep::SelectAddType { selected: 0 });
                 }
                 KeyCode::Char('d') | KeyCode::Char('D') => {
-                    // Delete selected tool model (cannot delete primary)
-                    if *selected_idx > 0 {
+                    if tool_models.is_empty() {
+                        *error = Some(
+                            "Cannot delete the last provider. Press A to add another provider first."
+                                .into(),
+                        );
+                    } else if *selected_idx == 0 {
+                        *primary_model = tool_models.remove(0);
+                    } else {
                         let tool_idx = *selected_idx - 1;
                         if tool_idx < tool_models.len() {
                             tool_models.remove(tool_idx);
