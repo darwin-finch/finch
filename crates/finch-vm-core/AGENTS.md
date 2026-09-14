@@ -11,6 +11,10 @@ continue to use `finch-vm`; the five explicitly documented compiler-support expo
 `nearest_names`, `apply_signature_types`, `instantiate_signature_types`, and `parse_type_name`)
 are an intentionally restricted workspace seam and are not stable application API.
 
+**Documentation:** [`docs/README.md`](docs/README.md) owns implemented IR/verifier reference
+material for this crate. Cross-frontend planned semantics remain in the shared
+[language design](../../docs/language/README.md).
+
 **Dependencies:** this unpublished foundation crate depends only on `anyhow`, `once_cell`, `serde`,
 `serde_json`, `thiserror`, and `uuid`. It never depends on `finch-vm` or the root `finch` crate.
 

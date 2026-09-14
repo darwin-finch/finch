@@ -331,7 +331,7 @@ Related design documents, intent rather than evidence:
 [shared program runtime](docs/SHARED_PROGRAM_RUNTIME_PLAN.md),
 [Brain convergence](docs/BRAIN_CONVERGENCE_PLAN.md),
 [VM-native agent runtime](docs/VM_NATIVE_AGENT_RUNTIME_PLAN.md),
-[typed Lisp/Forth capabilities and JIT](docs/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md).
+[typed Lisp/Forth capabilities and JIT](docs/language/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md).
 
 ## Open questions
 

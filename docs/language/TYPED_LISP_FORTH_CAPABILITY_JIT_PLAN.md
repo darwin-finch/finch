@@ -488,9 +488,9 @@ lengths are unequal without inspecting elements. If either length is dynamic, eq
 lengths and then corresponding elements. Arrays, slices, vectors, and lists may therefore compare
 directly whenever their element types have compatible `Equal` evidence; no representation conversion
 or temporary copy occurs. Lexicographic ordering and hashing use similarly explicit evidence, and
-`Hash` must agree with `Equal` before a type may be a map key. Arbitrary lazy or potentially infinite
-ranges do not receive equality implicitly because comparison could consume effects or fail to
-terminate.
+map keys require sealed `HashKey` evidence combining an equivalence relation with a consistent hash.
+Arbitrary lazy or potentially infinite ranges do not receive equality implicitly because comparison
+could consume effects or fail to terminate.
 
 Indexing syntax performs a checked lookup and produces a defined bounds trap containing the index,
 length, and source origin. `.get` instead returns `option<&T>` when absence is ordinary data. Slicing
@@ -578,6 +578,101 @@ length plus validated UTF-8 bytes, `bytes` encode length plus octets, arrays inc
 their declared static length, and vectors/lists encode an ordered element sequence under a versioned
 element schema. Decoding enforces size/allocation budgets before construction and never restores a
 native pointer, capacity, reference count, or framework string object from serialized data.
+
+### Operators, comparison evidence, and segmented text
+
+Operator punctuation is syntax for named public concept operations, never privileged member lookup.
+An operator expression records the token, both operand types, selected evidence identity, and source
+span before lowering to an ordinary concept call. The initial token and precedence table is fixed by
+the language version; libraries may define evidence for new type pairs but cannot invent punctuation
+or precedence. This keeps parsing deterministic and makes operator behavior available to macros,
+foreign frontends, the interpreter, and native lowering through one semantic path.
+
+Binary concepts name both operand positions and may produce an associated result:
+
+```text
+concept Equal<L,R> symmetric {
+    operation equal(borrow left: L, borrow right: R) -> bool
+        guarantees pure total deterministic non-suspending
+}
+
+concept Compare<L,R> {
+    associated Ordering
+    operation compare(borrow left: L, borrow right: R) -> Ordering
+        guarantees pure total deterministic non-suspending
+}
+
+concept Add<L,R> {
+    associated Output
+    operation add(borrow left: L, borrow right: R) -> Output
+}
+```
+
+`symmetric` is an explicit concept law and evidence-generation rule, not a guess based on an
+operation's name. One `Equal<A,B>` implementation supplies a compiler-generated `Equal<B,A>`
+adapter that swaps the arguments while retaining the same sealed evidence identity. Defining both
+directions independently is therefore an overlap error unless one is explicitly named non-default
+evidence. Ordered concepts such as `Add<L,R>` and `Compare<L,R>` do not imply their reverse; numeric
+libraries may publish a separately proven commutative derivation where that law is actually valid.
+`!=` is derived by negating selected equality evidence, and `<`, `<=`, `>`, and `>=` derive from one
+selected comparison operation rather than admitting six unrelated implementations.
+
+Algebraic structure is expressed by evidence that bundles operations and their laws, not by making
+every operator symmetric or attaching arithmetic inheritance to a record. A `Ring<T>` can require
+additive commutativity while leaving multiplication ordered; a `StarAlgebra<T,Scalar>` can add scalar
+multiplication and an involution whose law reverses product order; a `CStarAlgebra<T,Scalar>` can add
+norm and completeness contracts. The underlying `T` may be an ordinary record. Its implementation
+maps each operator to named callable evidence and can be selected statically or carried in a `dyn`
+view like any other concept implementation. Generic algorithms can request the complete algebraic
+bundle when their reasoning needs those coherent laws, or only `Add<T,T>` when it does not.
+
+The compiler enforces the mechanically decidable portion of a law bundle: operation types,
+ownership/effects, associated-type agreement, evidence coherence, and declared derivations such as
+argument reversal. It does not claim to prove arbitrary algebraic identities or analytic properties
+from function bodies. Standard intrinsics may carry trusted certificates; user implementations make
+an auditable contract and should be checked by generated property tests or stronger optional proof
+artifacts. Optimizations may rely only on laws admitted by the active safety/profile policy.
+
+Operator selection uses only operand types plus lexically explicit or uniquely canonical evidence.
+It never uses the expected result type, import order, receiver/member position, or speculative body
+compilation. At most one implementation for a concept/type tuple may be the operator default in a
+scope. Alternative policies remain available through an explicit `using` selection, a concept-
+qualified call, or a policy wrapper type. Thus two serialization or numeric policies can coexist
+without punctuation silently changing meaning.
+
+Operator equality is allowed to be non-reflexive for domains such as IEEE floating point. A map key
+requires the stronger `Equivalence<T>` law (reflexive, symmetric, and transitive) together with a
+compatible `Hash<T>` implementation; `HashKey<T>` bundles and seals that evidence. This prevents a
+convenient `==` implementation from accidentally defining an invalid hash-table key relation.
+
+`Text` exposes a readonly sequence of valid-UTF-8 byte chunks as well as its logical scalar content.
+A rope, flat `string`, borrowed substring, or foreign text view can therefore implement the same
+public comparison evidence without flattening. Exact text equality first rejects known unequal byte
+lengths, then walks overlapping chunk regions and uses bytewise comparison within each region. It is
+segmentation-independent, allocation-free, linear in compared bytes, and uses constant auxiliary
+space. Equal valid-UTF-8 byte sequences are equal scalar sequences, so this optimization preserves
+the language rule; normalization, case folding, locale collation, and `bytes`/text conversion remain
+explicit policies. Hashing streams the same logical bytes across chunk boundaries so equal flat and
+segmented text values hash identically. Immutable views with proven identical owner/range identity
+may short-circuit before reading bytes.
+
+For other sequences, a certified `BytewiseEqual<T>` property permits bulk comparison of contiguous
+regions only when every bit pattern and padding rule makes that operation semantically equivalent to
+element equality. Otherwise comparison invokes element evidence. Arrays with incompatible static
+lengths reject immediately; same-length arrays and slices with already-proven equal lengths omit a
+runtime length branch; dynamically sized inputs check length once. Rope chunks can still use bytewise
+comparison because their element is an octet even though the whole value is non-contiguous.
+
+Canonical spellings are ordinary operator forms in both frontends:
+
+```text
+CoLisp:   (== rope text)       (+ duration offset)
+Co-Forth: rope text ==         duration offset +
+```
+
+Both forms construct the same operator semantic node and resolve the same evidence. The named forms
+remain available for explicit policy selection; punctuation is convenience, not an otherwise
+inexpressible operation.
 
 ### Records, layout, placement, and member access
 
@@ -1312,6 +1407,7 @@ the same nodes without source-to-source CoLisp generation.
 | text/collection literal | `string`, `array`, `vector`, `list`, `bytes` forms | string literal, `array{}`, `vector{}`, `list{}`, `bytes{}` | literal node plus public builder evidence |
 | view/index/slice | borrow, `.get`, index/slice forms | `borrow`, `.get`, `index`, `slice` words | borrow projection and checked access |
 | text traversal | `.bytes`, `.chars`, `.graphemes` | `text-bytes`, `text-chars`, `text-graphemes` | explicit range evidence |
+| operators/comparison | `(== a b)`, `(+ a b)`, explicit `using` | `a b ==`, `a b +`, explicit `using` | named binary-concept evidence call |
 | builder/freeze | builder operations and `freeze` | `*-builder`, mutation words, `freeze` | unique owner mutation then consuming conversion |
 | concept/evidence | `concept`, `implementation`, `using` | `concept:`, `implementation:`, `using` | named evidence and adapter thunk |
 | dispatch type/view | `static C`, `dyn C`, `some C` | same type constructors; `as-static`, `as-dyn`, `as-some` words | evidence constant, erased view, opaque result |
@@ -3612,6 +3708,12 @@ Every phase adds tests at the layer where its invariant is enforced:
 - text tests for exact UTF-8/scalar equality, invalid decoding, scalar-boundary slicing, distinct
   byte/scalar/grapheme units, versioned normalization/collation, raw delimiters and escapes, absence
   of ambiguous integer string indexing, and constant-pattern dispatch with collision checks;
+- operator tests proving operand-directed evidence selection, generated symmetric adapters,
+  rejection of ambiguous defaults and accidental ordered reversal, derivation of inequality and
+  ordering relations, explicit alternate-policy selection, and identical CoLisp/Co-Forth lowering;
+- segmented-text tests comparing every flat/rope/subslice chunking combination without flattening,
+  including unequal known lengths, cross-chunk boundaries, identical-owner short circuits,
+  allocation-free equality, and segmentation-independent hashes;
 - ownership/ABI tests proving array/vector/bytes-to-slice calls are zero-copy, escaped views fail,
   vector growth cannot overlap a borrow, builder freeze consumes and may reuse storage, owning
   conversions are never implicit, C-string interior nul is handled explicitly, and native managed

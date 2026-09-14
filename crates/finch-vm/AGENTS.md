@@ -15,6 +15,10 @@ modules are private, so reaching past it is a compile error. To expose something
 deliberately. The root crate provides compatibility namespaces for the former `finch::lisp`
 reader and types paths.
 
+**Documentation:** [`docs/README.md`](docs/README.md) owns implemented interpreter, fiber,
+checkpoint, and execution reference material. Cross-frontend planned semantics remain in the shared
+[language design](../../docs/language/README.md).
+
 **Dependencies:** `finch-vm` depends downward on the unpublished `finch-vm-core`, `finch-colisp`,
 and `finch-coforth` crates and never on the root `finch` crate. Each frontend reaches only the core
 crate's documented, restricted compiler-support seam. Frontends never depend on each other or back

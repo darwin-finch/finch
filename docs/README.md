@@ -52,7 +52,8 @@ promises and must not be cited as proof that a behavior is implemented.
 - [Shared program runtime plans](SHARED_PROGRAM_RUNTIME_PLAN.md)
 - [Brain convergence plan](BRAIN_CONVERGENCE_PLAN.md)
 - [VM-native agent runtime plan](VM_NATIVE_AGENT_RUNTIME_PLAN.md)
-- [Typed Lisp/Forth capability and JIT plan](TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md)
+- [Finch language documentation](language/README.md), including the typed Lisp/Forth capability
+  and JIT plan
 - [Semiotic transition research note](SEMIOTIC_TRANSITION_SYSTEM.md)
 - [Two programmers, one VM](TWO_PROGRAMMERS.md)
 - [Template parsing design](DESIGN_TEMPLATE_PARSING.md)
