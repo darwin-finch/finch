@@ -336,7 +336,8 @@ Related design documents, intent rather than evidence:
 [Brain convergence](docs/BRAIN_CONVERGENCE_PLAN.md),
 [VM-native agent runtime](docs/VM_NATIVE_AGENT_RUNTIME_PLAN.md),
 [Finch language design](docs/language/FINCH_LANGUAGE_DESIGN.md),
-[ticketing plugins](docs/TICKETING_PLUGINS.md).
+[ticketing plugins](docs/TICKETING_PLUGINS.md),
+[model cost, routing, and review loops](docs/MODEL_COST.md).
 
 ## Open questions
 
@@ -344,6 +345,7 @@ Related design documents, intent rather than evidence:
 - Whether `poset` belongs with programs or with Brain planning.
 - Which subsystem owns `planning`, `agent`, and `review`, which sit between providers and Brain.
 - How `tools` splits into a dependency-free API and application-bound implementations.
+- Whether implement vs review vs `/plan` personas bind to named provider profiles now, or wait for a specialized review harness with a frozen cache prefix.
 
 ## Snapshot
 

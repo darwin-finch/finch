@@ -50,6 +50,7 @@ promises and must not be cited as proof that a behavior is implemented.
 - [Roadmap](ROADMAP.md)
 - [MCP client implementation plan](MCP_CLIENT_IMPLEMENTATION_PLAN.md)
 - [Ticketing plugins and setup contributions](TICKETING_PLUGINS.md)
+- [Model cost, routing, and review loops](MODEL_COST.md)
 - [Shared program runtime plans](SHARED_PROGRAM_RUNTIME_PLAN.md)
 - [Brain convergence plan](BRAIN_CONVERGENCE_PLAN.md)
 - [VM-native agent runtime plan](VM_NATIVE_AGENT_RUNTIME_PLAN.md)
