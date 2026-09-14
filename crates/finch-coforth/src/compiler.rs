@@ -8,6 +8,16 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+#[cfg(test)]
+thread_local! {
+    static PARSER_TOKEN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn record_parser_token_visit() {
+    #[cfg(test)]
+    PARSER_TOKEN_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
 #[derive(Debug, Clone)]
 struct LocalBinding<'source> {
     name: &'source str,
@@ -81,7 +91,14 @@ struct ForthBodyAst<'source> {
 
 #[derive(Debug, Clone)]
 enum ForthBodyNode<'source> {
-    Word(ForthWordAst<'source>),
+    Primitive(ForthOperationAst<'source>),
+    Control(ForthOperationAst<'source>),
+    Collection(ForthOperationAst<'source>),
+    RecordReference(ForthOperationAst<'source>),
+    QuotationReference(ForthOperationAst<'source>),
+    LocalReference(ForthBindingReferenceAst<'source>),
+    CaptureReference(ForthBindingReferenceAst<'source>),
+    Call(ForthCallAst<'source>),
     Literal(ForthLiteralAst<'source>),
     Quotation(ForthQuotationAst<'source>),
     Group(ForthBodyAst<'source>),
@@ -90,7 +107,13 @@ enum ForthBodyNode<'source> {
 impl ForthBodyNode<'_> {
     fn leading_token(&self) -> &Token<'_> {
         match self {
-            Self::Word(word) => &word.token,
+            Self::Primitive(operation)
+            | Self::Control(operation)
+            | Self::Collection(operation)
+            | Self::RecordReference(operation)
+            | Self::QuotationReference(operation) => &operation.token,
+            Self::LocalReference(binding) | Self::CaptureReference(binding) => &binding.token,
+            Self::Call(call) => &call.token,
             Self::Literal(literal) => &literal.token,
             Self::Quotation(quotation) => &quotation.open,
             Self::Group(body) => body.nodes[0].leading_token(),
@@ -99,13 +122,63 @@ impl ForthBodyNode<'_> {
 }
 
 #[derive(Debug, Clone)]
-struct ForthWordAst<'source> {
+struct ForthOperationAst<'source> {
     token: Token<'source>,
+    name: &'source str,
+    parameter: Option<&'source str>,
+    type_argument: Option<Result<Type, ()>>,
+    variant: Option<ForthVariantAst>,
     syntax: ForthSyntax,
-    operand: Option<Token<'source>>,
+    operand: Option<ForthReferenceAst<'source>>,
     field: Option<Cow<'source, str>>,
+    field_valid: bool,
     control_valid: bool,
     next_is_terminal: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ForthReferenceAst<'source> {
+    /// The target's source span remains independent of its operator's span.
+    #[allow(dead_code)]
+    token: Token<'source>,
+    name: Option<&'source str>,
+    valid_loop_label: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ForthVariantAst {
+    variants: Vec<(String, Option<Type>)>,
+    tag: String,
+    payload_type: Option<Type>,
+}
+
+#[derive(Debug, Clone)]
+struct ForthBindingReferenceAst<'source> {
+    token: Token<'source>,
+    index: u32,
+    ty: Type,
+}
+
+#[derive(Debug, Clone)]
+struct ForthCallAst<'source> {
+    token: Token<'source>,
+    name: &'source str,
+    kind: ForthCallKind,
+}
+
+#[derive(Debug, Clone)]
+enum ForthCallKind {
+    Function,
+    Yield,
+    OutputOpen,
+    Ui(UiOperation),
+}
+
+#[derive(Debug, Clone)]
+struct ForthCaptureAst<'source> {
+    binding: LocalBinding<'source>,
+    index: u32,
+    from_local: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +191,7 @@ struct ForthLiteralAst<'source> {
 struct ForthQuotationAst<'source> {
     open: Token<'source>,
     signature: Result<(StackSignature, bool), Vec<VmDiagnostic>>,
+    captures: Vec<ForthCaptureAst<'source>>,
     body: ForthBodyAst<'source>,
     end: usize,
 }
@@ -218,7 +292,24 @@ enum ControlKind {
 /// first diagnostic without searching for delimiters or adjacent operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForthSyntax {
-    Word,
+    Call,
+    Execute,
+    EmptyMap,
+    EmptyList,
+    Variant,
+    VariantGet,
+    Dup,
+    Drop,
+    Swap,
+    Defer,
+    DeferCpu,
+    TaskPoll,
+    TaskJoin,
+    TaskCancel,
+    FiberNext,
+    FiberJoin,
+    FiberCancel,
+    PropagateResult,
     QuoteTarget,
     RecordField,
     RecordGetNamed,
@@ -252,6 +343,19 @@ enum ForthSyntax {
 impl ForthSyntax {
     fn parse(word: &str) -> Self {
         match word {
+            "execute" => Self::Execute,
+            "dup" => Self::Dup,
+            "drop" => Self::Drop,
+            "swap" => Self::Swap,
+            "defer" => Self::Defer,
+            "defer-cpu" => Self::DeferCpu,
+            "task-poll" => Self::TaskPoll,
+            "task-join" => Self::TaskJoin,
+            "task-cancel" => Self::TaskCancel,
+            "fiber-next" => Self::FiberNext,
+            "fiber-join" => Self::FiberJoin,
+            "fiber-cancel" => Self::FiberCancel,
+            "?" => Self::PropagateResult,
             "[']" => Self::QuoteTarget,
             "record-get" => Self::RecordGet,
             "record-set" => Self::RecordSet,
@@ -278,7 +382,7 @@ impl ForthSyntax {
             "while" => Self::While,
             "repeat" => Self::Repeat,
             "until" => Self::Until,
-            _ => Self::Word,
+            _ => Self::Call,
         }
     }
 }
@@ -298,32 +402,62 @@ impl<'source> ForthBodyAst<'source> {
     }
 }
 
-/// Distinguish `[ signature | body ]` from the ordinary `[ values ]` list
-/// literal without introducing a second lexer mode. Only a top-level `|`
-/// following a top-level `--` selects quotation syntax.
-fn anonymous_quotation_bounds(tokens: &[Token], start: usize) -> Option<(usize, usize)> {
-    let mut depth = 0usize;
-    let mut separator = None;
-    let mut has_stack_arrow = false;
-    for (index, token) in tokens.iter().enumerate().skip(start) {
-        let TokenValue::Word(word) = &token.value else {
-            continue;
-        };
-        match *word {
-            "[" => depth += 1,
-            "]" => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return (has_stack_arrow && separator.is_some())
-                        .then(|| (separator.unwrap(), index));
+/// The delimiter index is built once, without inspecting a nested slice again.
+/// The cursor subsequently consumes every token exactly once, even when a
+/// quotation is an operand whose body is not semantically elaborated.
+struct ForthParser<'tokens, 'source> {
+    atoms: &'tokens [Token<'source>],
+    quotations: Vec<Option<(usize, usize)>>,
+    cursor: usize,
+}
+
+impl<'tokens, 'source> ForthParser<'tokens, 'source> {
+    fn new(atoms: &'tokens [Token<'source>]) -> Self {
+        let mut quotations = vec![None; atoms.len()];
+        let mut brackets: Vec<(usize, Option<usize>, bool)> = Vec::new();
+        for (index, token) in atoms.iter().enumerate() {
+            record_parser_token_visit();
+            match token.value {
+                TokenValue::Word("[") => brackets.push((index, None, false)),
+                TokenValue::Word("]") => {
+                    if let Some((open, Some(pipe), true)) = brackets.pop() {
+                        quotations[open] = Some((pipe, index));
+                    }
                 }
+                TokenValue::Word("--") => {
+                    if let Some((_, _, arrow)) = brackets.last_mut() {
+                        *arrow = true;
+                    }
+                }
+                TokenValue::Word("|") => {
+                    if let Some((_, pipe, _)) = brackets.last_mut() {
+                        pipe.get_or_insert(index);
+                    }
+                }
+                _ => {}
             }
-            "--" if depth == 1 => has_stack_arrow = true,
-            "|" if depth == 1 && separator.is_none() => separator = Some(index),
-            _ => {}
+        }
+        Self {
+            atoms,
+            quotations,
+            cursor: 0,
         }
     }
-    None
+
+    fn next(&mut self) -> Option<(usize, Token<'source>)> {
+        let index = self.cursor;
+        let token = self.atoms.get(index)?.clone();
+        self.cursor += 1;
+        record_parser_token_visit();
+        Some((index, token))
+    }
+
+    fn advance_to(&mut self, end: usize) {
+        while self.cursor < end {
+            self.next()
+                .expect("parser boundary is inside its token stream");
+        }
+    }
 }
 
 fn parse_quotation_signature(
@@ -583,16 +717,6 @@ fn lower_forth_ast_body_with_locals(
     let mut list_literals: Vec<ListLiteralFrame> = Vec::new();
     let mut record_literals: Vec<RecordLiteralFrame> = Vec::new();
 
-    let local_indexes = locals
-        .iter()
-        .enumerate()
-        .map(|(index, local)| (local.name, (index as u32, local.ty.clone())))
-        .collect::<BTreeMap<_, _>>();
-    let capture_indexes = captures
-        .iter()
-        .enumerate()
-        .map(|(index, capture)| (capture.name, (index as u32, capture.ty.clone())))
-        .collect::<BTreeMap<_, _>>();
     let mut available_functions = linked_functions.clone();
 
     let emit = |blocks: &mut BTreeMap<u32, BasicBlock>,
@@ -652,38 +776,15 @@ fn lower_forth_ast_body_with_locals(
             let (declared_signature, declares_pure) =
                 quotation.signature.clone()?;
 
-            // Locals shadow captures. Capturing all visible immutable
-            // bindings matches Lisp's deterministic initial lowering;
-            // later escape analysis may remove unused captures.
-            let local_names = locals
-                .iter()
-                .map(|local| local.name)
-                .collect::<BTreeSet<_>>();
-            let mut visible = captures
-                .iter()
-                .filter(|capture| !local_names.contains(capture.name))
-                .cloned()
-                .collect::<Vec<_>>();
-            visible.extend_from_slice(locals);
-
-            for capture in &visible {
-                if let Some((index, _)) = local_indexes.get(capture.name) {
-                    stack.push(capture.ty.clone());
-                    emit(
-                        &mut blocks,
-                        current,
-                        Instruction::LocalGet { index: *index },
-                        origin.clone(),
-                    );
-                } else if let Some((index, _)) = capture_indexes.get(capture.name) {
-                    stack.push(capture.ty.clone());
-                    emit(
-                        &mut blocks,
-                        current,
-                        Instruction::CaptureGet { index: *index },
-                        origin.clone(),
-                    );
-                }
+            let visible = quotation.captures.iter().map(|capture| capture.binding.clone()).collect::<Vec<_>>();
+            for capture in &quotation.captures {
+                stack.push(capture.binding.ty.clone());
+                let instruction = if capture.from_local {
+                    Instruction::LocalGet { index: capture.index }
+                } else {
+                    Instruction::CaptureGet { index: capture.index }
+                };
+                emit(&mut blocks, current, instruction, origin.clone());
             }
 
             let compiled = lower_forth_ast_body_with_locals(
@@ -766,8 +867,22 @@ fn lower_forth_ast_body_with_locals(
             return Ok(());
         }
         let origin = origin(source_id, source, token.start, token.end);
-        if let ForthBodyNode::Word(word_node) = node {
-            let TokenValue::Word(word) = word_node.token.value else { unreachable!("word node has a word token") };
+        if let ForthBodyNode::LocalReference(binding) | ForthBodyNode::CaptureReference(binding) = node {
+            stack.push(binding.ty.clone());
+            let instruction = if matches!(node, ForthBodyNode::LocalReference(_)) {
+                Instruction::LocalGet { index: binding.index }
+            } else {
+                Instruction::CaptureGet { index: binding.index }
+            };
+            emit(&mut blocks, current, instruction, origin);
+            return Ok(());
+        }
+        if let ForthBodyNode::Primitive(word_node)
+            | ForthBodyNode::Control(word_node)
+            | ForthBodyNode::Collection(word_node)
+            | ForthBodyNode::RecordReference(word_node)
+            | ForthBodyNode::QuotationReference(word_node) = node {
+            let word = word_node.name;
             if word_node.syntax == ForthSyntax::QuoteTarget {
                 let Some(target) = word_node.operand.as_ref() else {
                     return Err(vec![control_error(
@@ -776,14 +891,14 @@ fn lower_forth_ast_body_with_locals(
                         origin.clone(),
                     )]);
                 };
-                let TokenValue::Word(target_name) = &target.value else {
+                let Some(target_name) = target.name else {
                     return Err(vec![control_error(
                         "E-FORTH-QUOTE-001",
                         "quotation target must be a word name",
                         origin,
                     )]);
                 };
-                let Some(function) = available_functions.get(*target_name) else {
+                let Some(function) = available_functions.get(target_name) else {
                     return Err(vec![control_error(
                         "E-FORTH-QUOTE-002",
                         format!("quotation target '{target_name}' is not a typed word"),
@@ -808,7 +923,7 @@ fn lower_forth_ast_body_with_locals(
                     &mut blocks,
                     current,
                     Instruction::MakeClosure {
-                        function: (*target_name).to_owned(),
+                        function: target_name.to_owned(),
                         capture_count: 0,
                         signature,
                     },
@@ -816,7 +931,7 @@ fn lower_forth_ast_body_with_locals(
                 );
                 return Ok(());
             }
-            if word == "execute" {
+            if word_node.syntax == ForthSyntax::Execute {
                 let Type::Function {
                     arguments,
                     result,
@@ -859,13 +974,9 @@ fn lower_forth_ast_body_with_locals(
                 );
                 return Ok(());
             }
-            if let Some(arguments) = word
-                .strip_prefix("empty-map<")
-                .and_then(|value| value.strip_suffix('>'))
-            {
-                let map_type = format!("map<{arguments}>");
+            if word_node.syntax == ForthSyntax::EmptyMap {
                 let Type::Map(key_type, value_type) =
-                    parse_type_name(&map_type).map_err(|_| {
+                    word_node.type_argument.clone().expect("parser elaborates map type arguments").map_err(|_| {
                         vec![control_error(
                             "E-MAP-005",
                             "empty-map requires two valid type arguments, for example empty-map<string,int>",
@@ -888,11 +999,8 @@ fn lower_forth_ast_body_with_locals(
                 );
                 return Ok(());
             }
-            if let Some(element) = word
-                .strip_prefix("empty-list<")
-                .and_then(|value| value.strip_suffix('>'))
-            {
-                let element_type = parse_type_name(element).map_err(|_| {
+            if word_node.syntax == ForthSyntax::EmptyList {
+                let element_type = word_node.type_argument.clone().expect("parser elaborates list type argument").map_err(|_| {
                     vec![control_error(
                         "E-LIST-005",
                         "empty-list requires one valid type argument, for example empty-list<string>",
@@ -911,9 +1019,8 @@ fn lower_forth_ast_body_with_locals(
                 );
                 return Ok(());
             }
-            if word.starts_with("variant<") {
-                let Some((variants, tag, payload_type)) = parse_variant_constructor_name(word)
-                else {
+            if word_node.syntax == ForthSyntax::Variant {
+                let Some(ForthVariantAst { variants, tag, payload_type }) = word_node.variant.clone() else {
                     return Err(vec![control_error(
                         "E-VARIANT-001",
                         "variant constructor must be variant<variant{tag|tag(type)},selected-tag>",
@@ -950,10 +1057,8 @@ fn lower_forth_ast_body_with_locals(
                 );
                 return Ok(());
             }
-            if let Some(tag) = word
-                .strip_prefix("variant-get<")
-                .and_then(|value| value.strip_suffix('>'))
-            {
+            if word_node.syntax == ForthSyntax::VariantGet {
+                let tag = word_node.parameter.expect("parser retains variant tag");
                 let found = stack.pop().ok_or_else(|| {
                     vec![control_error(
                         "E-STACK-001",
@@ -994,11 +1099,7 @@ fn lower_forth_ast_body_with_locals(
             }
             if word_node.syntax == ForthSyntax::RecordField {
                 let field = word_node.field.as_deref().expect("parsed record field");
-                if field.is_empty()
-                    || !field.chars().all(|character| {
-                        character.is_ascii_alphanumeric() || character == '_' || character == '-'
-                    })
-                {
+                if !word_node.field_valid {
                     return Err(vec![control_error(
                         "E-RECORD-001",
                         "record fields use name: with an ASCII letter, digit, '_' or '-' name",
@@ -1607,16 +1708,16 @@ fn lower_forth_ast_body_with_locals(
                         )]
                     })?;
                     let (then_type, else_type, condition) = match option {
-                        Type::Option(inner) if word == "if-some" => {
+                        Type::Option(inner) if word_node.syntax == ForthSyntax::MatchOption => {
                             ((*inner).clone(), None, MatchCondition::Option)
                         }
-                        Type::Result(ok, err) if word == "if-ok" => {
+                        Type::Result(ok, err) if word_node.syntax == ForthSyntax::MatchResult => {
                             ((*ok).clone(), Some((*err).clone()), MatchCondition::Result)
                         }
                         _ => {
                             return Err(vec![control_error(
                                 "E-TYPE-012",
-                                if word == "if-some" {
+                                if word_node.syntax == ForthSyntax::MatchOption {
                                     "if-some requires an option<T> condition"
                                 } else {
                                     "if-ok requires a result<T,E> condition"
@@ -1812,11 +1913,8 @@ fn lower_forth_ast_body_with_locals(
                     return Ok(());
                 }
                 ForthSyntax::Begin | ForthSyntax::NamedBegin => {
-                    let label = if word == "begin:" {
-                        let Some(Token {
-                            value: TokenValue::Word(label),
-                            ..
-                        }) = word_node.operand.as_ref()
+                    let label = if word_node.syntax == ForthSyntax::NamedBegin {
+                        let Some(label) = word_node.operand.as_ref().and_then(|operand| operand.name)
                         else {
                             return Err(vec![control_error(
                                 "E-FORTH-LOOP-006",
@@ -1824,14 +1922,10 @@ fn lower_forth_ast_body_with_locals(
                                 origin,
                             )]);
                         };
-                        if label.is_empty()
-                            || matches!(
-                                *label,
-                                "if" | "else" | "then" | "while" | "repeat" | "until"
-                            )
+                        if !word_node.operand.as_ref().expect("parsed named loop operand").valid_loop_label
                             || loops
                                 .iter()
-                                .any(|frame| frame.label.as_deref() == Some(*label))
+                                .any(|frame| frame.label.as_deref() == Some(label))
                         {
                             return Err(vec![control_error(
                                 "E-FORTH-LOOP-006",
@@ -1839,7 +1933,7 @@ fn lower_forth_ast_body_with_locals(
                                 origin,
                             )]);
                         }
-                        Some((*label).to_owned())
+                        Some(label.to_owned())
                     } else {
                         None
                     };
@@ -1870,10 +1964,7 @@ fn lower_forth_ast_body_with_locals(
                     return Ok(());
                 }
                 ForthSyntax::Break | ForthSyntax::Continue => {
-                    let Some(Token {
-                        value: TokenValue::Word(label),
-                        ..
-                    }) = word_node.operand.as_ref()
+                    let Some(label) = word_node.operand.as_ref().and_then(|operand| operand.name)
                     else {
                         return Err(vec![control_error(
                             "E-FORTH-LOOP-007",
@@ -1884,7 +1975,7 @@ fn lower_forth_ast_body_with_locals(
                     let Some(frame) = loops
                         .iter()
                         .rev()
-                        .find(|frame| frame.label.as_deref() == Some(*label))
+                        .find(|frame| frame.label.as_deref() == Some(label))
                     else {
                         return Err(vec![control_error(
                             "E-FORTH-LOOP-007",
@@ -1904,7 +1995,7 @@ fn lower_forth_ast_body_with_locals(
                         diagnostic.found_types = stack.clone();
                         return Err(vec![diagnostic]);
                     }
-                    let target = if word == "break" {
+                    let target = if word_node.syntax == ForthSyntax::Break {
                         let Some(exit) = frame.exit else {
                             return Err(vec![control_error(
                                 "E-FORTH-LOOP-008",
@@ -2107,9 +2198,9 @@ fn lower_forth_ast_body_with_locals(
                 _ => {}
             }
         }
-        let instruction = match token.value {
-            TokenValue::Word(word) => {
-                if word == "dup" {
+        let instruction = match node {
+            ForthBodyNode::Primitive(word_node) => match word_node.syntax {
+                ForthSyntax::Dup => {
                     let value = stack.last().cloned().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-STACK-001",
@@ -2120,7 +2211,8 @@ fn lower_forth_ast_body_with_locals(
                     })?;
                     stack.push(value);
                     Instruction::Dup
-                } else if word == "drop" {
+                }
+                ForthSyntax::Drop => {
                     stack.pop().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-STACK-001",
@@ -2130,7 +2222,8 @@ fn lower_forth_ast_body_with_locals(
                         )]
                     })?;
                     Instruction::Drop
-                } else if word == "swap" {
+                }
+                ForthSyntax::Swap => {
                     if stack.len() < 2 {
                         return Err(vec![VmDiagnostic::error(
                             "E-STACK-001",
@@ -2142,7 +2235,8 @@ fn lower_forth_ast_body_with_locals(
                     let len = stack.len();
                     stack.swap(len - 1, len - 2);
                     Instruction::Swap
-                } else if word == "defer" {
+                }
+                ForthSyntax::Defer => {
                     let closure = stack.pop().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-FIBER-021",
@@ -2183,7 +2277,8 @@ fn lower_forth_ast_body_with_locals(
                     }
                     stack.push(Type::Fiber(closure_suspension.yield_type, result));
                     Instruction::DeferFiber
-                } else if word == "defer-cpu" {
+                }
+                ForthSyntax::DeferCpu => {
                     let closure = stack.pop().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-FIBER-003",
@@ -2236,7 +2331,8 @@ fn lower_forth_ast_body_with_locals(
                     }
                     stack.push(Type::Task(result));
                     Instruction::DeferCpu
-                } else if word == "task-poll" {
+                }
+                ForthSyntax::TaskPoll => {
                     let task = stack.pop().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-FIBER-009",
@@ -2255,7 +2351,8 @@ fn lower_forth_ast_body_with_locals(
                     };
                     stack.push(Type::task_poll(*result));
                     Instruction::PollCpuFiber
-                } else if word == "task-join" {
+                }
+                ForthSyntax::TaskJoin => {
                     let task = stack.pop().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-FIBER-010",
@@ -2274,7 +2371,8 @@ fn lower_forth_ast_body_with_locals(
                     };
                     stack.push(*result);
                     Instruction::JoinCpuFiber
-                } else if word == "task-cancel" {
+                }
+                ForthSyntax::TaskCancel => {
                     let task = stack.pop().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-FIBER-020",
@@ -2293,7 +2391,8 @@ fn lower_forth_ast_body_with_locals(
                     }
                     stack.push(Type::Unit);
                     Instruction::CancelCpuFiber
-                } else if word == "fiber-next" {
+                }
+                ForthSyntax::FiberNext => {
                     let fiber = stack.pop().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-FIBER-024",
@@ -2312,7 +2411,8 @@ fn lower_forth_ast_body_with_locals(
                     };
                     stack.push(Type::fiber_step(*yield_type, *result_type));
                     Instruction::NextFiber
-                } else if word == "fiber-join" {
+                }
+                ForthSyntax::FiberJoin => {
                     let fiber = stack.pop().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-FIBER-025",
@@ -2331,7 +2431,8 @@ fn lower_forth_ast_body_with_locals(
                     };
                     stack.push(*result_type);
                     Instruction::JoinFiber
-                } else if word == "fiber-cancel" {
+                }
+                ForthSyntax::FiberCancel => {
                     let fiber = stack.pop().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-FIBER-026",
@@ -2350,7 +2451,8 @@ fn lower_forth_ast_body_with_locals(
                     }
                     stack.push(Type::Unit);
                     Instruction::CancelFiber
-                } else if word == "?" {
+                }
+                ForthSyntax::PropagateResult => {
                     let Some(expected_return) = expected_return else {
                         return Err(vec![VmDiagnostic::error(
                             "E-RESULT-TRY-002",
@@ -2396,13 +2498,12 @@ fn lower_forth_ast_body_with_locals(
                         return_ok_type: (**return_ok_type).clone(),
                         error_type: (**return_error_type).clone(),
                     }
-                } else if let Some((index, ty)) = local_indexes.get(word) {
-                    stack.push(ty.clone());
-                    Instruction::LocalGet { index: *index }
-                } else if let Some((index, ty)) = capture_indexes.get(word) {
-                    stack.push(ty.clone());
-                    Instruction::CaptureGet { index: *index }
-                } else {
+
+                }
+                _ => unreachable!("primitive was handled before general instruction emission"),
+            },
+            ForthBodyNode::Call(call) => {
+                let word = call.name;
                     let Some(signature) = vocabulary.get(word) else {
                         let mut diagnostic = VmDiagnostic::error(
                             "E-LINK-002",
@@ -2434,7 +2535,8 @@ fn lower_forth_ast_body_with_locals(
                         concrete_signature.suspension.as_ref(),
                         &origin,
                     )?;
-                    if word == "yield" {
+                    match &call.kind {
+                    ForthCallKind::Yield => {
                         let value_type = concrete_signature
                             .input
                             .values
@@ -2442,28 +2544,31 @@ fn lower_forth_ast_body_with_locals(
                             .cloned()
                             .expect("yield has one typed input");
                         Instruction::Yield { value_type }
-                    } else if word == "output-open" {
+                    }
+                    ForthCallKind::OutputOpen => {
                         Instruction::OutputOpen
-                    } else if let Some(operation) = output_operation(word) {
+                    }
+                    ForthCallKind::Ui(operation) => {
                         Instruction::UiEffect {
-                            operation,
+                            operation: *operation,
                             input: concrete_signature.input.values.clone(),
                             output: concrete_signature.output.values.clone(),
                         }
-                    } else if signature.effects.0.len() == 1 {
+                    }
+                    ForthCallKind::Function if signature.effects.0.len() == 1 => {
                         Instruction::CapabilityRequest {
                             requirement: signature.effects.0.iter().next().unwrap().clone(),
                             input: concrete_signature.input.values.clone(),
                             output: concrete_signature.output.values.clone(),
                         }
-                    } else {
+                    }
+                    ForthCallKind::Function => {
                         Instruction::Call { function: word.to_owned() }
                     }
-                }
+
+                    }
             }
-            TokenValue::String(_) | TokenValue::Json(_) => {
-                unreachable!("body parser retains string and JSON values as literal nodes")
-            }
+            _ => unreachable!("structured and reference nodes were emitted above"),
         };
         emit(&mut blocks, current, instruction, origin);
         Ok(())
@@ -2689,8 +2794,14 @@ fn parse_forth_module<'source>(
             documentation: forth_definition_documentation(source, definition_start),
             signature,
             declares_pure,
+            body: parse_forth_body(
+                source_id,
+                source,
+                &tokens[body_start_index..end],
+                &locals,
+                &[],
+            ),
             locals,
-            body: parse_forth_body(source_id, source, &tokens[body_start_index..end]),
             start: definition_start,
             end: definition_end,
         });
@@ -2698,7 +2809,7 @@ fn parse_forth_module<'source>(
     }
     Ok(ForthModuleAst {
         definitions,
-        body: parse_forth_body(source_id, source, &main_atoms),
+        body: parse_forth_body(source_id, source, &main_atoms, &[], &[]),
     })
 }
 
@@ -2709,47 +2820,116 @@ fn parse_forth_body<'source>(
     source_id: &str,
     source: &'source str,
     atoms: &[Token<'source>],
+    locals: &[LocalBinding<'source>],
+    captures: &[LocalBinding<'source>],
+) -> ForthBodyAst<'source> {
+    parse_forth_body_cursor(
+        &mut ForthParser::new(atoms),
+        source_id,
+        source,
+        atoms.len(),
+        locals,
+        captures,
+    )
+}
+
+fn parse_forth_body_cursor<'source>(
+    parser: &mut ForthParser<'_, 'source>,
+    source_id: &str,
+    source: &'source str,
+    end: usize,
+    locals: &[LocalBinding<'source>],
+    captures: &[LocalBinding<'source>],
 ) -> ForthBodyAst<'source> {
     let mut nodes = Vec::new();
     let mut groups: Vec<(ForthSyntax, Vec<ForthBodyNode<'source>>)> = Vec::new();
     let mut controls = Vec::new();
     let mut record_depth = 0usize;
     let mut previous = None;
-    let mut cursor = 0;
-    while cursor < atoms.len() {
-        if token_is(&atoms[cursor], "[") {
-            if let Some((pipe_index, close_index)) = anonymous_quotation_bounds(atoms, cursor) {
-                nodes.push(ForthBodyNode::Quotation(ForthQuotationAst {
-                    open: atoms[cursor].clone(),
-                    signature: parse_quotation_signature(
-                        source_id,
-                        source,
-                        &atoms[cursor + 1..pipe_index],
-                        &origin(
-                            source_id,
-                            source,
-                            atoms[cursor].start,
-                            atoms[close_index].end,
-                        ),
-                    ),
-                    body: parse_forth_body(source_id, source, &atoms[pipe_index + 1..close_index]),
-                    end: atoms[close_index].end,
-                }));
-                previous = Some(cursor);
-                cursor = close_index + 1;
-                continue;
-            }
+    while parser.cursor < end {
+        let (index, token) = parser.next().expect("body ends inside its token stream");
+        if let Some((pipe_index, close_index)) = parser.quotations[index] {
+            let captured = captures
+                .iter()
+                .enumerate()
+                .filter(|(_, capture)| !locals.iter().any(|local| local.name == capture.name))
+                .map(|(index, capture)| ForthCaptureAst {
+                    binding: capture.clone(),
+                    index: index as u32,
+                    from_local: false,
+                })
+                .chain(
+                    locals
+                        .iter()
+                        .enumerate()
+                        .map(|(index, local)| ForthCaptureAst {
+                            binding: local.clone(),
+                            index: index as u32,
+                            from_local: true,
+                        }),
+                )
+                .collect::<Vec<_>>();
+            let visible = captured
+                .iter()
+                .map(|capture| capture.binding.clone())
+                .collect::<Vec<_>>();
+            let quote_end = parser.atoms[close_index].end;
+            let signature = parse_quotation_signature(
+                source_id,
+                source,
+                &parser.atoms[index + 1..pipe_index],
+                &origin(source_id, source, token.start, quote_end),
+            );
+            parser.advance_to(pipe_index + 1);
+            let body =
+                parse_forth_body_cursor(parser, source_id, source, close_index, &[], &visible);
+            parser
+                .next()
+                .expect("indexed quotation has a closing bracket");
+            nodes.push(ForthBodyNode::Quotation(ForthQuotationAst {
+                open: token,
+                signature,
+                captures: captured,
+                body,
+                end: quote_end,
+            }));
+            previous = Some(index);
+            continue;
         }
-        if let Some(value) = forth_literal_value(&atoms[cursor]) {
+        if let Some(value) = forth_literal_value(&token) {
             nodes.push(ForthBodyNode::Literal(ForthLiteralAst {
-                token: atoms[cursor].clone(),
+                token: token.clone(),
                 value,
             }));
         } else {
-            let TokenValue::Word(name) = atoms[cursor].value else {
+            let TokenValue::Word(name) = token.value else {
                 unreachable!("all non-word token values are parser-owned literals");
             };
             let mut syntax = ForthSyntax::parse(name);
+            let parameter = if let Some(arguments) = name
+                .strip_prefix("empty-map<")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                syntax = ForthSyntax::EmptyMap;
+                Some(arguments)
+            } else if let Some(element) = name
+                .strip_prefix("empty-list<")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                syntax = ForthSyntax::EmptyList;
+                Some(element)
+            } else if name.starts_with("variant<") {
+                syntax = ForthSyntax::Variant;
+                Some(name)
+            } else if let Some(tag) = name
+                .strip_prefix("variant-get<")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                syntax = ForthSyntax::VariantGet;
+                Some(tag)
+            } else {
+                None
+            };
             let named_field = name
                 .strip_prefix("field:")
                 .or_else(|| (record_depth > 0).then(|| name.strip_suffix(':')).flatten());
@@ -2821,25 +3001,78 @@ fn parse_forth_body<'source>(
                     | ForthSyntax::Break
                     | ForthSyntax::Continue
             );
-            let operand = consumes_operand
-                .then(|| atoms.get(cursor + 1).cloned())
-                .flatten();
             if matches!(syntax, ForthSyntax::RecordGet | ForthSyntax::RecordSet) {
-                field = previous.and_then(|index: usize| match &atoms[index].value {
+                field = previous.and_then(|index: usize| match &parser.atoms[index].value {
                     TokenValue::String(field) => Some(Cow::Owned(field.clone())),
                     _ => None,
                 });
             }
-            nodes.push(ForthBodyNode::Word(ForthWordAst {
-                token: atoms[cursor].clone(),
-                syntax,
-                operand,
-                field,
-                control_valid,
-                next_is_terminal: atoms.get(cursor + 1).is_some_and(|token| {
-                    token_is(token, "otherwise") || token_is(token, "endcase")
-                }),
-            }));
+            previous = Some(index);
+            let operand = if consumes_operand && parser.cursor < end {
+                let (operand_index, operand) = parser.next().expect("reference operand exists");
+                previous = Some(operand_index);
+                if let Some((_, close)) = parser.quotations[operand_index] {
+                    parser.advance_to(close + 1);
+                }
+                let name = match operand.value {
+                    TokenValue::Word(name) => Some(name),
+                    _ => None,
+                };
+                let valid_loop_label = name.is_some_and(|name| {
+                    !name.is_empty()
+                        && !matches!(name, "if" | "else" | "then" | "while" | "repeat" | "until")
+                });
+                Some(ForthReferenceAst {
+                    token: operand,
+                    name,
+                    valid_loop_label,
+                })
+            } else {
+                None
+            };
+            let type_argument = match syntax {
+                ForthSyntax::EmptyMap => Some(
+                    parse_type_name(&format!("map<{}>", parameter.expect("map arguments")))
+                        .map_err(|_| ()),
+                ),
+                ForthSyntax::EmptyList => {
+                    Some(parse_type_name(parameter.expect("list type argument")).map_err(|_| ()))
+                }
+                _ => None,
+            };
+            let variant = (syntax == ForthSyntax::Variant)
+                .then(|| parse_variant_constructor_name(name))
+                .flatten()
+                .map(|(variants, tag, payload_type)| ForthVariantAst {
+                    variants,
+                    tag,
+                    payload_type,
+                });
+            nodes.push(
+                ForthOperationAst {
+                    token: token.clone(),
+                    name,
+                    parameter,
+                    type_argument,
+                    variant,
+                    syntax,
+                    operand,
+                    field_valid: field.as_deref().is_some_and(|field| {
+                        !field.is_empty()
+                            && field.chars().all(|character| {
+                                character.is_ascii_alphanumeric()
+                                    || character == '_'
+                                    || character == '-'
+                            })
+                    }),
+                    field,
+                    control_valid,
+                    next_is_terminal: parser.atoms.get(parser.cursor).is_some_and(|token| {
+                        token_is(token, "otherwise") || token_is(token, "endcase")
+                    }),
+                }
+                .into_node(locals, captures),
+            );
             let closes_group = match syntax {
                 ForthSyntax::Then => Some(ForthSyntax::If),
                 ForthSyntax::Repeat | ForthSyntax::Until => Some(ForthSyntax::Begin),
@@ -2858,27 +3091,92 @@ fn parse_forth_body<'source>(
                     nodes = parent;
                 }
             }
-            if consumes_operand && cursor + 1 < atoms.len() {
-                cursor += 1;
-                previous = Some(cursor);
-                // A reference consumes one parsed atom, including an anonymous
-                // quotation. Its leading '[' remains the operand spelling.
-                if token_is(&atoms[cursor], "[") {
-                    if let Some((_, close)) = anonymous_quotation_bounds(atoms, cursor) {
-                        cursor = close + 1;
-                        continue;
-                    }
-                }
-            }
         }
-        previous = Some(cursor);
-        cursor += 1;
+        if matches!(nodes.last(), Some(ForthBodyNode::Literal(_))) {
+            previous = Some(index);
+        }
     }
     while let Some((_, mut parent)) = groups.pop() {
         parent.push(ForthBodyNode::Group(ForthBodyAst { nodes }));
         nodes = parent;
     }
     ForthBodyAst { nodes }
+}
+
+impl<'source> ForthOperationAst<'source> {
+    fn into_node(
+        self,
+        locals: &[LocalBinding<'source>],
+        captures: &[LocalBinding<'source>],
+    ) -> ForthBodyNode<'source> {
+        if self.syntax == ForthSyntax::Call {
+            if let Some((index, local)) = locals
+                .iter()
+                .enumerate()
+                .find(|(_, local)| local.name == self.name)
+            {
+                return ForthBodyNode::LocalReference(ForthBindingReferenceAst {
+                    token: self.token,
+                    index: index as u32,
+                    ty: local.ty.clone(),
+                });
+            }
+            if let Some((index, capture)) = captures
+                .iter()
+                .enumerate()
+                .find(|(_, capture)| capture.name == self.name)
+            {
+                return ForthBodyNode::CaptureReference(ForthBindingReferenceAst {
+                    token: self.token,
+                    index: index as u32,
+                    ty: capture.ty.clone(),
+                });
+            }
+            let kind = match self.name {
+                "yield" => ForthCallKind::Yield,
+                "output-open" => ForthCallKind::OutputOpen,
+                name => output_operation(name)
+                    .map(ForthCallKind::Ui)
+                    .unwrap_or(ForthCallKind::Function),
+            };
+            return ForthBodyNode::Call(ForthCallAst {
+                token: self.token,
+                name: self.name,
+                kind,
+            });
+        }
+        match self.syntax {
+            ForthSyntax::QuoteTarget => ForthBodyNode::QuotationReference(self),
+            ForthSyntax::RecordGet | ForthSyntax::RecordSet | ForthSyntax::RecordGetNamed => {
+                ForthBodyNode::RecordReference(self)
+            }
+            ForthSyntax::ListOpen
+            | ForthSyntax::ListClose
+            | ForthSyntax::MapOpen
+            | ForthSyntax::MapClose
+            | ForthSyntax::RecordOpen
+            | ForthSyntax::RecordClose
+            | ForthSyntax::RecordField => ForthBodyNode::Collection(self),
+            ForthSyntax::Case
+            | ForthSyntax::Of
+            | ForthSyntax::EndOf
+            | ForthSyntax::Otherwise
+            | ForthSyntax::EndCase
+            | ForthSyntax::If
+            | ForthSyntax::MatchOption
+            | ForthSyntax::MatchResult
+            | ForthSyntax::Else
+            | ForthSyntax::Then
+            | ForthSyntax::Begin
+            | ForthSyntax::NamedBegin
+            | ForthSyntax::Break
+            | ForthSyntax::Continue
+            | ForthSyntax::While
+            | ForthSyntax::Repeat
+            | ForthSyntax::Until => ForthBodyNode::Control(self),
+            _ => ForthBodyNode::Primitive(self),
+        }
+    }
 }
 
 fn forth_literal_value(token: &Token) -> Option<TypedValue> {
@@ -3698,7 +3996,7 @@ mod tests {
             .expect("quotation syntax should parse before semantic lowering");
         assert_eq!(ast.body.nodes.len(), 2);
         assert!(matches!(ast.body.nodes[0], ForthBodyNode::Quotation(_)));
-        let ForthBodyNode::Word(execute) = &ast.body.nodes[1] else {
+        let ForthBodyNode::Primitive(execute) = &ast.body.nodes[1] else {
             panic!("the word after a quotation should remain the adjacent body node");
         };
         assert_eq!(&source[execute.token.start..execute.token.end], "execute");
@@ -3730,7 +4028,7 @@ mod tests {
                 TypedValue::Json(serde_json::json!({"ok": true})),
             ]
         );
-        let ForthBodyNode::Word(dup) = &ast.body.nodes[5] else {
+        let ForthBodyNode::Primitive(dup) = &ast.body.nodes[5] else {
             panic!("non-literal words should remain explicit unresolved word nodes");
         };
         assert!(token_is(&dup.token, "dup"));
@@ -4025,6 +4323,105 @@ mod tests {
     }
 
     #[test]
+    fn test_ast_repair_distinguishes_binding_call_and_control_nodes() {
+        let ast = parse_forth_module("node-kinds.forth", ": identity ( S value:int -- S int ! pure ) value 1 + ; : capture ( S value:int -- S fn<unit,int> ! pure ) [ -- int | value ] ; true if 1 else 2 then").unwrap();
+        let local = &ast.definitions[0].body.nodes[0];
+        let call = &ast.definitions[0].body.nodes[2];
+        let ForthBodyNode::Quotation(quote) = &ast.definitions[1].body.nodes[0] else {
+            panic!("capture definition must retain its quotation: {ast:?}");
+        };
+        let capture = &quote.body.nodes[0];
+        let ForthBodyNode::Group(branch) = &ast.body.nodes[1] else {
+            panic!("conditional must retain its structured body: {ast:?}");
+        };
+        let nodes = [local, capture, call, &branch.nodes[0]];
+        for (index, node) in nodes.iter().enumerate() {
+            for other in &nodes[index + 1..] {
+                assert_ne!(std::mem::discriminant(*node), std::mem::discriminant(*other), "parser must distinguish local, capture, call, and control nodes before lowering: {node:?} versus {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parser_resolves_shadowed_calls_nested_captures_and_quotation_operands() {
+        let source = ": identity ( S yield:int -- S int ! pure ) yield ; : capture ( S left:int right:int -- S fn<unit,fn<unit,int>> ! pure ) [ unit -- fn<unit,int> | drop [ unit -- int | drop left right + ] ] ;";
+        let verified = compile_forth("bindings.forth", source, Vec::new(), &core_vocabulary())
+            .unwrap_or_else(|diagnostics| {
+                panic!(
+                    "resolved lexical references must preserve verified closures: {diagnostics:?}"
+                )
+            });
+        let identity = &verified.module.functions["identity"];
+        assert!(
+            identity
+                .blocks
+                .values()
+                .flat_map(|block| &block.instructions)
+                .any(|located| matches!(located.instruction, Instruction::LocalGet { index: 0 })),
+            "a named input shadows a vocabulary call such as yield: {identity:?}"
+        );
+        assert!(
+            identity.signature.suspension.is_none(),
+            "a lexical reference named yield must not acquire a suspension contract: {identity:?}"
+        );
+        let captures = verified
+            .module
+            .functions
+            .values()
+            .filter(|function| function.name.starts_with("quote$"))
+            .map(|function| {
+                function
+                    .blocks
+                    .values()
+                    .flat_map(|block| &block.instructions)
+                    .filter_map(|located| match located.instruction {
+                        Instruction::CaptureGet { index } => Some(index),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(captures, vec![vec![0, 1], vec![0, 1]], "nested quotations must retain the parser's deterministic inherited capture slots: {verified:?}");
+        let operand_source = "begin: [ -- int | 1 ] true while break [ -- int | 1 ] repeat";
+        let operand = compile_forth(
+            "operands.forth",
+            operand_source,
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_or_else(|diagnostics| {
+            panic!(
+                "a quotation used as a loop-label operand is consumed as one atom: {diagnostics:?}"
+            )
+        });
+        assert_eq!(
+            operand.module.functions.len(),
+            1,
+            "consumed reference operands must not create executable closures: {operand:?}"
+        );
+        assert!(
+            operand.module.functions["main"]
+                .signature
+                .output
+                .values
+                .is_empty(),
+            "reference operand bodies must not affect the operand stack: {operand:?}"
+        );
+    }
+
+    #[test]
+    fn test_ast_repair_nested_quotations_consume_tokens_linearly() {
+        for prefix in ["", "['] "] {
+            let source = format!("{prefix}{}1{}", "[ -- int | ".repeat(32), " ]".repeat(32));
+            let tokens = tokenize("nested.forth", &source).unwrap().len();
+            PARSER_TOKEN_VISITS.with(|visits| visits.set(0));
+            let ast = parse_forth_module("nested.forth", &source).unwrap();
+            let visits = PARSER_TOKEN_VISITS.with(|visits| visits.get());
+            assert!(visits <= 2 * tokens, "nested quotation parsing may index each token once and consume it once, including quotation reference operands: {tokens} tokens, {visits} visits, {} root nodes", ast.body.nodes.len());
+        }
+    }
+
+    #[test]
     fn test_parser_owns_reference_operands_and_borrows_source_spellings() {
         let source = String::from("\\ finch-doc: Identity.\n: identity ( S value:int -- S int ! pure ) value ; ['] identity begin: outer continue outer");
         let ast = parse_forth_module("references.forth", &source).unwrap();
@@ -4040,14 +4437,14 @@ mod tests {
                 "AST spelling must borrow its immutable source buffer: {spelling:?}"
             );
         }
-        let ForthBodyNode::Word(quote) = &ast.body.nodes[0] else {
+        let ForthBodyNode::QuotationReference(quote) = &ast.body.nodes[0] else {
             panic!("quotation target must be owned by its reference node: {ast:?}");
         };
         assert!(
             quote
                 .operand
                 .as_ref()
-                .is_some_and(|token| token_is(token, "identity")),
+                .is_some_and(|token| token_is(&token.token, "identity")),
             "quotation target operand is retained: {quote:?}"
         );
         let ForthBodyNode::Group(body) = &ast.body.nodes[1] else {
@@ -4060,7 +4457,7 @@ mod tests {
         );
         for node in &body.nodes {
             assert!(
-                matches!(node, ForthBodyNode::Word(word) if word.operand.as_ref().is_some_and(|token| token_is(token, "outer"))),
+                matches!(node, ForthBodyNode::Control(word) if word.operand.as_ref().is_some_and(|token| token_is(&token.token, "outer"))),
                 "begin and continue each retain their label: {node:?}"
             );
         }
@@ -4155,6 +4552,8 @@ mod tests {
                 "record-get",
             ),
             ("unknown true if", "E-LINK-002", "unknown"),
+            ("unknown empty-list<invalid>", "E-LINK-002", "unknown"),
+            ("unknown [ -- invalid | 1 ]", "E-LINK-002", "unknown"),
         ] {
             let diagnostics = compile_forth("spans.forth", source, Vec::new(), &core_vocabulary())
                 .expect_err("malformed structured source must report a diagnostic");
