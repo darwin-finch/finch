@@ -1,7 +1,7 @@
 //! Finch's typed, provider-neutral virtual-machine contracts.
 //!
-//! Co-Forth and Finch Lisp are source languages. Both compile to the typed IR
-//! defined here and are checked by the same verifier before execution.
+//! Execution consumes [`ModuleVerified`] certificates. Source compilation lives
+//! in `finch-language`; this crate owns the reference interpreter and runtime.
 
 mod fiber;
 #[cfg(test)]
@@ -11,11 +11,6 @@ mod interpreter;
 mod migration;
 mod runtime;
 
-pub use finch_coforth::{compile_forth, compile_forth_with_functions};
-pub use finch_colisp::{
-    compile_lisp, compile_lisp_with_functions, parse_math, parse_str, parse_str_spanned,
-    SpannedVal, Val,
-};
 pub use finch_vm_core::{
     agent_task_result_type, agent_task_snapshot_type, agent_task_spec_type,
     capability_grant_entry_type, core_vocabulary, core_word_documentation, core_word_registry,
@@ -26,11 +21,12 @@ pub use finch_vm_core::{
     CapabilityRequirement, ControlEffect, CoreHostBinding, CoreWordDocumentation,
     CoreWordImplementation, CoreWordSpec, DiagnosticPhase, EffectSet, FileOperation, FileSelector,
     FileSelectorTemplate, FileSelectorTemplatePart, Function, GrantScope, GrantSet, Instruction,
-    LocatedInstruction, McpSelectorTemplate, Module, NetworkSelectorTemplate,
+    LocatedInstruction, McpSelectorTemplate, Module, ModuleVerified, NetworkSelectorTemplate,
     ProcessSelectorTemplate, ProgramLanguage, ProgramSelectorTemplate, ResourceRoot,
     ResourceSelector, SelectorError, Severity, SourceLanguage, SourceOrigin, SourceSpan, StackRow,
     StackSignature, SuspensionSignature, TaskKind, Type, TypedValue, UiOperation, VerifiedFunction,
-    VerifiedModule, Verifier, VmDiagnostic, Vocabulary, VM_TYPE_SYSTEM_VERSION,
+    VerifiedModule, Verifier, VmDiagnostic, Vocabulary, SEMANTIC_CONSTRUCTION_VERSION,
+    VM_TYPE_SYSTEM_VERSION,
 };
 pub use interpreter::instantiate_requirement;
 pub use interpreter::{

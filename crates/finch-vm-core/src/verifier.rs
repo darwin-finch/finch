@@ -74,6 +74,16 @@ impl<'a> Verifier<'a> {
         }
     }
 
+    /// Local structural certification of one function. This is not a module
+    /// certificate and does not permit execution.
+    pub fn certify_function(
+        &self,
+        function: &Function,
+        module_functions: &BTreeMap<String, Function>,
+    ) -> Result<VerifiedFunction, Vec<VmDiagnostic>> {
+        self.verify_function(function, module_functions)
+    }
+
     fn verify_function(
         &self,
         function: &Function,

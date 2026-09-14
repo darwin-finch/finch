@@ -430,7 +430,8 @@ fn run_fiber(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{compile_forth, core_vocabulary};
+    use crate::core_vocabulary;
+    use finch_language::{compile_forth, compile_lisp};
 
     #[test]
     fn pure_cpu_fiber_has_a_private_stack_and_returns_a_typed_result() {
@@ -444,7 +445,7 @@ mod tests {
         let scheduler = Arc::new(CpuFiberScheduler::new(1));
         let id = scheduler
             .spawn(
-                module,
+                module.into_verified(),
                 "square",
                 Vec::new(),
                 vec![TypedValue::Int(7)],
@@ -467,13 +468,19 @@ mod tests {
         .unwrap();
         let scheduler = Arc::new(CpuFiberScheduler::new(1));
         assert!(scheduler
-            .spawn(module, "announce", Vec::new(), Vec::new(), 1_000)
+            .spawn(
+                module.into_verified(),
+                "announce",
+                Vec::new(),
+                Vec::new(),
+                1_000,
+            )
             .is_err());
     }
 
     #[test]
     fn deferred_closure_copies_captures_into_a_private_frame() {
-        let module = crate::compile_lisp(
+        let module = compile_lisp(
             "fiber.lisp",
             "(let ((value 42)) (lambda () value))",
             Vec::new(),
@@ -490,7 +497,9 @@ mod tests {
         .unwrap();
         let closure = closure_stack.pop().expect("lambda leaves one closure");
         let scheduler = Arc::new(CpuFiberScheduler::new(1));
-        let id = scheduler.spawn_closure(module, closure, 1_000).unwrap();
+        let id = scheduler
+            .spawn_closure(module.into_verified(), closure, 1_000)
+            .unwrap();
         let result = scheduler.join(id).unwrap();
         assert_eq!(result.status, CpuFiberStatus::Completed);
         assert_eq!(result.result, Some(vec![TypedValue::Int(42)]));

@@ -20,6 +20,8 @@ pub enum AuthorizationDecision { Allowed, ApprovalRequired, Denied }
 pub struct BasicBlock { … }
 /// Compiler-support identifier for a basic block in shared typed IR.
 pub type BlockId = u32;
+/// Then/else/merge blocks created for a boolean branch.
+pub struct BoolBranch { … }
 pub enum CapabilityAuditAction { Granted, Revoked, Consumed }
 pub struct CapabilityAuditEntry { … }
 /// Source-free record of one authorization decision.
@@ -78,6 +80,18 @@ impl EffectSet {
     pub fn pure() -> Self;
     pub fn union(&self, other: &Self) -> Self;
 }
+/// Syntax-neutral module under construction.
+pub struct Elaborated { … }
+impl Elaborated {
+    /// Record a locally certified function.
+    pub fn add_function(&mut self, certified: FunctionCertified);
+    /// Record an already-lowered dependency that this module may call.
+    pub fn add_linked_function(&mut self, function: Function);
+    /// Start an elaborated module with no functions.
+    pub fn new(name: impl Into<String>, entry: impl Into<String>) -> Self;
+    /// Freeze declarations, exports, and content identity.
+    pub fn seal(self) -> ModuleSealed;
+}
 pub enum FileOperation { Read, Write }
 /// A normalized pattern relative to an immutable resource root.
 pub struct FileSelector { … }
@@ -95,6 +109,16 @@ impl FileSelectorTemplate {
 }
 pub enum FileSelectorTemplatePart { Literal, Argument }
 pub struct Function { … }
+/// A function whose local structural, type, stack, and dependency checks passed.
+pub struct FunctionCertified { … }
+impl FunctionCertified {
+    /// Local verification of one function against the functions it may call.
+    pub fn certify(function: Function, vocabulary: &Vocabulary, module_functions: &BTreeMap<String, Function>) -> Result<Self, Vec<VmDiagnostic>>;
+    /// Verifier facts for this function, never a module certificate.
+    pub fn facts(&self) -> &VerifiedFunction;
+    /// The certified function IR.
+    pub fn function(&self) -> &Function;
+}
 pub enum GrantScope { Once, Task, Session, Project, Global }
 pub struct GrantSet { … }
 impl GrantSet {
@@ -114,6 +138,8 @@ pub struct LocatedInstruction { … }
 impl LocatedInstruction {
     pub fn generated(instruction: Instruction, word: impl Into<String>) -> Self;
 }
+/// A lexically active structured loop.
+pub struct LoopBinding { … }
 /// Argument-dependent MCP authority.
 pub struct McpSelectorTemplate { … }
 impl McpSelectorTemplate {
@@ -123,10 +149,38 @@ pub struct Module { … }
 impl Module {
     pub fn single(function: Function) -> Self;
 }
+/// A closed declaration graph with frozen exports.
+pub struct ModuleSealed { … }
+impl ModuleSealed {
+    /// The sealed but unverified module IR.
+    pub fn module(&self) -> &Module;
+    /// Independent composition and security verification.
+    pub fn verify(self, vocabulary: &Vocabulary) -> Result<ModuleVerified, Vec<VmDiagnostic>>;
+}
+/// The only compiler phase permitted to reach execution.
+pub struct ModuleVerified { … }
+impl ModuleVerified {
+    /// The independently verified module retained for interpretation.
+    pub fn as_verified(&self) -> &VerifiedModule;
+    /// Unwrap the serializable verified module used by checkpoints.
+    pub fn into_verified(self) -> VerifiedModule;
+}
 /// Argument-dependent network authority.
 pub struct NetworkSelectorTemplate { … }
 impl NetworkSelectorTemplate {
     pub fn instantiate(&self, arguments: &[super::types::TypedValue]) -> Result<(String, u16), SelectorError>;
+}
+/// A frontend syntax tree that has not yet entered semantic construction.
+pub struct Parsed<Ast> { … }
+impl Parsed {
+    /// Borrow the frontend syntax tree.
+    pub fn ast(&self) -> &Ast;
+    /// Wrap a frontend AST as the parse-complete phase.
+    pub fn from_frontend(source_id: impl Into<String>, ast: Ast) -> Self;
+    /// Consume the wrapper and return the frontend syntax tree.
+    pub fn into_ast(self) -> Ast;
+    /// Source identity retained from the parse boundary.
+    pub fn source_id(&self) -> &str;
 }
 /// Argument-dependent process authority.
 pub struct ProcessSelectorTemplate { … }
@@ -150,6 +204,40 @@ impl ProgramSelectorTemplate {
 pub enum ResourceRoot { Workspace, Project, TaskOutput, HostMachine, Named }
 pub enum ResourceSelector { None, File, FileTemplate, NetworkTemplate, Network, Automation, Agent, Process, ProcessTemplate, Program, ProgramTemplate, Mcp, McpTemplate, Memory, Schedule }
 pub enum SelectorError { Empty, AbsolutePath, ParentTraversal, UnknownRoot, InvalidRecursiveWildcard, DifferentRoots, IndeterminateIntersection, InvalidTemplateArgument, TemplateArgumentOutOfBounds, WildcardInRuntimePath, InvalidSeparator, InvalidNetworkTemplateArgument, NetworkTemplateArgumentOutOfBounds, InvalidProcessTemplateArgument, ProcessTemplateArgumentOutOfBounds, InvalidProgramTemplateArgument, ProgramTemplateArgumentOutOfBounds, InvalidMcpTemplateArgument, McpTemplateArgumentOutOfBounds }
+/// A lexical binding introduced during semantic construction.
+pub enum SemanticBinding { Local, Capture }
+impl SemanticBinding {
+    /// Type of the bound value.
+    pub fn ty(&self) -> &Type;
+}
+/// Syntax-neutral IR constructor used by every frontend.
+pub struct SemanticBuilder { … }
+impl SemanticBuilder {
+    /// Allocate a local slot of `ty`.
+    pub fn allocate_local(&mut self, ty: Type) -> u32;
+    /// Append an instruction unless the current block already terminated.
+    pub fn emit(&mut self, instruction: Instruction, origin: SourceOrigin);
+    /// Finish a function with the live output row.
+    pub fn finish(self, output: Vec<Type>) -> Function;
+    /// Finish with an explicit closed stack signature, as Co-Forth definitions do.
+    pub fn finish_closed(self, input: Vec<Type>, output: Vec<Type>, documentation: Option<String>) -> Function;
+    /// Jump from the current alternative to `branch.merge_block`.
+    pub fn jump_to_merge(&mut self, branch: &BoolBranch, origin: SourceOrigin);
+    /// Merge an incoming yield contract into this callable.
+    pub fn merge_suspension(&mut self, incoming: Option<&SuspensionSignature>, origin: &SourceOrigin) -> Result<(), Vec<VmDiagnostic>>;
+    /// Start a function body with `input` already on the stack.
+    pub fn new(name: impl Into<String>, input: Vec<Type>) -> Self;
+    /// Allocate a fresh basic block.
+    pub fn new_block(&mut self) -> BlockId;
+    /// Resolve a name through nested scopes, innermost first.
+    pub fn resolve(&self, name: &str) -> Option<SemanticBinding>;
+    /// Consume a live `bool` and emit a then/else/merge branch skeleton.
+    pub fn start_bool_branch(&mut self, origin: SourceOrigin) -> Result<BoolBranch, Vec<VmDiagnostic>>;
+    /// Continue lowering in `block` with `stack` as the live row.
+    pub fn switch_to(&mut self, block: BlockId, stack: Vec<Type>);
+    /// Visible bindings, innermost first then sorted by name within a scope.
+    pub fn visible_bindings(&self) -> Vec<(String, SemanticBinding)>;
+}
 pub enum Severity { Note, Warning, Error }
 pub enum SourceLanguage { Forth, Lisp, FinchIr, Native, Provider }
 pub struct SourceOrigin { … }
@@ -201,6 +289,8 @@ pub struct VerifiedFunction { … }
 pub struct VerifiedModule { … }
 pub struct Verifier<'a> { … }
 impl Verifier {
+    /// Local structural certification of one function.
+    pub fn certify_function(&self, function: &Function, module_functions: &BTreeMap<String, Function>) -> Result<VerifiedFunction, Vec<VmDiagnostic>>;
     pub fn new(vocabulary: &'a Vocabulary) -> Self;
     pub fn verify(&self, module: Module) -> Result<VerifiedModule, Vec<VmDiagnostic>>;
 }
@@ -224,6 +314,8 @@ pub fn agent_task_spec_type() -> Type { … }
 /// Apply a word signature to a concrete virtual stack.
 pub fn apply_signature_types(signature: &StackSignature, stack: &mut Vec<Type>, origin: &SourceOrigin) -> Result<(), VmDiagnostic> { … }
 pub fn capability_grant_entry_type() -> Type { … }
+/// Seal a complete function map and independently verify it.
+pub fn certify_module(name: impl Into<String>, entry: impl Into<String>, functions: BTreeMap<String, Function>, vocabulary: &Vocabulary) -> Result<ModuleVerified, Vec<VmDiagnostic>> { … }
 /// Canonical signatures for verifier-facing consumers.
 pub fn core_vocabulary() -> Vocabulary { … }
 /// Return provider-neutral documentation for a registered core word.
@@ -245,6 +337,8 @@ pub fn tree_listing_type() -> Type { … }
 ## Constants
 
 ```rust
+/// Version of the frontend-facing semantic-construction protocol.
+pub const SEMANTIC_CONSTRUCTION_VERSION: u32 = 1;
 /// Version of the typed VM contract and serialized IR family.
 pub const VM_TYPE_SYSTEM_VERSION: u32 = 5;
 ```
