@@ -31,23 +31,33 @@ hits, which is the problem this runtime exists to end.
 ## The provider/credential matrix is the UX tax
 
 Claude Code, ChatGPT, and Grok each have **one** account and a model picker.
-Finch has provider × credential × model × thinking level. That matrix is
-correct internally and hostile in a Brain: four choices every time you hit a
-limit.
+Finch has many named `[[providers]]`. `/provider` already switches those names.
+The remaining tax is model and thinking level *inside* a name, and which name
+fills `compress` / `review` when the user never set it.
 
-The user-facing object is a **lane**, not a tuple:
+**Lanes hang on a `[[providers]]` entry**, they are not a fourth object.
+`ProviderEntry` already has `name`, `model`, and (on some types) `reasoning_effort`.
+Add a `roles` list (`compress`, `cheap`, `review`, `default`). Heuristics fill
+that from the stable `type` tag, not from the user's display name:
 
-- a named profile: `cheap`, `review`, `grok-sub`, `claude-api`
-- each lane binds provider + credential + default model + default effort
-- `/model` or a Brain picker switches **lanes**
-- changing model or thinking level *inside* a lane is a secondary control
-  (planned: [#217](https://github.com/darwin-finch/finch/issues/217) persist
-  per Brain, [#338](https://github.com/darwin-finch/finch/issues/338) effort,
-  [#450](https://github.com/darwin-finch/finch/issues/450) hot-swap on cap)
+- `type = "local"` (Qwen/ONNX/Candle) → `compress` (and `cheap` if nothing else is)
+- `type = "grok"` → `cheap` / implement default
+- `type = "claude"` → `review` if no review role exists yet
+- first enabled cloud entry → `default` work lane if unset
 
-When a cap hits, offer the next **lane**, not a credentials form. Setup
-(#700) still collects OAuth, PAT, or `gh auth token` per plugin; that is
-once, not per turn.
+The user can override. `/provider` already switches by **name**; keep that.
+Within one named entry, same backend and same credentials: `/model` and
+`/effort` (thinking level) are cheap controls
+([#217](https://github.com/darwin-finch/finch/issues/217),
+[#338](https://github.com/darwin-finch/finch/issues/338)). Cap failover
+([#450](https://github.com/darwin-finch/finch/issues/450)) offers the next
+**named provider** (or the next entry that has the needed role), not a
+credentials form.
+
+**Cache:** if the model id does not change, the conversation prefix is already
+stable and providers' automatic prefix cache works. Compression (#707) is for
+**crossing providers** (or a model id that would miss the prefix), not for
+toggling effort on the same model.
 
 ## Routing: packet role, not a second LLM
 
@@ -114,8 +124,10 @@ providers whatever they want; Finch must not grep for `qwen`.
 
 Setup assigns `compress` once (default: local Qwen; else cheapest configured
 cloud; else refuse and send only the last N turns with a warning). Hot-swap
-(#450) then: run `compress` on the log → attach summary + tail → new lane.
-The summary is an event on the Brain, so you can see what was dropped.
+(#450) **to a different provider** then: run `compress` on the log → attach
+summary + tail → new entry. Same provider, new model/effort: skip compress;
+prefix cache should still hit. The summary is an event on the Brain, so you
+can see what was dropped.
 
 Do not use the outgoing flagship to summarize "random back and forth." That
 defeats the point. Local Qwen shipped by default is how this stays free when
@@ -130,5 +142,7 @@ the user has no API.
 - Git hooks that move Jira columns (ticketing plugins).
 - Exposing the raw provider/credential/model/effort matrix as the Brain
   switcher.
-- Selecting the compressor by provider name (`qwen`, `luna`, …).
-- Replaying the full Brain log to the new provider on swap.
+- Selecting the compressor by provider **name** (`qwen`, `luna`, …). Heuristics
+  use `type`.
+- Replaying the full Brain log when the **provider** changes. Same-model
+  effort/model tweaks should not compress.
