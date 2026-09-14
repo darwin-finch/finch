@@ -110,11 +110,13 @@ Generated syntax retains both its call-site and definition origin and is never c
 and reparsed.
 
 Lisp and Co-Forth are the first two frontends, not a closed set. A future language frontend may
-parse its own source once and submit its elaborated, span-bearing AST through a versioned semantic-
+parse its own source once and submit span-bearing structured syntax through a versioned semantic-
 construction protocol. That protocol is a typed builder surface—operations such as declaring a
-function, resolving a call, and constructing a match, closure, generic instantiation, or effect—not
-a public HIR-node ABI. Compiler-owned builders may change internal AST/HIR representation without
-making independent frontends clients of compiler internals. A frontend may reuse CoLisp's ordinary
+function and constructing an unresolved call, match, closure, generic application, or effect
+syntax—not a public HIR-node ABI and not permission to claim a resolved symbol or verified type.
+The common elaborator alone resolves identities, selects evidence, derives ownership/effects, and
+constructs compiler-private HIR. Compiler-owned builders may change internal AST/HIR representation
+without making independent frontends clients of compiler internals. A frontend may reuse CoLisp's ordinary
 syntax, macro, concept, and CTFE libraries by constructing their structured inputs directly, but it
 must not emit CoLisp text and invoke another reader. This makes Finch a practical compiler substrate
 without turning CoLisp into a second semantic waist or losing the foreign language's source origins
@@ -389,12 +391,13 @@ bytes            immutable or uniquely owned byte sequence
 path<R>          normalized path proven relative to root R
 list<T>          persistent or managed sequence
 map<K,V>         managed mapping
+tuple<T...>      anonymous fixed-length heterogeneous product
 option<T>        standard-library closed variant: none or some(T)
 result<T,E>      standard-library closed variant: ok(T) or err(E)
 record{...}      named product type
 variant{...}     tagged sum type
 word<S,E>        callable word with stack signature S and effects E
-fn(A...)->R ! E  lexical closure
+fn(P...)->R       lexical callable; P includes ownership modes and the full callable contract
 task<T>          scheduler-owned child/task handle
 stream<T>        scheduler-owned lazy sequence/cursor handle
 fiber<Y,Resume,R> resumable producer that yields Y, accepts Resume, and returns R once
@@ -425,6 +428,15 @@ versus heap placement, an ownership policy, or static versus dynamic behavioral 
 `Foo` may therefore be frame-owned inline, embedded inside another record, placed behind
 `Unique<Foo>` or `Shared<Foo>`, or borrowed through any of those carriers without becoming a
 different aggregate type.
+
+Named records have nominal identity. Matching field names do not make independently declared
+records interchangeable, because their invariants, constructors, lifecycle evidence, and layout
+contracts may differ. Structural width conversion is available only through an explicit readonly
+record-view type/evidence that borrows selected fields; it does not reinterpret or copy a record by
+layout and never applies implicitly across `repr(C)`, `repr(stable N)`, mutable, or owning storage.
+`tuple<T...>` is the anonymous structural product for fixed heterogeneous values such as selected
+parameter packs and `join-all` results; it has positional fields, derived lifecycle evidence, no
+nominal identity, and no declaration-owned invariants.
 
 Native record layout is compiler-owned and may evolve with the compiler/runtime ABI. An explicit
 layout declaration chooses a stronger contract when required: conceptually `repr(native)` is the
@@ -489,26 +501,34 @@ Signatures use row polymorphism so a word states what it consumes while preservi
 beneath it:
 
 ```text
-dup          forall A: Copy, S. (S A -- S A A) ! CopyEffects<A>
-drop         forall A: Drop, S. (S A -- S) ! DropEffects<A>
-+            forall S.   (S int int -- S int) ! pure
-file.read    forall R S. (S path<R> -- S bytes) ! fs.read<R>
-agent.await  forall T S. (S task<T> -- S result<T,agent-error>) ! agent.await
-yield        forall Y Resume S. (S Y -- S Resume) ! yields<Y,Resume>
+dup          forall A: Copy, S. (S value A -- S A A) ! CopyEffects<A>
+drop         forall A: Drop, S. (S take A -- S) ! DropEffects<A>
++            forall S.   (S value int value int -- S int) guarantees pure
+file.read    forall R S. (S borrow path<R> -- S path<R> bytes) ! fs.read<R>
+agent.await  forall T S. (S take task<T> -- S result<T,agent-error>) ! agent.await
+yield        forall Y Resume S. (S value Y -- S Resume) ! yields<Y,Resume>
 ```
 
-The stack arrow describes values retained or removed from the logical operand stack; each input
-also has a borrow or take mode. A borrowing input leaves its owner in the row, while a taking input
-consumes that owner. `dup` therefore requires explicit `Copy` evidence (and retaining a `Shared<T>`
-is its copy operation); it cannot duplicate a `Unique<T>`. The surface signature grammar must make
-those modes visible rather than relying on a word's spelling or implementation.
+The stack arrow describes values retained or removed from the logical operand stack. Each input has
+one explicit semantic mode: `borrow T` receives a scoped `&T`; `borrow-mut T` receives an exclusive
+scoped `&mut T`; `take T` consumes an owner; and `value T` consumes an already materialized value
+operand. A source-level ordinary parameter defaults to `borrow`; a `Copy` scalar may use `value`
+without moving the caller's lexical binding because call lowering first materializes a copy. In
+Co-Forth the operand stack itself owns its cells: applying a borrowing callable to an owned top cell
+must retain that owner and create a distinct scoped borrow operand, whereas `take` or `value`
+consumes the indicated cell. The surface transform therefore also shows the borrowed owner in its
+output row; lowering creates a transient borrow cell for the callee and destroys only that cell on
+return. There is no word-specific implicit choice based on spelling. `dup`
+therefore requires explicit `Copy` evidence (and retaining a `Shared<T>` is its copy operation); it
+cannot duplicate a `Unique<T>`.
 
 `!` introduces one canonical typed effect row. Capability requirements, suspension, mutation,
 nondeterminism, and other observable behavior are distinct tagged members of that row, not
 unrelated annotation systems. The broker selects capability-bearing members for authorization; the
 verifier, optimizer, scheduler, and generic reflection inspect the whole row. Omitted `!` requests
 inference rather than asserting an empty row. `pure` is not itself a row member or an alias for
-emptiness: it is a verifier-derived predicate over the resolved row and body. A deterministic
+emptiness: it is a verifier-derived predicate over the resolved row and body. Source may request
+that proof with a separate `guarantees pure` clause; `! pure` is invalid. A deterministic
 function may throw and remain pure but partial; a function may separately be total, `nothrow`,
 deterministic, and non-suspending. Generic constraints can require those predicates explicitly. A
 yielding callable remains a scheduling barrier even when it performs no mutation or host operation.
@@ -528,14 +548,28 @@ A published callable must choose `nothrow`, an explicit `throws A | B` upper bou
 metadata, not a value type, generic `throws<E>`, or effect-row member. Publication proves the
 inferred escaping set is contained by the declared bound.
 
-The signature includes:
+The complete callable type and published signature include:
 
 - input and output stack rows;
-- generic type parameters and constraints;
-- inferred control-flow behavior such as return, exceptional exit, or suspend;
+- the ordered parameter list including borrow, mutable-borrow, take, or value mode and receiver mode;
+- generic type/value/pack parameters, constraints, and selected evidence identities;
+- the result and tuple/product shape;
 - a capability/effect row;
-- optional `nothrow`, determinism, allocation, and numeric-overflow guarantees useful to callers and
-  optimization.
+- an escaping-exception contract;
+- a suspension contract;
+- linkage, symbol/mangling contract, calling convention, fixed versus C-variadic status, target ABI,
+  and parameter/result ABI classifications where externally visible;
+- optional `nothrow`, purity, totality, determinism, allocation, and numeric-overflow guarantees
+  useful to callers and optimization.
+
+Private callables infer suspension. A published callable chooses `non-suspending`, a `suspends`
+upper-bound contract that permits compatible suspension to be added later, or `suspends infer` to
+freeze its exact inferred suspension summary. Widening an explicit public contract from
+non-suspending to suspending, or widening an exact inferred summary, is breaking because callers may
+hold borrows or rely on checkpoint boundaries. These properties participate in callable
+substitution, module interface hashes, native cache keys, evidence-slot compatibility, and callback
+validation; a throwing, suspending, taking, or foreign-ABI callable cannot be stored behind a
+narrower callable type merely because its value parameters and result match.
 
 Declaration attributes are separate compile-time metadata, uniformly spelled `@name(...)` for both
 core and user definitions. Core attributes live in explicit namespaces and may be imported into
@@ -1083,19 +1117,95 @@ following constructs.
 Illustrative syntax:
 
 ```forth
-: square ( S int -- S int ! pure )
+: square ( S value int -- S int ) guarantees pure
   dup *
 ;
 
 : save-report
-  ( S path<workspace:"generated/**"> string -- S unit
-    ! {fs.write(workspace:"generated/**")} )
+  ( S borrow path<workspace:"generated/**"> value string
+    -- S path<workspace:"generated/**"> unit
+    ! {fs.write(workspace:"generated/**")} ) suspends
   file.write
 ;
 ```
 
 Signatures are compiler-readable, not comments. A compatibility reader may initially accept classic
 `( ... )` comments, but verified definitions store a parsed `Signature` object.
+
+### Canonical structured surface and parity ledger
+
+Co-Forth is not merely the low-level subset of CoLisp. Its postfix evaluation order maps closely to
+typed stack IR, but every common semantic AST node has a direct structured spelling. The following
+tokens are the target canonical forms; convenience aliases may be added only when they parse into
+the same nodes without source-to-source CoLisp generation.
+
+| Semantic form | CoLisp | Co-Forth | Semantic construction / IR family |
+|---|---|---|---|
+| module identity | `(module name ...)` | `module: name ... ;` | module declaration, no runtime instruction |
+| immutable import/export | `(import ref ...)`, `(export ...)` | `import: ref { ... } ;`, `export: ... ;` | resolved module/symbol identity |
+| record/layout | `(record Foo ...)` | `record: Foo repr(...) fields{ ... } ;` | record schema/layout |
+| record construction/projection | `(Foo :x a :y b)`, `(. value x)` | `Foo{ x: a y: b }`, `value .x` | `RecordNew`, `FieldGet`/borrow projection |
+| closed variant | `(variant Result ...)`, `(ok value)` | `variant: Result cases{ ... } ;`, `value Ok{}` | `VariantNew` |
+| pattern match | `(match value ...)` | `value match ... of ... endof endmatch` | typed decision tree / `Match` |
+| generic declaration/application | generic header, explicit type application | `< types T... values N... > ... where ...`, `word<...>` | parametric artifact / fixed call |
+| parameter/rest pack | delimited call or `:spread` | `args{ ... }`, `rest{ ... }`, `rest-spread` | fixed operands or one rest collection |
+| concept/evidence | `concept`, `implementation`, `using` | `concept:`, `implementation:`, `using` | named evidence and adapter thunk |
+| dispatch type/view | `static C`, `dyn C`, `some C` | same type constructors; `as-static`, `as-dyn`, `as-some` words | evidence constant, erased view, opaque result |
+| exception region | `(try body (catch ...))` | `try ... catch { error } ... endtry` | `HandlerEnter`/`HandlerExit` and match |
+| exception transfer | `(throw e)`, `(rethrow e)` | `throw`, `rethrow` | `Throw`, `Rethrow` |
+| scope guard | `(scope exit|success|failure action)` | quotation followed by `scope-exit`, `scope-success`, or `scope-failure` | lexical cleanup record |
+| closure capture | `lambda` capture specification | quotation `captures:` header | `CaptureSpec`, `MakeClosure` |
+| ownership | `new unique`, `new shared`, `share`, borrow/take/retain | `new-unique`, `new-shared`, `share`, `borrow`, `take`, `retain`, `weaken` | owner/lifecycle operations |
+| fibers/tasks | `defer`, `spawn`, `join`, `race`, `next` | same typed words applied to quotations/handles | scheduled-execution operations |
+| range iteration | range operations / `foreach` | range words and quotation `foreach` | concept calls and structured loop |
+| macro/syntax | `define-syntax`, syntax constructors | `macro:`, `syntax[ ... ]`, explicit splice/fresh/context words | `Syntax` CTFE, then ordinary nodes |
+| unsafe/FFI | `(unsafe ...)`, `(extern "C" ...)` | `unsafe[ ... ]`, `extern(C): ... ;` | marked unsafe/foreign call; unhosted only |
+
+Structured delimiters such as `Foo{...}`, `args{...}`, `match...endmatch`, and `unsafe[...]` are
+reader forms that retain spans and nesting; they are not ordinary words searching backward through
+an unbounded ambient stack. Record construction is field-labelled, and variant/pattern fields are
+explicit, so layout changes cannot silently reinterpret positional source.
+
+Representative forms are:
+
+```forth
+module: reports.user
+import: codec.json@sha256:... { JsonSerializable UserJson } ;
+
+record: User repr(native) fields{
+  id: int
+  name: string
+} ;
+
+variant: ParseResult cases{
+  Ok(Date)
+  Error(ParseError)
+} ;
+
+: show-result ( S borrow ParseResult -- S string )
+  match
+    Ok{ date } of date format-date endof
+    Error{ error } of error describe endof
+  endmatch
+;
+
+: load-user ( S borrow path -- S Config ) throws ConfigError suspends
+  try
+    file.read parse-config
+  catch { error }
+    error match
+      ConfigError.NotFound{ path } of path default-config endof
+      remaining of remaining rethrow endof
+    endmatch
+  endtry
+;
+```
+
+The full grammar must assign every delimiter, keyword, and nesting rule unambiguously and reserve
+them before the feature ships. A feature is parity-complete only when the specification contains
+canonical source in both syntaxes, both construct the same semantic node family, successful cases
+produce equivalent typed IR and results, and their principal invalid case produces the same stable
+diagnostic with frontend-specific source spans. Equivalent semantics do not require identical sugar.
 
 ### Locals, quotations, and closures
 
@@ -1110,7 +1220,7 @@ Provide explicit locals for generated code and readable handwritten definitions:
 Quotations are typed callable values:
 
 ```forth
-[ int -- int ! pure | 1 + ]
+[ value int -- int guarantees pure | 1 + ]
 ```
 
 An escaping quotation is closure-converted into an immutable code reference plus an owner-carrying
@@ -1141,6 +1251,24 @@ parameter. Illustrative canonical CoLisp forms are:
         ()
         body...)                              ; value default with an override
 ```
+
+The corresponding Co-Forth quotation header is structured syntax before `|`, not values executed
+on the operand stack:
+
+```forth
+[ ( S value int -- S int ) | ... ]
+[ captures: move ( S value int -- S int ) | ... ]
+[ captures: {
+    borrow config
+    take socket
+    retain cache
+  }
+  ( S value Request -- S Response )
+| ... ]
+[ captures: move { borrow config } ( S -- S unit ) | ... ]
+```
+
+The reader produces the same `CaptureSpec` and ordered `CaptureEntry` syntax objects as CoLisp.
 
 With no policy, the compiler may infer scoped borrows for a closure proven not to escape or
 suspend. If such a closure is returned, stored, deferred, dynamically erased, passed to an unknown
@@ -1174,9 +1302,9 @@ origins are omitted here):
 ```text
 main:
   const.int 10
-  make-closure lambda$0 captures=1 : (S int -- S int ! pure)
+  make-closure lambda$0 captures=1 : (S value int -- S int) guarantees pure
   const.int 5
-  call-closure (S int -- S int ! pure)
+  call-closure (S value int -- S int) guarantees pure
   return
 
 lambda$0 captures: [int], locals: [int] # n is capture[0], x is local[0]
@@ -1367,10 +1495,11 @@ explicitly throws it. A throw caught entirely inside the same lexical scope does
 and therefore does not fire its guards; guards in inner scopes unwound on the way to the handler do
 fire before catch matching begins.
 
-Illustrative Lisp spellings are `(scope exit cleanup)`, `(scope success publish)`, and
-`(scope failure compensate)`; Co-Forth receives equivalent typed guard words. The precise reader
-spelling may change, but all three lower to the same IR cleanup record rather than separate language
-features.
+CoLisp spells these `(scope exit cleanup)`, `(scope success publish)`, and
+`(scope failure compensate)`. Co-Forth spells them `[ cleanup ] scope-exit`,
+`[ publish ] scope-success`, and `[ compensate ] scope-failure`; a dismissible registration returns
+an affine guard token consumed by `guard-dismiss`. All three lower to the same IR cleanup record
+rather than separate language features.
 
 Guards are expressible as nested `try`/`finally` behavior but should not be implemented by repeatedly
 rewriting the source AST. Elaboration registers one cleanup action and trigger at its lexical point;
@@ -1795,7 +1924,8 @@ public definitions, effect and capability-selector boundaries, refinements, and 
 declared signatures; publication validates and freezes the declaration rather than exporting an
 accidentally inferred contract. Exception flow remains inferred throughout the body, but a published
 definition chooses `nothrow`, an explicit exception upper bound, or `throws infer` to make its API
-stability policy visible. Private/intermediary definitions omit that clause. Concepts, parameter
+stability policy visible. It likewise chooses `non-suspending`, a `suspends` upper bound, or
+`suspends infer`; private/intermediary definitions infer both clauses. Concepts, parameter
 packs, ranges, overload resolution, and bounded CTFE should
 make routine code feel as direct as Python or JavaScript while retaining a static, optimizable
 execution path. Do not achieve convenience by silently inserting `dynamic`, unchecked coercions, or
@@ -1946,6 +2076,29 @@ implementation WidgetDrawable for Widget : Drawable {
 }
 ```
 
+The canonical Co-Forth declaration shape carries the same fields rather than relying on matching
+word names:
+
+```forth
+concept: JsonSerializable
+  associated: Output type ;
+  operation: serialize ( S borrow Self borrow JsonOptions -- S Self JsonOptions Output ) ;
+;
+
+implementation: UserJson for User : JsonSerializable
+  associated: Output = bytes ;
+  operation: serialize { self options -- }
+    options self UserCodec.serialize
+  ;
+  dynamic-evidence-version: 1 ;
+;
+
+user options JsonSerializable.serialize using UserJson
+```
+
+The implementation operation body is a checked receiver adapter with named inputs; `using` is
+compile-time evidence selection and does not consume a runtime stack value.
+
 The adapter may explicitly reorder arguments or project a composed receiver. A direct
 `operation serialize = encode-user-json` shorthand is valid only when the callable already has the
 exact canonical signature, receiver ownership, argument order, result, effects, and exception
@@ -1961,6 +2114,14 @@ derive tool may generate the declaration, but the compiler still consumes an exp
 rather than silently treating matching names as conformance. Exported evidence is named and stable.
 Each requirement has exactly one selected mapping in a compilation context; competing equally valid
 evidence is an ambiguity error, never an import-order decision.
+
+Concept evidence is never made ambient merely by loading or importing its defining module. Every
+implementation has a stable qualified name. A call either names it with `using`, receives it through
+a generic evidence parameter, or uses one default explicitly imported into that lexical compilation
+context. Initially only the module that defines the concept or the concrete type may publish such a
+default; third-party implementations remain named. A module records every selected evidence identity
+in its sealed interface, so adding another import cannot retrospectively change dispatch or make an
+already compiled call ambiguous.
 
 Operation names live in their concept evidence rather than one shared method namespace. For
 example, independent derives may map both `JsonSerializable.serialize` and
@@ -2001,6 +2162,14 @@ binds associated types/values/effects, validates remaining arguments, and reuses
 Candidate selection must not compile arbitrary bodies to see which one succeeds. D-style
 `static if`, `is(...)`, and `__traits(compiles)` probes, C++-style SFINAE, and unconstrained
 "does this expression compile?" reflection are not the concept-resolution model.
+
+An exported generic publishes a versioned verified parametric artifact, not compiler-private HIR.
+That artifact contains the generic's semantic operations, type/value/pack parameters, constraints,
+ownership and effect transformations, source origins, and explicit evidence-table parameters in a
+canonical representation accepted by the independent verifier. Downstream compilers instantiate or
+share that artifact without reparsing source or depending on an internal AST layout. A concrete
+instantiation is an ordinary fixed-signature function; specialization is a rebuildable cache keyed
+by the parametric artifact and selected arguments/evidence.
 
 Generic parameters marked `infer` are outputs of evidence resolution rather than variables in a
 global back-solving system. For example, `T : Map<K,V>, infer K, infer V` derives `K` and `V` from
@@ -2091,12 +2260,105 @@ Generated definitions are structured syntax with expansion provenance and are ve
 string mixins and overlapping special-purpose metaprogramming subsystems are not part of the
 design.
 
-Type-safe variadics follow from this template model rather than using a privileged calling
-convention. A generic definition may bind a type/value parameter pack, inspect or destructure it,
-and traverse its ordered pairs with bounded compile-time `foreach`. Instantiation yields an
-ordinary fixed-arity signature, or explicitly lowers a homogeneous pack to a typed list/range, so
-verification and effect inference see every argument. This is distinct from C ABI `...`, which
-remains an explicitly unsafe FFI boundary behind a typed wrapper.
+### Parameter packs, runtime rest arguments, and C varargs
+
+Finch has no single overloaded notion of “variadic.” Declaration syntax selects one of three
+facilities, and overload resolution never changes that choice from an expected result.
+
+Canonical declaration shapes are:
+
+```lisp
+(define (render-all <(types Ts...)>
+                    (args : (params (borrow Ts)...)))
+  : string
+  (ct-foreach ((T arg) args) ...))
+
+(define (sum (values : (rest-borrow int))))
+```
+
+```forth
+: render-all < types Ts... >
+  ( S params<borrow Ts...> -- S string )
+  ct:foreach-param ...
+;
+
+: sum ( S borrow rest<int> -- S rest<int> int ) ... ;
+```
+
+A compile-time heterogeneous parameter pack is kinded. `types Ts...` contains types; `values xs :
+Ts...` contains corresponding compile-time values; and `params ps...` contains ordered parameter
+descriptors carrying type, ownership mode, binding identity, and source origin. Packs may be empty
+and are initially final in their parameter list. Bounded CTFE may inspect, slice, destructure, zip,
+and `foreach` over them, but expansion occurs only at an explicit expansion site. Each argument is
+evaluated exactly once from left to right and retains its own borrow/take/value/retain contract.
+Instantiation erases the pack abstraction and produces an ordinary fixed-arity callable signature.
+An uninstantiated pack-generic is not a first-class closure, callback, dynamic evidence slot, or FFI
+function; it must first be selected and instantiated. A pack cannot be addressed, stored, returned,
+or carried across suspension unless explicitly reified as a `tuple<T...>`, list, or other owner.
+
+A runtime-variable homogeneous rest parameter is instead one fixed-ABI collection operand.
+`rest-borrow<T>` receives a call-scoped readonly slice and cannot escape; an ordinary owned
+`list<T>` (or another explicitly selected collection/range) may be taken and retained. Call syntax
+may construct or explicitly spread a collection into that operand, but the declaration determines
+the representation and no callee consumes an unknown number of ambient stack cells. Exact fixed
+arity ranks ahead of a rest or pack candidate; a pack candidate participates only when its declared
+constraints resolve without compiling arbitrary bodies. Arity and CTFE expansion have explicit
+implementation limits with structured diagnostics.
+
+CoLisp call parentheses already delimit candidate arguments, while Co-Forth requires a retained
+structured boundary because a row-polymorphic stack cannot determine where `S` ends and `Ts...`
+begins:
+
+```text
+CoLisp:   (render-all 1 "x" true)
+Co-Forth: args{ 1 "x" true } render-all
+
+CoLisp:   (sum :spread integers)
+Co-Forth: integers rest-spread sum
+```
+
+`args{...}` is compile-time call syntax and lowers to fixed operands; it is not a runtime container
+or marker. `rest{...}` may construct the declared homogeneous borrowed/owned rest operand. Supplying
+an existing tuple, list, or range requires explicit `pack-spread` or `rest-spread`; ordinary values
+are never flattened implicitly.
+
+C ABI `...` is a third, unrelated facility available only to explicitly unhosted unsafe FFI. It is
+part of the callable's linkage/type, requires at least one named parameter, follows the selected
+target's default argument promotions, and accepts only supported C-ABI scalars, raw pointers, and
+explicitly permitted `repr(C)` aggregates. Every variadic argument has an explicit promoted ABI type;
+Finch strings, managed owners, closures, resources, borrows, exceptions, suspension, and ownership
+transfer cannot cross `...`. Initially Finch may call imported C-variadic declarations through a
+fixed-signature thunk per call-site type vector, but cannot define a C-variadic callee or callback.
+There is no D-style Finch linkage with hidden raw argument pointers or runtime `TypeInfo[]`; dynamic
+Finch values use ordinary checked types instead of creating another calling convention. This is an
+intentional simplification of the three function-level forms in the
+[D variadic-function specification](https://dlang.org/spec/function.html#variadic-functions), not an
+assumption that D's native type-info variadics are C compatible.
+
+Canonical unhosted spellings make every promoted argument visible:
+
+```lisp
+(extern "C" (printf (fmt : (c-ptr const c-char)) (args : c-varargs)) : c-int)
+(unsafe
+  (printf fmt
+          (c-vararg c-int count)
+          (c-vararg c-double ratio)))
+```
+
+```forth
+extern(C): printf
+  ( S value c-ptr<const-c-char> c-varargs -- S c-int )
+;
+
+unsafe[
+  fmt
+  cargs{ count c-vararg<c-int> ratio c-vararg<c-double> }
+  printf
+]
+```
+
+Here `cargs{...}` is retained unsafe call-site syntax from which the fixed thunk is generated, not a
+portable runtime container or a `va_list` that safe code may inspect.
 
 Constraint construction retains the source span that introduced it, macro invocation and
 definition ancestry, generic definition, chosen evidence, and specialization or dynamic-erasure
@@ -2116,8 +2378,12 @@ Module
   type table
   capability requirements
   imports by immutable ProgramRef
+  verified parametric artifacts
   functions
     signature
+      parameter ownership/receiver modes
+      effect, exception, and suspension contracts
+      linkage/calling convention/variadic and target ABI classification
     inferred_exception_set
     published_exception_contract = nothrow | upper_bound(types) | infer(types)
     locals/captures
@@ -2170,6 +2436,30 @@ Verifier output is a reusable certificate summary keyed to the exact module hash
 send summaries for caching, but each receiver verifies the module independently.
 
 ## Runtime, memory, and concurrency
+
+### Concurrency memory model
+
+Safe Finch is data-race-free. Ordinary mutable storage has one exclusive borrower and cannot be
+observed concurrently; immutable values may be shared when their ownership evidence permits it.
+Cross-worker transfer requires `Transfer<T>`, and retaining an owner across workers requires
+`ShareAcrossWorkers<T>` plus immutable or explicitly synchronized interior state. A scheduler moving
+a suspended task between workers does not relax those rules.
+
+The memory model defines happens-before edges for task creation and ownership transfer, successful
+join, mutex unlock/lock, channel or actor send/receive, transaction publication, and atomic
+release/acquire or stronger operations. Standard atomics default to sequential consistency for
+ordinary source; weaker `relaxed`, `acquire`, `release`, and `acq-rel` operations are explicit and
+type-checked for valid load/store/read-modify-write positions. Compiler and JIT reordering must
+preserve these edges and the observable order of `ordered-drop`. A safe dynamic synchronization
+failure produces a defined trap or typed result, never undefined behavior. Only an unhosted unsafe
+boundary may assert unchecked aliasing or synchronization, and the backend records that fact rather
+than applying safe-code race assumptions across it.
+
+Module loading performs no ambient user initialization. Initial core modules contain only immutable
+constants evaluable by bounded CTFE and declarations. Mutable process, thread, task, or host state is
+constructed by an explicit callable that returns an owner and is destroyed by that owner. A future
+static-resource facility must specify initialization order, failure, concurrency, and teardown as an
+ordinary owned runtime protocol before it can extend this rule.
 
 ### Trampolined execution and resumable waits
 
@@ -3146,9 +3436,20 @@ Every phase adds tests at the layer where its invariant is enforced:
   to native frontends;
 - type inference, value-restriction, no-cross-binding-back-solving, stack-row, branch-merge, and
   loop-invariant tests;
+- paired CoLisp/Co-Forth grammar fixtures for every parity-ledger row, each comparing semantic nodes,
+  accepted IR/results, and the stable diagnostic for its principal invalid form;
+- parameter-pack tests for empty and heterogeneous packs, explicit Co-Forth `args{}` boundaries,
+  per-element ownership and left-to-right effects, expansion limits, fixed-signature lowering,
+  overload precedence, tuple reification, and rejection from first-class ABI positions before
+  instantiation;
+- runtime-rest tests for borrowed versus owned escape behavior, explicit spread, homogeneous type
+  checking, fixed ABI representation, and refusal to consume an inferred ambient stack suffix;
+- unhosted C-varargs tests for default promotions, explicit promoted types, unsupported managed or
+  nontrivial-owner values, target ABI classification, fixed-call-site thunks, and hosted rejection;
 - concept mapping, associated-output, coherence, shared/static-specialized/dynamic dispatch
   equivalence, canonical receiver adapters for member/static/free/delegated callables, view-carried
-  evidence without record mutation, and runtime-factory tests;
+  evidence without record mutation, explicit-import/default evidence coherence, sealed selected
+  evidence identities, and runtime-factory tests;
 - derive-macro tests proving generated explicit concept evidence, hygienic same-named operations,
   concept-qualified static selection, named same-concept ambiguity resolution, and equivalent
   `dyn` evidence-table dispatch;
@@ -3187,6 +3488,13 @@ Every phase adds tests at the layer where its invariant is enforced:
   default callers propagate without annotations, `nothrow` rejects only escaping exceptional
   edges, exhaustive handlers satisfy it, explicit public exception bounds reject widening, and
   implementation narrowing preserves an unchanged declared interface;
+- callable-substitution and module-compatibility tests covering ownership/receiver modes, effects,
+  exception bounds, suspension contracts, linkage, calling convention, variadicness, and target ABI;
+- concurrency litmus tests for spawn/join, ownership transfer, mutexes, actor/channel delivery,
+  transaction publication, and each atomic memory order, plus compile-fail data races and
+  interpreter/native agreement under permitted reordering;
+- module-loading tests proving declarations and CTFE constants perform no ambient runtime
+  initialization and mutable state enters and leaves only through explicit owned callables;
 - match/catch tests for disjoint-arm reordering, specific-before-general diagnostics, ambiguous and
   shadowed patterns, `as` binding, partial catch propagation, and ordinary-match exhaustiveness;
 - unwind tests for cleanup-before-catch, reverse scope-guard/drop order, moved cleanup obligations,
