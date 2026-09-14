@@ -8,13 +8,22 @@ use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use base64::Engine as _;
 use serde_json::Value;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fs;
-use std::io::IsTerminal;
+use std::fs::{File, OpenOptions};
+use std::io::{IsTerminal, Read as _, Seek as _, Write as _};
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::propose::{propose_in_editor, run_script_async};
+use super::propose::{
+    build_review_artifact, open_review_artifact, parse_proposal_decision, proposal_chat_context,
+    verify_render_is_faithful, ProposalDecision,
+};
 
 /// Run `~/.finch/hooks/post-save <file_path>` if that script exists.
 /// Fire-and-forget — the hook runs in the background; errors are ignored.
@@ -29,29 +38,528 @@ fn run_post_save_hook(file_path: &str) {
     }
 }
 
-/// Build a bash/python script that writes content to a file.
-/// Used by the propose-before-execute flow.
-fn build_write_code(file_path: &str, content: &str) -> String {
-    let content_b64 = base64::engine::general_purpose::STANDARD.encode(content);
-    let path_py = format!("{:?}", file_path);
-    let line_count = content.lines().count();
-    [
-        "python3 << 'PYEOF'\n",
-        "import base64, os\n",
-        &format!("path = {}\n", path_py),
-        &format!(
-            "content = base64.b64decode(b\"{}\").decode(\"utf-8\")\n",
-            content_b64
-        ),
-        "os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)\n",
-        "is_new = not os.path.exists(path)\n",
-        "with open(path, \"w\") as f:\n",
-        "    f.write(content)\n",
-        &format!("verb = \"Created\" if is_new else \"Updated\"\n"),
-        &format!("print(verb + \" {} ({} lines)\")\n", file_path, line_count),
-        "PYEOF",
-    ]
-    .concat()
+enum ReviewTarget {
+    Missing(MissingTarget),
+    Existing { file: File, original: String },
+}
+
+#[cfg(unix)]
+struct MissingTarget {
+    parent: File,
+    parent_path: PathBuf,
+    missing: Vec<OsString>,
+}
+
+#[cfg(not(unix))]
+struct MissingTarget;
+
+#[cfg(unix)]
+fn open_directory_at(parent: &File, name: &std::ffi::OsStr) -> nix::Result<File> {
+    use nix::fcntl::{openat, OFlag};
+    use nix::sys::stat::Mode;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let descriptor = openat(
+        Some(parent.as_raw_fd()),
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    // SAFETY: openat returned a new descriptor owned by this File.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn snapshot_missing_target(path: &Path) -> Result<MissingTarget> {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::Mode;
+    use std::os::fd::FromRawFd as _;
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        anyhow::bail!("Interactive write review requires an absolute target path");
+    }
+    #[cfg(target_os = "macos")]
+    let path = if let Ok(relative) = path.strip_prefix("/tmp") {
+        Path::new("/private/tmp").join(relative)
+    } else if let Ok(relative) = path.strip_prefix("/var") {
+        Path::new("/private/var").join(relative)
+    } else {
+        path.to_path_buf()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let path = path.to_path_buf();
+
+    let components = path
+        .strip_prefix("/")?
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name.to_os_string()),
+            _ => anyhow::bail!("Write target contains an unsafe path component"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let Some((_leaf, parents)) = components.split_last() else {
+        anyhow::bail!("Write target cannot be the filesystem root");
+    };
+    let root = open(
+        "/",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    // SAFETY: open returned a new descriptor owned by this File.
+    let mut parent = unsafe { File::from_raw_fd(root) };
+    let mut parent_path = PathBuf::from("/");
+    for (index, component) in parents.iter().enumerate() {
+        match open_directory_at(&parent, component) {
+            Ok(next) => {
+                parent = next;
+                parent_path.push(component);
+            }
+            Err(nix::errno::Errno::ENOENT) => {
+                return Ok(MissingTarget {
+                    parent,
+                    parent_path,
+                    missing: components[index..].to_vec(),
+                });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Write target ancestry is not a safe directory at {parent_path:?}")
+                })
+            }
+        }
+    }
+    Ok(MissingTarget {
+        parent,
+        parent_path,
+        missing: vec![components.last().expect("leaf exists").clone()],
+    })
+}
+
+#[cfg(not(unix))]
+fn snapshot_missing_target(_path: &Path) -> Result<MissingTarget> {
+    anyhow::bail!(
+        "Interactive write review cannot safely pin a missing target's ancestry on this platform"
+    )
+}
+
+fn open_review_target(file_path: &str) -> Result<ReviewTarget> {
+    match OpenOptions::new().read(true).write(true).open(file_path) {
+        Ok(mut file) => {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("Failed to read review target: {file_path}"))?;
+            let original = String::from_utf8(bytes).map_err(|_| {
+                anyhow::anyhow!(
+                    "{file_path} is not valid UTF-8 text, so it cannot be shown as a reviewable diff"
+                )
+            })?;
+            Ok(ReviewTarget::Existing { file, original })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ReviewTarget::Missing(
+            snapshot_missing_target(Path::new(file_path))?,
+        )),
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to open review target: {file_path}"))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn path_still_names_handle(file_path: &str, handle: &File) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path_metadata = fs::metadata(file_path)
+        .with_context(|| format!("Failed to inspect review target path: {file_path}"))?;
+    let handle_metadata = handle
+        .metadata()
+        .with_context(|| format!("Failed to inspect retained review target: {file_path}"))?;
+    Ok(
+        path_metadata.dev() == handle_metadata.dev()
+            && path_metadata.ino() == handle_metadata.ino(),
+    )
+}
+
+#[cfg(unix)]
+fn entry_still_names_handle(parent: &File, name: &std::ffi::OsStr, handle: &File) -> Result<bool> {
+    use nix::fcntl::AtFlags;
+    use nix::sys::stat::{fstat, fstatat};
+    use std::os::fd::AsRawFd as _;
+
+    let entry = fstatat(Some(parent.as_raw_fd()), name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+    let retained = fstat(handle.as_raw_fd())?;
+    Ok(entry.st_dev == retained.st_dev && entry.st_ino == retained.st_ino)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn publish_noreplace(
+    parent: &File,
+    staged_name: &std::ffi::OsStr,
+    final_name: &std::ffi::OsStr,
+) -> nix::Result<()> {
+    use nix::fcntl::{renameat2, RenameFlags};
+    use std::os::fd::AsRawFd as _;
+
+    renameat2(
+        Some(parent.as_raw_fd()),
+        staged_name,
+        Some(parent.as_raw_fd()),
+        final_name,
+        RenameFlags::RENAME_NOREPLACE,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn publish_noreplace(
+    parent: &File,
+    staged_name: &std::ffi::OsStr,
+    final_name: &std::ffi::OsStr,
+) -> nix::Result<()> {
+    use nix::errno::Errno;
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let staged = CString::new(staged_name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let final_name = CString::new(final_name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+    // SAFETY: both C strings live for the call, and `parent` owns a valid open
+    // directory descriptor. RENAME_EXCL is Darwin's atomic no-replace flag.
+    let result = unsafe {
+        nix::libc::renameatx_np(
+            parent.as_raw_fd(),
+            staged.as_ptr(),
+            parent.as_raw_fd(),
+            final_name.as_ptr(),
+            nix::libc::RENAME_EXCL,
+        )
+    };
+    Errno::result(result).map(drop)
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(all(target_os = "linux", target_env = "gnu"))
+))]
+fn publish_noreplace(
+    _parent: &File,
+    _staged_name: &std::ffi::OsStr,
+    _final_name: &std::ffi::OsStr,
+) -> nix::Result<()> {
+    Err(nix::errno::Errno::ENOTSUP)
+}
+
+#[cfg(unix)]
+fn next_stage_name(kind: &str) -> OsString {
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+    let nonce = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+    OsString::from(format!(
+        ".finch-write-{kind}-{}-{nonce}.tmp",
+        std::process::id()
+    ))
+}
+
+#[cfg(unix)]
+fn staged_directory_is_empty(directory: &File) -> Result<bool> {
+    use std::os::fd::{FromRawFd as _, IntoRawFd as _};
+
+    let cloned = directory.try_clone()?;
+    // SAFETY: try_clone duplicated the descriptor; Dir::from takes ownership of it.
+    let mut entries =
+        nix::dir::Dir::from(unsafe { std::fs::File::from_raw_fd(cloned.into_raw_fd()) })?;
+    for entry in entries.iter() {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn unlink_if_still_ours(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    handle: &File,
+    directory: bool,
+) -> Result<()> {
+    use nix::unistd::{unlinkat, UnlinkatFlags};
+    use std::os::fd::AsRawFd as _;
+
+    if !entry_still_names_handle(parent, name, handle)? {
+        return Ok(());
+    }
+    let flags = if directory {
+        UnlinkatFlags::RemoveDir
+    } else {
+        UnlinkatFlags::NoRemoveDir
+    };
+    unlinkat(Some(parent.as_raw_fd()), name, flags).map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn publish_error(file_path: &str, error: nix::errno::Errno) -> anyhow::Error {
+    if error == nix::errno::Errno::EEXIST {
+        anyhow::anyhow!(
+            "Write not applied: {file_path} was created while the diff was under review"
+        )
+    } else if error == nix::errno::Errno::ENOTSUP {
+        anyhow::anyhow!(
+            "Write not applied: this platform cannot atomically publish a reviewed file without replacing an existing target"
+        )
+    } else {
+        anyhow::anyhow!("Failed to atomically publish reviewed file {file_path}: {error}")
+    }
+}
+
+#[cfg(unix)]
+fn publish_exclusive(
+    parent: &File,
+    staged: &File,
+    staged_name: &std::ffi::OsStr,
+    final_name: &std::ffi::OsStr,
+    directory: bool,
+    file_path: &str,
+) -> Result<()> {
+    if !entry_still_names_handle(parent, staged_name, staged)? {
+        anyhow::bail!(
+            "Write not applied: a staged path for {file_path} was replaced while the file was being committed"
+        );
+    }
+    if let Err(error) = publish_noreplace(parent, staged_name, final_name) {
+        let _ = unlink_if_still_ours(parent, staged_name, staged, directory);
+        return Err(publish_error(file_path, error));
+    }
+    if !entry_still_names_handle(parent, final_name, staged)? {
+        anyhow::bail!(
+            "Write not applied: {file_path} no longer names the reviewed inode after exclusive publication"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stage_missing_write(parent: &File, content: &str) -> Result<(File, OsString)> {
+    use nix::fcntl::{openat, OFlag};
+    use nix::sys::stat::Mode;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    for _ in 0..128 {
+        let name = next_stage_name("file");
+        let descriptor = match openat(
+            Some(parent.as_raw_fd()),
+            name.as_os_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(nix::errno::Errno::EEXIST) => continue,
+            Err(error) => return Err(error).context("Failed to stage reviewed file"),
+        };
+        // SAFETY: openat returned a new descriptor owned by this File.
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        return Ok((file, name));
+    }
+    anyhow::bail!("Failed to reserve a private staging name for reviewed file")
+}
+
+#[cfg(unix)]
+fn stage_missing_directory(parent: &File) -> Result<(File, OsString)> {
+    use nix::sys::stat::{mkdirat, Mode};
+    use std::os::fd::AsRawFd as _;
+
+    for _ in 0..128 {
+        let name = next_stage_name("dir");
+        match mkdirat(
+            Some(parent.as_raw_fd()),
+            name.as_os_str(),
+            Mode::from_bits_truncate(0o700),
+        ) {
+            Ok(()) => {
+                let created = open_directory_at(parent, name.as_os_str())?;
+                if !entry_still_names_handle(parent, name.as_os_str(), &created)?
+                    || !staged_directory_is_empty(&created)?
+                {
+                    let _ = unlink_if_still_ours(parent, name.as_os_str(), &created, true);
+                    anyhow::bail!(
+                        "Write not applied: a staged directory was replaced while the file was being committed"
+                    );
+                }
+                return Ok((created, name));
+            }
+            Err(nix::errno::Errno::EEXIST) => continue,
+            Err(error) => return Err(error).context("Failed to stage reviewed directory"),
+        }
+    }
+    anyhow::bail!("Failed to reserve a private staging name for reviewed directory")
+}
+
+#[cfg(not(unix))]
+fn path_still_names_handle(_file_path: &str, _handle: &File) -> Result<bool> {
+    anyhow::bail!(
+        "Interactive write review cannot safely verify file identity on this platform; the write was not applied"
+    )
+}
+
+#[cfg(unix)]
+fn commit_missing_write(file_path: &str, content: &str, target: MissingTarget) -> Result<()> {
+    if !path_still_names_handle(
+        target.parent_path.to_string_lossy().as_ref(),
+        &target.parent,
+    )? {
+        anyhow::bail!(
+            "Write not applied: an ancestor of {file_path} changed while the diff was under review"
+        );
+    }
+    let Some((leaf, directories)) = target.missing.split_last() else {
+        anyhow::bail!("Write not applied: missing target has no filename");
+    };
+    let mut parent = target.parent;
+    for directory in directories {
+        let (created, staged_name) = stage_missing_directory(&parent)?;
+        publish_exclusive(
+            &parent,
+            &created,
+            staged_name.as_os_str(),
+            directory.as_os_str(),
+            true,
+            file_path,
+        )?;
+        parent = created;
+    }
+    let (staged, staged_name) = stage_missing_write(&parent, content)?;
+    publish_exclusive(
+        &parent,
+        &staged,
+        staged_name.as_os_str(),
+        leaf.as_os_str(),
+        false,
+        file_path,
+    )?;
+    if !path_still_names_handle(file_path, &staged)? {
+        anyhow::bail!(
+            "Write not applied: {file_path} no longer names the reviewed file after exclusive publication"
+        );
+    }
+    parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn commit_missing_write(_file_path: &str, _content: &str, _target: MissingTarget) -> Result<()> {
+    anyhow::bail!("Interactive write review cannot safely create a missing target on this platform")
+}
+
+fn commit_reviewed_write(file_path: &str, content: &str, target: ReviewTarget) -> Result<()> {
+    match target {
+        ReviewTarget::Missing(target) => commit_missing_write(file_path, content, target)?,
+        ReviewTarget::Existing { mut file, original } => {
+            if !path_still_names_handle(file_path, &file)? {
+                anyhow::bail!(
+                    "Write not applied: {file_path} now names a different file than the one reviewed"
+                );
+            }
+            file.seek(std::io::SeekFrom::Start(0))?;
+            let mut current = Vec::new();
+            file.read_to_end(&mut current)?;
+            if current != original.as_bytes() {
+                anyhow::bail!(
+                    "Write not applied: {file_path} changed while the diff was under review"
+                );
+            }
+            file.seek(std::io::SeekFrom::Start(0))?;
+            file.write_all(content.as_bytes())?;
+            file.set_len(content.len() as u64)?;
+            file.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_review_is_faithful(file_path: &str, original: &str, content: &str) -> Result<()> {
+    let shown_path = crate::cli::diff::sanitize_terminal(file_path);
+    if shown_path != file_path {
+        anyhow::bail!(
+            "Cannot open a byte-faithful write review: the target path contains terminal control bytes"
+        );
+    }
+    for (label, text) in [("current file", original), ("proposed file", content)] {
+        if text.contains('\0') {
+            anyhow::bail!(
+                "Cannot open a byte-faithful write review: the {label} contains binary NUL bytes"
+            );
+        }
+        if text.contains('\r') {
+            anyhow::bail!(
+                "Cannot open a byte-faithful write review: the {label} contains CR/CRLF line endings"
+            );
+        }
+        for (offset, character) in text.char_indices() {
+            if character == '\n' || !character.is_control() {
+                continue;
+            }
+            let name = match character {
+                '\t' => "TAB".to_string(),
+                '\u{1b}' => "ESCAPE".to_string(),
+                other => format!("control character U+{:04X}", other as u32),
+            };
+            anyhow::bail!(
+                "Cannot open a byte-faithful write review: the {label} contains {name} at byte {offset}"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn review_and_apply_write<F, Fut>(
+    file_path: &str,
+    content: &str,
+    open_editor: F,
+) -> Result<String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>>>,
+{
+    let target = open_review_target(file_path)?;
+    let original = match &target {
+        ReviewTarget::Missing(_) => "",
+        ReviewTarget::Existing { original, .. } => original,
+    };
+    ensure_review_is_faithful(file_path, original, content)?;
+    let file_diff = match &target {
+        ReviewTarget::Missing(_) => crate::cli::diff::FileDiff::from_created(file_path, content),
+        ReviewTarget::Existing { original, .. } => {
+            crate::cli::diff::FileDiff::from_texts(file_path, original, content)
+        }
+    };
+    let diff = file_diff.to_unified();
+    verify_render_is_faithful("write", &file_diff, &diff, original, content)?;
+    let description = format!("Write {} ({} lines)", file_path, content.lines().count());
+    let artifact = build_review_artifact(&description, &diff);
+    let Some(returned) = open_editor(artifact.clone()).await? else {
+        return Ok("Write aborted by user.".to_string());
+    };
+
+    match parse_proposal_decision(&returned) {
+        ProposalDecision::Cancel => Ok("Write aborted by user.".to_string()),
+        ProposalDecision::Chat { .. } => {
+            let context = proposal_chat_context(&returned, &artifact);
+            Ok(format!(
+                "Write not applied. The user asked for a different change instead of approving:\n{context}"
+            ))
+        }
+        ProposalDecision::Execute { source } if source != diff => Ok(format!(
+            "Write not applied: the proposed diff for {file_path} was edited during review.\n\
+             Re-issue the write with the content you want, or set `# finch: action=chat` to describe it."
+        )),
+        ProposalDecision::Execute { .. } => {
+            commit_reviewed_write(file_path, content, target)?;
+            Ok(diff)
+        }
+    }
 }
 
 pub struct WriteTool;
@@ -94,37 +602,12 @@ impl Tool for WriteTool {
             .as_str()
             .context("Missing content parameter")?;
 
-        // Interactive: propose the script in $EDITOR before writing.
+        // Interactive: review a plaintext diff, then perform the write here.
         if std::io::stdin().is_terminal() {
-            let (original, was_missing) = match fs::read_to_string(file_path) {
-                Ok(value) => (value, false),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("Failed to read existing file: {}", file_path))
-                }
-            };
-            let line_count = content.lines().count();
-            let description = format!("Write {} ({} lines)", file_path, line_count);
-            let code = build_write_code(file_path, content);
-            let approved = propose_in_editor(&description, &code).await?;
-            let Some(script) = approved else {
-                return Ok("Write aborted by user.".to_string());
-            };
-            let script_stdout = run_script_async(&script).await?;
-            let updated = fs::read_to_string(file_path)
-                .with_context(|| format!("Failed to read written file: {}", file_path))?;
-            let diff = if was_missing {
-                crate::cli::diff::FileDiff::from_created(file_path, &updated)
-            } else {
-                crate::cli::diff::FileDiff::from_texts(file_path, &original, &updated)
-            }
-            .to_unified();
-            return Ok(if script_stdout.trim().is_empty() {
-                diff
-            } else {
-                format!("{}\n{}", script_stdout.trim_end(), diff)
-            });
+            return review_and_apply_write(file_path, content, |artifact| async move {
+                open_review_artifact(&artifact).await
+            })
+            .await;
         }
 
         // Non-interactive (tests, daemon): write directly.
@@ -164,6 +647,169 @@ impl Tool for WriteTool {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_publish_never_replaces_or_unlinks_concurrent_destination() {
+        let directory = tempfile::tempdir().expect("temporary publish directory");
+        let parent = File::open(directory.path()).expect("open publish directory");
+        let (_staged, staged_name) =
+            stage_missing_write(&parent, "reviewed bytes\n").expect("stage reviewed bytes");
+        let destination = directory.path().join("target.txt");
+        fs::write(&destination, "concurrent actor\n").expect("create concurrent destination");
+
+        let error = publish_noreplace(
+            &parent,
+            staged_name.as_os_str(),
+            std::ffi::OsStr::new("target.txt"),
+        )
+        .expect_err("no-replace publication must reject a concurrent destination");
+
+        assert_eq!(
+            error,
+            nix::errno::Errno::EEXIST,
+            "atomic no-replace publication returned the wrong diagnostic: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "concurrent actor\n",
+            "a failed publish must preserve the other actor's destination bytes"
+        );
+        assert!(
+            directory.path().join(&staged_name).exists(),
+            "a failed publish must not unlink a pathname another actor could have replaced"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_created_intermediate_identity_rejects_replacement() {
+        let directory = tempfile::tempdir().expect("temporary ancestry directory");
+        let parent = File::open(directory.path()).expect("open ancestry directory");
+        fs::create_dir(directory.path().join("created")).expect("create intermediate");
+        let retained = open_directory_at(&parent, std::ffi::OsStr::new("created"))
+            .expect("retain created intermediate");
+        fs::rename(
+            directory.path().join("created"),
+            directory.path().join("displaced"),
+        )
+        .expect("displace retained intermediate");
+        fs::create_dir(directory.path().join("created")).expect("install replacement");
+
+        assert!(
+            !entry_still_names_handle(&parent, std::ffi::OsStr::new("created"), &retained)
+                .expect("compare intermediate identity"),
+            "a replacement directory must not satisfy the retained intermediate identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exclusive_publish_refuses_replaced_staged_source() {
+        let directory = tempfile::tempdir().expect("temporary staged-source directory");
+        let parent = File::open(directory.path()).expect("open staged-source directory");
+        let (staged, staged_name) =
+            stage_missing_write(&parent, "reviewed bytes\n").expect("stage reviewed bytes");
+        let stolen = directory.path().join("stolen.txt");
+        fs::rename(directory.path().join(&staged_name), &stolen).expect("displace staged source");
+        fs::write(directory.path().join(&staged_name), "attacker\n")
+            .expect("install replacement at staged name");
+        let destination = directory.path().join("target.txt");
+
+        let error = publish_exclusive(
+            &parent,
+            &staged,
+            staged_name.as_os_str(),
+            std::ffi::OsStr::new("target.txt"),
+            false,
+            destination.to_str().expect("utf-8 destination"),
+        )
+        .expect_err("replaced staged source must not be published");
+
+        assert!(
+            error.to_string().contains("replaced"),
+            "exclusive publish must refuse a replaced staged source: {error}"
+        );
+        assert!(
+            !destination.exists(),
+            "a replaced staged source must not create the destination"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join(&staged_name)).unwrap(),
+            "attacker\n",
+            "exclusive publish must not move another actor's replacement file"
+        );
+        assert_eq!(
+            fs::read_to_string(&stolen).unwrap(),
+            "reviewed bytes\n",
+            "the reviewed inode must remain at the displaced path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exclusive_directory_publish_refuses_replaced_intermediate() {
+        let directory = tempfile::tempdir().expect("temporary intermediate directory");
+        let parent = File::open(directory.path()).expect("open intermediate directory");
+        let (created, staged_name) =
+            stage_missing_directory(&parent).expect("stage reviewed directory");
+        let displaced = directory.path().join("displaced");
+        fs::rename(directory.path().join(&staged_name), &displaced)
+            .expect("displace staged directory");
+        fs::create_dir(directory.path().join(&staged_name)).expect("install replacement directory");
+        fs::write(
+            directory.path().join(&staged_name).join("secret.txt"),
+            "keep\n",
+        )
+        .expect("plant secret in replacement");
+
+        let error = publish_exclusive(
+            &parent,
+            &created,
+            staged_name.as_os_str(),
+            std::ffi::OsStr::new("created"),
+            true,
+            "created/child/target.txt",
+        )
+        .expect_err("replaced staged directory must not be published");
+
+        assert!(
+            error.to_string().contains("replaced"),
+            "exclusive directory publish must refuse a replaced intermediate: {error}"
+        );
+        assert!(
+            !directory.path().join("created").exists(),
+            "a replaced intermediate must not be renamed onto the final directory name"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join(&staged_name).join("secret.txt")).unwrap(),
+            "keep\n",
+            "exclusive directory publish must not move another actor's replacement tree"
+        );
+        assert!(
+            !displaced.join("child").exists()
+                && !directory.path().join(&staged_name).join("child").exists(),
+            "a replaced intermediate must not receive reviewed children"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_staged_directory_is_empty_rejects_planted_entries() {
+        let directory = tempfile::tempdir().expect("temporary empty-dir probe");
+        let empty = File::open(directory.path()).expect("open empty directory");
+        assert!(
+            staged_directory_is_empty(&empty).expect("scan empty directory"),
+            "a newly created staging directory must be empty"
+        );
+        fs::write(directory.path().join("secret.txt"), "keep\n")
+            .expect("plant an entry in the replacement");
+        let planted = File::open(directory.path()).expect("open planted directory");
+        assert!(
+            !staged_directory_is_empty(&planted).expect("scan planted directory"),
+            "a replacement directory that already contains files must not pass the empty-dir guard"
+        );
+    }
 
     #[tokio::test]
     async fn test_write_new_file() {
