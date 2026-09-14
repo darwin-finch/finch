@@ -254,6 +254,7 @@ fn math_parse_atom(t: &[MTok], pos: &mut usize) -> Result<Val> {
 enum Tok {
     LParen,
     RParen,
+    RBracket,
     /// Typed Finch record literal: `{ :field value ... }`. JSON object
     /// literals remain a distinct reader form and are recognized when the
     /// opening brace is followed by a JSON key/value spelling.
@@ -268,6 +269,12 @@ enum Tok {
     Atom(String),
     MathVal(Val), // from $...$ math expression
     JsonVal(Val), // from {...} JSON literal
+}
+
+#[derive(Debug, PartialEq)]
+struct SpannedTok {
+    kind: Tok,
+    span: Range<usize>,
 }
 
 /// Convert pasted JSON literals into the neutral Lisp syntax tree consumed by
@@ -293,9 +300,14 @@ fn json_value_to_syntax(value: serde_json::Value) -> Val {
     }
 }
 
-fn tokenize(src: &str) -> Result<Vec<Tok>> {
+fn tokenize(src: &str) -> Result<Vec<SpannedTok>> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = src.chars().collect();
+    let byte_offsets: Vec<usize> = src
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(src.len()))
+        .collect();
     let mut i = 0;
 
     while i < chars.len() {
@@ -331,16 +343,21 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
             continue;
         }
 
+        let token_start = i;
+
         // Compact structural types are annotation atoms, not record/JSON
         // values. Keeping the balanced spelling intact lets typed Lisp and
         // Co-Forth share one type-expression grammar.
         if let Some(end) = compact_braced_type_end(&chars, i) {
-            tokens.push(Tok::Atom(chars[i..end].iter().collect()));
+            tokens.push(SpannedTok {
+                kind: Tok::Atom(chars[i..end].iter().collect()),
+                span: byte_offsets[i]..byte_offsets[end],
+            });
             i = end;
             continue;
         }
 
-        match c {
+        let kind = match c {
             '$' => {
                 i += 1;
                 let start = i;
@@ -350,9 +367,9 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                 if i >= chars.len() {
                     bail!("unterminated math expression: missing closing '$'");
                 }
-                let math_src: String = chars[start..i].iter().collect();
+                let math_src = &src[byte_offsets[start]..byte_offsets[i]];
                 i += 1; // consume closing '$'
-                tokens.push(Tok::MathVal(parse_math(&math_src)?));
+                Tok::MathVal(parse_math(math_src)?)
             }
             '[' => {
                 // JSON array literal — bracket-balanced span, parsed with serde_json.
@@ -390,15 +407,18 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                     }
                     i += 1;
                 }
-                let json_src: String = chars[start..i].iter().collect();
-                let jv: serde_json::Value = serde_json::from_str(&json_src)
+                let json_src = &src[byte_offsets[start]..byte_offsets[i]];
+                let jv: serde_json::Value = serde_json::from_str(json_src)
                     .map_err(|e| anyhow::anyhow!("JSON array literal: {e}"))?;
-                tokens.push(Tok::JsonVal(json_value_to_syntax(jv)));
+                Tok::JsonVal(json_value_to_syntax(jv))
             }
             '{' => {
                 if brace_starts_typed_record(&chars, i) {
-                    tokens.push(Tok::LBrace);
                     i += 1;
+                    tokens.push(SpannedTok {
+                        kind: Tok::LBrace,
+                        span: byte_offsets[token_start]..byte_offsets[i],
+                    });
                     continue;
                 }
                 // JSON literal — read a brace-balanced span, then parse with serde_json.
@@ -436,38 +456,42 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                     }
                     i += 1;
                 }
-                let json_src: String = chars[start..i].iter().collect();
-                let jv: serde_json::Value = serde_json::from_str(&json_src)
+                let json_src = &src[byte_offsets[start]..byte_offsets[i]];
+                let jv: serde_json::Value = serde_json::from_str(json_src)
                     .map_err(|e| anyhow::anyhow!("JSON literal: {e}"))?;
-                tokens.push(Tok::JsonVal(json_value_to_syntax(jv)));
+                Tok::JsonVal(json_value_to_syntax(jv))
+            }
+            ']' => {
+                i += 1;
+                Tok::RBracket
             }
             '}' => {
-                tokens.push(Tok::RBrace);
                 i += 1;
+                Tok::RBrace
             }
             '(' => {
-                tokens.push(Tok::LParen);
                 i += 1;
+                Tok::LParen
             }
             ')' => {
-                tokens.push(Tok::RParen);
                 i += 1;
+                Tok::RParen
             }
             '\'' => {
-                tokens.push(Tok::Quote);
                 i += 1;
+                Tok::Quote
             }
             '`' => {
-                tokens.push(Tok::BackQuote);
                 i += 1;
+                Tok::BackQuote
             }
             ',' => {
                 if i + 1 < chars.len() && chars[i + 1] == '@' {
-                    tokens.push(Tok::CommaAt);
                     i += 2;
+                    Tok::CommaAt
                 } else {
-                    tokens.push(Tok::Comma);
                     i += 1;
+                    Tok::Comma
                 }
             }
             '"' => {
@@ -507,7 +531,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                         }
                     }
                 }
-                tokens.push(Tok::Str(s));
+                Tok::Str(s)
             }
             _ => {
                 // Atom: read until delimiter
@@ -543,12 +567,16 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                 let atom: String = chars[start..i].iter().collect();
                 // Lone "." is a special token
                 if atom == "." {
-                    tokens.push(Tok::Dot);
+                    Tok::Dot
                 } else {
-                    tokens.push(Tok::Atom(atom));
+                    Tok::Atom(atom)
                 }
             }
-        }
+        };
+        tokens.push(SpannedTok {
+            kind,
+            span: byte_offsets[token_start]..byte_offsets[i],
+        });
     }
 
     Ok(tokens)
@@ -595,6 +623,17 @@ fn brace_starts_typed_record(chars: &[char], open: usize) -> bool {
 
 /// Parse all top-level expressions from `src`.
 pub fn parse_str(src: &str) -> Result<Vec<Val>> {
+    Ok(parse_str_spanned(src)?
+        .into_iter()
+        .map(|form| form.value)
+        .collect())
+}
+
+/// Parse all top-level expressions while retaining their source structure.
+///
+/// The reader constructs values and byte ranges together from one token stream.
+/// Reader sugar keeps its exact enclosing span without inventing child ranges.
+pub fn parse_str_spanned(src: &str) -> Result<Vec<SpannedVal>> {
     let tokens = tokenize(src)?;
     let mut pos = 0;
     let mut exprs = Vec::new();
@@ -604,354 +643,76 @@ pub fn parse_str(src: &str) -> Result<Vec<Val>> {
     Ok(exprs)
 }
 
-/// Parse all top-level expressions while retaining their source structure.
-///
-/// The ordinary [`parse_str`] reader remains the semantic authority: this
-/// routine first obtains exactly those values, then decorates them with a
-/// lexical source tree.  If an extended reader form expands into a different
-/// tree shape (math, JSON, quote shorthand), it keeps its exact enclosing
-/// span and intentionally omits invented child spans.
-pub fn parse_str_spanned(src: &str) -> Result<Vec<SpannedVal>> {
-    let values = parse_str(src)?;
-    let syntax = scan_top_level_forms(src)
-        .ok_or_else(|| anyhow::anyhow!("could not determine Lisp source form boundaries"))?;
-    if values.len() != syntax.len() {
-        bail!(
-            "reader/source span disagreement: parsed {} forms but found {} source forms",
-            values.len(),
-            syntax.len()
-        );
-    }
-    Ok(values
-        .into_iter()
-        .zip(syntax)
-        .map(|(value, syntax)| decorate_span(value, syntax))
-        .collect())
-}
-
-#[derive(Debug, Clone)]
-struct SyntaxForm {
-    span: Range<usize>,
-    children: Vec<SyntaxForm>,
-}
-
-fn decorate_span(value: Val, syntax: SyntaxForm) -> SpannedVal {
-    let children = match &value {
-        Val::List(values) if values.len() == syntax.children.len() => values
-            .iter()
-            .cloned()
-            .zip(syntax.children)
-            .map(|(value, syntax)| decorate_span(value, syntax))
-            .collect(),
-        // A brace record lowers in the reader to the hidden
-        // `(finch-record-literal (name value) ...)` form. Its marker is
-        // reader-introduced, so give it the enclosing span
-        // and retain precise field/value children from the original braces.
-        Val::List(values)
-            if matches!(values.first(), Some(Val::Symbol(name)) if name == "finch-record-literal")
-                && values.len() == syntax.children.len() + 1 =>
-        {
-            let mut children = Vec::with_capacity(values.len());
-            children.push(SpannedVal {
-                value: values[0].clone(),
-                span: syntax.span.clone(),
-                children: Vec::new(),
-            });
-            children.extend(
-                values[1..]
-                    .iter()
-                    .cloned()
-                    .zip(syntax.children)
-                    .map(|(value, syntax)| decorate_span(value, syntax)),
-            );
-            children
-        }
-        _ => Vec::new(),
-    };
-    SpannedVal {
-        value,
-        span: syntax.span,
-        children,
-    }
-}
-
-fn scan_top_level_forms(source: &str) -> Option<Vec<SyntaxForm>> {
-    let mut cursor = 0;
-    let mut forms = Vec::new();
-    while let Some(start) = skip_trivia(source, cursor) {
-        let form = scan_form(source, start)?;
-        cursor = form.span.end;
-        forms.push(form);
-    }
-    Some(forms)
-}
-
-fn skip_trivia(source: &str, mut cursor: usize) -> Option<usize> {
-    loop {
-        while let Some(character) = source.get(cursor..)?.chars().next() {
-            if !character.is_whitespace() {
-                break;
-            }
-            cursor += character.len_utf8();
-        }
-        if source.get(cursor..)?.starts_with(';') {
-            cursor += source[cursor..].find('\n').unwrap_or(source.len() - cursor);
-            continue;
-        }
-        if source.get(cursor..)?.starts_with("#|") {
-            let end = source[cursor + 2..].find("|#")?;
-            cursor += 2 + end + 2;
-            continue;
-        }
-        return (cursor < source.len()).then_some(cursor);
-    }
-}
-
-fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
-    let rest = source.get(start..)?;
-    if let Some(end) = scan_compact_braced_type(source, start) {
-        return Some(SyntaxForm {
-            span: start..end,
+impl SpannedVal {
+    fn leaf(value: Val, span: Range<usize>) -> Self {
+        Self {
+            value,
+            span,
             children: Vec::new(),
-        });
+        }
     }
-    let first = rest.chars().next()?;
-    match first {
-        '(' => scan_list(source, start),
-        '[' => scan_balanced_atom(source, start, '[', ']'),
-        '{' if brace_starts_typed_record_source(source, start) => scan_record(source, start),
-        '{' => scan_balanced_atom(source, start, '{', '}'),
-        '\'' | '`' => {
-            let child_start = skip_trivia(source, start + first.len_utf8())?;
-            let child = scan_form(source, child_start)?;
-            Some(SyntaxForm {
-                span: start..child.span.end,
-                children: vec![child],
-            })
-        }
-        ',' => {
-            let prefix_len = if rest.starts_with(",@") { 2 } else { 1 };
-            let child_start = skip_trivia(source, start + prefix_len)?;
-            let child = scan_form(source, child_start)?;
-            Some(SyntaxForm {
-                span: start..child.span.end,
-                children: vec![child],
-            })
-        }
-        '"' => scan_string(source, start).map(|end| SyntaxForm {
-            span: start..end,
-            children: Vec::new(),
-        }),
-        '$' => source[start + 1..].find('$').map(|offset| SyntaxForm {
-            span: start..start + 1 + offset + 1,
-            children: Vec::new(),
-        }),
-        ')' | ']' | '}' | ';' => None,
-        _ => {
-            let mut end = start;
-            let mut angle_depth = 0usize;
-            while let Some(next) = source.get(end..)?.chars().next() {
-                if next == '<' {
-                    angle_depth += 1;
-                    end += next.len_utf8();
-                    continue;
-                }
-                if next == '>' && angle_depth > 0 {
-                    angle_depth -= 1;
-                    end += next.len_utf8();
-                    continue;
-                }
-                if next.is_whitespace()
-                    || matches!(next, '(' | ')' | '{' | '}' | '"' | ';' | '\'' | '`')
-                    || (next == ',' && angle_depth == 0)
-                {
-                    break;
-                }
-                end += next.len_utf8();
-            }
-            (end > start).then_some(SyntaxForm {
-                span: start..end,
-                children: Vec::new(),
-            })
+
+    fn list(children: Vec<Self>, span: Range<usize>) -> Self {
+        Self {
+            value: Val::List(children.iter().map(|child| child.value.clone()).collect()),
+            span,
+            children,
         }
     }
 }
 
-fn scan_compact_braced_type(source: &str, start: usize) -> Option<usize> {
-    let remainder = source.get(start..)?;
-    if !["record{", "variant{"]
-        .iter()
-        .any(|prefix| remainder.starts_with(prefix))
-    {
-        return None;
-    }
-    let mut depth = 0usize;
-    for (offset, character) in remainder.char_indices() {
-        if character.is_whitespace() || character == '"' {
-            return None;
-        }
-        match character {
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(start + offset + character.len_utf8());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn brace_starts_typed_record_source(source: &str, start: usize) -> bool {
-    source[start + 1..]
-        .chars()
-        .find(|character| !character.is_whitespace())
-        .is_some_and(|character| character == ':')
-}
-
-/// Scan a typed brace record structurally so source maps retain the exact
-/// field and value locations even though the reader introduces a hidden form.
-fn scan_record(source: &str, start: usize) -> Option<SyntaxForm> {
-    let mut cursor = start + 1;
-    let mut children = Vec::new();
-    loop {
-        let field_start = skip_trivia(source, cursor)?;
-        if source.get(field_start..)?.starts_with('}') {
-            return Some(SyntaxForm {
-                span: start..field_start + 1,
-                children,
-            });
-        }
-        let field = scan_form(source, field_start)?;
-        if !source[field.span.clone()].starts_with(':') {
-            return None;
-        }
-        let value_start = skip_trivia(source, field.span.end)?;
-        let value = scan_form(source, value_start)?;
-        children.push(SyntaxForm {
-            span: field.span.start..value.span.end,
-            children: vec![field, value],
-        });
-        cursor = children.last()?.span.end;
-    }
-}
-
-fn scan_list(source: &str, start: usize) -> Option<SyntaxForm> {
-    let mut cursor = start + 1;
-    let mut children = Vec::new();
-    loop {
-        let next = skip_trivia(source, cursor)?;
-        if source.get(next..)?.starts_with(')') {
-            return Some(SyntaxForm {
-                span: start..next + 1,
-                children,
-            });
-        }
-        let child = scan_form(source, next)?;
-        cursor = child.span.end;
-        children.push(child);
-    }
-}
-
-fn scan_string(source: &str, mut cursor: usize) -> Option<usize> {
-    cursor += 1;
-    while let Some(character) = source.get(cursor..)?.chars().next() {
-        cursor += character.len_utf8();
-        match character {
-            '\\' => {
-                let escaped = source.get(cursor..)?.chars().next()?;
-                cursor += escaped.len_utf8();
-            }
-            '"' => return Some(cursor),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn scan_balanced_atom(
-    source: &str,
-    mut cursor: usize,
-    open: char,
-    close: char,
-) -> Option<SyntaxForm> {
-    let start = cursor;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(character) = source.get(cursor..)?.chars().next() {
-        cursor += character.len_utf8();
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if in_string && character == '\\' {
-            escaped = true;
-            continue;
-        }
-        if character == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        if character == open {
-            depth += 1;
-        } else if character == close {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(SyntaxForm {
-                    span: start..cursor,
-                    children: Vec::new(),
-                });
-            }
-        }
-    }
-    None
-}
-
-fn parse_one(tokens: &[Tok], pos: &mut usize) -> Result<Val> {
-    if *pos >= tokens.len() {
+fn parse_one(tokens: &[SpannedTok], pos: &mut usize) -> Result<SpannedVal> {
+    let Some(token) = tokens.get(*pos) else {
         bail!("unexpected end of expression");
-    }
+    };
+    let start = token.span.start;
 
-    match &tokens[*pos] {
+    match &token.kind {
         Tok::LParen => {
             *pos += 1;
-            let mut list = Vec::new();
+            let mut children = Vec::new();
             loop {
-                if *pos >= tokens.len() {
+                let Some(next) = tokens.get(*pos) else {
                     bail!("missing closing ')'");
-                }
-                if tokens[*pos] == Tok::RParen {
+                };
+                if next.kind == Tok::RParen {
                     *pos += 1;
-                    return Ok(if list.is_empty() {
-                        Val::Nil
+                    let span = start..next.span.end;
+                    return Ok(if children.is_empty() {
+                        SpannedVal::leaf(Val::Nil, span)
                     } else {
-                        Val::List(list)
+                        SpannedVal::list(children, span)
                     });
                 }
-                list.push(parse_one(tokens, pos)?);
+                children.push(parse_one(tokens, pos)?);
             }
         }
 
         Tok::RParen => bail!("unexpected ')'"),
+        Tok::RBracket => bail!("unexpected ']'"),
 
         Tok::LBrace => {
             *pos += 1;
-            let mut fields = vec![Val::Symbol("finch-record-literal".to_string())];
+            let mut fields = Vec::new();
             loop {
-                if *pos >= tokens.len() {
+                let Some(next) = tokens.get(*pos) else {
                     bail!("missing closing '}}' for typed record");
-                }
-                if tokens[*pos] == Tok::RBrace {
+                };
+                if next.kind == Tok::RBrace {
                     *pos += 1;
-                    return Ok(Val::List(fields));
+                    let span = start..next.span.end;
+                    // The hidden marker uses the enclosing record origin; field
+                    // names and values retain their actual source ranges.
+                    fields.insert(
+                        0,
+                        SpannedVal::leaf(
+                            Val::Symbol("finch-record-literal".to_string()),
+                            span.clone(),
+                        ),
+                    );
+                    return Ok(SpannedVal::list(fields, span));
                 }
-                let Tok::Atom(field) = &tokens[*pos] else {
+                let Tok::Atom(field) = &next.kind else {
                     bail!("typed record fields must use :name value syntax");
                 };
                 let Some(name) = field.strip_prefix(':') else {
@@ -961,78 +722,48 @@ fn parse_one(tokens: &[Tok], pos: &mut usize) -> Result<Val> {
                     bail!("typed record field name cannot be empty");
                 }
                 let name = name.to_owned();
+                let name_span = next.span.clone();
                 *pos += 1;
-                if *pos >= tokens.len() || tokens[*pos] == Tok::RBrace {
+                if *pos >= tokens.len() || tokens[*pos].kind == Tok::RBrace {
                     bail!("typed record field ':{name}' needs a value");
                 }
                 let value = parse_one(tokens, pos)?;
-                fields.push(Val::List(vec![Val::Symbol(name), value]));
+                let span = name_span.start..value.span.end;
+                fields.push(SpannedVal::list(
+                    vec![SpannedVal::leaf(Val::Symbol(name), name_span), value],
+                    span,
+                ));
             }
         }
 
         Tok::RBrace => bail!("unexpected '}}'"),
 
-        // 'x → (quote x)
-        Tok::Quote => {
+        Tok::Quote | Tok::BackQuote | Tok::Comma | Tok::CommaAt => {
+            let head = match token.kind {
+                Tok::Quote => "quote",
+                Tok::BackQuote => "quasiquote",
+                Tok::Comma => "unquote",
+                Tok::CommaAt => "unquote-splicing",
+                _ => unreachable!(),
+            };
             *pos += 1;
             let inner = parse_one(tokens, pos)?;
-            Ok(Val::List(vec![Val::Symbol("quote".to_string()), inner]))
+            Ok(SpannedVal::leaf(
+                Val::List(vec![Val::Symbol(head.to_string()), inner.value]),
+                start..inner.span.end,
+            ))
         }
 
-        // `x → (quasiquote x)
-        Tok::BackQuote => {
+        Tok::Dot | Tok::Str(_) | Tok::Atom(_) | Tok::MathVal(_) | Tok::JsonVal(_) => {
+            let value = match &token.kind {
+                Tok::Dot => Val::Symbol(".".to_string()),
+                Tok::Str(s) => Val::Str(s.clone()),
+                Tok::Atom(a) => parse_atom(a)?,
+                Tok::MathVal(value) | Tok::JsonVal(value) => value.clone(),
+                _ => unreachable!(),
+            };
             *pos += 1;
-            let inner = parse_one(tokens, pos)?;
-            Ok(Val::List(vec![
-                Val::Symbol("quasiquote".to_string()),
-                inner,
-            ]))
-        }
-
-        // ,x → (unquote x)
-        Tok::Comma => {
-            *pos += 1;
-            let inner = parse_one(tokens, pos)?;
-            Ok(Val::List(vec![Val::Symbol("unquote".to_string()), inner]))
-        }
-
-        // ,@x → (unquote-splicing x)
-        Tok::CommaAt => {
-            *pos += 1;
-            let inner = parse_one(tokens, pos)?;
-            Ok(Val::List(vec![
-                Val::Symbol("unquote-splicing".to_string()),
-                inner,
-            ]))
-        }
-
-        Tok::Dot => {
-            *pos += 1;
-            Ok(Val::Symbol(".".to_string()))
-        }
-
-        Tok::Str(s) => {
-            let s = s.clone();
-            *pos += 1;
-            Ok(Val::Str(s))
-        }
-
-        Tok::Atom(a) => {
-            let a = a.clone();
-            *pos += 1;
-            parse_atom(&a)
-        }
-
-        Tok::MathVal(v) => {
-            let v = v.clone();
-            *pos += 1;
-            Ok(v)
-        }
-
-        Tok::JsonVal(v) => {
-            let v = v.clone();
-            *pos += 1;
-            Ok(v)
+            Ok(SpannedVal::leaf(value, token.span.clone()))
         }
     }
 }
@@ -1073,6 +804,143 @@ mod tests {
 
     fn parse1(s: &str) -> Val {
         parse_str(s).unwrap().into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn test_parse_projections_reject_unmatched_array_closer() {
+        for source in ["]", "(] 1)", "' ]", "{ :field ] }"] {
+            let plain = parse_str(source);
+            let spanned = parse_str_spanned(source);
+            assert!(
+                plain.is_err() && spanned.is_err(),
+                "both reader projections must reject an unmatched array closer: source={source:?}, plain={plain:?}, spanned={spanned:?}"
+            );
+            assert_eq!(
+                plain.unwrap_err().to_string(),
+                spanned.unwrap_err().to_string(),
+                "both reader projections must report the same malformed delimiter: source={source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_spanned_reader_preserves_unicode_record_and_nested_list_origins() {
+        let source = "; λ\n({ :名 (list \"é\" ()) :型 record{名:string} } #| 文 |# 42)";
+        let forms = parse_str_spanned(source).expect("Unicode nested record parses");
+        let root = &forms[0];
+        let record = &root.children[0];
+        let field = &record.children[1];
+        let value = &field.children[1];
+        for (node, spelling) in [
+            (
+                root,
+                "({ :名 (list \"é\" ()) :型 record{名:string} } #| 文 |# 42)",
+            ),
+            (record, "{ :名 (list \"é\" ()) :型 record{名:string} }"),
+            (
+                &record.children[0],
+                "{ :名 (list \"é\" ()) :型 record{名:string} }",
+            ),
+            (field, ":名 (list \"é\" ())"),
+            (&field.children[0], ":名"),
+            (value, "(list \"é\" ())"),
+            (&value.children[1], "\"é\""),
+            (&value.children[2], "()"),
+            (&record.children[2].children[1], "record{名:string}"),
+            (&root.children[1], "42"),
+        ] {
+            assert_eq!(
+                source.get(node.span.clone()),
+                Some(spelling),
+                "reader origins must be exact UTF-8 byte ranges into the source: node={node:?}, source={source:?}"
+            );
+        }
+        fn assert_children_match_values(node: &SpannedVal) {
+            if node.children.is_empty() {
+                return;
+            }
+            let values: Vec<_> = node
+                .children
+                .iter()
+                .map(|child| child.value.clone())
+                .collect();
+            assert_eq!(
+                node.value,
+                Val::List(values),
+                "a structured reader node must project exactly to its child values: node={node:?}"
+            );
+            for child in &node.children {
+                assert_children_match_values(child);
+            }
+        }
+        assert_children_match_values(root);
+        assert_eq!(
+            parse_str(source).unwrap(),
+            vec![root.value.clone()],
+            "plain parsing must project the authoritative spanned tree: source={source:?}, root={root:?}"
+        );
+    }
+
+    #[test]
+    fn test_spanned_reader_sugar_uses_complete_original_ranges() {
+        let spellings = [
+            "' #| λ |# (a 'b)",
+            "`(a ,b ,@c)",
+            ", #| λ |# x",
+            ",@ (a b)",
+            "$2*x + 1$",
+            r#"["λ]\"", {"x": [1]}]"#,
+            r#"{"x": ["}\\", 1]}"#,
+        ];
+        for spelling in spellings {
+            let source = format!("; é\n(list {spelling} 42)");
+            let forms = parse_str_spanned(&source).unwrap_or_else(|error| {
+                panic!("reader sugar must parse inside an ordinary list: source={source:?}, error={error}")
+            });
+            let sugar = &forms[0].children[1];
+            assert_eq!(
+                source.get(sugar.span.clone()), Some(spelling),
+                "sugar must retain its complete original UTF-8 range: source={source:?}, sugar={sugar:?}"
+            );
+            assert!(
+                sugar.children.is_empty(),
+                "reader expansion must not invent child origins: source={source:?}, sugar={sugar:?}"
+            );
+            assert_eq!(
+                source.get(forms[0].children[2].span.clone()),
+                Some("42"),
+                "sugar must not consume the following form: source={source:?}, forms={forms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_projections_share_malformed_form_diagnostics() {
+        for source in [
+            "(",
+            ")",
+            "}",
+            "(}",
+            "'",
+            "' )",
+            ",@",
+            "$1",
+            "[1",
+            "[1}",
+            "{\"x\": 1",
+            "{ :x 1",
+            "{ :x }",
+            "\"abc",
+            "#| comment",
+        ] {
+            let plain = parse_str(source).expect_err("malformed form must fail plain parsing");
+            let spanned =
+                parse_str_spanned(source).expect_err("malformed form must fail spanned parsing");
+            assert_eq!(
+                plain.to_string(), spanned.to_string(),
+                "both projections must share grammar errors: source={source:?}, plain={plain:?}, spanned={spanned:?}"
+            );
+        }
     }
 
     #[test]
