@@ -2493,6 +2493,7 @@ impl ProgramRuntime {
             .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, caller))
     }
 
+    /// Attach the application-owned agent scheduler, replacing any prior attachment.
     pub fn attach_agent_scheduler<S: agents::AgentSpawning + 'static>(&self, scheduler: &Arc<S>) {
         *self
             .agent_scheduler

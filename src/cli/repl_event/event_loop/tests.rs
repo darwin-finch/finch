@@ -766,10 +766,23 @@ fn lifecycle_test_event_loop() -> (EventLoop, Arc<crate::cli::output_manager::Ou
         Arc::new(NeverCompletes),
         Vec::new(),
         Arc::new(tokio::sync::Mutex::new(executor)),
-        runtime,
+        Arc::clone(&runtime),
+    );
+    assert!(
+        runtime.agent_binding_for_test(None).is_some(),
+        "the named-Brain production-boundary runner must explicitly attach its scheduler"
     );
     let output = Arc::clone(&event_loop.output_manager);
     (event_loop, output)
+}
+
+#[tokio::test]
+async fn test_named_brain_runner_attaches_its_scheduler() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (_event_loop, _output) = lifecycle_test_event_loop();
+        })
+        .await;
 }
 
 fn lifecycle_identity(

@@ -26,6 +26,7 @@ impl EventLoop {
             provider_resolver.clone(),
             Arc::clone(&program_runtime),
         );
+        program_runtime.attach_agent_scheduler(&agent_scheduler);
         use crate::cli::repl_event::parts::{
             ContextLimits, DaemonParts, GenerationParts, RuntimeParts, SessionParts, ToolParts,
             UiParts,

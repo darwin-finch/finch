@@ -435,17 +435,19 @@ impl AgentSpawning for AgentScheduler {
 }
 
 impl AgentScheduler {
+    /// Construct a scheduler without installing it into the runtime.
     pub fn new(resolver: ProviderResolver, runtime: Arc<ProgramRuntime>) -> Arc<Self> {
         Self::with_context_store(resolver, runtime, Arc::new(AgentContextStore::default()))
     }
 
+    /// Construct a scheduler with an explicit context store without installing it into the runtime.
     pub fn with_context_store(
         resolver: ProviderResolver,
         runtime: Arc<ProgramRuntime>,
         context_store: Arc<AgentContextStore>,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
-        let scheduler = Arc::new_cyclic(|self_ref| Self {
+        Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
             resolver,
             runtime: Arc::clone(&runtime),
@@ -461,9 +463,7 @@ impl AgentScheduler {
             wait_before_provider_poll: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             notify_before_attempt_lock: tokio::sync::Mutex::new(None),
-        });
-        runtime.attach_agent_scheduler(&scheduler);
-        scheduler
+        })
     }
 
     pub fn context_store(&self) -> Arc<AgentContextStore> {
@@ -1299,6 +1299,30 @@ mod tests {
         }
     }
 
+    fn attached_scheduler(
+        resolver: ProviderResolver,
+        runtime: Arc<ProgramRuntime>,
+    ) -> Arc<AgentScheduler> {
+        let scheduler = AgentScheduler::new(resolver, Arc::clone(&runtime));
+        runtime.attach_agent_scheduler(&scheduler);
+        scheduler
+    }
+
+    #[test]
+    fn test_agent_scheduler_constructor_does_not_attach_to_runtime() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+
+        assert!(
+            runtime.agent_binding_for_test(None).is_none(),
+            "constructing scheduler {:p} must not mutate its runtime attachment slot",
+            Arc::as_ptr(&scheduler)
+        );
+    }
+
     struct EchoGenerator;
 
     struct BlockingGenerator {
@@ -1624,7 +1648,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_returns_identity_and_wait_joins_result() {
         let resolver = ProviderResolver::new(Arc::new(EchoGenerator));
-        let scheduler = AgentScheduler::new(resolver, Arc::new(ProgramRuntime::new()));
+        let scheduler = attached_scheduler(resolver, Arc::new(ProgramRuntime::new()));
         let reference = scheduler
             .context_store()
             .register("artifact", "report-1", b"verified report".to_vec())
@@ -1662,7 +1686,7 @@ mod tests {
 
     #[tokio::test]
     async fn named_brain_spawn_publishes_one_canonical_child_lifecycle() {
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::new(ProgramRuntime::new()),
         );
@@ -1756,7 +1780,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_child_cancellation_publishes_cancelled_terminal_state() {
         let started = Arc::new(Notify::new());
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(BlockingGenerator {
                 started: Arc::clone(&started),
             })),
@@ -1918,7 +1942,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_rejects_unbounded_or_empty_resource_budgets() {
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::new(ProgramRuntime::new()),
         );
@@ -1947,7 +1971,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_rejects_malformed_context_hash_before_creating_a_task() {
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::new(ProgramRuntime::new()),
         );
@@ -1977,7 +2001,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_rejects_unknown_or_mismatched_context_before_creating_a_task() {
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::new(ProgramRuntime::new()),
         );
@@ -2075,7 +2099,7 @@ mod tests {
     #[tokio::test]
     async fn installed_scheduler_does_not_implicitly_authorize_agent_words() {
         let runtime = Arc::new(ProgramRuntime::new());
-        let _scheduler = AgentScheduler::new(
+        let _scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2106,7 +2130,7 @@ mod tests {
     #[test]
     fn child_tools_route_effects_through_typed_programs() {
         let runtime = Arc::new(ProgramRuntime::new());
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2149,7 +2173,7 @@ mod tests {
     #[tokio::test]
     async fn wait_rechecks_completion_after_registering_notification() {
         let runtime = Arc::new(ProgramRuntime::new());
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2224,7 +2248,7 @@ mod tests {
     async fn agent_spawn_reenters_authority_to_snapshot_grants_without_deadlock() {
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2260,7 +2284,7 @@ mod tests {
     async fn forth_can_fork_and_join_without_shelling_out() {
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2316,7 +2340,7 @@ mod tests {
         runtime.spawn(async move {
             let program_runtime = Arc::new(ProgramRuntime::new());
             grant_agent_capabilities(&program_runtime);
-            let scheduler = AgentScheduler::new(
+            let scheduler = attached_scheduler(
                 ProviderResolver::new(Arc::new(EchoGenerator)),
                 Arc::clone(&program_runtime),
             );
@@ -2335,9 +2359,9 @@ mod tests {
                     budget: None,
                 })
                 .await;
-            // The scheduler hold is load-bearing: `AgentScheduler::new` stores
-            // only a `Weak` on the runtime, so dropping this `Arc` would make
-            // `agent-spawn` fail with "agent scheduler is unavailable". The
+            // The scheduler hold is load-bearing: the explicit runtime attachment stores
+            // only a `Weak`, so dropping this `Arc` would make `agent-spawn`
+            // fail with "agent scheduler is unavailable". The
             // status assertion below already catches that, so counting the
             // tasks is defence in depth and consistency with the two sibling
             // tests -- not a hole it plugs. It does say to the next reader why
@@ -2364,7 +2388,7 @@ mod tests {
     async fn typed_lisp_can_fork_and_join_without_shelling_out() {
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2398,7 +2422,7 @@ mod tests {
     async fn typed_agent_spec_selects_role_context_model_and_budgets() {
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2487,7 +2511,7 @@ mod tests {
         );
         runtime.grant_typed_capability(file_read.clone()).unwrap();
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2539,7 +2563,7 @@ mod tests {
     #[tokio::test]
     async fn forged_capability_grant_id_is_rejected_before_task_creation() {
         let runtime = Arc::new(ProgramRuntime::new());
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2567,7 +2591,7 @@ mod tests {
     async fn typed_agent_spec_routes_model_selection_through_the_resolver() {
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2611,7 +2635,7 @@ mod tests {
     async fn coforth_can_spawn_from_the_same_typed_agent_spec() {
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -2663,7 +2687,7 @@ mod tests {
     async fn typed_task_handles_can_be_polled_across_submissions() {
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
         );
@@ -3023,7 +3047,7 @@ mod tests {
     }
 
     async fn run_usage_script(script: Vec<AttemptAction>) -> (AgentUsage, Vec<AgentEvent>) {
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(AttemptGenerator::new(script)),
             Arc::new(ProgramRuntime::new()),
         );
@@ -3140,7 +3164,7 @@ mod tests {
         ]);
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(provider.clone()),
             Arc::clone(&runtime),
         );
@@ -3201,7 +3225,7 @@ mod tests {
         ]);
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let _scheduler = AgentScheduler::new(
+        let _scheduler = attached_scheduler(
             ProviderResolver::new(provider.clone()),
             Arc::clone(&runtime),
         );
@@ -3232,7 +3256,7 @@ mod tests {
         ]);
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(provider.clone()),
             Arc::clone(&runtime),
         );
@@ -3306,7 +3330,7 @@ mod tests {
         let provider = AttemptGenerator::new(vec![AttemptAction::Final("must never run")]);
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(provider.clone()),
             Arc::clone(&runtime),
         );
@@ -3374,7 +3398,7 @@ mod tests {
         let provider = AttemptGenerator::new(vec![AttemptAction::Final("must never run")]);
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(provider.clone()),
             Arc::clone(&runtime),
         );
@@ -3477,7 +3501,7 @@ mod tests {
         let provider = AttemptGenerator::new(vec![AttemptAction::ToolTurn]);
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(provider.clone()),
             Arc::clone(&runtime),
         );
@@ -3586,7 +3610,7 @@ mod tests {
         ]);
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let _scheduler = AgentScheduler::new(
+        let _scheduler = attached_scheduler(
             ProviderResolver::new(provider.clone()),
             Arc::clone(&runtime),
         );
@@ -3635,7 +3659,7 @@ mod tests {
         let provider = AttemptGenerator::new(vec![AttemptAction::Final("must never run")]);
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let scheduler = AgentScheduler::new(
+        let scheduler = attached_scheduler(
             ProviderResolver::new(provider.clone()),
             Arc::clone(&runtime),
         );
@@ -3785,7 +3809,7 @@ mod tests {
         ]);
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
-        let _scheduler = AgentScheduler::new(
+        let _scheduler = attached_scheduler(
             ProviderResolver::new(provider.clone()),
             Arc::clone(&runtime),
         );
