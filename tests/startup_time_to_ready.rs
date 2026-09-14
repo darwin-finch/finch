@@ -47,14 +47,14 @@
 //! Cited precisely, because two earlier revisions of this file did not, and
 //! because a third revision named the commit as though #364 had. This
 //! requirement is written in #364 and its precedent is #242's four attempts,
-//! the last of them repaired by `a0ea2c64`. It is
-//! **not** a rule in `AGENTS.md`: PR #391, "docs(agents): write down the
-//! no-wall-clock-assertion rule", proposed adding it and was closed DO NOT
-//! MERGE, on the ground that a blanket prohibition is not what `a0ea2c64`
-//! established and conflicts with the coarse liveness and resource bounds
-//! Finch accepts elsewhere -- including in the deadlines below. A reader who
-//! greps `AGENTS.md` for this rule will not find it, and should not have been
-//! told to look there.
+//! the last of them repaired by `a0ea2c64`. The narrow form now lives in
+//! `AGENTS.md`'s Testing section (#399): do not use precision or comparative
+//! timing as the sole correctness oracle when deterministic state, event, or
+//! order assertions are available. PR #391, "docs(agents): write down the
+//! no-wall-clock-assertion rule", proposed a blanket prohibition and was
+//! closed DO NOT MERGE, because that is not what `a0ea2c64` established and
+//! it conflicts with the coarse liveness and resource bounds Finch accepts
+//! elsewhere -- including in the deadlines below.
 //!
 //! So nothing here asserts a duration, a ratio, or a deadline as a
 //! *property*. The timings are recorded and reported; what is asserted is
@@ -1870,7 +1870,7 @@ fn test_the_startup_report_leaks_no_private_content() {
 /// to be structural rather than absolute wall-clock thresholds; this reports
 /// timings and asserts none. (That requirement lives in #364, whose precedent
 /// is #242's four timing attempts -- the last repaired by `a0ea2c64` -- and
-/// not in `AGENTS.md`; see this file's header.)
+/// in the narrow `AGENTS.md` Testing policy from #399; see this file's header.)
 ///
 /// It lives here rather than in a shell script because the shell version
 /// launched the TUI itself through `script(1)` and cleaned up with
