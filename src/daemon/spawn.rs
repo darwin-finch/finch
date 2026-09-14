@@ -127,6 +127,78 @@ where
     ))
 }
 
+/// Owner-only mode for the frontend-created daemon log.
+///
+/// `~/.finch/daemon.log` can contain provider errors, Brain names, paths, and
+/// diagnostics, so the frontend must not create or leave it world-readable.
+#[cfg(unix)]
+const FRONTEND_LOG_MODE: u32 = 0o600;
+
+/// Open the daemon log the frontend hands the child as stdout/stderr.
+///
+/// The daemon owns rotation and retention for its own log. The frontend only
+/// guarantees the directory exists and that the path is a regular file, so
+/// early child output has somewhere safe to land before the daemon binds its
+/// own descriptors. A fresh log is created owner-only; a log left
+/// world-readable by an older build is repaired in place, because the child
+/// cannot do that if it fails to start.
+fn open_frontend_log(log_path: &std::path::Path) -> Result<std::fs::File> {
+    let log_file = open_frontend_log_append(log_path)?;
+    #[cfg(unix)]
+    repair_frontend_log_permissions(&log_file, log_path);
+    Ok(log_file)
+}
+
+/// Create or append-open the frontend log without repairing an existing mode.
+///
+/// `OpenOptions::mode` applies only on create. Callers that must observe that
+/// fact (and `open_frontend_log`, which then repairs) share this open so a
+/// mutation of the create mode cannot hide behind a test-local copy.
+fn open_frontend_log_append(log_path: &std::path::Path) -> Result<std::fs::File> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+    crate::daemon::log::ensure_regular_file(log_path)?;
+
+    let mut log_options = std::fs::OpenOptions::new();
+    log_options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The daemon secures this file once it starts, but the frontend creates
+        // it first. Without an explicit mode a fresh log is created at
+        // 0o666 & ~umask — typically 0644 — and is world-readable for the
+        // second or two before the daemon takes over.
+        log_options.mode(FRONTEND_LOG_MODE);
+        // `ensure_regular_file` dropped its handle, so this open is what the
+        // child actually receives. Without O_NOFOLLOW a symlink planted in the
+        // window between them redirects the daemon's stdout and stderr.
+        log_options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    log_options
+        .open(log_path)
+        .with_context(|| format!("Failed to open daemon log file: {}", log_path.display()))
+}
+
+/// Repair a log left world-readable by an older build.
+///
+/// `OpenOptions::mode` does not change an existing file. The child cannot do
+/// this repair if it fails to start, so the frontend must.
+#[cfg(unix)]
+fn repair_frontend_log_permissions(log_file: &std::fs::File, log_path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = log_file.metadata() {
+        let mut perms = metadata.permissions();
+        if perms.mode() & 0o777 != FRONTEND_LOG_MODE {
+            perms.set_mode(FRONTEND_LOG_MODE);
+            if let Err(error) = log_file.set_permissions(perms) {
+                warn!(path = %log_path.display(), %error, "Could not secure the daemon log");
+            }
+        }
+    }
+}
+
 /// Spawn daemon as background process
 ///
 /// Detaches daemon from current process and redirects logs to ~/.finch/daemon.log
@@ -137,55 +209,8 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     let exe_path =
         std::env::current_exe().context("Failed to determine current executable path")?;
 
-    // Create log file in ~/.finch/daemon.log
     let log_path = crate::daemon::daemon_log_path()?;
-
-    // The daemon owns rotation and retention for its own log (#249). The
-    // frontend only guarantees the directory exists and that the path is a
-    // regular file, so early child output has somewhere safe to land before
-    // the daemon binds its own descriptors.
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
-    }
-    crate::daemon::log::ensure_regular_file(&log_path)?;
-
-    // Open log file in append mode for the child's stdout/stderr
-    let mut log_options = std::fs::OpenOptions::new();
-    log_options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // The daemon secures this file once it starts, but the frontend creates
-        // it first. Without an explicit mode a fresh log is created at
-        // 0o666 & ~umask — typically 0644 — and is world-readable for the
-        // second or two before the daemon takes over.
-        log_options.mode(0o600);
-        // The reconcile above dropped its handle, so this open is what the child
-        // actually receives. Without O_NOFOLLOW a symlink planted in the window
-        // between them redirects the daemon's stdout and stderr.
-        log_options.custom_flags(nix::libc::O_NOFOLLOW);
-    }
-    let log_file = log_options
-        .open(&log_path)
-        .with_context(|| format!("Failed to open daemon log file: {}", log_path.display()))?;
-
-    // `mode` applies only when the file is created. A log left world-readable
-    // by an older build must also be repaired, and the child cannot do it if it
-    // fails to start.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = log_file.metadata() {
-            let mut perms = metadata.permissions();
-            if perms.mode() & 0o777 != 0o600 {
-                perms.set_mode(0o600);
-                if let Err(error) = log_file.set_permissions(perms) {
-                    warn!(path = %log_path.display(), %error, "Could not secure the daemon log");
-                }
-            }
-        }
-    }
+    let log_file = open_frontend_log(&log_path)?;
 
     info!(
         exe = %exe_path.display(),
@@ -386,46 +411,94 @@ mod tests {
         crate::daemon::log::ensure_regular_file(&path).unwrap();
     }
 
-    /// NOT A REGRESSION TEST FOR `spawn_daemon`, despite its name. Pre-existing
-    /// (`65813dff`, #249) and left as it is by #364's work, but recorded here
-    /// because #364's round-3 sweep for "tests that assert on their own
-    /// re-implementation" found it: the body below performs the open and the
-    /// `fchmod` repair itself and asserts the mode it just set. `spawn_daemon`
-    /// is never called, so deleting the permission-repair block in it, or
-    /// changing its `mode(0o600)`, leaves this green and the daemon log
-    /// world-readable. What it does prove is the platform premise the repair
-    /// rests on -- that `OpenOptions::mode` does not apply to an existing file
-    /// -- which is the `assert_eq!(.., 0o644, "precondition")` line. Closing
-    /// the gap means extracting the open into a callable function, which is a
-    /// change to the daemon spawn path and does not belong in a startup
-    /// instrumentation change.
+    /// Unix mode bits of `path`, excluding type bits.
+    #[cfg(unix)]
+    fn unix_mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// The frontend spawn path must create `~/.finch/daemon.log` owner-only.
+    /// Without `OpenOptions::mode(0o600)` a fresh log is `0o666 & ~umask`
+    /// (typically 0o644) and world-readable until the daemon starts. The
+    /// repair that follows does not mask this: the test opens through the
+    /// production create path and does not call the repair.
+    #[test]
+    #[cfg(unix)]
+    fn test_frontend_open_creates_an_owner_only_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        assert!(
+            !path.exists(),
+            "precondition: OpenOptions::mode applies only when the file is created"
+        );
+
+        open_frontend_log_append(&path).unwrap_or_else(|error| {
+            panic!("frontend spawn must be able to create the daemon log: {error:#}")
+        });
+
+        let mode = unix_mode(&path);
+        assert_eq!(
+            mode, 0o600,
+            "frontend spawn must create the daemon log owner-only (mode 0o600); \
+             without OpenOptions::mode a fresh log is 0o666 & ~umask (typically 0o644) and \
+             world-readable. The log can contain provider errors, Brain names, paths, and \
+             diagnostics. observed mode={mode:#o}"
+        );
+    }
+
+    /// The frontend spawn path must repair a log left world-readable by an
+    /// older build. `OpenOptions::mode` does not change an existing file, and
+    /// the child cannot fchmod if it fails to start, so `spawn_daemon` has to
+    /// do it. This calls `open_frontend_log` — the same function
+    /// `spawn_daemon` uses — rather than reproducing the chmod in the test.
     #[test]
     #[cfg(unix)]
     fn test_frontend_open_repairs_a_world_readable_log() {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.log");
         std::fs::write(&path, b"inherited\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        // The same open the frontend performs before handing the fd to the child.
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true).mode(0o600);
-        options.custom_flags(nix::libc::O_NOFOLLOW);
-        let file = options.open(&path).unwrap();
-
-        // `mode` applies only on create, so an existing file needs the fchmod
-        // repair; without it the log stays world-readable whenever the child
-        // fails to start.
-        let mut perms = file.metadata().unwrap().permissions();
-        assert_eq!(perms.mode() & 0o777, 0o644, "precondition");
-        perms.set_mode(0o600);
-        file.set_permissions(perms).unwrap();
-
+        let planted = unix_mode(&path);
         assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
+            planted, 0o644,
+            "precondition: planted a world-readable daemon log so the production \
+             repair has something to fix. observed mode={planted:#o}"
+        );
+
+        // Platform premise the repair exists for: OpenOptions::mode does not
+        // change an existing file. If this failed, the fchmod would be dead
+        // and deleting it would still leave the log at 0o600.
+        open_frontend_log_append(&path).unwrap_or_else(|error| {
+            panic!("frontend spawn must be able to open the inherited daemon log: {error:#}")
+        });
+        let after_open = unix_mode(&path);
+        assert_eq!(
+            after_open, 0o644,
+            "precondition: OpenOptions::mode applies only on create, so an inherited \
+             0o644 daemon.log stays world-readable until the fchmod repair. \
+             observed mode={after_open:#o}"
+        );
+
+        open_frontend_log(&path).unwrap_or_else(|error| {
+            panic!("frontend spawn must be able to repair the inherited daemon log: {error:#}")
+        });
+
+        let mode = unix_mode(&path);
+        assert_eq!(
+            mode, 0o600,
+            "frontend spawn must repair a world-readable daemon log to owner-only \
+             (mode 0o600); OpenOptions::mode does not change an existing file, and \
+             the child cannot do this if it fails to start. The log can contain \
+             provider errors, Brain names, paths, and diagnostics. \
+             observed mode={mode:#o}"
         );
     }
 
