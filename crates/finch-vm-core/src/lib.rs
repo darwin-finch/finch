@@ -5,6 +5,7 @@
 //! facade rather than importing this crate directly.
 
 mod capability;
+mod construction;
 mod diagnostic;
 mod effects;
 mod ir;
@@ -20,6 +21,10 @@ pub use capability::{
     CapabilityAuditAction, CapabilityAuditEntry, CapabilityAuthorizationAuditEntry,
     CapabilityAvailability, CapabilityGrant, CapabilityLedger, CapabilityPolicy, CapabilityRequest,
     GrantScope, GrantSet,
+};
+pub use construction::{
+    certify_module, BoolBranch, Elaborated, FunctionCertified, LoopBinding, ModuleSealed,
+    ModuleVerified, Parsed, SemanticBinding, SemanticBuilder, SEMANTIC_CONSTRUCTION_VERSION,
 };
 pub use diagnostic::{
     nearest_names, DiagnosticPhase, Severity, SourceLanguage, SourceOrigin, SourceSpan,

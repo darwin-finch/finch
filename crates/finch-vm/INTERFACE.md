@@ -150,6 +150,14 @@ pub struct Module { … }
 impl Module {
     pub fn single(function: Function) -> Self;
 }
+/// The only compiler phase permitted to reach execution. Re-exported from `finch-vm-core`.
+pub struct ModuleVerified { … }
+impl ModuleVerified {
+    /// The independently verified module retained for interpretation.
+    pub fn as_verified(&self) -> &VerifiedModule;
+    /// Unwrap the serializable verified module used by checkpoints.
+    pub fn into_verified(self) -> VerifiedModule;
+}
 /// Argument-dependent network authority. Re-exported from `finch-vm-core`.
 pub struct NetworkSelectorTemplate { … }
 impl NetworkSelectorTemplate {
@@ -197,8 +205,6 @@ pub struct SourceSpan { … }
 impl SourceSpan {
     pub fn bytes(source_id: impl Into<String>, start_byte: usize, end_byte: usize) -> Self;
 }
-/// A reader value paired with the exact byte range that produced it. Re-exported from `finch-colisp`.
-pub struct SpannedVal { … }
 /// A typed stack row. Re-exported from `finch-vm-core`.
 pub struct StackRow { … }
 impl StackRow {
@@ -230,6 +236,10 @@ impl Type {
 }
 /// Result of compiling and interpreting one source submission.
 pub struct TypedExecution { … }
+impl TypedExecution {
+    /// Construct a failed execution from compiler or verifier diagnostics.
+    pub fn failed(diagnostics: Vec<VmDiagnostic>) -> Self;
+}
 pub enum TypedExecutionStatus { Completed, Suspended, AuthorizationRequired, Failed }
 /// Persistent typed stack shared by Finch Lisp and Co-Forth source.
 pub struct TypedRuntime { … }
@@ -238,10 +248,11 @@ impl TypedRuntime {
     pub fn cancel_suspended_cpu_fiber(&self, suspension: &TypedSuspension) -> Result<bool, VmDiagnostic>;
     /// Capture only state that can safely survive outside this process.
     pub fn checkpoint(&self) -> Result<TypedRuntimeCheckpoint, VmDiagnostic>;
-    pub fn execute(&mut self, language: ProgramLanguage, source_id: &str, source: &str, fuel: u64) -> TypedExecution;
-    pub fn execute_with_declaration(&mut self, language: ProgramLanguage, source_id: &str, source: &str, fuel: u64, declared: Option<&EffectSet>) -> TypedExecution;
+    /// Execute a verified module.
+    pub fn execute(&mut self, module: &ModuleVerified, fuel: u64) -> TypedExecution;
+    pub fn execute_with_declaration(&mut self, module: &ModuleVerified, fuel: u64, declared: Option<&EffectSet>) -> TypedExecution;
     /// Execute using a host-owned capability handler.
-    pub fn execute_with_handler<H: CapabilityHandler>(&mut self, language: ProgramLanguage, source_id: &str, source: &str, fuel: u64, declared: Option<&EffectSet>, handler: &mut H) -> TypedExecution;
+    pub fn execute_with_handler<H: CapabilityHandler>(&mut self, module: &ModuleVerified, fuel: u64, declared: Option<&EffectSet>, handler: &mut H) -> TypedExecution;
     /// Restore a checkpoint into a fresh typed runtime and reverify every persisted definition against the current core vocabulary.
     pub fn from_checkpoint(checkpoint: TypedRuntimeCheckpoint) -> Result<Self, Vec<VmDiagnostic>>;
     pub fn functions(&self) -> &BTreeMap<String, Function>;
@@ -274,19 +285,6 @@ impl TypedValue {
 pub enum UiOperation { Create, Append, Replace, Status, Progress, Complete, Fail }
 /// Bounded or indeterminate progress metadata carried as data, rather than terminal control codes.
 pub struct UiProgress { … }
-/// Re-exported from `finch-colisp`.
-pub enum Val { Nil, Bool, Int, Float, Str, Symbol, Bytes, List }
-impl Val {
-    pub fn as_bytes(&self) -> anyhow::Result<&[u8]>;
-    pub fn as_float(&self) -> anyhow::Result<f64>;
-    pub fn as_int(&self) -> anyhow::Result<i64>;
-    pub fn as_list(&self) -> anyhow::Result<&[Val]>;
-    pub fn as_str(&self) -> anyhow::Result<&str>;
-    pub fn is_truthy(&self) -> bool;
-    /// Like Display but wraps strings in quotes (for printing inside lists).
-    pub fn repr(&self) -> String;
-    pub fn type_name(&self) -> &'static str;
-}
 /// Re-exported from `finch-vm-core`.
 pub struct VerifiedFunction { … }
 /// A verified module is immutable execution data. Re-exported from `finch-vm-core`.
@@ -294,6 +292,8 @@ pub struct VerifiedModule { … }
 /// Re-exported from `finch-vm-core`.
 pub struct Verifier<'a> { … }
 impl Verifier {
+    /// Local structural certification of one function.
+    pub fn certify_function(&self, function: &Function, module_functions: &BTreeMap<String, Function>) -> Result<VerifiedFunction, Vec<VmDiagnostic>>;
     pub fn new(vocabulary: &'a Vocabulary) -> Self;
     pub fn verify(&self, module: Module) -> Result<VerifiedModule, Vec<VmDiagnostic>>;
 }
@@ -363,14 +363,6 @@ pub fn agent_task_spec_type() -> Type { … }
 pub fn capability_grant_entry_type() -> Type { … }
 /// Classify a rejected provider submission for aggregate conformance metrics.
 pub fn classify_wire_failure(source: &str, diagnostic: &str) -> WireFailureClass { … }
-/// Compile user/model-entered Co-Forth source text directly into Finch typed stack IR and run the common verifier. Re-exported from `finch-coforth`.
-pub fn compile_forth(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary) -> Result<VerifiedModule, Vec<VmDiagnostic>> { … }
-/// Compile Co-Forth source with additional already-lowered functions available for definition calls, then verify the complete typed module. Re-exported from `finch-coforth`.
-pub fn compile_forth_with_functions(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary, linked_functions: &BTreeMap<String, Function>) -> Result<VerifiedModule, Vec<VmDiagnostic>> { … }
-/// Parse and compile Finch Lisp directly into the common typed stack IR. Re-exported from `finch-colisp`.
-pub fn compile_lisp(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary) -> Result<VerifiedModule, Vec<VmDiagnostic>> { … }
-/// Re-exported from `finch-colisp`.
-pub fn compile_lisp_with_functions(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary, linked_functions: &BTreeMap<String, Function>) -> Result<VerifiedModule, Vec<VmDiagnostic>> { … }
 /// Canonical signatures for verifier-facing consumers. Re-exported from `finch-vm-core`.
 pub fn core_vocabulary() -> Vocabulary { … }
 /// Return provider-neutral documentation for a registered core word. Re-exported from `finch-vm-core`.
@@ -381,12 +373,6 @@ pub fn core_word_registry() -> &'static BTreeMap<String, CoreWordSpec> { … }
 pub fn core_word_spec(name: &str) -> Option<CoreWordSpec> { … }
 /// Instantiate a selector template in a declared capability requirement against the arguments of a call.
 pub fn instantiate_requirement(requirement: &CapabilityRequirement, arguments: &[TypedValue]) -> Result<CapabilityRequirement, String> { … }
-/// Parse a full math expression from `src` into a Lisp Val tree. Re-exported from `finch-colisp`.
-pub fn parse_math(src: &str) -> Result<Val> { … }
-/// Parse all top-level expressions from `src`. Re-exported from `finch-colisp`.
-pub fn parse_str(src: &str) -> Result<Vec<Val>> { … }
-/// Parse all top-level expressions while retaining their source structure. Re-exported from `finch-colisp`.
-pub fn parse_str_spanned(src: &str) -> Result<Vec<SpannedVal>> { … }
 /// Re-exported from `finch-vm-core`.
 pub fn tree_entry_type() -> Type { … }
 /// Re-exported from `finch-vm-core`.
@@ -398,6 +384,8 @@ pub fn wire_diagnostic_code(diagnostic: &str) -> Option<String> { … }
 ## Constants
 
 ```rust
+/// Version of the frontend-facing semantic-construction protocol. Re-exported from `finch-vm-core`.
+pub const SEMANTIC_CONSTRUCTION_VERSION: u32 = 1;
 /// Version of the typed VM contract and serialized IR family. Re-exported from `finch-vm-core`.
 pub const VM_TYPE_SYSTEM_VERSION: u32 = 5;
 ```

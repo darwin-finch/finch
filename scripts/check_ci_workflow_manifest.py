@@ -16,9 +16,25 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = Path(".github/workflows")
 
 EXPECTED_WORKFLOWS = (
+    "ci-superseded-run-cancellation.yml",
     "ci.yml", "docs.yml", "issue-201-chatgpt-auth.yml",
     "issue-56-brain-isolation.yml", "release.yml", "repository-hygiene.yml",
 )
+
+# Trusted default-branch controller for canonical CI supersession. It is not
+# pull-request active; membership is the empty fixture set.
+CANCELLATION_WORKFLOW = "ci-superseded-run-cancellation.yml"
+CANCELLATION_JOB = "cancel-superseded"
+CANCELLATION_JOB_IF = (
+    "github.event.action == 'requested' || github.event.workflow_run.run_attempt > 1"
+)
+CANCELLATION_PERMISSIONS = {"actions": "write", "pull-requests": "read"}
+CANCELLATION_WORKFLOW_RUN = {
+    "workflows": ["CI"],
+    "types": ["requested", "in_progress"],
+}
+CANCELLATION_STEP = "Cancel superseded canonical CI runs"
+CANCELLATION_TOKEN = "${{ github.token }}"
 
 # Exact triggers are reviewed separately from fixture activation so a path change cannot hide
 # merely because none of the representative fixtures exercises it.
@@ -1026,6 +1042,109 @@ def escape_api_errors(root: Path) -> list[str]:
     ]
 
 
+def cancellation_controller_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
+    """Check the effective privileged envelope, not a line-set/regex oracle.
+
+    Whitespace-equivalent duplicate YAML keys such as ``if : false`` or
+    ``actions : read`` are already rejected by ``load_yaml``. This function
+    then checks the parsed mapping GitHub would execute: one workflow_run
+    trigger, exact cancel permissions, and the required job condition.
+    """
+    document = documents.get(CANCELLATION_WORKFLOW)
+    if document is None:
+        return []
+    errors: list[str] = []
+    display = CANCELLATION_WORKFLOW
+    if document.get("name") != "Cancel superseded CI runs":
+        errors.append(
+            f"{display}: workflow name changed; "
+            f"expected='Cancel superseded CI runs' actual={document.get('name')!r}"
+        )
+    triggers = document.get("on")
+    if not isinstance(triggers, dict) or set(triggers) != {"workflow_run"}:
+        errors.append(
+            f"{display}: trusted controller must subscribe only to workflow_run; "
+            f"actual={triggers!r}"
+        )
+    elif triggers.get("workflow_run") != CANCELLATION_WORKFLOW_RUN:
+        errors.append(
+            f"{display}: workflow_run trigger changed; "
+            f"expected={CANCELLATION_WORKFLOW_RUN!r} actual={triggers.get('workflow_run')!r}"
+        )
+    if document.get("permissions") != CANCELLATION_PERMISSIONS:
+        errors.append(
+            f"{display}: effective permissions changed; "
+            f"expected={CANCELLATION_PERMISSIONS!r} actual={document.get('permissions')!r}"
+        )
+    if "concurrency" in document:
+        errors.append(
+            f"{display}: concurrency groups cannot encode source-age ordering; remove them"
+        )
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict) or tuple(jobs) != (CANCELLATION_JOB,):
+        actual = list(jobs) if isinstance(jobs, dict) else jobs
+        errors.append(
+            f"{display}: exactly one job {CANCELLATION_JOB!r} is required; actual={actual!r}"
+        )
+        return errors
+    job = jobs[CANCELLATION_JOB]
+    if not isinstance(job, dict):
+        errors.append(f"{display}: job {CANCELLATION_JOB!r} must be a mapping")
+        return errors
+    if job.get("if") != CANCELLATION_JOB_IF:
+        errors.append(
+            f"{display}: job {CANCELLATION_JOB!r} condition changed; "
+            f"expected={CANCELLATION_JOB_IF!r} actual={job.get('if')!r}"
+        )
+    if job.get("runs-on") != "ubuntu-24.04":
+        errors.append(
+            f"{display}: job {CANCELLATION_JOB!r} must run on ubuntu-24.04; "
+            f"actual={job.get('runs-on')!r}"
+        )
+    if job.get("timeout-minutes") != 5:
+        errors.append(
+            f"{display}: job {CANCELLATION_JOB!r} timeout-minutes must be 5; "
+            f"actual={job.get('timeout-minutes')!r}"
+        )
+    if "permissions" in job:
+        errors.append(
+            f"{display}: job {CANCELLATION_JOB!r} must inherit workflow permissions; "
+            f"actual={job.get('permissions')!r}"
+        )
+    if "concurrency" in job:
+        errors.append(f"{display}: job {CANCELLATION_JOB!r} must not set a concurrency group")
+    if job.get("continue-on-error") not in (None, False):
+        errors.append(f"{display}: job {CANCELLATION_JOB!r} must gate failure")
+    steps = job.get("steps")
+    if not isinstance(steps, list) or len(steps) != 1 or not isinstance(steps[0], dict):
+        errors.append(f"{display}: job {CANCELLATION_JOB!r} must contain exactly one trusted step")
+        return errors
+    step = steps[0]
+    if step.get("name") != CANCELLATION_STEP:
+        errors.append(f"{display}: trusted step name changed; actual={step.get('name')!r}")
+    if "uses" in step:
+        errors.append(
+            f"{display}: trusted controller must not checkout or run an action; "
+            f"uses={step.get('uses')!r}"
+        )
+    if step.get("env") != {"TOKEN": CANCELLATION_TOKEN}:
+        errors.append(
+            f"{display}: trusted step token binding changed; "
+            f"expected={{'TOKEN': {CANCELLATION_TOKEN!r}}} actual={step.get('env')!r}"
+        )
+    run = step.get("run")
+    if not isinstance(run, str) or "python3 - <<'PYTHON'" not in run or not run.rstrip().endswith("PYTHON"):
+        errors.append(f"{display}: trusted step must run one literal PYTHON heredoc")
+    if step.get("if") is not None:
+        errors.append(
+            f"{display}: trusted step must run whenever the job runs; "
+            f"actual if={step.get('if')!r}"
+        )
+    if step.get("continue-on-error") not in (None, False):
+        errors.append(f"{display}: trusted step must gate failure")
+    return errors
+
+
 def compare_contract(root: Path) -> list[str]:
     directory = root / WORKFLOWS
     actual_files = tuple(sorted(path.name for path in directory.glob("*.y*ml")))
@@ -1098,6 +1217,7 @@ def compare_contract(root: Path) -> list[str]:
     errors.extend(isolation_errors(documents))
     errors.extend(ordinary_ci_supervision_errors(documents))
     errors.extend(cache_contract_errors(documents))
+    errors.extend(cancellation_controller_errors(documents))
     errors.extend(escape_api_errors(root))
     return errors
 

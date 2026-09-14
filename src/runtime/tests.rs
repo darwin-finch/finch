@@ -6230,7 +6230,20 @@ async fn revision_history_checkpoint_restores_persisted_vocabulary() {
         .and_then(|snapshot| snapshot.checkpoint.clone())
         .expect("pure revision exposes a restorable VM checkpoint");
     let mut restored = TypedRuntime::from_checkpoint(checkpoint).unwrap();
-    let result = restored.execute(ProgramLanguage::Forth, "restore.forth", "square", 1_000);
+    let module = crate::language::compile_with_functions(
+        ProgramLanguage::Forth,
+        "restore.forth",
+        "square",
+        restored
+            .stack()
+            .iter()
+            .map(crate::vm::TypedValue::value_type)
+            .collect(),
+        restored.vocabulary(),
+        restored.functions(),
+    )
+    .expect("restored checkpoint must compile square through the language facade");
+    let result = restored.execute(&module, 1_000);
 
     assert_eq!(result.status, TypedExecutionStatus::Completed);
     assert_eq!(restored.stack(), &[TypedValue::Int(49)]);

@@ -2375,6 +2375,31 @@ mod tests {
         decode_checkpoint_bytes(&encode_checkpoint_bytes(value)?)
     }
 
+    fn execute_source(
+        runtime: &mut TypedRuntime,
+        language: ProgramLanguage,
+        source_id: &str,
+        source: &str,
+        fuel: u64,
+    ) -> crate::vm::TypedExecution {
+        let initial_types = runtime
+            .stack()
+            .iter()
+            .map(crate::vm::TypedValue::value_type)
+            .collect();
+        match crate::language::compile_with_functions(
+            language,
+            source_id,
+            source,
+            initial_types,
+            runtime.vocabulary(),
+            runtime.functions(),
+        ) {
+            Ok(module) => runtime.execute(&module, fuel),
+            Err(diagnostics) => crate::vm::TypedExecution::failed(diagnostics),
+        }
+    }
+
     fn round_trip_effect_record(
         execution_id: uuid::Uuid,
         entry: &EffectJournalEntry,
@@ -2851,7 +2876,8 @@ mod tests {
     #[test]
     fn real_closure_and_suspended_fiber_checkpoint_round_trip() -> Result<()> {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = execute_source(
+            &mut runtime,
             ProgramLanguage::Lisp,
             "checkpoint.lisp",
             "(begin \
@@ -2879,7 +2905,8 @@ mod tests {
 
         let mut restored = TypedRuntime::from_checkpoint(decoded)
             .map_err(|errors| anyhow!("checkpoint failed verification: {errors:?}"))?;
-        let advanced = restored.execute(
+        let advanced = execute_source(
+            &mut restored,
             ProgramLanguage::Forth,
             "advance.forth",
             "fiber-next",
