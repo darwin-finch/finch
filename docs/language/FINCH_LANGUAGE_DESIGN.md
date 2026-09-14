@@ -85,6 +85,16 @@ optimization, linking, and independent IR verification operate on retained struc
 may rescan source, serialize transformed code, and reparse it. The independent verifier remains
 mandatory because it proves the produced IR rather than interpreting source a second time.
 
+Each source identity owns one immutable byte buffer, normally interned by content identity for the
+life of every diagnostic/compiler artifact that refers to it. Original-source spans are compact
+`(source_id, start_byte, end_byte)` references into that buffer; AST nodes do not allocate substring
+copies merely to retain spelling or location. A reader may intern a decoded symbol or store the
+semantic value of a literal, but diagnostics, source maps, and macro provenance recover original
+text lazily through the span. Offsets are byte offsets with validated token boundaries, so slicing
+never depends on platform character width. Generated syntax carries an expansion-origin chain and
+only owns text that has no original source span. Serialization deduplicates the source table rather
+than embedding the same source fragment in each node.
+
 Source order is independent from this parsing constraint. During parsing, the frontend registers a
 top-level declaration skeleton as soon as its header is stable and publishes its body node when that
 region is complete. A job may then wait for a skeleton encountered later, so later definitions are
