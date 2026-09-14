@@ -416,6 +416,37 @@ dynamic dispatch cost merely because the Lisp frontend exists.
 The serialized `ProgramValue` form is the wire/checkpoint representation, not necessarily the
 in-memory stack layout.
 
+### Records, layout, placement, and member access
+
+`record` is the one user-defined product aggregate in core CoLisp and Co-Forth. There are no
+separate class, struct, heap-object, or reference-record declarations. A record definition owns its
+logical fields, visibility, construction invariants, and layout contract; it does not select stack
+versus heap placement, an ownership policy, or static versus dynamic behavioral dispatch. The same
+`Foo` may therefore be frame-owned inline, embedded inside another record, placed behind
+`Unique<Foo>` or `Shared<Foo>`, or borrowed through any of those carriers without becoming a
+different aggregate type.
+
+Native record layout is compiler-owned and may evolve with the compiler/runtime ABI. An explicit
+layout declaration chooses a stronger contract when required: conceptually `repr(native)` is the
+optimized default, `repr(C)` follows the target C ABI, and `repr(stable N)` freezes a versioned Finch
+module/FFI representation. Explicit packing, alignment, field-offset, or validity claims are unsafe
+layout contracts. Exported opaque records expose operations without exposing offsets. Published
+non-opaque layouts contribute their representation version, size, alignment, field order, and
+calling convention to the module interface and compatibility hash.
+
+Human-facing member syntax uses one `.` operation; there is no separate `->`. Member access and an
+ordinary borrowed call may apply the same bounded safe receiver projection: a direct `Foo`, a
+scoped `&Foo`, or a uniquely selected `Owner<Foo>` borrow projection all present the same logical
+receiver. Resolution tries a direct member first, then one proven borrow projection, and reports
+ambiguity rather than following an unbounded user-defined dereference chain. Mutable access must
+produce an exclusive `&mut Foo`; `Shared<Foo>` cannot do so merely because it can produce `&Foo`.
+A raw pointer is never an automatic safe projection.
+
+Records and maps remain different representations. A record field has a compile-time type and
+offset and cannot be absent. A `map<K,V>` performs runtime key lookup. Repeated dynamic shapes may
+later receive JIT shape/offset caches, but static records do not begin as hash maps and pay to
+recover their declared structure.
+
 `option<T>` and `result<T,E>` are ordinary standard-library definitions over the general closed
 variant facility. The compiler privileges neither their names nor their constructors. They gain
 exhaustive destructuring from normal pattern matching and may expose ordinary `map`, `and-then`,
@@ -1095,6 +1126,41 @@ through `CaptureGet`; parameters become frame locals in normal call order. A clo
 captures a proven scoped borrow or an owner, never an unchecked alias to a caller operand stack,
 mutable frame, grant, or ambient host authority.
 
+Lambda capture policy is an optional structured operand of the lambda form, not a runtime
+parameter. Illustrative canonical CoLisp forms are:
+
+```lisp
+(lambda (x) body...)                         ; inferred minimal captures
+(lambda :move (x) body...)                   ; used free bindings captured by value
+(lambda (:captures (borrow config)
+                   (take socket)
+                   (retain cache))
+        (x)
+        body...)                              ; exact capture contract
+(lambda (:captures :move (borrow config))
+        ()
+        body...)                              ; value default with an override
+```
+
+With no policy, the compiler may infer scoped borrows for a closure proven not to escape or
+suspend. If such a closure is returned, stored, deferred, dynamically erased, passed to an unknown
+callee, or crosses suspension, compilation fails at that boundary and suggests `:move`, an explicit
+owning capture, or a `scoped` callback contract. `:move` captures each used free binding by value
+according to its existing type: `Copy` values copy, unique owners and other non-copyable values
+move, `Shared<T>` retains/copies its handle, and moving an existing borrow moves only that borrow
+without acquiring its referent. An exact `:captures` list rejects unlisted free bindings. Capture
+entries may explicitly borrow, mutably borrow, take, retain, weaken, clone, or bind a computed
+expression under a capture name; each operation uses its ordinary ownership and effect contract.
+
+The compiler materializes captures conceptually as one anonymous record plus a code identity. That
+record is the callable's hidden receiver: readonly invocation borrows it, mutation of captured
+fields requires an exclusive receiver, and consuming an owned capture requires a taking receiver.
+The corresponding callable evidence is generated from those operations. A `self` referenced by a
+lambda inside an operation is an ordinary capture, not a second privileged context pointer.
+Lexically nested record declarations are context-free and never gain a hidden outer-object or
+enclosing-frame field merely because of their declaration location; required context must be an
+explicit field or closure capture.
+
 For example, this Lisp:
 
 ```lisp
@@ -1129,17 +1195,14 @@ This is also why `(defer :cpu (lambda () ...))` is safe: it moves unique capture
 captures into a separate CPU task and never shares a borrowed parent stack location.
 
 **Target representation and allocation rule.** Copyable primitive captures (`int`, `bool`,
-`float`, `char`, symbols, small opaque handles) are copied inline in the closure value. A
-non-escaping closure may borrow a non-copyable capture when local dataflow proves its extent. An
-escaping closure must acquire an owner: capturing a unique value moves it; capturing a shared value
-retains a handle. The initial interpreter may represent a short-lived closure as an owned
-`TypedValue::Closure` and needs no tracing heap. It must not manufacture a heap environment for a
-non-escaping direct call merely for frontend convenience. Later escape analysis may stack-allocate
-or inline a closure that is immediately called and never stored, returned, deferred, or passed to
-an unknown callee; that optimization is semantics-preserving and optional. A closure is treated as
-escaping, and its environment gets stable explicit ownership, when it is returned, stored in a
-collection/record/dictionary, placed on the persistent VM stack, passed through `dynamic`, used by
-`defer`, or handed to a host boundary.
+`float`, `char`, symbols, small opaque handles) are copied inline in the closure value. An explicit
+or inferred borrow remains a scoped borrow; an owning capture stores its actual inline, unique,
+shared, weak, or user-defined carrier. The initial interpreter may represent a short-lived closure
+as an owned `TypedValue::Closure` and needs no tracing heap. Escape analysis may stack-allocate,
+inline, or eliminate a closure environment when that is unobservable, but it never changes what
+the source capture policy captured. A closure is conservatively escaping when it is returned,
+stored in a collection/record/dictionary, placed on the persistent VM stack, passed through
+`dynamic`, used by `defer`, or handed to a host or unknown call boundary.
 
 Capability requirements compose from the generated function signature into `MakeClosure` and every
 call site. Capturing a string/path/resource does not capture authority; only the resulting verified
@@ -1480,6 +1543,13 @@ other stack borrow is a compile error; promotion consumes the stack value and in
 binding. A raw pointer is a non-owning unsafe/FFI primitive and never acquires cleanup behavior by
 accident.
 
+Core safe memory management requires no tracing garbage collector. Frame ownership, moves,
+explicit unique/shared carriers, deterministic drop, and bounded borrow analysis provide the
+default storage model; reference counting is paid only by a chosen shared carrier. A host or
+library may expose a tracing arena as an explicit owner implementation with declared safepoint,
+pinning, finalization, and checkpoint behavior, but that extension cannot change ordinary record,
+closure, or pointer semantics or make finalization nondeterministic for other owners.
+
 All constructed values may define deterministic destruction. A stack/frame value is dropped when
 its owning scope unwinds. A unique heap pointee is destroyed and deallocated when its `Unique`
 owner drops. A shared heap pointee is destroyed and deallocated when the final strong `Shared`
@@ -1522,6 +1592,31 @@ workers requires `Transfer<T>` evidence. Retaining a shared owner across workers
 requires `ShareAcrossWorkers<T>` evidence, normally derived only for immutable values or explicitly
 synchronized containers. Reference counting alone is not a thread-safety claim.
 
+### Receiver mutability, deep immutability, and copy-on-write
+
+Receiver access is the ordinary mutability contract. A receiver defaults to readonly `&self`;
+mutation requires `&mut self`, and ownership escape or destruction requires `take self`. An
+operation declared with `&self` is usable through mutable, readonly, unique, shared, or deeply
+immutable storage because it promises not to mutate through that receiver. The compiler rejects
+mutation in such an operation and should diagnose an unnecessarily exclusive private receiver, so
+one implementation does not need mutable/const/immutable/inout overloads merely to express that it
+does not write.
+
+Readonly access is not a D-style transitive type constructor applied implicitly to the entire
+reachable object graph. It prevents mutation through that borrow. Deep immutability is a separate
+explicit guarantee, represented by immutable/frozen owner evidence, and is required only by APIs
+that depend on permanent non-mutation, cross-worker sharing without synchronization, ROM placement,
+or similar properties. Interior mutation remains possible only through a carrier whose public
+evidence states the synchronization or transactional policy.
+
+Copy-on-write is likewise an explicit library ownership policy such as `Cow<T>`, not the default
+semantics of record member calls or `Shared<T>`. Read projection from `Cow<T>` never clones; an
+exclusive edit may prove uniqueness or clone using declared copy/clone evidence before lending
+`&mut T`. This makes the possible allocation visible in the carrier type and excludes resources,
+pinned/self-referential values, identity-sensitive objects, and other values without valid clone
+evidence. The optimizer may remove a uniqueness check or allocation when it proves the carrier is
+already sole and the change is unobservable.
+
 ### Borrowed results, ranges, closures, and suspension
 
 A borrowed view, range, iterator, or slice may remain allocation-free inside the scope that owns its
@@ -1530,11 +1625,13 @@ stored range therefore owns its source carrier, retains a shared source, materia
 or uses an explicit dynamic owner envelope. This permits Voldemort adaptor types and fused
 stack-local pipelines without exporting Rust-style lifetime parameters.
 
-A non-escaping closure may borrow captures only while the compiler proves the closure remains within
-the invocation and never suspends. An escaping, stored, returned, deferred, or dynamically erased
-closure must capture owners: unique captures move and shared captures retain. The same rule applies
+A closure with inferred or explicit borrowed captures is valid only while the compiler proves that
+it remains within the invocation and never suspends. An escaping, stored, returned, deferred, or
+dynamically erased closure must use `:move` or an explicit capture list that supplies owners: unique
+captures move and shared captures retain according to their carrier behavior. The same rule applies
 to async state machines and continuations. No borrowed reference survives a checkpoint, worker
-migration, or host-effect suspension.
+migration, or host-effect suspension, and escape analysis never silently promotes a borrow into an
+owning capture.
 
 These restrictions intentionally trade a small amount of Rust's most general borrowed-return
 expressiveness for bounded local dataflow analysis, predictable compilation time, and errors at the
@@ -1569,10 +1666,11 @@ invisible snapshot copy.
 Every ownership construct exposed by CoLisp must have a direct typed Co-Forth spelling or word:
 borrowing, taking, unique/shared/weak construction, promotion, static/dynamic owner evidence, drop,
 unsafe boundaries, variant construction/destructuring, `throw`, handler regions, catch patterns,
-and `nothrow` guarantees. Co-Forth stack effects record whether an input is borrowed or consumed,
-and its handler syntax lowers to the same exceptional edges and match decision trees, so its direct
-operation mapping to typed IR loses no source-level guarantee. CoLisp lowers the same semantics
-rather than routing through Co-Forth text.
+`nothrow` guarantees, record layout declarations, safe receiver projection, and inferred/move/exact
+closure capture policies. Co-Forth stack effects record whether an input is borrowed or consumed,
+and its handler and closure syntax lower to the same exceptional edges, match decision trees,
+capture records, and ownership transitions, so its direct operation mapping to typed IR loses no
+source-level guarantee. CoLisp lowers the same semantics rather than routing through Co-Forth text.
 
 The common IR records moves, owner/evidence erasure, borrows where relevant to verification, and
 cleanup edges. Its verifier rejects use-after-move, double drop, leaked required ownership, escaping
@@ -1694,6 +1792,25 @@ Macro execution has explicit fuel, recursion, and allocation limits. Expansion p
 generated forms back to both macro invocation and macro definition. A macro cannot hide effects:
 the expanded IR is what the verifier analyzes.
 
+The S-expression is the visible structural notation, while `Syntax` is the compiler-facing value.
+An identifier syntax object carries its spelling, scope marks, phase, source origin, and eventually
+its resolved binding identity; destructuring or taking the head/tail of syntax must not discard that
+metadata. `syntax->datum` is an explicit lossy conversion to ordinary runtime symbols/lists.
+`datum->syntax` must receive a lexical context explicitly, and constructing a hygienically fresh
+identifier is distinct from deliberately requesting a caller-context identifier. Implementations
+may store syntax in arenas with compact metadata IDs; this logical contract does not require a fat
+allocation for every atom.
+
+Every source-visible core form has public hygienic constructors and projections even when its
+lowering is compiler-defined. In particular, lambda syntax exposes an introspectable `CaptureSpec`
+with a default policy and ordered `CaptureEntry` values, parameters, body, and origins. Before name
+resolution a capture entry contains syntax identifiers; afterward it records stable binding IDs,
+types, ownership modes, and source origins; closure conversion records final field indices and
+capture operations. Syntax macros run before capture analysis, so free bindings introduced by an
+expansion participate in the completed capture set. Typed later-stage reflection may inspect the
+resolved plan but cannot mutate compiler-private physical offsets. Co-Forth syntax construction
+exposes the same semantic capture nodes rather than requiring generation of CoLisp text.
+
 An expansion may emit ordinary type, callable, and concept-implementation declarations. This is
 how a derive macro can generate serialization code *and* publish the explicit evidence that the
 record satisfies `JsonSerializable`; generating methods with familiar names is never sufficient.
@@ -1735,6 +1852,37 @@ implementation MyListRange<T> : Range {
     dynamic-evidence-version = 1
 }
 ```
+
+An operation requirement defines one canonical receiver and call ABI. Receiver forms are
+readonly `&self`, exclusive `&mut self`, consuming `take self`, or no receiver for an associated
+operation. An implementation mapping is a type-checked receiver adapter, not only a function-name
+alias: it binds the concept parameters and states exactly how they reach a member, namespaced/static
+function, free function, generated callable, or composed delegate. For example:
+
+```text
+concept JsonSerializable {
+    associated Output = bytes
+    operation serialize(&self, options: &JsonOptions) -> Output
+}
+
+implementation UserJson for User : JsonSerializable {
+    operation serialize(&self, options) =>
+        UserCodec.serialize(options, self)
+}
+
+implementation WidgetDrawable for Widget : Drawable {
+    operation draw(&self, canvas) =>
+        Drawable.draw(&self.presentation, canvas) using PresentationDrawable
+}
+```
+
+The adapter may explicitly reorder arguments or project a composed receiver. A direct
+`operation serialize = encode-user-json` shorthand is valid only when the callable already has the
+exact canonical signature, receiver ownership, argument order, result, effects, and exception
+contract. Static use can inline the adapter; a dynamic evidence slot points at a canonical-ABI
+adapter thunk. The verifier rejects an adapter that takes through `&self`, obtains mutation without
+exclusive access, lets a receiver-tied borrow escape, widens the operation's effects/exceptions, or
+performs an implicit representation conversion.
 
 These spellings are illustrative until the surface grammar is frozen. The declaration is evidence,
 not inherited implementation or an implicit method search. It may publish only static evidence, or
@@ -1806,6 +1954,44 @@ tool for heterogeneous collections, plugins, and especially runtime factories wh
 result depends on configuration or runtime input. Runtime acquisition such as
 `as-concept(value, Reader<Item=bytes>)` performs an identity-based registry lookup and returns
 `option` or `result`; it never scans method names or treats a failed call as conformance.
+
+Dynamic evidence belongs to the erased view, not the concrete record layout. A borrowed view is
+conceptually `(data pointer, selected evidence-table pointer)`; an owned existential additionally
+retains the actual owner/lifecycle evidence required to destroy its storage. The evidence table is
+immutable shared module data, not copied into each object. Consequently a concrete record contains
+no mandatory vptr, may remain inline, and may simultaneously form different concept views or use
+different named implementations without mutation. An implementation declared in another module
+emits its own stable evidence table; forming `dyn C using Implementation` selects that table and
+does not rewrite existing values. Conversion from an already erased value uses its runtime type
+identity and the sealed module's versioned evidence registry, returning `option`/`result`; loading
+new evidence may extend a new verified composition epoch but never retrofits an existing view in
+place.
+
+### Explicit dynamic property and invocation hooks
+
+Ordinary member failure remains a compile error unless the receiver explicitly supplies dynamic
+property evidence. The standard library may define a facility conceptually like:
+
+```text
+concept MissingProperty<V> {
+    operation property-get(&self, name: symbol) -> option<&V>
+    operation property-get-mut(&mut self, name: symbol) -> option<&mut V>
+    operation property-set(&mut self, name: symbol, take value: V) -> option<V>
+}
+```
+
+`JSONValue`, a string-keyed map wrapper, row, proxy, or similar type may opt in with a named
+implementation. Resolution tries real fields/members first and then the uniquely selected
+`MissingProperty` evidence; arbitrary keys remain available through indexing. A constant member
+name may carry a precomputed hash or receive a JIT shape/offset fast path, but absence still returns
+the declared `option`/`result`. This hook never establishes concept satisfaction, rescues failed
+overload resolution, suppresses errors in its implementation, or manufactures JavaScript-style
+`undefined`.
+
+Dynamic method invocation is a separate `DynamicInvoke` concept with a fixed argument/result and
+effect/exception contract. Accessing `json.customer` may therefore request a JSON property without
+making `json.send-email()` silently execute a name-selected operation. Real-member shadowing makes
+indexed access the permanent unambiguous spelling for colliding property names.
 
 Keep three terms distinct. An **overload** is a compile-time choice among declared signatures; a
 concept **implementation** is the explicit requirement-to-callable mapping that produces evidence;
@@ -2470,7 +2656,8 @@ every valid instantiation by default.
 - Lower checked arithmetic with explicit overflow/division side exits according to language policy.
 - Call stable Rust runtime shims for allocation, capability requests, task operations, and complex
   managed-value operations.
-- Use safepoints/stack maps if a tracing heap is introduced.
+- Core owners require no tracing safepoints. An explicit tracing-arena owner extension supplies and
+  pays for its own declared safepoint/stack-map ABI without changing ordinary frames and owners.
 - Preserve cancellation/fuel polling at verified loop and call boundaries.
 - Follow the platform ABI; do not permanently reserve a global error register.
 
@@ -2822,13 +3009,26 @@ Every phase adds tests at the layer where its invariant is enforced:
 - type inference, value-restriction, no-cross-binding-back-solving, stack-row, branch-merge, and
   loop-invariant tests;
 - concept mapping, associated-output, coherence, shared/static-specialized/dynamic dispatch
-  equivalence, and runtime-factory tests;
+  equivalence, canonical receiver adapters for member/static/free/delegated callables, view-carried
+  evidence without record mutation, and runtime-factory tests;
 - derive-macro tests proving generated explicit concept evidence, hygienic same-named operations,
   concept-qualified static selection, named same-concept ambiguity resolution, and equivalent
   `dyn` evidence-table dispatch;
+- record-layout tests for native/C/versioned-stable representations, opaque boundaries, inline and
+  owned placement of the same record type, one-step safe `.` projection, and rejection of raw or
+  ambiguous automatic dereference;
+- dynamic-property tests proving explicit opt-in, real-member precedence, indexed collision access,
+  absence as `option`/`result`, errors inside the hook remain errors, and missing-property lookup
+  never satisfies a concept or becomes dynamic method invocation;
 - paired CoLisp/Co-Forth ownership cases for borrowing, unique moves, use-after-move diagnostics,
   shared retain/final release, weak upgrade, destructor ordering, owner variance, and static/dynamic
-  carrier evidence;
+  carrier evidence, plus explicit `Cow<T>` uniqueness/clone behavior and non-cloneable exclusions;
+- closure-capture tests for inferred scoped borrows, `:move`, exact and mixed capture lists,
+  copy/unique/shared/weak carriers, mutation and consuming callable receivers, escape/suspension
+  diagnostics, context-free nested records, macro-generated free names, and identical semantics
+  under stack allocation or closure-environment elimination;
+- syntax-object tests proving capture forms retain spans, hygiene, phase and binding identity through
+  destructuring/construction, while explicit datum conversion loses those guarantees;
 - range-refinement preservation, opaque adaptor result, explicit-erasure, prefix-parser remainder,
   and whole-document trailing-input tests;
 - effect derivation, selector normalization, containment, intersection, and adversarial path tests;
