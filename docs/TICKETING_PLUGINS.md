@@ -56,6 +56,8 @@ JQL, Linear filter, GitHub search, or Pyramid query. No portable query AST.
 "Go through my assigned tickets" is `tickets.mine` plus pull-after-release.
 Do not push a ticket into a live Brain turn.
 
+If the daemon dies mid-ticket, Pyramid (or Linear/Jira) must see the lease expire — heartbeat, then `tickets.release` is *not* required from a corpse. Finch's job is to stop using the old generation and reap the claim directory on restart. Tracker write-back (`complete`/`close` on GitHub) failing is a tool error: do not tell the model the ticket is done. Pyramid's outbox (PYR-773) is the native-work case; other adapters should retry then surface failure in the TUI rather than mark local success.
+
 ## First-party adapters
 
 | Tracker | Issue |
