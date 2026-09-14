@@ -3,18 +3,18 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/memory/` (MemTree over SQLite `schema.sql`, embeddings and the TF-IDF fallback,
-the neural embedding engine, retrieval quality, the program registry), `src/memory_status.rs`,
-and `src/workbook.rs`. Local model loading is `src/models/`; Brain event logs are `src/brain/`.
+retrieval quality, and the opaque program-index table), `src/memory_status.rs`,
+and `src/workbook.rs`. Neural embedding model loading is `src/models/neural_embedding.rs`.
+Program-definition mapping, authored files, and VM manifests are `src/program_registry.rs`.
+Brain event logs are `src/brain/`.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
 modules are private, so the `pub use` list in `src/memory/mod.rs` is the whole public surface, and
 `scripts/check_subsystems.py` rejects a `pub mod` there.
 
-**Dependencies:** one, and it is unwanted: `memory → programs` (`memory::program_registry`,
-`MemorySystem::save_lisp_define`). Add no others, and prefer removing that one to matching it. The
-planned
-`finch-memory` crate must exclude ONNX, Candle, tokenizers, and Hugging Face; only
-`neural_embedding.rs` uses them today, so add no new uses.
+**Dependencies:** none. Callers inject `EmbeddingEngine`; constructors never select or download
+models. Program identity types stay in `programs`; memory stores `ProgramIndexRecord` rows.
+The planned `finch-memory` crate must exclude ONNX, Candle, tokenizers, and Hugging Face.
 
 **Durability:** changes to `schema.sql`, persistence, or retrieval order need the restart and
 replay cases from the root [testing rules](../../CLAUDE.md#testing-mandatory).

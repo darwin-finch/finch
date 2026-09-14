@@ -12,6 +12,7 @@ pub mod loaders; // ONNX model loader
 pub mod lora; // LoRA fine-tuning configuration (Python training, Phase 5)
 pub mod manager;
 pub mod model_selector;
+pub mod neural_embedding;
 pub mod persistence;
 pub mod sampling; // Context-aware sampling system
 pub mod threshold_router;
@@ -43,6 +44,7 @@ pub use lora::{
 };
 pub use manager::{ModelManager, OverallStats, TrainingReport};
 pub use model_selector::{ModelSelector, QwenSize};
+pub use neural_embedding::{select_memory_embedding_engine, NeuralEmbeddingEngine};
 #[allow(deprecated)]
 pub use persistence::{load_model_metadata, model_exists, save_model_with_metadata, ModelMetadata};
 pub use sampling::{ComparisonResult, QueryCategory, Sampler, SamplingConfig, SamplingDecision};

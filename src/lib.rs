@@ -110,6 +110,7 @@ pub mod node_name; // Per-machine cute name (e.g. "tiny-bird"), persisted to ~/.
 pub mod oauth; // Provider-neutral OAuth 2 authorization and credential lifecycle
 pub mod planning; // IMPCPD iterative plan refinement loop
 pub mod poset; // Co-Forth poset VM — partially-ordered task graph with 3D renderer
+pub mod program_registry; // Caller-owned adapter from programs onto memory's index
 pub mod programs; // Persistent shared Forth/Lisp program vocabulary
 pub mod providers; // Multi-provider LLM support
 pub mod registry; // Migration-only legacy Co-Forth peer registry

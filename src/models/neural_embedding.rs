@@ -9,7 +9,7 @@
 // Distribution: downloaded from HuggingFace (Xenova/all-MiniLM-L6-v2-ONNX)
 // ~23MB quantized ONNX model; cached in standard HF cache after first download.
 
-use super::embeddings::EmbeddingEngine;
+use crate::memory::{EmbeddingEngine, TfIdfEmbedding};
 use anyhow::{anyhow, bail, Context, Result};
 use ndarray::Array2;
 use ort::{
@@ -18,7 +18,7 @@ use ort::{
     value::Value,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 use tracing::{debug, info};
 
@@ -222,7 +222,36 @@ impl NeuralEmbeddingEngine {
 
         None
     }
+}
 
+/// Select the production memory embedding engine without downloading.
+///
+/// Composition owns this choice. `MemorySystem` constructors must not probe the
+/// HuggingFace cache or start a download.
+pub fn select_memory_embedding_engine(use_neural_embeddings: bool) -> Arc<dyn EmbeddingEngine> {
+    if use_neural_embeddings {
+        match NeuralEmbeddingEngine::find_in_cache()
+            .and_then(|dir| NeuralEmbeddingEngine::load(&dir).ok())
+        {
+            Some(neural) => {
+                debug!("Using neural ONNX embeddings (all-MiniLM-L6-v2)");
+                Arc::new(neural)
+            }
+            None => {
+                debug!(
+                    "Neural embedding model not in cache — using TF-IDF fallback. \
+                     Run `finch memory download` or call \
+                     NeuralEmbeddingEngine::ensure_downloaded() to download."
+                );
+                Arc::new(TfIdfEmbedding::new())
+            }
+        }
+    } else {
+        Arc::new(TfIdfEmbedding::new())
+    }
+}
+
+impl NeuralEmbeddingEngine {
     /// Encode text into input_ids and attention_mask, truncated at MAX_SEQ_LEN.
     fn tokenize(&self, text: &str) -> Result<(Vec<i64>, Vec<i64>)> {
         let encoding = self
@@ -382,6 +411,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_select_memory_embedding_engine_disabled_is_tfidf() {
+        let engine = select_memory_embedding_engine(false);
+        assert_eq!(
+            engine.dimension(),
+            TfIdfEmbedding::new().dimension(),
+            "disabling neural embeddings must yield the TF-IDF fallback, dim={}",
+            engine.dimension()
+        );
+    }
+
+    #[test]
     fn test_neural_embedding_dim_constant() {
         assert_eq!(EMBEDDING_DIM, 384);
     }
@@ -450,8 +490,8 @@ mod tests {
             let e2 = engine.embed("Rust systems programming").unwrap();
             let e3 = engine.embed("Python machine learning").unwrap();
 
-            let sim_related = crate::memory::embeddings::cosine_similarity(&e1, &e2);
-            let sim_unrelated = crate::memory::embeddings::cosine_similarity(&e1, &e3);
+            let sim_related = crate::memory::cosine_similarity(&e1, &e2);
+            let sim_unrelated = crate::memory::cosine_similarity(&e1, &e3);
 
             assert!(
                 sim_related > sim_unrelated,

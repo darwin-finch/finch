@@ -679,7 +679,10 @@ impl Repl {
             // its cost is deliberately not inside this phase (#364,
             // "Instrument and reduce Finch interactive TUI time-to-ready").
             let memory_open = crate::startup::phase(crate::startup::PHASE_MEMORY_OPEN);
-            let opened = crate::memory::MemorySystem::new(config.memory.clone());
+            let engine =
+                crate::models::select_memory_embedding_engine(config.memory.use_neural_embeddings);
+            let opened =
+                crate::memory::MemorySystem::new_with_engine(config.memory.clone(), engine);
             drop(memory_open);
             match opened {
                 Ok(system) => {
@@ -690,9 +693,10 @@ impl Repl {
                     let mut synced_roots: u64 = 0;
                     let mut attempted_roots: u64 = 0;
                     // Plain-text program files are canonical; SQLite is their discovery index.
+                    let registry = crate::program_registry::ProgramRegistry::from_ref(&system);
                     if let Some(root) = project_program_root.as_ref() {
                         attempted_roots += 1;
-                        if let Err(error) = system
+                        if let Err(error) = registry
                             .sync_program_files(root, crate::programs::ProgramScope::Project)
                             .await
                         {
@@ -703,7 +707,7 @@ impl Repl {
                     }
                     let root = system.program_source_root();
                     attempted_roots += 1;
-                    if let Err(error) = system
+                    if let Err(error) = registry
                         .sync_program_files(&root, crate::programs::ProgramScope::Personal)
                         .await
                     {

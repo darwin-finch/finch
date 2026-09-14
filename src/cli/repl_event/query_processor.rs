@@ -1129,7 +1129,7 @@ pub(crate) async fn process_query_with_tools(
         // history, so it must be re-injected each round trip.
         let manifest_query = vm_manifest_query(&msgs, &query);
         let manifest = match memory_system.as_ref() {
-            Some(memory) => memory
+            Some(memory) => crate::program_registry::ProgramRegistry::from_ref(memory)
                 .vm_manifest(&manifest_query, 12)
                 .await
                 .unwrap_or_else(|_| fallback_vm_manifest()),
