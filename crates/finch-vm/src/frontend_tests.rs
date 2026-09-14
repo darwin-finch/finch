@@ -1,6 +1,81 @@
 use crate::interpreter::{DenyCapabilities, Interpreter};
 use crate::*;
 
+#[test]
+fn wire_failure_classifier_covers_every_stable_class() {
+    let cases = [
+        (
+            "Hello there",
+            "E-WIRE-001: prose",
+            WireFailureClass::RawProse,
+        ),
+        (
+            "```lisp",
+            "E-WIRE-002: fenced",
+            WireFailureClass::MarkdownFence,
+        ),
+        (
+            "invented",
+            "E-LINK-002: unknown word",
+            WireFailureClass::InventedWord,
+        ),
+        (
+            "1 +",
+            "E-STACK-001: underflow",
+            WireFailureClass::StackOrType,
+        ),
+        (
+            "(say \"hi\")",
+            "E-LINK-002: expected Co-Forth",
+            WireFailureClass::WrongLanguageDispatch,
+        ),
+        (
+            "read-file",
+            "E-CAP-003: denied",
+            WireFailureClass::Capability,
+        ),
+        ("anything", "E-RUNTIME-001: failed", WireFailureClass::Other),
+    ];
+    for (source, diagnostic, expected) in cases {
+        assert_eq!(
+            classify_wire_failure(source, diagnostic),
+            expected,
+            "wire failure classification changed for source={source:?}, diagnostic={diagnostic:?}"
+        );
+    }
+}
+
+#[test]
+fn wire_failure_class_serialization_remains_snake_case() {
+    let variants = [
+        (WireFailureClass::RawProse, "raw_prose"),
+        (WireFailureClass::MarkdownFence, "markdown_fence"),
+        (WireFailureClass::InventedWord, "invented_word"),
+        (WireFailureClass::StackOrType, "stack_or_type"),
+        (
+            WireFailureClass::WrongLanguageDispatch,
+            "wrong_language_dispatch",
+        ),
+        (
+            WireFailureClass::MissingOutputEffect,
+            "missing_output_effect",
+        ),
+        (WireFailureClass::Capability, "capability"),
+        (WireFailureClass::Other, "other"),
+    ];
+    for (class, encoded) in variants {
+        assert_eq!(
+            serde_json::to_string(&class).unwrap(),
+            format!("\"{encoded}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<WireFailureClass>(&format!("\"{encoded}\"")).unwrap(),
+            class,
+            "wire failure class {encoded} must remain round-trippable"
+        );
+    }
+}
+
 mod forth {
     use super::*;
 

@@ -3,7 +3,8 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/programs/`: the durable identity and metadata of a stored program, the script
-envelope (`parse_finch_script`), the wire corpus capture and audit, and Co-Forth token helpers.
+envelope (`parse_finch_script`), the wire corpus capture/audit and its source-only
+`ProgramCompilerContext`, and Co-Forth token helpers.
 The typed machine that runs a program is `crates/finch-vm/`; the service that schedules and
 authorizes one is `src/runtime/`.
 
@@ -11,8 +12,10 @@ authorizes one is `src/runtime/`.
 modules are private, so the `pub use` list in `src/programs/mod.rs` is the whole public surface,
 and `scripts/check_subsystems.py` rejects a `pub mod` there.
 
-**Dependencies:** `vm`, and nothing else by design. Two unwanted edges remain — `config` (via
-`crate::metrics`) and `runtime` — which are to be removed rather than joined. Add no new ones.
+**Dependencies:** `vm`, and nothing else by design. Corpus capture accepts a lazy context supplier;
+the application runtime may construct that context, but this subsystem never knows or clones a
+`ProgramRuntime` when capture is disabled. Wire-failure classification is VM compiler-boundary
+behavior re-exported here only for compatibility.
 
 **Language is not decided here.** `ProgramLanguage` lives in `vm` and is re-exported for
 compatibility; a program's meaning belongs to the VM frontends, never to a second evaluator here.

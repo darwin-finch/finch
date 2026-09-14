@@ -1,5 +1,6 @@
 // Metrics data types
 
+use crate::vm::WireFailureClass;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -38,24 +39,6 @@ pub struct RequestMetric {
     /// Router confidence scores
     pub router_confidence: Option<f64>,
     pub validator_confidence: Option<f64>,
-}
-
-/// Why a provider's first Finch VM wire submission was not accepted.
-///
-/// Keep this deliberately coarse and source-free: conformance reporting needs
-/// provider/model aggregates, not a second log of user prompts or generated
-/// programs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WireFailureClass {
-    RawProse,
-    MarkdownFence,
-    InventedWord,
-    StackOrType,
-    WrongLanguageDispatch,
-    MissingOutputEffect,
-    Capability,
-    Other,
 }
 
 /// One terminal provider-wire attempt, including whether bounded repair was

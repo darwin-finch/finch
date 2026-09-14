@@ -16,11 +16,19 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use crate::vm::compile_forth_with_functions;
-use crate::vm::compile_lisp_with_functions;
+use crate::vm::{compile_forth_with_functions, compile_lisp_with_functions, Function};
 
 pub const WIRE_CORPUS_FORMAT_VERSION: u32 = 1;
 pub const WIRE_CORPUS_PATH_ENV: &str = "FINCH_WIRE_CORPUS_PATH";
+
+/// Reducible language context needed to compile a captured provider program
+/// without retaining a live operand stack or host authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramCompilerContext {
+    pub manifest_generation: u64,
+    pub revision: u64,
+    pub functions: BTreeMap<String, Function>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,7 +55,7 @@ pub struct WireCorpusEntry {
     pub source_sha256: String,
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compiler_context: Option<crate::runtime::ProgramCompilerContext>,
+    pub compiler_context: Option<ProgramCompilerContext>,
 }
 
 impl WireCorpusEntry {
@@ -74,10 +82,7 @@ impl WireCorpusEntry {
         }
     }
 
-    pub fn with_compiler_context(
-        mut self,
-        compiler_context: crate::runtime::ProgramCompilerContext,
-    ) -> Self {
+    pub fn with_compiler_context(mut self, compiler_context: ProgramCompilerContext) -> Self {
         self.compiler_context = Some(compiler_context);
         self
     }
@@ -146,19 +151,43 @@ pub fn capture_from_env(
     }
 }
 
-pub fn capture_with_runtime_from_env(
-    runtime: &crate::runtime::ProgramRuntime,
+pub fn capture_with_compiler_context_from_env<F>(
+    compiler_context: F,
     provider: &str,
     model: &str,
     surface: &str,
     attempt: WireCorpusAttempt,
     source: &str,
-) {
-    let Some(logger) = WireCorpusLogger::from_env() else {
+) where
+    F: FnOnce() -> Result<ProgramCompilerContext>,
+{
+    capture_with_compiler_context(
+        WireCorpusLogger::from_env(),
+        compiler_context,
+        provider,
+        model,
+        surface,
+        attempt,
+        source,
+    );
+}
+
+fn capture_with_compiler_context<F>(
+    logger: Option<WireCorpusLogger>,
+    compiler_context: F,
+    provider: &str,
+    model: &str,
+    surface: &str,
+    attempt: WireCorpusAttempt,
+    source: &str,
+) where
+    F: FnOnce() -> Result<ProgramCompilerContext>,
+{
+    let Some(logger) = logger else {
         return;
     };
     let mut entry = WireCorpusEntry::new(provider, model, surface, attempt, source);
-    match runtime.compiler_context() {
+    match compiler_context() {
         Ok(context) => entry = entry.with_compiler_context(context),
         Err(error) => {
             tracing::warn!("failed to snapshot provider corpus compiler context: {error}")
@@ -317,6 +346,69 @@ pub fn audit(path: &Path) -> Result<WireCorpusAudit> {
 mod tests {
     use super::*;
 
+    fn compiler_context_with_double() -> ProgramCompilerContext {
+        let verified = crate::vm::compile_lisp(
+            "corpus-context.lisp",
+            "(define (double (n : int)) : int (* n 2))",
+            Vec::new(),
+            &crate::vm::core_vocabulary(),
+        )
+        .expect("pure compiler fixture should produce a verified definition");
+        let entry = verified.module.entry.clone();
+        let functions = verified
+            .module
+            .functions
+            .into_iter()
+            .filter(|(name, _)| name != &entry)
+            .collect();
+        ProgramCompilerContext {
+            manifest_generation: 7,
+            revision: 11,
+            functions,
+        }
+    }
+
+    #[test]
+    fn compiler_context_json_contract_keeps_field_names() {
+        let encoded = serde_json::to_value(compiler_context_with_double()).unwrap();
+        let keys = encoded
+            .as_object()
+            .expect("compiler context must remain a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "functions",
+                "manifest_generation",
+                "revision"
+            ]),
+            "the durable compiler-context field names are a corpus compatibility contract: {encoded}"
+        );
+    }
+
+    #[test]
+    fn disabled_capture_does_not_construct_compiler_context() {
+        let constructed = std::cell::Cell::new(false);
+        capture_with_compiler_context(
+            None,
+            || {
+                constructed.set(true);
+                Ok(compiler_context_with_double())
+            },
+            "xai",
+            "grok",
+            "interactive",
+            WireCorpusAttempt::FirstPass,
+            "(say \"hello\")",
+        );
+        assert!(
+            !constructed.get(),
+            "an opt-out corpus path must not clone the runtime's compiled functions"
+        );
+    }
+
     #[test]
     fn corpus_round_trip_and_report_only_audit() {
         let directory = tempfile::tempdir().unwrap();
@@ -371,28 +463,8 @@ mod tests {
         assert!(audit(&path).unwrap_err().to_string().contains("hash check"));
     }
 
-    #[tokio::test]
-    async fn replay_uses_captured_promoted_word_context_without_execution() {
-        let runtime = crate::runtime::ProgramRuntime::new();
-        let outcome = runtime
-            .submit_typed_only(crate::runtime::ProgramSubmission {
-                language: ProgramLanguage::Lisp,
-                source_id: Some("corpus-context.lisp".to_string()),
-                source: "(define (double (n : int)) (* n 2))".to_string(),
-                intent: "prepare corpus compiler context".to_string(),
-                effect: crate::programs::ExecutionEffect::Pure,
-                declared_capabilities: Vec::new(),
-                manifest_generation: runtime.manifest_generation(),
-                expected_revision: Some(runtime.revision()),
-                budget: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed
-        );
-
+    #[test]
+    fn replay_uses_pure_compiled_function_context_without_execution() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("contextual.jsonl");
         let entry = WireCorpusEntry::new(
@@ -402,7 +474,7 @@ mod tests {
             WireCorpusAttempt::FirstPass,
             "(say (int-to-string (double 21)))",
         )
-        .with_compiler_context(runtime.compiler_context().unwrap());
+        .with_compiler_context(compiler_context_with_double());
         WireCorpusLogger::new(&path).append(&entry).unwrap();
 
         let report = audit(&path).unwrap();

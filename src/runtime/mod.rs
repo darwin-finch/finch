@@ -14,7 +14,7 @@ mod hostio;
 mod mcp;
 pub mod outcome;
 
-use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
+use crate::programs::{ExecutionEffect, ProgramCompilerContext, ProgramLanguage, ProgramValue};
 pub(crate) use hostio::workbook_cell_to_string;
 use hostio::{
     hex_digest, list_directory_tree, merkle_directory, read_bounded_csv_record,
@@ -240,15 +240,6 @@ pub struct VmStateSnapshot {
     pub typed_vocabulary: Vec<VmVocabularyEntry>,
     #[serde(default)]
     pub granted_capabilities: Vec<CapabilityRequirement>,
-}
-
-/// Reducible language context needed to compile a captured provider program
-/// without retaining the live operand stack or any host authority.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramCompilerContext {
-    pub manifest_generation: u64,
-    pub revision: u64,
-    pub functions: std::collections::BTreeMap<String, crate::vm::Function>,
 }
 
 /// An immutable in-memory checkpoint at a successful VM commit boundary.
