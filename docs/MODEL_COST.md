@@ -97,6 +97,30 @@ optimization on that path, not a reason to delay it. Subscription **OAuth**
 (Claude #199, Grok still missing) is what makes "one harness" true; API keys
 alone keep you in the vendor apps for the quota you already paid.
 
+## Mid-conversation provider switch: compress, then continue
+
+Dumping a 1M-token Brain log at a new provider is how a cap-failover costs more
+than the cap. The Brain's durable log stays complete. What the *new* model
+gets is a **compression** plus a recent tail — the same idea as Pyramid's
+cited summaries, not a second conversation.
+
+Do that compression on a reserved **lane role**, not a model name. Users name
+providers whatever they want; Finch must not grep for `qwen`.
+
+| Role | Default bind | Job |
+|------|----------------|-----|
+| `compress` | bundled local Qwen (ONNX/Candle) if weights exist | summarize Brain log → compact handoff |
+| `cheap` / `review` / … | user | actual work |
+
+Setup assigns `compress` once (default: local Qwen; else cheapest configured
+cloud; else refuse and send only the last N turns with a warning). Hot-swap
+(#450) then: run `compress` on the log → attach summary + tail → new lane.
+The summary is an event on the Brain, so you can see what was dropped.
+
+Do not use the outgoing flagship to summarize "random back and forth." That
+defeats the point. Local Qwen shipped by default is how this stays free when
+the user has no API.
+
 ## What not to do now
 
 - Semantic embedding router for every turn.
@@ -106,3 +130,5 @@ alone keep you in the vendor apps for the quota you already paid.
 - Git hooks that move Jira columns (ticketing plugins).
 - Exposing the raw provider/credential/model/effort matrix as the Brain
   switcher.
+- Selecting the compressor by provider name (`qwen`, `luna`, …).
+- Replaying the full Brain log to the new provider on swap.
