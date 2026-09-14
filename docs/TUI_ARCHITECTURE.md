@@ -1004,6 +1004,8 @@ All dialog regression tests live in `src/cli/tui/dialog.rs` `#[cfg(test)] mod te
 | `test_custom_mode_shift_enter_inserts_newline` | Shift+Enter inserts `\n` |
 | `test_custom_mode_alt_enter_inserts_newline` | Alt+Enter (macOS) inserts `\n` |
 | `test_long_write_payload_keeps_approval_controls_visible` | Huge write payload cannot push Yes/No off-screen |
+| `test_exact_fit_viewport_keeps_approval_controls_visible` | Pin keeps Yes/No when the suffix exactly fills the budget |
+| `test_markdown_body_bullets_do_not_steal_approval_controls` | Payload `●`/`○`/`─` cannot shift the control suffix |
 | `test_long_body_scroll_moves_payload_not_controls` | Body scroll stays inside the payload region |
 | `test_write_approval_summarises_instead_of_dumping_html` | Write approval leads with path/size/create-vs-overwrite |
 | `test_long_payload_does_not_shift_other_row_virtual_index` | Other-row virtual indices stay stable with a long body |

@@ -302,6 +302,26 @@ impl Dialog {
         }
     }
 
+    /// Option rows in the control suffix, not counting rules or the Cancel row.
+    ///
+    /// Used to distinguish "too many options" (top-clip) from a write approval
+    /// whose chrome is one row over the budget (pin the suffix tail).
+    pub(crate) fn option_row_count(&self) -> usize {
+        match &self.dialog_type {
+            DialogType::Select {
+                options,
+                allow_custom,
+                ..
+            } => options.len() + usize::from(*allow_custom),
+            DialogType::MultiSelect {
+                options,
+                allow_custom,
+                ..
+            } => options.len() + usize::from(*allow_custom),
+            DialogType::Confirm { .. } | DialogType::TextInput { .. } => 1,
+        }
+    }
+
     /// Handle a key event and return a result if the dialog should close
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Option<DialogResult> {
         // Priority 0: Scroll the body section (when not in custom mode). Laptop
@@ -770,29 +790,21 @@ impl DialogResult {
     }
 }
 
-/// Index of the first control line in a rendered dialog (the options divider
-/// immediately before the first option or button row).
-///
-/// Payload is everything before this index. Scrolling and clipping must consume
-/// the payload, never the control suffix, so approve/deny stay on-screen.
-pub(crate) fn dialog_control_start(lines: &[String]) -> Option<usize> {
-    let option_at = lines.iter().position(|line| is_dialog_control_line(line))?;
-    if option_at > 0 && is_horizontal_rule(&lines[option_at - 1]) {
-        Some(option_at - 1)
-    } else {
-        Some(option_at)
-    }
-}
-
 /// Keep the control suffix (options, buttons, rules) inside `max_rows` and
 /// clip the payload prefix when a long title or body would overflow.
 ///
-/// When the controls themselves cannot fit (too many options), falls back to
-/// clipping from the top so the title remains and a viewport marker is shown.
+/// `control_start` is the structural line index of the options divider, supplied
+/// by the renderer — not inferred from painted glyphs. Pin whenever the suffix
+/// fits (`control_phys <= max_rows`), including an exact fill with no payload.
+/// If chrome makes the suffix one or more rows over but the options themselves
+/// fit, keep the suffix tail so Yes/No stay. Top-clip + marker only when there
+/// are too many options to present.
 pub(crate) fn pin_dialog_controls(
     lines: Vec<String>,
+    control_start: usize,
     max_rows: usize,
     width: usize,
+    option_row_count: usize,
 ) -> Vec<String> {
     let width = width.max(1);
     let rows_of = |line: &str| super::shadow_buffer::physical_rows(line, width);
@@ -801,23 +813,27 @@ pub(crate) fn pin_dialog_controls(
         return lines;
     }
 
-    if let Some(start) = dialog_control_start(&lines) {
-        let control_phys: usize = lines[start..].iter().map(|line| rows_of(line)).sum();
-        if control_phys < max_rows {
-            let budget = max_rows - control_phys;
-            let mut kept = Vec::new();
-            let mut used = 0;
-            for line in &lines[..start] {
-                let rows = rows_of(line);
-                if used + rows > budget {
-                    break;
-                }
-                used += rows;
-                kept.push(line.clone());
+    let start = control_start.min(lines.len());
+    let suffix = &lines[start..];
+    let control_phys: usize = suffix.iter().map(|line| rows_of(line)).sum();
+    if control_phys <= max_rows {
+        let budget = max_rows - control_phys;
+        let mut kept = Vec::new();
+        let mut used = 0;
+        for line in &lines[..start] {
+            let rows = rows_of(line);
+            if used + rows > budget {
+                break;
             }
-            kept.extend(lines[start..].iter().cloned());
-            return kept;
+            used += rows;
+            kept.push(line.clone());
         }
+        kept.extend(suffix.iter().cloned());
+        return kept;
+    }
+
+    if option_row_count < max_rows {
+        return take_last_physical(suffix, max_rows, width);
     }
 
     let budget = max_rows.saturating_sub(1);
@@ -838,57 +854,56 @@ pub(crate) fn pin_dialog_controls(
     kept
 }
 
-fn strip_sgr(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    for nc in chars.by_ref() {
-                        if nc.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    for nc in chars.by_ref() {
-                        if nc == '\x07' || nc == '\x1b' {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        } else {
-            out.push(c);
+fn take_last_physical(lines: &[String], max_rows: usize, width: usize) -> Vec<String> {
+    let rows_of = |line: &str| super::shadow_buffer::physical_rows(line, width);
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for line in lines.iter().rev() {
+        let rows = rows_of(line);
+        if used + rows > max_rows {
+            break;
         }
+        used += rows;
+        kept.push(line.clone());
     }
-    out
-}
-
-fn is_horizontal_rule(line: &str) -> bool {
-    let visible = strip_sgr(line);
-    let trimmed = visible.trim();
-    !trimmed.is_empty() && trimmed.chars().all(|c| c == '─')
-}
-
-fn is_dialog_control_line(line: &str) -> bool {
-    let visible = strip_sgr(line);
-    let trimmed = visible.trim_start();
-    trimmed.starts_with('●')
-        || trimmed.starts_with('○')
-        || trimmed.starts_with('☑')
-        || trimmed.starts_with('☐')
-        || trimmed.starts_with("[ Cancel ]")
-        || trimmed.starts_with("[ Submit ]")
+    kept.reverse();
+    kept
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                match chars.peek() {
+                    Some('[') => {
+                        chars.next();
+                        for nc in chars.by_ref() {
+                            if nc.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        chars.next();
+                        for nc in chars.by_ref() {
+                            if nc == '\x07' || nc == '\x1b' {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
 
     #[test]
     fn test_dialog_option_creation() {
@@ -2195,9 +2210,34 @@ mod tests {
             dialog.body_scroll_offset
         );
         assert!(
-            !scrolled_text.contains("payload-line-000") || top_text.contains("payload-line-000"),
-            "scrolled payload should advance within the body; top had line 000, scrolled:\n\
-             {scrolled_text}"
+            top_text.contains("payload-line-000"),
+            "top window must show the first payload line: viewport={width}x{height}\n{top_text}"
+        );
+        assert!(
+            !scrolled_text.contains("payload-line-000"),
+            "scrolling must drop the first payload line: offset={} viewport={width}x{height}\n\
+             {scrolled_text}",
+            dialog.body_scroll_offset
+        );
+        assert!(
+            scrolled_text.contains("payload-line-080"),
+            "scrolling must show a later payload line: offset={} viewport={width}x{height}\n\
+             {scrolled_text}",
+            dialog.body_scroll_offset
+        );
+        let no_top = control_row(&top, "4. No");
+        let no_scrolled = control_row(&scrolled, "4. No");
+        assert_eq!(
+            yes_top.map(|row| top.len() - row),
+            yes_scrolled.map(|row| scrolled.len() - row),
+            "Yes must occupy the same trailing row after scroll: top={yes_top:?} \
+             scrolled={yes_scrolled:?} viewport={width}x{height}"
+        );
+        assert_eq!(
+            no_top.map(|row| top.len() - row),
+            no_scrolled.map(|row| scrolled.len() - row),
+            "No must occupy the same trailing row after scroll: top={no_top:?} \
+             scrolled={no_scrolled:?} viewport={width}x{height}"
         );
     }
 
@@ -2277,5 +2317,85 @@ mod tests {
             "Other-row activation must keep virtual indices stable"
         );
         assert_eq!(dialog.cancel_virtual_index(), Some(2));
+    }
+
+    #[test]
+    fn test_exact_fit_viewport_keeps_approval_controls_visible() {
+        // Write-approval suffix is 8 painted rows at width 80 (options divider,
+        // four options, buttons divider, Cancel, bottom rule). plan_live_frame
+        // spends one row on the session separator, so an 8-row terminal gives
+        // the dialog 7 rows. Pin must keep Yes/No even when chrome is one row
+        // over, not top-clip to a marker.
+        let (dialog, payload_bytes) = huge_html_write_dialog();
+        let width = 80;
+        let height = 8;
+        let dialog_budget = 7;
+
+        let lines = super::super::TuiRenderer::dialog_lines(&dialog, width, dialog_budget);
+        let painted: usize = lines
+            .iter()
+            .map(|line| super::super::shadow_buffer::physical_rows(line, width))
+            .sum();
+        let visible = visible_dialog_text(&lines);
+        let yes_row = control_row(&lines, "1. Yes");
+        let no_row = control_row(&lines, "4. No");
+        assert!(
+            yes_row.is_some() && no_row.is_some() && painted <= dialog_budget,
+            "exact-fit pin must keep approve/deny: max_rows={dialog_budget} painted={painted} \
+             payload_bytes={payload_bytes} yes_row={yes_row:?} no_row={no_row:?}\n{visible}"
+        );
+        assert!(
+            !visible.contains("dialog clipped to viewport"),
+            "exact-fit suffix must not take the too-many-options top-clip: \
+             max_rows={dialog_budget} payload_bytes={payload_bytes}\n{visible}"
+        );
+
+        let frame = plan_approval_frame(&dialog, width, height);
+        let frame_painted = frame.physical_rows(width);
+        let frame_text = visible_dialog_text(&frame.lines);
+        let frame_yes = control_row(&frame.lines, "1. Yes");
+        let frame_no = control_row(&frame.lines, "4. No");
+        assert!(
+            frame_yes.is_some() && frame_no.is_some() && frame_painted <= height,
+            "plan_live_frame 80x8 must keep approve/deny: painted={frame_painted} \
+             payload_bytes={payload_bytes} yes_row={frame_yes:?} no_row={frame_no:?}\n{frame_text}"
+        );
+        assert!(
+            !frame_text.contains("dialog clipped to viewport"),
+            "live-frame exact-fit must not show the clip marker: height={height} \
+             payload_bytes={payload_bytes}\n{frame_text}"
+        );
+    }
+
+    #[test]
+    fn test_markdown_body_bullets_do_not_steal_approval_controls() {
+        let decoy = format!(
+            "● 1. Yes\n○ spoofed option\n{}\n{}",
+            "─".repeat(40),
+            (0..200)
+                .map(|i| format!("markdown-item-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let dialog = Dialog::tool_approval("Write", "create docs.html, 12 bytes").with_body(decoy);
+        let width = 80;
+        let height = 16;
+        let lines = super::super::TuiRenderer::dialog_lines(&dialog, width, height);
+        let painted: usize = lines
+            .iter()
+            .map(|line| super::super::shadow_buffer::physical_rows(line, width))
+            .sum();
+        let visible = visible_dialog_text(&lines);
+        let no_row = control_row(&lines, "4. No");
+        let cancel_row = control_row(&lines, "[ Cancel ]");
+        assert!(
+            no_row.is_some() && cancel_row.is_some() && painted <= height,
+            "structural pin must ignore payload bullets: height={height} painted={painted} \
+             no_row={no_row:?} cancel_row={cancel_row:?}\n{visible}"
+        );
+        assert!(
+            !visible.contains("dialog clipped to viewport"),
+            "a bullet in the body must not inflate the suffix into the top-clip path:\n{visible}"
+        );
     }
 }

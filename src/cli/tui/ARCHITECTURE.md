@@ -40,6 +40,6 @@ Virtual row helpers:
 - `src/cli/tui/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`
 - `src/cli/tui/accordion.rs` — retained semantic projection, focus, and hit regions
 - `src/cli/tui/scrollback.rs` — `ScrollbackBuffer`
-- `src/cli/tui/dialog.rs` — Dialog state machine (7 regression tests)
+- `src/cli/tui/dialog.rs` — Dialog state machine and approval control pin
 - `src/cli/tui/input_widget.rs` — Input area (tui-textarea)
 - `src/cli/tui/status_widget.rs` — Status bar
