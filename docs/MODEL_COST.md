@@ -137,6 +137,25 @@ Do not use the outgoing flagship to summarize "random back and forth." That
 defeats the point. Local Qwen shipped by default is how this stays free when
 the user has no API.
 
+## Usage vs quota dialog
+
+A `/usage` (or Credentials/status) dialog should list **every named
+`[[providers]]` entry**: used, remaining, reset, and whether the figure is a
+subscription allowance or API tokens. ChatGPT subscription already returns
+`ProviderAllowance` percents on a turn; that is not a queryable snapshot and
+not something Claude/Grok/local implement.
+
+Add a provider-trait snapshot, not a ChatGPT-shaped UI:
+
+`quota_snapshot()` → `Inapplicable` (local), `Unknown` (no endpoint; never fake 0%),
+or `Known { used, limit, remaining, reset_at, unit }`.
+
+Each adapter fills it from that vendor's API. Finch may also show **session**
+`ProviderUsage` totals when the remote quota is unknown.
+
+The dialog is one table of names. Cap-failover (#450) can read the same
+snapshot. Do not sum Grok weekly % with OpenAI tokens into one bar.
+
 ## What not to do now
 
 - Semantic embedding router for every turn.
