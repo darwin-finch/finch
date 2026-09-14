@@ -952,6 +952,10 @@ The visible length calculation accounts for the cursor block character:
 let visible_len = 3 + input_text.chars().count(); // "> " + chars + cursor block
 ```
 
+### Bounded approval payload
+
+A write/edit approval leads with path, byte count, and created-vs-overwritten. The file bytes live in the scrollable body (structured diff when available), not the title. `dialog_lines` pins the option/button suffix inside the viewport so scrolling the payload never moves approve/deny off-screen. Full content remains reachable via body scroll (`Ctrl-U`/`Ctrl-D`, `PgUp`/`PgDn`) and, for file-mutating tools, Edit in `$EDITOR`.
+
 ### Submit/Cancel Virtual Rows
 
 `MultiSelect` dialogs have navigable Submit and Cancel buttons below the option list:
@@ -999,6 +1003,10 @@ All dialog regression tests live in `src/cli/tui/dialog.rs` `#[cfg(test)] mod te
 | `test_multiselect_submit_button_emits_selection` | Submit virtual row emits result |
 | `test_custom_mode_shift_enter_inserts_newline` | Shift+Enter inserts `\n` |
 | `test_custom_mode_alt_enter_inserts_newline` | Alt+Enter (macOS) inserts `\n` |
+| `test_long_write_payload_keeps_approval_controls_visible` | Huge write payload cannot push Yes/No off-screen |
+| `test_long_body_scroll_moves_payload_not_controls` | Body scroll stays inside the payload region |
+| `test_write_approval_summarises_instead_of_dumping_html` | Write approval leads with path/size/create-vs-overwrite |
+| `test_long_payload_does_not_shift_other_row_virtual_index` | Other-row virtual indices stay stable with a long body |
 
 ---
 

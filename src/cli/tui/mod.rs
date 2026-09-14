@@ -3333,7 +3333,11 @@ impl TuiRenderer {
     /// undercount left the top of the dialog unerased and the box redrew one
     /// row lower on every tick: the cascading duplicate dialogs. Measuring the
     /// emitted lines removes the possibility of the two disagreeing.
-    fn dialog_lines(dialog: &Dialog, width: usize, max_rows: usize) -> Vec<String> {
+    ///
+    /// When the payload (title/body) overflows, the option/button suffix is
+    /// pinned so approve/deny stay reachable. Too many options still clip from
+    /// the top and show the viewport marker.
+    pub(crate) fn dialog_lines(dialog: &Dialog, width: usize, max_rows: usize) -> Vec<String> {
         if max_rows == 0 {
             return Vec::new();
         }
@@ -3347,28 +3351,7 @@ impl TuiRenderer {
             .split_terminator("\r\n")
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let rows_of = |line: &str| shadow_buffer::physical_rows(line, width);
-        if all.iter().map(|line| rows_of(line)).sum::<usize>() <= max_rows {
-            return all;
-        }
-
-        // Keep whole lines while they fit, reserving one row for the marker.
-        let budget = max_rows.saturating_sub(1);
-        let mut kept = Vec::new();
-        let mut used = 0;
-        for line in all {
-            let rows = rows_of(&line);
-            if used + rows > budget {
-                break;
-            }
-            used += rows;
-            kept.push(line);
-        }
-        kept.push(ellipsize(
-            "… dialog clipped to viewport; use navigation keys …",
-            width,
-        ));
-        kept
+        dialog::pin_dialog_controls(all, max_rows, width)
     }
 
     /// Show a blocking dialog (used when no async event loop is running).

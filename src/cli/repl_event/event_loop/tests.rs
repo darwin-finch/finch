@@ -3086,6 +3086,74 @@ fn test_tool_approval_summary_unknown_tool() {
     assert_eq!(tool_approval_summary(&tool), "Execute WebFetch tool");
 }
 
+#[test]
+fn test_tool_approval_dialog_summary_write_create_does_not_dump_content() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("docs.html");
+    let html = format!("<!DOCTYPE html>{}", " <div>page content</div>".repeat(400));
+    let tool = make_tool_use(
+        "write",
+        serde_json::json!({"file_path": path.to_string_lossy(), "content": html}),
+    );
+    let summary = tool_approval_summary(&tool);
+    assert!(
+        !summary.contains("<!DOCTYPE") && !summary.contains("page content"),
+        "write approval must not dump file bytes: {summary:?}"
+    );
+    assert!(
+        summary.contains("docs.html") && summary.contains("create"),
+        "new write must name the path and say create: {summary:?}"
+    );
+    assert!(
+        summary.contains("KB") || summary.contains("bytes") || summary.contains("MB"),
+        "write approval must include a byte count: {summary:?}"
+    );
+}
+
+#[test]
+fn test_tool_approval_dialog_summary_write_overwrite_existing() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "old").unwrap();
+    let tool = make_tool_use(
+        "Write",
+        serde_json::json!({
+            "file_path": file.path().to_string_lossy(),
+            "content": "new contents"
+        }),
+    );
+    let summary = tool_approval_summary(&tool);
+    assert!(
+        summary.contains("overwrite") && summary.contains("replacing existing content"),
+        "existing write must say overwrite: {summary:?}"
+    );
+    assert!(
+        !summary.contains("new contents"),
+        "overwrite summary must not dump replacement bytes: {summary:?}"
+    );
+}
+
+#[test]
+fn test_tool_approval_dialog_summary_edit_is_one_line() {
+    let tool = make_tool_use(
+        "edit",
+        serde_json::json!({
+            "file_path": "src/main.rs",
+            "old_string": "old\n".repeat(80),
+            "new_string": "new\n".repeat(80)
+        }),
+    );
+    let summary = tool_approval_summary(&tool);
+    assert_eq!(
+        summary.lines().count(),
+        1,
+        "edit summary must stay one line: {summary:?}"
+    );
+    assert!(
+        summary.contains("src/main.rs") && !summary.contains("old\n"),
+        "edit summary must not dump the replacement: {summary:?}"
+    );
+}
+
 // ── dialog_result_to_confirmation (3-option Claude Code style) ───────────
 
 #[test]

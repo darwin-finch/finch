@@ -28,6 +28,7 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
 - `MultiSelect` — Space toggles; Enter on virtual Submit row emits `DialogResult::Selected`
 - `TextInput` — Enter submits
 - `Confirm` — `y`/`n` or Enter/Esc
+- Approval payload is a bounded, scrollable region. `dialog_lines` pins Yes/No/Cancel so a long write never moves the controls off-screen. Write approvals summarise path, size, and create-vs-overwrite; the full preview stays behind body scroll.
 
 Virtual row helpers:
 - `dialog.submit_virtual_index()` — MultiSelect: `options.len() + (1 if allow_custom)`

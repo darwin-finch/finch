@@ -983,6 +983,36 @@ mod tests {
     }
 
     #[test]
+    fn test_write_approval_dialog_byte_count_thresholds() {
+        assert_eq!(format_byte_count(0), "0 bytes");
+        assert_eq!(format_byte_count(1), "1 byte");
+        assert_eq!(format_byte_count(512), "512 bytes");
+        assert_eq!(format_byte_count(12 * 1024), "12 KB");
+        assert_eq!(format_byte_count(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn test_write_approval_dialog_summary_create_vs_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let created = directory.path().join("new.txt");
+        let created_summary = write_approval_summary(created.to_str().unwrap(), "hello");
+        assert!(
+            created_summary.contains("create")
+                && created_summary.contains("new.txt")
+                && created_summary.contains("5 bytes"),
+            "{created_summary}"
+        );
+        let existing = directory.path().join("old.txt");
+        std::fs::write(&existing, "old").unwrap();
+        let summary = write_approval_summary(existing.to_str().unwrap(), "replacement");
+        assert!(
+            summary.contains("overwrite") && summary.contains("replacing existing content"),
+            "{summary}"
+        );
+        assert!(summary.contains("11 bytes"), "{summary}");
+    }
+
+    #[test]
     fn test_write_approval_preview_marks_missing_file_as_created() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("new.txt");
@@ -1295,6 +1325,78 @@ mod tests {
     }
 }
 
+/// Human-readable size for a write/edit approval summary.
+pub(crate) fn format_byte_count(n: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+    if n >= MB {
+        let mb = n as f64 / MB as f64;
+        if mb >= 10.0 {
+            format!("{} MB", n / MB)
+        } else {
+            format!("{mb:.1} MB")
+        }
+    } else if n >= KB {
+        let kb = n as f64 / KB as f64;
+        if kb >= 10.0 {
+            format!("{} KB", n / KB)
+        } else {
+            format!("{kb:.1} KB")
+        }
+    } else if n == 1 {
+        "1 byte".to_string()
+    } else {
+        format!("{n} bytes")
+    }
+}
+
+/// Decision-relevant write summary: path, size, created vs overwritten.
+///
+/// The literal file bytes belong in the scrollable dialog body, not here.
+pub(crate) fn write_approval_summary(path: &str, content: &str) -> String {
+    let display_path = shorten_path(path);
+    let size = format_byte_count(content.len());
+    if std::path::Path::new(path).exists() {
+        format!("overwrite {display_path}, {size}, replacing existing content")
+    } else {
+        format!("create {display_path}, {size}")
+    }
+}
+
+/// Decision-relevant edit summary: path and replacement size.
+pub(crate) fn edit_approval_summary(path: &str, new_string: &str) -> String {
+    format!(
+        "edit {}, {}",
+        shorten_path(path),
+        format_byte_count(new_string.len())
+    )
+}
+
+/// Bounded plaintext preview used when a structured diff cannot be built.
+fn bounded_write_preview(content: &str) -> String {
+    const MAX_LINES: usize = 16;
+    const MAX_CHARS: usize = 512;
+    let total = content.lines().count();
+    let mut lines: Vec<String> = content
+        .lines()
+        .take(MAX_LINES)
+        .map(|line| {
+            if line.chars().count() > MAX_CHARS {
+                format!("{}…", line.chars().take(MAX_CHARS).collect::<String>())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if total > MAX_LINES {
+        lines.push(format!(
+            "… +{} lines (Ctrl-U/D or PgUp/PgDn to inspect)",
+            total - MAX_LINES
+        ));
+    }
+    crate::cli::diff::sanitize_multiline(&lines.join("\n"))
+}
+
 /// Build a file-tool approval dialog from a tool call.
 ///
 /// This lives here, not on `Dialog`, because it is assembly from Finch's own vocabulary: a
@@ -1312,6 +1414,23 @@ pub fn tool_approval_dialog(
         // sanitized the untrusted content and then applied its own SGR theme sequences; sanitizing
         // again strips those, and the preview renders identically in every colour mode.
         dialog.body = Some(preview);
+    } else if tool_use.name.eq_ignore_ascii_case("write") {
+        if let Some(content) = tool_use.input.get("content").and_then(Value::as_str) {
+            dialog.body = Some(bounded_write_preview(content));
+        }
     }
     dialog
+}
+
+/// Production assembly: compact summary plus a themed, scrollable preview.
+pub(crate) fn assemble_tool_approval(
+    tool_use: &crate::tools::ToolUse,
+    summary: &str,
+) -> crate::cli::tui::Dialog {
+    tool_approval_dialog(
+        tool_use,
+        summary,
+        &crate::theme::ColorScheme::default(),
+        crate::cli::diff::DiffColorMode::production(),
+    )
 }
