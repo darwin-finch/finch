@@ -477,8 +477,9 @@ pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
         | "search_memory"
         | "list_recent_memories"
         | "todoread" => ExecutionEffect::VmRead,
-        "todowrite" | "push" | "pop" | "clear" | "enterplanmode" | "presentplan"
-        | "askuserquestion" | "create_memory" => ExecutionEffect::VmWrite,
+        "todowrite" | "enterplanmode" | "presentplan" | "askuserquestion" | "create_memory" => {
+            ExecutionEffect::VmWrite
+        }
         "read" | "glob" | "grep" | "hash_compare" | "excel_read" | "excel_range"
         | "excel_sheets" | "gui_inspect" => ExecutionEffect::WorkspaceRead,
         "web_fetch" => ExecutionEffect::ExternalRead,
@@ -830,6 +831,17 @@ mod tests {
         assert!(legacy_tool_effect("read", &serde_json::json!({})).runs_autonomously());
         assert!(!legacy_tool_effect("write", &serde_json::json!({})).runs_autonomously());
         assert!(!legacy_tool_effect("unknown", &serde_json::json!({})).runs_autonomously());
+    }
+
+    #[test]
+    fn test_legacy_tool_effect_does_not_classify_unregistered_stack_words() {
+        for tool in ["push", "pop", "clear"] {
+            assert_eq!(
+                legacy_tool_effect(tool, &serde_json::json!({})),
+                ExecutionEffect::Unclassified,
+                "{tool} is not a registered tool (`/clear` is a REPL slash command) and must not grant VmWrite"
+            );
+        }
     }
 
     #[test]
