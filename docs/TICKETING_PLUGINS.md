@@ -95,3 +95,37 @@ daemon's configured tracker account, not a new CLI login per terminal.
 Workspace isolation, claim-owned directories, and sandbox ([#434](https://github.com/darwin-finch/finch/issues/434))
 remain Finch execution. Pyramid still names the workspace contract when the
 backend is Pyramid.
+
+## Industry pattern: git as the bus
+
+Corporate stacks usually do **not** give the model a ticket API. They wire
+GitHub/GitLab to Jira/Azure Boards and infer work from branches and PRs:
+
+- Branch or commit contains `DEV-123` → ticket "in progress"
+- PR opened → "in review", manager tagged, diff linked on the board
+- Copilot/Codex Agent HQ: a mission-control UI over those sessions
+- Azure DevOps MCP: assign a work item to an agent; it reads the ticket and
+  reports status
+- Codex desktop: isolated git worktrees, parallel agents, one PR each
+
+That is a **git-hook workflow sitting on Jira**. Status is a field updated by
+the forge. The agent often never calls `tickets.comment`.
+
+We take the mechanical pieces and refuse the bus:
+
+| Steal | Refuse |
+|-------|--------|
+| Ticket id on the branch/PR as *correlation* | Silent workflow transitions from git |
+| Isolated worktrees, one task each | Using the human's `~/repos` layout |
+| Parallel agents, human review of PRs | Unlimited review queue |
+| MCP for trackers we do not bundle (e.g. Azure DevOps) | MCP subprocess per first-party tracker |
+| PM sees which agent holds which item | A second "Agent HQ" product |
+
+Finch talks to the tracker with `tickets.*`. Git/PR is **evidence** the claim
+returns, not the coordinator. Pyramid (when it is the backend) already treats
+forge events as cited obligations, not as a second Jira. Smart-commit plugins
+that move Jira columns are a Linear/Jira adapter *option* behind an explicit
+command, never an implied side effect of `git push`.
+
+Azure Boards is not in the first-party adapter list. If someone needs it, they
+enable an MCP server (#694) or we add an adapter later the same way as Jira.
