@@ -22,6 +22,33 @@ keyword personas." Context assembly loads AGENTS.md and kin into the system
 prompt (`src/context/ASSEMBLY.md`); `finch query` / `finch agent` / local
 generators still do not get that (#77).
 
+Finch is **not yet a daily harness**. ChatGPT device OAuth exists. Claude
+subscription OAuth is [#199](https://github.com/darwin-finch/finch/issues/199)
+and not done. Grok and other subscriptions are API keys only. Until those
+logins feel like the vendor apps, people will keep switching UIs when a cap
+hits, which is the problem this runtime exists to end.
+
+## The provider/credential matrix is the UX tax
+
+Claude Code, ChatGPT, and Grok each have **one** account and a model picker.
+Finch has provider × credential × model × thinking level. That matrix is
+correct internally and hostile in a Brain: four choices every time you hit a
+limit.
+
+The user-facing object is a **lane**, not a tuple:
+
+- a named profile: `cheap`, `review`, `grok-sub`, `claude-api`
+- each lane binds provider + credential + default model + default effort
+- `/model` or a Brain picker switches **lanes**
+- changing model or thinking level *inside* a lane is a secondary control
+  (planned: [#217](https://github.com/darwin-finch/finch/issues/217) persist
+  per Brain, [#338](https://github.com/darwin-finch/finch/issues/338) effort,
+  [#450](https://github.com/darwin-finch/finch/issues/450) hot-swap on cap)
+
+When a cap hits, offer the next **lane**, not a credentials form. Setup
+(#700) still collects OAuth, PAT, or `gh auth token` per plugin; that is
+once, not per turn.
+
 ## Routing: packet role, not a second LLM
 
 An LLM router that embeds the prompt to pick GPT vs Claude is optional later
@@ -34,13 +61,13 @@ and easy to get wrong. For this product the signal is already in the **claim**:
 | Review | **different** member, cited review skill | stronger model, not the implementer |
 | Accept | human, morning QA | not a model |
 
-That is Pyramid PYR-777 plus Finch profiles, not RouteLLM. The router does not
+That is Pyramid PYR-777 plus Finch **lanes**, not RouteLLM. The router does not
 need to understand the code. It needs to know whether this Brain is
 implementing or reviewing. A classifier that reads "please find bugs" and
 upgrades the model is a fallback for chat, not the factory.
 
 Do not use one flagship for every persona in `/plan`. Worker vs critic vs
-final arbiter can be three profiles. Models that obsessively re-open working
+final arbiter can be three lanes. Models that obsessively re-open working
 code when told to "check again" should not own the inner loop.
 
 ## Prompt caching: later, and only with a frozen prefix
@@ -66,7 +93,9 @@ If we do it:
 Subscriptions vs API: the daemon already speaks provider HTTP. Paying ChatGPT
 Pro / Claude Max and pasting between UIs is the expensive path. One API wallet
 (native keys or OpenRouter) on the daemon is the product. Prompt caching is an
-optimization on that path, not a reason to delay it.
+optimization on that path, not a reason to delay it. Subscription **OAuth**
+(Claude #199, Grok still missing) is what makes "one harness" true; API keys
+alone keep you in the vendor apps for the quota you already paid.
 
 ## What not to do now
 
@@ -75,3 +104,5 @@ optimization on that path, not a reason to delay it.
 - Treating cache as a substitute for warm runtime / cold claim (Pyramid:
   durable Finch, clean task context).
 - Git hooks that move Jira columns (ticketing plugins).
+- Exposing the raw provider/credential/model/effort matrix as the Brain
+  switcher.
