@@ -1386,7 +1386,7 @@ Reflection and legacy words may be retained behind explicit boundaries:
 
 ```text
 dynamic.call       requires runtime signature check
-unsafe.memory      requires an unsafe-memory capability and cannot be remotely granted by default
+unsafe.memory      unhosted native profile only; hosted Finch rejects the module
 legacy.eval        unclassified; interpreted only; explicit approval
 ```
 
@@ -1487,6 +1487,16 @@ concept ShareableOwner<T> : Owner<T> {
     operation retain = &Self -> Self
 }
 
+concept StableAddressOwner<T> : Owner<T> {
+    # The pointee address remains fixed for this owner's live storage generation.
+    operation stable-borrow = &Self -> scoped stable &T
+}
+
+concept PinnableOwner<T> : Owner<T> {
+    associated Pinned : StableAddressOwner<T>
+    operation pin = take Self -> Pinned
+}
+
 Unique<T> : Owner<T>                 # movable, not copyable
 Shared<T> : ShareableOwner<T>        # copying retains a strong handle
 Weak<T>                              # upgrade returns option<Shared<T>>
@@ -1497,12 +1507,40 @@ they are not name-based duck typing. User-defined arenas, pools, foreign handles
 carriers may implement the same public contracts. A carrier's trusted implementation may use raw
 allocation primitives, but ordinary code sees its checked lifecycle behavior.
 
+Every `Owner<T>` keeps the pointee valid and at one address for the duration of each active borrow.
+An ordinary owner may relocate its pointee only between borrows, when no derived address or view
+survives. `StableAddressOwner<T>` strengthens that promise across the owner's whole live storage
+generation, while `PinnableOwner<T>` can consume a relocatable owner and return such a stable owner.
+Moving the owner handle need not move the pointee. Self-referential values, retained native
+callbacks, asynchronous FFI buffers, and APIs that store an address require stable-address evidence;
+ordinary borrowing does not acquire it accidentally. A raw address derived from a borrow remains
+bounded by that borrow even when the pointee is stable, and pinning never grants authority or
+extends ownership by itself.
+
 Copy and drop effects are part of generic evidence and every callable's inferred effect row,
 including implicit cleanup edges. They may perform bounded deterministic lifecycle work but cannot
 suspend, allow an exception to escape, acquire ambient authority, or hide an externally fallible mutation. Resource
 release authority travels with the owner that acquired the resource. General I/O, commit, flush,
 and protocol shutdown belong in explicit `close`/`finish` operations or scope guards. Dynamic owner
 evidence binds a fixed compatible cleanup effect row; erasure cannot conceal it.
+
+Drop classifications are derived compiler evidence, not annotations that ordinary programmers must
+sprinkle through records or call sites. The compiler derives the strongest class justified by every
+field and custom drop hook:
+
+```text
+trivial-drop    no cleanup action; it may be erased completely
+local-drop      deterministic memory-local release such as freeing or decrementing an owner
+ordered-drop    bounded local cleanup with observable sequencing, such as unlocking a guard
+```
+
+All three preserve the language's exactly-once, reverse-construction destruction rules. The class
+only tells optimization and generic code what is unobservable: a trivial drop may disappear, and a
+local drop may be inlined or coalesced where ownership dependencies prove that timing and order are
+unchanged. An ordered drop remains a sequencing barrier. Fallible, suspending, externally visible,
+or authority-acquiring work is not a fourth kind of destructor; it belongs in `close`, `finish`, or
+a scope guard. The compiler rejects a custom hook that cannot be certified into one of these bounded
+classes and reports which operation or field prevented certification.
 
 An ownership-taking API should not need to name `Shared<T>` merely because one caller uses shared
 storage. If the callee only needs to hold and eventually release one owner, it accepts an ownership
@@ -1558,6 +1596,14 @@ heap object whose destructor is silently unreachable merely because no ownership
 attached to its allocation. Shared cycles can retain memory and must be broken with weak edges or a
 different ownership policy; they are a diagnosable leak risk, not memory unsafety.
 
+Reference counting does not collect a strong cycle as a group. If `A` strongly owns `B` and `B`
+strongly owns `A`, dropping every outside `Shared` handle leaves both internal strong counts nonzero,
+so neither destructor begins. At least one back edge must be `Weak`, an explicit operation must break
+the cycle, or the graph must use an ownership policy such as an explicit tracing arena. This rare
+case does not justify tracing overhead for every shared value. The compiler should warn for obvious
+unconditional structural cycles, and debug runtimes may report retained strongly connected owner
+graphs, but neither diagnostic may pretend to prove arbitrary runtime graphs cycle-free.
+
 Drop is for deterministic, non-suspending cleanup. Fallible or asynchronous shutdown belongs in an
 explicit operation such as `close`, `finish`, or `join`; drop may provide a safe fallback but cannot
 hide its failure. Cancellation and typed exception unwinding run owned drops exactly once. A hard
@@ -1571,6 +1617,26 @@ trap carrying its source origin. Operations capable of violating the model—raw
 unchecked access, manual allocation, and unverifiable FFI contracts—require an explicit unsafe
 boundary. Every such construct is compiler-identifiable, warnable, searchable, and optionally
 forbidden by project policy; a warning alone never turns an unsafe operation into safe code.
+
+The safe surface may carry an opaque typed foreign address, compare it with null, and pass it back
+through a declared safe wrapper, but it cannot inspect the address, perform arithmetic, dereference
+it, convert it to or from an integer, manufacture a borrow from it, persist it, checkpoint it, or
+send it to another worker. Those operations require a lexically explicit `unsafe` block inside a
+callable whose contract states the caller-visible preconditions. Marking a callable unsafe does not
+disable ordinary type, ownership, effect, initialization, or control-flow checks, and a definitely
+invalid operation remains an error. Unsafe instructions and their source origins survive lowering
+and module certification; they are never erased into an apparently safe call edge.
+
+Hosted Finch admits no unsafe source or IR. The interactive client, daemon, provider/model execution,
+remote execution, and other hosted profiles reject a module containing unsafe instructions or an
+unsafe call edge—even when unreachable—and provide no prompt, grant, or capability that can override
+that decision. A `ModuleVerified` artifact therefore carries an explicit unsafe summary, and hosted
+admission requires it to be empty. Unsafe execution exists only in an eventual explicitly unhosted
+native/embedder profile whose build and policy both opt into the unsafe runtime surface. Even there,
+unsafe code does not gain filesystem, process, network, or other host authority; those remain
+separate typed capability effects. Trusted native host plugins are outside the hosted language
+sandbox and remain part of the host's auditable TCB rather than a way for hosted Finch code to enter
+unsafe mode.
 
 Subtyping follows capability and mutation rather than class layout. Function inputs are
 contravariant and results covariant. Readonly borrows and readonly owner views may be covariant;
@@ -1591,6 +1657,10 @@ operation that proves sole ownership and recovers a unique carrier. Moving a uni
 workers requires `Transfer<T>` evidence. Retaining a shared owner across workers additionally
 requires `ShareAcrossWorkers<T>` evidence, normally derived only for immutable values or explicitly
 synchronized containers. Reference counting alone is not a thread-safety claim.
+
+**Shared ownership never implies shared mutability.** Safe code, concept adapters, and optimizers may
+assume that aliases obtained through `Shared<T>` are readonly unless separate synchronization or
+recovered-uniqueness evidence explicitly permits mutation.
 
 ### Receiver mutability, deep immutability, and copy-on-write
 
@@ -2744,6 +2814,25 @@ ordinary FFI. Keep the reader framing, artifact loader, verifier, effect boundar
 runtime as a deliberately small stage-0 trusted implementation rather than requiring an existing
 self-hosted compiler to validate arbitrary input.
 
+Self-hosting is also the portability boundary for embedding. The staged Co-Forth/CoLisp compiler
+image contains the reader, semantic jobs, optimization, and portable IR generation once, rather
+than requiring each host language to translate those systems. A versioned C-compatible `libfinch`
+ABI exposes opaque runtime, compiler, module, and execution handles; byte/source buffers and owned
+diagnostics; compile, verify, interpret, and optional JIT entry points; and the correlated
+`VmSideEffect`/`VmResume` callback boundary. It specifies allocator ownership, buffer lifetime,
+thread affinity, reentrancy, cancellation, and the rule that exceptions and unwinding never cross
+the ABI. Generated C headers and thin language bindings let Rust, Go through cgo, and other native
+hosts consume the same staged compiler and runtime image. JIT-generated code calls stable runtime
+shims, never the Rust ABI, so Rust remains one implementation and binding rather than the portable
+contract.
+
+This removes most compiler duplication, not all platform work. Each supported target still needs a
+small stage-0 runtime/verifier build, executable-memory and W^X handling for JIT mode, native ABI and
+unwind integration, and an adapter from the host's event loop and effects into the portable resume
+protocol. Hosts may choose interpreter-only operation. Bindings should keep crossings coarse—Finch
+executes ordinary calls internally and returns to Go or another host primarily for declared effects—
+so cgo/callback overhead does not become the cost of every language operation.
+
 The eventual compiler distribution may be a self-bootstrapping staged image. A tiny audited native
 stage 0 validates a bounded canonical manifest and loads a minimal Co-Forth compiler module; later
 content-addressed stages use only the language/compiler surface exported by the preceding stage,
@@ -2831,8 +2920,8 @@ listener/socket/file resources to native descriptors. Typed `connect`, `listen`,
 interactive embedder. HTTP clients and servers can then be Finch libraries over byte streams (with
 optional optimized host vocabulary), while source programs never receive a forgeable integer file
 descriptor. Code that intentionally needs raw descriptor or foreign-ABI manipulation must enter an
-explicit unsafe native-extension boundary with a separately declared capability; producing an AOT
-binary does not silently grant that authority.
+explicit unsafe native-extension boundary in an unhosted profile; producing an AOT binary does not
+silently enable unsafe execution or grant host authority.
 
 The asynchronous host is selected through a narrow reactor/scheduler interface rather than being
 hard-wired to Tokio or one operating-system poller. A standalone service may let the Finch runtime
@@ -2847,8 +2936,10 @@ Safe wrappers describe argument/result layout, ownership, callback lifetime, thr
 effects; they never expose a raw owning pointer, and opaque C pointers remain generation-checked
 resources or explicit foreign ownership carriers. Calling an unverified symbol,
 passing a raw pointer/integer descriptor, variadic calls, and unchecked shared-memory access require
-an explicit unsafe-FFI capability. The same declarations feed interpreter bindings and Cranelift
-AOT lowering so FFI does not become a second language semantic path.
+an explicit unsafe boundary admitted only by an unhosted profile. The same declarations feed
+interpreter bindings and Cranelift AOT lowering so FFI does not become a second language semantic
+path. Hosted profiles may call only safe host wrappers whose implementation is outside the language
+sandbox and whose typed effect contract remains independently authorized.
 
 ## Implementation work packages
 
@@ -3023,6 +3114,15 @@ Every phase adds tests at the layer where its invariant is enforced:
 - paired CoLisp/Co-Forth ownership cases for borrowing, unique moves, use-after-move diagnostics,
   shared retain/final release, weak upgrade, destructor ordering, owner variance, and static/dynamic
   carrier evidence, plus explicit `Cow<T>` uniqueness/clone behavior and non-cloneable exclusions;
+- owner-address tests proving ordinary carriers cannot relocate during a borrow, stable/pinned
+  evidence is required for retained native addresses and self-references, and derived raw addresses
+  cannot outlive their borrow or cross suspension merely because storage is pinned;
+- lifecycle tests deriving trivial/local/ordered drop classes, preserving exact-once reverse-order
+  destruction through optimization and unwind, rejecting fallible or suspending hooks, and warning
+  on obvious strong-owner cycles without imposing tracing on acyclic `Shared` values;
+- safety-profile tests proving hosted admission rejects reachable and unreachable unsafe instructions
+  and transitive unsafe calls with no approval path, while an unhosted build still requires lexical
+  unsafe boundaries and explicit profile admission and cannot infer unrelated host authority;
 - closure-capture tests for inferred scoped borrows, `:move`, exact and mixed capture lists,
   copy/unique/shared/weak carriers, mutation and consuming callable receivers, escape/suspension
   diagnostics, context-free nested records, macro-generated free names, and identical semantics
@@ -3073,6 +3173,9 @@ Every phase adds tests at the layer where its invariant is enforced:
   failed-publication rollback, root/descendant generation pinning across replacement and restart,
   explicit-job versus CoLisp-fiber semantic equivalence, diverse source-to-stage reproducibility,
   and cached-versus-cold compiler-image equivalence;
+- portable-embedding tests in C and Go that load the same staged image through generated bindings,
+  compile and verify the same program, compare interpreter/JIT results where JIT is available, and
+  exercise diagnostic ownership, effect callbacks, cancellation, threading, and reentrancy rules;
 - UI snapshots for approval, denial, compile error, runtime trap, child failure, and revocation;
 - platform security tests for symlinks, races, Unicode paths, case sensitivity, and root changes.
 
