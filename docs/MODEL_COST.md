@@ -46,18 +46,20 @@ that from the stable `type` tag, not from the user's display name:
 - first enabled cloud entry → `default` work lane if unset
 
 The user can override. `/provider` already switches by **name**; keep that.
-Within one named entry, same backend and same credentials: `/model` and
-`/effort` (thinking level) are cheap controls
-([#217](https://github.com/darwin-finch/finch/issues/217),
-[#338](https://github.com/darwin-finch/finch/issues/338)). Cap failover
-([#450](https://github.com/darwin-finch/finch/issues/450)) offers the next
-**named provider** (or the next entry that has the needed role), not a
-credentials form.
+A Brain is bound to that **whole named entry** (backend + credentials). It
+must not mutate the shared `[[providers]]` row when you only wanted a
+different model or thinking level on *this* Brain.
 
-**Cache:** if the model id does not change, the conversation prefix is already
-stable and providers' automatic prefix cache works. Compression (#707) is for
-**crossing providers** (or a model id that would miss the prefix), not for
-toggling effort on the same model.
+Those are a **Brain overlay**: optional `model` and `reasoning_effort` on the
+Brain (or BrainRun), applied only if that provider type supports them
+([#217](https://github.com/darwin-finch/finch/issues/217),
+[#338](https://github.com/darwin-finch/finch/issues/338)). Local/ONNX/Candle:
+effort is meaningless and the control is hidden; model family/size lives on
+the provider entry, not a ChatGPT-style picker. Cap failover (#450) still
+offers the next **named provider**, not a credentials form.
+
+Crossing providers (#707 compress) is a different problem from overlaying
+model/effort on the same name.
 
 ## Routing: packet role, not a second LLM
 
@@ -124,10 +126,10 @@ providers whatever they want; Finch must not grep for `qwen`.
 
 Setup assigns `compress` once (default: local Qwen; else cheapest configured
 cloud; else refuse and send only the last N turns with a warning). Hot-swap
-(#450) **to a different provider** then: run `compress` on the log → attach
-summary + tail → new entry. Same provider, new model/effort: skip compress;
-prefix cache should still hit. The summary is an event on the Brain, so you
-can see what was dropped.
+(#450) **to a different named provider** then: run `compress` on the log →
+attach summary + tail → new binding. Overlaying model/effort on the **same**
+named provider is not a provider swap and does not compress. The summary is
+an event on the Brain, so you can see what was dropped.
 
 Do not use the outgoing flagship to summarize "random back and forth." That
 defeats the point. Local Qwen shipped by default is how this stays free when
@@ -144,5 +146,6 @@ the user has no API.
   switcher.
 - Selecting the compressor by provider **name** (`qwen`, `luna`, …). Heuristics
   use `type`.
-- Replaying the full Brain log when the **provider** changes. Same-model
-  effort/model tweaks should not compress.
+- Replaying the full Brain log when the **named provider** changes.
+- Treating `/model` or `/effort` as edits to the shared `[[providers]]` row.
+- Showing thinking-level UI on local providers.
