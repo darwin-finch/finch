@@ -566,7 +566,7 @@ impl Tool for SearchWordTool {
             })
             .collect::<Vec<_>>();
         let program_matches = match &self.memory {
-            Some(memory) => memory
+            Some(memory) => crate::program_registry::ProgramRegistry::from_ref(memory)
                 .search_program_definitions(&query, limit)
                 .await?
                 .into_iter()
@@ -666,7 +666,9 @@ impl Tool for InspectWordTool {
             let memory = self.memory.as_ref().context(
                 "inspect_word: no persisted program registry is available; use an exact built-in word name",
             )?;
-            let definitions = memory.search_program_definitions(name, 20).await?;
+            let definitions = crate::program_registry::ProgramRegistry::from_ref(memory)
+                .search_program_definitions(name, 20)
+                .await?;
             let definition = definitions
                 .into_iter()
                 .find(|definition| definition.name == name)
@@ -690,7 +692,7 @@ impl Tool for InspectWordTool {
             id: Uuid::from_str(id).context("inspect_word: invalid program id")?,
             version,
         };
-        let definition = memory
+        let definition = crate::program_registry::ProgramRegistry::from_ref(memory)
             .get_program_definition(&reference)
             .await?
             .context("inspect_word: program version not found")?;

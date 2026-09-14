@@ -55,7 +55,9 @@ impl Tool for SearchVocabularyTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: query"))?;
         let limit = params["limit"].as_u64().unwrap_or(8).clamp(1, 20) as usize;
-        let definitions = self.memory.search_program_definitions(query, limit).await?;
+        let definitions = crate::program_registry::ProgramRegistry::from_ref(&self.memory)
+            .search_program_definitions(query, limit)
+            .await?;
         if definitions.is_empty() {
             return Ok("No matching programs in the current VM vocabulary.".to_string());
         }
@@ -125,8 +127,7 @@ impl Tool for InspectProgramTool {
                 .map_err(|error| anyhow::anyhow!("invalid program id: {error}"))?,
             version,
         };
-        let definition = self
-            .memory
+        let definition = crate::program_registry::ProgramRegistry::from_ref(&self.memory)
             .get_program_definition(&reference)
             .await?
             .ok_or_else(|| anyhow::anyhow!("program version not found"))?;

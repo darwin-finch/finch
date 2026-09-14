@@ -75,12 +75,16 @@ impl MemorySystem {
     pub async fn conversation_summary_for_session(&self, session_id: &str, depth: usize) -> Result<ConversationSummaryLines>;
     /// Wait until every persisted node is in memory.
     pub async fn ensure_hydrated(&self) -> Result<()>;
+    /// Look up one immutable program-index version.
+    pub async fn get_program_index(&self, id: &str, version: u64) -> Result<Option<ProgramIndexRecord>>;
     /// Resolve the newest non-deprecated version of a scoped program name.
-    pub async fn get_program_by_name(&self, name: &str, language: Option<ProgramLanguage>) -> Result<Option<ProgramDefinition>>;
-    /// Look up one immutable program version.
-    pub async fn get_program_definition(&self, reference: &ProgramRef) -> Result<Option<ProgramDefinition>>;
+    pub async fn get_program_index_by_name(&self, name: &str, language: Option<&str>) -> Result<Option<ProgramIndexRecord>>;
     /// Get recent conversations (for context window)
     pub async fn get_recent_conversations(&self, limit: usize) -> Result<Vec<(String, String)>>;
+    /// Update the rebuildable SQLite projection for one source-backed definition.
+    pub async fn index_program_record(&self, mut record: ProgramIndexRecord) -> Result<ProgramIndexRef>;
+    /// Index many records in one transaction.
+    pub async fn index_program_records(&self, records: Vec<ProgramIndexRecord>) -> Result<usize>;
     /// Structural summary of the semantic index: (leaf count, max depth, widest fan-out below the root).
     pub async fn index_shape(&self) -> (usize, usize, usize);
     /// Insert one side of a successful named-Brain turn exactly once.
@@ -89,11 +93,11 @@ impl MemorySystem {
     pub async fn insert_conversation(&self, role: &str, content: &str, model: Option<&str>, session_id: Option<&str>) -> Result<()>;
     /// Resolve the stable ID returned by `query_with_sources`.
     pub async fn inspect_memory(&self, memory_id: &str) -> Result<Option<InspectedMemory>>;
+    /// Load canonical index rows for every current non-deprecated version.
+    pub async fn latest_program_indexes(&self) -> Result<Vec<ProgramIndexRecord>>;
     /// Load legacy persisted Lisp definitions for explicit migration tooling.
     pub async fn load_lisp_defines(&self) -> Result<Vec<String>>;
-    /// Create a new memory system, downloading the neural model if needed.
-    pub async fn new_async(config: MemoryConfig) -> Result<Self>;
-    /// Current monotonic registry generation used to invalidate stale model manifests.
+    /// Current monotonic registry generation used to invalidate stale manifests.
     pub async fn program_registry_generation(&self) -> Result<u64>;
     /// Query memory for relevant context
     pub async fn query(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<String>>;
@@ -101,39 +105,27 @@ impl MemorySystem {
     pub async fn query_with_sources(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<MemorySearchResult>>;
     /// Project every conversation that was stored but never indexed, and report how many were repaired.
     pub async fn recover_pending_projections(&self) -> Result<usize>;
-    /// Write an authored definition to the browsable vocabulary first, then index it.
-    pub async fn save_authored_program(&self, definition: ProgramDefinition) -> Result<(ProgramRef, PathBuf)>;
     /// Persist a successful Lisp `(define ...)` expression for session replay.
     pub async fn save_lisp_define(&self, expr: &str) -> Result<()>;
-    /// Search current program versions using a compact lexical relevance score.
-    pub async fn search_program_definitions(&self, query: &str, limit: usize) -> Result<Vec<ProgramDefinition>>;
+    /// Search current program-index versions using a compact lexical score.
+    pub async fn search_program_indexes(&self, query: &str, limit: usize) -> Result<Vec<ProgramIndexRecord>>;
     /// Get memory statistics
     pub async fn stats(&self) -> Result<MemoryStats>;
-    /// Load canonical `.forth` and `.lisp` files and update the searchable index.
-    pub async fn sync_program_files(&self, root: &std::path::Path, scope: ProgramScope) -> Result<usize>;
-    /// Build a compact discovery manifest for a model and its current task.
-    pub async fn vm_manifest(&self, query: &str, limit: usize) -> Result<VmManifest>;
     /// Progress of the background hydration, for status surfaces.
     pub fn hydration_status(&self) -> HydrationStatus;
-    /// Create new memory system (synchronous).
+    /// Create a new memory system with the TF-IDF fallback engine.
     pub fn new(config: MemoryConfig) -> Result<Self>;
+    /// Create a memory system that embeds with the caller-supplied engine.
+    pub fn new_with_engine(config: MemoryConfig, embedding_engine: Arc<dyn EmbeddingEngine>) -> Result<Self>;
     /// Root containing user-readable program sources beside the memory database.
     pub fn program_source_root(&self) -> PathBuf;
 }
-/// ONNX sentence transformer embedding engine.
-pub struct NeuralEmbeddingEngine { … }
-impl NeuralEmbeddingEngine {
-    /// Async version: download model using a blocking thread pool.
-    pub async fn ensure_downloaded() -> Result<PathBuf>;
-    /// Download the embedding model from HuggingFace if not already cached.
-    pub fn download_sync() -> Result<PathBuf>;
-    /// Try to find the model in the HuggingFace cache without downloading.
-    pub fn find_in_cache() -> Option<PathBuf>;
-    /// Load a pre-downloaded embedding model from a directory.
-    pub fn load(model_dir: &Path) -> Result<Self>;
-}
 /// Node ID in the tree
 pub type NodeId = u64;
+/// One stored program-index row.
+pub struct ProgramIndexRecord { … }
+/// Identity of one immutable program-index version.
+pub struct ProgramIndexRef { … }
 /// Word + character n-gram TF-IDF embedding engine  Dramatically better than a pure hash approach: - Tokenises into words (lowercase, alphanumeric) - Generates…
 pub struct TfIdfEmbedding { … }
 impl TfIdfEmbedding {

@@ -8,13 +8,12 @@
 
 mod embeddings;
 mod memtree;
-mod neural_embedding;
 mod program_registry;
 mod quality;
 
 pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
 pub use memtree::{MemTree, NodeId, TreeNode};
-pub use neural_embedding::NeuralEmbeddingEngine;
+pub use program_registry::{ProgramIndexRecord, ProgramIndexRef};
 pub use quality::{MemoryClassifier, MemoryImportance};
 
 use anyhow::{Context, Result};
@@ -320,10 +319,11 @@ pub struct MemoryConfig {
     pub max_context_items: usize,
     /// Checkpoint interval in seconds
     pub checkpoint_interval_secs: u64,
-    /// Use neural ONNX embeddings when the model is cached (default: true).
-    /// Falls back to TF-IDF if the model is not yet downloaded.
+    /// Composition-root flag: prefer neural embeddings when the model is cached.
+    /// `MemorySystem` constructors ignore this and use the injected engine.
     pub use_neural_embeddings: bool,
     /// Directory where the embedding model is cached / downloaded.
+    /// Composition reads this; memory does not download or load models.
     pub embedding_cache_dir: PathBuf,
 }
 
@@ -795,13 +795,22 @@ fn source_metadata_for_node(
 }
 
 impl MemorySystem {
-    /// Create new memory system (synchronous).
+    /// Create a new memory system with the TF-IDF fallback engine.
     ///
-    /// If `config.use_neural_embeddings` is true and the model is already in
-    /// the HuggingFace cache, a `NeuralEmbeddingEngine` is used; otherwise
-    /// falls back to `TfIdfEmbedding`.  Call `new_async` to trigger a
-    /// download on first run.
+    /// Model selection and download belong to the composition root. Inject a
+    /// neural engine with [`Self::new_with_engine`].
     pub fn new(config: MemoryConfig) -> Result<Self> {
+        Self::new_with_engine(config, Arc::new(TfIdfEmbedding::new()))
+    }
+
+    /// Create a memory system that embeds with the caller-supplied engine.
+    ///
+    /// The engine's dimension parameterizes the MemTree. Constructors never
+    /// probe the HuggingFace cache or download a model.
+    pub fn new_with_engine(
+        config: MemoryConfig,
+        embedding_engine: Arc<dyn EmbeddingEngine>,
+    ) -> Result<Self> {
         // Ensure directory exists
         if let Some(parent) = config.db_path.parent() {
             std::fs::create_dir_all(parent)
@@ -910,29 +919,7 @@ impl MemorySystem {
 
         tracing::debug!("Memory system initialized: {}", config.db_path.display());
 
-        // Select embedding engine: try neural if enabled and cached, else TF-IDF.
-        let embedding_engine: Arc<dyn EmbeddingEngine> = if config.use_neural_embeddings {
-            match NeuralEmbeddingEngine::find_in_cache()
-                .and_then(|dir| NeuralEmbeddingEngine::load(&dir).ok())
-            {
-                Some(neural) => {
-                    tracing::debug!("Using neural ONNX embeddings (all-MiniLM-L6-v2)");
-                    Arc::new(neural)
-                }
-                None => {
-                    tracing::debug!(
-                        "Neural embedding model not in cache — using TF-IDF fallback. \
-                         Run `finch memory download` or call MemorySystem::new_async() \
-                         to download."
-                    );
-                    Arc::new(TfIdfEmbedding::new())
-                }
-            }
-        } else {
-            Arc::new(TfIdfEmbedding::new())
-        };
-
-        // Parameterize MemTree dimension to match the chosen engine.
+        // Parameterize MemTree dimension to match the injected engine.
         let dim = embedding_engine.dimension();
         let mut tree = MemTree::new_with_dim(dim);
 
@@ -1089,21 +1076,6 @@ impl MemorySystem {
             embedding_engine,
             config,
         })
-    }
-
-    /// Create a new memory system, downloading the neural model if needed.
-    ///
-    /// Same as `new()` but also triggers `NeuralEmbeddingEngine::ensure_downloaded()`
-    /// before constructing, so the first run downloads the model rather than
-    /// falling back to TF-IDF.
-    pub async fn new_async(config: MemoryConfig) -> Result<Self> {
-        if config.use_neural_embeddings {
-            match NeuralEmbeddingEngine::ensure_downloaded().await {
-                Ok(_) => tracing::info!("Neural embedding model ready"),
-                Err(e) => tracing::warn!("Could not download neural model: {} — using TF-IDF", e),
-            }
-        }
-        Self::new(config)
     }
 
     /// Insert a conversation turn into memory
@@ -1314,12 +1286,11 @@ impl MemorySystem {
     /// live defect. `sweep_pending_projections_locked` clears the flag when the
     /// pending set comes back empty, and the set can be empty *because the `?1`
     /// exclusion removed the caller's own row*. The caller then failed at
-    /// `ctx.embedding_engine.embed()` — the neural engine returns `Err` on a
-    /// tokenizer or ONNX fault, and `use_neural_embeddings` defaults on — whose
-    /// `?` returned above both of those sites. The row stayed pending with the
-    /// flag disarmed, so no automatic sweep ran again for the life of the
-    /// process. The same asymmetry hit an ordinary first-time write that failed
-    /// at `embed`.
+    /// `ctx.embedding_engine.embed()` — a neural engine returns `Err` on a
+    /// tokenizer or ONNX fault — whose `?` returned above both of those sites.
+    /// The row stayed pending with the flag disarmed, so no automatic sweep ran
+    /// again for the life of the process. The same asymmetry hit an ordinary
+    /// first-time write that failed at `embed`.
     async fn project_stored_conversation(
         ctx: &ProjectionContext,
         pending: &PendingConversation,
@@ -2379,6 +2350,9 @@ impl MemorySystem {
     }
 
     /// Persist a successful Lisp `(define ...)` expression for session replay.
+    ///
+    /// This writes `lisp_env` only. Composition projects authored definitions
+    /// into the program index through the caller-owned adapter.
     pub async fn save_lisp_define(&self, expr: &str) -> Result<()> {
         let created_at = chrono::Utc::now().timestamp();
         {
@@ -2388,18 +2362,16 @@ impl MemorySystem {
                 rusqlite::params![expr, created_at],
             )?;
         }
-        if let Some(definition) = crate::programs::ProgramDefinition::from_lisp_define(expr, None) {
-            self.save_authored_program(definition).await?;
-        }
         Ok(())
     }
 
     /// Load legacy persisted Lisp definitions for explicit migration tooling.
     ///
     /// The interactive runtime must not replay these into the native Lisp evaluator: authored
-    /// definitions are projected into the shared typed program registry by `save_lisp_define`.
-    /// This reader remains temporarily available so older databases can be migrated without
-    /// making their obsolete evaluator state authoritative again.
+    /// definitions are projected into the shared typed program registry by the
+    /// composition adapter. This reader remains temporarily available so older
+    /// databases can be migrated without making their obsolete evaluator state
+    /// authoritative again.
     pub async fn load_lisp_defines(&self) -> Result<Vec<String>> {
         let conn = self.db.lock().await;
         let mut stmt = conn.prepare("SELECT expr FROM lisp_env ORDER BY seq ASC")?;
@@ -2940,6 +2912,62 @@ mod tests {
 
     use super::*;
     use tempfile::NamedTempFile;
+
+    struct FixedDimensionEngine {
+        dimension: usize,
+    }
+
+    impl EmbeddingEngine for FixedDimensionEngine {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            let mut embedding = vec![0.0; self.dimension];
+            if !embedding.is_empty() {
+                embedding[0] = 1.0;
+            }
+            Ok(embedding)
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+    }
+
+    #[test]
+    fn test_new_uses_tfidf_and_ignores_neural_selection_flag() {
+        let temp = NamedTempFile::new().unwrap();
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            memory.embedding_engine.dimension(),
+            TfIdfEmbedding::new().dimension(),
+            "MemorySystem::new must not select or load a neural model; the \
+             composition root injects the engine. flag=true, dim={}",
+            memory.embedding_engine.dimension()
+        );
+    }
+
+    #[test]
+    fn test_new_with_engine_uses_injected_dimension() {
+        let temp = NamedTempFile::new().unwrap();
+        let memory = MemorySystem::new_with_engine(
+            MemoryConfig {
+                db_path: temp.path().to_path_buf(),
+                use_neural_embeddings: true,
+                ..Default::default()
+            },
+            Arc::new(FixedDimensionEngine { dimension: 4 }),
+        )
+        .unwrap();
+        assert_eq!(
+            memory.embedding_engine.dimension(),
+            4,
+            "injected engine dimension must parameterize the store; got {}",
+            memory.embedding_engine.dimension()
+        );
+    }
 
     /// Content long enough to survive the quality classifier's noise filter.
     fn substantive(tag: &str) -> String {
@@ -4843,10 +4871,9 @@ mod tests {
 
     /// An embedding engine that can be switched to failing.
     ///
-    /// `NeuralEmbeddingEngine::embed` returns `Err` on a tokenizer or ONNX
-    /// fault and `use_neural_embeddings` defaults on, so the `?` at the top of
-    /// `project_stored_conversation` is a reachable production exit. Nothing
-    /// else in this suite can reach it.
+    /// A neural engine's `embed` returns `Err` on a tokenizer or ONNX fault, so
+    /// the `?` at the top of `project_stored_conversation` is a reachable
+    /// production exit. Nothing else in this suite can reach it.
     struct FailableEmbedding {
         inner: TfIdfEmbedding,
         fail: AtomicBool,
@@ -5380,17 +5407,16 @@ mod tests {
         };
         let brain_turn_id = strand_a_brain_conversation(&config).await?;
 
-        let mut reopened = MemorySystem::new(config)?;
+        let engine = Arc::new(FailableEmbedding {
+            inner: TfIdfEmbedding::new(),
+            fail: AtomicBool::new(true),
+        });
+        let reopened = MemorySystem::new_with_engine(config, Arc::clone(&engine) as _)?;
         assert!(
             reopened.hydration_task.is_none(),
             "precondition: the current-thread arm spawns no loader, so no sweep \
              runs behind this test's back"
         );
-        let engine = Arc::new(FailableEmbedding {
-            inner: TfIdfEmbedding::new(),
-            fail: AtomicBool::new(true),
-        });
-        reopened.embedding_engine = Arc::clone(&engine) as Arc<dyn EmbeddingEngine>;
 
         let error = reopened
             .insert_brain_conversation("user", BRAIN_TURN, None, Some("brain"), &brain_provenance())

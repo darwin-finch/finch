@@ -94,7 +94,7 @@ the MCP client should not have to load tool execution and permissions to get the
 | **`memory`** (1): MemTree storage and retrieval | `src/memory`, `memory_status.rs`, `workbook.rs` | Capsule [`src/memory/AGENTS.md`](src/memory/AGENTS.md), interface [`src/memory/INTERFACE.md`](src/memory/INTERFACE.md) |
 | **`tools-mcp`** (0): the client for external Model Context Protocol servers | `src/tools/mcp` | Capsule [`src/tools/mcp/AGENTS.md`](src/tools/mcp/AGENTS.md), interface [`src/tools/mcp/INTERFACE.md`](src/tools/mcp/INTERFACE.md), [user guide](docs/MCP_USER_GUIDE.md) |
 | **`tools`** (1): tool execution, permissions, GUI automation | `src/tools` except `mcp` | [Tool execution and permissions](src/tools/EXECUTION.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
-| **`runtime`** (2): the program runtime service and task-graph execution | `src/runtime`, `poset` | None yet |
+| **`runtime`** (2): the program runtime service and task-graph execution | `src/runtime`, `poset`; composition adapter [`src/program_registry.rs`](src/program_registry.rs) | None yet |
 | **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
 | **`providers`** (3): provider graph and wire transports, OAuth, planning prompts | `src/providers`, `claude`, `oauth`, `llms`, `planning` | [Claude client](src/claude/CLIENT.md), [OAuth boundary](docs/OAUTH.md), [ChatGPT subscription transport](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md), [OpenAI transport](docs/OPENAI_TRANSPORT.md) |
 | **`transport`** (3): Cap'n Proto IPC, node identity, service discovery | `src/ipc`, `node`, `network`, `service`, `node_name.rs`; `schema/` | Node capsule [`src/node/AGENTS.md`](src/node/AGENTS.md), interface [`src/node/INTERFACE.md`](src/node/INTERFACE.md); wire schema in [`schema/finch_ipc.capnp`](schema/finch_ipc.capnp) |
@@ -135,10 +135,10 @@ since [#584](https://github.com/darwin-finch/finch/issues/584):
 | `runtime` ↔ `brain` | `src/runtime/scheduler.rs` imports `brain::store::RunId`; `src/brain/store.rs` imports `runtime` |
 | `models` ↔ `cli` | `src/models/bootstrap.rs` imports `cli::OutputManager`; `src/cli/setup_wizard.rs` imports `models` |
 
-Memory has no two-way edge. Its only production import is `crate::programs`
-(`memory::program_registry` and `MemorySystem::save_lisp_define`). Its separate extraction blocker
-is heavy dependencies: `memory::neural_embedding` uses ONNX
-Runtime (`ort`), `tokenizers`, and `hf_hub` directly.
+Memory has no two-way edge and no production `crate::` import. Callers inject
+`EmbeddingEngine`; `models::neural_embedding` owns ONNX Runtime (`ort`), `tokenizers`, and
+`hf_hub` download/load. Program-definition mapping lives in the composition adapter
+[`src/program_registry.rs`](src/program_registry.rs).
 
 The application layer is knotted mostly through `tools`: `src/tools/types.rs` imports `cli`,
 `runtime`, `server`, `local`, and `models` types, and each of those imports `tools` back. `ipc`
