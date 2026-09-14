@@ -3531,7 +3531,7 @@ fn save_and_reload_wizard_state(
     name: &str,
 ) -> crate::config::Config {
     let path = directory.join(name);
-    let result = build_setup_result(state).expect("build setup result after provider add");
+    let result = build_setup_result(state).expect("build setup result after provider change");
     config_from_setup_result_with_paths(&result, directory.join("metrics"), None)
         .save_to(&path)
         .unwrap_or_else(|error| {
@@ -3548,6 +3548,168 @@ fn save_and_reload_wizard_state(
                 path.display()
             )
         })
+}
+
+#[test]
+fn test_delete_provider_through_reducer_preserves_survivors_after_save_and_reload() {
+    let mut second_subscription = chatgpt_subscription_provider();
+    if let ProviderEntry::Credentialed {
+        credential,
+        model,
+        name,
+        reasoning_effort,
+        ..
+    } = &mut second_subscription
+    {
+        credential.credential_ref = "chatgpt:work".into();
+        *model = Some("work-model-preview".into());
+        *name = Some("ChatGPT Work".into());
+        *reasoning_effort = Some(crate::config::ReasoningEffort::Low);
+    }
+    let mut second_credential = chatgpt_subscription_credential();
+    second_credential.name = "chatgpt:work".into();
+    second_credential.secret_ref = "oauth-store:chatgpt:work".into();
+    second_credential.account = Some("account-work".into());
+    let credentials = vec![chatgpt_subscription_credential(), second_credential];
+    let providers = [
+        expected_grok_provider(),
+        chatgpt_subscription_provider(),
+        second_subscription,
+    ];
+
+    for count in [2, 3] {
+        for selected in 0..count {
+            for delete_key in ['d', 'D'] {
+                let context = format!("{count} providers, selected {selected}, key {delete_key}");
+                let directory = tempfile::tempdir().unwrap();
+                let original_path = directory.path().join("original.toml");
+                let metrics_dir = directory.path().join("metrics");
+                crate::config::Config::with_providers_and_paths(
+                    providers[..count].to_vec(),
+                    metrics_dir.clone(),
+                    None,
+                )
+                .with_credentials(credentials.clone())
+                .save_to(&original_path)
+                .unwrap();
+                let original_bytes = std::fs::read(&original_path).unwrap();
+                let loaded = crate::config::load_config_from_path_with_paths(
+                    &original_path,
+                    metrics_dir,
+                    None,
+                )
+                .unwrap();
+                let mut state = WizardState::new_with_catalog_cache_dir(Some(&loaded), None);
+                state.current_section = WizardSection::Models;
+                for _ in 0..selected {
+                    handle_wizard_key(&mut state, key(KeyCode::Down)).unwrap();
+                }
+                let action = handle_wizard_key(&mut state, key(KeyCode::Char(delete_key))).unwrap();
+                let rendered = render_wizard_text(&state);
+                let result = build_setup_result(&state).unwrap();
+                let mut expected = providers[..count].to_vec();
+                let deleted = expected.remove(selected);
+                assert_eq!(
+                    result.providers, expected,
+                    "delete must remove exactly the selected provider and preserve ordered metadata; {context}; action={action:?}; rendered={rendered}"
+                );
+                assert_eq!(
+                    result.credentials, credentials,
+                    "provider deletion must retain every credential record; {context}"
+                );
+                assert_eq!(
+                    action,
+                    WizardAction::Continue,
+                    "delete must stay in setup until explicit save; {context}; rendered={rendered}"
+                );
+                assert!(
+                    !rendered.contains(&deleted.profile_name()),
+                    "deleted provider must disappear from the rendered list; {context}; rendered={rendered}"
+                );
+                for survivor in &expected {
+                    assert!(
+                        rendered.contains(&survivor.profile_name()),
+                        "surviving provider must remain visible; {context}; survivor={survivor:?}; rendered={rendered}"
+                    );
+                }
+                assert!(
+                    rendered.contains(&format!("Primary: {}", expected[0].profile_name())),
+                    "first surviving provider must render as primary; {context}; rendered={rendered}"
+                );
+                let expected_selection = selected.min(expected.len() - 1);
+                assert!(
+                    matches!(state.sections.get(&WizardSection::Models), Some(SectionState::Models { selected_idx, error: None, .. }) if *selected_idx == expected_selection),
+                    "selection must remain on the next row or clamp to the last survivor without an error; {context}; section={:?}",
+                    state.sections.get(&WizardSection::Models)
+                );
+                assert_eq!(
+                    std::fs::read(&original_path).unwrap(),
+                    original_bytes,
+                    "delete must not persist before explicit save; {context}"
+                );
+                assert_eq!(
+                    handle_wizard_key(
+                        &mut state,
+                        modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+                    )
+                    .unwrap(),
+                    WizardAction::Save,
+                    "Ctrl+S must accept the provider deletion; {context}"
+                );
+                let reopened = save_and_reload_wizard_state(&state, directory.path(), "after.toml");
+                assert_eq!(
+                    reopened.providers, expected,
+                    "saved deletion must preserve exact survivor ordering and metadata after reload; {context}"
+                );
+                assert_eq!(
+                    reopened.credentials(), credentials.as_slice(),
+                    "saved deletion must leave credential records unchanged after reload; {context}"
+                );
+                let reopened_state = WizardState::new_with_catalog_cache_dir(Some(&reopened), None);
+                assert_eq!(
+                    build_setup_result(&reopened_state).unwrap().providers,
+                    expected,
+                    "reopening setup must not resurrect the deleted provider; {context}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_delete_provider_refuses_last_provider_with_visible_recovery_after_reload() {
+    let directory = tempfile::tempdir().unwrap();
+    let (config, provider, credential) = persisted_subscription_config(directory.path());
+    let mut state = WizardState::new_with_catalog_cache_dir(Some(&config), None);
+    state.current_section = WizardSection::Models;
+    for delete_key in ['d', 'D', 'd'] {
+        let action = handle_wizard_key(&mut state, key(KeyCode::Char(delete_key))).unwrap();
+        let rendered = render_wizard_text(&state);
+        assert_eq!(
+            action, WizardAction::Continue,
+            "refusing the final deletion must keep setup open; key={delete_key}; rendered={rendered}"
+        );
+        assert!(
+            rendered.contains("Cannot delete the last provider. Press A to add another provider first."),
+            "last-provider refusal must explain the recovery in rendered text; key={delete_key}; rendered={rendered}"
+        );
+        assert!(
+            matches!(state.sections.get(&WizardSection::Models), Some(SectionState::Models { selected_idx: 0, tool_models, .. }) if tool_models.is_empty()),
+            "refusal must retain the only provider and valid selection; key={delete_key}; section={:?}",
+            state.sections.get(&WizardSection::Models)
+        );
+        let reloaded = save_and_reload_wizard_state(&state, directory.path(), "refused.toml");
+        assert_eq!(
+            reloaded.providers, vec![provider.clone()],
+            "repeated refused deletion must preserve exact provider metadata through save/reload; key={delete_key}"
+        );
+        assert_eq!(
+            reloaded.credentials(), &[credential.clone()],
+            "repeated refused deletion must retain credentials through save/reload; key={delete_key}"
+        );
+        state = WizardState::new_with_catalog_cache_dir(Some(&reloaded), None);
+        state.current_section = WizardSection::Models;
+    }
 }
 
 #[test]
