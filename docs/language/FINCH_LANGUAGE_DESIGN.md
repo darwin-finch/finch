@@ -1609,6 +1609,7 @@ the same nodes without source-to-source CoLisp generation.
 | ownership | `new unique`, `new shared`, `share`, borrow/take/retain | `new-unique`, `new-shared`, `share`, `borrow`, `take`, `retain`, `weaken` | owner/lifecycle operations |
 | fibers/tasks | `defer`, `spawn`, `join`, `race`, `next` | same typed words applied to quotations/handles | scheduled-execution operations |
 | range iteration | range operations / `foreach` | range words and quotation `foreach` | concept calls and structured loop |
+| named tests/suites | `(test ...)`, `(test-suite ...)` | `test: ... {}`, `test-suite: ... {}` | test-profile declarations, no production instruction |
 | macro/syntax | `define-syntax`, syntax constructors | `macro:`, `syntax[ ... ]`, explicit splice/fresh/context words | `Syntax` CTFE, then ordinary nodes |
 | unsafe/FFI | `(unsafe ...)`, `(extern "C" ...)` | `unsafe[ ... ]`, `extern(C): ... ;` | marked unsafe/foreign call; unhosted only |
 
@@ -3370,6 +3371,88 @@ Interpreted frames record word IDs and IR offsets. Optimized code uses explicit 
 metadata maps. Do not dedicate a permanent machine register to a global error flag, and do not rely
 on the Forth return stack to reconstruct optimized/inlined calls.
 
+## Named tests, fixtures, and typed test doubles
+
+Testing is a language-facing declaration and standard-library protocol, not module initialization
+or a runner convention that scrapes function names. Every test has a required human-readable name
+and a stable fully qualified identity derived from module, nested suite names, and test name.
+Duplicate identities are compile errors. Suites provide lexical grouping, inherited tags, and
+diagnostic paths; they do not own hidden mutable setup state or impose source-order execution.
+
+Conceptually, both frontends construct the same `TestDeclaration` and `TestSuiteDeclaration` nodes:
+
+```lisp
+(test-suite "JSON parser"
+  (test "rejects trailing input" (ctx)
+    (let ((actual (json/parse "{} junk")))
+      (expect ctx actual (matches (err (TrailingInput _)))))))
+```
+
+```forth
+test-suite: "JSON parser" {
+  test: "rejects trailing input" ( S borrow-mut TestContext -- S ) {
+    "{} junk" json.parse
+    matches{ Error{ TrailingInput{ _ } } } expect
+  }
+}
+```
+
+The exact punctuation may evolve with the paired grammars, but names, lexical grouping, source
+origins, and the shared semantic nodes are normative. Co-located test declarations can access their
+module's private interface. External test modules are black-box clients and see only published
+exports. Production sealing excludes test declarations and test-only evidence from the executable
+interface; a separate versioned test artifact links them under the test profile.
+
+A test body is an ordinary checked callable receiving a scoped `TestContext`. It may throw or
+suspend according to its inferred contract: ordinary I/O retains Finch's transparent green-task
+behavior and requires no `async`/`await` test variant. The runner owns the task, deadline,
+cancellation, output capture, capability grants, deterministic seed, and cleanup scope. A return is
+success; an uncaught value, trap, leaked owned task/fiber, unmet expectation, timeout, or cleanup
+failure is a structured test failure. The diagnostic names the stable test identity and contains
+the originating expression spans, matcher explanation/diff, captured output and effect trace, seed,
+and suppressed cleanup failures.
+
+`expect` is a hygienic standard-library syntax transform over typed matcher values, not a privileged
+comparison opcode. It evaluates the subject once, preserves its source spelling and span, and sends
+it with matcher evidence to `TestContext`. Ordinary concepts support equality, ordering, variants,
+exceptions, sequences, text diffs, approximate numerics, and user-defined domain matchers. A hard
+expectation aborts the current test through the structured test-failure path; an explicit soft
+expectation records the failure and continues. Test authors can write ordinary functions around
+matchers without losing type checking or diagnostic provenance.
+
+Fixtures are ordinary constructors returning owned values. Lexical ownership, `defer`/scope guards,
+and deterministic drop provide setup/teardown, so cleanup runs on success, throw, cancellation, and
+timeout without ambient `beforeEach` mutation. A suite may declare a fixture factory shorthand, but
+each test invocation receives a fresh result unless the source explicitly requests a shared fixture
+owner and synchronization policy. Parameterized tests expand stable case identities from explicit
+values; property tests use typed generators plus a recorded seed and shrinking trace. Snapshot/golden
+matchers store versioned, reviewable artifacts and never update them merely because a test failed.
+
+Mocks follow the same explicit concept-evidence and dependency-injection model as production code:
+
+- a static concept dependency receives test evidence and remains statically checked/specializable;
+- a `dyn Concept` dependency receives a test-owned data pointer plus mock evidence table;
+- a concrete callable is tested through an explicit function/record dependency rather than global
+  monkey-patching or import replacement;
+- typed mock operations record arguments, returns, throws, yields, call order, and ownership
+  transfers; impossible calls fail at compile time rather than becoming stringly typed expectations;
+- host effects are intercepted at `VmSideEffect`/`VmResume` by a capability-denying fake, scripted
+  adapter, or versioned record/replay harness. Clocks, randomness, schedulers, filesystems, and
+  provider clients are explicit dependencies or host bindings, never ambient test magic.
+
+Tests are isolated by default: each gets a fresh transaction, task tree, test context, explicit
+module-state instances, and no host authority unless requested by its test profile. Independent tests
+may run in parallel in any order. A test that genuinely shares an external resource declares a
+stable resource key so the runner can serialize or provision it explicitly; relying on incidental
+runner order is invalid. Record/replay data is independently validated and cannot grant effects not
+present in the test's capability policy.
+
+The minimal runner protocol lists stable identities and metadata without executing module code,
+filters by exact identity/tag/module, runs selected tests, emits structured per-test lifecycle events,
+and returns a machine-readable summary. Text, editor, TUI, CI, and future embedded runners consume
+that same protocol. This preserves the convenience of inline `unittest` blocks, the discoverability
+and matchers of Jest, and Finch's typed effects, deterministic cleanup, and parallel isolation.
+
 ## Provider-facing language definitions
 
 ### Canonical artifacts
@@ -3974,6 +4057,12 @@ Every phase adds tests at the layer where its invariant is enforced:
   independent lifetimes, shared `Once<T>` owners initialize exactly once under contention, recursive
   initialization diagnoses a cycle, each failure/cancellation policy is deterministic, effects and
   suspension remain visible, and final state drops with its owner rather than module unloading;
+- language-test tests proving stable mandatory names and discovery without execution, production
+  artifact exclusion, private versus black-box visibility, typed custom matchers and single subject
+  evaluation, fresh owned fixtures and cleanup on every exit, static/dynamic concept mocks, typed
+  host-effect interception, deterministic seeds/shrinking/snapshots, suspending tests without a
+  distinct async form, parallel isolation, explicit shared-resource serialization, and equivalent
+  structured lifecycle/results from text, TUI, CI, and embedded runners;
 - type inference, value-restriction, no-cross-binding-back-solving, stack-row, branch-merge, and
   loop-invariant tests;
 - paired CoLisp/Co-Forth grammar fixtures for every parity-ledger row, each comparing semantic nodes,

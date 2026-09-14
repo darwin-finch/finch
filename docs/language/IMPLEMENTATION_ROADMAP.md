@@ -137,6 +137,9 @@ Goal: freeze the semantic shapes on which later features depend.
   before closures, suspension, or FFI make their representation costly to alter.
 - Implement [#675 (coherent text and sequence values)](https://github.com/darwin-finch/finch/issues/675)
   on those ownership/layout foundations without representation coercion.
+- Reserve syntax-neutral named test/suite nodes and a versioned discovery/result protocol for
+  [#677 (named tests, typed matchers, fixtures, and mocks)](https://github.com/darwin-finch/finch/issues/677);
+  test declarations must not become module initialization or production exports.
 - Run #86 (language ergonomics and model-repair metrics) before freezing surface syntax.
 
 Exit: representative multi-module programs type-check through both syntaxes with identical semantic
@@ -152,6 +155,9 @@ Goal: make advanced facilities ordinary compositions over one compiler kernel.
   builtin-only dispatch paths.
 - Implement #83 (one extensible effect row), #84 (typed exceptions and scope guards), and #85
   (uniform namespaced attributes).
+- Complete [#677 (named tests, typed matchers, fixtures, and mocks)](https://github.com/darwin-finch/finch/issues/677)
+  over concepts and injected effects, with paired CoLisp/Co-Forth syntax, deterministic per-test
+  isolation, and no global monkey-patching.
 - Delete the restricted template macro path after migration fixtures pass.
 
 Exit: a user-defined record can derive an implementation, satisfy a concept through explicit
