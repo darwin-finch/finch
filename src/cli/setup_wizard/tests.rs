@@ -4318,7 +4318,7 @@ async fn real_retry_http_handler(
 struct RealRetryAuthenticator {
     client: crate::oauth::OAuthClient<
         crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect<RealRetryVerifier>,
-        crate::oauth::file_store::FileOAuthCredentialStore,
+        crate::oauth::FileOAuthCredentialStore,
     >,
 }
 
@@ -4460,8 +4460,8 @@ struct DurableSetupAuthenticator {
 
 #[cfg(unix)]
 impl DurableSetupAuthenticator {
-    fn store(&self) -> crate::oauth::file_store::FileOAuthCredentialStore {
-        crate::oauth::file_store::FileOAuthCredentialStore::new(self.root.clone())
+    fn store(&self) -> crate::oauth::FileOAuthCredentialStore {
+        crate::oauth::FileOAuthCredentialStore::new(self.root.clone())
     }
 
     fn token_record(reference: &str) -> crate::oauth::OAuthTokenRecord {
@@ -4762,7 +4762,7 @@ async fn setup_retry_crosses_real_oauth_boundary_with_fresh_quiescent_ceremony()
     use crate::oauth::OAuthCredentialStore;
     let server = RealRetryHttpServer::start().await;
     let temporary = tempfile::tempdir().unwrap();
-    let store = std::sync::Arc::new(crate::oauth::file_store::FileOAuthCredentialStore::new(
+    let store = std::sync::Arc::new(crate::oauth::FileOAuthCredentialStore::new(
         temporary.path().join("oauth"),
     ));
     let dialect = crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect::for_test(
@@ -5309,7 +5309,7 @@ async fn setup_multi_account_terminal_failure_tombstones_prior_issue_and_restart
     .to_string()
     .contains("sign-in was denied"));
 
-    let reopened = crate::oauth::file_store::FileOAuthCredentialStore::new(root.clone());
+    let reopened = crate::oauth::FileOAuthCredentialStore::new(root.clone());
     let first = reopened.load("chatgpt:a").unwrap().unwrap();
     assert!(first.revoked && !first.mutation_pending);
     assert!(first.access_token.is_empty());
@@ -5382,7 +5382,7 @@ async fn setup_injected_save_failure_compensates_owned_generation_without_config
         std::fs::read_to_string(config_path).unwrap(),
         "prior-config-sentinel"
     );
-    let record = crate::oauth::file_store::FileOAuthCredentialStore::new(root)
+    let record = crate::oauth::FileOAuthCredentialStore::new(root)
         .load("chatgpt:work")
         .unwrap()
         .unwrap();
@@ -5424,7 +5424,7 @@ async fn setup_compensation_generation_race_leaves_concurrent_replacement_untouc
     .to_string();
     assert!(error.contains("could not be rolled back safely"), "{error}");
     assert!(!error.contains("terminal second-account denial"), "{error}");
-    let reopened = crate::oauth::file_store::FileOAuthCredentialStore::new(root);
+    let reopened = crate::oauth::FileOAuthCredentialStore::new(root);
     let external = reopened.load("chatgpt:b").unwrap().unwrap();
     assert!(!external.revoked && !external.mutation_pending);
     assert_eq!(external.access_token, "external-replacement-sentinel");
@@ -5466,7 +5466,7 @@ async fn setup_final_validation_preserves_cause_and_compensates_every_owned_gene
     assert!(!error.contains("secret-access"), "{error}");
     assert!(!error.contains("secret-refresh"), "{error}");
 
-    let reopened = crate::oauth::file_store::FileOAuthCredentialStore::new(root);
+    let reopened = crate::oauth::FileOAuthCredentialStore::new(root);
     for reference in ["chatgpt:a", "chatgpt:b"] {
         let owned = reopened.load(reference).unwrap().unwrap();
         assert!(owned.revoked && !owned.mutation_pending);

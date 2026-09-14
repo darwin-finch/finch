@@ -1655,7 +1655,7 @@ async fn file_store_reopens_pending_revoke_and_recovers_durable_tombstone() {
         )
         .await
         .unwrap();
-    let store = Arc::new(file_store::FileOAuthCredentialStore::new(root.clone()));
+    let store = Arc::new(FileOAuthCredentialStore::new(root.clone()));
     store
         .compare_and_swap("chatgpt:file", None, &initial)
         .unwrap();
@@ -1682,7 +1682,7 @@ async fn file_store_reopens_pending_revoke_and_recovers_durable_tombstone() {
     drop(client);
     drop(store);
 
-    let reopened = Arc::new(file_store::FileOAuthCredentialStore::new(root.clone()));
+    let reopened = Arc::new(FileOAuthCredentialStore::new(root.clone()));
     let recovery = OAuthClient::new(dialect, reopened.clone()).unwrap();
     let metadata = recovery
         .recover_interrupted_as_revoked("chatgpt:file")
@@ -1691,7 +1691,7 @@ async fn file_store_reopens_pending_revoke_and_recovers_durable_tombstone() {
     drop(recovery);
     drop(reopened);
 
-    let verified_store = Arc::new(file_store::FileOAuthCredentialStore::new(root));
+    let verified_store = Arc::new(FileOAuthCredentialStore::new(root));
     let verified = verified_store.load("chatgpt:file").unwrap().unwrap();
     assert!(verified.revoked && !verified.mutation_pending);
     assert!(verified.access_token.is_empty() && verified.refresh_token.is_none());
@@ -1726,6 +1726,24 @@ async fn file_store_reopens_pending_revoke_and_recovers_durable_tombstone() {
     assert_eq!(
         after_restart.refresh_token.as_deref(),
         Some("refresh-after-restart")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn facade_file_store_load_existing_is_read_only_for_a_missing_root() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("missing").join("oauth");
+    let store = FileOAuthCredentialStore::new(root.clone());
+    let loaded = store.load_existing("chatgpt:default").unwrap();
+    assert!(
+        loaded.is_none(),
+        "facade FileOAuthCredentialStore::load_existing must return None when the credential root is absent, got {loaded:?}"
+    );
+    assert!(
+        !root.exists(),
+        "facade FileOAuthCredentialStore::load_existing must not create {}; the credential root appeared",
+        root.display()
     );
 }
 

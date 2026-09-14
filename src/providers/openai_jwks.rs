@@ -953,7 +953,7 @@ mod tests {
         let dialect =
             Arc::new(OpenAiChatGptOAuthDialect::for_test(&server.origin, verifier).unwrap());
         let directory = tempfile::tempdir().unwrap();
-        let store = Arc::new(crate::oauth::file_store::FileOAuthCredentialStore::new(
+        let store = Arc::new(crate::oauth::FileOAuthCredentialStore::new(
             directory.path().join("oauth"),
         ));
         let client = crate::oauth::OAuthClient::new(dialect, store.clone()).unwrap();
@@ -994,7 +994,7 @@ mod tests {
         let dialect =
             Arc::new(OpenAiChatGptOAuthDialect::for_test(&server.origin, verifier).unwrap());
         let directory = tempfile::tempdir().unwrap();
-        let store = Arc::new(crate::oauth::file_store::FileOAuthCredentialStore::new(
+        let store = Arc::new(crate::oauth::FileOAuthCredentialStore::new(
             directory.path().join("oauth"),
         ));
         let client = crate::oauth::OAuthClient::new(dialect, store.clone()).unwrap();
@@ -1038,7 +1038,7 @@ mod tests {
         let dialect =
             Arc::new(OpenAiChatGptOAuthDialect::for_test(&server.origin, verifier).unwrap());
         let directory = tempfile::tempdir().unwrap();
-        let store = Arc::new(crate::oauth::file_store::FileOAuthCredentialStore::new(
+        let store = Arc::new(crate::oauth::FileOAuthCredentialStore::new(
             directory.path().join("oauth"),
         ));
         let client = crate::oauth::OAuthClient::new(dialect, store.clone()).unwrap();

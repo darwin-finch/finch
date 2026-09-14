@@ -28,6 +28,12 @@ use crate::config::{
     ProviderCredential, ResolvedCredential, ResolvedSecret,
 };
 
+mod file_store;
+#[cfg(test)]
+mod tests;
+
+pub use file_store::FileOAuthCredentialStore;
+
 const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const RFC8628_DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -1313,8 +1319,3 @@ fn random_secret(bytes: usize) -> String {
     value.zeroize();
     encoded
 }
-
-pub mod file_store;
-
-#[cfg(test)]
-mod tests;

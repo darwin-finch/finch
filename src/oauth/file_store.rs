@@ -20,6 +20,7 @@ pub struct FileOAuthCredentialStore {
 }
 
 impl FileOAuthCredentialStore {
+    /// Create a store rooted at `root` without touching the filesystem.
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
