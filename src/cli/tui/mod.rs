@@ -1065,9 +1065,6 @@ pub(crate) struct LiveFrame {
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub cursor_visible: bool,
-    /// True when the paint ends with a newline, parking the cursor on the row
-    /// *below* the last painted one. Dialogs do this; the input area does not.
-    pub trailing_newline: bool,
     /// The live transcript lines that survived the viewport budget, carried so
     /// the caller can rebuild mouse hit regions against what was really drawn.
     pub visible_live: Vec<RenderedTranscriptLine>,
@@ -1122,15 +1119,8 @@ fn write_live_frame(
     if rows == 0 {
         return Ok(0);
     }
-    if frame.trailing_newline {
-        execute!(out, Print("\r\n"))?;
-    }
     // Row the cursor is actually on once the paint finishes.
-    let landed = if frame.trailing_newline {
-        rows
-    } else {
-        rows - 1
-    };
+    let landed = rows - 1;
     let up = landed.saturating_sub(frame.cursor_row);
     if up > 0 {
         execute!(out, cursor::MoveUp(up as u16))?;
@@ -1260,14 +1250,10 @@ pub(crate) fn plan_live_frame(
         for line in TuiRenderer::dialog_lines(dialog, width, budget) {
             frame.push(line);
         }
-        // A dialog has no editable text cursor. Leaving it visible after the
-        // final newline leaves a stray black cell below the modal.
+        // A dialog has no editable text cursor. Keep the hidden cursor on the
+        // final owned row so painting at the viewport bottom cannot scroll it.
         frame.cursor_visible = false;
-        // Dialog lines each end with a newline, so the cursor parks on the row
-        // past the last one. erase_live_area() walks up by cursor_row to reach
-        // the top, so this must be the row count, not the last row index.
-        frame.trailing_newline = true;
-        frame.cursor_row = frame.physical_rows(width);
+        frame.cursor_row = frame.physical_rows(width).saturating_sub(1);
         return frame;
     }
 
@@ -2644,7 +2630,7 @@ impl TuiRenderer {
             )
             .ok()?;
             let rows = 1 + dialog_rows;
-            return Some((rows, rows));
+            return Some((rows, rows.saturating_sub(1)));
         }
         let term_width = usize::from(width).max(1);
         let draw_width = term_width;
@@ -5601,7 +5587,6 @@ mod tests {
             cursor_row: 0,
             cursor_col: 9,
             cursor_visible: true,
-            trailing_newline: false,
             visible_live: Vec::new(),
         };
         let mut bytes = Vec::new();
@@ -5694,6 +5679,132 @@ mod tests {
             "approval frames must hide the terminal cursor",
             &terminal,
         );
+    }
+
+    #[test]
+    fn test_vt_oracle_bottom_anchored_dialog_paint_repaint_and_close_stay_in_owned_rows() {
+        let width = 32;
+        for height in [8, 12] {
+            let mut terminal = VtOracle::new(width, height);
+            let input = vec!["final".to_string()];
+            let mut autocomplete = AutocompleteState::new();
+            let mut dialog = Dialog::multiselect("Choose", vec![DialogOption::new("Keep")]);
+            let mut inputs = live_inputs(width, height, &input, "ready");
+            inputs.dialog = Some(&dialog);
+            let mut frame = plan_live_frame(&inputs, &mut autocomplete);
+            let plan = viewport_redraw_plan(height, frame.physical_rows(width), 2);
+            let transcript: Vec<String> = if height == 12 {
+                vec!["retained first".into(), "retained last".into()]
+            } else {
+                Vec::new()
+            };
+            let mut bytes = Vec::new();
+            begin_full_viewport_paint(&mut bytes, plan, &transcript).unwrap();
+            let mut active_rows = write_live_frame(&mut bytes, &frame, width).unwrap();
+            execute!(bytes, EndSynchronizedUpdate).unwrap();
+            terminal.feed(&bytes);
+
+            for title in ["Choose", "Pick", "Go"] {
+                if title != "Choose" {
+                    bytes.clear();
+                    write_live_area_erase(&mut bytes, active_rows, frame.cursor_row).unwrap();
+                    terminal.feed(&bytes);
+                    assert_vt(
+                        terminal.cursor() == (plan.live_top, 0, false)
+                            && (plan.live_top..height).all(|row| terminal.row(row).is_empty()),
+                        "dialog erase must clear every owned row and return to the exact origin",
+                        &terminal,
+                    );
+                    dialog.title = title.into();
+                    let mut inputs = live_inputs(width, height, &input, "ready");
+                    inputs.dialog = Some(&dialog);
+                    frame = plan_live_frame(&inputs, &mut autocomplete);
+                    bytes.clear();
+                    active_rows = write_live_frame(&mut bytes, &frame, width).unwrap();
+                    execute!(bytes, EndSynchronizedUpdate).unwrap();
+                    terminal.feed(&bytes);
+                }
+                let rule = "─".repeat(width);
+                let expected = [
+                    "──  ~/repos/finch  jade-river ──".to_string(),
+                    rule.clone(),
+                    format!("  {title}"),
+                    rule.clone(),
+                    "    ☐ Keep".to_string(),
+                    rule.clone(),
+                    "  [ Submit ]   [ Cancel ]".to_string(),
+                    rule,
+                ];
+                for (row, expected) in expected.iter().enumerate() {
+                    assert_vt(
+                        terminal.row(plan.live_top + row) == *expected,
+                        &format!("bottom-anchored dialog row {row} must equal {expected:?} without scrolling"),
+                        &terminal,
+                    );
+                }
+                assert_vt(
+                    active_rows == 8
+                        && frame.cursor_row == 7
+                        && terminal.cursor() == (height - 1, 0, false),
+                    "dialog paint must own exactly eight rows and hide its cursor on the final row",
+                    &terminal,
+                );
+                for row in 0..plan.live_top {
+                    let expected = match row {
+                        2 => "retained first",
+                        3 => "retained last",
+                        _ => "",
+                    };
+                    assert_vt(
+                        terminal.row(row) == expected,
+                        "dialog paint and repaint must preserve the retained transcript and top padding",
+                        &terminal,
+                    );
+                }
+            }
+
+            let colors = ColorScheme::default();
+            let output = Arc::new(OutputManager::new(colors.clone()));
+            let mut renderer =
+                TuiRenderer::new_headless(output, Arc::new(StatusBar::new()), colors);
+            renderer.active_dialog = Some(dialog);
+            assert_vt(
+                renderer.live_geometry(width as u16, height as u16)
+                    == Some((active_rows, frame.cursor_row)),
+                "viewport geometry must agree with the actual dialog rows and hidden cursor",
+                &terminal,
+            );
+
+            bytes.clear();
+            write_live_area_erase(&mut bytes, active_rows, frame.cursor_row).unwrap();
+            let mut closed_inputs = live_inputs(width, height, &input, "ready");
+            closed_inputs.input_cursor = (0, 5);
+            let closed = plan_live_frame(&closed_inputs, &mut autocomplete);
+            write_live_frame(&mut bytes, &closed, width).unwrap();
+            execute!(bytes, EndSynchronizedUpdate).unwrap();
+            terminal.feed(&bytes);
+            let expected = [
+                "──  ~/repos/finch  jade-river ──".to_string(),
+                "❯ final".to_string(),
+                "─".repeat(width),
+                "ready".to_string(),
+            ];
+            for row in plan.live_top..height {
+                let expected = expected.get(row - plan.live_top).map_or("", String::as_str);
+                assert_vt(
+                    terminal.row(row) == expected,
+                    &format!(
+                        "dialog close row {row} must equal {expected:?} with no stale modal cells"
+                    ),
+                    &terminal,
+                );
+            }
+            assert_vt(
+                terminal.cursor() == (plan.live_top + 1, 7, true),
+                "dialog close must restore the visible input cursor after the draft",
+                &terminal,
+            );
+        }
     }
 
     #[test]
@@ -6376,75 +6487,6 @@ mod tests {
             };
         }
         // If we reach here, the guard was not dropped — correct.
-    }
-
-    // ── dialog cursor_row_from_top regression ─────────────────────────────────
-    // Regression: draw_live_area set cursor_row_from_top = rows.saturating_sub(1)
-    // for the dialog path, but after printing D rows with \r\n the cursor is at
-    // position D (one past the last row, 0-indexed from start).  erase_live_area
-    // moves up by cursor_row_from_top to reach row 0, so using D-1 caused it to
-    // stop at row 1 — missing the first row of the live area on every tick and
-    // making the dialog cascade downward with each render cycle.
-    //
-    // The fix: cursor_row_from_top = rows (not rows - 1) in the dialog branch.
-    //
-    // We verify the invariant without a real terminal by inspecting the formula
-    // directly: the number of rows moved up in erase must equal the cursor
-    // position after draw (which equals total_rows for the dialog path).
-
-    #[test]
-    fn dialog_cursor_row_from_top_equals_total_rows_not_rows_minus_one() {
-        // Simulate dialog: separator (1) + N dialog rows → total_rows = 1 + N.
-        // After drawing with \r\n, cursor is at row total_rows.
-        // erase must move up total_rows to reach row 0.
-        // cursor_row_from_top must therefore equal total_rows, not total_rows - 1.
-        let separator_rows: usize = 1;
-        for dialog_rows in [3usize, 7, 12, 20] {
-            let total_rows = separator_rows + dialog_rows;
-
-            // This is the CORRECT formula (the fix):
-            let correct_cursor_row_from_top = total_rows;
-
-            // This is the OLD (buggy) formula:
-            let buggy_cursor_row_from_top = total_rows.saturating_sub(1);
-
-            // erase moves up by cursor_row_from_top from position total_rows.
-            // Resulting row after erase (0 = top of live area):
-            let correct_row_after_erase =
-                (total_rows as isize) - (correct_cursor_row_from_top as isize);
-            let buggy_row_after_erase =
-                (total_rows as isize) - (buggy_cursor_row_from_top as isize);
-
-            assert_eq!(
-                correct_row_after_erase, 0,
-                "dialog_rows={}: correct formula must erase to row 0 (top of live area), \
-                 got row {}",
-                dialog_rows, correct_row_after_erase
-            );
-            assert_eq!(
-                buggy_row_after_erase, 1,
-                "dialog_rows={}: buggy formula leaves cursor at row 1 (misses first row), \
-                 got row {}",
-                dialog_rows, buggy_row_after_erase
-            );
-        }
-    }
-
-    #[test]
-    fn dialog_cursor_row_from_top_saturating_sub_does_not_help_single_row() {
-        // Edge case: if total_rows = 1 (just the separator, dialog returned 0 rows),
-        // rows.saturating_sub(1) = 0, so erase would not move up at all —
-        // meaning it would clear from the current position (row 1) downward,
-        // which clears nothing.  cursor_row_from_top = rows = 1 moves back to row 0.
-        let total_rows: usize = 1;
-        let correct = total_rows; // 1 — moves up to row 0
-        let buggy = total_rows.saturating_sub(1); // 0 — stays at row 1, clears nothing
-        assert_eq!(correct, 1, "single-row: must move up 1 to reach top");
-        assert_eq!(buggy, 0, "single-row: buggy formula is 0 (no-op erase)");
-        assert_ne!(
-            correct, buggy,
-            "correct and buggy must differ for single-row case"
-        );
     }
 
     // ── poset_to_forth_lines ──────────────────────────────────────────────────
