@@ -22,7 +22,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read as _, Seek as _, Write as _};
 
 use super::propose::open_review_artifact;
-use crate::cli::diff::{FileDiff, MAX_DIFF_LINE_CHARS};
+use crate::cli::diff::FileDiff;
 
 /// Separates the machine-read decision header from the human-read diff.
 ///
@@ -458,124 +458,6 @@ fn fidelity_notes(diff: &FileDiff, original: &str, planned: &str) -> Vec<String>
 /// an unfaithful view. This checks the rendering against itself — each hunk
 /// header states how many old and new lines its body holds — so it needs no
 /// second diff engine and has no timing dependence.
-fn verify_render_is_faithful(
-    file_diff: &FileDiff,
-    rendered: &str,
-    original: &str,
-    planned: &str,
-) -> Result<()> {
-    let interim = "This is an interim refusal for issue #482 (the shared diff renderer can \
-                   silently drop part of a change); it is not a problem with the file.";
-    if file_diff.binary {
-        // Binary content is presented as prose with byte sizes, which is a
-        // complete description rather than a partial diff.
-        return Ok(());
-    }
-    if !file_diff.counts_are_exact() {
-        let detail = file_diff.elided.as_deref().unwrap_or("reason not reported");
-        anyhow::bail!(
-            "Refusing to edit {}: the diff is incomplete or elided ({detail}), so the review \
-             would hide part of the change. Make a smaller edit.\n{}",
-            file_diff.display_path(),
-            interim
-        );
-    }
-    if rendered
-        .lines()
-        .any(|line| line == "# finch: diff rendering truncated")
-    {
-        anyhow::bail!(
-            "Refusing to edit {}: the diff is too large to display in full, so the review \
-             would have shown only part of the change.\nMake a smaller edit.\n{}",
-            file_diff.display_path(),
-            interim
-        );
-    }
-    if rendered.contains("[line truncated]") {
-        anyhow::bail!(
-            "Refusing to edit {}: at least one rendered hunk line exceeds the {}-character \
-             display limit, so the review would hide suffix bytes. Make a smaller edit.",
-            file_diff.display_path(),
-            MAX_DIFF_LINE_CHARS
-        );
-    }
-
-    let mut hunks = 0usize;
-    let mut changed_lines = 0usize;
-    let mut pending: Option<(usize, usize, usize, usize)> = None; // old_want, new_want, old_seen, new_seen
-    let finish = |pending: Option<(usize, usize, usize, usize)>| -> Result<()> {
-        if let Some((old_want, new_want, old_seen, new_seen)) = pending {
-            if old_want != old_seen || new_want != new_seen {
-                anyhow::bail!(
-                    "Refusing to edit {}: the rendered diff does not match its own hunk header \
-                     (it claims {} old and {} new lines but shows {} and {}), so the review \
-                     would have hidden part of the change.\n{}",
-                    file_diff.display_path(),
-                    old_want,
-                    new_want,
-                    old_seen,
-                    new_seen,
-                    interim
-                );
-            }
-        }
-        Ok(())
-    };
-    for line in rendered.lines() {
-        if let Some(counts) = hunk_counts(line) {
-            finish(pending.take())?;
-            hunks += 1;
-            pending = Some((counts.0, counts.1, 0, 0));
-            continue;
-        }
-        let Some((_, _, old_seen, new_seen)) = pending.as_mut() else {
-            continue;
-        };
-        match line.chars().next() {
-            Some(' ') | None => {
-                *old_seen += 1;
-                *new_seen += 1;
-            }
-            Some('-') => {
-                *old_seen += 1;
-                changed_lines += 1;
-            }
-            Some('+') => {
-                *new_seen += 1;
-                changed_lines += 1;
-            }
-            // "\ No newline at end of file" belongs to neither side, and a
-            // "# finch:" footer note ends the hunk body.
-            _ => {}
-        }
-    }
-    finish(pending.take())?;
-
-    if original != planned && (hunks == 0 || changed_lines == 0) {
-        anyhow::bail!(
-            "Refusing to edit {}: the change could not be rendered as a reviewable diff, so \
-             the review would have shown nothing to approve.\nMake a smaller edit.\n{}",
-            file_diff.display_path(),
-            interim
-        );
-    }
-    Ok(())
-}
-
-/// Old-side and new-side line counts declared by a `@@ -a,b +c,d @@` header.
-fn hunk_counts(line: &str) -> Option<(usize, usize)> {
-    let rest = line.strip_prefix("@@ -")?;
-    let (ranges, _) = rest.split_once(" @@")?;
-    let (old, new) = ranges.split_once(" +")?;
-    let count = |range: &str| -> Option<usize> {
-        match range.split_once(',') {
-            Some((_, n)) => n.parse().ok(),
-            None => Some(1),
-        }
-    };
-    Some((count(old)?, count(new)?))
-}
-
 /// Validate the replacement and produce the file's new content.
 ///
 /// Shared by the interactive and non-interactive paths so an ambiguous or
@@ -681,7 +563,7 @@ where
 
     let file_diff = FileDiff::from_texts(file_path, &original, &planned);
     let diff = file_diff.to_unified();
-    verify_render_is_faithful(&file_diff, &diff, &original, &planned)?;
+    super::propose::verify_render_is_faithful("edit", &file_diff, &diff, &original, &planned)?;
     let mut description = format!("Edit {}", file_path);
     for note in fidelity_notes(&file_diff, &original, &planned) {
         description.push('\n');

@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use super::propose::propose_in_editor;
+use super::propose::{propose_with_decision, ProposalDecision};
 
 pub struct BashTool;
 
@@ -38,10 +38,14 @@ impl Tool for BashTool {
         let description = input["description"].as_str().unwrap_or("");
 
         // Propose the command in $EDITOR before running it.
-        let approved = propose_in_editor(description, command).await?;
-        let script = match approved {
-            None => return Ok("Tool call aborted by user.".to_string()),
-            Some(s) => s,
+        let script = match propose_with_decision(description, command).await? {
+            ProposalDecision::Execute { source } => source,
+            ProposalDecision::Chat { context } => {
+                return Ok(format!(
+                    "Tool call not executed. The user asked for a different command instead:\n{context}"
+                ))
+            }
+            ProposalDecision::Cancel => return Ok("Tool call aborted by user.".to_string()),
         };
 
         let mut command = Command::new("bash");
