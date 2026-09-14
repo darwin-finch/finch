@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -176,6 +176,11 @@ enum Command {
         #[command(subcommand)]
         sessions_command: SessionsCommand,
     },
+    /// List and archive named Brains
+    Brain {
+        #[command(subcommand)]
+        brain_command: BrainCommand,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -235,6 +240,27 @@ fn parse_credential_reference(value: &str) -> std::result::Result<String, String
 enum SessionsCommand {
     /// List saved sessions
     List,
+}
+
+#[derive(Parser, Debug)]
+enum BrainCommand {
+    /// List named Brains without hydrating their logs
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Emit a JSON array of `{name, path}` objects
+        #[arg(long)]
+        json: bool,
+    },
+    /// Archive a named Brain out of the live namespace
+    ///
+    /// The log is moved to `~/.finch/brains-archive/`, not deleted. Refuses
+    /// while the daemon is running so a live store cannot recreate an empty
+    /// Brain under the same name.
+    #[command(visible_alias = "remove")]
+    Rm {
+        /// Brain name (`1-64` letters, numbers, `-` or `_`)
+        name: String,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -897,6 +923,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Sessions { sessions_command }) => {
             return run_sessions_command(sessions_command);
+        }
+        Some(Command::Brain { brain_command }) => {
+            return run_brain_command(brain_command);
         }
         None => {
             // Fall through to REPL mode (check for piped input first)
@@ -3205,9 +3234,85 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
     Ok(())
 }
 
+/// Handle `finch brain` subcommands against the default on-disk store.
+fn run_brain_command(cmd: BrainCommand) -> Result<()> {
+    let store = finch::brain::store::BrainStore::new("cli");
+    let daemon_running = if matches!(cmd, BrainCommand::Rm { .. }) {
+        finch::daemon::DaemonLifecycle::new()?.is_running()
+    } else {
+        false
+    };
+    execute_brain_command(cmd, &store, daemon_running, &mut io::stdout())
+}
+
+fn execute_brain_command(
+    cmd: BrainCommand,
+    store: &finch::brain::store::BrainStore,
+    daemon_running: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    match cmd {
+        BrainCommand::Ls { json } => list_named_brains(store, json, out),
+        BrainCommand::Rm { name } => remove_named_brain(store, &name, daemon_running, out),
+    }
+}
+
+fn list_named_brains(
+    store: &finch::brain::store::BrainStore,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    let names = store.list_names_unhydrated();
+    if json {
+        let entries: Vec<serde_json::Value> = names
+            .into_iter()
+            .map(|name| {
+                let path = store
+                    .root()
+                    .map(|root| root.join(&name).display().to_string());
+                serde_json::json!({ "name": name, "path": path })
+            })
+            .collect();
+        writeln!(out, "{}", serde_json::to_string(&entries)?)?;
+        return Ok(());
+    }
+    for name in names {
+        writeln!(out, "{name}")?;
+    }
+    Ok(())
+}
+
+fn remove_named_brain(
+    store: &finch::brain::store::BrainStore,
+    name: &str,
+    daemon_running: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    let name = finch::brain::store::BrainStore::validate_name(name)?.to_string();
+    if !store.list_names_unhydrated().contains(&name) {
+        anyhow::bail!("brain '{name}' not found");
+    }
+    if daemon_running {
+        anyhow::bail!(
+            "cannot remove brain '{name}' while the Finch daemon is running; \
+             stop it first with: finch daemon-stop"
+        );
+    }
+    match store.archive(&name)? {
+        Some(archived_to) => {
+            writeln!(out, "Archived '{name}' to {}", archived_to.display())?;
+            Ok(())
+        }
+        None => anyhow::bail!("brain '{name}' not found"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{finish_first_run_setup, register_query_vm_tools, Args, AuthCommand, Command};
+    use super::{
+        execute_brain_command, finish_first_run_setup, register_query_vm_tools, Args, AuthCommand,
+        BrainCommand, Command,
+    };
     use clap::Parser;
     use std::sync::Arc;
 
@@ -3464,5 +3569,289 @@ mod tests {
             assert!(!names.contains(legacy));
             assert!(registry.has_tool(legacy));
         }
+    }
+
+    #[test]
+    fn brain_ls_json_and_rm_parse_as_named_brain_commands() {
+        let ls = Args::try_parse_from(["finch", "brain", "ls", "--json"]).unwrap();
+        assert!(
+            matches!(
+                ls.command,
+                Some(Command::Brain {
+                    brain_command: BrainCommand::Ls { json: true }
+                })
+            ),
+            "finch brain ls --json must set the subcommand JSON flag, not a global one: {ls:?}"
+        );
+
+        let list = Args::try_parse_from(["finch", "brain", "list"]).unwrap();
+        assert!(
+            matches!(
+                list.command,
+                Some(Command::Brain {
+                    brain_command: BrainCommand::Ls { json: false }
+                })
+            ),
+            "list is an alias for ls: {list:?}"
+        );
+
+        let rm = Args::try_parse_from(["finch", "brain", "rm", "golden-ridge-0771a6"]).unwrap();
+        assert!(
+            matches!(
+                rm.command,
+                Some(Command::Brain {
+                    brain_command: BrainCommand::Rm { ref name }
+                }) if name == "golden-ridge-0771a6"
+            ),
+            "finch brain rm <name> must capture the Brain name: {rm:?}"
+        );
+
+        let remove = Args::try_parse_from(["finch", "brain", "remove", "old-project"]).unwrap();
+        assert!(
+            matches!(
+                remove.command,
+                Some(Command::Brain {
+                    brain_command: BrainCommand::Rm { ref name }
+                }) if name == "old-project"
+            ),
+            "remove is an alias for rm: {remove:?}"
+        );
+    }
+
+    fn isolated_brain_store() -> (tempfile::TempDir, finch::brain::store::BrainStore) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("brains");
+        std::fs::create_dir_all(&root).expect("create brains root");
+        let store = finch::brain::store::BrainStore::with_root("cli-test", Some(root));
+        (temp, store)
+    }
+
+    fn plant_unhydrated_brain(store: &finch::brain::store::BrainStore, name: &str) {
+        let root = store.root().expect("on-disk store");
+        std::fs::create_dir_all(root.join(name)).expect("plant Brain directory");
+    }
+
+    #[test]
+    fn brain_ls_emits_sorted_names_without_hydrating_or_creating_files() {
+        let (_temp, store) = isolated_brain_store();
+        plant_unhydrated_brain(&store, "zeta");
+        plant_unhydrated_brain(&store, "alpha");
+        std::fs::write(store.root().unwrap().join("not-a-brain.json"), "{}")
+            .expect("plant ignored file");
+
+        let mut out = Vec::new();
+        execute_brain_command(BrainCommand::Ls { json: false }, &store, false, &mut out)
+            .expect("list named Brains");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(
+            text, "alpha\nzeta\n",
+            "text ls must emit sorted names, one per line, ignoring non-directories; got {text:?}"
+        );
+
+        let metadata = store.root().unwrap().join("alpha").join("metadata.json");
+        assert!(
+            !metadata.exists(),
+            "ls must not hydrate; {} would mean ensure_loaded ran",
+            metadata.display()
+        );
+    }
+
+    #[test]
+    fn brain_ls_json_includes_name_and_on_disk_path() {
+        let (_temp, store) = isolated_brain_store();
+        plant_unhydrated_brain(&store, "golden-ridge-0771a6");
+
+        let mut out = Vec::new();
+        execute_brain_command(BrainCommand::Ls { json: true }, &store, false, &mut out)
+            .expect("list named Brains as JSON");
+        let text = String::from_utf8(out).expect("utf8");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(text.trim()).expect("ls --json must be a JSON array");
+        assert_eq!(parsed.len(), 1, "expected one Brain in {text}");
+        assert_eq!(
+            parsed[0]["name"].as_str(),
+            Some("golden-ridge-0771a6"),
+            "JSON name field: {text}"
+        );
+        let expected_path = store
+            .root()
+            .unwrap()
+            .join("golden-ridge-0771a6")
+            .display()
+            .to_string();
+        assert_eq!(
+            parsed[0]["path"].as_str(),
+            Some(expected_path.as_str()),
+            "JSON path must be the live Brain directory; got {text}"
+        );
+    }
+
+    #[test]
+    fn brain_ls_json_empty_store_emits_empty_array() {
+        let (_temp, store) = isolated_brain_store();
+        let mut out = Vec::new();
+        execute_brain_command(BrainCommand::Ls { json: true }, &store, false, &mut out)
+            .expect("list empty store");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8").trim(),
+            "[]",
+            "empty JSON ls must be an empty array for cleanup scripts"
+        );
+    }
+
+    #[test]
+    fn brain_rm_archives_named_brain_when_daemon_is_stopped() {
+        let (_temp, store) = isolated_brain_store();
+        plant_unhydrated_brain(&store, "scratch-brain");
+        std::fs::write(
+            store
+                .root()
+                .unwrap()
+                .join("scratch-brain")
+                .join("events.jsonl"),
+            "{\"seq\":1}\n",
+        )
+        .expect("plant a log so archive has something to keep");
+
+        let mut out = Vec::new();
+        execute_brain_command(
+            BrainCommand::Rm {
+                name: "scratch-brain".into(),
+            },
+            &store,
+            false,
+            &mut out,
+        )
+        .expect("archive named Brain");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("Archived 'scratch-brain' to") && text.contains("brains-archive"),
+            "rm must report the archive destination for '{text}'"
+        );
+        assert!(
+            !store.root().unwrap().join("scratch-brain").exists(),
+            "live directory must be gone after rm; listing is {:?}, path {}",
+            store.list_names_unhydrated(),
+            store.root().unwrap().join("scratch-brain").display()
+        );
+        assert_eq!(
+            store.list_names_unhydrated(),
+            Vec::<String>::new(),
+            "ls membership after rm must be empty, got {:?}",
+            store.list_names_unhydrated()
+        );
+        let archive_root = store
+            .root()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("brains-archive");
+        let archived: Vec<_> = std::fs::read_dir(&archive_root)
+            .unwrap_or_else(|error| panic!("read {}: {error}", archive_root.display()))
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(
+            archived.len(),
+            1,
+            "exactly one archive directory under {}",
+            archive_root.display()
+        );
+        let archived_name = archived[0].file_name();
+        let archived_name = archived_name.to_string_lossy();
+        assert!(
+            archived_name.starts_with("scratch-brain-"),
+            "archive directory must keep the Brain name, got {archived_name}"
+        );
+        assert!(
+            archived[0].path().join("events.jsonl").exists(),
+            "archive must preserve the event log at {}",
+            archived[0].path().display()
+        );
+    }
+
+    #[test]
+    fn brain_rm_refuses_while_daemon_is_running_and_leaves_the_brain() {
+        let (_temp, store) = isolated_brain_store();
+        plant_unhydrated_brain(&store, "live-brain");
+
+        let mut out = Vec::new();
+        let error = execute_brain_command(
+            BrainCommand::Rm {
+                name: "live-brain".into(),
+            },
+            &store,
+            true,
+            &mut out,
+        )
+        .expect_err("rm must fail closed while the daemon is running");
+        assert_eq!(
+            error.to_string(),
+            "cannot remove brain 'live-brain' while the Finch daemon is running; \
+             stop it first with: finch daemon-stop",
+            "daemon-running refusal must name the Brain and the stop command"
+        );
+        assert!(
+            out.is_empty(),
+            "failed rm must not print a success line, got {}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            store.root().unwrap().join("live-brain").is_dir(),
+            "live Brain directory must remain after a refused rm"
+        );
+        assert_eq!(
+            store.list_names_unhydrated(),
+            vec!["live-brain".to_string()],
+            "ls membership must be unchanged after a refused rm, got {:?}",
+            store.list_names_unhydrated()
+        );
+    }
+
+    #[test]
+    fn brain_rm_missing_name_fails_without_touching_the_store() {
+        let (_temp, store) = isolated_brain_store();
+        plant_unhydrated_brain(&store, "kept");
+
+        let mut out = Vec::new();
+        let error = execute_brain_command(
+            BrainCommand::Rm {
+                name: "missing-brain".into(),
+            },
+            &store,
+            false,
+            &mut out,
+        )
+        .expect_err("rm of an unknown Brain must fail");
+        assert_eq!(
+            error.to_string(),
+            "brain 'missing-brain' not found",
+            "missing-name error must identify the requested Brain"
+        );
+        assert_eq!(
+            store.list_names_unhydrated(),
+            vec!["kept".to_string()],
+            "an unknown rm must not archive a different Brain, got {:?}",
+            store.list_names_unhydrated()
+        );
+    }
+
+    #[test]
+    fn brain_rm_invalid_name_fails_before_archive() {
+        let (_temp, store) = isolated_brain_store();
+        let mut out = Vec::new();
+        let error = execute_brain_command(
+            BrainCommand::Rm {
+                name: "../other".into(),
+            },
+            &store,
+            false,
+            &mut out,
+        )
+        .expect_err("path-like names must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "brain name must use 1-64 letters, numbers, '-' or '_'",
+            "invalid-name error must use the store's validate_name message"
+        );
     }
 }

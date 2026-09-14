@@ -1560,6 +1560,11 @@ impl BrainStore {
         &self.environment
     }
 
+    /// On-disk directory that holds named Brain folders, if this store persists.
+    pub fn root(&self) -> Option<&std::path::Path> {
+        self.root.as_deref()
+    }
+
     #[cfg(test)]
     pub(crate) fn with_test_environment_generation(
         machine: impl Into<String>,

@@ -103,6 +103,9 @@ finch daemon-stop             stop the background daemon
 finch --forth "1 2 +"         evaluate typed Co-Forth without an LLM
 finch --lisp "(+ 1 2)"        evaluate typed Finch Lisp without an LLM
 finch --exec path/to/file      execute a typed Finch script
+finch brain ls                list named Brains (one name per line)
+finch brain ls --json         list named Brains as JSON
+finch brain rm <name>         archive a named Brain (stop the daemon first)
 ```
 
 Run `finch --help` and `finch <command> --help` for the full generated CLI reference. In the REPL,
