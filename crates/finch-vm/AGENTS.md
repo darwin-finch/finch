@@ -5,7 +5,8 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 **Owns** `crates/finch-vm/src/` (the interpreter, typed runtime, fibers, compiler-boundary wire
 failure classification, and compatibility facade), and the shared repository-root `vocabulary/`
 and `examples/finch/` integration corpus.
-The CoLisp and CoForth source frontends live in sibling crates.
+Source compilation lives in [`finch-language`](../finch-language/AGENTS.md); this crate consumes
+`ModuleVerified` and does not select or invoke a frontend.
 Shared typed IR, verification, capability/effect descriptions, and vocabulary contracts live in
 [`finch-vm-core`](../finch-vm-core/AGENTS.md). The program runtime service is `src/runtime/`; the
 program catalog is `src/programs/`.
@@ -21,11 +22,11 @@ checkpoint, and execution reference material. Cross-frontend planned semantics r
 [language design](../../docs/language/README.md); source-compilation separation follows the shared
 [implementation roadmap](../../docs/language/IMPLEMENTATION_ROADMAP.md).
 
-**Dependencies:** `finch-vm` depends downward on the unpublished `finch-vm-core`, `finch-colisp`,
-and `finch-coforth` crates and never on the root `finch` crate. Each frontend reaches only the core
-crate's documented, restricted compiler-support seam. Frontends never depend on each other or back
-on this execution crate. The pure CPU fiber scheduler remains here; `programs` re-exports the
-core-owned `ProgramLanguage` through this compatibility facade.
+**Dependencies:** `finch-vm` depends downward on the unpublished `finch-vm-core` crate and never
+on `finch-colisp`, `finch-coforth`, `finch-language`, or the root `finch` crate. The language
+facade is a test-only dependency so execution-equivalence tests can compile fixtures without
+making production VM code select a frontend. The pure CPU fiber scheduler remains here;
+`programs` re-exports the core-owned `ProgramLanguage` through this compatibility facade.
 
 **Effects** go through the capability broker, never around it
 ([capability boundaries](../../CLAUDE.md#key-principles)).

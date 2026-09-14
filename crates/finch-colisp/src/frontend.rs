@@ -1,10 +1,10 @@
 use crate::{SpannedVal, Val};
 use finch_vm_core::{
-    apply_signature_types, instantiate_signature_types, nearest_names, parse_type_name, BasicBlock,
-    BlockId, CapabilityKind, CapabilityRequirement, ControlEffect, DiagnosticPhase, EffectSet,
-    Function, Instruction, LocatedInstruction, Module, ResourceSelector, SourceLanguage,
-    SourceOrigin, SourceSpan, StackRow, StackSignature, SuspensionSignature, Type, TypedValue,
-    UiOperation, VerifiedModule, Verifier, VmDiagnostic, Vocabulary, VM_TYPE_SYSTEM_VERSION,
+    apply_signature_types, certify_module, instantiate_signature_types, nearest_names,
+    parse_type_name, CapabilityKind, CapabilityRequirement, ControlEffect, DiagnosticPhase,
+    EffectSet, Function, Instruction, LoopBinding, ModuleVerified, Parsed, ResourceSelector,
+    SemanticBinding, SemanticBuilder, SourceLanguage, SourceOrigin, SourceSpan, StackRow,
+    StackSignature, SuspensionSignature, Type, TypedValue, UiOperation, VmDiagnostic, Vocabulary,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -19,191 +19,6 @@ struct SourceForm {
     span: Range<usize>,
     source: SpannedVal,
     expansion: Option<SourceOrigin>,
-}
-
-#[derive(Debug, Clone)]
-enum Binding {
-    Local { index: u32, ty: Type },
-    Capture { index: u32, ty: Type },
-}
-
-/// A lexically active structured loop.  It is compiler metadata only: the
-/// emitted IR still contains ordinary typed blocks and explicit jump edges.
-#[derive(Debug, Clone)]
-struct LoopBinding {
-    label: Option<String>,
-    header: BlockId,
-    exit: BlockId,
-    stack: Vec<Type>,
-}
-
-impl Binding {
-    fn ty(&self) -> &Type {
-        match self {
-            Self::Local { ty, .. } | Self::Capture { ty, .. } => ty,
-        }
-    }
-}
-
-struct FunctionBuilder {
-    name: String,
-    blocks: BTreeMap<BlockId, BasicBlock>,
-    current: BlockId,
-    next_block: BlockId,
-    locals: Vec<Type>,
-    captures: Vec<Type>,
-    scopes: Vec<HashMap<String, Binding>>,
-    loops: Vec<LoopBinding>,
-    stack: Vec<Type>,
-    input: Vec<Type>,
-    effects: EffectSet,
-    suspension: Option<SuspensionSignature>,
-    /// The enclosing definition's result contract, when it opted into
-    /// early-result propagation. Top-level forms and closures intentionally
-    /// have none: `try` must not manufacture a hidden dynamic return path.
-    return_result: Option<(Type, Type)>,
-}
-
-impl FunctionBuilder {
-    fn new(name: impl Into<String>, input: Vec<Type>) -> Self {
-        Self {
-            name: name.into(),
-            blocks: BTreeMap::from([(
-                0,
-                BasicBlock {
-                    id: 0,
-                    instructions: Vec::new(),
-                },
-            )]),
-            current: 0,
-            next_block: 1,
-            locals: Vec::new(),
-            captures: Vec::new(),
-            scopes: vec![HashMap::new()],
-            loops: Vec::new(),
-            stack: input.clone(),
-            input,
-            effects: EffectSet::pure(),
-            suspension: None,
-            return_result: None,
-        }
-    }
-
-    fn emit(&mut self, instruction: Instruction, origin: SourceOrigin) {
-        let block = self
-            .blocks
-            .get_mut(&self.current)
-            .expect("current block exists");
-        // Structured loop exits terminate their current edge. Continue
-        // lowering only to close surrounding forms and type-check their live
-        // alternatives; never append a synthetic merge instruction after a
-        // terminator.
-        if block
-            .instructions
-            .last()
-            .is_some_and(|located| located.instruction.is_terminator())
-        {
-            return;
-        }
-        block.instructions.push(LocatedInstruction {
-            instruction,
-            origin,
-        });
-    }
-
-    fn merge_suspension(
-        &mut self,
-        incoming: Option<&SuspensionSignature>,
-        origin: &SourceOrigin,
-    ) -> Result<(), Vec<VmDiagnostic>> {
-        let Some(incoming) = incoming else {
-            return Ok(());
-        };
-        if let Some(current) = &self.suspension {
-            if current != incoming {
-                return Err(vec![VmDiagnostic::error(
-                    "E-YIELD-004",
-                    DiagnosticPhase::TypeInference,
-                    format!(
-                        "one callable cannot yield incompatible types {} and {}",
-                        current.yield_type, incoming.yield_type
-                    ),
-                    Some(origin.clone()),
-                )]);
-            }
-        } else {
-            self.suspension = Some(incoming.clone());
-        }
-        Ok(())
-    }
-
-    fn new_block(&mut self) -> BlockId {
-        let id = self.next_block;
-        self.next_block += 1;
-        self.blocks.insert(
-            id,
-            BasicBlock {
-                id,
-                instructions: Vec::new(),
-            },
-        );
-        id
-    }
-
-    fn switch_to(&mut self, block: BlockId, stack: Vec<Type>) {
-        self.current = block;
-        self.stack = stack;
-    }
-
-    fn allocate_local(&mut self, ty: Type) -> u32 {
-        let index = self.locals.len() as u32;
-        self.locals.push(ty);
-        index
-    }
-
-    fn resolve(&self, name: &str) -> Option<Binding> {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name).cloned())
-    }
-
-    fn visible_bindings(&self) -> Vec<(String, Binding)> {
-        let mut seen = HashSet::new();
-        let mut bindings = Vec::new();
-        for scope in self.scopes.iter().rev() {
-            for (name, binding) in scope {
-                if seen.insert(name.clone()) {
-                    bindings.push((name.clone(), binding.clone()));
-                }
-            }
-        }
-        bindings.sort_by(|left, right| left.0.cmp(&right.0));
-        bindings
-    }
-
-    fn finish(self, output: Vec<Type>) -> Function {
-        Function {
-            name: self.name,
-            documentation: None,
-            signature: StackSignature {
-                type_parameters: Vec::new(),
-                input: StackRow::polymorphic("S", self.input),
-                output: StackRow::polymorphic("S", output),
-                effects: self.effects,
-                control: if self.suspension.is_some() {
-                    ControlEffect::MaySuspend
-                } else {
-                    ControlEffect::Returns
-                },
-                suspension: self.suspension,
-            },
-            locals: self.locals,
-            captures: self.captures,
-            entry: 0,
-            blocks: self.blocks,
-        }
-    }
 }
 
 struct Compiler<'a> {
@@ -228,7 +43,7 @@ pub fn compile_lisp(
     source: &str,
     initial_stack: Vec<Type>,
     vocabulary: &Vocabulary,
-) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
+) -> Result<ModuleVerified, Vec<VmDiagnostic>> {
     compile_lisp_with_functions(
         source_id,
         source,
@@ -244,7 +59,7 @@ pub fn compile_lisp_with_functions(
     initial_stack: Vec<Type>,
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
-) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
+) -> Result<ModuleVerified, Vec<VmDiagnostic>> {
     let parsed_forms = crate::parse_str_spanned(source).map_err(|error| {
         vec![VmDiagnostic::error(
             "E-READ-002",
@@ -270,6 +85,8 @@ pub fn compile_lisp_with_functions(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let expressions = flatten_top_level_begins(expressions);
+    let parsed = Parsed::from_frontend(source_id, expressions);
+    let expressions = parsed.into_ast();
     let mut compiler = Compiler {
         source_id,
         source,
@@ -300,7 +117,7 @@ pub fn compile_lisp_with_functions(
             executable.push(expression.clone());
         }
     }
-    let mut builder = FunctionBuilder::new("main", initial_stack);
+    let mut builder = SemanticBuilder::new("main", initial_stack);
     if executable.is_empty() {
         if expressions.is_empty() {
             builder.stack.push(Type::Unit);
@@ -336,17 +153,9 @@ pub fn compile_lisp_with_functions(
     builder.emit(Instruction::Return, compiler.origin("<return>"));
     let main = builder.finish(output);
     compiler.functions.insert("main".into(), main);
-    let module = Module {
-        version: VM_TYPE_SYSTEM_VERSION,
-        name: source_id.to_string(),
-        entry: "main".into(),
-        functions: {
-            let mut functions = linked_functions.clone();
-            functions.extend(compiler.functions);
-            functions
-        },
-    };
-    Verifier::new(vocabulary).verify(module)
+    let mut functions = linked_functions.clone();
+    functions.extend(compiler.functions);
+    certify_module(source_id.to_string(), "main", functions, vocabulary)
 }
 
 /// Scheme-style top-level `begin` is a declaration container, not a runtime
@@ -675,7 +484,7 @@ impl Compiler<'_> {
         &mut self,
         expression: &Val,
         source: Option<&SpannedVal>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let Some(source) = source else {
             return self.compile_expression(expression, builder);
@@ -717,7 +526,7 @@ impl Compiler<'_> {
     fn compile_expression(
         &mut self,
         expression: &Val,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let origin = self.origin(expression.to_string());
         let ty = match expression {
@@ -776,8 +585,8 @@ impl Compiler<'_> {
                     )]
                 })?;
                 let instruction = match binding.clone() {
-                    Binding::Local { index, .. } => Instruction::LocalGet { index },
-                    Binding::Capture { index, .. } => Instruction::CaptureGet { index },
+                    SemanticBinding::Local { index, .. } => Instruction::LocalGet { index },
+                    SemanticBinding::Capture { index, .. } => Instruction::CaptureGet { index },
                 };
                 builder.emit(instruction, origin);
                 binding.ty().clone()
@@ -826,7 +635,7 @@ impl Compiler<'_> {
             .iter()
             .map(|(_, ty)| ty.clone())
             .collect::<Vec<_>>();
-        let mut child = FunctionBuilder::new(name, arguments);
+        let mut child = SemanticBuilder::new(name, arguments);
         child.return_result = declared_return.as_ref().and_then(|ty| match ty {
             Type::Result(ok, error) => Some(((**ok).clone(), (**error).clone())),
             _ => None,
@@ -835,7 +644,7 @@ impl Compiler<'_> {
             let index = child.allocate_local(ty.clone());
             child.scopes[0].insert(
                 parameter_name.clone(),
-                Binding::Local {
+                SemanticBinding::Local {
                     index,
                     ty: ty.clone(),
                 },
@@ -960,7 +769,7 @@ impl Compiler<'_> {
     fn compile_list(
         &mut self,
         items: &[Val],
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         // Source children are owned by the reader tree, not reconstructed by
         // text matching. Clone this small metadata vector before recursive
@@ -1199,7 +1008,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.is_empty() {
             builder.emit(
@@ -1239,7 +1048,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() != 1 {
             return Err(vec![self.error(
@@ -1291,7 +1100,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() != 1 {
             return Err(vec![self.error(
@@ -1339,7 +1148,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() == 1 {
             return self.compile_defer_fiber(expressions, expression_sources, builder);
@@ -1376,7 +1185,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
         operation: &str,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() != 1 {
@@ -1413,7 +1222,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
         join: bool,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let name = if join { "task-join" } else { "task-poll" };
@@ -1454,7 +1263,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() != 1 {
             return Err(vec![
@@ -1479,7 +1288,7 @@ impl Compiler<'_> {
     fn compile_list_value(
         &mut self,
         expressions: &[Val],
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let Some(first) = expressions.first() else {
             return Err(vec![self.error(
@@ -1514,7 +1323,7 @@ impl Compiler<'_> {
     fn compile_empty_list(
         &mut self,
         expressions: &[Val],
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [Val::Symbol(element)] = expressions else {
             return Err(vec![self.error(
@@ -1541,7 +1350,7 @@ impl Compiler<'_> {
     fn compile_map_value(
         &mut self,
         expressions: &[Val],
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.is_empty() || !expressions.len().is_multiple_of(2) {
             return Err(vec![
@@ -1585,7 +1394,7 @@ impl Compiler<'_> {
     fn compile_empty_map(
         &mut self,
         expressions: &[Val],
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [Val::Symbol(key), Val::Symbol(value)] = expressions else {
             return Err(vec![self.error(
@@ -1616,7 +1425,7 @@ impl Compiler<'_> {
         &mut self,
         fields: &[Val],
         field_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let mut record_fields = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
@@ -1661,7 +1470,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [Val::Symbol(type_name), Val::Symbol(tag), rest @ ..] = expressions else {
             return Err(vec![self.error(
@@ -1726,7 +1535,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [variant, Val::Symbol(tag)] = expressions else {
             return Err(vec![self.error(
@@ -1770,7 +1579,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [record, Val::Str(field)] = expressions else {
             return Err(vec![self.error(
@@ -1824,7 +1633,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [record, Val::Str(field), value] = expressions else {
             return Err(vec![self.error(
@@ -1891,7 +1700,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() < 2 {
             return Err(vec![
@@ -1931,7 +1740,7 @@ impl Compiler<'_> {
             );
             scope.insert(
                 name.clone(),
-                Binding::Local {
+                SemanticBinding::Local {
                     index: *index,
                     ty: ty.clone(),
                 },
@@ -1951,7 +1760,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() != 3 {
             return Err(vec![
@@ -1970,34 +1779,18 @@ impl Compiler<'_> {
                 Some(self.origin("if")),
             )]);
         }
-        builder.stack.pop();
-        let branch_stack = builder.stack.clone();
-        let then_block = builder.new_block();
-        let else_block = builder.new_block();
-        let merge_block = builder.new_block();
-        builder.emit(
-            Instruction::Branch {
-                then_block,
-                else_block,
-            },
-            self.origin("if"),
-        );
+        let branch = builder.start_bool_branch(self.origin("if"))?;
 
-        builder.switch_to(then_block, branch_stack.clone());
+        builder.switch_to(branch.then_block, branch.entry_stack.clone());
         let then_type = self.compile_expression_at(
             &expressions[1],
             expression_sources.and_then(|sources| sources.get(1)),
             builder,
         )?;
         let then_stack = builder.stack.clone();
-        builder.emit(
-            Instruction::Jump {
-                target: merge_block,
-            },
-            self.origin("if/then"),
-        );
+        builder.jump_to_merge(&branch, self.origin("if/then"));
 
-        builder.switch_to(else_block, branch_stack);
+        builder.switch_to(branch.else_block, branch.entry_stack.clone());
         let else_type = self.compile_expression_at(
             &expressions[2],
             expression_sources.and_then(|sources| sources.get(2)),
@@ -2010,13 +1803,8 @@ impl Compiler<'_> {
                 Some(self.origin("if")),
             )]);
         }
-        builder.emit(
-            Instruction::Jump {
-                target: merge_block,
-            },
-            self.origin("if/else"),
-        );
-        builder.switch_to(merge_block, then_stack);
+        builder.jump_to_merge(&branch, self.origin("if/else"));
+        builder.switch_to(branch.merge_block, then_stack);
         Ok(builder.stack.pop().expect("if expression leaves value"))
     }
 
@@ -2034,7 +1822,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [option_expression, some_arm, none_arm] = expressions else {
             return Err(vec![self.error(
@@ -2130,7 +1918,7 @@ impl Compiler<'_> {
         );
         builder.scopes.push(HashMap::from([(
             binding.clone(),
-            Binding::Local {
+            SemanticBinding::Local {
                 index,
                 ty: (*inner).clone(),
             },
@@ -2184,7 +1972,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() < 2 {
             return Err(vec![self.error(
@@ -2235,7 +2023,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let Some((variant_expression, arms)) = expressions.split_first() else {
             return Err(vec![self.error(
@@ -2383,7 +2171,7 @@ impl Compiler<'_> {
                     );
                     scope.insert(
                         binding,
-                        Binding::Local {
+                        SemanticBinding::Local {
                             index,
                             ty: payload_type,
                         },
@@ -2455,7 +2243,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [record_expression, arm] = expressions else {
             return Err(vec![self.error(
@@ -2566,8 +2354,8 @@ impl Compiler<'_> {
         record_local: u32,
         record_fields: &[(String, Type)],
         bindings: Vec<(String, String, Type)>,
-        builder: &mut FunctionBuilder,
-    ) -> HashMap<String, Binding> {
+        builder: &mut SemanticBuilder,
+    ) -> HashMap<String, SemanticBinding> {
         let mut scope = HashMap::new();
         for (field, binding, field_type) in bindings {
             if binding == "_" {
@@ -2615,7 +2403,7 @@ impl Compiler<'_> {
             );
             scope.insert(
                 binding,
-                Binding::Local {
+                SemanticBinding::Local {
                     index,
                     ty: field_type,
                 },
@@ -2632,7 +2420,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [list_expression, empty_arm, cons_arm] = expressions else {
             return Err(vec![self.error(
@@ -2808,7 +2596,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let Some((value, arms)) = expressions.split_first() else {
             return Err(vec![self.error(
@@ -2836,7 +2624,7 @@ impl Compiler<'_> {
         &mut self,
         arms: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if arms.len() != 2 {
             return Err(vec![self.error(
@@ -2925,7 +2713,7 @@ impl Compiler<'_> {
         &mut self,
         arms: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if arms.len() < 2 {
             return Err(vec![self.error(
@@ -3096,7 +2884,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [result_expression, ok_arm, err_arm] = expressions else {
             return Err(vec![self.error(
@@ -3179,7 +2967,7 @@ impl Compiler<'_> {
         );
         builder.scopes.push(HashMap::from([(
             ok_binding,
-            Binding::Local {
+            SemanticBinding::Local {
                 index,
                 ty: (*ok_type).clone(),
             },
@@ -3218,7 +3006,7 @@ impl Compiler<'_> {
         );
         builder.scopes.push(HashMap::from([(
             err_binding,
-            Binding::Local {
+            SemanticBinding::Local {
                 index,
                 ty: (*err_type).clone(),
             },
@@ -3258,7 +3046,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [expression] = expressions else {
             return Err(vec![self.error(
@@ -3306,7 +3094,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let (label, condition_index) = match expressions {
             [Val::Symbol(marker), Val::Symbol(label), rest @ ..] if marker == ":label" => {
@@ -3406,7 +3194,7 @@ impl Compiler<'_> {
         &mut self,
         kind: &str,
         expressions: &[Val],
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [Val::Symbol(label)] = expressions else {
             return Err(vec![self.error(
@@ -3458,7 +3246,7 @@ impl Compiler<'_> {
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() < 2 {
             return Err(vec![
@@ -3496,7 +3284,7 @@ impl Compiler<'_> {
             .iter()
             .map(|(_, ty)| ty.clone())
             .collect::<Vec<_>>();
-        let mut child = FunctionBuilder::new(&name, arguments.clone());
+        let mut child = SemanticBuilder::new(&name, arguments.clone());
         child.captures = visible
             .iter()
             .map(|(_, binding)| binding.ty().clone())
@@ -3504,7 +3292,7 @@ impl Compiler<'_> {
         for (index, (capture_name, binding)) in visible.iter().enumerate() {
             child.scopes[0].insert(
                 capture_name.clone(),
-                Binding::Capture {
+                SemanticBinding::Capture {
                     index: index as u32,
                     ty: binding.ty().clone(),
                 },
@@ -3514,7 +3302,7 @@ impl Compiler<'_> {
             let index = child.allocate_local(ty.clone());
             child.scopes[0].insert(
                 name.clone(),
-                Binding::Local {
+                SemanticBinding::Local {
                     index,
                     ty: ty.clone(),
                 },
@@ -3564,7 +3352,7 @@ impl Compiler<'_> {
         arguments: &[Val],
         argument_sources: Option<&[SpannedVal]>,
         operator_source: Option<&SpannedVal>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let word = match operator {
             "string-append" => "str-cat",
@@ -3744,7 +3532,7 @@ impl Compiler<'_> {
         arguments: &[Val],
         target_source: Option<&SpannedVal>,
         argument_sources: Option<&[SpannedVal]>,
-        builder: &mut FunctionBuilder,
+        builder: &mut SemanticBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         for (index, argument) in arguments.iter().enumerate() {
             self.compile_expression_at(
@@ -3801,10 +3589,10 @@ impl Compiler<'_> {
         Ok(builder.stack.pop().expect("closure leaves result"))
     }
 
-    fn emit_binding_load(&self, builder: &mut FunctionBuilder, binding: Binding) {
+    fn emit_binding_load(&self, builder: &mut SemanticBuilder, binding: SemanticBinding) {
         let (instruction, ty) = match binding {
-            Binding::Local { index, ty } => (Instruction::LocalGet { index }, ty),
-            Binding::Capture { index, ty } => (Instruction::CaptureGet { index }, ty),
+            SemanticBinding::Local { index, ty } => (Instruction::LocalGet { index }, ty),
+            SemanticBinding::Capture { index, ty } => (Instruction::CaptureGet { index }, ty),
         };
         builder.emit(instruction, self.origin("capture"));
         builder.stack.push(ty);

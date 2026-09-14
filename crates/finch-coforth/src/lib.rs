@@ -1,7 +1,8 @@
 //! Co-Forth source compiler for Finch's shared typed VM.
 //!
-//! This crate owns source parsing, type elaboration, and lowering from
-//! Co-Forth into the provider-neutral IR supplied by `finch-vm-core`.
+//! This crate owns source parsing and translation from Co-Forth syntax into
+//! the shared semantic-construction protocol. It does not mint executable
+//! modules except through independent verification.
 
 mod compiler;
 

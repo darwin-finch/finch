@@ -3,12 +3,17 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `crates/finch-vm-core/src/`: the provider-neutral typed IR, types, signatures,
-diagnostics, capability/effect descriptions, verifier, language identity, and core vocabulary.
+diagnostics, capability/effect descriptions, verifier, language identity, core vocabulary,
+and the syntax-neutral semantic-construction protocol with opaque phase types.
 It owns no frontend, interpreter, runtime, fiber scheduler, or checkpoint codec.
+Capability *requirements* live here as typed effects; grants, approval policy, and
+authorization ledgers remain physically in this crate until application-runtime
+extraction, and are not consulted during compilation.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`. Application callers
-continue to use `finch-vm`; the five explicitly documented compiler-support exports (`BlockId`,
-`nearest_names`, `apply_signature_types`, `instantiate_signature_types`, and `parse_type_name`)
+continue to use `finch-vm`; the compiler-support exports (`BlockId`, `nearest_names`,
+`apply_signature_types`, `instantiate_signature_types`, `parse_type_name`, `SemanticBuilder`,
+`Parsed`, `Elaborated`, `FunctionCertified`, `ModuleSealed`, and `ModuleVerified`)
 are an intentionally restricted workspace seam and are not stable application API.
 
 **Documentation:** [`docs/README.md`](docs/README.md) owns implemented IR/verifier reference

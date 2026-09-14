@@ -1,6 +1,6 @@
 //! Report-only compatibility checks for source written for older Finch runtimes.
 
-use crate::compile_forth;
+use finch_language::compile_forth;
 use finch_vm_core::Vocabulary;
 use std::collections::BTreeMap;
 

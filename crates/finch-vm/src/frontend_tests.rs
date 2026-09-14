@@ -1,5 +1,6 @@
 use crate::interpreter::{DenyCapabilities, Interpreter};
 use crate::*;
+use finch_language::{compile_forth, compile_lisp};
 
 #[test]
 fn wire_failure_classifier_covers_every_stable_class() {
