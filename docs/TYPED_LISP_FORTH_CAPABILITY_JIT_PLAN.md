@@ -51,9 +51,11 @@ Bare `"text"` is the preferred short escaped-string literal in Co-Forth. `s"text
 Forth-compatible equivalent and has no implicit leading space: both `s"text"` and conventional
 `s" text"` produce `text` because the one delimiter whitespace is consumed. Spacing belongs in
 the literal or is composed explicitly (for example `space`, `str-cat`, or separate `say` events).
-`"""..."""` is the preferred raw multiline/prose literal; compatible `s"""..."""` also works.
-It preserves its contents verbatim until the next triple quote, avoiding fragile quote escaping in
-user-visible text. Co-Forth uses `\\` line comments. In an untagged compact provider stream,
+`"""..."""` is the preferred short raw multiline/prose literal; compatible `s"""..."""` also
+works. It preserves contents until the next triple quote. Content containing that terminator uses
+the selectable raw fence `r#"..."#` (with additional matching hashes as needed), so every valid
+source-text payload remains expressible without escaping or another string type. Co-Forth uses `\\`
+line comments. In an untagged compact provider stream,
 parenthesized Co-Forth comments are allowed only after a Co-Forth token because leading `(` is the
 Lisp shorthand. Explicitly tagged Co-Forth has no such transport ambiguity and may begin with a
 parenthesized comment. The normative language definition must give exact escaping and raw-delimiter
@@ -295,6 +297,10 @@ and JIT execution the same verified IR, transaction, and error behavior.
    second semantic VM.
 8. There is no process-wide GIL. Executions own their stacks and frames; shared state uses immutable
    versions, explicit transactions, concurrent handles, or narrowly scoped synchronization.
+9. Ordinary application code feels like statically checked scripting: local types, generic
+   evidence, safe borrows, representation-independent comparisons, and profitable specialization
+   are inferred without hiding allocation, erasure, encoding changes, authority, or ownership
+   escape.
 
 ### Product boundary: Finch Runtime and Finch application
 
@@ -337,6 +343,30 @@ verifies before publishing the word in a manifest.
 - Do not silently replay or compensate external effects when reverting VM state.
 
 ## Architectural decisions
+
+### Scripting ergonomics with a systems cost model
+
+Finch aims to provide nearly systems-level layout, ownership, compilation, and native-code control
+while making ordinary code read like a scripting language. Most private code should not mention a
+type that is already determined by its initializer and immediate arguments. The compiler performs
+directional local inference, inserts proven scoped borrows and readonly views, resolves declared
+concept evidence, specializes when measured to help, and removes bounds/ownership checks it proves
+redundant. Errors remain attached to the expression that introduced the incompatible value rather
+than a distant constraint solution.
+
+“Automatic” does not mean cost-blind. An implicit adaptation may prove a fact, copy a `Copy` scalar,
+or create a scoped zero-copy view. It may not allocate, retain shared ownership beyond the call,
+change text encoding, erase static evidence, perform runtime name lookup, acquire authority, or move
+an owner unless the source construct or receiving contract makes that cost visible. Literals and
+operations whose purpose is construction may allocate according to their declared result type; the
+optimizer may keep them inline or remove the allocation when unobservable.
+
+Compiler-recognized syntax is kept smaller than the standard library. The compiler owns literal
+syntax, static array/tuple layout, borrow and slice validity, checked indexing, and UTF-8 literal
+validation because they affect parsing, safety, or ABI. Public concepts expose sequence iteration,
+comparison, literal construction, text views, ranges, and collection building so user-defined types
+can receive the same generic algorithms and most surface convenience. No standard-library type gets
+a private method lookup or comparison path unavailable through those contracts.
 
 ### One semantic runtime, two source-language frontends
 
@@ -386,10 +416,14 @@ int              signed 64-bit integer initially
 uint             unsigned 64-bit integer initially
 float            IEEE-754 binary64 initially
 char             Unicode scalar value
-string           immutable UTF-8 managed value
-bytes            immutable or uniquely owned byte sequence
+string           immutable owned valid-UTF-8 text value
+bytes            immutable owned contiguous byte sequence
+array<T,N>       fixed-length inline homogeneous product
+slice<T>         scoped readonly contiguous view
+slice-mut<T>     scoped exclusive contiguous view
+vector<T>        uniquely owned growable contiguous sequence
 path<R>          normalized path proven relative to root R
-list<T>          persistent or managed sequence
+list<T>          immutable persistent sequence
 map<K,V>         managed mapping
 tuple<T...>      anonymous fixed-length heterogeneous product
 option<T>        standard-library closed variant: none or some(T)
@@ -418,6 +452,132 @@ dynamic dispatch cost merely because the Lisp frontend exists.
 
 The serialized `ProgramValue` form is the wire/checkpoint representation, not necessarily the
 in-memory stack layout.
+
+### Text, arrays, slices, vectors, and lists
+
+Text and collections share public sequence concepts without pretending to share one representation:
+
+| Type | Length/layout | Ownership and mutation | Primary use |
+|---|---|---|---|
+| `array<T,N>` | `N` in the type; values inline | owned value; fixed length | stack fields, ABI-shaped buffers, small fixed data |
+| `slice<T>` | runtime length; contiguous view | scoped readonly borrow | zero-copy input over arrays/vectors/bytes |
+| `slice-mut<T>` | runtime length; contiguous view | scoped exclusive borrow | checked in-place algorithms |
+| `vector<T>` | runtime length/capacity; contiguous | unique owner; exclusive mutation/growth | dynamic arrays and buffers |
+| `list<T>` | runtime length; non-contiguous allowed | immutable persistent owner | structural sharing and list algorithms |
+| `bytes` | runtime length; contiguous octets | immutable owner | binary and wire data |
+| `string` | runtime byte length; valid UTF-8 | immutable owner | human text |
+
+These are logical value types, not framework storage classes. Backing storage may use the ordinary
+owner carriers and may be kept inline or eliminated when unobservable. `slice` and `slice-mut` never
+own or extend storage; their origin is checked by the ordinary borrow rules, and they cannot escape,
+survive suspension, or become retained native addresses without owner and pinning evidence. A
+mutable vector operation that may grow invalidates outstanding views, which is already prevented by
+the exclusive-borrow rule. Persistent-list updates return a new list. Shared ownership never grants
+mutation.
+
+`Sequence<T>` provides finite readonly traversal. Independent concepts provide runtime sizing,
+`KnownLength<N>`, contiguity, random access, mutable access, growth, and ownership. Algorithms state
+only the evidence they require: equality needs two finite readable sequences and compatible element
+equality; a native write needs contiguity plus a stable borrow; append-in-place needs unique growable
+storage. Built-in and user-defined collections publish explicit mappings through the same concept
+system. Compiler syntax may select an optimized loop from evidence but cannot use a private
+standard-library-only operation.
+
+Sequence equality is an allocation-free algorithm, not a coercion. Arrays of different static
+lengths are unequal without inspecting elements. If either length is dynamic, equality compares
+lengths and then corresponding elements. Arrays, slices, vectors, and lists may therefore compare
+directly whenever their element types have compatible `Equal` evidence; no representation conversion
+or temporary copy occurs. Lexicographic ordering and hashing use similarly explicit evidence, and
+`Hash` must agree with `Equal` before a type may be a map key. Arbitrary lazy or potentially infinite
+ranges do not receive equality implicitly because comparison could consume effects or fail to
+terminate.
+
+Indexing syntax performs a checked lookup and produces a defined bounds trap containing the index,
+length, and source origin. `.get` instead returns `option<&T>` when absence is ordinary data. Slicing
+checks its endpoints once and returns a scoped view. Static lengths, loop refinements, and preceding
+guards allow the verifier/JIT to remove redundant checks; safe source does not need unchecked
+indexing for performance.
+
+A collection literal becomes one span-bearing `SequenceLiteral<T,N>` syntax node. Homogeneous
+elements infer `T` locally; empty or intentionally mixed literals require an expected element type
+or an explicit variant/dynamic type. An expression-local expected type may select `array<T,N>`,
+`vector<T>`, `list<T>`, `bytes`, or a user-defined `FromElements<T,N>` implementation. Without such
+an expectation, the scripting-oriented default is `vector<T>`; fixed arrays, persistent lists, and
+bytes use explicit constructors. Elements evaluate exactly once from left to right. Literal
+construction may allocate because construction is visible, but converting an existing owner to a
+different representation is explicit (`to-vector`, `to-list`, or equivalent). A compatible
+array/vector/bytes value may implicitly lend a zero-copy slice because that adaptation only borrows.
+
+Canonical paired spellings include:
+
+```text
+CoLisp:   (array 1 2 3)    (vector 1 2 3)    (list 1 2 3)    (bytes #x00 #xff)
+Co-Forth: array{ 1 2 3 }   vector{ 1 2 3 }   list{ 1 2 3 }   bytes{ 0x00 0xff }
+```
+
+Spread into a fixed array requires compile-time-known cardinality; runtime spread is accepted only
+by a growable builder. A uniquely owned `StringBuilder` or `VectorBuilder<T>` exposes mutation and
+then `freeze` consumes it into immutable `string`, `bytes`, or another selected collection. Freeze
+may reuse its allocation, invalidates the builder, and creates no second owner. Copy-on-write and
+shared builders remain explicit policies rather than literal magic.
+
+Ordinary string concatenation constructs one owned string and is linear in the combined byte
+length. A chain of concatenations may be fused into one builder allocation only when evaluation
+order, exceptions, and observable allocations remain equivalent. Incremental or loop-based
+construction uses `StringBuilder` explicitly, so convenient `str-cat` does not imply a quadratic
+implementation or a hidden mutable string type.
+
+`string` is the sole core Unicode text value: immutable, movable, and guaranteed to contain valid
+UTF-8. A string literal is validated by the reader and may use immutable module backing without a
+runtime allocation. `Text` is a public readonly-view concept rather than another owning string
+class; `string`, literals, and foreign/framework carriers can map a scoped allocation-free text
+borrow into it. Readonly APIs accept `borrow Text`; an API retaining text accepts or constructs an
+owned `string`. A substring is a scoped text borrow by default, and escaping it requires explicit
+materialization or an owner-carrying view, avoiding both hidden reference counts and accidentally
+retaining a huge source buffer for a tiny substring.
+
+Exact string equality and hashing compare Unicode scalar content, equivalently the bytes of two
+already-valid UTF-8 values. They do not normalize, case-fold, or apply locale collation implicitly.
+Those operations are explicit versioned library policies because they may allocate and Unicode-data
+versions affect results. Nul is an ordinary scalar in a Finch string. Strings and bytes do not
+compare implicitly merely because a string has a
+UTF-8 representation; viewing a string as readonly UTF-8 bytes is zero-copy, while decoding arbitrary
+bytes validates and returns `result<string,Utf8Error>`. Lossy decoding is explicitly named.
+
+Integer `string[i]` is intentionally absent: in Unicode, “character” may mean a byte, scalar, or
+grapheme cluster, and scalar/grapheme indexing is not constant-time in UTF-8. `.bytes`, `.chars`, and
+`.graphemes` expose explicit ranges; `byte-count`, `scalar-count`, and `grapheme-count` name their
+units. Byte slicing must preserve scalar boundaries or return an error. Grapheme operations state a
+Unicode-data version. Source escapes include `\\`, `\"`, `\n`, and `\u{...}` and reject surrogate
+values. Both frontends accept `r"..."`, with matching hash-count fences such as `r#"..."#` and
+`r##"..."##`, so embedded quotes and shorter fence sequences need no escaping. The reader records
+the chosen fence but the resulting value is the same `string`; raw spelling does not create another
+string type.
+
+Constant-pattern matching is generic semantics with representation-specific lowering. A constant
+arm uses certified pure, total, deterministic, non-suspending `PatternEqual` evidence; optional
+consistent `PatternHash` evidence permits hashed dispatch. Closed variants may use tag jump tables,
+dense integers may use value jump tables, and strings may use length buckets, tries, or perfect/hash
+tables followed by equality for collision checks. Other library-defined key types can receive the
+same optimization by publishing the evidence. Matching strings therefore requires no hidden type
+byte and no string-only source rule. An open domain such as string or integer still requires a
+catch-all arm for exhaustiveness.
+
+Framework and FFI boundaries use views and ownership protocols rather than inventing string
+classes. The portable Finch ABI represents borrowed text/bytes as pointer-plus-length views with an
+explicit call-scoped lifetime, and owned results as versioned owner handles with a matching release
+operation. C strings, UTF-16 platform strings, nul termination, normalization, and foreign allocator
+ownership require named adapters. An adapter borrows without allocation only when encoding,
+termination, lifetime, and address stability already satisfy the target; otherwise its scoped
+allocation or owned result is visible in the contract. Native `string`, vector, and list layouts
+never become the C or stable Finch ABI. `repr(C)` fixed arrays require C-safe elements; stable records
+embed managed collections only through specified stable handles or encodings.
+
+Wire and checkpoint encodings are likewise logical rather than native layouts: strings encode a
+length plus validated UTF-8 bytes, `bytes` encode length plus octets, arrays include and validate
+their declared static length, and vectors/lists encode an ordered element sequence under a versioned
+element schema. Decoding enforces size/allocation budgets before construction and never restores a
+native pointer, capacity, reference count, or framework string object from serialized data.
 
 ### Records, layout, placement, and member access
 
@@ -1149,6 +1309,10 @@ the same nodes without source-to-source CoLisp generation.
 | pattern match | `(match value ...)` | `value match ... of ... endof endmatch` | typed decision tree / `Match` |
 | generic declaration/application | generic header, explicit type application | `< types T... values N... > ... where ...`, `word<...>` | parametric artifact / fixed call |
 | parameter/rest pack | delimited call or `:spread` | `args{ ... }`, `rest{ ... }`, `rest-spread` | fixed operands or one rest collection |
+| text/collection literal | `string`, `array`, `vector`, `list`, `bytes` forms | string literal, `array{}`, `vector{}`, `list{}`, `bytes{}` | literal node plus public builder evidence |
+| view/index/slice | borrow, `.get`, index/slice forms | `borrow`, `.get`, `index`, `slice` words | borrow projection and checked access |
+| text traversal | `.bytes`, `.chars`, `.graphemes` | `text-bytes`, `text-chars`, `text-graphemes` | explicit range evidence |
+| builder/freeze | builder operations and `freeze` | `*-builder`, mutation words, `freeze` | unique owner mutation then consuming conversion |
 | concept/evidence | `concept`, `implementation`, `using` | `concept:`, `implementation:`, `using` | named evidence and adapter thunk |
 | dispatch type/view | `static C`, `dyn C`, `some C` | same type constructors; `as-static`, `as-dyn`, `as-some` words | evidence constant, erased view, opaque result |
 | exception region | `(try body (catch ...))` | `try ... catch { error } ... endtry` | `HandlerEnter`/`HandlerExit` and match |
@@ -2702,9 +2866,10 @@ placed in an explicitly selected per-runtime tracing arena with safepoints. Do n
 collector lock. If tracing collection is introduced, expose it as another ownership policy, prefer
 per-runtime/per-arena collection plus immutable cross-arena handles, and document its safepoints.
 
-Builders are first-class implementation APIs for strings, bytes, lists, diagnostics, and patches.
-Compilation and rendering must not repeatedly replace or concatenate whole strings for incremental
-construction.
+Unique builders are first-class implementation APIs for strings, bytes/vectors, persistent lists,
+diagnostics, and patches. Their consuming `freeze` contract is the one defined by the collection
+model above. Compilation and rendering must not repeatedly replace or concatenate whole immutable
+strings for incremental construction.
 
 ## Capability broker and approval pipeline
 
@@ -3438,6 +3603,19 @@ Every phase adds tests at the layer where its invariant is enforced:
   loop-invariant tests;
 - paired CoLisp/Co-Forth grammar fixtures for every parity-ledger row, each comparing semantic nodes,
   accepted IR/results, and the stable diagnostic for its principal invalid form;
+- paired text/collection literal fixtures for array, vector, list, bytes, builders, views, indexing,
+  slicing, spread, and freeze, including empty/mixed inference diagnostics and exactly-once
+  left-to-right element evaluation;
+- cross-length and cross-representation sequence equality/order/hash tests proving no allocation or
+  materialization, static unequal-length elimination, dynamic length checking, element-evidence
+  selection, map-key consistency, and refusal to compare potentially infinite/effectful ranges;
+- text tests for exact UTF-8/scalar equality, invalid decoding, scalar-boundary slicing, distinct
+  byte/scalar/grapheme units, versioned normalization/collation, raw delimiters and escapes, absence
+  of ambiguous integer string indexing, and constant-pattern dispatch with collision checks;
+- ownership/ABI tests proving array/vector/bytes-to-slice calls are zero-copy, escaped views fail,
+  vector growth cannot overlap a borrow, builder freeze consumes and may reuse storage, owning
+  conversions are never implicit, C-string interior nul is handled explicitly, and native managed
+  layouts never cross C or stable ABIs;
 - parameter-pack tests for empty and heterogeneous packs, explicit Co-Forth `args{}` boundaries,
   per-element ownership and left-to-right effects, expansion limits, fixed-signature lowering,
   overload precedence, tuple reification, and rejection from first-class ABI positions before
