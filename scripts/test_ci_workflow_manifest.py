@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CHECKER = ROOT / "scripts/check_ci_workflow_manifest.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 from check_ci_workflow_manifest import (  # noqa: E402
+    CANCELLATION_JOB_IF,
+    CANCELLATION_WORKFLOW,
     ESCAPE_API_ALLOWLIST,
     EXPECTED_PATHS,
     ISOLATION_WORKFLOW,
@@ -709,6 +711,51 @@ class WorkflowContractTests(unittest.TestCase):
     def test_malformed_yaml_fails_actionably(self) -> None:
         self.repository.workflow("docs.yml").write_text("jobs: [\n")
         self.assert_fails("docs.yml: invalid workflow YAML")
+
+    def test_cancellation_controller_is_not_pull_request_active(self) -> None:
+        self.assertNotIn(
+            CANCELLATION_WORKFLOW,
+            EXPECTED_PATHS,
+            "the trusted controller must keep the empty fixture-membership set",
+        )
+        document = load_yaml(ROOT / ".github/workflows" / CANCELLATION_WORKFLOW)
+        self.assertIs(
+            event_contract(document, CANCELLATION_WORKFLOW, "pull_request"),
+            False,
+            "the trusted controller must not activate on pull_request",
+        )
+
+    def test_cancellation_whitespace_duplicate_job_if_fails_as_duplicate_yaml_key(self) -> None:
+        # Round-two HIGH: `if : false` after the required condition left a
+        # line-set/regex oracle green while YAML treated it as the same key.
+        self.repository.replace(
+            CANCELLATION_WORKFLOW,
+            "    runs-on: ubuntu-24.04\n",
+            "    if : false\n    runs-on: ubuntu-24.04\n",
+        )
+        self.assert_fails('duplicate YAML key "if"')
+
+    def test_cancellation_whitespace_duplicate_actions_permission_fails_as_duplicate_yaml_key(self) -> None:
+        # Round-two HIGH: `actions : read` after `actions: write` left extracted
+        # controller tests green while the effective token lost cancel authority.
+        self.repository.replace(
+            CANCELLATION_WORKFLOW,
+            "  actions: write\n",
+            "  actions: write\n  actions : read\n",
+        )
+        self.assert_fails('duplicate YAML key "actions"')
+
+    def test_cancellation_effective_actions_permission_narrowing_fails(self) -> None:
+        self.repository.replace(CANCELLATION_WORKFLOW, "  actions: write\n", "  actions: read\n")
+        self.assert_fails("effective permissions changed", "'actions': 'write'", "'actions': 'read'")
+
+    def test_cancellation_effective_job_condition_disable_fails(self) -> None:
+        self.repository.replace(
+            CANCELLATION_WORKFLOW,
+            f"    if: {CANCELLATION_JOB_IF}\n",
+            "    if: false\n",
+        )
+        self.assert_fails("condition changed", CANCELLATION_JOB_IF, "actual=False")
 
 
 if __name__ == "__main__":

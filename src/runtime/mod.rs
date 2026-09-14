@@ -3318,14 +3318,25 @@ impl ProgramRuntime {
                 deferred_host_effects,
                 effect_audit,
             );
-            let execution = runtime.execute_with_handler(
+            let initial_types = runtime
+                .stack()
+                .iter()
+                .map(crate::vm::TypedValue::value_type)
+                .collect();
+            let compiled = crate::language::compile_with_functions(
                 language,
                 &source_id,
                 &source,
-                fuel,
-                declared.as_ref(),
-                &mut handler,
+                initial_types,
+                runtime.vocabulary(),
+                runtime.functions(),
             );
+            let execution = match compiled {
+                Ok(module) => {
+                    runtime.execute_with_handler(&module, fuel, declared.as_ref(), &mut handler)
+                }
+                Err(diagnostics) => crate::vm::TypedExecution::failed(diagnostics),
+            };
             (runtime, execution)
         })
         .await?;

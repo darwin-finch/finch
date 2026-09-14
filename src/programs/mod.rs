@@ -858,8 +858,11 @@ pub fn hash_text(text: &str) -> String {
 }
 
 fn lisp_definition_identity(source: &str) -> Option<(String, Option<String>)> {
-    use crate::vm::Val;
-    let expression = crate::vm::parse_str(source).ok()?.into_iter().next()?;
+    use crate::language::Val;
+    let expression = crate::language::parse_str(source)
+        .ok()?
+        .into_iter()
+        .next()?;
     let Val::List(parts) = expression else {
         return None;
     };
@@ -883,8 +886,11 @@ fn lisp_definition_identity(source: &str) -> Option<(String, Option<String>)> {
 /// The typed compiler treats the first body string as metadata and omits it
 /// from the emitted IR, so this parser deliberately follows the same rule.
 fn lisp_definition_documentation(source: &str) -> Option<String> {
-    use crate::vm::Val;
-    let expression = crate::vm::parse_str(source).ok()?.into_iter().next()?;
+    use crate::language::Val;
+    let expression = crate::language::parse_str(source)
+        .ok()?
+        .into_iter()
+        .next()?;
     let Val::List(parts) = expression else {
         return None;
     };
@@ -1007,7 +1013,15 @@ mod tests {
         assert_eq!(script.language, ProgramLanguage::Lisp);
 
         let mut runtime = TypedRuntime::new();
-        let result = runtime.execute(script.language, "reply.lisp", &script.source, 1_000);
+        let module = crate::language::compile(
+            script.language,
+            "reply.lisp",
+            &script.source,
+            Vec::new(),
+            runtime.vocabulary(),
+        )
+        .expect("script fixture must compile through the language facade");
+        let result = runtime.execute(&module, 1_000);
         assert_eq!(result.status, TypedExecutionStatus::Completed);
         assert_eq!(result.output, "hello from script");
         assert!(result.values.is_empty());

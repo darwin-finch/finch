@@ -87,9 +87,10 @@ the MCP client should not have to load tool execution and permissions to get the
 |-----------------------------------|------|---------------------|
 | **`config`** (0): configuration, instruction loading, licensing, metrics | `src/config`, `context`, `license`, `metrics`, `monitoring`, `errors.rs`; `data/` personas | Capsule [`src/config/AGENTS.md`](src/config/AGENTS.md), interface [`src/config/INTERFACE.md`](src/config/INTERFACE.md); [configuration](src/config/CONFIGURATION.md), [context assembly](src/context/ASSEMBLY.md), [licensing](src/license/LICENSING.md) |
 | **`vm-core`** (0): shared typed IR, verifier, types, effects, capabilities, diagnostics, and vocabulary contracts | `crates/finch-vm-core` | Capsule [`crates/finch-vm-core/AGENTS.md`](crates/finch-vm-core/AGENTS.md), interface [`crates/finch-vm-core/INTERFACE.md`](crates/finch-vm-core/INTERFACE.md) |
-| **`colisp`** (0): parse and compile CoLisp into the shared typed IR | `crates/finch-colisp`; `vocabulary/language/FINCH_LISP.md` | Capsule [`crates/finch-colisp/AGENTS.md`](crates/finch-colisp/AGENTS.md), interface [`crates/finch-colisp/INTERFACE.md`](crates/finch-colisp/INTERFACE.md) |
-| **`coforth`** (0): parse and compile CoForth into the shared typed IR | `crates/finch-coforth`; `vocabulary/language/FINCH_FORTH.md` | Capsule [`crates/finch-coforth/AGENTS.md`](crates/finch-coforth/AGENTS.md), interface [`crates/finch-coforth/INTERFACE.md`](crates/finch-coforth/INTERFACE.md) |
-| **`vm`** (0): execute both language frontends through the shared VM contract, classify compiler-boundary wire failures, and preserve their compatibility facade | `crates/finch-vm`; `vocabulary/language/FINCH_VM.md`, `examples/finch/` | Capsule [`crates/finch-vm/AGENTS.md`](crates/finch-vm/AGENTS.md), interface [`crates/finch-vm/INTERFACE.md`](crates/finch-vm/INTERFACE.md); language contracts compiled into the binary and given to the model: [`FINCH_VM.md`](vocabulary/language/FINCH_VM.md), [`FINCH_FORTH.md`](vocabulary/language/FINCH_FORTH.md), [`FINCH_LISP.md`](vocabulary/language/FINCH_LISP.md); reference: [typed VM migration audit](docs/TYPED_VM_MIGRATION_AUDIT.md) |
+| **`colisp`** (0): CoLisp reader and translation into the shared semantic-construction protocol | `crates/finch-colisp`; `vocabulary/language/FINCH_LISP.md` | Capsule [`crates/finch-colisp/AGENTS.md`](crates/finch-colisp/AGENTS.md), interface [`crates/finch-colisp/INTERFACE.md`](crates/finch-colisp/INTERFACE.md) |
+| **`coforth`** (0): Co-Forth reader and translation into the shared semantic-construction protocol | `crates/finch-coforth`; `vocabulary/language/FINCH_FORTH.md` | Capsule [`crates/finch-coforth/AGENTS.md`](crates/finch-coforth/AGENTS.md), interface [`crates/finch-coforth/INTERFACE.md`](crates/finch-coforth/INTERFACE.md) |
+| **`language`** (0): compilation facade that selects a frontend and returns `ModuleVerified` | `crates/finch-language` | Capsule [`crates/finch-language/AGENTS.md`](crates/finch-language/AGENTS.md), interface [`crates/finch-language/INTERFACE.md`](crates/finch-language/INTERFACE.md) |
+| **`vm`** (0): execute verified modules, classify compiler-boundary wire failures, and preserve the execution compatibility facade | `crates/finch-vm`; `vocabulary/language/FINCH_VM.md`, `examples/finch/` | Capsule [`crates/finch-vm/AGENTS.md`](crates/finch-vm/AGENTS.md), interface [`crates/finch-vm/INTERFACE.md`](crates/finch-vm/INTERFACE.md); language contracts compiled into the binary and given to the model: [`FINCH_VM.md`](vocabulary/language/FINCH_VM.md), [`FINCH_FORTH.md`](vocabulary/language/FINCH_FORTH.md), [`FINCH_LISP.md`](vocabulary/language/FINCH_LISP.md); reference: [typed VM migration audit](docs/TYPED_VM_MIGRATION_AUDIT.md) |
 | **`programs`** (1): durable program identity, catalog, source-only compiler context, and corpus | `src/programs` | Capsule [`src/programs/AGENTS.md`](src/programs/AGENTS.md), interface [`src/programs/INTERFACE.md`](src/programs/INTERFACE.md) |
 | **`memory`** (1): MemTree storage and retrieval | `src/memory`, `memory_status.rs`, `workbook.rs` | Capsule [`src/memory/AGENTS.md`](src/memory/AGENTS.md), interface [`src/memory/INTERFACE.md`](src/memory/INTERFACE.md) |
 | **`tools-mcp`** (0): the client for external Model Context Protocol servers | `src/tools/mcp` | Capsule [`src/tools/mcp/AGENTS.md`](src/tools/mcp/AGENTS.md), interface [`src/tools/mcp/INTERFACE.md`](src/tools/mcp/INTERFACE.md), [user guide](docs/MCP_USER_GUIDE.md) |
@@ -288,11 +289,11 @@ Design intent, not current fact. The program, its phases, and its measurable gat
   Reverse and cross-subsystem implementation imports are removed before code moves between
   crates.
 - **Extraction order.** The shared typed contract is currently `finch-vm-core`; the coarse
-  `finch-colisp` and `finch-coforth` frontends depend only on that Finch crate; `finch-vm` currently
-  composes them with the interpreter and CPU fiber scheduler. The next language boundary introduces
-  a syntax-neutral semantic-construction/compiler facade and moves frontend selection out of VM
-  execution, as staged in the [language implementation roadmap](docs/language/IMPLEMENTATION_ROADMAP.md).
-  `programs` now depends only on the `finch-vm` facade; after the language boundary is proven, the
+  `finch-colisp` and `finch-coforth` frontends depend only on that Finch crate; `finch-language`
+  selects a frontend and returns `ModuleVerified`; `finch-vm` executes verified modules without
+  depending on either source reader. Remaining language work is staged in the
+  [language implementation roadmap](docs/language/IMPLEMENTATION_ROADMAP.md).
+  `programs` now depends on the language facade for compilation and `finch-vm` for execution; the
   broader extraction sequence continues with `finch-programs`, then `finch-memory` (MemTree,
   retrieval, TF-IDF fallback, and an
   embedding port, without ONNX, Candle, tokenizer, Hugging Face, HTTP, or TUI stacks).
