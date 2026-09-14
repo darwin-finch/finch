@@ -13,12 +13,12 @@ pub(crate) use crate::runtime::agents::{
     MAX_CONTEXT_ARTIFACT_BYTES, MAX_CONTEXT_FIELD_BYTES, MAX_CONTEXT_REFERENCES,
     MAX_CONTEXT_TOTAL_BYTES, MAX_DEPTH, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, MAX_TURNS,
 };
-use crate::tools::implementations::{
+use crate::tools::Tool;
+use crate::tools::ToolContext;
+use crate::tools::{
     GetLanguageDefinitionTool, GetVmStateTool, InspectWordTool, SearchWordTool, SubmitProgramTool,
 };
-use crate::tools::permissions::{PermissionCheck, PermissionManager};
-use crate::tools::registry::Tool;
-use crate::tools::types::ToolContext;
+use crate::tools::{PermissionCheck, PermissionManager};
 use crate::vm::EffectSet;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -1129,7 +1129,7 @@ mod tests {
         ResolvedCredential, ResolvedSecret,
     };
     use crate::generators::{GeneratorCapabilities, GeneratorResponse, ResponseMetadata, ToolUse};
-    use crate::tools::types::ToolDefinition;
+    use crate::tools::ToolDefinition;
     use crate::vm::{CapabilityKind, CapabilityRequirement, ResourceSelector};
     use async_trait::async_trait;
     use std::collections::BTreeSet;

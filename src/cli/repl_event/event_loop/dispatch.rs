@@ -399,9 +399,7 @@ impl EventLoop {
                     return Ok(());
                 }
                 if let Some(restart) =
-                    crate::tools::implementations::restart::deferred_frontend_restart_from_tool_result(
-                        &result,
-                    )
+                    crate::tools::deferred_frontend_restart_from_tool_result(&result)
                 {
                     match self.pending_named_brain_turns.get_mut(&query_id) {
                         Some(turn) if turn.restart.is_none() => {

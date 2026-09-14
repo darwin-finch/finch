@@ -21,7 +21,7 @@ use crate::cli::tui::TuiRenderer;
 use crate::generators::Generator;
 use crate::models::bootstrap::GeneratorState;
 use crate::router::Router;
-use crate::tools::types::ToolDefinition;
+use crate::tools::ToolDefinition;
 
 use super::events::{LlmRequest, ReplEvent};
 use super::model_selection::GeneratorPins;

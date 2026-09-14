@@ -295,7 +295,7 @@ impl ProviderBackend for FallbackChain {
 mod tests {
     use super::*;
     use crate::claude::types::ContentBlock;
-    use crate::tools::types::{ToolDefinition, ToolInputSchema};
+    use crate::tools::{ToolDefinition, ToolInputSchema};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Mock provider for testing

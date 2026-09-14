@@ -3,14 +3,14 @@
 // Tests the full flow: format tools → parse tool calls → execute
 
 use finch::models::{ToolCallParser, ToolPromptFormatter};
-use finch::tools::types::{ToolDefinition, ToolInputSchema};
+use finch::tools::{ToolDefinition, ToolInputSchema};
 
 #[cfg(unix)]
-use finch::tools::implementations::{BashTool, EditTool, WriteTool};
-#[cfg(unix)]
-use finch::tools::types::ToolContext;
-#[cfg(unix)]
 use finch::tools::Tool;
+#[cfg(unix)]
+use finch::tools::ToolContext;
+#[cfg(unix)]
+use finch::tools::{BashTool, EditTool, WriteTool};
 #[cfg(unix)]
 use nix::pty::openpty;
 #[cfg(unix)]

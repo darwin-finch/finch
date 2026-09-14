@@ -1530,18 +1530,18 @@ fn parse_runner_handoff_id(
 
 fn read_tools(
     list: capnp::struct_list::Reader<finch_ipc_capnp::tool_definition::Owned>,
-) -> Result<Vec<crate::tools::types::ToolDefinition>, capnp::Error> {
+) -> Result<Vec<crate::tools::ToolDefinition>, capnp::Error> {
     let mut out = Vec::with_capacity(list.len() as usize);
     for td in list.iter() {
-        let schema: crate::tools::types::ToolInputSchema =
+        let schema: crate::tools::ToolInputSchema =
             serde_json::from_str(td.get_input_schema_json()?.to_str()?).unwrap_or_else(|_| {
-                crate::tools::types::ToolInputSchema {
+                crate::tools::ToolInputSchema {
                     schema_type: "object".to_string(),
                     properties: serde_json::Value::Object(serde_json::Map::new()),
                     required: vec![],
                 }
             });
-        out.push(crate::tools::types::ToolDefinition {
+        out.push(crate::tools::ToolDefinition {
             name: td.get_name()?.to_str()?.to_string(),
             description: td.get_description()?.to_str()?.to_string(),
             input_schema: schema,
@@ -1557,7 +1557,7 @@ fn read_tools(
 fn write_query_response(
     mut builder: finch_ipc_capnp::query_response::Builder,
     text: &str,
-    tool_uses: &[crate::tools::types::ToolUse],
+    tool_uses: &[crate::tools::ToolUse],
     model: &str,
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,

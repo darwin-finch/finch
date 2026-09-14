@@ -164,7 +164,7 @@ impl EventHandler {
         &mut self,
         console: &mut MemTreeConsole,
         query_id: Uuid,
-        tool_use: &crate::tools::types::ToolUse,
+        tool_use: &crate::tools::ToolUse,
     ) -> Result<()> {
         // Get the response node for this query
         if let Some(&parent_id) = self.query_to_response.get(&query_id) {
@@ -246,7 +246,7 @@ impl EventHandler {
 }
 
 /// Format tool use for display
-fn format_tool_description(tool_use: &crate::tools::types::ToolUse) -> String {
+fn format_tool_description(tool_use: &crate::tools::ToolUse) -> String {
     match tool_use.name.as_str() {
         "Read" => {
             if let Some(file_path) = tool_use.input.get("file_path") {

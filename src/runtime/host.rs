@@ -17,7 +17,7 @@ pub(super) struct TypedHostHandler {
     side_effects: Vec<crate::vm::HostSideEffect>,
     scheduler: Option<agent_vm::AgentVmBinding>,
     memory: Option<Arc<crate::memory::MemorySystem>>,
-    mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
+    mcp_client: Option<Arc<crate::tools::McpClient>>,
     mcp_output_schemas: BTreeMap<String, serde_json::Value>,
     vocabulary: String,
     network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
@@ -56,7 +56,7 @@ impl TypedHostHandler {
         resource_roots: Arc<RwLock<ResourceRootState>>,
         scheduler: Option<agent_vm::AgentVmBinding>,
         memory: Option<Arc<crate::memory::MemorySystem>>,
-        mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
+        mcp_client: Option<Arc<crate::tools::McpClient>>,
         mcp_output_schemas: BTreeMap<String, serde_json::Value>,
         vocabulary: String,
         network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
@@ -2002,16 +2002,11 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                 let source = source.clone();
                 self.mark_host_use();
                 let decision = block_on_host(async move {
-                    crate::tools::implementations::propose::propose_artifact_with_decision(
-                        &language, &intent, &source,
-                    )
-                    .await
+                    crate::tools::propose_artifact_with_decision(&language, &intent, &source).await
                 })
                 .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 let value = match decision {
-                    crate::tools::implementations::propose::ProposalDecision::Execute {
-                        source,
-                    } => TypedValue::Option {
+                    crate::tools::ProposalDecision::Execute { source } => TypedValue::Option {
                         inner_type: Type::Result(Box::new(Type::String), Box::new(Type::String)),
                         value: Some(Box::new(TypedValue::Result {
                             ok_type: Type::String,
@@ -2020,29 +2015,19 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                             value: Box::new(TypedValue::String(source)),
                         })),
                     },
-                    crate::tools::implementations::propose::ProposalDecision::Chat { context } => {
-                        TypedValue::Option {
-                            inner_type: Type::Result(
-                                Box::new(Type::String),
-                                Box::new(Type::String),
-                            ),
-                            value: Some(Box::new(TypedValue::Result {
-                                ok_type: Type::String,
-                                error_type: Type::String,
-                                is_ok: false,
-                                value: Box::new(TypedValue::String(context)),
-                            })),
-                        }
-                    }
-                    crate::tools::implementations::propose::ProposalDecision::Cancel => {
-                        TypedValue::Option {
-                            inner_type: Type::Result(
-                                Box::new(Type::String),
-                                Box::new(Type::String),
-                            ),
-                            value: None,
-                        }
-                    }
+                    crate::tools::ProposalDecision::Chat { context } => TypedValue::Option {
+                        inner_type: Type::Result(Box::new(Type::String), Box::new(Type::String)),
+                        value: Some(Box::new(TypedValue::Result {
+                            ok_type: Type::String,
+                            error_type: Type::String,
+                            is_ok: false,
+                            value: Box::new(TypedValue::String(context)),
+                        })),
+                    },
+                    crate::tools::ProposalDecision::Cancel => TypedValue::Option {
+                        inner_type: Type::Result(Box::new(Type::String), Box::new(Type::String)),
+                        value: None,
+                    },
                 };
                 return Ok(vec![value]);
             }

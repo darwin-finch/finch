@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::claude::{ClaudeClient, ContentBlock, Message, MessageRequest};
 use crate::context::{collect_instructions, InstructionSources};
-use crate::tools::types::ToolDefinition;
+use crate::tools::ToolDefinition;
 
 use super::{
     Generator, GeneratorCapabilities, GeneratorResponse, ResponseMetadata, StreamChunk, ToolUse,

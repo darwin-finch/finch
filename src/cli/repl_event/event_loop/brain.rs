@@ -1,7 +1,7 @@
 use super::*;
 // Used only by the test runner below, which is `cfg(test)`.
 #[cfg(test)]
-use crate::tools::executor::ToolExecutor;
+use crate::tools::ToolExecutor;
 
 impl EventLoop {
     #[cfg(test)]
@@ -16,11 +16,9 @@ impl EventLoop {
         let status_bar = Arc::new(StatusBar::new());
         let tui_renderer =
             TuiRenderer::new_headless(Arc::clone(&output_manager), Arc::clone(&status_bar), colors);
-        let todo_list = Arc::new(tokio::sync::RwLock::new(
-            crate::tools::todo::TodoList::default(),
-        ));
+        let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
         let (_todo_writer, todo_target, todo_receiver) =
-            crate::tools::todo::todo_journal(Arc::clone(&todo_list));
+            crate::tools::todo_journal(Arc::clone(&todo_list));
         let provider_resolver = crate::scheduler::ProviderResolver::new(Arc::clone(&generator));
         let agent_scheduler = crate::scheduler::AgentScheduler::new(
             provider_resolver.clone(),
@@ -444,7 +442,7 @@ impl EventLoop {
         &mut self,
         brain: String,
         run_id: crate::brain::store::RunId,
-        restart: crate::tools::implementations::restart::DeferredFrontendRestart,
+        restart: crate::tools::DeferredFrontendRestart,
     ) -> Result<()> {
         anyhow::ensure!(
             self.runner_brain.as_deref() == Some(brain.as_str()) && self.home_runner_lease_active,
@@ -503,10 +501,7 @@ impl EventLoop {
                 )
                 .await);
         }
-        let args = crate::tools::implementations::restart::frontend_replacement_args(
-            std::env::args_os(),
-            &brain,
-        );
+        let args = crate::tools::frontend_replacement_args(std::env::args_os(), &brain);
         crate::set_tui_active(false);
         crate::cli::tui::emergency_restore_terminal();
 
@@ -871,7 +866,7 @@ impl EventLoop {
                     return;
                 }
                 let kind = match approval_kind.as_str() {
-                    "tool" => RemoteBrainApprovalKind::Tool(crate::tools::types::ToolUse {
+                    "tool" => RemoteBrainApprovalKind::Tool(crate::tools::ToolUse {
                         id: approval_id.clone(),
                         name: subject.clone(),
                         input: detail

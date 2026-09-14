@@ -368,7 +368,7 @@ pub struct ProgramRuntime {
     memory: RwLock<Option<Arc<crate::memory::MemorySystem>>>,
     /// Host-owned MCP transport. Installing it makes configured servers
     /// callable but never grants authority to any server or tool.
-    mcp_client: RwLock<Option<Arc<crate::tools::mcp::McpClient>>>,
+    mcp_client: RwLock<Option<Arc<crate::tools::McpClient>>>,
     host_vocabulary: RwLock<BTreeMap<String, HostVocabularyMetadata>>,
     network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
     /// Output handles are opaque, per-execution presentation resources.  They
@@ -809,7 +809,7 @@ impl ProgramRuntime {
     /// and the manifest generation, never capability grants.
     pub async fn bind_mcp_client(
         &self,
-        client: Arc<crate::tools::mcp::McpClient>,
+        client: Arc<crate::tools::McpClient>,
     ) -> Result<Vec<String>> {
         let mut rejected = Vec::new();
         let mut signatures = BTreeMap::new();

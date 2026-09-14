@@ -34,7 +34,7 @@ use crate::models::bootstrap::GeneratorState;
 use crate::models::NeuralEmbeddingEngine;
 use crate::review::store::DiffStore;
 use crate::router::Router;
-use crate::tools::types::ToolDefinition;
+use crate::tools::ToolDefinition;
 
 use super::events::{LlmRequest, ReplEvent, RunnerReconnectTarget};
 use super::llm_loop::LlmLoop;
@@ -52,7 +52,7 @@ type PendingApprovalsMap = Arc<
         std::collections::HashMap<
             Uuid,
             (
-                crate::tools::types::ToolUse,
+                crate::tools::ToolUse,
                 tokio::sync::oneshot::Sender<super::events::ConfirmationResult>,
             ),
         >,
@@ -393,8 +393,8 @@ pub struct EventLoop {
     context_recall_k: usize,
 
     /// Projection of the selected Brain task list shared with Todo tools.
-    todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
-    todo_journal_target: crate::tools::todo::TodoJournalTarget,
+    todo_list: Arc<tokio::sync::RwLock<crate::tools::TodoList>>,
+    todo_journal_target: crate::tools::TodoJournalTarget,
 
     /// Whether to summarise dropped messages (Infinite Context Phase 2).
     /// From config.features.enable_summarization.
@@ -692,7 +692,7 @@ struct PendingNamedBrainTurn {
     /// Daemon-issued authority retained for the whole provider/tool loop.
     /// Query metadata carries a clone to each submitted ProgramRun.
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
-    restart: Option<crate::tools::implementations::restart::DeferredFrontendRestart>,
+    restart: Option<crate::tools::DeferredFrontendRestart>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -702,7 +702,7 @@ enum NamedBrainToolResultDisposition {
 }
 
 impl PendingNamedBrainTurn {
-    fn observe_tool_calls(&mut self, tool_uses: Vec<crate::tools::types::ToolUse>) {
+    fn observe_tool_calls(&mut self, tool_uses: Vec<crate::tools::ToolUse>) {
         for tool_use in tool_uses {
             self.active_tool_ids.insert(tool_use.id.clone());
             self.turn_events.push(crate::server::RunnerTurnEvent::Call {
@@ -943,7 +943,7 @@ struct RemoteBrainApproval {
 
 #[derive(Clone)]
 enum RemoteBrainApprovalKind {
-    Tool(crate::tools::types::ToolUse),
+    Tool(crate::tools::ToolUse),
     Vm {
         prompt: crate::vm::ApprovalPrompt,
         choices: Vec<crate::vm::ApprovalChoice>,
@@ -1573,15 +1573,13 @@ fn deferred_proposal_from_tool_result(result: &anyhow::Result<String>) -> Option
     })
 }
 
-fn proposal_resume_values(
-    decision: crate::tools::implementations::propose::ProposalDecision,
-) -> Vec<crate::vm::TypedValue> {
+fn proposal_resume_values(decision: crate::tools::ProposalDecision) -> Vec<crate::vm::TypedValue> {
     let inner_type = crate::vm::Type::Result(
         Box::new(crate::vm::Type::String),
         Box::new(crate::vm::Type::String),
     );
     let value = match decision {
-        crate::tools::implementations::propose::ProposalDecision::Execute { source } => {
+        crate::tools::ProposalDecision::Execute { source } => {
             Some(Box::new(crate::vm::TypedValue::Result {
                 ok_type: crate::vm::Type::String,
                 error_type: crate::vm::Type::String,
@@ -1589,7 +1587,7 @@ fn proposal_resume_values(
                 value: Box::new(crate::vm::TypedValue::String(source)),
             }))
         }
-        crate::tools::implementations::propose::ProposalDecision::Chat { context } => {
+        crate::tools::ProposalDecision::Chat { context } => {
             Some(Box::new(crate::vm::TypedValue::Result {
                 ok_type: crate::vm::Type::String,
                 error_type: crate::vm::Type::String,
@@ -1597,7 +1595,7 @@ fn proposal_resume_values(
                 value: Box::new(crate::vm::TypedValue::String(context)),
             }))
         }
-        crate::tools::implementations::propose::ProposalDecision::Cancel => None,
+        crate::tools::ProposalDecision::Cancel => None,
     };
     vec![crate::vm::TypedValue::Option { inner_type, value }]
 }
@@ -1609,7 +1607,7 @@ fn proposal_resume_values(
 async fn resume_deferred_proposal(
     runtime: &crate::runtime::ProgramRuntime,
     proposal: &DeferredProposal,
-    decision: crate::tools::implementations::propose::ProposalDecision,
+    decision: crate::tools::ProposalDecision,
 ) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
     runtime
         .resume_typed_execution_with_effect_result(
@@ -3312,13 +3310,12 @@ impl EventLoop {
                         )
                     })
                     .unwrap_or_else(|| proposal.intent.clone());
-                let decision =
-                    crate::tools::implementations::propose::propose_artifact_with_decision(
-                        &proposal.language,
-                        &intent,
-                        &proposal.source,
-                    )
-                    .await?;
+                let decision = crate::tools::propose_artifact_with_decision(
+                    &proposal.language,
+                    &intent,
+                    &proposal.source,
+                )
+                .await?;
                 let outcome =
                     resume_deferred_proposal(runtime.as_ref(), &proposal, decision).await?;
                 Ok::<_, anyhow::Error>(serde_json::to_string(&outcome)?)
@@ -4154,7 +4151,7 @@ impl EventLoop {
     fn dialog_result_to_confirmation(
         &self,
         dialog_result: crate::cli::tui::DialogResult,
-        tool_use: &crate::tools::types::ToolUse,
+        tool_use: &crate::tools::ToolUse,
     ) -> super::events::ConfirmationResult {
         dialog_result_to_confirmation(dialog_result, tool_use)
     }
@@ -4422,7 +4419,7 @@ pub(crate) fn find_last_exchange(messages: &[crate::claude::Message]) -> (String
 ///
 /// Returns a single line such as `"Command: git push"` or `"File: src/main.rs"`.
 /// Exported `pub(crate)` so it can be unit-tested directly.
-pub(crate) fn tool_approval_summary(tool_use: &crate::tools::types::ToolUse) -> String {
+pub(crate) fn tool_approval_summary(tool_use: &crate::tools::ToolUse) -> String {
     let tool_name = &tool_use.name;
     match tool_name.as_str() {
         "bash" | "Bash" => {
@@ -4629,10 +4626,10 @@ fn unified_diff_summary(before: &str, after: &str, context: usize) -> String {
 /// Exported `pub(crate)` so it can be unit-tested directly.
 pub(crate) fn dialog_result_to_confirmation(
     dialog_result: crate::cli::tui::DialogResult,
-    tool_use: &crate::tools::types::ToolUse,
+    tool_use: &crate::tools::ToolUse,
 ) -> super::events::ConfirmationResult {
     use super::events::ConfirmationResult;
-    use crate::tools::patterns::ToolPattern;
+    use crate::tools::ToolPattern;
 
     match dialog_result {
         crate::cli::tui::DialogResult::Selected(index) => match index {
@@ -4695,14 +4692,14 @@ fn confirmation_audit_value(confirmation: &super::events::ConfirmationResult) ->
 
 fn confirmation_from_audit_value(
     decision: &serde_json::Value,
-    tool_use: &crate::tools::types::ToolUse,
+    tool_use: &crate::tools::ToolUse,
 ) -> anyhow::Result<super::events::ConfirmationResult> {
     use super::events::ConfirmationResult;
 
     match decision.get("choice").and_then(serde_json::Value::as_str) {
         Some("approve_once") => Ok(ConfirmationResult::ApproveOnce),
         Some("approve_pattern_session") => Ok(ConfirmationResult::ApprovePatternSession(
-            crate::tools::patterns::ToolPattern::new(
+            crate::tools::ToolPattern::new(
                 "*".to_string(),
                 tool_use.name.clone(),
                 format!("Allow all {} calls (session)", tool_use.name),
@@ -4843,13 +4840,13 @@ fn open_in_editor(content: &str) -> anyhow::Result<String> {
     struct TerminalRestorer;
     impl Drop for TerminalRestorer {
         fn drop(&mut self) {
-            crate::tools::implementations::propose::resume_terminal_after_editor();
+            crate::tools::resume_terminal_after_editor();
         }
     }
     let _restore = TerminalRestorer;
-    crate::tools::implementations::propose::suspend_terminal_for_editor();
+    crate::tools::suspend_terminal_for_editor();
 
-    let status = crate::tools::implementations::propose::run_editor(&tmp_path)?;
+    let status = crate::tools::run_editor(&tmp_path)?;
 
     if !status.success() {
         anyhow::bail!("Editor exited with status {}", status);

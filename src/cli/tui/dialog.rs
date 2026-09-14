@@ -1788,7 +1788,7 @@ mod tests {
     fn test_file_approval_uses_shared_sanitized_diff_renderer() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "old\n").unwrap();
-        let tool = crate::tools::types::ToolUse::new(
+        let tool = crate::tools::ToolUse::new(
             "edit".into(),
             serde_json::json!({
                 "file_path": file.path(),
@@ -1814,7 +1814,7 @@ mod tests {
     fn test_file_approval_preview_composes_with_light_and_dark_themes() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "old\n").unwrap();
-        let tool = crate::tools::types::ToolUse::new(
+        let tool = crate::tools::ToolUse::new(
             "edit".into(),
             serde_json::json!({
                 "file_path": file.path(),

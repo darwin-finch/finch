@@ -790,7 +790,7 @@ mod script_tests {
 
     #[tokio::test]
     async fn query_tools_and_terminal_wire_share_one_typed_runtime() {
-        use finch::tools::types::ToolContext;
+        use finch::tools::ToolContext;
         use finch::tools::ToolRegistry;
 
         let runtime = Arc::new(finch::runtime::ProgramRuntime::new());
@@ -1986,10 +1986,10 @@ async fn build_query_tool_executor(
     config: &Config,
 ) -> Result<(
     Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
-    Vec<finch::tools::types::ToolDefinition>,
+    Vec<finch::tools::ToolDefinition>,
     Arc<finch::runtime::ProgramRuntime>,
 )> {
-    use finch::tools::implementations::{
+    use finch::tools::{
         BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
     };
     use finch::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
@@ -2030,7 +2030,7 @@ fn register_query_vm_tools(
     registry: &mut finch::tools::ToolRegistry,
     program_runtime: Arc<finch::runtime::ProgramRuntime>,
 ) {
-    use finch::tools::implementations::{
+    use finch::tools::{
         GetLanguageDefinitionTool, GetVmStateTool, InspectWordTool, SearchWordTool,
         SubmitProgramTool,
     };
@@ -2343,7 +2343,7 @@ async fn run_query_teacher_only(
     query: &str,
     config: &Config,
     executor: Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
-    tool_definitions: Vec<finch::tools::types::ToolDefinition>,
+    tool_definitions: Vec<finch::tools::ToolDefinition>,
     program_runtime: Arc<finch::runtime::ProgramRuntime>,
     show_program: bool,
 ) -> Result<()> {
@@ -2484,7 +2484,7 @@ async fn run_query_teacher_only(
         let tool_uses = response.tool_uses();
         let mut result_blocks = Vec::new();
         for tu in &tool_uses {
-            let tool_use = finch::tools::types::ToolUse {
+            let tool_use = finch::tools::ToolUse {
                 id: tu.id.clone(),
                 name: tu.name.clone(),
                 input: tu.input.clone(),

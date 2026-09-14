@@ -2,7 +2,7 @@
 //
 // Tests the full MCP workflow: configuration, connection, tool discovery, and execution
 
-use finch::tools::mcp::{McpClient, McpServerConfig, TransportType};
+use finch::tools::{McpClient, McpServerConfig, TransportType};
 use std::collections::HashMap;
 
 #[tokio::test]

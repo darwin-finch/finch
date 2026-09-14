@@ -23,7 +23,7 @@ use crate::ipc::schema::finch_ipc_capnp::{
     stream_receiver,
 };
 use crate::ipc::transport::sock_path;
-use crate::tools::types::{ToolDefinition, ToolUse};
+use crate::tools::{ToolDefinition, ToolUse};
 
 pub struct BrainRunnerBootstrap {
     pub runtime_revision: u64,

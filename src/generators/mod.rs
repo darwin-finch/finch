@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::claude::{ContentBlock, Message};
-use crate::tools::types::ToolDefinition;
+use crate::tools::ToolDefinition;
 
 pub(crate) const MAX_RESPONSE_MODEL_BYTES: usize = 256;
 

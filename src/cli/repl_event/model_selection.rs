@@ -223,7 +223,7 @@ mod tests {
     use crate::generators::{
         GeneratorCapabilities, GeneratorResponse, ResponseMetadata, StreamChunk,
     };
-    use crate::tools::types::ToolDefinition;
+    use crate::tools::ToolDefinition;
 
     struct MockGenerator {
         name: &'static str,

@@ -10,9 +10,9 @@
 use crate::cli::messages::WorkUnit;
 use crate::cli::output_manager::VmOutputProjection;
 use crate::runtime::VmEffectEnvelope;
-use crate::tools::executor::ToolSignature;
-use crate::tools::patterns::ToolPattern;
-use crate::tools::types::ToolUse;
+use crate::tools::ToolPattern;
+use crate::tools::ToolSignature;
+use crate::tools::ToolUse;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -247,7 +247,7 @@ pub enum ReplEvent {
     FrontendRestartReady {
         brain: String,
         run_id: crate::brain::store::RunId,
-        restart: crate::tools::implementations::restart::DeferredFrontendRestart,
+        restart: crate::tools::DeferredFrontendRestart,
     },
 }
 
@@ -415,7 +415,7 @@ mod tests {
         // ToolApprovalNeeded requires a oneshot channel — exercise construction
         let (tx, _rx) = tokio::sync::oneshot::channel::<ConfirmationResult>();
         let id = Uuid::new_v4();
-        let tool_use = crate::tools::types::ToolUse {
+        let tool_use = crate::tools::ToolUse {
             id: "tool_1".to_string(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "/tmp/test"}),

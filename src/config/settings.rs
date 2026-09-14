@@ -176,7 +176,7 @@ pub struct Config {
     pub features: FeaturesConfig,
 
     /// MCP (Model Context Protocol) server configurations
-    pub mcp_servers: HashMap<String, crate::tools::mcp::McpServerConfig>,
+    pub mcp_servers: HashMap<String, crate::tools::McpServerConfig>,
 
     /// Memory system configuration (Phase 4: Hierarchical Memory)
     pub memory: crate::memory::MemoryConfig,

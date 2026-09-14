@@ -17,7 +17,7 @@ use crate::cli::tui::TuiRenderer;
 use crate::generators::{Generator, StreamChunk};
 use crate::models::bootstrap::GeneratorState;
 use crate::router::Router;
-use crate::tools::types::{ToolDefinition, ToolUse};
+use crate::tools::{ToolDefinition, ToolUse};
 
 /// Preserve a provider response as submitted wire source.
 ///
@@ -820,7 +820,7 @@ async fn persist_completed_turn_memory(
 /// * Memory status bar refresh after all tools are queued
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn dispatch_tool_uses(
-    tool_uses: Vec<crate::tools::types::ToolUse>,
+    tool_uses: Vec<crate::tools::ToolUse>,
     query_id: Uuid,
     round_token: crate::cli::conversation::ToolRoundToken,
     work_unit: &Arc<crate::cli::messages::WorkUnit>,
@@ -2027,9 +2027,9 @@ mod tests {
     use super::*;
     use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind, WorkUnit};
     use crate::generators::GeneratorCapabilities;
-    use crate::tools::executor::ToolExecutor;
-    use crate::tools::permissions::PermissionManager;
-    use crate::tools::registry::ToolRegistry;
+    use crate::tools::PermissionManager;
+    use crate::tools::ToolExecutor;
+    use crate::tools::ToolRegistry;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -22,7 +22,7 @@ use crate::cli::output_manager::OutputManager;
 use crate::cli::repl::ReplMode;
 use crate::cli::repl_event::events::ReplEvent;
 use crate::cli::tui::TuiRenderer;
-use crate::tools::types::ToolUse;
+use crate::tools::ToolUse;
 
 // ── Tool-mode gate ────────────────────────────────────────────────────────────
 

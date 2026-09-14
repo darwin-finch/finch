@@ -9,9 +9,9 @@ use crate::claude::{ContentBlock, Message};
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
 use crate::models::{ToolCallParser, ToolPromptFormatter};
-use crate::tools::executor::ToolExecutor;
-use crate::tools::types::ToolUse as ToolsToolUse;
-use crate::tools::types::{ToolDefinition, ToolResult}; // Import with alias to avoid confusion
+use crate::tools::ToolExecutor;
+use crate::tools::ToolUse as ToolsToolUse;
+use crate::tools::{ToolDefinition, ToolResult}; // Import with alias to avoid confusion
 
 use super::{
     Generator,

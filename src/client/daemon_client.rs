@@ -13,8 +13,8 @@ use crate::daemon::ensure_daemon_running;
 use crate::server::openai_types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionDefinition, Tool,
 };
-use crate::tools::executor::ToolExecutor;
-use crate::tools::types::{ToolDefinition, ToolUse};
+use crate::tools::ToolExecutor;
+use crate::tools::{ToolDefinition, ToolUse};
 
 /// Configuration for daemon connection
 #[derive(Debug, Clone)]

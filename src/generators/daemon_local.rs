@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::claude::{ContentBlock, Message};
 use crate::client::DaemonClient;
-use crate::tools::types::ToolDefinition;
+use crate::tools::ToolDefinition;
 
 use super::{
     Generator, GeneratorCapabilities, GeneratorResponse, ResponseMetadata, StreamChunk, ToolUse,

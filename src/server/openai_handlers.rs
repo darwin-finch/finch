@@ -22,8 +22,8 @@ use super::openai_types::*;
 use super::AgentServer;
 use crate::claude::{ContentBlock, Message};
 use crate::router::RouteDecision;
-use crate::tools::types::ToolDefinition as InternalToolDefinition;
-use crate::tools::types::ToolInputSchema;
+use crate::tools::ToolDefinition as InternalToolDefinition;
+use crate::tools::ToolInputSchema;
 
 /// Error response for OpenAI API
 #[derive(Debug, serde::Serialize)]

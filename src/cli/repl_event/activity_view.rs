@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::cli::tui::activity::{ActivityRow, ActivityRows, ActivityState, ActivityUpdate};
 use crate::scheduler::{AgentActivitySnapshot, AgentEvent, AgentTaskSnapshot, AgentTaskStatus};
-use crate::tools::todo::{TodoList, TodoPriority, TodoStatus};
+use crate::tools::{TodoList, TodoPriority, TodoStatus};
 
 fn activity_usage(
     usage: &crate::scheduler::AgentUsage,
@@ -130,7 +130,7 @@ mod tests {
     fn test_a_high_priority_todo_is_urgent_and_an_in_progress_one_is_active() {
         // The renderer decides how urgency looks; this decides what counts as urgent.
         let mut list = TodoList::default();
-        list.replace_all(vec![crate::tools::todo::TodoItem {
+        list.replace_all(vec![crate::tools::TodoItem {
             id: "1".into(),
             content: "write the thing".into(),
             status: TodoStatus::InProgress,

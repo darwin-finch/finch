@@ -5,7 +5,7 @@ impl crate::generators::Generator for NeverCompletes {
     async fn generate(
         &self,
         _messages: Vec<crate::claude::Message>,
-        _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<crate::generators::GeneratorResponse> {
         std::future::pending().await
     }
@@ -13,7 +13,7 @@ impl crate::generators::Generator for NeverCompletes {
     async fn generate_stream(
         &self,
         _messages: Vec<crate::claude::Message>,
-        _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<
         Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
     > {
@@ -154,9 +154,9 @@ async fn boundary_01_dispatch_scenario() {
 
     let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
     let tempdir = tempfile::tempdir().expect("TEST-BOUNDARY-01: create isolated tool state");
-    let executor = crate::tools::executor::ToolExecutor::new(
-        crate::tools::registry::ToolRegistry::new(),
-        crate::tools::permissions::PermissionManager::new(),
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
         tempdir.path().join("patterns.json"),
     )
     .expect("TEST-BOUNDARY-01: construct inert tool executor");
@@ -734,7 +734,7 @@ fn approval_audit_value_preserves_the_decision_scope() {
 
 #[test]
 fn remote_tool_approval_round_trips_edited_input() {
-    let tool_use = crate::tools::types::ToolUse {
+    let tool_use = crate::tools::ToolUse {
         id: "tool-1".into(),
         name: "edit".into(),
         input: serde_json::json!({"path": "src/main.rs", "new_string": "old"}),
@@ -2942,8 +2942,8 @@ fn test_sliding_window_strips_orphaned_tool_use() {
 
 // ── tool_approval_summary ────────────────────────────────────────────────
 
-fn make_tool_use(name: &str, input: serde_json::Value) -> crate::tools::types::ToolUse {
-    crate::tools::types::ToolUse {
+fn make_tool_use(name: &str, input: serde_json::Value) -> crate::tools::ToolUse {
+    crate::tools::ToolUse {
         id: "test_id".to_string(),
         name: name.to_string(),
         input,

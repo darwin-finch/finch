@@ -278,7 +278,7 @@ impl EventLoop {
     pub(super) async fn handle_tool_approval_request(
         &mut self,
         query_id: Uuid,
-        tool_use: crate::tools::types::ToolUse,
+        tool_use: crate::tools::ToolUse,
         response_tx: tokio::sync::oneshot::Sender<
             crate::cli::repl_event::events::ConfirmationResult,
         >,

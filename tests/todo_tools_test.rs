@@ -4,10 +4,10 @@
 // Arc<RwLock<TodoList>> and the list's active_items ordering is correct
 // for TUI display.
 
-use finch::tools::implementations::{TodoReadTool, TodoWriteTool};
-use finch::tools::registry::Tool;
-use finch::tools::todo::{TodoItem, TodoList, TodoPriority, TodoStatus};
-use finch::tools::types::ToolContext;
+use finch::tools::Tool;
+use finch::tools::ToolContext;
+use finch::tools::{TodoItem, TodoList, TodoPriority, TodoStatus};
+use finch::tools::{TodoReadTool, TodoWriteTool};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
