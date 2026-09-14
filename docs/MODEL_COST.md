@@ -46,6 +46,8 @@ that from the stable `type` tag, not from the user's display name:
 - first enabled cloud entry → `default` work lane if unset
 
 The user can override. `/provider` already switches by **name**; keep that.
+Today `/model` is documented as the same selector as `/provider` — that alias is the
+footgun and must split.
 A Brain is bound to that **whole named entry** (backend + credentials). It
 must not mutate the shared `[[providers]]` row when you only wanted a
 different model or thinking level on *this* Brain.
