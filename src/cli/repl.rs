@@ -2285,6 +2285,8 @@ impl Repl {
             provider_resolver.clone(),
             Arc::clone(&self.program_runtime),
         );
+        self.program_runtime
+            .attach_agent_scheduler(&agent_scheduler);
         drop(scheduler_phase);
 
         let mut tool_definitions_phase =

@@ -7498,6 +7498,33 @@ mod agent_capability {
     }
 
     #[tokio::test]
+    async fn test_attaching_a_second_spawner_replaces_the_first() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let first = RecordingSpawner::new();
+        let second = RecordingSpawner::new();
+        runtime.attach_agent_scheduler(&first);
+        runtime.attach_agent_scheduler(&second);
+
+        runtime
+            .agent_binding_for_test(None)
+            .expect("the replacement spawner must remain attached")
+            .spawn("replacement work".into())
+            .await
+            .expect("the replacement spawner accepts every task");
+
+        assert!(
+            first.spawned.lock().unwrap().is_empty(),
+            "a replaced spawner must receive no later tasks; first={:?}",
+            first.spawned.lock().unwrap()
+        );
+        assert_eq!(
+            second.spawned.lock().unwrap().as_slice(),
+            ["replacement work"],
+            "the most recently attached spawner must receive the task"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelling_authorizes_before_it_cancels() {
         // Order matters: a task the caller does not own must be refused before anything changes.
         let runtime = Arc::new(ProgramRuntime::new());
