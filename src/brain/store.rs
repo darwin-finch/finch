@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
@@ -729,6 +729,45 @@ pub struct BrainSnapshot {
     /// Canonical projection of the schema-v15 effect-audit transitions.
     #[serde(default)]
     pub effect_audits: Vec<crate::runtime::effect_log::EffectAuditEntry>,
+}
+
+/// One currently connected participant, as projected from the event log
+/// without hydrating the Brain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainListAttachment {
+    pub subject: String,
+    pub role: AttachmentRole,
+}
+
+/// One live subagent run, as projected from the event log without hydrating.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainListAgent {
+    pub run_id: RunId,
+    pub status: BrainRunStatus,
+    pub initiated_by: String,
+}
+
+/// Directory-and-journal facts about one named Brain, gathered without
+/// replaying the reducer, opening effect-audit databases, or creating files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainListSummary {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brain_id: Option<BrainId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_ms: Option<u64>,
+    pub bytes: u64,
+    pub events: u64,
+    pub revision: u64,
+    pub turns: u64,
+    pub attached: Vec<BrainListAttachment>,
+    pub agents: Vec<BrainListAgent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
 }
 
 impl BrainSnapshot {
@@ -1560,6 +1599,11 @@ impl BrainStore {
         &self.environment
     }
 
+    /// On-disk directory that holds named Brain folders, if this store persists.
+    pub fn root(&self) -> Option<&std::path::Path> {
+        self.root.as_deref()
+    }
+
     #[cfg(test)]
     pub(crate) fn with_test_environment_generation(
         machine: impl Into<String>,
@@ -1818,6 +1862,90 @@ impl BrainStore {
     /// status probes want; they were calling `list()?.len()`.
     pub fn count_unhydrated(&self) -> usize {
         self.list_names_unhydrated().len()
+    }
+
+    /// Per-Brain listing facts without hydrating any of them.
+    ///
+    /// Membership and order match [`BrainStore::list_names_unhydrated`]. Each
+    /// summary is read from `metadata.json` and `events.jsonl` when those
+    /// files already exist; missing or unreadable files yield empty counters
+    /// rather than an error, and the journal is never truncated. This does
+    /// not create `metadata.json`, `initialization.json`, or effect-audit
+    /// databases, and it does not fold events through the reducer.
+    pub fn list_summaries_unhydrated(&self) -> Vec<BrainListSummary> {
+        self.list_names_unhydrated()
+            .into_iter()
+            .map(|name| self.summarize_unhydrated(&name))
+            .collect()
+    }
+
+    fn summarize_unhydrated(&self, name: &str) -> BrainListSummary {
+        let path = self.root.as_ref().map(|root| root.join(name));
+        let mut summary = BrainListSummary {
+            name: name.to_string(),
+            path: path.clone(),
+            brain_id: None,
+            created_ms: None,
+            updated_ms: None,
+            bytes: 0,
+            events: 0,
+            revision: 0,
+            turns: 0,
+            attached: Vec::new(),
+            agents: Vec::new(),
+            runner: None,
+        };
+        let Some(directory) = path else {
+            return summary;
+        };
+        summary.bytes = directory_bytes(&directory);
+        if let Ok(bytes) = std::fs::read(directory.join("metadata.json")) {
+            if let Ok(metadata) = serde_json::from_slice::<BrainMetadata>(&bytes) {
+                if metadata.version == BRAIN_METADATA_VERSION && metadata.brain_id != BrainId::nil()
+                {
+                    summary.brain_id = Some(metadata.brain_id);
+                    summary.created_ms = Some(metadata.created_ms);
+                }
+            }
+        }
+        let projection = scan_journal_readonly(&directory.join("events.jsonl"));
+        summary.events = projection.events;
+        summary.revision = projection.revision;
+        summary.turns = projection.turns;
+        summary.updated_ms = projection.updated_ms;
+        let now = unix_millis();
+        summary.runner = projection
+            .runner
+            .filter(|lease| lease.expires_ms > now)
+            .map(|lease| lease.subject);
+        let mut attached: Vec<BrainListAttachment> = projection
+            .attachments
+            .into_values()
+            .filter(|attachment| attachment.connected)
+            .map(|attachment| BrainListAttachment {
+                subject: attachment.subject,
+                role: attachment.role,
+            })
+            .collect();
+        attached.sort_by(|left, right| {
+            left.subject
+                .cmp(&right.subject)
+                .then_with(|| format!("{:?}", left.role).cmp(&format!("{:?}", right.role)))
+        });
+        summary.attached = attached;
+        let mut agents: Vec<BrainListAgent> = projection
+            .runs
+            .into_values()
+            .filter(|run| run.kind == BrainRunKind::Subagent && !run.status.is_terminal())
+            .map(|run| BrainListAgent {
+                run_id: run.run_id,
+                status: run.status,
+                initiated_by: run.initiated_by,
+            })
+            .collect();
+        agents.sort_by_key(|agent| agent.run_id.0);
+        summary.agents = agents;
+        summary
     }
 
     /// How many Brains are actually resident in memory, i.e. hydrated.
@@ -6796,6 +6924,148 @@ fn validate_participant_subject<'a>(label: &str, subject: &'a str) -> Result<&'a
         anyhow::bail!("{label} must be 1-128 printable characters");
     }
     Ok(subject)
+}
+
+#[derive(Default)]
+struct JournalProjection {
+    events: u64,
+    revision: u64,
+    turns: u64,
+    updated_ms: Option<u64>,
+    attachments: HashMap<AttachmentId, BrainAttachment>,
+    runs: HashMap<RunId, BrainRun>,
+    runner: Option<BrainRunnerLease>,
+}
+
+fn directory_bytes(root: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if let Ok(metadata) = entry.metadata() {
+                total += metadata.len();
+            }
+        }
+    }
+    total
+}
+
+/// Best-effort read of a Brain journal. Unreadable or torn lines are skipped;
+/// the file is never truncated.
+fn scan_journal_readonly(path: &Path) -> JournalProjection {
+    let mut projection = JournalProjection::default();
+    let Ok(bytes) = std::fs::read(path) else {
+        return projection;
+    };
+    for terminated in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if terminated.last() != Some(&b'\n') {
+            break;
+        }
+        let line = &terminated[..terminated.len() - 1];
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let parsed = match serde_json::from_slice::<BrainJournalRecord>(line) {
+            Ok(BrainJournalRecord::EventBatch { events: batch, .. }) => batch,
+            Err(_) => match serde_json::from_slice::<BrainEvent>(line) {
+                Ok(event) => vec![event],
+                Err(_) => continue,
+            },
+        };
+        for event in parsed {
+            apply_scan_event(&mut projection, event);
+        }
+    }
+    projection
+}
+
+fn apply_scan_event(projection: &mut JournalProjection, event: BrainEvent) {
+    projection.events += 1;
+    projection.revision = projection.revision.max(event.seq);
+    projection.updated_ms = Some(projection.updated_ms.unwrap_or(0).max(event.created_ms));
+    match event.kind {
+        BrainEventKind::Prompt { .. } => {
+            projection.turns += 1;
+        }
+        BrainEventKind::ClientAttached {
+            attachment_id,
+            connection_id,
+            subject,
+            role,
+        } => {
+            let acknowledged_seq = projection
+                .attachments
+                .get(&attachment_id)
+                .map(|attachment| attachment.acknowledged_seq)
+                .unwrap_or(0);
+            projection.attachments.insert(
+                attachment_id,
+                BrainAttachment {
+                    attachment_id,
+                    subject,
+                    role,
+                    acknowledged_seq,
+                    connected: true,
+                    connection_id: Some(connection_id),
+                },
+            );
+        }
+        BrainEventKind::ClientDetached {
+            attachment_id,
+            connection_id,
+        } => {
+            if let Some(attachment) = projection.attachments.get_mut(&attachment_id) {
+                if attachment.connection_id == Some(connection_id) {
+                    attachment.connected = false;
+                    attachment.connection_id = None;
+                }
+            }
+        }
+        BrainEventKind::RunStarted { run } => {
+            projection.runs.insert(run.run_id, run);
+        }
+        BrainEventKind::RunStatusChanged {
+            run_id,
+            status,
+            detail,
+        } => {
+            if let Some(run) = projection.runs.get_mut(&run_id) {
+                run.status = status;
+                run.updated_ms = event.created_ms;
+                run.detail = detail;
+            }
+        }
+        BrainEventKind::ScheduleDue { due } => {
+            projection.runs.insert(due.run.run_id, due.run);
+        }
+        BrainEventKind::RunnerLeaseAcquired { lease } => {
+            projection.runner = Some(lease);
+        }
+        BrainEventKind::RunnerLeaseReleased { lease_id } => {
+            if projection
+                .runner
+                .as_ref()
+                .is_some_and(|lease| lease.lease_id == lease_id)
+            {
+                projection.runner = None;
+            }
+        }
+        BrainEventKind::RunnerHandoffCompleted { lease, .. } => {
+            projection.runner = Some(lease);
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn unix_millis() -> u64 {

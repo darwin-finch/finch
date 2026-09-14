@@ -146,6 +146,131 @@ fn test_counting_brains_creates_no_files() {
     );
 }
 
+#[test]
+fn test_list_summaries_unhydrated_does_not_hydrate_or_create_files() {
+    const BRAINS: usize = 8;
+    let temp = seed_brain_root(BRAINS);
+    let before = walk_paths(temp.path());
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let summaries = store.list_summaries_unhydrated();
+    let after = walk_paths(temp.path());
+
+    assert_eq!(
+        summaries.len(),
+        BRAINS,
+        "summaries must cover the same inventory as list_names_unhydrated"
+    );
+    assert!(
+        hydrated_names(&store).is_empty(),
+        "summaries must not hydrate; resident: {:?}",
+        hydrated_names(&store)
+    );
+    assert_eq!(
+        before,
+        after,
+        "summaries must not create, remove or rename anything under the Brain root; \
+         appeared: {:?}, disappeared: {:?}",
+        after.difference(&before).collect::<Vec<_>>(),
+        before.difference(&after).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_list_summaries_unhydrated_reports_turns_attachments_agents_and_size() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let writer = BrainStore::with_root("box.local", Some(root.clone()));
+    writer
+        .push(
+            "busy",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "hello".into(),
+            },
+        )
+        .unwrap();
+    writer
+        .push(
+            "busy",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "again".into(),
+            },
+        )
+        .unwrap();
+    let prompt_seq = writer.snapshot("busy").unwrap().revision;
+    let attachment = writer
+        .attach("busy", "alice@box.local", AttachmentRole::Driver, None)
+        .unwrap();
+    writer
+        .activate_connection(
+            "busy",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        )
+        .unwrap();
+    let run = writer
+        .start_run(
+            "busy",
+            "alice@box.local",
+            BrainRunKind::Subagent,
+            prompt_seq,
+            attachment.attachment_id,
+            BrainRunStatus::Running,
+        )
+        .unwrap();
+    drop(writer);
+
+    let before = walk_paths(&root);
+    let reader = BrainStore::with_root("box.local", Some(root.clone()));
+    let summaries = reader.list_summaries_unhydrated();
+    let after = walk_paths(&root);
+
+    assert_eq!(
+        summaries.len(),
+        1,
+        "exactly the written Brain must appear: {summaries:?}"
+    );
+    let summary = &summaries[0];
+    assert_eq!(summary.name, "busy");
+    assert_eq!(
+        summary.turns, 2,
+        "each Prompt event is one turn; summary={summary:?}"
+    );
+    assert!(
+        summary.bytes > 0,
+        "event log and metadata must contribute to size; summary={summary:?}"
+    );
+    assert_eq!(
+        summary.attached,
+        vec![BrainListAttachment {
+            subject: "alice@box.local".into(),
+            role: AttachmentRole::Driver,
+        }],
+        "activated driver must be listed as attached; summary={summary:?}"
+    );
+    assert_eq!(
+        summary.agents.len(),
+        1,
+        "running Subagent must appear as a live agent; summary={summary:?}"
+    );
+    assert_eq!(summary.agents[0].run_id, run.run_id);
+    assert_eq!(summary.agents[0].status, BrainRunStatus::Running);
+    assert_eq!(summary.agents[0].initiated_by, "alice@box.local");
+    assert!(
+        hydrated_names(&reader).is_empty(),
+        "a fresh store must remain unhydrated after summaries; resident: {:?}",
+        hydrated_names(&reader)
+    );
+    assert_eq!(
+        before,
+        after,
+        "summaries must not mutate the written Brain tree; appeared: {:?}, disappeared: {:?}",
+        after.difference(&before).collect::<Vec<_>>(),
+        before.difference(&after).collect::<Vec<_>>()
+    );
+}
+
 fn walk_paths(root: &std::path::Path) -> std::collections::BTreeSet<PathBuf> {
     let mut found = std::collections::BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
