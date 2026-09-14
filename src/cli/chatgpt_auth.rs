@@ -14,8 +14,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{CredentialProvider, ProviderCredential};
-use crate::oauth::file_store::FileOAuthCredentialStore;
-use crate::oauth::{OAuthClient, OAuthCredentialStore, OAuthDialect, OAuthTokenRecord};
+use crate::oauth::{
+    FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthDialect, OAuthTokenRecord,
+};
 use crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect;
 use chrono::Utc;
 

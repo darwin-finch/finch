@@ -29,8 +29,7 @@ use crate::claude::{ContentBlock, Message};
 use crate::config::{
     AudienceBinding, CredentialProvider, EndpointFamily, ProviderCredential, ReasoningEffort,
 };
-use crate::oauth::file_store::FileOAuthCredentialStore;
-use crate::oauth::{OAuthClient, OAuthCredentialStore, OAuthTokenRecord};
+use crate::oauth::{FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthTokenRecord};
 use crate::tools::types::ToolDefinition;
 
 pub const CHATGPT_INFERENCE_PROTOCOL_REVISION: &str =
