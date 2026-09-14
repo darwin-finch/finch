@@ -15,8 +15,9 @@ child modules are private, so the `pub use` list in `src/tools/mcp/mod.rs` is th
 surface, and `scripts/check_subsystems.py` rejects a `pub mod` there.
 
 **Dependencies:** none downward, and one unwanted edge back up to its parent — `client.rs` uses the tool
-vocabulary `ToolDefinition` and `ToolInputSchema` — which clears when `tools` splits its API from
-its implementations (that is the tools facade work). Add no other import.
+vocabulary `ToolDefinition` and `ToolInputSchema`. That edge clears when tools splits a
+dependency-free API from its implementations; the parent facade does not remove it. Add no other
+import.
 
 **Transports are not equal.** STDIO launches a local process and is supported. Streamable HTTP is
 not implemented, and a legacy SSE configuration is rejected explicitly rather than silently

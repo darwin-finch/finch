@@ -13,7 +13,7 @@ use crate::claude::Message;
 use crate::generators::GeneratorResponse;
 use crate::models::adapters::LocalModelAdapter;
 use crate::models::GeneratorModel;
-use crate::tools::types::ToolDefinition;
+use crate::tools::ToolDefinition;
 use crate::training::batch_trainer::BatchTrainer;
 use anyhow::Result;
 use std::sync::Arc;

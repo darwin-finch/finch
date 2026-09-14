@@ -3770,21 +3770,17 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
 "#;
     let config = std::collections::HashMap::from([(
         "fixture".to_string(),
-        crate::tools::mcp::McpServerConfig {
+        crate::tools::McpServerConfig {
             command: Some("sh".to_string()),
             args: vec!["-c".to_string(), script.to_string()],
-            transport: crate::tools::mcp::TransportType::Stdio,
+            transport: crate::tools::TransportType::Stdio,
             url: None,
             env: std::collections::HashMap::new(),
             enabled: true,
             timeout_secs: 5,
         },
     )]);
-    let client = Arc::new(
-        crate::tools::mcp::McpClient::from_config(&config)
-            .await
-            .unwrap(),
-    );
+    let client = Arc::new(crate::tools::McpClient::from_config(&config).await.unwrap());
     let runtime = ProgramRuntime::new();
     assert!(!runtime.has_mcp_client());
     assert!(runtime.bind_mcp_client(client).await.unwrap().is_empty());

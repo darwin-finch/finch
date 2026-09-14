@@ -156,8 +156,8 @@ pub struct AgentServer {
     /// Application-owned MCP configuration and lazily connected transport for
     /// daemon-executed named-Brain programs. The transport is shared, while
     /// each Brain runtime installs its own verified vocabulary metadata.
-    mcp_servers: std::collections::HashMap<String, crate::tools::mcp::McpServerConfig>,
-    mcp_client: tokio::sync::OnceCell<Arc<crate::tools::mcp::McpClient>>,
+    mcp_servers: std::collections::HashMap<String, crate::tools::McpServerConfig>,
+    mcp_client: tokio::sync::OnceCell<Arc<crate::tools::McpClient>>,
     /// Runtime-rotatable password for remote named-brain access.
     brain_password: Arc<RwLock<String>>,
     /// Pins the descriptor-relative state root used only by authenticated
@@ -865,14 +865,14 @@ impl AgentServer {
     /// Return the daemon-owned MCP transport, connecting it on first use.
     /// Named Brain runtimes borrow this host service but retain independent
     /// typed dictionaries, manifests, grants, and effect journals.
-    pub async fn mcp_client(&self) -> Result<Option<Arc<crate::tools::mcp::McpClient>>> {
+    pub async fn mcp_client(&self) -> Result<Option<Arc<crate::tools::McpClient>>> {
         if self.mcp_servers.is_empty() {
             return Ok(None);
         }
         let client = self
             .mcp_client
             .get_or_try_init(|| async {
-                crate::tools::mcp::McpClient::from_config(&self.mcp_servers)
+                crate::tools::McpClient::from_config(&self.mcp_servers)
                     .await
                     .map(Arc::new)
             })

@@ -3,7 +3,7 @@
 // Formats tool definitions into model-readable system prompts
 // and tool results into continuation messages.
 
-use crate::tools::types::{ToolDefinition, ToolResult};
+use crate::tools::{ToolDefinition, ToolResult};
 use serde_json::Value;
 
 /// Formats tool definitions and results for local model prompts
@@ -134,7 +134,7 @@ impl ToolPromptFormatter {
     }
 
     /// Generate example parameters for a tool
-    fn generate_example_params(schema: &crate::tools::types::ToolInputSchema) -> String {
+    fn generate_example_params(schema: &crate::tools::ToolInputSchema) -> String {
         let mut params = serde_json::Map::new();
 
         if let Some(properties) = schema.properties.as_object() {
@@ -159,7 +159,7 @@ impl ToolPromptFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::types::ToolInputSchema;
+    use crate::tools::ToolInputSchema;
 
     #[test]
     fn test_format_empty_tools() {

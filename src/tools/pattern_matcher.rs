@@ -9,8 +9,9 @@ use regex::Regex;
 use serde_json::json;
 use tracing::{debug, instrument};
 
-/// Tool pattern - matches queries to tool invocations
-pub struct ToolPattern {
+/// Query trigger used only by [`ToolPatternMatcher`]. Distinct from the
+/// persisted approval [`super::patterns::ToolPattern`].
+struct QueryPattern {
     /// Trigger regex pattern
     trigger: Regex,
     /// Tool name to invoke
@@ -20,7 +21,7 @@ pub struct ToolPattern {
 }
 
 /// Parameter extractor - extracts tool parameters from regex captures
-pub struct ParamExtractor {
+struct ParamExtractor {
     /// Parameter name in tool input
     param_name: String,
     /// Capture group index (1-based)
@@ -29,9 +30,9 @@ pub struct ParamExtractor {
     default_value: Option<String>,
 }
 
-impl ToolPattern {
+impl QueryPattern {
     /// Create new tool pattern
-    pub fn new(
+    fn new(
         trigger: &str,
         tool_name: String,
         param_extractors: Vec<ParamExtractor>,
@@ -44,12 +45,12 @@ impl ToolPattern {
     }
 
     /// Check if pattern matches query
-    pub fn matches(&self, query: &str) -> bool {
+    fn matches(&self, query: &str) -> bool {
         self.trigger.is_match(query)
     }
 
     /// Extract tool use from query
-    pub fn extract(&self, query: &str) -> Option<ToolUse> {
+    fn extract(&self, query: &str) -> Option<ToolUse> {
         let captures = self.trigger.captures(query)?;
 
         let mut input = serde_json::Map::new();
@@ -80,7 +81,7 @@ impl ToolPattern {
 
 impl ParamExtractor {
     /// Create extractor from capture group
-    pub fn from_capture(param_name: String, capture_index: usize) -> Self {
+    fn from_capture(param_name: String, capture_index: usize) -> Self {
         Self {
             param_name,
             capture_index,
@@ -90,7 +91,7 @@ impl ParamExtractor {
 
     #[allow(dead_code)]
     /// Create extractor with default value
-    pub fn with_default(param_name: String, default_value: String) -> Self {
+    fn with_default(param_name: String, default_value: String) -> Self {
         Self {
             param_name,
             capture_index: 0,
@@ -101,7 +102,7 @@ impl ParamExtractor {
 
 /// Pattern-based tool matcher
 pub struct ToolPatternMatcher {
-    patterns: Vec<ToolPattern>,
+    patterns: Vec<QueryPattern>,
 }
 
 impl ToolPatternMatcher {
@@ -117,7 +118,7 @@ impl ToolPatternMatcher {
         let mut matcher = Self::new();
 
         // Read file patterns
-        matcher.add_pattern(ToolPattern::new(
+        matcher.add_pattern(QueryPattern::new(
             r#"(?i)read (?:the )?(?:file |contents of )?['"]?([^'"]+)['"]?"#,
             "read".to_string(),
             vec![ParamExtractor::from_capture("file_path".to_string(), 1)],
@@ -125,7 +126,7 @@ impl ToolPatternMatcher {
 
         // Grep patterns (before glob to match "search for X in Y" patterns first)
         // Capture pattern up to (but not including) " in " separator
-        matcher.add_pattern(ToolPattern::new(
+        matcher.add_pattern(QueryPattern::new(
             r#"(?i)(?:search|grep) (?:for )?['"]?([^'"]+?)['"]?\s+in\s+(.+)"#,
             "grep".to_string(),
             vec![
@@ -135,28 +136,28 @@ impl ToolPatternMatcher {
         )?)?;
 
         // Grep without path
-        matcher.add_pattern(ToolPattern::new(
+        matcher.add_pattern(QueryPattern::new(
             r#"(?i)(?:search|grep) (?:for )?['"]?([^'"]+)['"]?$"#,
             "grep".to_string(),
             vec![ParamExtractor::from_capture("pattern".to_string(), 1)],
         )?)?;
 
         // Glob patterns (after grep to avoid matching "find" in "search for")
-        matcher.add_pattern(ToolPattern::new(
+        matcher.add_pattern(QueryPattern::new(
             r#"(?i)(?:find|list|show) (?:all )?files? (?:matching |like )?['"]?([^'"]+)['"]?"#,
             "glob".to_string(),
             vec![ParamExtractor::from_capture("pattern".to_string(), 1)],
         )?)?;
 
         // Web fetch patterns
-        matcher.add_pattern(ToolPattern::new(
+        matcher.add_pattern(QueryPattern::new(
             r#"(?i)(?:fetch|get|retrieve) (?:from |contents of )?(?:url |website )?['"]?(https?://[^'"]+)['"]?"#,
             "web_fetch".to_string(),
             vec![ParamExtractor::from_capture("url".to_string(), 1)],
         )?)?;
 
         // Bash patterns
-        matcher.add_pattern(ToolPattern::new(
+        matcher.add_pattern(QueryPattern::new(
             r#"(?i)(?:run|execute) (?:command |bash )?['"]?([^'"]+)['"]?"#,
             "bash".to_string(),
             vec![ParamExtractor::from_capture("command".to_string(), 1)],
@@ -166,7 +167,7 @@ impl ToolPatternMatcher {
     }
 
     /// Add a pattern
-    pub fn add_pattern(&mut self, pattern: ToolPattern) -> Result<()> {
+    fn add_pattern(&mut self, pattern: QueryPattern) -> Result<()> {
         self.patterns.push(pattern);
         Ok(())
     }

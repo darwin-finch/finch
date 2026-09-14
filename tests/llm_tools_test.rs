@@ -3,7 +3,7 @@
 use anyhow::Result;
 use finch::config::TeacherEntry;
 use finch::llms::LLMRegistry;
-use finch::tools::implementations::llm_tools::create_llm_tools;
+use finch::tools::create_llm_tools;
 
 fn create_teacher(
     provider: &str,

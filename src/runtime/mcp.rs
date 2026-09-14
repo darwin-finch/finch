@@ -1,4 +1,4 @@
-use crate::tools::mcp::McpToolDescriptor;
+use crate::tools::McpToolDescriptor;
 use crate::vm::{
     CapabilityKind, CapabilityRequirement, ControlEffect, EffectSet, ResourceSelector, StackRow,
     StackSignature, Type,

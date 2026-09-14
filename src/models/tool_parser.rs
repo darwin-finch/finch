@@ -2,7 +2,7 @@
 //
 // Parses XML-formatted tool calls from model responses using regex
 
-use crate::tools::types::ToolUse;
+use crate::tools::ToolUse;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;

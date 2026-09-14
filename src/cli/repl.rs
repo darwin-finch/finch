@@ -30,17 +30,17 @@ use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::runtime::automation::{
     permission_context_key, permission_target_description, AutomationState,
 };
-use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
-use crate::tools::implementations::{
+use crate::tools::ToolPattern;
+use crate::tools::ToolPermissionConfig;
+use crate::tools::{generate_tool_signature, ApprovalSource, ToolSignature};
+use crate::tools::{
     AnsibleTool, AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool,
     HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
-use crate::tools::implementations::{GuiClickTool, GuiInspectTool, GuiTypeTool};
-use crate::tools::patterns::ToolPattern;
-use crate::tools::permissions::ToolPermissionConfig;
-use crate::tools::types::{ToolDefinition, ToolUse};
+use crate::tools::{GuiClickTool, GuiInspectTool, GuiTypeTool};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
+use crate::tools::{ToolDefinition, ToolUse};
 use crate::training::batch_trainer::BatchTrainer;
 
 use super::commands::{handle_command, Command, CommandOutput};
@@ -541,9 +541,9 @@ pub struct Repl {
     memory_system: Option<Arc<crate::memory::MemorySystem>>,
 
     // Projection of the selected Brain task list (TodoWrite / TodoRead tools)
-    todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
-    todo_journal_target: crate::tools::todo::TodoJournalTarget,
-    todo_journal_receiver: Option<crate::tools::todo::TodoJournalReceiver>,
+    todo_list: Arc<tokio::sync::RwLock<crate::tools::TodoList>>,
+    todo_journal_target: crate::tools::TodoJournalTarget,
+    todo_journal_receiver: Option<crate::tools::TodoJournalReceiver>,
 
     // Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
@@ -787,27 +787,21 @@ impl Repl {
         tool_registry.register(Box::new(WriteTool));
         tool_registry.register(Box::new(HashCompareTool));
         tool_registry.register(Box::new(AnsibleTool));
-        tool_registry.register(Box::new(
-            crate::tools::implementations::SubmitProgramTool::new(Arc::clone(&program_runtime)),
-        ));
-        tool_registry.register(Box::new(
-            crate::tools::implementations::GetVmStateTool::new(Arc::clone(&program_runtime)),
-        ));
-        tool_registry.register(Box::new(
-            crate::tools::implementations::GetLanguageDefinitionTool,
-        ));
-        tool_registry.register(Box::new(
-            crate::tools::implementations::SearchWordTool::new(
-                Arc::clone(&program_runtime),
-                memory_system.clone(),
-            ),
-        ));
-        tool_registry.register(Box::new(
-            crate::tools::implementations::InspectWordTool::new(
-                Arc::clone(&program_runtime),
-                memory_system.clone(),
-            ),
-        ));
+        tool_registry.register(Box::new(crate::tools::SubmitProgramTool::new(Arc::clone(
+            &program_runtime,
+        ))));
+        tool_registry.register(Box::new(crate::tools::GetVmStateTool::new(Arc::clone(
+            &program_runtime,
+        ))));
+        tool_registry.register(Box::new(crate::tools::GetLanguageDefinitionTool));
+        tool_registry.register(Box::new(crate::tools::SearchWordTool::new(
+            Arc::clone(&program_runtime),
+            memory_system.clone(),
+        )));
+        tool_registry.register(Box::new(crate::tools::InspectWordTool::new(
+            Arc::clone(&program_runtime),
+            memory_system.clone(),
+        )));
         // Historical vocabulary spellings remain executable for persisted
         // turns and external clients, but providers must see one coherent
         // discovery surface. The old searches each covered only a subset
@@ -855,7 +849,7 @@ impl Repl {
 
         // Phase 1: Register LLM delegation tools if multi-LLM is configured
         if let Some(ref registry) = llm_registry {
-            let llm_tools = crate::tools::implementations::llm_tools::create_llm_tools(registry);
+            let llm_tools = crate::tools::create_llm_tools(registry);
             for tool in llm_tools {
                 tool_registry.register(tool);
             }
@@ -880,7 +874,7 @@ impl Repl {
 
         // Phase 4: Register memory tools if memory system is enabled
         if let Some(ref memory) = memory_system {
-            use crate::tools::implementations::{
+            use crate::tools::{
                 CreateMemoryTool, InspectMemoryTool, ListRecentTool, SearchMemoryTool,
             };
             tool_registry.register(Box::new(SearchMemoryTool::new(memory.clone())));
@@ -892,13 +886,11 @@ impl Repl {
         // Session task list. Snake_case names are provider-facing; aliases
         // keep persisted/legacy provider turns executable without advertising
         // two tools for the same operation.
-        let todo_list = Arc::new(tokio::sync::RwLock::new(
-            crate::tools::todo::TodoList::default(),
-        ));
+        let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
         let (todo_journal, todo_journal_target, todo_journal_receiver) =
-            crate::tools::todo::todo_journal(Arc::clone(&todo_list));
+            crate::tools::todo_journal(Arc::clone(&todo_list));
         {
-            use crate::tools::implementations::{TodoReadTool, TodoWriteTool};
+            use crate::tools::{TodoReadTool, TodoWriteTool};
             tool_registry.register(Box::new(TodoWriteTool::journaled(
                 Arc::clone(&todo_list),
                 todo_journal,
@@ -968,31 +960,21 @@ impl Repl {
                 fallback_registry.register(Box::new(GrepTool));
                 fallback_registry.register(Box::new(WebFetchTool::new()));
                 fallback_registry.register(Box::new(BashTool));
-                fallback_registry.register(Box::new(
-                    crate::tools::implementations::SubmitProgramTool::new(Arc::clone(
-                        &program_runtime,
-                    )),
-                ));
-                fallback_registry.register(Box::new(
-                    crate::tools::implementations::GetVmStateTool::new(Arc::clone(
-                        &program_runtime,
-                    )),
-                ));
-                fallback_registry.register(Box::new(
-                    crate::tools::implementations::GetLanguageDefinitionTool,
-                ));
-                fallback_registry.register(Box::new(
-                    crate::tools::implementations::SearchWordTool::new(
-                        Arc::clone(&program_runtime),
-                        memory_system.clone(),
-                    ),
-                ));
-                fallback_registry.register(Box::new(
-                    crate::tools::implementations::InspectWordTool::new(
-                        Arc::clone(&program_runtime),
-                        memory_system.clone(),
-                    ),
-                ));
+                fallback_registry.register(Box::new(crate::tools::SubmitProgramTool::new(
+                    Arc::clone(&program_runtime),
+                )));
+                fallback_registry.register(Box::new(crate::tools::GetVmStateTool::new(
+                    Arc::clone(&program_runtime),
+                )));
+                fallback_registry.register(Box::new(crate::tools::GetLanguageDefinitionTool));
+                fallback_registry.register(Box::new(crate::tools::SearchWordTool::new(
+                    Arc::clone(&program_runtime),
+                    memory_system.clone(),
+                )));
+                fallback_registry.register(Box::new(crate::tools::InspectWordTool::new(
+                    Arc::clone(&program_runtime),
+                    memory_system.clone(),
+                )));
                 fallback_registry.register_alias("search_vm_vocabulary", "search_word");
                 fallback_registry.register_alias("inspect_vm_word", "inspect_word");
                 fallback_registry.register_alias("search_vocabulary", "search_word");
@@ -1730,7 +1712,7 @@ impl Repl {
 
                 // Check mode-based permissions first
                 if !Self::is_tool_allowed_in_mode(&tool_use.name, &self.mode) {
-                    use crate::tools::types::ToolResult;
+                    use crate::tools::ToolResult;
                     let error_result = ToolResult::error(
                         tool_use.id.clone(),
                         format!(
@@ -1753,7 +1735,7 @@ impl Repl {
                 let signature = generate_tool_signature(tool_use, &working_dir);
 
                 let is_auto_approved =
-                    crate::tools::permissions::legacy_tool_effect(&tool_use.name, &tool_use.input)
+                    crate::tools::legacy_tool_effect(&tool_use.name, &tool_use.input)
                         .runs_autonomously();
 
                 // Check if pre-approved in cache
@@ -1842,7 +1824,7 @@ impl Repl {
                                     self.output_tool(&tool_use.name, "  ✓ Approved with edits");
                                 }
                                 ConfirmationResult::Deny => {
-                                    use crate::tools::types::ToolResult;
+                                    use crate::tools::ToolResult;
                                     let error_result = ToolResult::error(
                                         tool_use.id.clone(),
                                         "Tool execution denied by user".to_string(),
@@ -2297,18 +2279,26 @@ impl Repl {
             crate::startup::phase(crate::startup::PHASE_TOOL_DEFINITIONS);
         let tool_definitions: Vec<ToolDefinition> = {
             let mut executor = self.tool_executor.lock().await;
-            executor.registry_mut().register(Box::new(
-                crate::tools::implementations::AgentSpawnTool::new(Arc::clone(&agent_scheduler)),
-            ));
-            executor.registry_mut().register(Box::new(
-                crate::tools::implementations::AgentAwaitTool::new(Arc::clone(&agent_scheduler)),
-            ));
-            executor.registry_mut().register(Box::new(
-                crate::tools::implementations::AgentPollTool::new(Arc::clone(&agent_scheduler)),
-            ));
-            executor.registry_mut().register(Box::new(
-                crate::tools::implementations::AgentCancelTool::new(Arc::clone(&agent_scheduler)),
-            ));
+            executor
+                .registry_mut()
+                .register(Box::new(crate::tools::AgentSpawnTool::new(Arc::clone(
+                    &agent_scheduler,
+                ))));
+            executor
+                .registry_mut()
+                .register(Box::new(crate::tools::AgentAwaitTool::new(Arc::clone(
+                    &agent_scheduler,
+                ))));
+            executor
+                .registry_mut()
+                .register(Box::new(crate::tools::AgentPollTool::new(Arc::clone(
+                    &agent_scheduler,
+                ))));
+            executor
+                .registry_mut()
+                .register(Box::new(crate::tools::AgentCancelTool::new(Arc::clone(
+                    &agent_scheduler,
+                ))));
             // `submit_program` remains registered for scripts, CLI callers,
             // and compatibility integrations, but VM-wire providers must not
             // see it because it redundantly wraps direct source.
@@ -3048,9 +3038,9 @@ impl Repl {
                 };
 
                 let type_str = match pattern.pattern_type {
-                    crate::tools::patterns::PatternType::Wildcard => "wildcard",
-                    crate::tools::patterns::PatternType::Regex => "regex",
-                    crate::tools::patterns::PatternType::Structured => "structured",
+                    crate::tools::PatternType::Wildcard => "wildcard",
+                    crate::tools::PatternType::Regex => "regex",
+                    crate::tools::PatternType::Structured => "structured",
                 };
                 output.push_str(&format!(
                     "  {} ({})\n",
@@ -3221,7 +3211,7 @@ impl Repl {
 
     /// Add a pattern interactively
     pub async fn add_pattern_interactive(&mut self) -> Result<String> {
-        use crate::tools::patterns::PatternType;
+        use crate::tools::PatternType;
 
         self.output_status("Add Confirmation Pattern");
         self.output_status("========================\n");

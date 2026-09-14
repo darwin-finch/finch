@@ -291,7 +291,7 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
 /// Build the approval preview for a mutating file tool using the same bounded,
 /// sanitized renderer as completed transcript rows.
 pub(crate) fn tool_approval_diff_preview(
-    tool_use: &crate::tools::types::ToolUse,
+    tool_use: &crate::tools::ToolUse,
     colors: &crate::theme::ColorScheme,
     mode: crate::cli::diff::DiffColorMode,
 ) -> Option<String> {
@@ -967,7 +967,7 @@ mod tests {
     #[test]
     fn test_write_approval_preview_preserves_existing_read_errors() {
         let directory = tempfile::tempdir().unwrap();
-        let tool = crate::tools::types::ToolUse::new(
+        let tool = crate::tools::ToolUse::new(
             "write".into(),
             serde_json::json!({
                 "file_path": directory.path(),
@@ -986,7 +986,7 @@ mod tests {
     fn test_write_approval_preview_marks_missing_file_as_created() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("new.txt");
-        let tool = crate::tools::types::ToolUse::new(
+        let tool = crate::tools::ToolUse::new(
             "write".into(),
             serde_json::json!({
                 "file_path": path,
@@ -1301,7 +1301,7 @@ mod tests {
 /// `ToolUse` and a diff colour mode. The terminal framework offers `Dialog::tool_approval` and
 /// `with_body`, and knows nothing about tools.
 pub fn tool_approval_dialog(
-    tool_use: &crate::tools::types::ToolUse,
+    tool_use: &crate::tools::ToolUse,
     summary: &str,
     colors: &crate::theme::ColorScheme,
     mode: crate::cli::diff::DiffColorMode,

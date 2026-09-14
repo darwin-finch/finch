@@ -267,7 +267,7 @@ impl From<ProviderResponse> for crate::claude::types::MessageResponse {
 #[cfg(test)]
 mod capability_contract_tests {
     use super::*;
-    use crate::tools::types::{ToolDefinition, ToolInputSchema};
+    use crate::tools::{ToolDefinition, ToolInputSchema};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct ContractProvider {

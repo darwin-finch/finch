@@ -2323,7 +2323,7 @@ mod tests {
     #[tokio::test]
     async fn canonical_gpt_5_6_posts_exact_current_chat_completions_json() {
         use crate::claude::types::{ContentBlock, Message};
-        use crate::tools::types::{ToolDefinition, ToolInputSchema};
+        use crate::tools::{ToolDefinition, ToolInputSchema};
 
         let mut server = mockito::Server::new_async().await;
         let jpeg = valid_jpeg_base64();

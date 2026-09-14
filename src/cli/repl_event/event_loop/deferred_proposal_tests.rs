@@ -28,12 +28,12 @@ fn test_pending_named_brain_turn() -> PendingNamedBrainTurn {
 fn named_brain_effect_audit_cancellation_quiesces_without_late_tool_result() {
     let mut turn = test_pending_named_brain_turn();
     turn.observe_tool_calls(vec![
-        crate::tools::types::ToolUse {
+        crate::tools::ToolUse {
             id: "tool-a".into(),
             name: "submit_program".into(),
             input: serde_json::json!({"source": "secret-a"}),
         },
-        crate::tools::types::ToolUse {
+        crate::tools::ToolUse {
             id: "tool-b".into(),
             name: "submit_program".into(),
             input: serde_json::json!({"source": "secret-b"}),
@@ -173,7 +173,7 @@ async fn proposal_decision_resumes_the_saved_effect_without_replaying_source() {
     let completed = resume_deferred_proposal(
         runtime.as_ref(),
         &proposal,
-        crate::tools::implementations::propose::ProposalDecision::Chat {
+        crate::tools::ProposalDecision::Chat {
             context: "Please explain the artifact first.".into(),
         },
     )

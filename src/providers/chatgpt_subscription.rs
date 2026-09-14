@@ -30,7 +30,7 @@ use crate::config::{
     AudienceBinding, CredentialProvider, EndpointFamily, ProviderCredential, ReasoningEffort,
 };
 use crate::oauth::{FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthTokenRecord};
-use crate::tools::types::ToolDefinition;
+use crate::tools::ToolDefinition;
 
 pub const CHATGPT_INFERENCE_PROTOCOL_REVISION: &str =
     "openai-codex-responses-lite@6478a751fde8884b2fdc76486fe23175a8e795d4";

@@ -143,7 +143,7 @@ fn test_gemini_tool_use_id_format() {
 /// Test that ProviderRequest can include tools
 #[test]
 fn test_provider_request_with_tools() -> Result<()> {
-    use finch::tools::types::{ToolDefinition, ToolInputSchema};
+    use finch::tools::{ToolDefinition, ToolInputSchema};
 
     let tools = vec![ToolDefinition {
         name: "Read".to_string(),

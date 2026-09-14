@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // Re-export tool types for convenience
-pub use crate::tools::types::ToolDefinition;
+pub use crate::tools::ToolDefinition;
 
 use crate::config::{DEFAULT_CLAUDE_MODEL, DEFAULT_MAX_TOKENS};
 
@@ -313,11 +313,11 @@ impl MessageResponse {
     }
 
     /// Extract tool uses from response
-    pub fn tool_uses(&self) -> Vec<crate::tools::types::ToolUse> {
+    pub fn tool_uses(&self) -> Vec<crate::tools::ToolUse> {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input } => Some(crate::tools::types::ToolUse {
+                ContentBlock::ToolUse { id, name, input } => Some(crate::tools::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_message_request_with_tools() {
-        use crate::tools::types::ToolInputSchema;
+        use crate::tools::ToolInputSchema;
         let tool = ToolDefinition {
             name: "read".to_string(),
             description: "Read a file".to_string(),

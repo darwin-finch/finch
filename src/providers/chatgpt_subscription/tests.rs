@@ -1,6 +1,6 @@
 use super::*;
 use crate::providers::LlmProvider;
-use crate::tools::types::ToolInputSchema;
+use crate::tools::ToolInputSchema;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

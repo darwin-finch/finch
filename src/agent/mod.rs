@@ -16,10 +16,10 @@ use crate::claude::types::{ContentBlock, Message, MessageRequest};
 use crate::claude::ClaudeClient;
 use crate::config::{Config, Persona};
 use crate::generators::claude::CODING_SYSTEM_PROMPT;
-use crate::tools::implementations::{
+use crate::tools::ToolDefinition;
+use crate::tools::{
     BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
 };
-use crate::tools::types::ToolDefinition;
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 
 use activity_log::{ActivityLogger, AgentEvent};
@@ -304,7 +304,7 @@ impl AgentLoop {
                     cmd: cmd_preview,
                 });
 
-                let tool_use = crate::tools::types::ToolUse {
+                let tool_use = crate::tools::ToolUse {
                     id: tu.id.clone(),
                     name: tu.name.clone(),
                     input: tu.input.clone(),

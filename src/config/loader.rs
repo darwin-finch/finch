@@ -146,7 +146,7 @@ where
         #[serde(default)]
         features: Option<FeaturesConfig>,
         #[serde(default)]
-        mcp_servers: Option<std::collections::HashMap<String, crate::tools::mcp::McpServerConfig>>,
+        mcp_servers: Option<std::collections::HashMap<String, crate::tools::McpServerConfig>>,
         #[serde(default)]
         active_theme: Option<String>,
         #[serde(default)]

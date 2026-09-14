@@ -298,7 +298,7 @@ mod tests {
         async fn generate(
             &self,
             _messages: Vec<Message>,
-            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+            _tools: Option<Vec<crate::tools::ToolDefinition>>,
         ) -> Result<crate::generators::GeneratorResponse> {
             panic!("PanicGenerator: generate() should not be called in this test")
         }
@@ -306,7 +306,7 @@ mod tests {
         async fn generate_stream(
             &self,
             _messages: Vec<Message>,
-            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+            _tools: Option<Vec<crate::tools::ToolDefinition>>,
         ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
         {
             panic!("PanicGenerator: generate_stream() should not be called")
@@ -337,7 +337,7 @@ mod tests {
         async fn generate(
             &self,
             _messages: Vec<Message>,
-            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+            _tools: Option<Vec<crate::tools::ToolDefinition>>,
         ) -> Result<crate::generators::GeneratorResponse> {
             Ok(crate::generators::GeneratorResponse {
                 text: self.summary.clone(),
@@ -362,7 +362,7 @@ mod tests {
         async fn generate_stream(
             &self,
             _messages: Vec<Message>,
-            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+            _tools: Option<Vec<crate::tools::ToolDefinition>>,
         ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
         {
             Ok(None)

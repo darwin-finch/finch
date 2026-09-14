@@ -5,7 +5,7 @@
 
 use crate::claude::types::{ContentBlock, Message};
 use crate::config::ReasoningEffort;
-use crate::tools::types::ToolDefinition;
+use crate::tools::ToolDefinition;
 use serde::{Deserialize, Serialize};
 
 /// Whether a provider/model capability is known to be usable.
@@ -848,11 +848,11 @@ impl ProviderResponse {
     }
 
     /// Extract tool uses from response
-    pub fn tool_uses(&self) -> Vec<crate::tools::types::ToolUse> {
+    pub fn tool_uses(&self) -> Vec<crate::tools::ToolUse> {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input } => Some(crate::tools::types::ToolUse {
+                ContentBlock::ToolUse { id, name, input } => Some(crate::tools::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
@@ -1225,7 +1225,7 @@ mod tests {
 
     #[test]
     fn test_provider_request_with_tools() {
-        use crate::tools::types::{ToolDefinition, ToolInputSchema};
+        use crate::tools::{ToolDefinition, ToolInputSchema};
         let tool = ToolDefinition {
             name: "bash".to_string(),
             description: "Run commands".to_string(),
@@ -1307,7 +1307,7 @@ mod tests {
         let tool = ToolDefinition {
             name: "lookup".into(),
             description: "lookup".into(),
-            input_schema: crate::tools::types::ToolInputSchema::simple(vec![]),
+            input_schema: crate::tools::ToolInputSchema::simple(vec![]),
         };
         let cases = [
             (

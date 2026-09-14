@@ -52,11 +52,11 @@ pub struct UiParts {
 
 /// Tools the model may call, and the task list it keeps.
 pub struct ToolParts {
-    pub definitions: Vec<crate::tools::types::ToolDefinition>,
+    pub definitions: Vec<crate::tools::ToolDefinition>,
     pub executor: Arc<Mutex<crate::tools::ToolExecutor>>,
-    pub todo_list: Arc<RwLock<crate::tools::todo::TodoList>>,
-    pub todo_journal_target: crate::tools::todo::TodoJournalTarget,
-    pub todo_journal_receiver: crate::tools::todo::TodoJournalReceiver,
+    pub todo_list: Arc<RwLock<crate::tools::TodoList>>,
+    pub todo_journal_target: crate::tools::TodoJournalTarget,
+    pub todo_journal_receiver: crate::tools::TodoJournalReceiver,
 }
 
 /// How this frontend reaches a daemon, and why it could not.
@@ -113,7 +113,7 @@ pub struct LlmGeneration {
 
 /// Tools the model may call, and what is in flight.
 pub struct LlmTools {
-    pub definitions: Arc<RwLock<Vec<crate::tools::types::ToolDefinition>>>,
+    pub definitions: Arc<RwLock<Vec<crate::tools::ToolDefinition>>>,
     pub coordinator: super::tool_execution::ToolExecutionCoordinator,
     pub call_history:
         Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,

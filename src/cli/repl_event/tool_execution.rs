@@ -20,8 +20,8 @@ use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::ReplMode;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
-use crate::tools::executor::{generate_tool_signature, ToolExecutor};
-use crate::tools::types::{LiveOutput, LiveOutputSink, ToolUse};
+use crate::tools::{generate_tool_signature, ToolExecutor};
+use crate::tools::{LiveOutput, LiveOutputSink, ToolUse};
 
 use super::events::ReplEvent;
 
@@ -191,14 +191,11 @@ impl ToolExecutionCoordinator {
             let approval_source = tool_executor.lock().await.is_approved(&signature);
 
             let is_auto_approved =
-                crate::tools::permissions::legacy_tool_effect(&tool_use.name, &tool_use.input)
+                crate::tools::legacy_tool_effect(&tool_use.name, &tool_use.input)
                     .runs_autonomously();
 
             let needs_approval = !is_auto_approved
-                && matches!(
-                    approval_source,
-                    crate::tools::executor::ApprovalSource::NotApproved
-                );
+                && matches!(approval_source, crate::tools::ApprovalSource::NotApproved);
 
             if needs_approval {
                 // Request approval from user (non-blocking for other queries)

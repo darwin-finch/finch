@@ -351,7 +351,7 @@ impl crate::generators::Generator for ProviderSubmitProgramGenerator {
     async fn generate(
         &self,
         _messages: Vec<crate::claude::Message>,
-        _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<crate::generators::GeneratorResponse> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         anyhow::ensure!(call == 0, "provider continuation escaped cancellation");
@@ -384,7 +384,7 @@ impl crate::generators::Generator for ProviderSubmitProgramGenerator {
     async fn generate_stream(
         &self,
         _messages: Vec<crate::claude::Message>,
-        _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<
         Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
     > {
@@ -1342,7 +1342,7 @@ async fn effect_audit_remote_disconnected_exception_does_not_claim_transport_tea
 async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publication() {
     tokio::task::LocalSet::new()
             .run_until(async {
-                use crate::tools::registry::Tool;
+                use crate::tools::Tool;
 
                 let temp = tempfile::tempdir().unwrap();
                 let task_output = temp.path().join("task-output");
@@ -1403,16 +1403,16 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                         calls: std::sync::Arc::clone(&provider_calls),
                     });
                 let submit_tool =
-                    crate::tools::implementations::program::SubmitProgramTool::new(
+                    crate::tools::SubmitProgramTool::new(
                         std::sync::Arc::clone(&runtime),
                     );
                 let definitions = vec![submit_tool.definition()];
-                let mut registry = crate::tools::registry::ToolRegistry::new();
+                let mut registry = crate::tools::ToolRegistry::new();
                 registry.register(Box::new(submit_tool));
-                let permissions = crate::tools::permissions::PermissionManager::new()
-                    .with_default_rule(crate::tools::permissions::PermissionRule::Allow);
+                let permissions = crate::tools::PermissionManager::new()
+                    .with_default_rule(crate::tools::PermissionRule::Allow);
                 let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
-                    crate::tools::executor::ToolExecutor::new(
+                    crate::tools::ToolExecutor::new(
                         registry,
                         permissions,
                         temp.path().join("tool-patterns.json"),
