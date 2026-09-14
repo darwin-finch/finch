@@ -35,7 +35,7 @@ use std::time::Duration;
 use tui_textarea::TextArea;
 
 use super::{OutputManager, StatusBar, StatusLineType};
-use crate::cli::messages::{MessageId, MessageRef, MessageStatus};
+use crate::cli::messages::{MessageId, MessageRef, MessageStatus, TranscriptRowKind};
 // Sub-modules
 mod accordion;
 pub mod activity;
@@ -1929,7 +1929,10 @@ impl TuiRenderer {
     /// program disappear as soon as the provider stream ended, while its
     /// program-output WorkUnit was still running.
     fn find_live_messages(&self) -> Vec<MessageRef> {
-        uncommitted_suffix(self.output_manager.get_messages(), &self.printed_ids)
+        swap_completed_program_source_for_output(uncommitted_suffix(
+            self.output_manager.get_messages(),
+            &self.printed_ids,
+        ))
     }
 }
 
@@ -1966,6 +1969,30 @@ fn uncommitted_suffix(
     messages
         .into_iter()
         .filter(|message| !printed_ids.contains(&message.id()))
+        .collect()
+}
+
+/// Stream IR while the program is still arriving. Once any program-output
+/// row has visible body, drop completed program-source rows so the turn is
+/// one item (the output), not source plus output.
+fn swap_completed_program_source_for_output(messages: Vec<MessageRef>) -> Vec<MessageRef> {
+    let colors = ColorScheme::default();
+    let output_visible = messages.iter().any(|message| {
+        message.transcript_row(&colors).is_some_and(|row| {
+            row.kind == TranscriptRowKind::Output && row.body.iter().any(|line| !line.is_empty())
+        })
+    });
+    if !output_visible {
+        return messages;
+    }
+    messages
+        .into_iter()
+        .filter(|message| {
+            message.status() == MessageStatus::InProgress
+                || !message
+                    .transcript_row(&colors)
+                    .is_some_and(|row| row.kind == TranscriptRowKind::Program)
+        })
         .collect()
 }
 
@@ -4479,7 +4506,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_program_source_stays_live_behind_running_output() {
+    fn completed_program_source_swaps_for_visible_output() {
         let source = Arc::new(WorkUnit::new("source"));
         source.set_program_source("lisp");
         source.set_response("(say \"hello\")");
@@ -4491,19 +4518,19 @@ mod tests {
 
         let source_ref: MessageRef = source.clone();
         let output_ref: MessageRef = output.clone();
-        let messages = vec![source_ref.clone(), output_ref.clone()];
-        let live = uncommitted_suffix(messages, &HashSet::new());
-        assert_eq!(live.len(), 2);
-        assert!(live[0]
-            .format(&ColorScheme::default())
-            .contains("(say \"hello\")"));
-        assert_eq!(live[1].format(&ColorScheme::default()), "hello");
-
-        let mut printed = HashSet::new();
-        printed.insert(source_ref.id());
-        let live = uncommitted_suffix(vec![source_ref, output_ref], &printed);
-        assert_eq!(live.len(), 1);
+        let live = swap_completed_program_source_for_output(uncommitted_suffix(
+            vec![source_ref.clone(), output_ref.clone()],
+            &HashSet::new(),
+        ));
+        assert_eq!(live.len(), 1, "output replaces completed IR as the turn");
         assert_eq!(live[0].format(&ColorScheme::default()), "hello");
+
+        let streaming = Arc::new(WorkUnit::new("streaming"));
+        streaming.set_program_source("lisp");
+        streaming.set_response("(say");
+        let streaming_ref: MessageRef = streaming;
+        let ir_only = swap_completed_program_source_for_output(vec![streaming_ref]);
+        assert_eq!(ir_only.len(), 1, "IR stays visible while it is still streaming");
     }
 
     #[test]

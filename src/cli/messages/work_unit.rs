@@ -950,8 +950,9 @@ impl Message for WorkUnit {
                 TranscriptRowKind::Program,
                 format!("Program source ({language})"),
                 lines(&inner.response_text),
-                inner.status == MessageStatus::InProgress
-                    || inner.response_text.lines().count() <= 3,
+                // Stream IR while it arrives. Once complete, stay collapsed so
+                // program output can replace it as the turn's visible item.
+                inner.status == MessageStatus::InProgress,
             ),
             WorkUnitPresentation::ProgramOutput { title } => (
                 TranscriptRowKind::Output,
@@ -2272,6 +2273,20 @@ mod tests {
         assert!(rendered.contains("→ program (forth)"));
         assert!(rendered.contains("s\"hello\" say"));
         assert!(!rendered.contains("⏺"));
+    }
+
+    #[test]
+    fn completed_program_source_is_collapsed_so_output_can_replace_it() {
+        let source = WorkUnit::new("ignored");
+        source.set_program_source("lisp");
+        source.set_response("(say \"hi\")");
+        source.set_complete();
+        let row = source.transcript_row(&colors()).expect("program row");
+        assert_eq!(row.kind, super::TranscriptRowKind::Program);
+        assert!(
+            !row.default_expanded,
+            "completed IR must not stay expanded beside program output"
+        );
     }
 
     // ── Rows ─────────────────────────────────────────────────────────────────
