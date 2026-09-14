@@ -3232,3 +3232,282 @@ fn test_pattern_persistent_tool_name_matches_tool_use() {
         result
     );
 }
+
+/// Clock-free `ReplMode` fixtures. `Planning` and `Executing` carry timestamps,
+/// so they are pinned to the epoch: nothing here reads a clock.
+fn modes_under_test() -> Vec<(&'static str, crate::cli::repl::ReplMode)> {
+    use crate::cli::repl::ReplMode;
+
+    let at = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid timestamp");
+    let plan_path = std::path::PathBuf::from("/nonexistent/finch-438-plan.md");
+
+    vec![
+        ("Normal", ReplMode::Normal),
+        (
+            "Planning",
+            ReplMode::Planning {
+                task: "explore".to_string(),
+                plan_path: plan_path.clone(),
+                created_at: at,
+            },
+        ),
+        (
+            "Executing",
+            ReplMode::Executing {
+                task: "explore".to_string(),
+                plan_path,
+                approved_at: at,
+            },
+        ),
+    ]
+}
+
+/// Host-effect tools the status bar must not claim are auto-accepted.
+/// `PermissionManager::check_tool_use` does not take a `ReplMode`, so the
+/// outcome is the same in every mode.
+fn host_effect_tools() -> [(&'static str, serde_json::Value); 3] {
+    [
+        ("write", serde_json::json!({"path": "src/lib.rs"})),
+        ("edit", serde_json::json!({"path": "src/lib.rs"})),
+        ("bash", serde_json::json!({"command": "echo hi"})),
+    ]
+}
+
+/// No mode's status-bar label may advertise that approvals are waived,
+/// because no mode waives one.
+///
+/// `ReplMode::Normal` shipped labelled `accept edits on` while
+/// `crate::tools::PermissionManager::check_tool_use` still returns `AskUser`
+/// for write/edit/bash. A maintainer read the label, believed approvals had
+/// been waived, and then hit `$EDITOR` on every write. The status bar is the
+/// only surface reporting mode, and it reported a mode that does not exist.
+///
+/// This asserts the property rather than the wording, so a later rewrite of
+/// the labels cannot drift back the way a hardcoded expected string would.
+/// Should an auto-accept mode ever be implemented, this test is the thing
+/// that must change in the same commit that makes the claim true.
+#[test]
+fn test_mode_indicator_never_claims_edits_are_accepted_automatically() {
+    let permissions = crate::tools::PermissionManager::new();
+    for (tool, input) in host_effect_tools() {
+        let outcome = permissions.check_tool_use(tool, &input);
+        assert!(
+            matches!(outcome, crate::tools::PermissionCheck::AskUser(_)),
+            "invariant: host-effect tool {tool} must ask via \
+             crate::tools::PermissionManager::check_tool_use; that function \
+             never takes a ReplMode, so no mode can waive this approval. \
+             outcome={outcome:?} input={input}"
+        );
+    }
+
+    const CLAIMS_OF_WAIVED_APPROVAL: [&str; 12] = [
+        "accept edits",
+        "accepts edits",
+        "auto-accept",
+        "auto accept",
+        "autoaccept",
+        "accepted automatically",
+        "automatically accept",
+        "no confirmation",
+        "without confirmation",
+        "without approval",
+        "skip confirmation",
+        "skips confirmation",
+    ];
+
+    for (mode_name, mode) in modes_under_test() {
+        let indicator = super::plan_mode_indicator(&mode);
+        let lowered = indicator.to_lowercase();
+
+        for claim in CLAIMS_OF_WAIVED_APPROVAL {
+            assert!(
+                !lowered.contains(claim),
+                "invariant: a REPL mode indicator must never advertise waived \
+                 approvals, because crate::tools::PermissionManager::check_tool_use \
+                 never reads ReplMode and still returns AskUser for write/edit/bash, \
+                 and the executor's only mode branch restricts Planning rather than \
+                 widening anything. mode={mode_name} mode_value={mode:?} \
+                 indicator={indicator:?} forbidden_claim={claim:?}"
+            );
+        }
+    }
+}
+
+/// Each label must state something true of its own variant, and must reach
+/// the status bar as written.
+///
+/// Required substrings are behavioural facts, each checkable in source:
+///
+/// - `Normal` and `Executing` prompt for approval. Neither is exempt from
+///   `check_tool_use`; `Executing` differs from `Normal` only in that a plan
+///   has been approved, not in what a tool call costs the user.
+/// - `Planning` is restricted to inspection tools — `ToolExecutor::execute_tool`
+///   rejects anything outside read/glob/grep/web_fetch plus the plan tools.
+/// - Shift+tab is live in every mode. `KeyCode::BackTab` maps to `/plan`
+///   unconditionally (`src/cli/tui/async_input.rs`), and the handler returns
+///   both `Planning` and `Executing` to `Normal`.
+#[test]
+fn test_mode_indicator_describes_each_modes_actual_behavior() {
+    use crate::cli::status_bar::{StatusBar, StatusLineType};
+
+    let required: [(&str, &str, &str); 3] = [
+        (
+            "Normal",
+            "confirm",
+            "Normal is subject to check_tool_use like every other mode; \
+             write/edit/bash return AskUser",
+        ),
+        (
+            "Planning",
+            "inspection",
+            "ToolExecutor::execute_tool rejects any tool outside \
+             read/glob/grep/web_fetch plus the plan tools while Planning",
+        ),
+        (
+            "Executing",
+            "confirm",
+            "Executing lifts the Planning tool restriction only; it does not \
+             exempt anything from check_tool_use",
+        ),
+    ];
+
+    for (mode_name, mode) in modes_under_test() {
+        let indicator = super::plan_mode_indicator(&mode);
+        let lowered = indicator.to_lowercase();
+
+        let (_, needle, why) = required
+            .iter()
+            .find(|(name, _, _)| *name == mode_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "invariant: every ReplMode variant needs a stated required \
+                     fact in this test, so a new variant cannot ship an \
+                     unchecked label. unmatched mode={mode_name}"
+                )
+            });
+
+        assert!(
+            lowered.contains(needle),
+            "invariant: a REPL mode indicator must state what its mode \
+             actually does. mode={mode_name} mode_value={mode:?} \
+             indicator={indicator:?} missing={needle:?} grounds={why:?}"
+        );
+
+        assert!(
+            !lowered.contains("disabled"),
+            "invariant: no mode may report shift+tab as disabled — \
+             KeyCode::BackTab maps to /plan unconditionally \
+             (src/cli/tui/async_input.rs) and the handler returns both \
+             Planning and Executing to Normal. \
+             mode={mode_name} mode_value={mode:?} indicator={indicator:?}"
+        );
+
+        let status_bar = StatusBar::new();
+        let line = StatusLineType::Custom("plan_mode".to_string());
+        status_bar.update_line(line.clone(), indicator);
+        let shown = status_bar.get_line(&line);
+
+        assert_eq!(
+            shown.as_deref(),
+            Some(indicator),
+            "invariant: the plan_mode status line must carry the mode \
+             indicator verbatim, since it is the only surface reporting mode. \
+             mode={mode_name} mode_value={mode:?} \
+             indicator={indicator:?} status_line={shown:?}"
+        );
+    }
+}
+
+struct PlanningWriteProbe;
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for PlanningWriteProbe {
+    fn name(&self) -> &str {
+        "write"
+    }
+
+    fn description(&self) -> &str {
+        "probe: execute must not run in Planning"
+    }
+
+    fn input_schema(&self) -> crate::tools::ToolInputSchema {
+        crate::tools::ToolInputSchema::simple(vec![("path", "unused")])
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _context: &crate::tools::ToolContext<'_>,
+    ) -> anyhow::Result<String> {
+        Ok("must-not-execute-in-planning".to_string())
+    }
+}
+
+/// The executor's only `ReplMode` branch *restricts* `Planning`; it does not
+/// waive `AskUser` for write. Grounds the Planning label in the production
+/// execute_tool path rather than in the ReplMode doc comment. The probe is
+/// named `write` so a missed gate fails the assertion instead of opening
+/// `$EDITOR`.
+#[tokio::test]
+async fn test_mode_indicator_planning_executor_restricts_write_instead_of_waiving_approval() {
+    use crate::cli::repl::ReplMode;
+    use crate::tools::{PermissionManager, ToolExecutor, ToolRegistry, ToolUse};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(PlanningWriteProbe));
+    let tempdir = tempfile::tempdir().expect("isolated tool-pattern store for planning gate");
+    let executor = ToolExecutor::new(
+        registry,
+        PermissionManager::new(),
+        tempdir.path().join("patterns.json"),
+    )
+    .expect("construct executor for planning-mode write gate");
+
+    let at = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid timestamp");
+    let planning = Arc::new(RwLock::new(ReplMode::Planning {
+        task: "explore".to_string(),
+        plan_path: std::path::PathBuf::from("/nonexistent/finch-438-plan.md"),
+        created_at: at,
+    }));
+    let tool_use = ToolUse::new(
+        "write".to_string(),
+        serde_json::json!({"path": "src/lib.rs", "content": "must not be written"}),
+    );
+
+    let result = executor
+        .execute_tool(
+            &tool_use,
+            None,
+            None::<fn() -> anyhow::Result<()>>,
+            None,
+            None,
+            None,
+            Some(planning),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("planning restriction returns ToolResult, not a transport error");
+
+    assert!(
+        result.is_error,
+        "invariant: ToolExecutor::execute_tool must reject write in Planning \
+         rather than auto-accepting it. content={:?} is_error={}",
+        result.content, result.is_error
+    );
+    assert!(
+        result.content.contains("not allowed in planning mode"),
+        "invariant: the Planning executor branch must name the mode restriction, \
+         not a permission waiver. content={:?}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("must-not-execute-in-planning"),
+        "invariant: Planning must return before execute, so the write probe \
+         body never runs. content={:?}",
+        result.content
+    );
+}

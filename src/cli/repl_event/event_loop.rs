@@ -4162,14 +4162,26 @@ impl EventLoop {
     fn update_plan_mode_indicator(&self, mode: &ReplMode) {
         use crate::cli::status_bar::StatusLineType;
 
-        let indicator = match mode {
-            ReplMode::Normal => "⏵⏵ accept edits on (shift+tab to cycle)",
-            ReplMode::Planning { .. } => "⏸ plan mode on (shift+tab to cycle)",
-            ReplMode::Executing { .. } => "▶ executing plan (shift+tab disabled)",
-        };
+        self.status_bar.update_line(
+            StatusLineType::Custom("plan_mode".to_string()),
+            plan_mode_indicator(mode),
+        );
+    }
+}
 
-        self.status_bar
-            .update_line(StatusLineType::Custom("plan_mode".to_string()), indicator);
+/// Status-bar text for a REPL mode.
+///
+/// This is the only surface that reports the current mode, so the string must
+/// describe what the mode actually does. `crate::tools::PermissionManager::check_tool_use`
+/// decides every approval and does not take a `ReplMode`. The executor's only
+/// mode branch restricts tools in `Planning`; no variant waives an approval.
+pub(crate) fn plan_mode_indicator(mode: &ReplMode) -> &'static str {
+    match mode {
+        ReplMode::Normal => "⏵ tools require confirmation (shift+tab for plan mode)",
+        ReplMode::Planning { .. } => "⏸ plan mode: inspection tools only (shift+tab to exit)",
+        ReplMode::Executing { .. } => {
+            "▶ executing plan: tools still require confirmation (shift+tab to exit)"
+        }
     }
 }
 
