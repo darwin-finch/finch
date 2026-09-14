@@ -335,7 +335,8 @@ Related design documents, intent rather than evidence:
 [shared program runtime](docs/SHARED_PROGRAM_RUNTIME_PLAN.md),
 [Brain convergence](docs/BRAIN_CONVERGENCE_PLAN.md),
 [VM-native agent runtime](docs/VM_NATIVE_AGENT_RUNTIME_PLAN.md),
-[Finch language design](docs/language/FINCH_LANGUAGE_DESIGN.md).
+[Finch language design](docs/language/FINCH_LANGUAGE_DESIGN.md),
+[ticketing plugins](docs/TICKETING_PLUGINS.md).
 
 ## Open questions
 
