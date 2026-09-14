@@ -217,6 +217,7 @@ impl FileDiff {
                 break;
             }
             let line = raw.trim_end_matches('\r');
+            let in_open_hunk = hunk.as_ref().is_some_and(hunk_body_is_open);
             if let Some(paths) = line.strip_prefix("diff --git ") {
                 if files.len().saturating_add(usize::from(file.is_some())) >= MAX_DIFF_FILES {
                     let current = file.get_or_insert_with(empty_file);
@@ -235,28 +236,30 @@ impl FileDiff {
                 git_header_awaits_file_headers = true;
                 continue;
             }
-            if let Some(path) = line.strip_prefix("--- ") {
-                if !git_header_awaits_file_headers
-                    && file
-                        .as_ref()
-                        .is_some_and(|f| !f.old_path.is_empty() && !f.new_path.is_empty())
-                {
-                    if files.len().saturating_add(1) >= MAX_DIFF_FILES {
-                        let current = file.as_mut().expect("checked existing file");
-                        current.record_elision("additional files omitted at file limit");
-                        current.totals_exact = false;
-                        current.file_count_exact = false;
-                        break;
+            if !in_open_hunk {
+                if let Some(path) = line.strip_prefix("--- ") {
+                    if !git_header_awaits_file_headers
+                        && file
+                            .as_ref()
+                            .is_some_and(|f| !f.old_path.is_empty() && !f.new_path.is_empty())
+                    {
+                        if files.len().saturating_add(1) >= MAX_DIFF_FILES {
+                            let current = file.as_mut().expect("checked existing file");
+                            current.record_elision("additional files omitted at file limit");
+                            current.totals_exact = false;
+                            current.file_count_exact = false;
+                            break;
+                        }
+                        flush_file(&mut files, &mut file, &mut hunk)
                     }
-                    flush_file(&mut files, &mut file, &mut hunk)
+                    file.get_or_insert_with(empty_file).old_path = parse_path(path);
+                    git_header_awaits_file_headers = false;
+                    continue;
                 }
-                file.get_or_insert_with(empty_file).old_path = parse_path(path);
-                git_header_awaits_file_headers = false;
-                continue;
-            }
-            if let Some(path) = line.strip_prefix("+++ ") {
-                file.get_or_insert_with(empty_file).new_path = parse_path(path);
-                continue;
+                if let Some(path) = line.strip_prefix("+++ ") {
+                    file.get_or_insert_with(empty_file).new_path = parse_path(path);
+                    continue;
+                }
             }
             if let Some(path) = line.strip_prefix("rename from ") {
                 file.get_or_insert_with(empty_file).old_path = parse_path(path);
@@ -731,6 +734,28 @@ fn line_ending(value: &str) -> Option<&'static str> {
         None
     }
 }
+fn counted_hunk_lines(hunk: &DiffHunk) -> (usize, usize) {
+    let mut old = 0usize;
+    let mut new = 0usize;
+    for line in &hunk.lines {
+        match line.kind {
+            DiffLineKind::Context => {
+                old = old.saturating_add(1);
+                new = new.saturating_add(1);
+            }
+            DiffLineKind::Remove => old = old.saturating_add(1),
+            DiffLineKind::Add => new = new.saturating_add(1),
+            DiffLineKind::NoNewline => {}
+        }
+    }
+    (old, new)
+}
+
+fn hunk_body_is_open(hunk: &DiffHunk) -> bool {
+    let (old, new) = counted_hunk_lines(hunk);
+    old < hunk.old_count || new < hunk.new_count
+}
+
 fn parse_hunk_header(line: &str) -> Option<DiffHunk> {
     let end = line.get(2..)?.find("@@")? + 2;
     let mut p = line.get(2..end)?.split_whitespace();
@@ -1413,6 +1438,94 @@ mod tests {
             rendered.contains("-- keep totals") && rendered.contains("++ keep totals"),
             "render must show the header-looking lines that re-parsing a unified string would \
              drop; got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_parse_all_keeps_in_hunk_double_dash_and_double_plus_lines() {
+        let old = "SELECT 1;\n-- keep totals\n-- and averages\nSELECT 2;\n";
+        let new = "SELECT 1;\n++ keep totals\n++ and averages\nSELECT 2;\n";
+        let unified = FileDiff::from_texts("q.sql", old, new).to_unified();
+        assert!(
+            unified.contains("--- keep totals") && unified.contains("+++ keep totals"),
+            "fixture must serialize the header-looking lines so parse_all can drop them; got {unified}"
+        );
+
+        let files = FileDiff::parse_all(&unified);
+        assert_eq!(
+            files.len(),
+            1,
+            "in-hunk '--- keep totals' must not start a second file; restoring header-before-hunk \
+             dispatch splits the change and drops the removal. files={files:?} unified={unified}"
+        );
+        let parsed = FileDiff::parse(&unified).unwrap_or_else(|| {
+            panic!("parse must retain the SQL file; unified={unified}");
+        });
+        let lines_of = |kind: DiffLineKind| -> Vec<&str> {
+            parsed
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .filter(|line| line.kind == kind)
+                .map(|line| line.text.as_str())
+                .collect()
+        };
+        let removed = lines_of(DiffLineKind::Remove);
+        let added = lines_of(DiffLineKind::Add);
+        assert!(
+            removed.contains(&"-- keep totals") && removed.contains(&"-- and averages"),
+            "parse(from_texts().to_unified()) must keep removed '-- ' lines; header-before-hunk \
+             dispatch treats '--- keep totals' as a file header and drops the change. \
+             added={} removed={} exact={} complete={} files={} hunks={:?} unified={unified}",
+            parsed.added(),
+            parsed.removed(),
+            parsed.counts_are_exact(),
+            parsed.is_complete(),
+            files.len(),
+            parsed.hunks
+        );
+        assert!(
+            added.contains(&"++ keep totals") && added.contains(&"++ and averages"),
+            "parse(from_texts().to_unified()) must keep added '++ ' lines; header-before-hunk \
+             dispatch treats '+++ keep totals' as a file header and drops the change. \
+             added={} removed={} exact={} complete={} files={} hunks={:?} unified={unified}",
+            parsed.added(),
+            parsed.removed(),
+            parsed.counts_are_exact(),
+            parsed.is_complete(),
+            files.len(),
+            parsed.hunks
+        );
+        assert_eq!(
+            (parsed.added(), parsed.removed()),
+            (2, 2),
+            "replayed counts must include the header-looking lines; added={} removed={} \
+             exact={} complete={} hunks={:?}",
+            parsed.added(),
+            parsed.removed(),
+            parsed.counts_are_exact(),
+            parsed.is_complete(),
+            parsed.hunks
+        );
+        assert!(
+            parsed.counts_are_exact() && parsed.file_count_is_exact() && parsed.is_complete(),
+            "keeping the lines must remain an exact complete view, not a remnant that claims \
+             exactness after dropping them; elided={:?} files={}",
+            parsed.elided,
+            files.len()
+        );
+
+        let from_lines = FileDiff::parse_lines(unified.lines());
+        assert_eq!(
+            from_lines.len(),
+            1,
+            "parse_lines must not split on in-hunk ---; {from_lines:?}"
+        );
+        assert_eq!(
+            (from_lines[0].added(), from_lines[0].removed()),
+            (2, 2),
+            "parse_lines must keep the same header-looking line counts; hunks={:?}",
+            from_lines[0].hunks
         );
     }
 
