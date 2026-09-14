@@ -247,7 +247,8 @@ enum BrainCommand {
     /// List named Brains without hydrating their logs
     #[command(visible_alias = "list")]
     Ls {
-        /// Emit a JSON array of `{name, path}` objects
+        /// Emit a JSON array of Brain summaries (name, path, turns, size,
+        /// attachments, live agents)
         #[arg(long)]
         json: bool,
     },
@@ -3262,24 +3263,46 @@ fn list_named_brains(
     json: bool,
     out: &mut impl Write,
 ) -> Result<()> {
-    let names = store.list_names_unhydrated();
+    let summaries = store.list_summaries_unhydrated();
     if json {
-        let entries: Vec<serde_json::Value> = names
-            .into_iter()
-            .map(|name| {
-                let path = store
-                    .root()
-                    .map(|root| root.join(&name).display().to_string());
-                serde_json::json!({ "name": name, "path": path })
-            })
-            .collect();
-        writeln!(out, "{}", serde_json::to_string(&entries)?)?;
+        writeln!(out, "{}", serde_json::to_string(&summaries)?)?;
         return Ok(());
     }
-    for name in names {
-        writeln!(out, "{name}")?;
+    if summaries.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "{:<32} {:>5} {:>8} {:>8} {:>6}",
+        "NAME", "TURNS", "SIZE", "ATTACHED", "AGENTS"
+    )?;
+    for summary in summaries {
+        writeln!(
+            out,
+            "{:<32} {:>5} {:>8} {:>8} {:>6}",
+            summary.name,
+            summary.turns,
+            format_brain_bytes(summary.bytes),
+            summary.attached.len(),
+            summary.agents.len()
+        )?;
     }
     Ok(())
+}
+
+fn format_brain_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.1}G", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1}M", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1}K", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 fn remove_named_brain(
@@ -3643,9 +3666,22 @@ mod tests {
         execute_brain_command(BrainCommand::Ls { json: false }, &store, false, &mut out)
             .expect("list named Brains");
         let text = String::from_utf8(out).expect("utf8");
+        let names: Vec<&str> = text
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
         assert_eq!(
-            text, "alpha\nzeta\n",
-            "text ls must emit sorted names, one per line, ignoring non-directories; got {text:?}"
+            names,
+            ["alpha", "zeta"],
+            "text ls must emit a header then sorted names, ignoring non-directories; got {text:?}"
+        );
+        assert!(
+            text.contains("TURNS")
+                && text.contains("SIZE")
+                && text.contains("ATTACHED")
+                && text.contains("AGENTS"),
+            "text ls must show turns, size, attachments and agents; got {text:?}"
         );
 
         let metadata = store.root().unwrap().join("alpha").join("metadata.json");
@@ -3683,6 +3719,136 @@ mod tests {
             parsed[0]["path"].as_str(),
             Some(expected_path.as_str()),
             "JSON path must be the live Brain directory; got {text}"
+        );
+        assert_eq!(
+            parsed[0]["turns"].as_u64(),
+            Some(0),
+            "an empty Brain directory has no Prompt events; got {text}"
+        );
+        assert_eq!(
+            parsed[0]["bytes"].as_u64(),
+            Some(0),
+            "an empty Brain directory has no files; got {text}"
+        );
+        assert_eq!(
+            parsed[0]["attached"].as_array().map(|items| items.len()),
+            Some(0),
+            "an empty Brain directory has no attachments; got {text}"
+        );
+        assert_eq!(
+            parsed[0]["agents"].as_array().map(|items| items.len()),
+            Some(0),
+            "an empty Brain directory has no live subagents; got {text}"
+        );
+    }
+
+    #[test]
+    fn brain_ls_json_reports_turns_size_attachments_and_live_agents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("brains");
+        let writer = finch::brain::store::BrainStore::with_root("cli-test", Some(root.clone()));
+        writer
+            .push(
+                "busy-brain",
+                "alice",
+                finch::brain::store::BrainEventKind::Prompt {
+                    text: "hello".into(),
+                },
+            )
+            .expect("prompt");
+        writer
+            .push(
+                "busy-brain",
+                "alice",
+                finch::brain::store::BrainEventKind::Prompt {
+                    text: "again".into(),
+                },
+            )
+            .expect("second prompt");
+        let snapshot = writer.snapshot("busy-brain").expect("snapshot");
+        let prompt_seq = snapshot.events.last().expect("prompt event").seq;
+        let attachment = writer
+            .attach(
+                "busy-brain",
+                "alice@box.local",
+                finch::brain::store::AttachmentRole::Driver,
+                None,
+            )
+            .expect("attach");
+        writer
+            .activate_connection(
+                "busy-brain",
+                attachment.attachment_id,
+                attachment.connection_id.expect("connection"),
+            )
+            .expect("activate");
+        writer
+            .start_run(
+                "busy-brain",
+                "alice@box.local",
+                finch::brain::store::BrainRunKind::Subagent,
+                prompt_seq,
+                attachment.attachment_id,
+                finch::brain::store::BrainRunStatus::Running,
+            )
+            .expect("start subagent");
+
+        let store = finch::brain::store::BrainStore::with_root("cli-test", Some(root));
+
+        let mut out = Vec::new();
+        execute_brain_command(BrainCommand::Ls { json: true }, &store, false, &mut out)
+            .expect("list named Brains as JSON");
+        let text = String::from_utf8(out).expect("utf8");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(text.trim()).expect("ls --json must be a JSON array");
+        assert_eq!(parsed.len(), 1, "expected one Brain in {text}");
+        let entry = &parsed[0];
+        assert_eq!(
+            entry["name"].as_str(),
+            Some("busy-brain"),
+            "JSON name: {text}"
+        );
+        assert_eq!(
+            entry["turns"].as_u64(),
+            Some(2),
+            "each Prompt event is one turn; got {text}"
+        );
+        let bytes = entry["bytes"].as_u64().expect("bytes");
+        assert!(
+            bytes > 0,
+            "a Brain with an event log must report a positive size; got {text}"
+        );
+        let attached = entry["attached"].as_array().expect("attached array");
+        assert_eq!(
+            attached.len(),
+            1,
+            "activated driver must appear as attached; got {text}"
+        );
+        assert_eq!(
+            attached[0]["subject"].as_str(),
+            Some("alice@box.local"),
+            "attached subject: {text}"
+        );
+        assert_eq!(
+            attached[0]["role"].as_str(),
+            Some("driver"),
+            "attached role: {text}"
+        );
+        let agents = entry["agents"].as_array().expect("agents array");
+        assert_eq!(
+            agents.len(),
+            1,
+            "a running Subagent run is a live agent; got {text}"
+        );
+        assert_eq!(
+            agents[0]["status"].as_str(),
+            Some("running"),
+            "live agent status: {text}"
+        );
+        assert_eq!(
+            agents[0]["initiated_by"].as_str(),
+            Some("alice@box.local"),
+            "live agent initiator: {text}"
         );
     }
 
