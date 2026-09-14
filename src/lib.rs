@@ -84,16 +84,16 @@ pub mod ipc; // Cap'n Proto IPC layer (CLI ↔ daemon over Unix socket)
 pub mod license;
 /// Compatibility paths for Finch Lisp syntax values and reader functions.
 pub mod lisp {
-    pub use finch_vm::Val;
+    pub use finch_language::Val;
 
     /// Compatibility namespace for Finch Lisp reader functions and spanned values.
     pub mod reader {
-        pub use finch_vm::{parse_math, parse_str, parse_str_spanned, SpannedVal};
+        pub use finch_language::{parse_math, parse_str, parse_str_spanned, SpannedVal};
     }
 
     /// Compatibility namespace for Finch Lisp syntax values.
     pub mod types {
-        pub use finch_vm::Val;
+        pub use finch_language::Val;
     }
 }
 pub mod llms; // Generic LLM abstraction (Phase 1)
@@ -126,5 +126,6 @@ pub mod startup; // Startup phase timing: #364, instrument and reduce
 pub mod theme; // Colour scheme and semantic bands: what a renderer needs, with no config format
 pub mod tools; // Tool execution system
 pub mod training; // Batch training and checkpoints (Phase 2) // Offline Ed25519 commercial license key validation
+pub use finch_language as language; // Source compilation facade; returns ModuleVerified
 pub use finch_vm as vm; // Typed stack IR, verifier, capabilities, and language contracts
 pub(crate) mod workbook; // Bounding a worksheet before calamine materialises it (#282)

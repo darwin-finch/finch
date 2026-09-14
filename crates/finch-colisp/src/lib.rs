@@ -1,7 +1,8 @@
 //! CoLisp reader and compiler for Finch's shared typed stack IR.
 //!
-//! This unpublished frontend crate owns CoLisp source syntax and lowering.
-//! Runtime execution and verification remain behind the `finch-vm` facade.
+//! This unpublished frontend crate owns CoLisp source syntax and translation
+//! into the shared semantic-construction protocol. Runtime execution remains
+//! behind the `finch-vm` facade.
 
 mod frontend;
 mod reader;

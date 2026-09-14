@@ -11,7 +11,7 @@ Everything below is what callers outside this module can reach. Implementation m
 
 ```rust
 /// Compile user/model-entered Co-Forth source text directly into Finch typed stack IR and run the common verifier.
-pub fn compile_forth(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary) -> Result<VerifiedModule, Vec<VmDiagnostic>> { … }
+pub fn compile_forth(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary) -> Result<ModuleVerified, Vec<VmDiagnostic>> { … }
 /// Compile Co-Forth source with additional already-lowered functions available for definition calls, then verify the complete typed module.
-pub fn compile_forth_with_functions(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary, linked_functions: &BTreeMap<String, Function>) -> Result<VerifiedModule, Vec<VmDiagnostic>> { … }
+pub fn compile_forth_with_functions(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary, linked_functions: &BTreeMap<String, Function>) -> Result<ModuleVerified, Vec<VmDiagnostic>> { … }
 ```
