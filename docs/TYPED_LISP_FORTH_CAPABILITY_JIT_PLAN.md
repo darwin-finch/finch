@@ -2711,6 +2711,38 @@ interpreted. Shared evidence-passing generics remain eligible for tier 1; tier 2
 monomorphize layout-dependent or hot evidence/type combinations rather than multiplying code for
 every valid instantiation by default.
 
+### Long-term embeddable native tier
+
+A long-term adoption target is a LuaJIT-like embeddable Finch runtime: small enough to ship inside
+another application, fast to initialize, inexpensive to call, and able to turn hot CoLisp/Co-Forth
+code into native code without requiring the host application to embed the Rust toolchain or Finch's
+Rust implementation. This is a distribution and latency goal, not a claim that Finch will reproduce
+LuaJIT's tracing architecture or current performance.
+
+Cranelift is a practical first native backend and can itself be embedded. It remains the reference
+baseline while language semantics, runtime shims, native metadata, and differential tests stabilize.
+After self-hosting, Finch may add a compact baseline machine-code generator written in CoLisp or
+Co-Forth. Verified typed stack IR, resolved layouts, explicit control edges, and certified ownership
+and effects let that backend encode a deliberately small instruction-selection and register-allocation
+surface instead of rebuilding frontend semantics. The initial target should support one architecture
+and ABI well, fall back to the interpreter for unsupported operations, and expand only from measured
+embedding workloads.
+
+An in-process JIT needs an encoder, relocation/patching support, executable-memory manager, runtime
+shim table, source/trap maps, and cache format; it does not require a general-purpose static linker.
+AOT and standalone-library output additionally need a constrained object writer or integration with
+the platform linker. Finch may eventually provide compact self-hosted implementations of those
+pieces, but ELF, Mach-O, PE/COFF, x86-64, AArch64, unwind formats, and calling conventions are
+separate correctness surfaces. They must remain target modules behind one backend contract rather
+than accumulating target conditionals in the semantic compiler.
+
+The custom backend is successful only if it materially improves cold start, binary size, compile
+latency, deployment simplicity, or hot-code performance over the interpreter/Cranelift combination.
+Cranelift remains an available fallback and differential oracle until the custom backend passes the
+same capability, ownership, exception, cancellation, transaction, and source-origin gates. Native
+code always calls the versioned portable runtime ABI, so replacing a backend never changes the host
+embedding contract.
+
 ### Native ABI and lowering
 
 - Lower verified Finch IR blocks into CLIF blocks and map virtual stack slots to CLIF SSA values.
@@ -2724,7 +2756,7 @@ every valid instantiation by default.
   payload, runtime type identity, and compact provenance envelope without turning every call into a
   source-level `result` value.
 - Lower checked arithmetic with explicit overflow/division side exits according to language policy.
-- Call stable Rust runtime shims for allocation, capability requests, task operations, and complex
+- Call stable portable runtime shims for allocation, capability requests, task operations, and complex
   managed-value operations.
 - Core owners require no tracing safepoints. An explicit tracing-arena owner extension supplies and
   pays for its own declared safepoint/stack-map ABI without changing ordinary frames and owners.
@@ -3083,6 +3115,21 @@ Exit: independent tasks scale across worker threads and state conflicts are expl
 Exit: the JIT is optional, capability-safe, observably faster on selected hot paths, and removable
 without changing language behavior.
 
+### Phase 11: Self-hosted compact native backend
+
+- Freeze the portable backend/runtime-shim contract using the interpreter and Cranelift evidence.
+- Implement one measured architecture/ABI subset in CoLisp or Co-Forth, with interpreter fallback
+  for unsupported verified IR.
+- Add the encoder, relocations, executable-memory manager, source/trap maps, and cache invalidation
+  needed for an in-process JIT before considering a self-hosted object writer.
+- Keep target ABIs and object formats in independent modules and compare generated programs against
+  both the interpreter and Cranelift.
+- Demonstrate a materially smaller or faster C/Go embedding on representative workloads before
+  widening target coverage.
+
+Exit: an application can embed a compact Finch-owned native tier through the unchanged `libfinch`
+ABI, with measured benefit and safe fallback, without depending on Rust or Cranelift at deployment.
+
 ## Testing strategy
 
 Every phase adds tests at the layer where its invariant is enforced:
@@ -3168,6 +3215,9 @@ Every phase adds tests at the layer where its invariant is enforced:
 - interpreter/Lisp-lowering differential tests during migration;
 - interpreter/JIT differential tests when the JIT exists, including handler selection, thrown-value
   provenance, cleanup/unwind paths, `nothrow`, and trap/exception separation;
+- three-way interpreter/Cranelift/self-hosted-backend differential tests for every supported native
+  subset, including relocations, calling conventions, runtime-shim version rejection, W^X transitions,
+  source/trap maps, fallback, cancellation, and cache invalidation;
 - staged-bootstrap tests for canonical manifest/artifact-kind validation, per-module parse boundaries,
   rejection before every module is `ModuleVerified`, unforgeable `StageVerified` publication,
   failed-publication rollback, root/descendant generation pinning across replacement and restart,
