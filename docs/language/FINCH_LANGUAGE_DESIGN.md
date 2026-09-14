@@ -2483,6 +2483,16 @@ Macro execution has explicit fuel, recursion, and allocation limits. Expansion p
 generated forms back to both macro invocation and macro definition. A macro cannot hide effects:
 the expanded IR is what the verifier analyzes.
 
+Finch has no string mixin or `compile(text)` facility. Compile-time code cannot manufacture source
+bytes and ask a frontend to parse them inside the current module; that would create a second parse
+boundary, discard hygiene and binding identity, and move diagnostics onto generated text. The useful
+declaration-composition behavior sometimes called a mixin is expressed by a structured syntax macro
+that returns declaration nodes. It may generate fields, callables, nested declarations, attributes,
+or explicit concept evidence, all of which retain expansion provenance and pass through the normal
+coherence and verification pipeline. Optional `mixin` surface sugar may only invoke that ordinary
+structured macro protocol; it is not inheritance, textual member injection, or another expansion
+engine. Runtime composition remains record embedding, delegation, and concept evidence.
+
 The S-expression is the visible structural notation, while `Syntax` is the compiler-facing value.
 An identifier syntax object carries its spelling, scope marks, phase, source origin, and eventually
 its resolved binding identity; destructuring or taking the head/tail of syntax must not discard that
@@ -4116,7 +4126,8 @@ Every phase adds tests at the layer where its invariant is enforced:
   evidence identities, and runtime-factory tests;
 - derive-macro tests proving generated explicit concept evidence, hygienic same-named operations,
   concept-qualified static selection, named same-concept ambiguity resolution, and equivalent
-  `dyn` evidence-table dispatch;
+  `dyn` evidence-table dispatch, plus rejection of generated-source reparsing/string mixins and
+  provenance-preserving structured declaration composition;
 - record-layout tests for native/C/versioned-stable representations, opaque boundaries, inline and
   owned placement of the same record type, one-step safe `.` projection, and rejection of raw or
   ambiguous automatic dereference;
