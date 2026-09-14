@@ -3358,6 +3358,55 @@ embedding contract.
 - Preserve cancellation/fuel polling at verified loop and call boundaries.
 - Follow the platform ABI; do not permanently reserve a global error register.
 
+### Future tensor and accelerator lowering
+
+Finch should eventually make efficient matrix/tensor kernels expressible through ordinary CoLisp
+and Co-Forth concepts, macros, CTFE, and law evidence rather than introducing a Python-hosted side
+language. The target is scripting-level expression with systems-level control when requested:
+shape inference, fusion, tiling, vectorization, memory placement, transfer, synchronization, and
+specialized native kernels remain inspectable semantic objects.
+
+Do not lower matrix expressions immediately into opaque library calls or scalar stack operations.
+Retain a bounded parametric tensor/kernel HIR until shapes, element types, layouts, algebra evidence,
+target features, and scheduling choices are known. A macro constructs typed semantic nodes through
+the public compiler protocol; it never emits source text, PTX, or unchecked native bytes. A selected
+schedule then lowers into an accelerator kernel region under the Finch IR/verifier boundary. That
+region explicitly records:
+
+- logical iteration and reduction domains, static dimensions, and guarded dynamic dimensions;
+- tensor layout/stride evidence and host, device-global, device-shared, and register address spaces;
+- ownership and aliasing of buffers, transfers, views, and temporary storage;
+- workgroup/lane mapping, barriers, atomics, asynchronous copies, and divergent control flow;
+- required device capabilities, resource limits, exceptional/trap behavior, and source origins.
+
+The accelerator verifier proves bounds or retains guards, rejects cross-space pointer confusion,
+checks barrier convergence and shared-memory lifetimes, and validates that host/device effects remain
+inside the granted capability profile. Kernel execution is an explicit effect; an optimizer cannot
+silently move a computation to a device when transfer, precision, failure, or scheduling would be
+observable.
+
+Certified algebraic evidence may drive rewrites before scheduling. Linearity can permit map/reduction
+fusion and distribution; associativity can permit reduction trees; identity and annihilator laws can
+remove work; Hermitian/unitary refinements can select specialized algorithms. The preceding proof
+rules still apply: an unchecked law declaration never authorizes a semantic rewrite, and strict
+floating-point or checked-arithmetic behavior forbids transformations that change rounding or traps.
+
+Scheduling is a replaceable compile-time policy rather than semantics. Standard-library policies may
+choose tiles, warps/workgroups, vector widths, shared-memory staging, and pipelining from target and
+shape evidence. Expert code can provide an explicit schedule or lower-level kernel operations.
+Autotuning evaluates only already-verified semantically equivalent candidates under bounded budgets,
+then caches the choice by IR, shape/layout constraints, device/driver features, numeric policy, and
+compiler version. Dynamic inputs use guards and safe fallback rather than compiling an unbounded
+specialization set.
+
+Initial backends should reuse an established GPU toolchain or portable device format and retain a
+CPU interpreter/Cranelift oracle. A compact self-hosted backend may later emit one GPU instruction
+set directly, but backend replacement must not change kernel semantics or capability enforcement.
+Claiming parity with or replacement of a mature tiled-kernel system requires differential numerical
+tests, race/bounds diagnostics, profiler/source mapping, representative model kernels, competitive
+compile latency and throughput, and measured portability across supported devices. The nearer goal
+is a clean Finch kernel substrate on which those results can be earned.
+
 ### Errors and deoptimization
 
 Every native code range maps to module/function/IR offset, Forth origin, Lisp origin, and inline
@@ -3856,6 +3905,10 @@ Every phase adds tests at the layer where its invariant is enforced:
 - three-way interpreter/Cranelift/self-hosted-backend differential tests for every supported native
   subset, including relocations, calling conventions, runtime-shim version rejection, W^X transitions,
   source/trap maps, fallback, cancellation, and cache invalidation;
+- accelerator tests covering shape/layout inference, guarded dynamic dimensions, address-space and
+  alias validation, bounds, barrier convergence, shared-memory lifetime, race diagnostics, law-
+  certified fusion/reduction rewrites, strict-numeric counterexamples, bounded autotuning/cache
+  invalidation, source/profiler mapping, and differential CPU/device results;
 - staged-bootstrap tests for canonical manifest/artifact-kind validation, per-module parse boundaries,
   rejection before every module is `ModuleVerified`, unforgeable `StageVerified` publication,
   failed-publication rollback, root/descendant generation pinning across replacement and restart,
