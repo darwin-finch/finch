@@ -722,8 +722,7 @@ pub(super) async fn refresh_context_strip(
 /// near-identical to every other program because they all share `(`, `say` and
 /// quoting tokens, which is corrosive to a similarity-driven index (#254).
 ///
-/// The source streams while it arrives, then program output replaces it as the
-/// visible turn. The IR row remains inspectable, collapsed. Do not index it.
+/// Do not index the wire source. Memory stores what the turn produced.
 async fn persist_completed_turn_memory(
     memory_system: &crate::memory::MemorySystem,
     conversation: &Arc<RwLock<ConversationHistory>>,
@@ -1505,8 +1504,7 @@ pub(crate) async fn process_query_with_tools(
                         // was raw `(say ...)` source, which shares `(`, `say`
                         // and quoting tokens with every other program, making
                         // all programs near-identical under a lexical
-                        // embedding (#254). IR streams, then output replaces it
-                        // as the visible turn; do not index the source.
+                        // embedding (#254). Do not index the source.
                         persist_completed_turn_memory(
                             mem,
                             &conversation,

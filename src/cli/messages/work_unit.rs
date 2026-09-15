@@ -950,8 +950,6 @@ impl Message for WorkUnit {
                 TranscriptRowKind::Program,
                 format!("Program source ({language})"),
                 lines(&inner.response_text),
-                // Stream IR while it arrives. Once complete, stay collapsed so
-                // program output can replace it as the turn's visible item.
                 inner.status == MessageStatus::InProgress,
             ),
             WorkUnitPresentation::ProgramOutput { title } => (
