@@ -48,6 +48,7 @@ use super::menu::{Menu, MenuOption};
 use super::output_manager::OutputManager;
 use super::status_bar::StatusBar;
 use super::tui::TuiRenderer;
+use crate::cli::repl_event::plan_handler::{is_tool_allowed_in_mode, PLANNING_ALLOWED_TOOLS};
 
 // Phase 3.5: Import output macros for global output routing
 use crate::output_status;
@@ -107,19 +108,27 @@ fn apply_repl_always_allow_tools(permissions: &mut PermissionManager) {
     }
 }
 
+/// Compatibility spellings the owner REPL registers for dispatch, mapped to
+/// the canonical registered name. Aliases are dispatch-only and never appear
+/// in provider manifests (`ToolRegistry::definitions`).
+pub(crate) const REPL_TOOL_ALIASES: &[(&str, &str)] = &[
+    ("search_vm_vocabulary", "search_word"),
+    ("inspect_vm_word", "inspect_word"),
+    ("search_vocabulary", "search_word"),
+    ("inspect_program", "inspect_word"),
+    ("EnterPlanMode", "enter_plan_mode"),
+    ("PresentPlan", "present_plan"),
+    ("AskUserQuestion", "ask_user_question"),
+    ("TodoWrite", "todo_write"),
+    ("TodoRead", "todo_read"),
+    // Legacy conversations and compacted history can carry "Bash" tool calls
+    // (see `conversation_compactor`); register the spelling so dispatch and
+    // the planning gate resolve it like any other alias (#465).
+    ("Bash", "bash"),
+];
+
 fn register_repl_tool_aliases(registry: &mut ToolRegistry) {
-    const ALIASES: &[(&str, &str)] = &[
-        ("search_vm_vocabulary", "search_word"),
-        ("inspect_vm_word", "inspect_word"),
-        ("search_vocabulary", "search_word"),
-        ("inspect_program", "inspect_word"),
-        ("EnterPlanMode", "enter_plan_mode"),
-        ("PresentPlan", "present_plan"),
-        ("AskUserQuestion", "ask_user_question"),
-        ("TodoWrite", "todo_write"),
-        ("TodoRead", "todo_read"),
-    ];
-    for (alias, canonical) in ALIASES {
+    for (alias, canonical) in REPL_TOOL_ALIASES {
         if registry.has_tool(canonical) {
             registry.register_alias(*alias, *canonical);
         }
@@ -1720,16 +1729,17 @@ impl Repl {
                 }
 
                 // Check mode-based permissions first
-                if !Self::is_tool_allowed_in_mode(&tool_use.name, &self.mode) {
+                if !is_tool_allowed_in_mode(&tool_use.name, &self.mode) {
                     use crate::tools::ToolResult;
                     let error_result = ToolResult::error(
                         tool_use.id.clone(),
                         format!(
                             "Tool '{}' is not allowed in planning mode.\n\
                              Reason: This tool can modify system state.\n\
-                             Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
+                             Available tools: {}\n\
                              Type /approve to execute your plan with all tools enabled.",
-                            tool_use.name
+                            tool_use.name,
+                            PLANNING_ALLOWED_TOOLS.join(", ")
                         ),
                     );
                     tool_results.push(error_result);
@@ -2923,35 +2933,6 @@ impl Repl {
     }
 
     /// Extract directory from a context string
-    /// Check if tool is allowed in current mode
-    fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool {
-        match mode {
-            ReplMode::Normal | ReplMode::Executing { .. } => {
-                // All tools allowed (subject to normal confirmation)
-                true
-            }
-            ReplMode::Planning { .. } => {
-                // Inspection tools + plan completion tools allowed
-                matches!(
-                    tool_name,
-                    "read"
-                        | "glob"
-                        | "grep"
-                        | "web_fetch"
-                        | "bash"
-                        | "Bash"
-                        | "present_plan"
-                        | "PresentPlan"
-                        | "ask_user_question"
-                        | "AskUserQuestion"
-                        | "enter_plan_mode"
-                        | "EnterPlanMode"
-                        | "ExitPlanMode"
-                )
-            }
-        }
-    }
-
     fn get_dir_from_context(context: &str) -> String {
         // For "reading /path/to/file.txt", return "/path/to"
         if let Some(last_slash) = context.rfind('/') {
