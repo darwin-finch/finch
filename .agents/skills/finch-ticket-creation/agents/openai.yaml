@@ -1,0 +1,7 @@
+interface:
+  display_name: "Finch Ticket Creator"
+  short_description: "Turn Finch bug reports into actionable tickets"
+  default_prompt: "Use $finch-ticket-creation to turn this Finch problem into a deduplicated, evidence-based ticket draft."
+
+policy:
+  allow_implicit_invocation: true

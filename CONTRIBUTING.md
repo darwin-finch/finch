@@ -4,8 +4,9 @@ Thank you for improving Finch. The project accepts focused fixes, tests, documen
 discussion. Before starting a large change, open or join an issue so implementation and conformance
 work can be coordinated.
 
-Codex contributors can invoke `$finch-backlog`, and Claude Code contributors can invoke
-`/finch-backlog`, to audit the current GitHub dependency frontier and carry an issue through an
+Codex contributors can invoke `$finch-implement-ticket` for an accepted ticket, or
+`$finch-backlog-autonomous` to triage and replenish multiple workers. Claude Code contributors can
+invoke the corresponding slash commands. The implementation workflow carries an issue through an
 isolated worktree, regression, review, CI, merge evidence, and cleanup. The canonical skill lives in
 `.agents/skills/finch-backlog`; `.claude/skills/finch-backlog` links to the same directory so both
 tools use one reviewable workflow rather than private or duplicated assistant configuration.

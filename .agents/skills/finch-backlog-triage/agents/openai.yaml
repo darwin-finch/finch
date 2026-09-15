@@ -1,0 +1,7 @@
+interface:
+  display_name: "Finch Backlog Triage"
+  short_description: "Prepare a dependency- and scope-aware Finch queue"
+  default_prompt: "Use $finch-backlog-triage to groom Finch issues and produce the next safe worker queue."
+
+policy:
+  allow_implicit_invocation: true

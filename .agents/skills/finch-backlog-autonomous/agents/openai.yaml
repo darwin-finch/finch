@@ -1,0 +1,7 @@
+interface:
+  display_name: "Finch Autonomous Backlog"
+  short_description: "Keep a bounded Finch worker pool replenished"
+  default_prompt: "Use $finch-backlog-autonomous to triage Finch and keep N safe ticket workers busy until the queue is exhausted or blocked."
+
+policy:
+  allow_implicit_invocation: true

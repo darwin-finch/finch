@@ -34,6 +34,13 @@ Parallelize independent tasks when that reduces elapsed time. Use the compact pa
 investigation, or send the whole conversation. Workers return findings and proof, not exploration
 logs. The coordinator continues useful independent work while workers run.
 
+Use a replenishing pool, not fixed waves: keep at most `N` workers active, dispatch the next
+dependency-eligible ticket as soon as any worker returns, and refresh the poset after an accepted
+integration or any change to blocker state. A dependency wave is an ordering constraint, not a
+barrier. Do not wait for the slowest worker when another ticket is eligible and the pool has room.
+If a worker fails, keep its slot accounted for until its claim is released or handed off; do not
+silently reuse its worktree or dispatch overlapping scope.
+
 ## Test once at the narrowest sufficient level
 
 Run the smallest relevant local gate first and broaden only when risk or repository rules require
