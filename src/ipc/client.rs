@@ -32,9 +32,9 @@ pub struct BrainRunnerBootstrap {
 }
 
 pub struct BrainSubmissionResult {
-    pub accepted: crate::brain::store::BrainEvent,
-    pub run: Option<crate::brain::store::BrainRun>,
-    pub result: Option<crate::brain::store::BrainEvent>,
+    pub accepted: crate::brain::BrainEvent,
+    pub run: Option<crate::brain::BrainRun>,
+    pub result: Option<crate::brain::BrainEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ impl IpcClient {
     pub(crate) async fn register_test_brain_runner_client(
         &self,
         brain: &str,
-        lease_id: crate::brain::store::RunnerLeaseId,
+        lease_id: crate::brain::RunnerLeaseId,
         runner: brain_runner::Client,
     ) -> Result<()> {
         let mut request = self.client.register_brain_runner_request();
@@ -211,7 +211,7 @@ impl IpcClient {
         Ok(reply.get()?.get_service()?)
     }
 
-    pub async fn brain_snapshot(&self, brain: &str) -> Result<crate::brain::store::BrainSnapshot> {
+    pub async fn brain_snapshot(&self, brain: &str) -> Result<crate::brain::BrainSnapshot> {
         let service = self.brain_service().await?;
         let mut request = service.snapshot_request();
         request.get().set_brain(brain);
@@ -222,8 +222,8 @@ impl IpcClient {
     pub async fn brain_inspect_run(
         &self,
         brain: &str,
-        run_id: crate::brain::store::RunId,
-    ) -> Result<crate::brain::store::BrainRun> {
+        run_id: crate::brain::RunId,
+    ) -> Result<crate::brain::BrainRun> {
         let service = self.brain_service().await?;
         let mut request = service.inspect_run_request();
         request.get().set_brain(brain);
@@ -235,9 +235,9 @@ impl IpcClient {
     pub async fn brain_cancel_run(
         &self,
         brain: &str,
-        attachment: &crate::brain::store::BrainAttachment,
-        run_id: crate::brain::store::RunId,
-    ) -> Result<crate::brain::store::BrainRun> {
+        attachment: &crate::brain::BrainAttachment,
+        run_id: crate::brain::RunId,
+    ) -> Result<crate::brain::BrainRun> {
         let connection_id = attachment
             .connection_id
             .context("Brain attachment has no live connection")?;
@@ -258,14 +258,14 @@ impl IpcClient {
     pub async fn brain_create_schedule(
         &self,
         brain: &str,
-        attachment: &crate::brain::store::BrainAttachment,
-        language: crate::brain::store::ProgramLanguage,
+        attachment: &crate::brain::BrainAttachment,
+        language: crate::brain::ProgramLanguage,
         source: &str,
         grant_ceiling: &crate::vm::EffectSet,
         next_due_ms: u64,
         interval_ms: Option<u64>,
-        delivery_policy: &crate::brain::store::BrainScheduleDeliveryPolicy,
-    ) -> Result<crate::brain::store::BrainSchedule> {
+        delivery_policy: &crate::brain::BrainScheduleDeliveryPolicy,
+    ) -> Result<crate::brain::BrainSchedule> {
         let connection_id = attachment
             .connection_id
             .context("Brain attachment has no live connection")?;
@@ -277,12 +277,8 @@ impl IpcClient {
             params.set_attachment_id(&attachment.attachment_id.0.to_string());
             params.set_connection_id(&connection_id.0.to_string());
             params.set_language(match language {
-                crate::brain::store::ProgramLanguage::Forth => {
-                    finch_ipc_capnp::ProgramLanguage::Forth
-                }
-                crate::brain::store::ProgramLanguage::Lisp => {
-                    finch_ipc_capnp::ProgramLanguage::Lisp
-                }
+                crate::brain::ProgramLanguage::Forth => finch_ipc_capnp::ProgramLanguage::Forth,
+                crate::brain::ProgramLanguage::Lisp => finch_ipc_capnp::ProgramLanguage::Lisp,
             });
             params.set_source(source);
             crate::ipc::checkpoint_codec::encode_effects(
@@ -298,10 +294,10 @@ impl IpcClient {
             }
             let mut policy = params.reborrow().init_policy();
             match delivery_policy {
-                crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce => {
+                crate::brain::BrainScheduleDeliveryPolicy::Coalesce => {
                     policy.set_kind(finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce)
                 }
-                crate::brain::store::BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                crate::brain::BrainScheduleDeliveryPolicy::BoundedCatchUp {
                     max_catch_up,
                     expires_after_ms,
                 } => {
@@ -318,8 +314,8 @@ impl IpcClient {
     pub async fn brain_inspect_schedule(
         &self,
         brain: &str,
-        schedule_id: crate::brain::store::ScheduleId,
-    ) -> Result<Option<crate::brain::store::BrainSchedule>> {
+        schedule_id: crate::brain::ScheduleId,
+    ) -> Result<Option<crate::brain::BrainSchedule>> {
         let service = self.brain_service().await?;
         let mut request = service.inspect_schedule_request();
         request.get().set_brain(brain);
@@ -337,8 +333,8 @@ impl IpcClient {
     pub async fn brain_cancel_schedule(
         &self,
         brain: &str,
-        attachment: &crate::brain::store::BrainAttachment,
-        schedule_id: crate::brain::store::ScheduleId,
+        attachment: &crate::brain::BrainAttachment,
+        schedule_id: crate::brain::ScheduleId,
     ) -> Result<bool> {
         let connection_id = attachment
             .connection_id
@@ -358,9 +354,9 @@ impl IpcClient {
     pub async fn brain_schedule_initialization(
         &self,
         brain: &str,
-        attachment: &crate::brain::store::BrainAttachment,
+        attachment: &crate::brain::BrainAttachment,
         next_due_ms: u64,
-    ) -> Result<crate::brain::store::BrainSchedule> {
+    ) -> Result<crate::brain::BrainSchedule> {
         let connection_id = attachment
             .connection_id
             .context("Brain attachment has no live connection")?;
@@ -381,9 +377,9 @@ impl IpcClient {
         &self,
         brain: &str,
         subject: &str,
-        role: crate::brain::store::AttachmentRole,
-        attachment_id: Option<crate::brain::store::AttachmentId>,
-    ) -> Result<crate::brain::store::BrainAttachment> {
+        role: crate::brain::AttachmentRole,
+        attachment_id: Option<crate::brain::AttachmentId>,
+    ) -> Result<crate::brain::BrainAttachment> {
         let service = self.brain_service().await?;
         let mut request = service.attach_request();
         {
@@ -403,9 +399,9 @@ impl IpcClient {
     pub async fn brain_acknowledge(
         &self,
         brain: &str,
-        attachment: &crate::brain::store::BrainAttachment,
+        attachment: &crate::brain::BrainAttachment,
         seq: u64,
-    ) -> Result<crate::brain::store::BrainAttachment> {
+    ) -> Result<crate::brain::BrainAttachment> {
         let connection_id = attachment
             .connection_id
             .context("Brain attachment has no live connection")?;
@@ -425,7 +421,7 @@ impl IpcClient {
     pub async fn brain_detach(
         &self,
         brain: &str,
-        attachment: &crate::brain::store::BrainAttachment,
+        attachment: &crate::brain::BrainAttachment,
     ) -> Result<()> {
         let connection_id = attachment
             .connection_id
@@ -445,8 +441,8 @@ impl IpcClient {
     pub async fn brain_submit(
         &self,
         brain: &str,
-        attachment: &crate::brain::store::BrainAttachment,
-        kind: crate::brain::store::BrainEventKind,
+        attachment: &crate::brain::BrainAttachment,
+        kind: crate::brain::BrainEventKind,
     ) -> Result<BrainSubmissionResult> {
         let connection_id = attachment
             .connection_id
@@ -482,13 +478,13 @@ impl IpcClient {
     pub async fn brain_start_speculative(
         &self,
         brain: &str,
-        attachment: &crate::brain::store::BrainAttachment,
+        attachment: &crate::brain::BrainAttachment,
         prompt: String,
-    ) -> Result<crate::brain::store::BrainRun> {
+    ) -> Result<crate::brain::BrainRun> {
         self.brain_submit(
             brain,
             attachment,
-            crate::brain::store::BrainEventKind::SpeculativePrompt { text: prompt },
+            crate::brain::BrainEventKind::SpeculativePrompt { text: prompt },
         )
         .await?
         .run
@@ -498,8 +494,8 @@ impl IpcClient {
     pub async fn brain_watch(
         &self,
         brain: &str,
-        attachment: &crate::brain::store::BrainAttachment,
-    ) -> Result<mpsc::UnboundedReceiver<Result<crate::brain::store::BrainWireMessage>>> {
+        attachment: &crate::brain::BrainAttachment,
+    ) -> Result<mpsc::UnboundedReceiver<Result<crate::brain::BrainWireMessage>>> {
         let connection_id = attachment
             .connection_id
             .context("Brain attachment has no live connection")?;
@@ -527,10 +523,10 @@ impl IpcClient {
         &self,
         brain: &str,
         subject: &str,
-        environment: &crate::brain::store::BrainEnvironment,
-        lease_id: Option<crate::brain::store::RunnerLeaseId>,
+        environment: &crate::brain::BrainEnvironment,
+        lease_id: Option<crate::brain::RunnerLeaseId>,
         ttl_ms: u64,
-    ) -> Result<crate::brain::store::BrainRunnerLease> {
+    ) -> Result<crate::brain::BrainRunnerLease> {
         let service = self.brain_service().await?;
         let mut request = service.acquire_runner_request();
         {
@@ -559,7 +555,7 @@ impl IpcClient {
     pub async fn brain_release_runner(
         &self,
         brain: &str,
-        lease_id: crate::brain::store::RunnerLeaseId,
+        lease_id: crate::brain::RunnerLeaseId,
     ) -> Result<()> {
         let service = self.brain_service().await?;
         let mut request = service.release_runner_request();
@@ -577,10 +573,10 @@ impl IpcClient {
         brain: &str,
         requested_by: &str,
         target_subject: &str,
-        expected_lease_id: crate::brain::store::RunnerLeaseId,
-        environment: &crate::brain::store::BrainEnvironment,
+        expected_lease_id: crate::brain::RunnerLeaseId,
+        environment: &crate::brain::BrainEnvironment,
         ttl_ms: u64,
-    ) -> Result<crate::brain::store::BrainRunnerHandoff> {
+    ) -> Result<crate::brain::BrainRunnerHandoff> {
         let service = self.brain_service().await?;
         let mut request = service.request_runner_handoff_request();
         {
@@ -600,10 +596,10 @@ impl IpcClient {
         &self,
         brain: &str,
         target_subject: &str,
-        handoff_id: crate::brain::store::RunnerHandoffId,
-        environment: &crate::brain::store::BrainEnvironment,
+        handoff_id: crate::brain::RunnerHandoffId,
+        environment: &crate::brain::BrainEnvironment,
         ttl_ms: u64,
-    ) -> Result<crate::brain::store::BrainRunnerLease> {
+    ) -> Result<crate::brain::BrainRunnerLease> {
         let service = self.brain_service().await?;
         let mut request = service.accept_runner_handoff_request();
         {
@@ -621,7 +617,7 @@ impl IpcClient {
     pub async fn brain_cancel_runner_handoff(
         &self,
         brain: &str,
-        handoff_id: crate::brain::store::RunnerHandoffId,
+        handoff_id: crate::brain::RunnerHandoffId,
         sender: &str,
     ) -> Result<()> {
         let service = self.brain_service().await?;
@@ -658,7 +654,7 @@ impl IpcClient {
     pub async fn register_brain_runner(
         &self,
         brain: &str,
-        lease_id: crate::brain::store::RunnerLeaseId,
+        lease_id: crate::brain::RunnerLeaseId,
         event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
     ) -> Result<BrainRunnerBootstrap> {
         let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl { event_tx });
@@ -970,16 +966,12 @@ impl brain_runner::Server for BrainRunnerImpl {
             .and_then(|value| value.to_str().map_err(anyhow::Error::new))
             .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::new))
         {
-            Ok(run_id) => crate::brain::store::RunId(run_id),
+            Ok(run_id) => crate::brain::RunId(run_id),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let language = match request.get_language() {
-            Ok(finch_ipc_capnp::ProgramLanguage::Forth) => {
-                crate::brain::store::ProgramLanguage::Forth
-            }
-            Ok(finch_ipc_capnp::ProgramLanguage::Lisp) => {
-                crate::brain::store::ProgramLanguage::Lisp
-            }
+            Ok(finch_ipc_capnp::ProgramLanguage::Forth) => crate::brain::ProgramLanguage::Forth,
+            Ok(finch_ipc_capnp::ProgramLanguage::Lisp) => crate::brain::ProgramLanguage::Lisp,
             Err(error) => return Promise::err(error.into()),
         };
         let control = match request.get_control() {
@@ -1006,10 +998,10 @@ impl brain_runner::Server for BrainRunnerImpl {
                             {
                                 let mut params = call.get();
                                 params.set_language(match language {
-                                    crate::brain::store::ProgramLanguage::Forth => {
+                                    crate::brain::ProgramLanguage::Forth => {
                                         finch_ipc_capnp::ProgramLanguage::Forth
                                     }
-                                    crate::brain::store::ProgramLanguage::Lisp => {
+                                    crate::brain::ProgramLanguage::Lisp => {
                                         finch_ipc_capnp::ProgramLanguage::Lisp
                                     }
                                 });
@@ -1027,12 +1019,12 @@ impl brain_runner::Server for BrainRunnerImpl {
                                 }
                                 let mut policy = params.reborrow().init_policy();
                                 match delivery_policy {
-                                    crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce => {
+                                    crate::brain::BrainScheduleDeliveryPolicy::Coalesce => {
                                         policy.set_kind(
                                             finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce,
                                         );
                                     }
-                                    crate::brain::store::BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                                    crate::brain::BrainScheduleDeliveryPolicy::BoundedCatchUp {
                                         max_catch_up,
                                         expires_after_ms,
                                     } => {
@@ -1194,7 +1186,7 @@ impl brain_runner::Server for BrainRunnerImpl {
             .and_then(|value| value.to_str().map_err(anyhow::Error::new))
             .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::new))
         {
-            Ok(run_id) => crate::brain::store::RunId(run_id),
+            Ok(run_id) => crate::brain::RunId(run_id),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let context = match request
@@ -1279,10 +1271,10 @@ impl brain_runner::Server for BrainRunnerImpl {
                 Ok(response) => {
                     result.set_source(&response.source);
                     result.set_language(match response.language {
-                        crate::brain::store::ProgramLanguage::Forth => {
+                        crate::brain::ProgramLanguage::Forth => {
                             finch_ipc_capnp::ProgramLanguage::Forth
                         }
-                        crate::brain::store::ProgramLanguage::Lisp => {
+                        crate::brain::ProgramLanguage::Lisp => {
                             finch_ipc_capnp::ProgramLanguage::Lisp
                         }
                     });
@@ -1343,7 +1335,7 @@ impl brain_runner::Server for BrainRunnerImpl {
             .and_then(|value| value.to_str().map_err(anyhow::Error::new))
             .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::new))
         {
-            Ok(run_id) => crate::brain::store::RunId(run_id),
+            Ok(run_id) => crate::brain::RunId(run_id),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -1401,7 +1393,7 @@ impl brain_runner::Server for BrainRunnerImpl {
             .map_err(anyhow::Error::new)
             .and_then(parse_uuid)
         {
-            Ok(value) => crate::brain::store::BrainId(value),
+            Ok(value) => crate::brain::BrainId(value),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let run_id = match request
@@ -1409,7 +1401,7 @@ impl brain_runner::Server for BrainRunnerImpl {
             .map_err(anyhow::Error::new)
             .and_then(parse_uuid)
         {
-            Ok(value) => crate::brain::store::RunId(value),
+            Ok(value) => crate::brain::RunId(value),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let text = |value: capnp::Result<capnp::text::Reader<'_>>| {
@@ -1541,7 +1533,7 @@ pub(crate) fn encode_brain_turn_event(
 // ---------------------------------------------------------------------------
 
 struct BrainWireReceiverImpl {
-    tx: mpsc::UnboundedSender<Result<crate::brain::store::BrainWireMessage>>,
+    tx: mpsc::UnboundedSender<Result<crate::brain::BrainWireMessage>>,
 }
 
 impl brain_wire_receiver::Server for BrainWireReceiverImpl {
@@ -1569,17 +1561,15 @@ struct StreamReceiverImpl {
 }
 
 fn attachment_role_to_capnp(
-    role: crate::brain::store::AttachmentRole,
+    role: crate::brain::AttachmentRole,
 ) -> finch_ipc_capnp::BrainAttachmentRole {
     match role {
-        crate::brain::store::AttachmentRole::Runner => finch_ipc_capnp::BrainAttachmentRole::Runner,
-        crate::brain::store::AttachmentRole::Driver => finch_ipc_capnp::BrainAttachmentRole::Driver,
-        crate::brain::store::AttachmentRole::Consultant => {
+        crate::brain::AttachmentRole::Runner => finch_ipc_capnp::BrainAttachmentRole::Runner,
+        crate::brain::AttachmentRole::Driver => finch_ipc_capnp::BrainAttachmentRole::Driver,
+        crate::brain::AttachmentRole::Consultant => {
             finch_ipc_capnp::BrainAttachmentRole::Consultant
         }
-        crate::brain::store::AttachmentRole::Observer => {
-            finch_ipc_capnp::BrainAttachmentRole::Observer
-        }
+        crate::brain::AttachmentRole::Observer => finch_ipc_capnp::BrainAttachmentRole::Observer,
     }
 }
 
@@ -2071,14 +2061,10 @@ mod tests {
     }
 
     struct BlockingBrainRunner {
-        started:
-            std::cell::RefCell<Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>>,
+        started: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<crate::brain::RunId>>>,
         cancellations: std::rc::Rc<
             std::cell::RefCell<
-                std::collections::HashMap<
-                    crate::brain::store::RunId,
-                    tokio::sync::oneshot::Sender<()>,
-                >,
+                std::collections::HashMap<crate::brain::RunId, tokio::sync::oneshot::Sender<()>>,
             >,
         >,
     }
@@ -2100,7 +2086,7 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| uuid::Uuid::parse_str(value).ok())
             {
-                Some(run_id) => crate::brain::store::RunId(run_id),
+                Some(run_id) => crate::brain::RunId(run_id),
                 None => return Promise::err(capnp::Error::failed("invalid run id".into())),
             };
             let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
@@ -2142,7 +2128,7 @@ mod tests {
                 .ok()
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                .map(crate::brain::store::RunId);
+                .map(crate::brain::RunId);
             let cancelled = run_id
                 .and_then(|run_id| self.cancellations.borrow_mut().remove(&run_id))
                 .is_some_and(|cancel| cancel.send(()).is_ok());
@@ -2219,7 +2205,7 @@ mod tests {
                 .brain_attach(
                     &brain,
                     "smoke@localhost",
-                    crate::brain::store::AttachmentRole::Driver,
+                    crate::brain::AttachmentRole::Driver,
                     None,
                 )
                 .await
@@ -2230,7 +2216,7 @@ mod tests {
                 .expect("fresh daemon event watch timed out")
                 .expect("fresh daemon event watch closed")
                 .expect("fresh daemon event watch failed");
-            let crate::brain::store::BrainWireMessage::Snapshot { brain: watched } = initial else {
+            let crate::brain::BrainWireMessage::Snapshot { brain: watched } = initial else {
                 panic!("fresh daemon watch did not start with a snapshot");
             };
             assert_eq!(watched.brain_id, snapshot.brain_id);
@@ -2274,7 +2260,7 @@ mod tests {
                     .brain_attach(
                         &brain,
                         "smoke@localhost",
-                        crate::brain::store::AttachmentRole::Driver,
+                        crate::brain::AttachmentRole::Driver,
                         Some(attachment_id),
                     )
                     .await
@@ -2299,7 +2285,7 @@ mod tests {
                 .expect("replacement event watch timed out")
                 .expect("replacement event watch closed")
                 .expect("replacement event watch failed");
-            let crate::brain::store::BrainWireMessage::Snapshot { brain: resumed } = resumed else {
+            let crate::brain::BrainWireMessage::Snapshot { brain: resumed } = resumed else {
                 panic!("replacement watch did not start with a snapshot");
             };
             assert_eq!(resumed.brain_id, snapshot.brain_id);
@@ -2336,7 +2322,7 @@ mod tests {
                 .brain_attach(
                     &brain,
                     "codex-smoke@localhost",
-                    crate::brain::store::AttachmentRole::Driver,
+                    crate::brain::AttachmentRole::Driver,
                     None,
                 )
                 .await
@@ -2347,7 +2333,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            let crate::brain::store::BrainWireMessage::Snapshot { brain: initial } = initial else {
+            let crate::brain::BrainWireMessage::Snapshot { brain: initial } = initial else {
                 panic!("Brain watch did not begin with a snapshot");
             };
             assert_eq!(initial.brain_id, snapshot.brain_id);
@@ -2356,7 +2342,7 @@ mod tests {
                 .brain_submit(
                     &brain,
                     &attachment,
-                    crate::brain::store::BrainEventKind::ParticipantMessage {
+                    crate::brain::BrainEventKind::ParticipantMessage {
                         text: "human-only collaboration message".into(),
                     },
                 )
@@ -2371,9 +2357,9 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 relayed,
-                crate::brain::store::BrainWireMessage::Event {
-                    event: crate::brain::store::BrainEvent {
-                        kind: crate::brain::store::BrainEventKind::ParticipantMessage { ref text },
+                crate::brain::BrainWireMessage::Event {
+                    event: crate::brain::BrainEvent {
+                        kind: crate::brain::BrainEventKind::ParticipantMessage { ref text },
                         ..
                     }
                 } if text == "human-only collaboration message"
@@ -2383,7 +2369,7 @@ mod tests {
                 .brain_submit(
                     &brain,
                     &attachment,
-                    crate::brain::store::BrainEventKind::Prompt {
+                    crate::brain::BrainEventKind::Prompt {
                         text: "queue this smoke-test turn".into(),
                     },
                 )
@@ -2391,7 +2377,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 outcome.run.as_ref().map(|run| run.status),
-                Some(crate::brain::store::BrainRunStatus::QueuedForEnvironment)
+                Some(crate::brain::BrainRunStatus::QueuedForEnvironment)
             );
             assert!(outcome.result.is_none());
             assert!(outcome.accepted.seq > relay.accepted.seq);
@@ -2402,10 +2388,7 @@ mod tests {
                 .brain_cancel_run(&brain, &attachment, run.run_id)
                 .await
                 .unwrap();
-            assert_eq!(
-                cancelled.status,
-                crate::brain::store::BrainRunStatus::Cancelled
-            );
+            assert_eq!(cancelled.status, crate::brain::BrainRunStatus::Cancelled);
             let acknowledged = client
                 .brain_acknowledge(&brain, &attachment, outcome.accepted.seq)
                 .await
@@ -2435,7 +2418,7 @@ mod tests {
                 .brain_attach(
                     &brain,
                     "codex-cancel@localhost",
-                    crate::brain::store::AttachmentRole::Driver,
+                    crate::brain::AttachmentRole::Driver,
                     None,
                 )
                 .await
@@ -2478,8 +2461,8 @@ mod tests {
                     .brain_submit(
                         &submit_brain,
                         &submit_attachment,
-                        crate::brain::store::BrainEventKind::Program {
-                            language: crate::brain::store::ProgramLanguage::Lisp,
+                        crate::brain::BrainEventKind::Program {
+                            language: crate::brain::ProgramLanguage::Lisp,
                             source: "(say \"this must not complete\")".into(),
                         },
                     )
@@ -2493,10 +2476,7 @@ mod tests {
                 .brain_cancel_run(&brain, &attachment, run_id)
                 .await
                 .unwrap();
-            assert_eq!(
-                cancelled.status,
-                crate::brain::store::BrainRunStatus::Cancelled
-            );
+            assert_eq!(cancelled.status, crate::brain::BrainRunStatus::Cancelled);
             let outcome = submission.await.unwrap().unwrap();
             assert_eq!(outcome.run.unwrap().run_id, run_id);
             assert_eq!(
@@ -2505,7 +2485,7 @@ mod tests {
                     .await
                     .unwrap()
                     .status,
-                crate::brain::store::BrainRunStatus::Cancelled
+                crate::brain::BrainRunStatus::Cancelled
             );
             client
                 .brain_release_runner(&brain, lease.lease_id)
@@ -2580,7 +2560,7 @@ mod tests {
                 .brain_attach(
                     &brain,
                     "owner/attachment-authority",
-                    crate::brain::store::AttachmentRole::Driver,
+                    crate::brain::AttachmentRole::Driver,
                     None,
                 )
                 .await
@@ -2594,14 +2574,14 @@ mod tests {
                     .unwrap();
             assert!(matches!(
                 initial,
-                crate::brain::store::BrainWireMessage::Snapshot { .. }
+                crate::brain::BrainWireMessage::Snapshot { .. }
             ));
 
             assert!(intruder
                 .brain_submit(
                     &brain,
                     &attachment,
-                    crate::brain::store::BrainEventKind::ParticipantMessage {
+                    crate::brain::BrainEventKind::ParticipantMessage {
                         text: "forged message".into(),
                     },
                 )
@@ -2624,7 +2604,7 @@ mod tests {
                 .brain_submit(
                     &brain,
                     &attachment,
-                    crate::brain::store::BrainEventKind::ParticipantMessage {
+                    crate::brain::BrainEventKind::ParticipantMessage {
                         text: "owner message".into(),
                     },
                 )

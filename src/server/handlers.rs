@@ -196,8 +196,8 @@ fn authorize_named_brain(
     server: &AgentServer,
     headers: &HeaderMap,
     name: &str,
-    scope: crate::brain::credential::BrainCredentialScope,
-) -> Result<crate::brain::credential::BrainCredentialClaims, Response> {
+    scope: crate::brain::BrainCredentialScope,
+) -> Result<crate::brain::BrainCredentialClaims, Response> {
     let token = bearer_token(headers).ok_or_else(|| {
         brain_auth_error(StatusCode::UNAUTHORIZED, "scoped Brain credential required")
     })?;
@@ -222,12 +222,12 @@ fn authorize_named_brain(
 
 pub(crate) fn authorize_pending_remote_attachment(
     lifecycle: &crate::server::BrainLifecycleService,
-    credentials: &crate::brain::credential::BrainCredentialAuthority,
+    credentials: &crate::brain::BrainCredentialAuthority,
     headers: &HeaderMap,
     name: &str,
-    attachment_id: crate::brain::store::AttachmentId,
-    connection_id: crate::brain::store::ConnectionId,
-) -> Result<crate::brain::credential::BrainCredentialClaims, Response> {
+    attachment_id: crate::brain::AttachmentId,
+    connection_id: crate::brain::ConnectionId,
+) -> Result<crate::brain::BrainCredentialClaims, Response> {
     let token = bearer_token(headers).ok_or_else(|| {
         brain_auth_error(StatusCode::UNAUTHORIZED, "scoped Brain credential required")
     })?;
@@ -242,7 +242,7 @@ pub(crate) fn authorize_pending_remote_attachment(
             snapshot.brain_id,
             name,
             snapshot.environment.generation,
-            crate::brain::credential::BrainCredentialScope::BrainRead,
+            crate::brain::BrainCredentialScope::BrainRead,
         )
         .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
     let attachment = lifecycle
@@ -260,15 +260,15 @@ const MAX_BRAIN_INVITATION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 #[derive(Debug, Deserialize)]
 struct IssueNamedBrainCredentialRequest {
     subject: String,
-    role: crate::brain::store::AttachmentRole,
-    scopes: Option<std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope>>,
+    role: crate::brain::AttachmentRole,
+    scopes: Option<std::collections::BTreeSet<crate::brain::BrainCredentialScope>>,
     ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct IssueNamedBrainCredentialResponse {
     token: String,
-    claims: crate::brain::credential::BrainCredentialClaims,
+    claims: crate::brain::BrainCredentialClaims,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,15 +279,15 @@ struct RevokeDelegatedNamedBrainCredentialRequest {
 
 #[derive(Debug, Deserialize)]
 struct IssueNamedBrainInvitationRequest {
-    role: crate::brain::store::AttachmentRole,
-    scopes: Option<std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope>>,
+    role: crate::brain::AttachmentRole,
+    scopes: Option<std::collections::BTreeSet<crate::brain::BrainCredentialScope>>,
     ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct IssueNamedBrainInvitationResponse {
     invitation: String,
-    claims: crate::brain::credential::BrainInvitationClaims,
+    claims: crate::brain::BrainInvitationClaims,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,8 +297,8 @@ struct RedeemNamedBrainInvitationRequest {
 }
 
 fn claims_match_attachment(
-    claims: &crate::brain::credential::BrainCredentialClaims,
-    attachment: &crate::brain::store::BrainAttachment,
+    claims: &crate::brain::BrainCredentialClaims,
+    attachment: &crate::brain::BrainAttachment,
 ) -> Result<(), Response> {
     claims
         .require_participant(&attachment.subject, attachment.role)
@@ -312,7 +312,7 @@ fn claims_match_attachment(
 }
 
 fn require_unbound_administrative_credential(
-    claims: &crate::brain::credential::BrainCredentialClaims,
+    claims: &crate::brain::BrainCredentialClaims,
 ) -> Result<(), Response> {
     if claims.attachment_id.is_some() || claims.connection_id.is_some() {
         return Err(brain_auth_error(
@@ -326,10 +326,10 @@ fn require_unbound_administrative_credential(
 #[derive(Debug, Serialize)]
 struct NamedBrainListEntry {
     name: String,
-    environment: crate::brain::store::BrainEnvironment,
+    environment: crate::brain::BrainEnvironment,
     event_revision: u64,
     retained_programs: usize,
-    runner: Option<crate::brain::store::BrainRunnerLease>,
+    runner: Option<crate::brain::BrainRunnerLease>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,15 +340,15 @@ struct CreateNamedBrainRequest {
 #[derive(Debug, Deserialize)]
 struct AttachNamedBrainRequest {
     subject: String,
-    role: crate::brain::store::AttachmentRole,
-    attachment_id: Option<crate::brain::store::AttachmentId>,
+    role: crate::brain::AttachmentRole,
+    attachment_id: Option<crate::brain::AttachmentId>,
 }
 
 #[derive(Debug, Serialize)]
 struct AttachNamedBrainResponse {
-    attachment: crate::brain::store::BrainAttachment,
+    attachment: crate::brain::BrainAttachment,
     token: String,
-    claims: crate::brain::credential::BrainCredentialClaims,
+    claims: crate::brain::BrainCredentialClaims,
 }
 
 fn brain_state_conflict(error: anyhow::Error) -> Response {
@@ -373,11 +373,11 @@ struct ArchiveNamedBrainResponse {
 }
 
 fn attachment_can_submit(
-    role: crate::brain::store::AttachmentRole,
-    kind: &crate::brain::store::BrainEventKind,
+    role: crate::brain::AttachmentRole,
+    kind: &crate::brain::BrainEventKind,
     can_approve: bool,
 ) -> bool {
-    use crate::brain::store::{AttachmentRole, BrainEventKind};
+    use crate::brain::{AttachmentRole, BrainEventKind};
     (match role {
         AttachmentRole::Driver => matches!(
             kind,
@@ -396,10 +396,10 @@ fn attachment_can_submit(
 }
 
 struct RunAdmissionTerminalizer {
-    store: crate::brain::store::BrainStore,
+    store: crate::brain::BrainStore,
     runners: crate::server::BrainRunnerBroker,
     brain: String,
-    run: Option<crate::brain::store::BrainRun>,
+    run: Option<crate::brain::BrainRun>,
     armed: bool,
 }
 
@@ -425,7 +425,7 @@ impl Drop for RunAdmissionTerminalizer {
             "daemon",
             run.run_id,
             run.request_seq,
-            crate::brain::store::BrainRunStatus::Failed,
+            crate::brain::BrainRunStatus::Failed,
             detail.clone(),
         ) {
             Ok(Some(_)) => {}
@@ -439,7 +439,7 @@ impl Drop for RunAdmissionTerminalizer {
                 "daemon".into(),
                 run.run_id,
                 run.request_seq,
-                crate::brain::store::BrainRunStatus::Failed,
+                crate::brain::BrainRunStatus::Failed,
                 detail,
             ),
         }
@@ -460,15 +460,15 @@ impl Drop for RunAdmissionTerminalizer {
 /// diverge by transport.
 #[cfg(test)]
 pub(crate) async fn submit_named_brain_event(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     approvals: &crate::server::BrainApprovalBroker,
     name: &str,
-    attachment: &crate::brain::store::BrainAttachment,
-    kind: crate::brain::store::BrainEventKind,
+    attachment: &crate::brain::BrainAttachment,
+    kind: crate::brain::BrainEventKind,
 ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
-    let can_approve = crate::brain::credential::default_participant_scopes(attachment.role)
-        .contains(&crate::brain::credential::BrainCredentialScope::BrainApprove);
+    let can_approve = crate::brain::default_participant_scopes(attachment.role)
+        .contains(&crate::brain::BrainCredentialScope::BrainApprove);
     submit_named_brain_event_with_authority(
         store,
         runners,
@@ -482,12 +482,12 @@ pub(crate) async fn submit_named_brain_event(
 }
 
 pub(crate) async fn submit_named_brain_event_with_authority(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     approvals: &crate::server::BrainApprovalBroker,
     name: &str,
-    attachment: &crate::brain::store::BrainAttachment,
-    kind: crate::brain::store::BrainEventKind,
+    attachment: &crate::brain::BrainAttachment,
+    kind: crate::brain::BrainEventKind,
     can_approve: bool,
 ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
     submit_named_brain_event_with_authority_and_receipt(
@@ -504,16 +504,16 @@ pub(crate) async fn submit_named_brain_event_with_authority(
 }
 
 pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     approvals: &crate::server::BrainApprovalBroker,
     name: &str,
-    attachment: &crate::brain::store::BrainAttachment,
-    kind: crate::brain::store::BrainEventKind,
+    attachment: &crate::brain::BrainAttachment,
+    kind: crate::brain::BrainEventKind,
     can_approve: bool,
-    mutation: Option<crate::brain::store::BrainMutationReceipt>,
+    mutation: Option<crate::brain::BrainMutationReceipt>,
 ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
-    use crate::brain::store::BrainEventKind;
+    use crate::brain::BrainEventKind;
 
     if matches!(kind, BrainEventKind::SpeculativePrompt { .. }) {
         return Err(BrainSubmissionError::Invalid(
@@ -580,9 +580,9 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
             | BrainEventKind::SpeculativePrompt { .. }
     ) {
         Some(if named_brain_runner_is_ready(store, runners, name)? {
-            crate::brain::store::BrainRunStatus::Running
+            crate::brain::BrainRunStatus::Running
         } else {
-            crate::brain::store::BrainRunStatus::QueuedForEnvironment
+            crate::brain::BrainRunStatus::QueuedForEnvironment
         })
     } else {
         None
@@ -644,9 +644,9 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
             name,
             &attachment.subject,
             if matches!(kind, BrainEventKind::SpeculativePrompt { .. }) {
-                crate::brain::store::BrainRunKind::Speculative
+                crate::brain::BrainRunKind::Speculative
             } else {
-                crate::brain::store::BrainRunKind::Interactive
+                crate::brain::BrainRunKind::Interactive
             },
             accepted.seq,
             attachment.attachment_id,
@@ -672,7 +672,7 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
     take_run_admission_pause(&PAUSE_AFTER_RUN_BIND, name).await;
 
     let result = match run.as_ref() {
-        Some(run) if run.status == crate::brain::store::BrainRunStatus::Running => {
+        Some(run) if run.status == crate::brain::BrainRunStatus::Running => {
             Some(dispatch_named_brain_run(store, runners, name, run).await)
         }
         Some(_) => None,
@@ -720,11 +720,11 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
 }
 
 fn completed_run_result(
-    snapshot: &crate::brain::store::BrainSnapshot,
-    run: &crate::brain::store::BrainRun,
-) -> Option<crate::brain::store::BrainEvent> {
+    snapshot: &crate::brain::BrainSnapshot,
+    run: &crate::brain::BrainRun,
+) -> Option<crate::brain::BrainEvent> {
     let terminal_seq = snapshot.events.iter().find_map(|event| match event.kind {
-        crate::brain::store::BrainEventKind::RunStatusChanged { run_id, status, .. }
+        crate::brain::BrainEventKind::RunStatusChanged { run_id, status, .. }
             if run_id == run.run_id && status.is_terminal() =>
         {
             Some(event.seq)
@@ -738,16 +738,13 @@ fn completed_run_result(
         .find(|event| {
             event.seq > run.request_seq
                 && event.seq < terminal_seq
-                && matches!(
-                    event.kind,
-                    crate::brain::store::BrainEventKind::Result { .. }
-                )
+                && matches!(event.kind, crate::brain::BrainEventKind::Result { .. })
         })
         .cloned()
 }
 
 fn named_brain_runner_is_ready(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
 ) -> anyhow::Result<bool> {
@@ -755,7 +752,7 @@ fn named_brain_runner_is_ready(
     ensure_named_brain_store_environment(store, &snapshot)?;
     Ok(snapshot.runner_lease.as_ref().is_some_and(|lease| {
         lease.environment_generation == snapshot.environment.generation
-            && lease.expires_ms > crate::brain::store::unix_millis()
+            && lease.expires_ms > crate::brain::unix_millis()
             && runners.has_registration(name, lease.lease_id)
     }))
 }
@@ -763,10 +760,10 @@ fn named_brain_runner_is_ready(
 /// The `(prompt, rendered)` pair for one committed Brain turn. The second
 /// element is the rendered output the user saw, never the program source.
 fn committed_named_brain_memory_pair(
-    snapshot: &crate::brain::store::BrainSnapshot,
-    run: &crate::brain::store::BrainRun,
+    snapshot: &crate::brain::BrainSnapshot,
+    run: &crate::brain::BrainRun,
 ) -> anyhow::Result<(String, String)> {
-    use crate::brain::store::{BrainEventKind, BrainRunStatus};
+    use crate::brain::{BrainEventKind, BrainRunStatus};
 
     anyhow::ensure!(
         run.status == BrainRunStatus::Completed,
@@ -837,10 +834,10 @@ fn committed_named_brain_memory_pair(
 /// a runner registers. Deterministic Brain/run/role identities make exact
 /// replays no-ops, while a missed callback or rebuilt memory index recovers.
 pub(crate) async fn replay_committed_named_brain_memory(
-    store: crate::brain::store::BrainStore,
+    store: crate::brain::BrainStore,
     runners: crate::server::BrainRunnerBroker,
     name: String,
-    lease_id: crate::brain::store::RunnerLeaseId,
+    lease_id: crate::brain::RunnerLeaseId,
 ) -> anyhow::Result<usize> {
     let execution_lock = store.execution_lock(&name)?;
     let _turn = execution_lock.lock_owned().await;
@@ -848,7 +845,7 @@ pub(crate) async fn replay_committed_named_brain_memory(
     let lease_is_current = snapshot.runner_lease.as_ref().is_some_and(|lease| {
         lease.lease_id == lease_id
             && lease.environment_generation == snapshot.environment.generation
-            && lease.expires_ms > crate::brain::store::unix_millis()
+            && lease.expires_ms > crate::brain::unix_millis()
     });
     if !lease_is_current || !runners.has_registration(&name, lease_id) {
         return Ok(0);
@@ -857,7 +854,7 @@ pub(crate) async fn replay_committed_named_brain_memory(
     for run in snapshot
         .runs
         .iter()
-        .filter(|run| run.status == crate::brain::store::BrainRunStatus::Completed)
+        .filter(|run| run.status == crate::brain::BrainRunStatus::Completed)
     {
         let Ok((prompt, rendered)) = committed_named_brain_memory_pair(&snapshot, run) else {
             continue;
@@ -911,10 +908,10 @@ pub(crate) async fn replay_committed_named_brain_memory(
 /// The exact lease that registered the callback must still be current before
 /// each run begins; work that has not begun remains queued on disconnect.
 pub(crate) async fn resume_queued_named_brain_runs(
-    store: crate::brain::store::BrainStore,
+    store: crate::brain::BrainStore,
     runners: crate::server::BrainRunnerBroker,
     name: String,
-    lease_id: crate::brain::store::RunnerLeaseId,
+    lease_id: crate::brain::RunnerLeaseId,
 ) -> anyhow::Result<usize> {
     let execution_lock = store.execution_lock(&name)?;
     let _turn = execution_lock.lock_owned().await;
@@ -926,12 +923,12 @@ pub(crate) async fn resume_queued_named_brain_runs(
 /// supervisor, so a later submission cannot overtake it between accept and
 /// dispatch.
 pub(crate) async fn resume_queued_named_brain_runs_in_lane(
-    store: crate::brain::store::BrainStore,
+    store: crate::brain::BrainStore,
     runners: crate::server::BrainRunnerBroker,
     name: String,
-    lease_id: crate::brain::store::RunnerLeaseId,
+    lease_id: crate::brain::RunnerLeaseId,
 ) -> anyhow::Result<usize> {
-    use crate::brain::store::BrainRunStatus;
+    use crate::brain::BrainRunStatus;
 
     let queued = store
         .snapshot(&name)?
@@ -945,7 +942,7 @@ pub(crate) async fn resume_queued_named_brain_runs_in_lane(
         let lease_is_current = snapshot.runner_lease.as_ref().is_some_and(|lease| {
             lease.lease_id == lease_id
                 && lease.environment_generation == snapshot.environment.generation
-                && lease.expires_ms > crate::brain::store::unix_millis()
+                && lease.expires_ms > crate::brain::unix_millis()
         });
         if !lease_is_current || !runners.has_registration(&name, lease_id) {
             break;
@@ -961,12 +958,12 @@ pub(crate) async fn resume_queued_named_brain_runs_in_lane(
 /// Advance one Brain's durable schedules and, when its environment runner is
 /// live, execute the newly queued ProgramRuns through that exact runner.
 pub(crate) async fn deliver_due_named_brain_schedules(
-    store: crate::brain::store::BrainStore,
+    store: crate::brain::BrainStore,
     runners: crate::server::BrainRunnerBroker,
     name: String,
     now_ms: u64,
 ) -> anyhow::Result<usize> {
-    use crate::brain::store::BrainRunStatus;
+    use crate::brain::BrainRunStatus;
 
     let execution_lock = store.execution_lock(&name)?;
     let _turn = execution_lock.lock_owned().await;
@@ -993,15 +990,15 @@ pub(crate) async fn deliver_due_named_brain_schedules(
 }
 
 fn commit_named_brain_approval_decision(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     approvals: &crate::server::BrainApprovalBroker,
     name: &str,
-    attachment: &crate::brain::store::BrainAttachment,
+    attachment: &crate::brain::BrainAttachment,
     request_seq: u64,
     approval_id: &str,
     decision: serde_json::Value,
-    mutation: Option<crate::brain::store::BrainMutationReceipt>,
-) -> anyhow::Result<crate::brain::store::BrainEvent> {
+    mutation: Option<crate::brain::BrainMutationReceipt>,
+) -> anyhow::Result<crate::brain::BrainEvent> {
     let snapshot = store.snapshot(name)?;
     let connection_id = attachment.connection_id;
     let validate_pending = || -> anyhow::Result<()> {
@@ -1035,7 +1032,7 @@ fn commit_named_brain_approval_decision(
         let mutation_id = receipt.mutation_id;
         if let Some(event) = store.replay_mutation(name, &receipt)? {
             anyhow::ensure!(
-                matches!(&event.kind, crate::brain::store::BrainEventKind::ApprovalDecided {
+                matches!(&event.kind, crate::brain::BrainEventKind::ApprovalDecided {
                 request_seq: recorded_seq, approval_id: recorded_id,
                 decision: recorded_decision,
             } if *recorded_seq == request_seq && recorded_id == approval_id
@@ -1132,7 +1129,7 @@ fn commit_named_brain_approval_decision(
     let accepted = store.push(
         name,
         &attachment.subject,
-        crate::brain::store::BrainEventKind::ApprovalDecided {
+        crate::brain::BrainEventKind::ApprovalDecided {
             request_seq,
             approval_id: approval_id.to_string(),
             decision: decision.clone(),
@@ -1151,14 +1148,14 @@ fn commit_named_brain_approval_decision(
 }
 
 fn push_named_brain_run_result(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     name: &str,
-    run_id: crate::brain::store::RunId,
+    run_id: crate::brain::RunId,
     request_seq: u64,
     result: anyhow::Result<String>,
     continuation_messages: Vec<crate::claude::Message>,
     invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
-) -> anyhow::Result<crate::brain::store::BrainEvent> {
+) -> anyhow::Result<crate::brain::BrainEvent> {
     if let Some(metadata) = &invocation_metadata {
         metadata.validate()?;
     }
@@ -1170,7 +1167,7 @@ fn push_named_brain_run_result(
         name,
         "daemon",
         run_id,
-        crate::brain::store::BrainEventKind::Result {
+        crate::brain::BrainEventKind::Result {
             request_seq,
             output,
             error,
@@ -1207,12 +1204,12 @@ fn validate_runner_effect_journal(
 }
 
 fn persist_named_brain_turn_events(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     name: &str,
-    run_id: Option<crate::brain::store::RunId>,
+    run_id: Option<crate::brain::RunId>,
     request_seq: u64,
     runner_subject: &str,
-    expected_approval_audience: &crate::brain::store::BrainApprovalAudience,
+    expected_approval_audience: &crate::brain::BrainApprovalAudience,
     turn_events: Vec<crate::server::RunnerTurnEvent>,
 ) -> anyhow::Result<()> {
     let mut persisted = store
@@ -1220,22 +1217,22 @@ fn persist_named_brain_turn_events(
         .events
         .into_iter()
         .filter_map(|event| match event.kind {
-            crate::brain::store::BrainEventKind::ToolCall {
+            crate::brain::BrainEventKind::ToolCall {
                 request_seq: event_request,
                 tool_id,
                 ..
             } if event_request == request_seq => Some(format!("call:{tool_id}")),
-            crate::brain::store::BrainEventKind::ToolResult {
+            crate::brain::BrainEventKind::ToolResult {
                 request_seq: event_request,
                 tool_id,
                 ..
             } if event_request == request_seq => Some(format!("result:{tool_id}")),
-            crate::brain::store::BrainEventKind::ApprovalRequested {
+            crate::brain::BrainEventKind::ApprovalRequested {
                 request_seq: event_request,
                 approval_id,
                 ..
             } if event_request == request_seq => Some(format!("approval:{approval_id}")),
-            crate::brain::store::BrainEventKind::ApprovalDecided {
+            crate::brain::BrainEventKind::ApprovalDecided {
                 request_seq: event_request,
                 approval_id,
                 ..
@@ -1258,7 +1255,7 @@ fn persist_named_brain_turn_events(
                     name,
                     "provider",
                     run_id,
-                    crate::brain::store::BrainEventKind::ToolCall {
+                    crate::brain::BrainEventKind::ToolCall {
                         request_seq,
                         tool_id,
                         name: tool_name,
@@ -1279,7 +1276,7 @@ fn persist_named_brain_turn_events(
                     name,
                     "runner",
                     run_id,
-                    crate::brain::store::BrainEventKind::ToolResult {
+                    crate::brain::BrainEventKind::ToolResult {
                         request_seq,
                         tool_id,
                         output,
@@ -1306,7 +1303,7 @@ fn persist_named_brain_turn_events(
                     name,
                     "runner",
                     run_id,
-                    crate::brain::store::BrainEventKind::ApprovalRequested {
+                    crate::brain::BrainEventKind::ApprovalRequested {
                         request_seq,
                         approval_id,
                         approval_kind,
@@ -1328,7 +1325,7 @@ fn persist_named_brain_turn_events(
                     name,
                     runner_subject,
                     run_id,
-                    crate::brain::store::BrainEventKind::ApprovalDecided {
+                    crate::brain::BrainEventKind::ApprovalDecided {
                         request_seq,
                         approval_id,
                         decision,
@@ -1341,12 +1338,12 @@ fn persist_named_brain_turn_events(
 }
 
 fn push_named_brain_correlated_event(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     name: &str,
     sender: &str,
-    run_id: Option<crate::brain::store::RunId>,
-    kind: crate::brain::store::BrainEventKind,
-) -> anyhow::Result<crate::brain::store::BrainEvent> {
+    run_id: Option<crate::brain::RunId>,
+    kind: crate::brain::BrainEventKind,
+) -> anyhow::Result<crate::brain::BrainEvent> {
     match run_id {
         Some(run_id) => store.push_for_run(name, sender, run_id, kind),
         None => store.push(name, sender, kind),
@@ -1354,10 +1351,10 @@ fn push_named_brain_correlated_event(
 }
 
 fn named_brain_provider_messages_at(
-    snapshot: &crate::brain::store::BrainSnapshot,
+    snapshot: &crate::brain::BrainSnapshot,
     request_seq: u64,
 ) -> Vec<Message> {
-    use crate::brain::store::BrainEventKind;
+    use crate::brain::BrainEventKind;
 
     // Speculative helper transcripts are visible in the canonical log, but
     // they are not conversation input. Correlation is an envelope identity,
@@ -1365,7 +1362,7 @@ fn named_brain_provider_messages_at(
     let speculative_run_ids = snapshot
         .runs
         .iter()
-        .filter(|run| run.kind == crate::brain::store::BrainRunKind::Speculative)
+        .filter(|run| run.kind == crate::brain::BrainRunKind::Speculative)
         .map(|run| run.run_id)
         .collect::<std::collections::HashSet<_>>();
 
@@ -1508,8 +1505,8 @@ fn named_brain_provider_messages_at(
                 "[{} submitted a Finch {} program as event #{}]\n{}",
                 event.sender,
                 match language {
-                    crate::brain::store::ProgramLanguage::Forth => "Co-Forth",
-                    crate::brain::store::ProgramLanguage::Lisp => "Lisp",
+                    crate::brain::ProgramLanguage::Forth => "Co-Forth",
+                    crate::brain::ProgramLanguage::Lisp => "Lisp",
                 },
                 event.seq,
                 source,
@@ -1589,7 +1586,7 @@ fn named_brain_provider_messages_at(
 }
 
 #[cfg(test)]
-fn named_brain_provider_messages(snapshot: &crate::brain::store::BrainSnapshot) -> Vec<Message> {
+fn named_brain_provider_messages(snapshot: &crate::brain::BrainSnapshot) -> Vec<Message> {
     let request_seq = snapshot.events.last().map_or(0, |event| event.seq);
     named_brain_provider_messages_at(snapshot, request_seq)
 }
@@ -1602,7 +1599,7 @@ const MAX_SUBMITTED_TASK_ID_CHARS: usize = 128;
 const MAX_SUBMITTED_TASK_CONTENT_CHARS: usize = 4096;
 
 fn validate_submitted_brain_tasks(
-    tasks: &[crate::brain::tasks::BrainTask],
+    tasks: &[crate::brain::BrainTask],
 ) -> Result<(), BrainSubmissionError> {
     if tasks.len() > MAX_SUBMITTED_BRAIN_TASKS {
         return Err(BrainSubmissionError::Invalid(format!(
@@ -1658,8 +1655,8 @@ fn validate_submitted_brain_tasks(
 /// ordered by lifecycle (in progress, then pending), priority, and finally its
 /// stable list position. The first in-progress item is the only state the
 /// current task model permits us to identify as current.
-fn named_brain_task_context(tasks: &[crate::brain::tasks::BrainTask]) -> Option<String> {
-    use crate::brain::tasks::{BrainTaskPriority, BrainTaskStatus};
+fn named_brain_task_context(tasks: &[crate::brain::BrainTask]) -> Option<String> {
+    use crate::brain::{BrainTaskPriority, BrainTaskStatus};
 
     let status_rank = |status: &BrainTaskStatus| match status {
         BrainTaskStatus::InProgress => 0,
@@ -1679,7 +1676,7 @@ fn named_brain_task_context(tasks: &[crate::brain::tasks::BrainTask]) -> Option<
 
     // Keep only the bounded provider-facing prefix while scanning. This avoids
     // sorting or normalizing an arbitrarily large legacy/on-disk projection.
-    let mut unfinished: Vec<(usize, &crate::brain::tasks::BrainTask)> =
+    let mut unfinished: Vec<(usize, &crate::brain::BrainTask)> =
         Vec::with_capacity(MAX_PROVIDER_TASKS);
     let mut unfinished_count = 0usize;
     let mut in_progress = 0usize;
@@ -1717,7 +1714,7 @@ fn named_brain_task_context(tasks: &[crate::brain::tasks::BrainTask]) -> Option<
     let pending = unfinished_count.saturating_sub(in_progress);
     let omitted = unfinished_count.saturating_sub(MAX_PROVIDER_TASKS);
 
-    let render = |task: &crate::brain::tasks::BrainTask| {
+    let render = |task: &crate::brain::BrainTask| {
         let id = json_task_string(&bounded_task_field(&task.id, MAX_PROVIDER_TASK_ID_CHARS));
         let content = json_task_string(&bounded_task_field(
             &task.content,
@@ -1820,8 +1817,8 @@ fn json_task_string(value: &str) -> String {
 }
 
 fn ensure_named_brain_store_environment(
-    store: &crate::brain::store::BrainStore,
-    snapshot: &crate::brain::store::BrainSnapshot,
+    store: &crate::brain::BrainStore,
+    snapshot: &crate::brain::BrainSnapshot,
 ) -> anyhow::Result<()> {
     let configured = store.environment();
     if &snapshot.environment != configured {
@@ -1854,15 +1851,15 @@ fn remote_brain_error(
 
 pub(crate) fn execute_authorized_remote_initialization(
     lifecycle: &crate::server::BrainLifecycleService,
-    claims: &crate::brain::credential::BrainCredentialClaims,
+    claims: &crate::brain::BrainCredentialClaims,
     name: &str,
-    attachment_id: crate::brain::store::AttachmentId,
-    connection_id: crate::brain::store::ConnectionId,
+    attachment_id: crate::brain::AttachmentId,
+    connection_id: crate::brain::ConnectionId,
     request_id: u64,
     next_due_ms: u64,
-    mutation: Option<crate::brain::store::BrainMutationReceipt>,
+    mutation: Option<crate::brain::BrainMutationReceipt>,
 ) -> crate::ipc::brain_codec::BrainRemoteReply {
-    use crate::brain::credential::BrainCredentialScope;
+    use crate::brain::BrainCredentialScope;
     use crate::ipc::brain_codec::BrainRemoteReply;
 
     if !claims.permits(BrainCredentialScope::BrainSubmit) {
@@ -1902,11 +1899,11 @@ async fn execute_remote_brain_command(
     server: &Arc<AgentServer>,
     headers: &HeaderMap,
     name: &str,
-    attachment_id: crate::brain::store::AttachmentId,
-    connection_id: crate::brain::store::ConnectionId,
+    attachment_id: crate::brain::AttachmentId,
+    connection_id: crate::brain::ConnectionId,
     command: crate::ipc::brain_codec::BrainRemoteCommand,
 ) -> crate::ipc::brain_codec::BrainRemoteReply {
-    use crate::brain::credential::BrainCredentialScope;
+    use crate::brain::BrainCredentialScope;
     use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
     let request_id = command.request_id;
@@ -1968,7 +1965,7 @@ async fn execute_remote_brain_command(
                 Ok(fingerprint) => fingerprint,
                 Err(error) => return remote_brain_error(request_id, "invalid", error.to_string()),
             };
-        Some(crate::brain::store::BrainMutationReceipt {
+        Some(crate::brain::BrainMutationReceipt {
             mutation_id: mutation.idempotency_key,
             attachment_id,
             expected_revision: mutation.expected_revision,
@@ -1978,14 +1975,12 @@ async fn execute_remote_brain_command(
     };
     match command.kind {
         BrainRemoteCommandKind::Submit(kind) => {
-            let required_scope = if matches!(
-                &kind,
-                crate::brain::store::BrainEventKind::ApprovalDecided { .. }
-            ) {
-                BrainCredentialScope::BrainApprove
-            } else {
-                BrainCredentialScope::BrainSubmit
-            };
+            let required_scope =
+                if matches!(&kind, crate::brain::BrainEventKind::ApprovalDecided { .. }) {
+                    BrainCredentialScope::BrainApprove
+                } else {
+                    BrainCredentialScope::BrainSubmit
+                };
             let claims = match authorize_named_brain(server, headers, name, required_scope) {
                 Ok(claims) => claims,
                 Err(_) => {
@@ -2356,8 +2351,8 @@ async fn execute_remote_brain_command(
 async fn teardown_remote_brain_connection(
     lifecycle: &crate::server::BrainLifecycleService,
     name: &str,
-    attachment_id: crate::brain::store::AttachmentId,
-    connection_id: crate::brain::store::ConnectionId,
+    attachment_id: crate::brain::AttachmentId,
+    connection_id: crate::brain::ConnectionId,
     worker: tokio::task::JoinHandle<()>,
     approval_worker: tokio::task::JoinHandle<()>,
 ) {

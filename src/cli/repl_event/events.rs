@@ -21,8 +21,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct RunnerReconnectTarget {
     pub brain: String,
-    pub environment: crate::brain::store::BrainEnvironment,
-    pub lease_id: Option<crate::brain::store::RunnerLeaseId>,
+    pub environment: crate::brain::BrainEnvironment,
+    pub lease_id: Option<crate::brain::RunnerLeaseId>,
 }
 
 /// Result of a tool execution confirmation prompt
@@ -182,7 +182,7 @@ pub enum ReplEvent {
     /// Snapshot or live event from the currently attached named brain.
     RemoteBrainMessage {
         target: String,
-        message: crate::brain::store::BrainWireMessage,
+        message: crate::brain::BrainWireMessage,
     },
     RemoteBrainError {
         target: String,
@@ -198,7 +198,7 @@ pub enum ReplEvent {
     /// superseded receiver from invalidating its replacement.
     HomeBrainMessage {
         epoch: u64,
-        message: crate::brain::store::BrainWireMessage,
+        message: crate::brain::BrainWireMessage,
     },
     /// The home event watch ended independently of runner callback health.
     HomeBrainWatchFailed {
@@ -222,9 +222,9 @@ pub enum ReplEvent {
     /// prevents a stopped home-renewal task from overwriting a later handoff.
     RunnerLeaseStatus {
         brain: String,
-        environment: crate::brain::store::BrainEnvironment,
+        environment: crate::brain::BrainEnvironment,
         epoch: u64,
-        lease_id: Option<crate::brain::store::RunnerLeaseId>,
+        lease_id: Option<crate::brain::RunnerLeaseId>,
         detail: String,
     },
 
@@ -239,14 +239,14 @@ pub enum ReplEvent {
     /// Cancel one exact ProgramRun currently owned by this frontend.
     NamedBrainRunCancelRequested(crate::server::RunnerCancelRequest),
     /// Release frontend-local cancellation state after a delegated program ends.
-    NamedBrainProgramFinished(crate::brain::store::RunId),
+    NamedBrainProgramFinished(crate::brain::RunId),
 
     /// The daemon has durably committed the exact named-Brain turn that
     /// requested this frontend replacement. It is now safe to leave the
     /// runner lease and exec the verified candidate binary.
     FrontendRestartReady {
         brain: String,
-        run_id: crate::brain::store::RunId,
+        run_id: crate::brain::RunId,
         restart: crate::tools::DeferredFrontendRestart,
     },
 }

@@ -5,7 +5,7 @@ pub(super) async fn create_named_brain(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<CreateNamedBrainRequest>,
-) -> Result<(StatusCode, Json<crate::brain::store::BrainSnapshot>), Response> {
+) -> Result<(StatusCode, Json<crate::brain::BrainSnapshot>), Response> {
     check_brain_bootstrap_access(&server, addr, &headers).await?;
     let snapshot = crate::server::BrainLifecycleService::from_server(&server)
         .create(&request.name)
@@ -45,12 +45,12 @@ pub(super) async fn get_named_brain(
     State(server): State<Arc<AgentServer>>,
     headers: HeaderMap,
     Path(name): Path<String>,
-) -> Result<Json<crate::brain::store::BrainSnapshot>, Response> {
+) -> Result<Json<crate::brain::BrainSnapshot>, Response> {
     authorize_named_brain(
         &server,
         &headers,
         &name,
-        crate::brain::credential::BrainCredentialScope::BrainRead,
+        crate::brain::BrainCredentialScope::BrainRead,
     )?;
     server
         .brain_store()
@@ -63,18 +63,18 @@ pub(super) async fn get_named_brain_capabilities(
     State(server): State<Arc<AgentServer>>,
     headers: HeaderMap,
     Path(name): Path<String>,
-) -> Result<Json<crate::brain::remote::RemoteBrainCapabilities>, Response> {
+) -> Result<Json<crate::brain::RemoteBrainCapabilities>, Response> {
     authorize_named_brain(
         &server,
         &headers,
         &name,
-        crate::brain::credential::BrainCredentialScope::BrainRead,
+        crate::brain::BrainCredentialScope::BrainRead,
     )?;
     let snapshot = server
         .brain_store()
         .snapshot(&name)
         .map_err(|error| AppError(error).into_response())?;
-    Ok(Json(crate::brain::remote::RemoteBrainCapabilities {
+    Ok(Json(crate::brain::RemoteBrainCapabilities {
         schema_version: 1,
         brain_id: snapshot.brain_id,
         brain: snapshot.name,
@@ -94,7 +94,7 @@ pub(super) async fn attach_named_brain(
         &server,
         &headers,
         &name,
-        crate::brain::credential::BrainCredentialScope::BrainAttach,
+        crate::brain::BrainCredentialScope::BrainAttach,
     )?;
     claims
         .require_participant(&request.subject, request.role)
@@ -143,7 +143,7 @@ pub(super) async fn archive_named_brain(
         &server,
         &headers,
         &name,
-        crate::brain::credential::BrainCredentialScope::EnvironmentAdmin,
+        crate::brain::BrainCredentialScope::EnvironmentAdmin,
     )?;
     require_unbound_administrative_credential(&claims)?;
     let execution_lock = server

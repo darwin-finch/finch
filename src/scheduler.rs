@@ -295,22 +295,22 @@ impl ProviderResolver {
 #[derive(Debug)]
 pub enum AgentBrainControlRequest {
     Start {
-        parent_run_id: crate::brain::store::RunId,
+        parent_run_id: crate::brain::RunId,
         task_id: Uuid,
         detail: String,
-        response_tx: oneshot::Sender<Result<crate::brain::store::BrainRun, String>>,
+        response_tx: oneshot::Sender<Result<crate::brain::BrainRun, String>>,
     },
     Finish {
-        run_id: crate::brain::store::RunId,
-        status: crate::brain::store::BrainRunStatus,
+        run_id: crate::brain::RunId,
+        status: crate::brain::BrainRunStatus,
         detail: String,
-        response_tx: oneshot::Sender<Result<crate::brain::store::BrainRun, String>>,
+        response_tx: oneshot::Sender<Result<crate::brain::BrainRun, String>>,
     },
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct AgentBrainContext {
-    pub run_id: crate::brain::store::RunId,
+    pub run_id: crate::brain::RunId,
     pub request_seq: u64,
 }
 
@@ -520,7 +520,7 @@ impl AgentScheduler {
         let manifest_generation = self.runtime.manifest_generation();
         let parent_brain_run_id = match parent
             .and_then(|identity| identity.brain_run_id)
-            .map(crate::brain::store::RunId)
+            .map(crate::brain::RunId)
         {
             Some(run_id) => Some(run_id),
             None => self
@@ -557,7 +557,7 @@ impl AgentScheduler {
                 .map_err(|_| anyhow::anyhow!("named-Brain child lifecycle response dropped"))?
                 .map_err(anyhow::Error::msg)?;
             anyhow::ensure!(
-                run.run_id == crate::brain::store::RunId(task_id)
+                run.run_id == crate::brain::RunId(task_id)
                     && run.parent_run_id == Some(parent_run_id),
                 "daemon returned a conflicting named-Brain child identity"
             );
@@ -805,10 +805,10 @@ impl AgentScheduler {
     async fn store_result(&self, mut result: AgentTaskResult, usage: AgentUsage) {
         if let Some(run_id) = result.identity.brain_run_id {
             let status = match result.status {
-                AgentTaskStatus::Completed => crate::brain::store::BrainRunStatus::Completed,
-                AgentTaskStatus::Cancelled => crate::brain::store::BrainRunStatus::Cancelled,
+                AgentTaskStatus::Completed => crate::brain::BrainRunStatus::Completed,
+                AgentTaskStatus::Cancelled => crate::brain::BrainRunStatus::Cancelled,
                 AgentTaskStatus::Failed | AgentTaskStatus::Queued | AgentTaskStatus::Running => {
-                    crate::brain::store::BrainRunStatus::Failed
+                    crate::brain::BrainRunStatus::Failed
                 }
             };
             let detail = if result.final_message.is_empty() {
@@ -823,7 +823,7 @@ impl AgentScheduler {
                 let (response_tx, response_rx) = oneshot::channel();
                 control
                     .send(AgentBrainControlRequest::Finish {
-                        run_id: crate::brain::store::RunId(run_id),
+                        run_id: crate::brain::RunId(run_id),
                         status,
                         detail,
                         response_tx,
@@ -1028,7 +1028,7 @@ impl AgentScheduler {
 fn starting_context_hash(
     spec: &AgentTaskSpec,
     parent: Option<&AgentIdentity>,
-    parent_brain_run_id: Option<crate::brain::store::RunId>,
+    parent_brain_run_id: Option<crate::brain::RunId>,
     provider_model: &str,
     vm_revision: u64,
     manifest_generation: u64,
@@ -1690,7 +1690,7 @@ mod tests {
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::new(ProgramRuntime::new()),
         );
-        let parent_run_id = crate::brain::store::RunId(Uuid::new_v4());
+        let parent_run_id = crate::brain::RunId(Uuid::new_v4());
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         scheduler.bind_brain_control(control_tx).await;
         scheduler
@@ -1713,14 +1713,14 @@ mod tests {
             assert_eq!(requested_parent, parent_run_id);
             assert_eq!(detail, "inspect");
             response_tx
-                .send(Ok(crate::brain::store::BrainRun {
-                    run_id: crate::brain::store::RunId(task_id),
-                    kind: crate::brain::store::BrainRunKind::Subagent,
+                .send(Ok(crate::brain::BrainRun {
+                    run_id: crate::brain::RunId(task_id),
+                    kind: crate::brain::BrainRunKind::Subagent,
                     parent_run_id: Some(parent_run_id),
                     request_seq: 7,
-                    initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
+                    initiating_attachment_id: crate::brain::AttachmentId(Uuid::new_v4()),
                     initiated_by: "alice".into(),
-                    status: crate::brain::store::BrainRunStatus::Running,
+                    status: crate::brain::BrainRunStatus::Running,
                     started_ms: 1,
                     updated_ms: 1,
                     detail: Some(detail),
@@ -1735,14 +1735,14 @@ mod tests {
             else {
                 panic!("expected child finish")
             };
-            assert_eq!(run_id, crate::brain::store::RunId(task_id));
-            assert_eq!(status, crate::brain::store::BrainRunStatus::Completed);
-            let _ = response_tx.send(Ok(crate::brain::store::BrainRun {
+            assert_eq!(run_id, crate::brain::RunId(task_id));
+            assert_eq!(status, crate::brain::BrainRunStatus::Completed);
+            let _ = response_tx.send(Ok(crate::brain::BrainRun {
                 run_id,
-                kind: crate::brain::store::BrainRunKind::Subagent,
+                kind: crate::brain::BrainRunKind::Subagent,
                 parent_run_id: Some(parent_run_id),
                 request_seq: 7,
-                initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
+                initiating_attachment_id: crate::brain::AttachmentId(Uuid::new_v4()),
                 initiated_by: "alice".into(),
                 status,
                 started_ms: 1,
@@ -1773,7 +1773,7 @@ mod tests {
         assert_eq!(result.status, AgentTaskStatus::Completed);
         assert_eq!(
             finished_rx.await.unwrap(),
-            crate::brain::store::RunId(identity.task_id)
+            crate::brain::RunId(identity.task_id)
         );
     }
 
@@ -1786,7 +1786,7 @@ mod tests {
             })),
             Arc::new(ProgramRuntime::new()),
         );
-        let parent_run_id = crate::brain::store::RunId(Uuid::new_v4());
+        let parent_run_id = crate::brain::RunId(Uuid::new_v4());
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         scheduler.bind_brain_control(control_tx).await;
         scheduler
@@ -1807,16 +1807,16 @@ mod tests {
                 panic!("expected child start")
             };
             assert_eq!(first_parent, parent_run_id);
-            let first_run_id = crate::brain::store::RunId(first_task_id);
+            let first_run_id = crate::brain::RunId(first_task_id);
             response_tx
-                .send(Ok(crate::brain::store::BrainRun {
+                .send(Ok(crate::brain::BrainRun {
                     run_id: first_run_id,
-                    kind: crate::brain::store::BrainRunKind::Subagent,
+                    kind: crate::brain::BrainRunKind::Subagent,
                     parent_run_id: Some(parent_run_id),
                     request_seq: 9,
-                    initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
+                    initiating_attachment_id: crate::brain::AttachmentId(Uuid::new_v4()),
                     initiated_by: "alice".into(),
-                    status: crate::brain::store::BrainRunStatus::Running,
+                    status: crate::brain::BrainRunStatus::Running,
                     started_ms: 1,
                     updated_ms: 1,
                     detail: Some(detail),
@@ -1832,16 +1832,16 @@ mod tests {
                 panic!("expected nested child start")
             };
             assert_eq!(second_parent, first_run_id);
-            let second_run_id = crate::brain::store::RunId(second_task_id);
+            let second_run_id = crate::brain::RunId(second_task_id);
             response_tx
-                .send(Ok(crate::brain::store::BrainRun {
+                .send(Ok(crate::brain::BrainRun {
                     run_id: second_run_id,
-                    kind: crate::brain::store::BrainRunKind::Subagent,
+                    kind: crate::brain::BrainRunKind::Subagent,
                     parent_run_id: Some(first_run_id),
                     request_seq: 9,
-                    initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
+                    initiating_attachment_id: crate::brain::AttachmentId(Uuid::new_v4()),
                     initiated_by: "alice".into(),
-                    status: crate::brain::store::BrainRunStatus::Running,
+                    status: crate::brain::BrainRunStatus::Running,
                     started_ms: 1,
                     updated_ms: 1,
                     detail: Some(detail),
@@ -1858,7 +1858,7 @@ mod tests {
                 else {
                     panic!("expected child finish")
                 };
-                assert_eq!(status, crate::brain::store::BrainRunStatus::Cancelled);
+                assert_eq!(status, crate::brain::BrainRunStatus::Cancelled);
                 let parent = if run_id == first_run_id {
                     parent_run_id
                 } else {
@@ -1866,12 +1866,12 @@ mod tests {
                     first_run_id
                 };
                 response_tx
-                    .send(Ok(crate::brain::store::BrainRun {
+                    .send(Ok(crate::brain::BrainRun {
                         run_id,
-                        kind: crate::brain::store::BrainRunKind::Subagent,
+                        kind: crate::brain::BrainRunKind::Subagent,
                         parent_run_id: Some(parent),
                         request_seq: 9,
-                        initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
+                        initiating_attachment_id: crate::brain::AttachmentId(Uuid::new_v4()),
                         initiated_by: "alice".into(),
                         status,
                         started_ms: 1,
@@ -1926,8 +1926,8 @@ mod tests {
         assert_eq!(result.status, AgentTaskStatus::Cancelled);
         assert_eq!(nested_result.status, AgentTaskStatus::Cancelled);
         let finished = cancelled_rx.await.unwrap();
-        assert!(finished.contains(&crate::brain::store::RunId(identity.task_id)));
-        assert!(finished.contains(&crate::brain::store::RunId(nested.task_id)));
+        assert!(finished.contains(&crate::brain::RunId(identity.task_id)));
+        assert!(finished.contains(&crate::brain::RunId(nested.task_id)));
     }
 
     #[tokio::test]
@@ -2084,7 +2084,7 @@ mod tests {
         let other_brain_parent = starting_context_hash(
             &spec,
             None,
-            Some(crate::brain::store::RunId(Uuid::new_v4())),
+            Some(crate::brain::RunId(Uuid::new_v4())),
             "echo",
             7,
             3,

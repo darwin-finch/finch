@@ -20,12 +20,12 @@ pub(super) async fn take_run_admission_pause(
 }
 
 pub(super) async fn dispatch_named_brain_run(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
-    run: &crate::brain::store::BrainRun,
-) -> anyhow::Result<Option<crate::brain::store::BrainEvent>> {
-    use crate::brain::store::{BrainEventKind, BrainRunStatus};
+    run: &crate::brain::BrainRun,
+) -> anyhow::Result<Option<crate::brain::BrainEvent>> {
+    use crate::brain::{BrainEventKind, BrainRunStatus};
 
     // The WebSocket command worker is the supervisor for this accepted run.
     // If its transport disappears while the callback is suspended, dropping
@@ -33,9 +33,9 @@ pub(super) async fn dispatch_named_brain_run(
     // Brain lane. The callback response receiver is dropped with the future,
     // fencing any late frontend completion from publication.
     struct DisconnectTerminalizer {
-        store: crate::brain::store::BrainStore,
+        store: crate::brain::BrainStore,
         brain: String,
-        run_id: crate::brain::store::RunId,
+        run_id: crate::brain::RunId,
         request_seq: u64,
         armed: bool,
     }
@@ -257,10 +257,10 @@ pub(super) async fn dispatch_named_brain_run(
 }
 
 pub(super) async fn project_committed_named_brain_memory(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
-    run: &crate::brain::store::BrainRun,
+    run: &crate::brain::BrainRun,
 ) -> anyhow::Result<usize> {
     let snapshot = store.snapshot(name)?;
     let committed_run = snapshot
@@ -274,7 +274,7 @@ pub(super) async fn project_committed_named_brain_memory(
         .as_ref()
         .filter(|lease| {
             lease.environment_generation == snapshot.environment.generation
-                && lease.expires_ms > crate::brain::store::unix_millis()
+                && lease.expires_ms > crate::brain::unix_millis()
         })
         .ok_or_else(|| anyhow::anyhow!("committed Brain turn has no live environment runner"))?;
     runners
@@ -291,16 +291,16 @@ pub(super) async fn project_committed_named_brain_memory(
 }
 
 pub(super) async fn dispatch_named_brain_program(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
-    run_id: crate::brain::store::RunId,
+    run_id: crate::brain::RunId,
     request_seq: u64,
-    language: crate::brain::store::ProgramLanguage,
+    language: crate::brain::ProgramLanguage,
     source: &str,
     interaction: crate::server::RunnerProgramInteraction,
     grant_ceiling: Option<crate::vm::EffectSet>,
-) -> anyhow::Result<crate::brain::store::BrainEvent> {
+) -> anyhow::Result<crate::brain::BrainEvent> {
     let snapshot = store.snapshot(name)?;
     ensure_named_brain_store_environment(store, &snapshot)?;
     let lease_id = snapshot
@@ -308,7 +308,7 @@ pub(super) async fn dispatch_named_brain_program(
         .as_ref()
         .filter(|lease| {
             lease.environment_generation == snapshot.environment.generation
-                && lease.expires_ms > crate::brain::store::unix_millis()
+                && lease.expires_ms > crate::brain::unix_millis()
         })
         .map(|lease| lease.lease_id)
         .ok_or_else(|| anyhow::anyhow!("named Brain '{name}' has no live environment runner"))?;
@@ -349,7 +349,7 @@ pub(super) async fn dispatch_named_brain_program(
                     name,
                     "daemon",
                     run_id,
-                    crate::brain::store::BrainRunStatus::Failed,
+                    crate::brain::BrainRunStatus::Failed,
                     Some(error.to_string()),
                 )?;
                 drop(publication);
@@ -384,7 +384,7 @@ pub(super) async fn dispatch_named_brain_program(
         name,
         "daemon",
         run_id,
-        crate::brain::store::BrainRunStatus::Completed,
+        crate::brain::BrainRunStatus::Completed,
         None,
     )?;
     drop(publication);
@@ -393,15 +393,15 @@ pub(super) async fn dispatch_named_brain_program(
 }
 
 pub(super) async fn dispatch_named_brain_turn(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
-    run_id: crate::brain::store::RunId,
+    run_id: crate::brain::RunId,
     request_seq: u64,
     prompt: &str,
-    requester: &crate::brain::store::BrainAttachment,
+    requester: &crate::brain::BrainAttachment,
 ) -> anyhow::Result<(
-    crate::brain::store::BrainEvent,
+    crate::brain::BrainEvent,
     Option<crate::server::RunnerTurnCommitAck>,
 )> {
     let snapshot = store.snapshot(name)?;
@@ -411,7 +411,7 @@ pub(super) async fn dispatch_named_brain_turn(
         .as_ref()
         .filter(|lease| {
             lease.environment_generation == snapshot.environment.generation
-                && lease.expires_ms > crate::brain::store::unix_millis()
+                && lease.expires_ms > crate::brain::unix_millis()
         })
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("named Brain '{name}' has no live environment runner"))?;
@@ -421,7 +421,7 @@ pub(super) async fn dispatch_named_brain_turn(
     // allow a restored connectionless turn to execute; its reverse approval
     // control will fail closed if it later requires an addressed decision.
     let approval_connection_id = requester.connection_id;
-    let approval_audience = crate::brain::store::BrainApprovalAudience {
+    let approval_audience = crate::brain::BrainApprovalAudience {
         brain_id: snapshot.brain_id,
         brain: name.to_string(),
         attachment_id: requester.attachment_id,
@@ -475,7 +475,7 @@ pub(super) async fn dispatch_named_brain_turn(
                     name,
                     "daemon",
                     run_id,
-                    crate::brain::store::BrainRunStatus::Failed,
+                    crate::brain::BrainRunStatus::Failed,
                     Some(error.to_string()),
                 )?;
                 drop(publication);
@@ -504,7 +504,7 @@ pub(super) async fn dispatch_named_brain_turn(
         name,
         "provider",
         run_id,
-        crate::brain::store::BrainEventKind::Program {
+        crate::brain::BrainEventKind::Program {
             language: outcome.language,
             source: outcome.source,
         },
@@ -529,7 +529,7 @@ pub(super) async fn dispatch_named_brain_turn(
         name,
         "daemon",
         run_id,
-        crate::brain::store::BrainRunStatus::Completed,
+        crate::brain::BrainRunStatus::Completed,
         None,
     )?;
     drop(publication);
@@ -544,8 +544,8 @@ pub(super) async fn watch_named_brain(
     Query(connection): Query<WatchNamedBrainQuery>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> Result<Response, Response> {
-    let attachment_id = crate::brain::store::AttachmentId(connection.attachment_id);
-    let connection_id = crate::brain::store::ConnectionId(connection.connection_id);
+    let attachment_id = crate::brain::AttachmentId(connection.attachment_id);
+    let connection_id = crate::brain::ConnectionId(connection.connection_id);
     let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
     authorize_pending_remote_attachment(
         &lifecycle,
@@ -619,7 +619,7 @@ pub(super) async fn watch_named_brain(
             });
 
             let initial = BrainRemoteEnvelope::Projection(
-                crate::brain::store::BrainWireMessage::Snapshot { brain: snapshot },
+                crate::brain::BrainWireMessage::Snapshot { brain: snapshot },
             );
             if let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&initial) {
                 if socket
@@ -659,7 +659,7 @@ pub(super) async fn watch_named_brain(
                                     let is_approval = matches!(
                                         &command.kind,
                                         crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(
-                                            crate::brain::store::BrainEventKind::ApprovalDecided { .. }
+                                            crate::brain::BrainEventKind::ApprovalDecided { .. }
                                         )
                                     );
                                     let sent = if is_approval {
@@ -719,18 +719,18 @@ pub(super) async fn watch_named_brain(
                         Ok(event) => {
                             let closes_attachment = matches!(
                                 &event.kind,
-                                crate::brain::store::BrainEventKind::ClientDetached {
+                                crate::brain::BrainEventKind::ClientDetached {
                                     attachment_id: detached,
                                     connection_id: disconnected,
                                 } if *detached == attachment_id && *disconnected == connection_id
                             );
-                            (crate::brain::store::BrainWireMessage::Event { event }, closes_attachment)
+                            (crate::brain::BrainWireMessage::Event { event }, closes_attachment)
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             let Ok(brain) = lifecycle.snapshot(&name) else {
                                 break;
                             };
-                            (crate::brain::store::BrainWireMessage::Snapshot { brain }, false)
+                            (crate::brain::BrainWireMessage::Snapshot { brain }, false)
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         };
@@ -753,7 +753,7 @@ pub(super) async fn watch_named_brain(
                             &server,
                             &headers,
                             &name,
-                            crate::brain::credential::BrainCredentialScope::BrainRead,
+                            crate::brain::BrainCredentialScope::BrainRead,
                         ).is_err()
                             || lifecycle.connection(
                                 &name,

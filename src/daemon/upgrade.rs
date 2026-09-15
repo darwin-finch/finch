@@ -200,7 +200,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
         .brain_attach(
             &brain,
             &driver_subject,
-            crate::brain::store::AttachmentRole::Driver,
+            crate::brain::AttachmentRole::Driver,
             None,
         )
         .await?;
@@ -209,7 +209,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
         .await
         .context("fresh daemon Brain watch timed out")?
         .context("fresh daemon Brain watch closed")??;
-    let crate::brain::store::BrainWireMessage::Snapshot { brain: watched } = first else {
+    let crate::brain::BrainWireMessage::Snapshot { brain: watched } = first else {
         anyhow::bail!("fresh daemon Brain watch did not begin with a snapshot");
     };
     anyhow::ensure!(
@@ -228,8 +228,8 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
             .brain_submit(
                 &submit_brain,
                 &submit_attachment,
-                crate::brain::store::BrainEventKind::Program {
-                    language: crate::brain::store::ProgramLanguage::Lisp,
+                crate::brain::BrainEventKind::Program {
+                    language: crate::brain::ProgramLanguage::Lisp,
                     source: "(say \"preflight callback live\")".into(),
                 },
             )
@@ -262,7 +262,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
     anyhow::ensure!(
         outcome.result.as_ref().is_some_and(|event| matches!(
             &event.kind,
-            crate::brain::store::BrainEventKind::Result { error: None, .. }
+            crate::brain::BrainEventKind::Result { error: None, .. }
         )),
         "fresh daemon did not complete runner output"
     );
@@ -271,10 +271,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
         .context("fresh daemon watch did not remain live after callback")?
         .context("fresh daemon watch closed after callback")??;
     anyhow::ensure!(
-        matches!(
-            watched_event,
-            crate::brain::store::BrainWireMessage::Event { .. }
-        ),
+        matches!(watched_event, crate::brain::BrainWireMessage::Event { .. }),
         "fresh daemon watch did not publish the callback-backed program"
     );
 
@@ -311,8 +308,8 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
         client.brain_submit(
             &brain,
             &attachment,
-            crate::brain::store::BrainEventKind::Program {
-                language: crate::brain::store::ProgramLanguage::Lisp,
+            crate::brain::BrainEventKind::Program {
+                language: crate::brain::ProgramLanguage::Lisp,
                 source: "(say \"force callback loss\")".into(),
             },
         ),
@@ -322,7 +319,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
     anyhow::ensure!(
         lost.result.as_ref().is_some_and(|event| matches!(
             &event.kind,
-            crate::brain::store::BrainEventKind::Result { error: Some(error), .. }
+            crate::brain::BrainEventKind::Result { error: Some(error), .. }
                 if error.contains("disconnected") || error.contains("stopped")
         )),
         "closed runner callback did not become an observable failure"
@@ -341,8 +338,8 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
             .brain_submit(
                 &submit_brain,
                 &submit_attachment,
-                crate::brain::store::BrainEventKind::Program {
-                    language: crate::brain::store::ProgramLanguage::Lisp,
+                crate::brain::BrainEventKind::Program {
+                    language: crate::brain::ProgramLanguage::Lisp,
                     source: "(say \"handoff callback restored\")".into(),
                 },
             )
@@ -382,7 +379,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
             .as_ref()
             .is_some_and(|event| matches!(
                 &event.kind,
-                crate::brain::store::BrainEventKind::Result { error: None, .. }
+                crate::brain::BrainEventKind::Result { error: None, .. }
             )),
         "restored handed-off run was rejected"
     );
@@ -394,9 +391,9 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
             .context("watch closed after handed-off callback restoration")??;
         if matches!(
             message,
-            crate::brain::store::BrainWireMessage::Event {
-                event: crate::brain::store::BrainEvent {
-                    kind: crate::brain::store::BrainEventKind::Result {
+            crate::brain::BrainWireMessage::Event {
+                event: crate::brain::BrainEvent {
+                    kind: crate::brain::BrainEventKind::Result {
                         output,
                         error: None,
                         ..
