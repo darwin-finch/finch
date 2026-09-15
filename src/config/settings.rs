@@ -1141,7 +1141,7 @@ mod tests {
     #[test]
     fn test_coreml_policy_persistence_round_trip_uses_isolated_path() {
         use crate::config::{CoreMlComputeUnits, ExecutionTarget, ProviderEntry};
-        use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+        use crate::models::{InferenceProvider, ModelFamily, ModelSize};
 
         let directory = tempfile::tempdir().unwrap();
         let first_path = directory.path().join("config.toml");
@@ -1323,7 +1323,7 @@ mod tests {
     fn test_with_providers_derives_backend_from_local() {
         use crate::config::ExecutionTarget;
         use crate::config::ProviderEntry;
-        use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+        use crate::models::{InferenceProvider, ModelFamily, ModelSize};
         let providers = vec![ProviderEntry::Local {
             inference_provider: InferenceProvider::Onnx,
             execution_target: ExecutionTarget::Auto,
@@ -1346,7 +1346,7 @@ mod tests {
     fn test_cloud_providers_filters_local() {
         use crate::config::ExecutionTarget;
         use crate::config::ProviderEntry;
-        use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+        use crate::models::{InferenceProvider, ModelFamily, ModelSize};
         let providers = vec![
             ProviderEntry::Grok {
                 api_key: "xai-key".to_string(),

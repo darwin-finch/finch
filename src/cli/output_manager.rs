@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::messages::{
     BrainParticipantMessage, LiveToolMessage, MessageId, MessageRef, OperationMessage,
-    StaticMessage, StreamingResponseMessage, UserQueryMessage, WorkUnit,
+    ProgressMessage, StaticMessage, StreamingResponseMessage, UserQueryMessage, WorkUnit,
 };
+use crate::models::{DownloadProgressDisplay, ModelProgress};
 use crate::runtime::VmEffectEnvelope;
 use crate::vm::{HostSideEffect, TypedValue, UiOperation, VmSideEffect};
 
@@ -503,6 +504,22 @@ impl OutputManager {
 impl Default for OutputManager {
     fn default() -> Self {
         Self::new(crate::theme::ColorScheme::default())
+    }
+}
+
+impl ModelProgress for OutputManager {
+    fn write_progress(&self, content: String) {
+        OutputManager::write_progress(self, content);
+    }
+
+    fn start_download_progress(
+        &self,
+        label: String,
+        total: u64,
+    ) -> Arc<dyn DownloadProgressDisplay> {
+        let msg = Arc::new(ProgressMessage::new(label, total));
+        self.add_trait_message(msg.clone());
+        msg
     }
 }
 

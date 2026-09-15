@@ -7,7 +7,7 @@
 // 4. Template artifacts are stripped (ChatML, etc.)
 
 use anyhow::Result;
-use finch::models::adapters::{DeepSeekAdapter, LlamaAdapter, LocalModelAdapter, QwenAdapter};
+use finch::models::{DeepSeekAdapter, LlamaAdapter, LocalModelAdapter, QwenAdapter};
 
 /// Test that QwenAdapter removes ChatML special tokens
 #[test]

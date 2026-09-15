@@ -3,9 +3,7 @@
 // Analyzes Claude's responses to learn what types of queries map to what types of responses
 // This feeds into both routing decisions and response generation
 
-use crate::models::learning::{
-    LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData,
-};
+use crate::models::{LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
