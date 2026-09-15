@@ -573,7 +573,30 @@ impl MemTree {
         // Sort by weighted score descending
         results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        results.into_iter().take(top_k).collect()
+        // One memory, one result slot.
+        //
+        // Insert deduplicates exact texts (`find_leaf_by_text`), but a store
+        // built before that guard ran — the reference host's — holds the same
+        // text on several leaves: 5 distinct texts occupied 11 of 27 nodes,
+        // and hydration loads every row, so top-k spent its budget returning
+        // the same memory twice. Identity here is the tree's own: exact text,
+        // the same rule `find_leaf_by_text` applies. The highest-scoring copy
+        // represents the text.
+        if top_k == 0 {
+            return Vec::new();
+        }
+        let mut seen: HashSet<String> = HashSet::with_capacity(results.len());
+        let mut picked: Vec<(NodeId, String, f32)> = Vec::with_capacity(top_k);
+        for entry in results {
+            if !seen.insert(entry.1.clone()) {
+                continue;
+            }
+            picked.push(entry);
+            if picked.len() == top_k {
+                break;
+            }
+        }
+        picked
     }
 
     /// Get node by ID
@@ -1214,6 +1237,50 @@ mod tests {
             .filter(|(_, text, _)| text == "first memory")
             .count();
         assert_eq!(first_count, 1, "a memory must appear once; got {results:?}");
+    }
+
+    #[test]
+    fn test_retrieve_deduplicates_identical_text_across_leaves() {
+        // #415 defect 1. Leaves-only retrieval stops an internal node's
+        // provisional label from surfacing, but a store built before insertion
+        // was fixed already holds the same text on SEVERAL leaves — the
+        // reference host measured 5 distinct texts across 11 of 27 nodes, and
+        // hydration loads every row. Nothing later removes the copies, so
+        // retrieval spent its top-k budget returning the same memory twice.
+        // Identical text is the tree's own definition of "the same memory"
+        // (`find_leaf_by_text`); retrieval must apply it too.
+        let mut tree = MemTree::new_with_dim(8);
+        {
+            let nodes = tree.all_nodes_mut();
+            for (id, axis) in [(1u64, 0usize), (2u64, 4usize)] {
+                nodes.insert(
+                    id,
+                    TreeNode {
+                        id,
+                        parent: Some(0),
+                        children: Vec::new(),
+                        text: "the signing key lives in the vault".to_string(),
+                        embedding: vec_on(axis, 8, 0.0),
+                        level: 1,
+                        created_at: 0,
+                        importance: 1,
+                    },
+                );
+                nodes.get_mut(&0).expect("root").children.push(id);
+            }
+        }
+        tree.set_next_id(3);
+
+        let results = tree.retrieve(&vec_on(0, 8, 0.0), 10);
+        let copies = results
+            .iter()
+            .filter(|(_, text, _)| text == "the signing key lives in the vault")
+            .count();
+        assert_eq!(
+            copies, 1,
+            "identical text on several leaves must be recalled once, or the \
+             top-k budget is spent on duplicates; got {results:?}"
+        );
     }
 
     #[test]
