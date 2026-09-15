@@ -112,18 +112,14 @@ jobs:
         install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned
         install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
 
-    - name: Reject self-issued proof authority
-      timeout-minutes: 15
+    # The whole module, not a list of names. Naming tests individually meant a test added to this
+    # module was scheduled nowhere: it ran only in the quick matrix, which supplies no contract, so
+    # its body returned at the guard and it reported pass without asserting anything (#614).
+    - name: Brain isolation boundaries under the supervisor contract
+      timeout-minutes: 25
       run: >-
         ./scripts/test_brains.sh cargo test --lib
-        brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority
-        -- --nocapture
-
-    - name: Validate offset-independent concurrent proof reads
-      timeout-minutes: 15
-      run: >-
-        ./scripts/test_brains.sh cargo test --lib
-        brain::isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency
+        brain::isolation_tests::
         -- --nocapture
 
     - name: Reject rewritten proof at the production constructor
@@ -207,18 +203,14 @@ jobs:
         install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned
         install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
 
-    - name: Reject self-issued proof authority
-      timeout-minutes: 15
+    # The whole module, not a list of names. Naming tests individually meant a test added to this
+    # module was scheduled nowhere: it ran only in the quick matrix, which supplies no contract, so
+    # its body returned at the guard and reported pass without asserting anything (#614).
+    - name: Brain isolation boundaries under the supervisor contract
+      timeout-minutes: 25
       run: >-
         ./scripts/test_brains.sh cargo test --lib
-        brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority
-        -- --nocapture
-
-    - name: Validate offset-independent concurrent proof reads
-      timeout-minutes: 15
-      run: >-
-        ./scripts/test_brains.sh cargo test --lib
-        brain::isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency
+        brain::isolation_tests::
         -- --nocapture
 
     - name: Reject rewritten proof at the production constructor

@@ -6385,6 +6385,611 @@ fn effect_audit_connection_teardown_batch_is_exact_idempotent_and_retryable() {
                     } if outcome_kind == "uncertain_process_loss")));
 }
 
+/// Absolute path of a Brain's active effect-audit journal under a store root.
+fn active_journal_path(root: &std::path::Path) -> PathBuf {
+    root.join("shared")
+        .join("effect-audit-replay")
+        .join("active.sqlite3")
+}
+
+/// Enough unresolved audits that the durable journal crosses at least one
+/// SQLite page while they are reconciled. A two-row batch fits in already
+/// allocated pages and never moves the file size, which would make every
+/// byte-bound assertion below vacuous.
+const AUDIT_BOUND_FIXTURE_AUDITS: usize = 64;
+
+/// Build the shared effect-audit fixture on a real store root: a run, a
+/// runner lease, and `AUDIT_BOUND_FIXTURE_AUDITS` durable reserves, all
+/// through the production API.
+fn audit_bound_fixture(
+    root: &std::path::Path,
+) -> (
+    BrainStore,
+    BrainRunnerLease,
+    EffectAuditAuthorityGrant,
+    Vec<crate::runtime::effect_log::EffectAuditIdentity>,
+) {
+    let store = BrainStore::with_root("box.local", Some(root.to_path_buf()));
+    let (_run, lease, grant) = audit_run_fixture(&store);
+    let identities = (0..AUDIT_BOUND_FIXTURE_AUDITS as u64)
+        .map(|sequence| {
+            store
+                .reserve_effect_audit(
+                    &grant,
+                    uuid::Uuid::new_v4(),
+                    audit_effect(sequence, "bound"),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    (store, lease, grant, identities)
+}
+
+/// Measure, on a throwaway root, the journal size before the reconciliation
+/// batch and the size that same batch durably reaches. `after` is the exact
+/// size the batch's transaction commits at: the terminal fences that follow
+/// delete rows but never shrink the SQLite file.
+fn audit_batch_bound_probe() -> (u64, u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, _grant, _identities) = audit_bound_fixture(temp.path());
+    let before = store.effect_audit_journal_bytes_for_test("shared").unwrap();
+    let reconciled = store
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .unwrap();
+    let after = store.effect_audit_journal_bytes_for_test("shared").unwrap();
+    assert_eq!(
+        reconciled, AUDIT_BOUND_FIXTURE_AUDITS,
+        "bound probe fixture must reconcile every audit under the production bound \
+         (reconciled={reconciled} of {AUDIT_BOUND_FIXTURE_AUDITS}, \
+          journal {before} -> {after} bytes)"
+    );
+    assert!(
+        after > before,
+        "bound probe is vacuous: the reconciliation batch no longer grows the active \
+         effect-audit journal (before={before} bytes, after={after} bytes), so no bound \
+         value distinguishes landing on the boundary from crossing it"
+    );
+    (before, after)
+}
+
+/// Find the single-transition `Begin` append that first grows the durable
+/// journal, and measure the sizes it moves between. Returns the number of
+/// begins that precede it so a regression can replay the same fixture and
+/// place the bound exactly on that append.
+fn audit_single_bound_probe() -> (usize, u64, u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, _lease, grant, identities) = audit_bound_fixture(temp.path());
+    for (index, identity) in identities.iter().enumerate() {
+        let before = store.effect_audit_journal_bytes_for_test("shared").unwrap();
+        let _permit = store.begin_effect_audit(&grant, *identity).unwrap();
+        let after = store.effect_audit_journal_bytes_for_test("shared").unwrap();
+        if after > before {
+            return (index, before, after);
+        }
+    }
+    let settled = store.effect_audit_journal_bytes_for_test("shared").unwrap();
+    panic!(
+        "single-append bound probe is vacuous: no begin_effect_audit among \
+         {AUDIT_BOUND_FIXTURE_AUDITS} audits grew the active effect-audit journal \
+         (settled at {settled} bytes)"
+    );
+}
+
+fn replayed_duplicate_seqs(events: &[BrainEvent]) -> Vec<(u64, usize)> {
+    let mut seen = std::collections::BTreeMap::new();
+    for event in events {
+        *seen.entry(event.seq).or_insert(0usize) += 1;
+    }
+    seen.into_iter().filter(|(_, count)| *count > 1).collect()
+}
+
+/// #379 (effect-audit journal bound): a batch whose durable size lands exactly
+/// on the byte bound is admitted, and the canonical revision advances once
+/// per committed transition.
+#[test]
+fn test_effect_audit_batch_exactly_on_byte_bound_is_admitted_and_advances_revision() {
+    let (probe_before, bound) = audit_batch_bound_probe();
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, _grant, _identities) = audit_bound_fixture(temp.path());
+    let before = store.effect_audit_journal_bytes_for_test("shared").unwrap();
+    assert_eq!(
+        before, probe_before,
+        "effect-audit journal growth must be deterministic for the bound to be placeable: \
+         probe measured {probe_before} bytes before the batch, this fixture {before}"
+    );
+    store
+        .set_effect_audit_journal_max_bytes_for_test("shared", bound)
+        .unwrap();
+    let revision_before = store.snapshot("shared").unwrap().revision;
+
+    let reconciled = store
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .unwrap();
+
+    let after = store.effect_audit_journal_bytes_for_test("shared").unwrap();
+    let revision_after = store.snapshot("shared").unwrap().revision;
+    assert_eq!(
+        reconciled, AUDIT_BOUND_FIXTURE_AUDITS,
+        "a batch landing exactly on the durable byte bound must be admitted \
+         (reconciled={reconciled} of {AUDIT_BOUND_FIXTURE_AUDITS}, bound={bound} bytes, \
+          journal {before} -> {after} bytes, revision {revision_before} -> {revision_after})"
+    );
+    assert_eq!(
+        after, bound,
+        "the admitted batch must land exactly on the bound it was measured against \
+         (bound={bound} bytes, journal {before} -> {after} bytes)"
+    );
+    assert_eq!(
+        revision_after,
+        revision_before + AUDIT_BOUND_FIXTURE_AUDITS as u64,
+        "an admitted batch must advance the canonical revision once per transition \
+         (revision {revision_before} -> {revision_after}, reconciled={reconciled}, \
+          bound={bound} bytes, journal {before} -> {after} bytes)"
+    );
+}
+
+/// #379 (effect-audit journal bound): past the durable byte bound the batch
+/// must commit nothing. Before the fix the transaction committed and the
+/// caller still saw `Err`, so the journal held transitions the canonical
+/// revision did not know about.
+#[test]
+fn test_effect_audit_batch_past_byte_bound_commits_nothing_and_holds_the_sequence() {
+    let (_probe_before, admitting_bound) = audit_batch_bound_probe();
+    let bound = admitting_bound - 1;
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, _grant, _identities) = audit_bound_fixture(temp.path());
+    let journal_path = active_journal_path(temp.path());
+    let bytes_before = std::fs::read(&journal_path).unwrap();
+    let seqs_before = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+    let revision_before = store.snapshot("shared").unwrap().revision;
+    store
+        .set_effect_audit_journal_max_bytes_for_test("shared", bound)
+        .unwrap();
+
+    let refusal = store
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .expect_err(&format!(
+            "a batch whose durable size would reach {admitting_bound} bytes must be refused \
+             under a {bound}-byte bound"
+        ));
+
+    let bytes_after = std::fs::read(&journal_path).unwrap();
+    let seqs_after = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+    let revision_after = store.snapshot("shared").unwrap().revision;
+    assert!(
+        format!("{refusal:#}").contains("durable byte bound"),
+        "the refusal must name the durable byte bound so an operator can act on it \
+         (bound={bound} bytes, error={refusal:#})"
+    );
+    assert!(
+        bytes_before == bytes_after,
+        "a refused effect-audit append must leave the durable journal byte-identical: \
+         {} bytes before, {} bytes after, bound={bound}, refusal={refusal:#}",
+        bytes_before.len(),
+        bytes_after.len()
+    );
+    assert_eq!(
+        seqs_after, seqs_before,
+        "a refused effect-audit append must commit no sequence: journal held {seqs_before:?} \
+         before and {seqs_after:?} after, bound={bound} bytes, refusal={refusal:#}"
+    );
+    assert_eq!(
+        revision_after, revision_before,
+        "a refused effect-audit append must leave the canonical revision unmoved \
+         (revision {revision_before} -> {revision_after}, journal seqs {seqs_after:?}, \
+          bound={bound} bytes, refusal={refusal:#})"
+    );
+
+    let ordinary = store
+        .push(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "after refusal".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        ordinary.seq,
+        revision_before + 1,
+        "the next canonical append must take the seq the refused batch did not consume \
+         (revision was {revision_before}, ordinary event took seq {}, journal holds \
+          {seqs_after:?})",
+        ordinary.seq
+    );
+    assert!(
+        !seqs_after.contains(&ordinary.seq),
+        "the ordinary canonical event took seq {} which the effect-audit journal already \
+         holds ({seqs_after:?}) — this is the duplicate-seq corruption of #379 \
+         (effect-audit journal bound)",
+        ordinary.seq
+    );
+    store
+        .set_effect_audit_journal_max_bytes_for_test(
+            "shared",
+            crate::brain::effect_audit_archive::MAX_ACTIVE_JOURNAL_BYTES,
+        )
+        .unwrap();
+    let reconciled = store
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .unwrap();
+    let revision_final = store.snapshot("shared").unwrap().revision;
+    assert_eq!(
+        reconciled, AUDIT_BOUND_FIXTURE_AUDITS,
+        "the refused batch must still be retryable once the bound admits it \
+         (reconciled={reconciled} of {AUDIT_BOUND_FIXTURE_AUDITS}, \
+          revision {revision_after} -> {revision_final})"
+    );
+    assert_eq!(
+        revision_final,
+        ordinary.seq + AUDIT_BOUND_FIXTURE_AUDITS as u64,
+        "the retried batch must allocate fresh seqs above the ordinary event \
+         (ordinary seq {}, final revision {revision_final})",
+        ordinary.seq
+    );
+    let retried = store
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .unwrap();
+    assert_eq!(
+        retried, 0,
+        "a successful terminal batch must be exact-once: a second reconcile after \
+         admission must append nothing (reconciled={retried}, revision {revision_final})"
+    );
+}
+
+/// #379 (effect-audit journal bound): after a refused bound-crossing append
+/// and an ordinary canonical append, a restart must still replay the Brain
+/// with no duplicate `seq`.
+#[test]
+fn test_effect_audit_bound_refusal_does_not_reuse_a_seq_across_restart() {
+    let (_probe_before, admitting_bound) = audit_batch_bound_probe();
+    let bound = admitting_bound - 1;
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, _grant, identities) = audit_bound_fixture(temp.path());
+    let revision_before = store.snapshot("shared").unwrap().revision;
+    store
+        .set_effect_audit_journal_max_bytes_for_test("shared", bound)
+        .unwrap();
+    let refusal = store
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .expect_err("the bound-crossing reconciliation batch must be refused");
+    store
+        .set_effect_audit_journal_max_bytes_for_test(
+            "shared",
+            crate::brain::effect_audit_archive::MAX_ACTIVE_JOURNAL_BYTES,
+        )
+        .unwrap();
+    let ordinary = store
+        .push(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "after refusal".into(),
+            },
+        )
+        .unwrap();
+    let journal_seqs = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+    drop(store);
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let snapshot = restarted
+        .snapshot("shared")
+        .map_err(|error| {
+            format!(
+                "the Brain must still load after a refused bound-crossing append: {error:#} \
+                 (revision before refusal {revision_before}, refusal={refusal:#}, ordinary event \
+                  seq {}, effect-audit journal seqs {journal_seqs:?})",
+                ordinary.seq
+            )
+        })
+        .unwrap_or_else(|message| panic!("{message}"));
+    let duplicates = replayed_duplicate_seqs(&snapshot.events);
+    assert!(
+        duplicates.is_empty(),
+        "a refused bound-crossing append must not leave a duplicate canonical seq: \
+         duplicates {duplicates:?} in replayed seqs {:?} (effect-audit journal held \
+         {journal_seqs:?}, ordinary event took seq {}, revision before refusal \
+         {revision_before})",
+        snapshot
+            .events
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        ordinary.seq
+    );
+    let terminal = snapshot
+        .effect_audits
+        .iter()
+        .filter(|entry| identities.contains(&entry.intent.identity) && entry.state.is_terminal())
+        .count();
+    assert_eq!(
+        terminal,
+        identities.len(),
+        "restart replay must terminalize each refused identity exactly once \
+         (terminal={terminal} of {}, ordinary seq {}, revision before refusal \
+          {revision_before})",
+        identities.len(),
+        ordinary.seq
+    );
+    let retried = restarted
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .unwrap();
+    assert_eq!(
+        retried, 0,
+        "restart replay must leave no post-terminal effect: a later reconcile must \
+         append nothing (reconciled={retried}, terminal={terminal})"
+    );
+}
+
+/// Crash after a bound refusal, before any retry or ordinary append. Restart
+/// must load, drain unresolved identities exactly once, and not reuse a seq.
+#[test]
+fn test_effect_audit_bound_refusal_survives_crash_before_retry() {
+    let (_probe_before, admitting_bound) = audit_batch_bound_probe();
+    let bound = admitting_bound - 1;
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, _grant, identities) = audit_bound_fixture(temp.path());
+    let seqs_before = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+    let revision_before = store.snapshot("shared").unwrap().revision;
+    store
+        .set_effect_audit_journal_max_bytes_for_test("shared", bound)
+        .unwrap();
+    let refusal = store
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .expect_err("the bound-crossing reconciliation batch must be refused");
+    let seqs_after = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+    assert_eq!(
+        seqs_after, seqs_before,
+        "a refused batch must commit no sequence before the crash \
+         (seqs {seqs_before:?} -> {seqs_after:?}, revision {revision_before}, \
+          refusal={refusal:#})"
+    );
+    drop(store);
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let snapshot = restarted
+        .snapshot("shared")
+        .map_err(|error| {
+            format!(
+                "the Brain must still load after a crash on a refused bound-crossing append: \
+                 {error:#} (revision before refusal {revision_before}, refusal={refusal:#}, \
+                  journal seqs before crash {seqs_after:?})"
+            )
+        })
+        .unwrap_or_else(|message| panic!("{message}"));
+    let duplicates = replayed_duplicate_seqs(&snapshot.events);
+    assert!(
+        duplicates.is_empty(),
+        "a crash after bound refusal must not leave a duplicate canonical seq: \
+         duplicates {duplicates:?} (revision before refusal {revision_before}, \
+          journal seqs {seqs_after:?})"
+    );
+    let terminal = snapshot
+        .effect_audits
+        .iter()
+        .filter(|entry| identities.contains(&entry.intent.identity) && entry.state.is_terminal())
+        .count();
+    assert_eq!(
+        terminal,
+        identities.len(),
+        "restart after a refused bound-crossing append must terminalize each identity \
+         exactly once (terminal={terminal} of {}, revision before refusal {revision_before})",
+        identities.len()
+    );
+    let retried = restarted
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .unwrap();
+    assert_eq!(
+        retried, 0,
+        "restart drain must be exact-once: a later reconcile must append nothing \
+         (reconciled={retried}, terminal={terminal})"
+    );
+}
+
+/// #379 (effect-audit journal bound): the single-transition `append` has the
+/// identical shape and must refuse the same way. `begin_effect_audit` drives it.
+#[test]
+fn test_effect_audit_single_append_past_byte_bound_commits_nothing_and_holds_the_sequence() {
+    let (preceding_begins, probe_before, admitting_bound) = audit_single_bound_probe();
+    let bound = admitting_bound - 1;
+    let temp = tempfile::tempdir().unwrap();
+    let (store, _lease, grant, identities) = audit_bound_fixture(temp.path());
+    for identity in &identities[..preceding_begins] {
+        let _permit = store.begin_effect_audit(&grant, *identity).unwrap();
+    }
+    let identity = identities[preceding_begins];
+    let journal_path = active_journal_path(temp.path());
+    let bytes_before = std::fs::read(&journal_path).unwrap();
+    assert_eq!(
+        bytes_before.len() as u64,
+        probe_before,
+        "effect-audit journal growth must be deterministic for the bound to be placeable: \
+         probe measured {probe_before} bytes before the begin append, this fixture {}",
+        bytes_before.len()
+    );
+    let seqs_before = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+    let revision_before = store.snapshot("shared").unwrap().revision;
+    store
+        .set_effect_audit_journal_max_bytes_for_test("shared", bound)
+        .unwrap();
+
+    let refusal = store
+        .begin_effect_audit(&grant, identity)
+        .expect_err(&format!(
+            "a begin append whose durable size would reach {admitting_bound} bytes must be \
+             refused under a {bound}-byte bound"
+        ));
+
+    let bytes_after = std::fs::read(&journal_path).unwrap();
+    let seqs_after = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+    let revision_after = store.snapshot("shared").unwrap().revision;
+    assert!(
+        bytes_before == bytes_after,
+        "a refused single effect-audit append must leave the durable journal byte-identical: \
+         {} bytes before, {} bytes after, bound={bound}, refusal={refusal:#}",
+        bytes_before.len(),
+        bytes_after.len()
+    );
+    assert_eq!(
+        seqs_after, seqs_before,
+        "a refused single effect-audit append must commit no sequence: journal held \
+         {seqs_before:?} before and {seqs_after:?} after, bound={bound} bytes, \
+         refusal={refusal:#}"
+    );
+    assert_eq!(
+        revision_after, revision_before,
+        "a refused single effect-audit append must leave the canonical revision unmoved \
+         (revision {revision_before} -> {revision_after}, journal seqs {seqs_after:?}, \
+          bound={bound} bytes, refusal={refusal:#})"
+    );
+
+    let ordinary = store
+        .push(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "after refusal".into(),
+            },
+        )
+        .unwrap();
+    assert!(
+        !seqs_after.contains(&ordinary.seq),
+        "the ordinary canonical event took seq {} which the effect-audit journal already \
+         holds ({seqs_after:?}) — this is the duplicate-seq corruption of #379 \
+         (effect-audit journal bound)",
+        ordinary.seq
+    );
+    drop(store);
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let snapshot = restarted
+        .snapshot("shared")
+        .map_err(|error| {
+            format!(
+                "the Brain must still load after a refused single bound-crossing append: \
+                 {error:#} (ordinary event seq {}, effect-audit journal seqs {seqs_after:?}, \
+                  revision before refusal {revision_before})",
+                ordinary.seq
+            )
+        })
+        .unwrap_or_else(|message| panic!("{message}"));
+    let duplicates = replayed_duplicate_seqs(&snapshot.events);
+    assert!(
+        duplicates.is_empty(),
+        "a refused single bound-crossing append must not leave a duplicate canonical seq: \
+         duplicates {duplicates:?} in replayed seqs {:?} (effect-audit journal held \
+         {seqs_after:?}, ordinary event took seq {})",
+        snapshot
+            .events
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        ordinary.seq
+    );
+}
+
+/// Late failure: inserts succeed, commit is aborted by the test hook, then an
+/// ordinary canonical append and a restart must not reuse a seq, and retry
+/// must terminalize exactly once.
+#[test]
+fn test_effect_audit_late_pre_commit_failure_holds_sequence_across_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let (_run, lease, grant) = audit_run_fixture(&store);
+    let unbegun = store
+        .reserve_effect_audit(&grant, uuid::Uuid::new_v4(), audit_effect(0, "unbegun"))
+        .unwrap();
+    let begun = store
+        .reserve_effect_audit(&grant, uuid::Uuid::new_v4(), audit_effect(1, "begun"))
+        .unwrap();
+    let _permit = store.begin_effect_audit(&grant, begun).unwrap();
+    let seqs_before = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+    let revision_before = store.snapshot("shared").unwrap().revision;
+    store
+        .fail_next_effect_audit_batch_for_test("shared")
+        .unwrap();
+    let refusal = store
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .expect_err("injected pre-commit failure must abort the teardown batch");
+    let seqs_after = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+    let revision_after = store.snapshot("shared").unwrap().revision;
+    assert_eq!(
+        seqs_after, seqs_before,
+        "a late pre-commit failure must commit no sequence: journal held {seqs_before:?} \
+         before and {seqs_after:?} after, refusal={refusal:#}"
+    );
+    assert_eq!(
+        revision_after, revision_before,
+        "a late pre-commit failure must leave the canonical revision unmoved \
+         (revision {revision_before} -> {revision_after}, refusal={refusal:#})"
+    );
+    let ordinary = store
+        .push(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "after late failure".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        ordinary.seq,
+        revision_before + 1,
+        "the next canonical append must take the seq the failed batch did not consume \
+         (revision was {revision_before}, ordinary event took seq {})",
+        ordinary.seq
+    );
+    assert!(
+        !seqs_after.contains(&ordinary.seq),
+        "the ordinary canonical event took seq {} which the effect-audit journal already \
+         holds ({seqs_after:?})",
+        ordinary.seq
+    );
+    drop(store);
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let snapshot = restarted
+        .snapshot("shared")
+        .map_err(|error| {
+            format!(
+                "the Brain must still load after a late pre-commit failure: {error:#} \
+                 (ordinary event seq {}, journal seqs {seqs_after:?}, revision before \
+                  failure {revision_before})",
+                ordinary.seq
+            )
+        })
+        .unwrap_or_else(|message| panic!("{message}"));
+    let duplicates = replayed_duplicate_seqs(&snapshot.events);
+    assert!(
+        duplicates.is_empty(),
+        "a late pre-commit failure must not leave a duplicate canonical seq: \
+         duplicates {duplicates:?} (ordinary event seq {}, journal seqs {seqs_after:?})",
+        ordinary.seq
+    );
+    let terminal = snapshot
+        .effect_audits
+        .iter()
+        .filter(|entry| {
+            (entry.intent.identity == unbegun || entry.intent.identity == begun)
+                && entry.state.is_terminal()
+        })
+        .count();
+    assert_eq!(
+        terminal, 2,
+        "restart after a late pre-commit failure must terminalize each identity exactly \
+         once (terminal={terminal}, ordinary seq {})",
+        ordinary.seq
+    );
+    let retried = restarted
+        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+        .unwrap();
+    assert_eq!(
+        retried, 0,
+        "restart drain must be exact-once: a later reconcile must append nothing \
+         (reconciled={retried}, terminal={terminal})"
+    );
+}
+
 #[test]
 fn effect_audit_epochs_bound_active_history_and_fence_replay_after_restart() {
     let temp = tempfile::tempdir().unwrap();

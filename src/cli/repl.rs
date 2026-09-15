@@ -65,6 +65,69 @@ enum ConfirmationChoice {
     Deny,
 }
 
+/// Owner-REPL tools that skip the per-call approval prompt.
+///
+/// This list is a grant: each name is auto-approved. It covers workspace
+/// reads, VM discovery (canonical names and compatibility aliases), memory
+/// reads, and scheduler-local agent control. It does not include writes,
+/// host-effect tools, or names nothing registers.
+///
+/// Stack inspection is `get_vm_state` (which reports `stack_top` and
+/// `stack_depth`); those two strings are not tool names. `create_memory` is a
+/// write and is not granted here.
+pub(crate) const REPL_ALWAYS_ALLOW_TOOLS: &[&str] = &[
+    "read",
+    "glob",
+    "grep",
+    "web_fetch",
+    "search_memory",
+    "inspect_memory",
+    "list_recent_memories",
+    "get_vm_state",
+    "get_language_definition",
+    "search_vm_vocabulary",
+    "inspect_vm_word",
+    "search_word",
+    "inspect_word",
+    "search_vocabulary",
+    "inspect_program",
+    "spawn_agent",
+    "await_agent",
+    "poll_agent",
+    "cancel_agent",
+];
+
+fn apply_repl_always_allow_tools(permissions: &mut PermissionManager) {
+    let allow_config = ToolPermissionConfig {
+        enabled: true,
+        rule: PermissionRule::Allow,
+        allowed_patterns: Vec::new(),
+        blocked_patterns: Vec::new(),
+    };
+    for tool in REPL_ALWAYS_ALLOW_TOOLS {
+        permissions.register_tool_config(tool.to_string(), allow_config.clone());
+    }
+}
+
+fn register_repl_tool_aliases(registry: &mut ToolRegistry) {
+    const ALIASES: &[(&str, &str)] = &[
+        ("search_vm_vocabulary", "search_word"),
+        ("inspect_vm_word", "inspect_word"),
+        ("search_vocabulary", "search_word"),
+        ("inspect_program", "inspect_word"),
+        ("EnterPlanMode", "enter_plan_mode"),
+        ("PresentPlan", "present_plan"),
+        ("AskUserQuestion", "ask_user_question"),
+        ("TodoWrite", "todo_write"),
+        ("TodoRead", "todo_read"),
+    ];
+    for (alias, canonical) in ALIASES {
+        if registry.has_tool(canonical) {
+            registry.register_alias(*alias, *canonical);
+        }
+    }
+}
+
 /// Shared identity for interactive and redirected startup banners.
 pub fn startup_identity_line() -> String {
     format!("finch {} - {}", env!("CARGO_PKG_VERSION"), crate::ABOUT)
@@ -802,28 +865,15 @@ impl Repl {
             Arc::clone(&program_runtime),
             memory_system.clone(),
         )));
-        // Historical vocabulary spellings remain executable for persisted
-        // turns and external clients, but providers must see one coherent
-        // discovery surface. The old searches each covered only a subset
-        // (core VM or persisted programs), which led models to mistake an
-        // empty legacy search for an absent typed word or syntax form.
-        tool_registry.register_alias("search_vm_vocabulary", "search_word");
-        tool_registry.register_alias("inspect_vm_word", "inspect_word");
-        tool_registry.register_alias("search_vocabulary", "search_word");
-        tool_registry.register_alias("inspect_program", "inspect_word");
-
         // Self-improvement tools
         tool_registry.register(Box::new(RestartTool));
 
         // Plan mode tools
         tool_registry.register(Box::new(EnterPlanModeTool));
         tool_registry.register(Box::new(PresentPlanTool));
-        tool_registry.register_alias("EnterPlanMode", "enter_plan_mode");
-        tool_registry.register_alias("PresentPlan", "present_plan");
 
         // User interaction tools
         tool_registry.register(Box::new(AskUserQuestionTool));
-        tool_registry.register_alias("AskUserQuestion", "ask_user_question");
 
         // Phase 1: Initialize LLM registry (before ToolExecutor creation)
         let llm_registry = if config.teachers.len() > 1 {
@@ -896,12 +946,14 @@ impl Repl {
                 todo_journal,
             )));
             tool_registry.register(Box::new(TodoReadTool::new(Arc::clone(&todo_list))));
-            tool_registry.register_alias("TodoWrite", "todo_write");
-            tool_registry.register_alias("TodoRead", "todo_read");
         }
+        // Historical vocabulary spellings remain executable for persisted
+        // turns and external clients, but providers must see one coherent
+        // discovery surface. Aliases are registered after every canonical
+        // tool exists.
+        register_repl_tool_aliases(&mut tool_registry);
 
         // Create permission manager.
-        // Read-only tools are always allowed — they can't damage anything.
         // Destructive tools (bash, restart, write) require confirmation unless
         // the user has explicitly set auto_approve_tools = true.
         let default_rule = if config.features.auto_approve_tools {
@@ -909,43 +961,8 @@ impl Repl {
         } else {
             PermissionRule::Ask
         };
-        let allow_config = ToolPermissionConfig {
-            enabled: true,
-            rule: PermissionRule::Allow,
-            allowed_patterns: Vec::new(),
-            blocked_patterns: Vec::new(),
-        };
         let mut permissions = PermissionManager::new().with_default_rule(default_rule);
-        // Safe read-only tools — always allow without asking.
-        for tool in &[
-            "read",
-            "glob",
-            "grep",
-            "web_fetch",
-            "push",
-            "stack_push",
-            "stack_run",
-            "stack_clear",
-            "memory_read",
-            "memory_list",
-            "describe",
-            "view",
-            "search",
-            "get_vm_state",
-            "get_language_definition",
-            "search_vm_vocabulary",
-            "inspect_vm_word",
-            "search_word",
-            "inspect_word",
-            "search_vocabulary",
-            "inspect_program",
-            "spawn_agent",
-            "await_agent",
-            "poll_agent",
-            "cancel_agent",
-        ] {
-            permissions.register_tool_config(tool.to_string(), allow_config.clone());
-        }
+        apply_repl_always_allow_tools(&mut permissions);
 
         // Determine patterns path
         // Create tool executor
@@ -975,19 +992,13 @@ impl Repl {
                     Arc::clone(&program_runtime),
                     memory_system.clone(),
                 )));
-                fallback_registry.register_alias("search_vm_vocabulary", "search_word");
-                fallback_registry.register_alias("inspect_vm_word", "inspect_word");
-                fallback_registry.register_alias("search_vocabulary", "search_word");
-                fallback_registry.register_alias("inspect_program", "inspect_word");
                 fallback_registry.register(Box::new(RestartTool));
                 // Plan mode tools
                 fallback_registry.register(Box::new(EnterPlanModeTool));
                 fallback_registry.register(Box::new(PresentPlanTool));
-                fallback_registry.register_alias("EnterPlanMode", "enter_plan_mode");
-                fallback_registry.register_alias("PresentPlan", "present_plan");
                 // User interaction tools
                 fallback_registry.register(Box::new(AskUserQuestionTool));
-                fallback_registry.register_alias("AskUserQuestion", "ask_user_question");
+                register_repl_tool_aliases(&mut fallback_registry);
                 ToolExecutor::new(
                     fallback_registry,
                     PermissionManager::new().with_default_rule(PermissionRule::Allow),
@@ -2936,6 +2947,7 @@ impl Repl {
                         | "PresentPlan"
                         | "ask_user_question"
                         | "AskUserQuestion"
+                        | "enter_plan_mode"
                         | "EnterPlanMode"
                         | "ExitPlanMode"
                 )
@@ -4587,3 +4599,6 @@ impl Repl {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod always_allow_tests;

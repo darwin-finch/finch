@@ -12,7 +12,7 @@ authorizes one is `src/runtime/`.
 modules are private, so the `pub use` list in `src/programs/mod.rs` is the whole public surface,
 and `scripts/check_subsystems.py` rejects a `pub mod` there.
 
-**Dependencies:** `vm`, and nothing else by design. Corpus capture accepts a lazy context supplier;
+**Dependencies:** `vm` for execution contracts and `language` for source compilation. Corpus capture accepts a lazy context supplier;
 the application runtime may construct that context, but this subsystem never knows or clones a
 `ProgramRuntime` when capture is disabled. Wire-failure classification is VM compiler-boundary
 behavior re-exported here only for compatibility.

@@ -950,8 +950,7 @@ impl Message for WorkUnit {
                 TranscriptRowKind::Program,
                 format!("Program source ({language})"),
                 lines(&inner.response_text),
-                inner.status == MessageStatus::InProgress
-                    || inner.response_text.lines().count() <= 3,
+                inner.status == MessageStatus::InProgress,
             ),
             WorkUnitPresentation::ProgramOutput { title } => (
                 TranscriptRowKind::Output,
@@ -2272,6 +2271,30 @@ mod tests {
         assert!(rendered.contains("→ program (forth)"));
         assert!(rendered.contains("s\"hello\" say"));
         assert!(!rendered.contains("⏺"));
+    }
+
+    #[test]
+    fn completed_program_source_is_collapsed_so_output_can_replace_it() {
+        let streaming = WorkUnit::new("ignored");
+        streaming.set_program_source("lisp");
+        streaming.set_response("(say \"hi\")");
+        let streaming_row = streaming.transcript_row(&colors()).expect("program row");
+        assert_eq!(streaming_row.kind, super::TranscriptRowKind::Program);
+        assert!(
+            streaming_row.default_expanded,
+            "IR must stay expanded while the program is still arriving"
+        );
+
+        let source = WorkUnit::new("ignored");
+        source.set_program_source("lisp");
+        source.set_response("(say \"hi\")");
+        source.set_complete();
+        let row = source.transcript_row(&colors()).expect("program row");
+        assert_eq!(row.kind, super::TranscriptRowKind::Program);
+        assert!(
+            !row.default_expanded,
+            "completed IR must not stay expanded beside program output"
+        );
     }
 
     // ── Rows ─────────────────────────────────────────────────────────────────

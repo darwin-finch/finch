@@ -27,6 +27,8 @@ CURRENT_DOCS = (
     Path("crates/finch-coforth/docs/README.md"),
     Path("crates/finch-colisp/AGENTS.md"),
     Path("crates/finch-colisp/docs/README.md"),
+    Path("crates/finch-language/AGENTS.md"),
+    Path("crates/finch-language/docs/README.md"),
     Path("crates/finch-vm-core/AGENTS.md"),
     Path("crates/finch-vm-core/docs/README.md"),
     Path("crates/finch-vm/AGENTS.md"),
