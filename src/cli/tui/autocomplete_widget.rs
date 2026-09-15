@@ -136,7 +136,7 @@ pub(crate) fn completion_pane_lines(
     if row_budget > 1 {
         let remaining = state.matches.len().saturating_sub(end);
         let heading = format!(
-            "Commands {}-{} of {} ({remaining} more)  Up/Down select, Tab accept, Esc cancel",
+            "Commands {}-{} of {} ({remaining} more)  Up/Down select, Tab complete, Enter run, Esc cancel",
             state.first_visible + 1,
             end,
             state.matches.len()
