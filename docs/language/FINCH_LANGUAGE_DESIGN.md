@@ -181,6 +181,24 @@ This is the SDC lesson: parse AST is frontend-private; the compiler scheduler ru
 
 The VM fiber scheduler is a **different** machine from the compiler job scheduler. Compiler jobs may eventually be self-hosted as CoLisp fibers that yield `CompilerNeed`; they still lower to IR before anything executes.
 
+**3. Interpreter and Cranelift: the same IR waist.**
+
+The interpreter and the later Cranelift handoff consume the **same** Finch typed stack IR. They do not take AST, builder traces, or `require(symbol, stage)`. CLIF is a hidden, rebuildable backend IR behind Cranelift; it is not the program-exchange format and is not a second language.
+
+```text
+finch-language
+  await require(...) → lower → FunctionCertified → ModuleVerified
+                         │
+                         ├─→ interpreter (tier 0)
+                         └─→ CLIF → native (later)
+```
+
+Shared across both backends: IR types, verifier, source maps, trap/safepoint metadata, capability request sites, and the effect/resume ABI (native shims stay capability-bound). Not shared: the compiler scheduler, frontend trees, or CLIF.
+
+The interpreter **runs** only `ModuleVerified`. Native lowering **may start** from `FunctionCertified` as a quarantined cache, discarded if the module certificate never issues. An first implementation may wait for `ModuleVerified` for both.
+
+**Crate split that keeps the scheduler shareable.** `require` only works if the elaboratable tree, the symbol/phase table, and lowering live together (`finch-language`, with types in `finch-vm-core`). Frontends do not own that scheduler; they publish builder submissions. `finch-vm` does not own it either: it is an IR backend, like Cranelift. Splitting at IR is the intended waist. Splitting with AST inside `finch-vm`, or with frontends emitting IR, makes `require` impossible or forces every execution change to load the compiler.
+
 **Why not “shared AST into the VM instead of IR”.** Putting the elaboratable tree in `finch-vm` makes the interpreter a compiler, forces every Brain/runtime change to load elaborator state, and gives native lowering a second source of truth. The shared tree belongs to `finch-language`. The shared **executable** waist is typed stack IR. Today’s tree is inverted: frontends still lower privately and the VM still re-exports `compile_forth` / `compile_lisp`. That inversion is debt, not the target.
 
 Shared lowering helpers enforce Lisp/Co-Forth parity without requiring an intermediate tree for its
@@ -3570,6 +3588,10 @@ CLIF
         ↓ Cranelift code generation
 native code
 ```
+
+The interpreter and Cranelift are two backends of this same Finch IR, not two languages.
+See [Abstraction boundaries](#abstraction-boundaries-do-not-collapse). CLIF never becomes
+the handoff from `finch-language`.
 
 Finch IR is the durable semantic and verification boundary. CLIF is target/backend-oriented and
 normally a rebuildable compilation artifact. Do not serialize CLIF as the program-exchange ABI or
