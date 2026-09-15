@@ -419,6 +419,19 @@ impl ProviderEntry {
                 base_url: None,
                 name: name.clone(),
             }),
+            Self::Openrouter {
+                api_key,
+                model,
+                base_url,
+                name,
+                ..
+            } => Some(TeacherEntry {
+                provider: "openrouter".to_string(),
+                api_key: api_key.clone(),
+                model: model.clone(),
+                base_url: base_url.clone(),
+                name: name.clone(),
+            }),
             Self::Credentialed { .. }
             | Self::LegacyChatgptSubscription { .. }
             | Self::Ollama { .. }
@@ -471,6 +484,14 @@ impl ProviderEntry {
             "groq" => Self::Groq {
                 api_key: entry.api_key.clone(),
                 model: entry.model.clone(),
+                name: entry.name.clone(),
+            },
+            "openrouter" => Self::Openrouter {
+                api_key: entry.api_key.clone(),
+                model: entry.model.clone(),
+                base_url: entry.base_url.clone(),
+                chat_path: None,
+                models_path: None,
                 name: entry.name.clone(),
             },
             _ => {

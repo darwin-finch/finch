@@ -37,6 +37,7 @@ pub enum CredentialProvider {
     GoogleVertex,
     Mistral,
     Groq,
+    Openrouter,
 }
 
 impl CredentialProvider {
@@ -50,6 +51,7 @@ impl CredentialProvider {
             Self::GoogleVertex => "google_vertex",
             Self::Mistral => "mistral",
             Self::Groq => "groq",
+            Self::Openrouter => "openrouter",
         }
     }
 }
@@ -67,6 +69,7 @@ pub enum EndpointFamily {
     GoogleVertex,
     MistralApi,
     GroqApi,
+    OpenrouterApi,
     Custom,
 }
 
@@ -353,6 +356,13 @@ pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor
             family: EndpointFamily::GroqApi,
             standard_origin: "https://api.groq.com",
         },
+        CredentialProvider::Openrouter => ProviderAuthDescriptor {
+            provider,
+            issuer: "openrouter",
+            kinds: API_KEY,
+            family: EndpointFamily::OpenrouterApi,
+            standard_origin: "https://openrouter.ai",
+        },
     }
 }
 
@@ -625,6 +635,7 @@ mod tests {
             CredentialProvider::GoogleVertex,
             CredentialProvider::Mistral,
             CredentialProvider::Groq,
+            CredentialProvider::Openrouter,
         ];
         let kinds = [
             CredentialKind::ApiKey,

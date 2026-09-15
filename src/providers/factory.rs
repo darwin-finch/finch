@@ -296,6 +296,30 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
             Ok(Box::new(provider))
         }
 
+        ProviderEntry::Openrouter {
+            api_key,
+            model,
+            base_url,
+            chat_path,
+            models_path,
+            ..
+        } => {
+            let mut provider = OpenAIProvider::new_compatible(
+                api_key.clone(),
+                base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://openrouter.ai/api".to_string()),
+                chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+                models_path.as_deref().unwrap_or("/v1/models"),
+                "z-ai/glm-5.3-flash".to_string(),
+                "openrouter".to_string(),
+            )?;
+            if let Some(model) = model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+
         ProviderEntry::Ollama {
             base_url, model, ..
         } => Ok(Box::new(OpenAIProvider::new_ollama(
@@ -346,12 +370,14 @@ fn create_provider_from_resolved_entry(
         CredentialProvider::OpenaiPlatform
         | CredentialProvider::Xai
         | CredentialProvider::Mistral
-        | CredentialProvider::Groq => {
+        | CredentialProvider::Groq
+        | CredentialProvider::Openrouter => {
             let (default_base, default_model, provider_name) = match provider {
                 CredentialProvider::OpenaiPlatform => ("https://api.openai.com", "gpt-4o", "openai"),
                 CredentialProvider::Xai => ("https://api.x.ai", "grok-4.6", "grok"),
                 CredentialProvider::Mistral => ("https://api.mistral.ai", "mistral-large-2512", "mistral"),
                 CredentialProvider::Groq => ("https://api.groq.com/openai", "openai/gpt-oss-120b", "groq"),
+                CredentialProvider::Openrouter => ("https://openrouter.ai/api", "z-ai/glm-5.3-flash", "openrouter"),
                 _ => unreachable!("outer match limits provider"),
             };
             let mut provider = OpenAIProvider::new_compatible(
@@ -1570,6 +1596,21 @@ mod tests {
         let provider = create_provider_from_teacher(&entry("groq", "test-key"));
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().name(), "groq");
+    }
+
+    #[test]
+    fn test_create_openrouter_provider_uses_openrouter_defaults() {
+        let provider = create_provider_from_entry(&ProviderEntry::Openrouter {
+            api_key: "test-key".into(),
+            model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: None,
+        })
+        .expect("OpenRouter profile must use the OpenAI-compatible transport");
+        assert_eq!(provider.name(), "openrouter");
+        assert_eq!(provider.default_model(), "z-ai/glm-5.3-flash");
     }
 
     #[test]

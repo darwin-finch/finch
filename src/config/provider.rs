@@ -179,6 +179,19 @@ pub enum ProviderEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    Openrouter {
+        api_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        models_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// Ollama local/remote inference (OpenAI-compatible API).
     ///
     /// ```toml
@@ -257,6 +270,7 @@ impl ProviderEntry {
             | Self::Gemini { name, .. }
             | Self::Mistral { name, .. }
             | Self::Groq { name, .. }
+            | Self::Openrouter { name, .. }
             | Self::Ollama { name, .. }
             | Self::RemoteDaemon { name, .. }
             | Self::Local { name, .. } => name.as_deref(),
@@ -305,6 +319,7 @@ impl ProviderEntry {
             Self::Gemini { name, .. } => name.as_deref().unwrap_or("Gemini"),
             Self::Mistral { name, .. } => name.as_deref().unwrap_or("Mistral"),
             Self::Groq { name, .. } => name.as_deref().unwrap_or("Groq"),
+            Self::Openrouter { name, .. } => name.as_deref().unwrap_or("OpenRouter"),
             Self::Ollama { name, .. } => name.as_deref().unwrap_or("Ollama"),
             Self::RemoteDaemon { name, .. } => name.as_deref().unwrap_or("Remote Daemon"),
             Self::Local { name, .. } => name.as_deref().unwrap_or("Local"),
@@ -322,6 +337,7 @@ impl ProviderEntry {
             Self::Gemini { .. } => "gemini",
             Self::Mistral { .. } => "mistral",
             Self::Groq { .. } => "groq",
+            Self::Openrouter { .. } => "openrouter",
             Self::Ollama { .. } => "ollama",
             Self::RemoteDaemon { .. } => "remote_daemon",
             Self::Local { .. } => "local",
@@ -342,6 +358,7 @@ impl ProviderEntry {
             Self::Gemini { api_key, .. } => Some(api_key.as_str()),
             Self::Mistral { api_key, .. } => Some(api_key.as_str()),
             Self::Groq { api_key, .. } => Some(api_key.as_str()),
+            Self::Openrouter { api_key, .. } => Some(api_key.as_str()),
             Self::Credentialed { .. }
             | Self::LegacyChatgptSubscription { .. }
             | Self::Ollama { .. }
@@ -361,6 +378,7 @@ impl ProviderEntry {
             Self::Gemini { model, .. } => model.as_deref(),
             Self::Mistral { model, .. } => model.as_deref(),
             Self::Groq { model, .. } => model.as_deref(),
+            Self::Openrouter { model, .. } => model.as_deref(),
             Self::Ollama { model, .. } => Some(model.as_str()),
             Self::RemoteDaemon { .. } | Self::Local { .. } => None,
         }
