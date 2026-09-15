@@ -436,7 +436,7 @@ pub(super) fn handle_models_input(
                     let result_for_thread = Arc::clone(&result);
                     *catalog_generation = catalog_generation.wrapping_add(1);
                     let generation = *catalog_generation;
-                    let selection_identity = model_catalog::profile_cache_identity(&profile);
+                    let selection_identity = profile_cache_identity(&profile);
                     std::thread::spawn(move || {
                         let refreshed = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -445,7 +445,7 @@ pub(super) fn handle_models_input(
                             .map(|runtime| {
                                 if let Some(config) = named_config {
                                     runtime.block_on(async {
-                                        match model_catalog::refresh_from_config(
+                                        match refresh_from_config(
                                             &config,
                                             &named_profile,
                                             &crate::config::EnvironmentCredentialResolver,
@@ -455,7 +455,7 @@ pub(super) fn handle_models_input(
                                         {
                                             Ok(catalog) => (catalog, None),
                                             Err(error) => {
-                                                let mut fallback = model_catalog::fallback_catalog(
+                                                let mut fallback = fallback_catalog(
                                                     &profile.provider,
                                                     &profile.endpoints.models_url,
                                                 );
@@ -465,15 +465,13 @@ pub(super) fn handle_models_input(
                                         }
                                     })
                                 } else {
-                                    runtime.block_on(model_catalog::refresh_with_fallback(
-                                        &profile, &cache_dir,
-                                    ))
+                                    runtime.block_on(refresh_with_fallback(&profile, &cache_dir))
                                 }
                             });
                         *result_for_thread.lock().unwrap() = Some(match refreshed {
                             Ok(result) => result,
                             Err(_) => {
-                                let mut fallback = model_catalog::fallback_catalog(
+                                let mut fallback = fallback_catalog(
                                     &profile.provider,
                                     &profile.endpoints.models_url,
                                 );
@@ -593,9 +591,7 @@ pub(super) fn handle_models_input(
                                     ),
                                     catalog_cache_dir.clone(),
                                 ) {
-                                    if let Ok(Some(cached)) =
-                                        model_catalog::read_cache(&profile, &cache_dir)
-                                    {
+                                    if let Ok(Some(cached)) = read_cache(&profile, &cache_dir) {
                                         *catalog_models = cached.models;
                                         *catalog_source = CatalogSource::Cache;
                                         *catalog_refreshed_at = Some(cached.refreshed_at);
@@ -934,9 +930,7 @@ pub(super) fn handle_models_input(
                             model_catalog_profile(provider, name, api_key, persisted.as_ref()),
                             catalog_cache_dir.clone(),
                         ) {
-                            if let Ok(Some(cached)) =
-                                model_catalog::read_cache(&profile, &cache_dir)
-                            {
+                            if let Ok(Some(cached)) = read_cache(&profile, &cache_dir) {
                                 *catalog_models = cached.models;
                                 *catalog_source = CatalogSource::Cache;
                                 *catalog_refreshed_at = Some(cached.refreshed_at);

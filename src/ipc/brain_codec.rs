@@ -248,7 +248,7 @@ pub(super) fn decode_messages(
 
 pub(super) fn encode_invocation_metadata(
     mut builder: finch_ipc_capnp::invocation_metadata::Builder<'_>,
-    metadata: &crate::providers::types::InvocationMetadata,
+    metadata: &crate::providers::InvocationMetadata,
 ) {
     builder.set_requested_model(&metadata.requested_model);
     builder.set_resolved_model(&metadata.resolved_model);
@@ -273,8 +273,8 @@ pub(super) fn encode_invocation_metadata(
 
 pub(super) fn decode_invocation_metadata(
     reader: finch_ipc_capnp::invocation_metadata::Reader<'_>,
-) -> anyhow::Result<crate::providers::types::InvocationMetadata> {
-    let metadata = crate::providers::types::InvocationMetadata {
+) -> anyhow::Result<crate::providers::InvocationMetadata> {
+    let metadata = crate::providers::InvocationMetadata {
         requested_model: text(reader.get_requested_model()?)?,
         resolved_model: text(reader.get_resolved_model()?)?,
         actual_model: text(reader.get_actual_model()?)?,
@@ -2246,7 +2246,7 @@ mod tests {
                         crate::claude::ContentBlock::text("(say \"done\")"),
                     ],
                 )],
-                invocation_metadata: Some(crate::providers::types::InvocationMetadata {
+                invocation_metadata: Some(crate::providers::InvocationMetadata {
                     requested_model: "gpt-5.6".into(),
                     resolved_model: "gpt-5.6".into(),
                     actual_model: "gpt-5.6-sol".into(),

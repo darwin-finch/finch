@@ -2194,7 +2194,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         result.set_has_invocation_metadata(true);
         super::super::brain_codec::encode_invocation_metadata(
             result.reborrow().init_invocation_metadata(),
-            &crate::providers::types::InvocationMetadata {
+            &crate::providers::InvocationMetadata {
                 requested_model: "gpt-5.6".into(),
                 resolved_model: "gpt-5.6".into(),
                 actual_model: "gpt-5.6-sol".into(),

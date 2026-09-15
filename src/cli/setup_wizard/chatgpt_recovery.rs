@@ -376,7 +376,7 @@ where
             tenant: None,
             project: None,
             account: None,
-            scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+            scopes: crate::providers::chatgpt_required_scopes(),
             secret_ref: format!("oauth-store:{reference}"),
             lifecycle: crate::config::CredentialLifecycle::Active {
                 expires_at: None,
@@ -476,7 +476,7 @@ pub(super) fn is_exact_chatgpt_setup_credential(
             .account
             .as_deref()
             .is_some_and(|account| !account.is_empty())
-        && crate::providers::chatgpt_oauth::chatgpt_required_scopes().is_subset(&credential.scopes)
+        && crate::providers::chatgpt_required_scopes().is_subset(&credential.scopes)
 }
 
 pub(super) fn is_reusable_chatgpt_setup_credential(
@@ -503,39 +503,35 @@ pub(super) fn chatgpt_setup_failure_cause(error: &anyhow::Error) -> ChatGptSetup
             crate::oauth::OAuthDeviceAuthorizationError::Denied => ChatGptSetupFailureCause::Denied,
         };
     }
-    if let Some(endpoint) =
-        error.downcast_ref::<crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError>()
-    {
+    if let Some(endpoint) = error.downcast_ref::<crate::providers::ChatGptDeviceEndpointError>() {
         return match endpoint {
-            crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::StartDisabledOrUnsupported => {
+            crate::providers::ChatGptDeviceEndpointError::StartDisabledOrUnsupported => {
                 ChatGptSetupFailureCause::StartDisabledOrUnsupported
             }
-            crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::StartRejected(_)
-            | crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::PollRejected(_) => {
+            crate::providers::ChatGptDeviceEndpointError::StartRejected(_)
+            | crate::providers::ChatGptDeviceEndpointError::PollRejected(_) => {
                 ChatGptSetupFailureCause::ProviderRejected
             }
         };
     }
-    if let Some(stage) =
-        error.downcast_ref::<crate::providers::chatgpt_oauth::ChatGptAuthStageError>()
-    {
+    if let Some(stage) = error.downcast_ref::<crate::providers::ChatGptAuthStageError>() {
         return match stage {
-            crate::providers::chatgpt_oauth::ChatGptAuthStageError::PollContract => {
+            crate::providers::ChatGptAuthStageError::PollContract => {
                 ChatGptSetupFailureCause::PollContract
             }
-            crate::providers::chatgpt_oauth::ChatGptAuthStageError::TokenExchangeRejected(_) => {
+            crate::providers::ChatGptAuthStageError::TokenExchangeRejected(_) => {
                 ChatGptSetupFailureCause::TokenExchangeRejected
             }
-            crate::providers::chatgpt_oauth::ChatGptAuthStageError::TokenExchangeContract => {
+            crate::providers::ChatGptAuthStageError::TokenExchangeContract => {
                 ChatGptSetupFailureCause::TokenExchangeContract
             }
-            crate::providers::chatgpt_oauth::ChatGptAuthStageError::IdentityVerification => {
+            crate::providers::ChatGptAuthStageError::IdentityVerification => {
                 ChatGptSetupFailureCause::IdentityVerification
             }
-            crate::providers::chatgpt_oauth::ChatGptAuthStageError::ClientBinding => {
+            crate::providers::ChatGptAuthStageError::ClientBinding => {
                 ChatGptSetupFailureCause::ClientBinding
             }
-            crate::providers::chatgpt_oauth::ChatGptAuthStageError::AccountEntitlement => {
+            crate::providers::ChatGptAuthStageError::AccountEntitlement => {
                 ChatGptSetupFailureCause::AccountEntitlement
             }
         };

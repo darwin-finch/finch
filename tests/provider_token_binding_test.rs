@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use finch::providers::openai::OpenAIProvider;
+use finch::providers::OpenAIProvider;
 use finch::providers::{
     CapabilitySupport, LlmProvider, ModelCapabilities, ProviderBackend, ProviderRequest,
     ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest,

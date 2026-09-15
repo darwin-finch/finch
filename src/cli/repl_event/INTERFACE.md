@@ -77,7 +77,7 @@ impl QueryStateManager {
     /// Remove a completed/failed/cancelled query (cleanup)
     pub async fn remove_query(&self, query_id: Uuid);
     pub async fn set_brain_output_work_unit(&self, query_id: Uuid, unit: Option<Arc<WorkUnit>>);
-    pub async fn set_invocation_metadata(&self, query_id: Uuid, invocation: crate::providers::types::InvocationMetadata);
+    pub async fn set_invocation_metadata(&self, query_id: Uuid, invocation: crate::providers::InvocationMetadata);
     pub async fn set_tool_work_unit(&self, query_id: Uuid, unit: Option<Arc<WorkUnit>>);
     pub async fn tool_work_unit(&self, query_id: Uuid) -> Option<Arc<WorkUnit>>;
     /// Publish a text-only provider completion while holding the same state lock used by cancellation.

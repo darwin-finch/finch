@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use super::types::{MessageRequest, MessageResponse};
 use crate::generators::StreamChunk;
-use crate::providers::{claude::ClaudeProvider, LlmProvider, ProviderRequest};
+use crate::providers::{ClaudeProvider, LlmProvider, ProviderRequest};
 
 #[derive(Clone)]
 pub struct ClaudeClient {

@@ -201,7 +201,7 @@ impl ProviderResolver {
         model: Option<&str>,
     ) -> Result<Arc<dyn Generator>> {
         if let Some(config) = &self.config {
-            crate::providers::factory::preflight_provider_config(config)?;
+            crate::providers::preflight_provider_config(config)?;
         }
         let active = self.active.read().await.clone();
         if provider.is_none() && model.is_none() {

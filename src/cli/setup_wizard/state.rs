@@ -164,7 +164,7 @@ pub(super) struct WizardState {
 
 impl WizardState {
     pub(super) fn new(existing_config: Option<&crate::config::Config>) -> Self {
-        Self::new_with_catalog_cache_dir(existing_config, model_catalog::default_cache_dir().ok())
+        Self::new_with_catalog_cache_dir(existing_config, default_cache_dir().ok())
     }
 
     pub(super) fn new_with_catalog_cache_dir(

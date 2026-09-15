@@ -154,7 +154,7 @@ pub struct RunnerTurnResult {
     /// Exact ordered provider/tool continuation messages, including opaque reasoning.
     pub continuation_messages: Vec<crate::claude::Message>,
     /// Completed provider identity/accounting for durable Brain provenance.
-    pub invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
+    pub invocation_metadata: Option<crate::providers::InvocationMetadata>,
     pub turn_events: Vec<RunnerTurnEvent>,
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,

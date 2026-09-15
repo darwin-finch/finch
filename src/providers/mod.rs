@@ -9,32 +9,40 @@ use async_trait::async_trait;
 use std::any::{Any, TypeId};
 use tokio::sync::mpsc::Receiver;
 
-pub mod endpoints;
-pub mod model_catalog;
-pub mod types;
+mod endpoints;
+mod model_catalog;
+mod types;
 
 // Provider implementations
-pub mod chatgpt_oauth;
-pub mod chatgpt_subscription;
-pub mod claude;
-pub mod gemini;
-pub mod openai;
-pub mod openai_jwks;
+mod chatgpt_oauth;
+mod chatgpt_subscription;
+mod claude;
+mod gemini;
+mod openai;
+mod openai_jwks;
 
 // Provider factory
-pub mod factory;
+mod factory;
 
 // Fallback chain (not used in student-teacher architecture)
-pub mod fallback_chain;
+mod fallback_chain;
 
 // Teacher session management with context optimization
-pub mod teacher_session;
+mod teacher_session;
 
 // Universal alignment prompt for cross-provider behavioral consistency
-pub mod alignment;
+mod alignment;
 pub use alignment::{with_alignment, UNIVERSAL_ALIGNMENT_PROMPT};
 
 // Re-export commonly used types
+pub use chatgpt_oauth::{
+    chatgpt_required_scopes, ChatGptAuthStageError, ChatGptDeviceEndpointError,
+    OpenAiChatGptOAuthDialect, OpenAiTokenVerifier, VerifiedOpenAiClaims,
+    CHATGPT_OAUTH_PROTOCOL_REVISION, OPENAI_PUBLIC_CLIENT_ID, REQUIRED_TOKEN_ISSUER,
+};
+pub use claude::ClaudeProvider;
+pub use endpoints::ProviderEndpoints;
+pub use factory::preflight_provider_config;
 pub use factory::{
     create_provider, create_provider_from_config, create_provider_from_entries,
     create_provider_from_entry, create_provider_from_teacher, create_provider_graph_from_config,
@@ -43,86 +51,25 @@ pub use factory::{
     create_providers_from_config, create_providers_from_entries, ProviderGraph, ProviderProfile,
 };
 pub use fallback_chain::FallbackChain;
+pub use gemini::GeminiProvider;
+pub use model_catalog::{
+    default_cache_dir, fallback_catalog, profile_cache_identity, read_cache, refresh,
+    refresh_from_config, refresh_with_fallback, static_fallback, CatalogAuth, CatalogSource,
+    ModelCatalog, ModelCatalogProfile, STATIC_FALLBACK_AS_OF,
+};
+pub use openai::OpenAIProvider;
+pub use openai_jwks::OpenAiJwksVerifier;
 pub use teacher_session::{
     ConversationState, OptimizationStats, TeacherContextConfig, TeacherSession,
 };
 pub use types::{
-    CapabilityProvenance, CapabilitySupport, ContextWindowCapability, ModelCapabilities,
-    ModelFeature, OutputTokenLimitCapability, ProviderAllowance, ProviderRequest, ProviderResponse,
-    ProviderUsage, ReasoningCapability, StreamChunk, WireProtocol, WireProtocolCapability,
+    CapabilityProvenance, CapabilitySupport, ContextWindowCapability, InvocationMetadata,
+    ModelCapabilities, ModelFeature, OutputTokenLimitCapability, ProviderAllowance,
+    ProviderRequest, ProviderResponse, ProviderUsage, ReasoningCapability, StreamChunk,
+    WireProtocol, WireProtocolCapability,
 };
 
-mod validated_boundary {
-    use super::*;
-
-    /// A request whose effective provider/model identity and optional
-    /// capabilities were checked by Finch's non-overridable dispatch boundary.
-    ///
-    /// The fields and constructor are private to this module, so even a
-    /// provider backend elsewhere in the crate cannot fabricate a token.
-    ///
-    /// ```compile_fail
-    /// use finch::providers::ValidatedProviderRequest;
-    ///
-    /// let _ = ValidatedProviderRequest {
-    ///     request: panic!("unreachable"),
-    ///     capabilities: panic!("unreachable"),
-    /// };
-    /// ```
-    pub struct ValidatedProviderRequest {
-        request: ProviderRequest,
-        capabilities: ModelCapabilities,
-        target: usize,
-        target_type: TypeId,
-    }
-
-    impl ValidatedProviderRequest {
-        /// Consume this token at the exact provider instance for which it was
-        /// validated and return the effective request.
-        #[doc(hidden)]
-        pub fn into_request_for(
-            self,
-            provider: &(impl ProviderBackend + ?Sized),
-        ) -> Result<ProviderRequest> {
-            if self.target != provider_target(provider)
-                || self.target_type != ProviderConcreteType::provider_concrete_type_id(provider)
-            {
-                anyhow::bail!(
-                    "Validated provider request was presented to a different provider instance or concrete backend type"
-                );
-            }
-            Ok(self.request)
-        }
-
-        /// The exact descriptor used to validate this request.
-        pub fn capabilities(&self) -> &ModelCapabilities {
-            &self.capabilities
-        }
-    }
-
-    pub(crate) fn validate_provider_request(
-        provider: &(impl ProviderBackend + ?Sized),
-        request: &ProviderRequest,
-        streaming: bool,
-    ) -> Result<ValidatedProviderRequest> {
-        let (effective, capabilities) = resolve_effective_request(provider, request)?;
-        capabilities.validate_request(
-            &effective,
-            streaming,
-            provider.requested_reasoning_effort(&effective),
-        )?;
-        Ok(ValidatedProviderRequest {
-            request: effective,
-            capabilities,
-            target: provider_target(provider),
-            target_type: ProviderConcreteType::provider_concrete_type_id(provider),
-        })
-    }
-
-    fn provider_target(provider: &(impl ProviderBackend + ?Sized)) -> usize {
-        provider as *const _ as *const () as usize
-    }
-}
+mod validated_boundary;
 
 pub(crate) use validated_boundary::validate_provider_request;
 pub use validated_boundary::ValidatedProviderRequest;

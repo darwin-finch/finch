@@ -930,7 +930,7 @@ fn install_completed_catalog_refresh_result(
         *catalog_generation = catalog_generation.wrapping_add(1);
         *catalog_refresh = Some(CatalogRefresh {
             generation: *catalog_generation,
-            selection_identity: model_catalog::profile_cache_identity(profile),
+            selection_identity: profile_cache_identity(profile),
             result: Arc::new(Mutex::new(Some((catalog, error)))),
         });
     }
@@ -1556,10 +1556,7 @@ fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
     );
 
     assert!(label.contains("bundled fallback snapshot"), "{label}");
-    assert!(
-        label.contains(model_catalog::STATIC_FALLBACK_AS_OF),
-        "{label}"
-    );
+    assert!(label.contains(STATIC_FALLBACK_AS_OF), "{label}");
     assert!(label.contains("incomplete"), "{label}");
     assert!(label.contains("model ID remains editable"), "{label}");
     assert!(!label.contains("provider discovery"), "{label}");
@@ -1600,10 +1597,7 @@ fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
         .unwrap();
     let rendered = test_buffer_text(terminal.backend().buffer());
     assert!(rendered.contains("bundled fallback snapshot"), "{rendered}");
-    assert!(
-        rendered.contains(model_catalog::STATIC_FALLBACK_AS_OF),
-        "{rendered}"
-    );
+    assert!(rendered.contains(STATIC_FALLBACK_AS_OF), "{rendered}");
     assert!(rendered.contains("incomplete"), "{rendered}");
     assert!(!rendered.contains("provider discovery"), "{rendered}");
     assert!(!rendered.contains("local cache"), "{rendered}");
@@ -1677,8 +1671,7 @@ fn manual_openai_id_survives_save_reopen_and_fallback_installation() {
         Some(persisted),
     )
     .unwrap();
-    let mut fallback =
-        model_catalog::fallback_catalog(&profile.provider, &profile.endpoints.models_url);
+    let mut fallback = fallback_catalog(&profile.provider, &profile.endpoints.models_url);
     fallback.profile_id = profile.profile_id.clone();
     install_completed_catalog_refresh_result(
         &mut reopened,
@@ -1803,8 +1796,7 @@ fn failed_refresh_with_static_fallback_renders_snapshot_warning_and_preserves_ma
     });
     state.current_section = WizardSection::Models;
     let profile = model_catalog_profile("openai", "openai-work", "openai-key", None).unwrap();
-    let mut fallback =
-        model_catalog::fallback_catalog(&profile.provider, &profile.endpoints.models_url);
+    let mut fallback = fallback_catalog(&profile.provider, &profile.endpoints.models_url);
     fallback.profile_id = profile.profile_id.clone();
     install_completed_catalog_refresh_result(
         &mut state,
@@ -1828,10 +1820,7 @@ fn failed_refresh_with_static_fallback_renders_snapshot_warning_and_preserves_ma
     ));
     let rendered = render_wizard_text(&state);
     assert!(rendered.contains("bundled fallback snapshot"), "{rendered}");
-    assert!(
-        rendered.contains(model_catalog::STATIC_FALLBACK_AS_OF),
-        "{rendered}"
-    );
+    assert!(rendered.contains(STATIC_FALLBACK_AS_OF), "{rendered}");
     assert!(rendered.contains("incomplete"), "{rendered}");
     assert!(
         rendered.contains("Refresh warning: fake provider unavailable"),
@@ -3227,7 +3216,7 @@ async fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_
     let config_path = directory.path().join("config.toml");
     let reopened_path = directory.path().join("reopened.toml");
     let metrics_dir = directory.path().join("metrics");
-    let scopes = crate::providers::chatgpt_oauth::chatgpt_required_scopes();
+    let scopes = crate::providers::chatgpt_required_scopes();
     let providers = vec![
         ProviderEntry::Credentialed {
             provider: CredentialProvider::ChatgptSubscription,
@@ -3401,7 +3390,7 @@ fn chatgpt_subscription_provider() -> ProviderEntry {
             tenant: None,
             project: None,
             account: None,
-            required_scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+            required_scopes: crate::providers::chatgpt_required_scopes(),
         },
         model: Some("gpt-5.6-sol".into()),
         base_url: None,
@@ -3424,7 +3413,7 @@ fn chatgpt_subscription_credential() -> crate::config::ProviderCredential {
         tenant: None,
         project: None,
         account: Some("account-123".into()),
-        scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+        scopes: crate::providers::chatgpt_required_scopes(),
         secret_ref: "oauth-store:chatgpt:default".into(),
         lifecycle: crate::config::CredentialLifecycle::Active {
             expires_at: Some("2099-01-02T03:04:05Z".parse::<DateTime<Utc>>().unwrap()),
@@ -4155,7 +4144,7 @@ struct ScriptedRecoveryAuthenticator {
 struct RealRetryVerifier;
 
 #[async_trait::async_trait]
-impl crate::providers::chatgpt_oauth::OpenAiTokenVerifier for RealRetryVerifier {
+impl crate::providers::OpenAiTokenVerifier for RealRetryVerifier {
     fn preflight(&self) -> Result<()> {
         Ok(())
     }
@@ -4165,11 +4154,11 @@ impl crate::providers::chatgpt_oauth::OpenAiTokenVerifier for RealRetryVerifier 
         _id_token: Option<&str>,
         _access_token: &str,
         _cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<crate::providers::chatgpt_oauth::VerifiedOpenAiClaims> {
-        Ok(crate::providers::chatgpt_oauth::VerifiedOpenAiClaims {
-            issuer: crate::providers::chatgpt_oauth::REQUIRED_TOKEN_ISSUER.into(),
+    ) -> Result<crate::providers::VerifiedOpenAiClaims> {
+        Ok(crate::providers::VerifiedOpenAiClaims {
+            issuer: crate::providers::REQUIRED_TOKEN_ISSUER.into(),
             audiences: std::collections::BTreeSet::from([
-                crate::providers::chatgpt_oauth::OPENAI_PUBLIC_CLIENT_ID.into(),
+                crate::providers::OPENAI_PUBLIC_CLIENT_ID.into(),
             ]),
             authorized_party: None,
             subject: "subject-work".into(),
@@ -4318,7 +4307,7 @@ async fn real_retry_http_handler(
 
 struct RealRetryAuthenticator {
     client: crate::oauth::OAuthClient<
-        crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect<RealRetryVerifier>,
+        crate::providers::OpenAiChatGptOAuthDialect<RealRetryVerifier>,
         crate::oauth::FileOAuthCredentialStore,
     >,
 }
@@ -4381,28 +4370,28 @@ impl crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator for ScriptedRecove
         }
         tokio::task::yield_now().await;
         match self.outcomes.lock().unwrap().pop_front().unwrap() {
-                ScriptedChatGptOutcome::Cancelled => {
-                    Err(crate::oauth::OAuthDeviceAuthorizationError::Cancelled.into())
-                }
-                ScriptedChatGptOutcome::Expired => {
-                    Err(crate::oauth::OAuthDeviceAuthorizationError::Expired.into())
-                }
-                ScriptedChatGptOutcome::Denied => {
-                    Err(crate::oauth::OAuthDeviceAuthorizationError::Denied.into())
-                }
-                ScriptedChatGptOutcome::StartDisabledOrUnsupported => Err(
-                    crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::StartDisabledOrUnsupported.into(),
-                ),
-                ScriptedChatGptOutcome::ProviderRejected(status) => Err(
-                    crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::StartRejected(status).into(),
-                ),
-                ScriptedChatGptOutcome::Success => {
-                    Ok(crate::cli::chatgpt_auth::EnsuredChatGptCredential {
-                        credential: chatgpt_setup_credential(reference, "acct-isolated"),
-                        compensation: None,
-                    })
-                }
+            ScriptedChatGptOutcome::Cancelled => {
+                Err(crate::oauth::OAuthDeviceAuthorizationError::Cancelled.into())
             }
+            ScriptedChatGptOutcome::Expired => {
+                Err(crate::oauth::OAuthDeviceAuthorizationError::Expired.into())
+            }
+            ScriptedChatGptOutcome::Denied => {
+                Err(crate::oauth::OAuthDeviceAuthorizationError::Denied.into())
+            }
+            ScriptedChatGptOutcome::StartDisabledOrUnsupported => {
+                Err(crate::providers::ChatGptDeviceEndpointError::StartDisabledOrUnsupported.into())
+            }
+            ScriptedChatGptOutcome::ProviderRejected(status) => {
+                Err(crate::providers::ChatGptDeviceEndpointError::StartRejected(status).into())
+            }
+            ScriptedChatGptOutcome::Success => {
+                Ok(crate::cli::chatgpt_auth::EnsuredChatGptCredential {
+                    credential: chatgpt_setup_credential(reference, "acct-isolated"),
+                    compensation: None,
+                })
+            }
+        }
     }
 }
 
@@ -4468,19 +4457,18 @@ impl DurableSetupAuthenticator {
     fn token_record(reference: &str) -> crate::oauth::OAuthTokenRecord {
         crate::oauth::OAuthTokenRecord {
             dialect_id: "openai_chatgpt_subscription".into(),
-            protocol_revision: crate::providers::chatgpt_oauth::CHATGPT_OAUTH_PROTOCOL_REVISION
-                .into(),
+            protocol_revision: crate::providers::CHATGPT_OAUTH_PROTOCOL_REVISION.into(),
             provider: crate::config::CredentialProvider::ChatgptSubscription,
             kind: crate::config::CredentialKind::OauthDevice,
             issuer: "openai-chatgpt".into(),
             audience: crate::config::AudienceBinding::standard(
                 crate::config::EndpointFamily::ChatgptSubscription,
             ),
-            client_id: crate::providers::chatgpt_oauth::OPENAI_PUBLIC_CLIENT_ID.into(),
+            client_id: crate::providers::OPENAI_PUBLIC_CLIENT_ID.into(),
             account: format!("acct-{}", reference.rsplit(':').next().unwrap()),
             tenant: None,
             project: None,
-            scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+            scopes: crate::providers::chatgpt_required_scopes(),
             access_token: format!("secret-access-{reference}"),
             refresh_token: Some(format!("secret-refresh-{reference}")),
             id_token: Some(format!("secret-identity-{reference}")),
@@ -4567,7 +4555,7 @@ fn chatgpt_setup_credential(reference: &str, account: &str) -> crate::config::Pr
         tenant: None,
         project: None,
         account: Some(account.into()),
-        scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+        scopes: crate::providers::chatgpt_required_scopes(),
         secret_ref: format!("oauth-store:{reference}"),
         lifecycle: crate::config::CredentialLifecycle::Active {
             expires_at: Some(Utc::now() + chrono::TimeDelta::hours(1)),
@@ -4588,7 +4576,7 @@ fn chatgpt_setup_profile(reference: &str, name: &str, model: &str) -> ProviderEn
             tenant: None,
             project: None,
             account: None,
-            required_scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+            required_scopes: crate::providers::chatgpt_required_scopes(),
         },
         model: Some(model.into()),
         base_url: None,
@@ -4643,7 +4631,7 @@ fn setup_recovery_editor_reprompts_invalid_choice_and_name_without_reflection() 
 
 #[test]
 fn setup_post_browser_failures_are_stage_specific_and_secret_free() {
-    use crate::providers::chatgpt_oauth::ChatGptAuthStageError;
+    use crate::providers::ChatGptAuthStageError;
 
     fn wrapped_stage(stage: ChatGptAuthStageError) -> anyhow::Error {
         Err::<(), _>(anyhow::anyhow!("redacted upstream failure"))
@@ -4766,7 +4754,7 @@ async fn setup_retry_crosses_real_oauth_boundary_with_fresh_quiescent_ceremony()
     let store = std::sync::Arc::new(crate::oauth::FileOAuthCredentialStore::new(
         temporary.path().join("oauth"),
     ));
-    let dialect = crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect::for_test(
+    let dialect = crate::providers::OpenAiChatGptOAuthDialect::for_test(
         &server.origin,
         std::sync::Arc::new(RealRetryVerifier),
     )
