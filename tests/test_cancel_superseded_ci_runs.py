@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""Exercise the exact trusted CI cancellation controller against a fake GitHub API."""
+
+from __future__ import annotations
+
+import copy
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+WORKFLOW = ROOT / ".github/workflows/ci-superseded-run-cancellation.yml"
+sys.path.insert(0, str(ROOT / "scripts"))
+from check_ci_workflow_manifest import (  # noqa: E402
+    CANCELLATION_JOB_IF,
+    CANCELLATION_WORKFLOW,
+    ContractError,
+    cancellation_controller_errors,
+    load_yaml,
+)
+
+REPO = "darwin-finch/finch"
+REPO_ID = 1_161_397_642
+A = "a" * 40
+B = "b" * 40
+C = "c" * 40
+
+
+def extract_controller(workflow: str | None = None) -> str:
+    text = WORKFLOW.read_text() if workflow is None else workflow
+    match = re.search(
+        r"^          python3 - <<'PYTHON'\n(?P<script>.*?)^          PYTHON$",
+        text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError("workflow must contain one literal PYTHON heredoc controller")
+    lines = match.group("script").splitlines()
+    if any(line and not line.startswith("          ") for line in lines):
+        raise AssertionError("controller heredoc indentation drifted from the executable script")
+    return "\n".join(line[10:] for line in lines) + "\n"
+
+
+def validate_workflow_contract(text: str) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / CANCELLATION_WORKFLOW
+        path.write_text(text)
+        try:
+            document = load_yaml(path)
+        except ContractError as error:
+            raise AssertionError(
+                f"trusted cancellation workflow YAML is invalid: {error}"
+            ) from error
+        errors = cancellation_controller_errors({CANCELLATION_WORKFLOW: document})
+        if errors:
+            raise AssertionError(
+                "trusted cancellation workflow contract drifted: " + "; ".join(errors)
+            )
+    script = extract_controller(text)
+    compile(script, str(WORKFLOW), "exec")
+    required = (
+        '"Authorization": f"Bearer {token}",',
+        '"per_page": PAGE_SIZE,',
+        "PAGE_SIZE = 100",
+        "MAX_CANDIDATES = 50",
+        "truncated_statuses.append(status)",
+    )
+    missing = [item for item in required if item not in script]
+    forbidden = (
+        "concurrency:",
+        "actions/checkout",
+        "actions/cache",
+        "artifact",
+        "secrets.",
+        "github.event.workflow_run.head_",
+    )
+    present = [item for item in forbidden if item in text]
+    if missing or present:
+        raise AssertionError(
+            "trusted cancellation controller script drifted: "
+            f"missing={missing!r} forbidden={present!r}"
+        )
+
+
+def pr(number: int, sha: str, branch: str = "feature", *, state: str = "open") -> dict:
+    return {
+        "number": number,
+        "state": state,
+        "head": {"sha": sha, "ref": branch, "repo": {"full_name": "fork/repo"}},
+        "base": {"ref": "main", "repo": {"id": REPO_ID, "full_name": REPO}},
+    }
+
+
+def run(
+    run_id: int,
+    sha: str,
+    run_number: int,
+    *,
+    number: int = 7,
+    status: str = "queued",
+    attempt: int = 1,
+    branch: str = "feature",
+    event: str = "pull_request",
+) -> dict:
+    return {
+        "id": run_id,
+        "name": "CI",
+        "path": ".github/workflows/ci.yml",
+        "event": event,
+        "repository": {"id": REPO_ID, "full_name": REPO},
+        "head_sha": sha,
+        "head_branch": branch,
+        "run_number": run_number,
+        "run_attempt": attempt,
+        "status": status,
+        "pull_requests": [
+            {
+                "number": number,
+                "head": {
+                    "sha": sha,
+                    "ref": branch,
+                    "repo": {"id": 99, "name": "repo", "url": "https://api.test/repos/fork/repo"},
+                },
+                "base": {
+                    "ref": "main",
+                    "repo": {
+                        "id": REPO_ID,
+                        "name": "finch",
+                        "url": "https://api.test/repos/darwin-finch/finch",
+                    },
+                },
+            }
+        ],
+    }
+
+
+class FakeGitHub:
+    def __init__(self, trigger: dict, prs: dict[int, dict], listed: list[dict] | None = None):
+        self.runs = {trigger["id"]: copy.deepcopy(trigger)}
+        self.runs.update({item["id"]: copy.deepcopy(item) for item in listed or []})
+        self.prs = copy.deepcopy(prs)
+        self.listed = [copy.deepcopy(item) for item in listed or []]
+        for item in [*self.runs.values(), *self.listed]:
+            associations = item.get("pull_requests", [])
+            if len(associations) == 1 and associations[0].get("number") in self.prs:
+                live_head = self.prs[associations[0]["number"]]["head"]
+                associations[0]["head"]["sha"] = live_head["sha"]
+                associations[0]["head"]["ref"] = live_head["ref"]
+        self.requests: list[tuple[str, str]] = []
+        self.cancel_attempts: list[int] = []
+        self.errors: dict[str, tuple[int, bytes, dict[str, str]]] = {}
+        self.advance_on_pr_get: tuple[int, str] | None = None
+        self.pr_gets = 0
+        self.cancel_codes: dict[int, int] = {}
+        state = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def reply(self, code: int, value=b"", headers: dict[str, str] | None = None):
+                raw = json.dumps(value).encode() if not isinstance(value, bytes) else value
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                for key, item in (headers or {}).items():
+                    self.send_header(key, item)
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def route_error(self) -> bool:
+                for needle, response in state.errors.items():
+                    if needle in self.path:
+                        self.reply(*response)
+                        return True
+                return False
+
+            def authorized(self) -> bool:
+                required = {
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": "Bearer test-token",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                }
+                if all(self.headers.get(key) == value for key, value in required.items()):
+                    return True
+                self.reply(401, {"message": "missing required test authorization headers"})
+                return False
+
+            def do_GET(self):
+                state.requests.append(("GET", self.path))
+                if not self.authorized():
+                    return
+                if self.route_error():
+                    return
+                parsed = urllib.parse.urlparse(self.path)
+                run_match = re.fullmatch(rf"/repos/{REPO}/actions/runs/(\d+)", parsed.path)
+                pr_match = re.fullmatch(rf"/repos/{REPO}/pulls/(\d+)", parsed.path)
+                if run_match:
+                    value = state.runs.get(int(run_match.group(1)))
+                    self.reply(200, value if value is not None else {})
+                    return
+                if pr_match:
+                    number = int(pr_match.group(1))
+                    state.pr_gets += 1
+                    if state.advance_on_pr_get and state.pr_gets == state.advance_on_pr_get[0]:
+                        state.prs[number]["head"]["sha"] = state.advance_on_pr_get[1]
+                    self.reply(200, state.prs.get(number, {}))
+                    return
+                if parsed.path == f"/repos/{REPO}/actions/workflows/ci.yml/runs":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    page = int(query.get("page", ["1"])[0])
+                    per_page = int(query.get("per_page", ["30"])[0])
+                    branch = query.get("branch", [""])[0]
+                    status = query.get("status", [""])[0]
+                    matching = [
+                        item
+                        for item in state.listed
+                        if item["head_branch"] == branch
+                        and item["event"] == query.get("event", [""])[0]
+                        and item["status"] == status
+                    ]
+                    values = matching[(page - 1) * per_page : page * per_page]
+                    self.reply(200, {"total_count": len(matching), "workflow_runs": values})
+                    return
+                self.reply(404, {"message": "not found"})
+
+            def do_POST(self):
+                state.requests.append(("POST", self.path))
+                if not self.authorized():
+                    return
+                if self.route_error():
+                    return
+                match = re.fullmatch(rf"/repos/{REPO}/actions/runs/(\d+)/cancel", self.path)
+                if match is None:
+                    self.reply(404, {"message": "not found"})
+                    return
+                run_id = int(match.group(1))
+                state.cancel_attempts.append(run_id)
+                self.reply(state.cancel_codes.get(run_id, 202), {})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_args):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+
+def event(trigger: dict, action: str = "requested") -> dict:
+    return {
+        "action": action,
+        "repository": {"id": REPO_ID, "full_name": REPO},
+        "workflow_run": trigger,
+    }
+
+
+def execute(fake: FakeGitHub, payload: dict) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory() as directory:
+        event_path = Path(directory) / "event.json"
+        event_path.write_text(json.dumps(payload))
+        script = Path(directory) / "controller.py"
+        script.write_text(extract_controller())
+        environment = {
+            "PATH": os.environ["PATH"],
+            "GITHUB_EVENT_PATH": str(event_path),
+            "GITHUB_API_URL": fake.url,
+            "TOKEN": "test-token",
+        }
+        return subprocess.run(
+            ["python3", str(script)],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+
+class ControllerTests(unittest.TestCase):
+    def assert_result(self, result, fake, expected, context):
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"{context}: controller failed; stdout={result.stdout!r} stderr={result.stderr!r} "
+            f"requests={fake.requests!r} cancellations={fake.cancel_attempts!r}",
+        )
+        self.assertEqual(
+            fake.cancel_attempts,
+            expected,
+            f"{context}: unsafe cancellation plan; stdout={result.stdout!r} stderr={result.stderr!r} "
+            f"requests={fake.requests!r} cancellations={fake.cancel_attempts!r}",
+        )
+
+    def test_current_b_cancels_only_superseded_a_in_both_arrival_orders(self):
+        trigger = run(200, B, 20, status="queued")
+        old_queued = run(100, A, 10, status="queued")
+        old_rerun = run(101, A, 11, status="in_progress", attempt=2)
+        future = run(300, C, 30, status="queued")
+        same_sha = run(201, B, 19, status="in_progress")
+        other_pr = run(99, A, 9, number=8, status="in_progress")
+        push = run(98, A, 8, event="push")
+        with FakeGitHub(
+            trigger,
+            {7: pr(7, B), 8: pr(8, A)},
+            [old_queued, old_rerun, future, same_sha, other_pr, push],
+        ) as fake:
+            historical = fake.listed[0]["pull_requests"][0]
+            self.assertEqual(
+                historical["head"]["sha"],
+                B,
+                "GitHub historical run associations expose the PR's current head, not the run SHA",
+            )
+            self.assertNotIn(
+                "full_name",
+                historical["base"]["repo"],
+                "workflow-run association repos must use GitHub's compact id/name/url shape",
+            )
+            result = execute(fake, event(trigger))
+            self.assert_result(result, fake, [100, 101], "new B after queued/running A")
+            self.assertNotIn(push["id"], fake.cancel_attempts, "push work must remain isolated")
+
+    def test_current_a_and_initial_in_progress_do_not_cancel(self):
+        trigger = run(100, A, 10, status="in_progress")
+        with FakeGitHub(trigger, {7: pr(7, A)}) as fake:
+            result = execute(fake, event(trigger, "in_progress"))
+            self.assert_result(result, fake, [], "initial in_progress duplicate controller")
+            self.assertEqual(fake.requests, [], "initial in_progress must skip all API allocation")
+
+    def test_rerun_of_still_current_a_does_not_cancel(self):
+        trigger = run(101, A, 11, status="in_progress", attempt=2)
+        original = run(100, A, 10, status="queued")
+        with FakeGitHub(trigger, {7: pr(7, A)}, [original]) as fake:
+            result = execute(fake, event(trigger, "in_progress"))
+            self.assert_result(result, fake, [], "rerun of still-current A before B arrives")
+
+    def test_stale_a_rerun_after_b_cancels_self_only(self):
+        trigger = run(100, A, 10, status="in_progress", attempt=2)
+        current = run(200, B, 20, status="in_progress")
+        with FakeGitHub(trigger, {7: pr(7, B)}, [current]) as fake:
+            result = execute(fake, event(trigger, "in_progress"))
+            self.assert_result(result, fake, [100], "stale A rerun after B")
+
+    def test_push_triggering_run_is_ignored(self):
+        trigger = run(50, A, 5, event="push")
+        old = run(100, A, 10)
+        with FakeGitHub(trigger, {7: pr(7, A)}, [old]) as fake:
+            result = execute(fake, event(trigger))
+            self.assert_result(result, fake, [], "canonical push run")
+            self.assertEqual(fake.requests, [], "push workflow_run must skip all API allocation")
+
+    def test_duplicate_delivery_and_terminal_409_are_idempotent(self):
+        trigger = run(200, B, 20)
+        old = run(100, A, 10)
+        with FakeGitHub(trigger, {7: pr(7, B)}, [old]) as fake:
+            fake.cancel_codes[100] = 409
+            first = execute(fake, event(trigger))
+            second = execute(fake, event(trigger))
+            self.assertEqual(first.returncode, 0, f"first terminal 409 failed: {first.stderr}")
+            self.assertEqual(second.returncode, 0, f"requested redelivery failed: {second.stderr}")
+            self.assertEqual(
+                fake.cancel_attempts,
+                [100, 100],
+                f"duplicate requested delivery was not idempotent: requests={fake.requests!r}",
+            )
+
+    def test_pr_head_advance_before_mutation_cancels_b_and_preserves_c(self):
+        trigger = run(200, B, 20)
+        old = run(100, A, 10)
+        future = run(300, C, 30)
+        with FakeGitHub(trigger, {7: pr(7, B)}, [old, future]) as fake:
+            fake.advance_on_pr_get = (2, C)
+            result = execute(fake, event(trigger))
+            self.assert_result(result, fake, [200], "PR advanced from B to C during planning")
+
+    def test_candidate_revalidation_preserves_head_rolled_back_to_a(self):
+        trigger = run(200, B, 20)
+        old = run(100, A, 10)
+        with FakeGitHub(trigger, {7: pr(7, B)}, [old]) as fake:
+            fake.advance_on_pr_get = (3, A)
+            result = execute(fake, event(trigger))
+            self.assert_result(
+                result,
+                fake,
+                [],
+                "candidate that became the live PR head immediately before cancellation",
+            )
+
+    def test_explicit_page_size_reaches_stale_run_after_github_default(self):
+        trigger = run(500, B, 500)
+        current_sha_runs = [
+            run(10_000 + index, B, 400 - index, status="queued")
+            for index in range(30)
+        ]
+        old = run(100, A, 10)
+        with FakeGitHub(trigger, {7: pr(7, B)}, current_sha_runs + [old]) as fake:
+            result = execute(fake, event(trigger))
+            self.assert_result(result, fake, [100], "explicit 100-run status page")
+            first_post = next(
+                index for index, request in enumerate(fake.requests) if request[0] == "POST"
+            )
+            listings = [
+                request
+                for request in fake.requests[:first_post]
+                if "/actions/workflows/ci.yml/runs?" in request[1]
+            ]
+            self.assertEqual(
+                len(listings),
+                5,
+                "controller must finish every bounded active-status listing before cancellation: "
+                f"requests={fake.requests!r}",
+            )
+            self.assertTrue(
+                all("per_page=100" in path and "page=1" in path for _, path in listings),
+                f"every bounded listing must explicitly request one 100-run page: {listings!r}",
+            )
+
+    def test_completed_history_does_not_consume_active_inventory(self):
+        trigger = run(500, B, 500)
+        completed = [run(20_000 + index, A, index + 1, status="completed") for index in range(400)]
+        old = run(100, A, 10)
+        with FakeGitHub(trigger, {7: pr(7, B)}, completed + [old]) as fake:
+            result = execute(fake, event(trigger))
+            self.assert_result(result, fake, [100], "large completed branch history")
+
+    def test_more_than_plan_cap_makes_bounded_progress(self):
+        trigger = run(500, B, 500)
+        stale = [run(1_000 + index, A, index + 1) for index in range(51)]
+        with FakeGitHub(trigger, {7: pr(7, B)}, stale) as fake:
+            result = execute(fake, event(trigger))
+            self.assert_result(
+                result,
+                fake,
+                [1_000 + index for index in range(50)],
+                "51 stale runs",
+            )
+            self.assertIn(
+                "bounded_plan_omitted=1",
+                result.stdout,
+                f"bounded progress must report uncancelled remainder: {result.stdout!r}",
+            )
+
+    def test_truncated_active_status_page_is_reported(self):
+        trigger = run(500, B, 500)
+        queued = [run(10_000 + index, A, index + 1, status="queued") for index in range(101)]
+        with FakeGitHub(trigger, {7: pr(7, B)}, queued) as fake:
+            result = execute(fake, event(trigger))
+            self.assert_result(
+                result,
+                fake,
+                [10_000 + index for index in range(50)],
+                "101 queued stale runs with one truncated page",
+            )
+            self.assertIn(
+                "truncated_statuses=['queued']",
+                result.stdout,
+                f"truncated active listing must name the status: {result.stdout!r}",
+            )
+            self.assertIn(
+                "bounded_plan_omitted=50",
+                result.stdout,
+                f"page-truncated remainder must be visible: {result.stdout!r}",
+            )
+
+    def test_ambiguous_closed_and_malformed_identity_fail_closed(self):
+        cases = []
+        zero = run(100, A, 10)
+        zero["pull_requests"] = []
+        cases.append(("zero associations", zero, {7: pr(7, A)}))
+        multiple = run(100, A, 10)
+        multiple["pull_requests"].append(copy.deepcopy(multiple["pull_requests"][0]))
+        cases.append(("multiple associations", multiple, {7: pr(7, A)}))
+        closed = run(100, A, 10)
+        cases.append(("closed PR", closed, {7: pr(7, A, state="closed")}))
+        wrong_repo = run(100, A, 10)
+        wrong_repo["path"] = ".github/workflows/other.yml"
+        cases.append(("noncanonical workflow", wrong_repo, {7: pr(7, A)}))
+        for label, trigger, prs in cases:
+            with self.subTest(label=label), FakeGitHub(trigger, prs) as fake:
+                result = execute(fake, event(trigger))
+                self.assertNotEqual(result.returncode, 0, f"{label} must fail closed: {result.stdout!r}")
+                self.assertEqual(fake.cancel_attempts, [], f"{label} cancelled runs: {fake.cancel_attempts!r}")
+
+    def test_api_errors_and_malformed_json_fail_closed(self):
+        trigger = run(200, B, 20)
+        for label, error in (
+            ("forbidden", (403, b"{}", {})),
+            ("rate limited", (429, b"{}", {"Retry-After": "60"})),
+            ("server error", (500, b"{}", {})),
+            ("malformed", (200, b"not-json", {})),
+        ):
+            with self.subTest(label=label), FakeGitHub(trigger, {7: pr(7, B)}) as fake:
+                fake.errors["workflows/ci.yml/runs"] = error
+                result = execute(fake, event(trigger))
+                self.assertNotEqual(result.returncode, 0, f"{label} response was accepted: {result.stdout!r}")
+                self.assertEqual(fake.cancel_attempts, [], f"{label} caused cancellation: {fake.cancel_attempts!r}")
+                if error[0] in (403, 429, 500):
+                    self.assertIn("rate_limit_remaining", result.stderr, result.stderr)
+
+    def test_malicious_event_text_is_data_not_shell(self):
+        trigger = run(100, A, 10)
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "executed"
+            malicious = copy.deepcopy(trigger)
+            malicious["name"] = f"CI$(touch {marker})"
+            with FakeGitHub(trigger, {7: pr(7, A)}) as fake:
+                result = execute(fake, event(malicious))
+            self.assertNotEqual(result.returncode, 0, "malicious noncanonical workflow must fail closed")
+            self.assertFalse(marker.exists(), f"payload text executed shell command and created {marker}")
+
+    def test_missing_authorization_header_cannot_cancel(self):
+        text = WORKFLOW.read_text()
+        mutated = text.replace(
+            '"Authorization": f"Bearer {token}",',
+            '"X-Authorization": f"Bearer {token}",',
+        )
+        trigger = run(200, B, 20)
+        old = run(100, A, 10)
+        with FakeGitHub(trigger, {7: pr(7, B)}, [old]) as fake:
+            with tempfile.TemporaryDirectory() as directory:
+                event_path = Path(directory) / "event.json"
+                event_path.write_text(json.dumps(event(trigger)))
+                script = Path(directory) / "controller.py"
+                script.write_text(extract_controller(mutated))
+                result = subprocess.run(
+                    ["python3", str(script)],
+                    env={
+                        "PATH": os.environ["PATH"],
+                        "GITHUB_EVENT_PATH": str(event_path),
+                        "GITHUB_API_URL": fake.url,
+                        "TOKEN": "test-token",
+                    },
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+            self.assertNotEqual(
+                result.returncode,
+                0,
+                "controller missing Authorization must fail closed: "
+                f"stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertEqual(
+                fake.cancel_attempts,
+                [],
+                f"unauthorized controller cancelled runs: {fake.cancel_attempts!r}",
+            )
+
+
+class StaticContractTests(unittest.TestCase):
+    def test_workflow_has_narrow_trusted_contract(self):
+        validate_workflow_contract(WORKFLOW.read_text())
+
+    def test_whitespace_equivalent_duplicate_if_is_rejected(self):
+        text = WORKFLOW.read_text()
+        mutant = text.replace(
+            "    runs-on: ubuntu-24.04",
+            "    if : false\n    runs-on: ubuntu-24.04",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            validate_workflow_contract(mutant)
+        self.assertIn(
+            'duplicate YAML key "if"',
+            str(caught.exception),
+            f"whitespace-equivalent job condition must fail as a duplicate key: {caught.exception}",
+        )
+
+    def test_whitespace_equivalent_duplicate_actions_permission_is_rejected(self):
+        text = WORKFLOW.read_text()
+        mutant = text.replace(
+            "  actions: write\n",
+            "  actions: write\n  actions : read\n",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            validate_workflow_contract(mutant)
+        self.assertIn(
+            'duplicate YAML key "actions"',
+            str(caught.exception),
+            f"whitespace-equivalent actions permission must fail as a duplicate key: {caught.exception}",
+        )
+
+    def test_known_wrong_expression_shapes_are_rejected(self):
+        text = WORKFLOW.read_text()
+        mutations = {
+            "requested only": text.replace("types: [requested, in_progress]", "types: [requested]"),
+            "PR-only concurrency": text + "\nconcurrency: pr-${{ github.event.workflow_run.pull_requests[0].number }}\n",
+            "unique rerun concurrency": text + "\nconcurrency: run-${{ github.event.workflow_run.id }}\n",
+            "disabled duplicate job condition": text.replace(
+                "    runs-on: ubuntu-24.04",
+                "    if: false\n    runs-on: ubuntu-24.04",
+            ),
+            "whitespace duplicate job condition": text.replace(
+                "    runs-on: ubuntu-24.04",
+                "    if : false\n    runs-on: ubuntu-24.04",
+            ),
+            "whitespace duplicate actions permission": text.replace(
+                "  actions: write\n",
+                "  actions: write\n  actions : read\n",
+            ),
+            "narrowed actions permission": text.replace("actions: write", "actions: read"),
+            "disabled job condition": text.replace(f"if: {CANCELLATION_JOB_IF}", "if: false"),
+            "checkout": text.replace("steps:\n", "steps:\n      - uses: actions/checkout@v4\n", 1),
+            "broader permission": text.replace("pull-requests: read", "pull-requests: write"),
+            "default page size": text.replace('"per_page": PAGE_SIZE,\n', ""),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                with self.assertRaises(AssertionError, msg=f"static contract accepted {label}"):
+                    validate_workflow_contract(mutation)
+
+
+if __name__ == "__main__":
+    unittest.main()

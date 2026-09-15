@@ -1645,6 +1645,7 @@ dependencies = [
  "dashmap",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "finch-language",
  "finch-vm",
  "fs2",
  "futures",
@@ -1726,12 +1727,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "finch-language"
+version = "0.0.0"
+dependencies = [
+ "finch-coforth",
+ "finch-colisp",
+ "finch-vm-core",
+]
+
+[[package]]
 name = "finch-vm"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "finch-coforth",
- "finch-colisp",
+ "finch-language",
  "finch-vm-core",
  "serde",
  "serde_json",

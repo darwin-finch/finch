@@ -722,9 +722,7 @@ pub(super) async fn refresh_context_strip(
 /// near-identical to every other program because they all share `(`, `say` and
 /// quoting tokens, which is corrosive to a similarity-driven index (#254).
 ///
-/// The source is not hidden from the user — it renders as a `Program source`
-/// row, expanded by default at three lines or fewer, which is exactly the
-/// `(say ...)` case. It is simply the wrong thing to index.
+/// Do not index the wire source. Memory stores what the turn produced.
 async fn persist_completed_turn_memory(
     memory_system: &crate::memory::MemorySystem,
     conversation: &Arc<RwLock<ConversationHistory>>,
@@ -1506,9 +1504,7 @@ pub(crate) async fn process_query_with_tools(
                         // was raw `(say ...)` source, which shares `(`, `say`
                         // and quoting tokens with every other program, making
                         // all programs near-identical under a lexical
-                        // embedding (#254). The source is not hidden from the
-                        // user — it renders as a `Program source` row — it is
-                        // simply the wrong thing to index.
+                        // embedding (#254). Do not index the source.
                         persist_completed_turn_memory(
                             mem,
                             &conversation,
@@ -3374,5 +3370,222 @@ mod tests {
             serde_json::to_value(&multiple).unwrap()
         );
         assert!(history_content_with_source(&multiple, "rewritten".into()).is_err());
+    }
+
+    /// Production-boundary regression for #26: `/plan` (PlanModeToggle) puts
+    /// the REPL in Planning, then `dispatch_tool_uses` is the gate the
+    /// provider-emitted tool name actually hits. `ToolRegistry::definitions()`
+    /// omits aliases, so the only name the model can emit is
+    /// `EnterPlanModeTool::name()`. Starting the helper in Planning without
+    /// going through this path was the #447 (closed DO NOT MERGE) hole.
+    #[tokio::test]
+    async fn test_plan_toggle_dispatch_allows_canonical_enter_plan_mode() {
+        use crate::cli::commands::Command;
+        use crate::tools::{
+            EnterPlanModeTool, PermissionManager, Tool, ToolExecutor, ToolRegistry,
+        };
+
+        assert!(
+            matches!(Command::parse("/plan"), Some(Command::PlanModeToggle)),
+            "invariant: `/plan` is PlanModeToggle, the production entry that \
+             puts the REPL in Planning before the next tool batch"
+        );
+
+        let registered = EnterPlanModeTool.name();
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+
+        // Same Planning construction PlanModeToggle uses on an empty stack
+        // (`event_loop/input.rs`): temp plan path, task "Manual exploration".
+        let mode = Arc::new(RwLock::new(ReplMode::Planning {
+            task: "Manual exploration".to_string(),
+            plan_path: std::env::temp_dir().join(format!("plan_{}.md", uuid::Uuid::new_v4())),
+            created_at: chrono::Utc::now(),
+        }));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EnterPlanModeTool));
+        let tempdir = tempfile::tempdir().expect("isolated tool-pattern store for plan dispatch");
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct executor for plan-mode enter_plan_mode dispatch");
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::clone(&conversation),
+            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
+            Arc::clone(&mode),
+            Arc::new(RwLock::new(None)),
+        );
+
+        let enter_id = "toolu_enter_plan_mode_dispatch".to_string();
+        let write_id = "toolu_write_blocked_in_plan".to_string();
+        let enter_use = crate::tools::ToolUse {
+            id: enter_id.clone(),
+            name: registered.to_string(),
+            input: serde_json::json!({}),
+        };
+        let write_use = crate::tools::ToolUse {
+            id: write_id.clone(),
+            name: "write".to_string(),
+            input: serde_json::json!({"path": "/tmp/must-not-write"}),
+        };
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                crate::claude::Message {
+                    role: "assistant".to_string(),
+                    content: vec![
+                        ContentBlock::ToolUse {
+                            id: enter_id.clone(),
+                            name: registered.to_string(),
+                            input: enter_use.input.clone(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: write_id.clone(),
+                            name: "write".to_string(),
+                            input: write_use.input.clone(),
+                        },
+                    ],
+                },
+            )
+            .expect("stage the provider tool round that dispatch_tool_uses consumes");
+
+        let work_unit = output.start_work_unit("plan-mode dispatch");
+        let active_tool_uses: ActiveToolUsesMap = Arc::new(RwLock::new(HashMap::new()));
+        let tool_call_history = Arc::new(RwLock::new(HashMap::new()));
+
+        dispatch_tool_uses(
+            vec![enter_use, write_use],
+            query_id,
+            round_token,
+            &work_unit,
+            &mode,
+            &tool_call_history,
+            &event_tx,
+            &active_tool_uses,
+            &tui_renderer,
+            &output,
+            &query_states,
+            &tool_coordinator,
+            &None,
+            crate::memory_status::Recall::none(),
+            "test-session",
+            "/test/workspace",
+            &status,
+            4,
+        )
+        .await;
+
+        let mut enter_result = None;
+        let mut write_result = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while enter_result.is_none() || write_result.is_none() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, events.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "dispatch_tool_uses never produced both ToolResults; \
+                         enter={enter_result:?} write={write_result:?} \
+                         registered={registered:?}"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "event channel closed before both ToolResults; \
+                         enter={enter_result:?} write={write_result:?} \
+                         registered={registered:?}"
+                    )
+                });
+            match event {
+                ReplEvent::ToolApprovalNeeded {
+                    tool_use,
+                    response_tx,
+                    ..
+                } => {
+                    assert_eq!(
+                        tool_use.name, registered,
+                        "invariant: after `/plan`, only canonical {registered:?} \
+                         should reach the approval dialog; write must be stopped \
+                         by the Planning gate before spawn. tool={:?}",
+                        tool_use.name
+                    );
+                    response_tx
+                        .send(crate::cli::repl_event::ConfirmationResult::ApproveOnce)
+                        .expect("enter_plan_mode approval receiver must still be waiting");
+                }
+                ReplEvent::ToolResult {
+                    tool_id, result, ..
+                } => {
+                    let rendered = match result {
+                        Ok(text) => Ok(text),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    if tool_id == enter_id {
+                        enter_result = Some(rendered);
+                    } else if tool_id == write_id {
+                        write_result = Some(rendered);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let enter_result = enter_result.expect("enter_plan_mode ToolResult");
+        let write_result = write_result.expect("write ToolResult");
+
+        match &enter_result {
+            Ok(text) => {
+                assert!(
+                    text.to_lowercase().contains("already in")
+                        && text.to_lowercase().contains("planning"),
+                    "invariant: after `/plan`, canonical {registered:?} must pass \
+                     dispatch_tool_uses and run as the idempotent already-planning \
+                     no-op, not as a blocked state-changing tool (#26). got Ok({text:?})"
+                );
+            }
+            Err(error) => panic!(
+                "invariant: after `/plan`, canonical {registered:?} must not be \
+                 refused by dispatch_tool_uses. The provider is never shown the \
+                 alias EnterPlanMode because definitions() omits aliases. \
+                 got Err({error:?})"
+            ),
+        }
+
+        match &write_result {
+            Err(error) => {
+                assert!(
+                    error.contains("not allowed in planning mode"),
+                    "invariant: the same dispatch_tool_uses Planning gate must still \
+                     block write, proving this test hit the production allowlist \
+                     rather than a helper-only path. got Err({error:?})"
+                );
+            }
+            Ok(text) => panic!(
+                "invariant: write must remain blocked in Planning on the \
+                 dispatch_tool_uses path; got Ok({text:?})"
+            ),
+        }
     }
 }

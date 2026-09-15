@@ -2691,7 +2691,7 @@ mod tests {
 
     #[test]
     fn trampoline_yields_output_and_keeps_the_rest_as_vm_state() {
-        let module = crate::compile_forth(
+        let module = finch_language::compile_forth(
             "stream.forth",
             "s\"before\" say 2 3 + int-to-string say",
             Vec::new(),
@@ -2729,7 +2729,7 @@ mod tests {
 
     #[test]
     fn trampoline_yields_capability_request_then_resumes_with_typed_values() {
-        let module = crate::compile_forth(
+        let module = finch_language::compile_forth(
             "await.forth",
             "s\"Cargo.toml\" path file-read",
             Vec::new(),
@@ -2810,7 +2810,7 @@ mod tests {
 
     #[test]
     fn source_yield_suspends_without_exposing_a_continuation_value() {
-        let module = crate::compile_forth(
+        let module = finch_language::compile_forth(
             "yield.forth",
             "1 unit yield 2 +",
             Vec::new(),
@@ -2835,7 +2835,7 @@ mod tests {
 
     #[test]
     fn lisp_yield_is_a_statement_expression_with_unit_type() {
-        let module = crate::compile_lisp(
+        let module = finch_language::compile_lisp(
             "yield.lisp",
             "(begin (yield nil) (+ 1 2))",
             Vec::new(),
@@ -2858,14 +2858,14 @@ mod tests {
 
     #[test]
     fn both_frontends_publish_the_same_typed_yield_payload() {
-        let forth = crate::compile_forth(
+        let forth = finch_language::compile_forth(
             "producer.forth",
             "7 yield 8",
             Vec::new(),
             &core_vocabulary(),
         )
         .unwrap();
-        let lisp = crate::compile_lisp(
+        let lisp = finch_language::compile_lisp(
             "producer.lisp",
             "(begin (yield 7) 8)",
             Vec::new(),

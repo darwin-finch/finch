@@ -16,7 +16,8 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use crate::vm::{compile_forth_with_functions, compile_lisp_with_functions, Function};
+use crate::language::compile_with_functions;
+use crate::vm::Function;
 
 pub const WIRE_CORPUS_FORMAT_VERSION: u32 = 1;
 pub const WIRE_CORPUS_PATH_ENV: &str = "FINCH_WIRE_CORPUS_PATH";
@@ -300,22 +301,18 @@ pub fn audit(path: &Path) -> Result<WireCorpusAudit> {
         let result: std::result::Result<(), String> = language
             .map_err(|error| error.to_string())
             .and_then(|language| {
-                let verified = match language {
-                    ProgramLanguage::Forth => compile_forth_with_functions(
-                        "wire-corpus.forth",
-                        &entry.source,
-                        Vec::new(),
-                        &vocabulary,
-                        &linked_functions,
-                    ),
-                    ProgramLanguage::Lisp => compile_lisp_with_functions(
-                        "wire-corpus.lisp",
-                        &entry.source,
-                        Vec::new(),
-                        &vocabulary,
-                        &linked_functions,
-                    ),
+                let source_id = match language {
+                    ProgramLanguage::Forth => "wire-corpus.forth",
+                    ProgramLanguage::Lisp => "wire-corpus.lisp",
                 };
+                let verified = compile_with_functions(
+                    language,
+                    source_id,
+                    &entry.source,
+                    Vec::new(),
+                    &vocabulary,
+                    &linked_functions,
+                );
                 verified.map(|_| ()).map_err(|diagnostics| {
                     diagnostics
                         .first()
@@ -347,13 +344,14 @@ mod tests {
     use super::*;
 
     fn compiler_context_with_double() -> ProgramCompilerContext {
-        let verified = crate::vm::compile_lisp(
+        let verified = crate::language::compile_lisp(
             "corpus-context.lisp",
             "(define (double (n : int)) : int (* n 2))",
             Vec::new(),
             &crate::vm::core_vocabulary(),
         )
         .expect("pure compiler fixture should produce a verified definition");
+        let verified = verified.into_verified();
         let entry = verified.module.entry.clone();
         let functions = verified
             .module

@@ -1,7 +1,5 @@
-use finch_vm::{
-    compile_forth, compile_lisp, core_vocabulary, InterpreterConfig, TypedValue, VmStep,
-    VmTrampoline,
-};
+use finch_language::{compile_forth, compile_lisp};
+use finch_vm::{core_vocabulary, InterpreterConfig, TypedValue, VmStep, VmTrampoline};
 
 fn run_pure(module: &finch_vm::VerifiedModule) -> Vec<TypedValue> {
     let trampoline = VmTrampoline::new(
@@ -24,9 +22,9 @@ fn run_pure(module: &finch_vm::VerifiedModule) -> Vec<TypedValue> {
 fn test_external_frontends_compile_verify_and_execute_equivalently_through_facade() {
     let vocabulary = core_vocabulary();
     let forth = compile_forth("equivalent.forth", "41 1 +", Vec::new(), &vocabulary)
-        .expect("Co-Forth fixture must compile and verify through finch-vm");
+        .expect("Co-Forth fixture must compile through the language facade");
     let lisp = compile_lisp("equivalent.lisp", "(+ 41 1)", Vec::new(), &vocabulary)
-        .expect("Co-Lisp fixture must compile and verify through finch-vm");
+        .expect("Co-Lisp fixture must compile through the language facade");
 
     let forth_stack = run_pure(&forth);
     let lisp_stack = run_pure(&lisp);

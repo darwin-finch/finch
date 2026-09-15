@@ -1,8 +1,9 @@
 use finch_vm_core::{
-    apply_signature_types, instantiate_signature_types, nearest_names, parse_type_name, BasicBlock,
-    ControlEffect, DiagnosticPhase, EffectSet, Function, Instruction, LocatedInstruction, Module,
-    SourceLanguage, SourceOrigin, SourceSpan, StackRow, StackSignature, SuspensionSignature, Type,
-    TypedValue, UiOperation, VerifiedModule, Verifier, VmDiagnostic, Vocabulary,
+    apply_signature_types, certify_module, instantiate_signature_types, nearest_names,
+    parse_type_name, BasicBlock, ControlEffect, DiagnosticPhase, EffectSet, Function, Instruction,
+    LocatedInstruction, Module, ModuleVerified, Parsed, SourceLanguage, SourceOrigin, SourceSpan,
+    StackRow, StackSignature, SuspensionSignature, Type, TypedValue, UiOperation, VmDiagnostic,
+    Vocabulary,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -537,7 +538,7 @@ pub fn compile_forth(
     source: &str,
     initial_stack: Vec<Type>,
     vocabulary: &Vocabulary,
-) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
+) -> Result<ModuleVerified, Vec<VmDiagnostic>> {
     compile_forth_with_functions(
         source_id,
         source,
@@ -555,8 +556,10 @@ pub fn compile_forth_with_functions(
     initial_stack: Vec<Type>,
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
-) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
+) -> Result<ModuleVerified, Vec<VmDiagnostic>> {
     let ast = parse_forth_module(source_id, source)?;
+    let parsed = Parsed::from_frontend(source_id, ast);
+    let ast = parsed.into_ast();
     let definitions = ast.definitions;
     if definitions.is_empty() {
         return compile_forth_ast_body_with_functions(
@@ -671,7 +674,7 @@ fn compile_forth_ast_body_with_functions(
     initial_stack: Vec<Type>,
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
-) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
+) -> Result<ModuleVerified, Vec<VmDiagnostic>> {
     lower_forth_ast_body_with_locals(
         source_id,
         source,
@@ -697,7 +700,7 @@ fn lower_forth_ast_body_with_locals(
     locals: &[LocalBinding],
     captures: &[LocalBinding],
     expected_return: Option<&[Type]>,
-) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
+) -> Result<ModuleVerified, Vec<VmDiagnostic>> {
     let mut stack = initial_stack.clone();
     let mut effects = EffectSet::pure();
     let mut suspension: Option<SuspensionSignature> = None;
@@ -827,7 +830,7 @@ fn lower_forth_ast_body_with_locals(
             } else {
                 ControlEffect::Returns
             };
-            for (name, function) in compiled.module.functions {
+            for (name, function) in compiled.module.functions.clone() {
                 if name != compiled.module.entry {
                     available_functions.insert(name, function);
                 }
@@ -2651,11 +2654,11 @@ fn lower_forth_ast_body_with_locals(
         entry: 0,
         blocks,
     };
-    let mut module = Module::single(function);
+    let mut functions = Module::single(function).functions;
     for (name, function) in available_functions {
-        module.functions.insert(name.clone(), function.clone());
+        functions.insert(name.clone(), function.clone());
     }
-    Verifier::new(vocabulary).verify(module)
+    certify_module(source_id.to_string(), "main", functions, vocabulary)
 }
 
 fn output_operation(word: &str) -> Option<UiOperation> {

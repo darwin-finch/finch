@@ -3,10 +3,11 @@ use super::interpreter::{
     CapabilityHandler, HostSideEffect, InterpreterConfig, VmContinuation, VmSideEffect, VmStep,
     VmTrampoline,
 };
-use crate::{compile_forth_with_functions, compile_lisp_with_functions};
+#[cfg(test)]
+use finch_vm_core::ProgramLanguage;
 use finch_vm_core::{
     core_vocabulary, CapabilityKind, CapabilityRequirement, DiagnosticPhase, EffectSet, Function,
-    Module, ProgramLanguage, SourceOrigin, StackSignature, TaskKind, Type, TypedValue,
+    Module, ModuleVerified, SourceOrigin, StackSignature, TaskKind, Type, TypedValue,
     VerifiedModule, Verifier, VmDiagnostic, Vocabulary, VM_TYPE_SYSTEM_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -519,26 +520,19 @@ impl TypedRuntime {
         Ok(true)
     }
 
-    pub fn execute(
-        &mut self,
-        language: ProgramLanguage,
-        source_id: &str,
-        source: &str,
-        fuel: u64,
-    ) -> TypedExecution {
-        self.execute_with_declaration(language, source_id, source, fuel, None)
+    /// Execute a verified module. Source compilation is injected by the caller.
+    pub fn execute(&mut self, module: &ModuleVerified, fuel: u64) -> TypedExecution {
+        self.execute_with_declaration(module, fuel, None)
     }
 
     pub fn execute_with_declaration(
         &mut self,
-        language: ProgramLanguage,
-        source_id: &str,
-        source: &str,
+        module: &ModuleVerified,
         fuel: u64,
         declared: Option<&EffectSet>,
     ) -> TypedExecution {
         let mut handler = RuntimeCapabilities::default();
-        self.execute_with_handler(language, source_id, source, fuel, declared, &mut handler)
+        self.execute_with_handler(module, fuel, declared, &mut handler)
     }
 
     /// Execute using a host-owned capability handler. This is the integration
@@ -546,34 +540,12 @@ impl TypedRuntime {
     /// services; authorization and VM transactions remain in the shared VM.
     pub fn execute_with_handler<H: CapabilityHandler>(
         &mut self,
-        language: ProgramLanguage,
-        source_id: &str,
-        source: &str,
+        module: &ModuleVerified,
         fuel: u64,
         declared: Option<&EffectSet>,
         handler: &mut H,
     ) -> TypedExecution {
-        let initial_types = self.stack.iter().map(TypedValue::value_type).collect();
-        let compiled = match language {
-            ProgramLanguage::Forth => compile_forth_with_functions(
-                source_id,
-                source,
-                initial_types,
-                &self.vocabulary,
-                &self.functions,
-            ),
-            ProgramLanguage::Lisp => compile_lisp_with_functions(
-                source_id,
-                source,
-                initial_types,
-                &self.vocabulary,
-                &self.functions,
-            ),
-        };
-        let module = match compiled {
-            Ok(module) => module,
-            Err(diagnostics) => return TypedExecution::failed(diagnostics),
-        };
+        let module = module.as_verified().clone();
         let effects = entry_effects(&module);
         if let Some(declared) = declared {
             if !declared.grants(&effects) {
@@ -617,6 +589,65 @@ impl TypedRuntime {
         let execution = self.drive(module, continuation, handler);
         let execution = self.finish_producer_transaction(execution, baseline);
         self.finish_cpu_task_transaction(execution, cpu_baseline)
+    }
+
+    #[cfg(test)]
+    fn compile_source(
+        &self,
+        language: ProgramLanguage,
+        source_id: &str,
+        source: &str,
+    ) -> Result<ModuleVerified, Vec<VmDiagnostic>> {
+        let initial_types = self.stack.iter().map(TypedValue::value_type).collect();
+        finch_language::compile_with_functions(
+            language,
+            source_id,
+            source,
+            initial_types,
+            &self.vocabulary,
+            &self.functions,
+        )
+    }
+
+    /// Test helper: compile through the language facade, then execute the certificate.
+    #[cfg(test)]
+    fn execute_source(
+        &mut self,
+        language: ProgramLanguage,
+        source_id: &str,
+        source: &str,
+        fuel: u64,
+    ) -> TypedExecution {
+        self.execute_source_with_declaration(language, source_id, source, fuel, None)
+    }
+
+    #[cfg(test)]
+    fn execute_source_with_declaration(
+        &mut self,
+        language: ProgramLanguage,
+        source_id: &str,
+        source: &str,
+        fuel: u64,
+        declared: Option<&EffectSet>,
+    ) -> TypedExecution {
+        let mut handler = RuntimeCapabilities::default();
+        self.execute_source_with_handler(language, source_id, source, fuel, declared, &mut handler)
+    }
+
+    #[cfg(test)]
+    fn execute_source_with_handler<H: CapabilityHandler>(
+        &mut self,
+        language: ProgramLanguage,
+        source_id: &str,
+        source: &str,
+        fuel: u64,
+        declared: Option<&EffectSet>,
+        handler: &mut H,
+    ) -> TypedExecution {
+        match self.compile_source(language, source_id, source) {
+            Ok(module) => self.execute_with_handler(&module, fuel, declared, handler),
+            Err(diagnostics) => TypedExecution::failed(diagnostics),
+        }
     }
 
     /// Continue a previously returned VM boundary. Callers retain this token
@@ -2432,7 +2463,8 @@ impl CapabilityHandler for RuntimeCapabilities {
 }
 
 impl TypedExecution {
-    fn failed(diagnostics: Vec<VmDiagnostic>) -> Self {
+    /// Construct a failed execution from compiler or verifier diagnostics.
+    pub fn failed(diagnostics: Vec<VmDiagnostic>) -> Self {
         Self {
             status: TypedExecutionStatus::Failed,
             values: Vec::new(),
@@ -2602,7 +2634,7 @@ mod tests {
     #[test]
     fn lisp_say_compiles_directly_and_emits() {
         let mut runtime = TypedRuntime::new();
-        let result = runtime.execute(
+        let result = runtime.execute_source(
             ProgramLanguage::Lisp,
             "model-response.lisp",
             "(say \"hello\")",
@@ -2617,7 +2649,7 @@ mod tests {
     fn explicit_output_handles_emit_independent_portable_ui_events() {
         let mut runtime = TypedRuntime::new();
         let mut host = RecordingHost::default();
-        let result = runtime.execute_with_handler(
+        let result = runtime.execute_source_with_handler(
             ProgramLanguage::Lisp,
             "output.lisp",
             "(let ((handle (output-open \"download\")))
@@ -2655,7 +2687,7 @@ mod tests {
 
         let mut forth_runtime = TypedRuntime::new();
         let mut forth_host = RecordingHost::default();
-        let forth = forth_runtime.execute_with_handler(
+        let forth = forth_runtime.execute_source_with_handler(
             ProgramLanguage::Forth,
             "output.forth",
             "s\"download\" output-open dup s\"starting\" output-append output-complete",
@@ -2699,14 +2731,14 @@ mod tests {
 
         for case in suite.cases {
             let mut forth = TypedRuntime::new();
-            let forth_result = forth.execute(
+            let forth_result = forth.execute_source(
                 ProgramLanguage::Forth,
                 &format!("conformance/{}.forth", case.name),
                 &case.forth,
                 1_000,
             );
             let mut lisp = TypedRuntime::new();
-            let lisp_result = lisp.execute(
+            let lisp_result = lisp.execute_source(
                 ProgramLanguage::Lisp,
                 &format!("conformance/{}.lisp", case.name),
                 &case.lisp,
@@ -2752,7 +2784,7 @@ mod tests {
     fn approval_resumes_the_verified_frame_after_prior_output() {
         let mut runtime = TypedRuntime::new();
         let mut host = RecordingHost::default();
-        let pending = runtime.execute_with_handler(
+        let pending = runtime.execute_source_with_handler(
             ProgramLanguage::Lisp,
             "model-response.lisp",
             "(begin (say \"checking...\") (file-read (path \"Cargo.toml\")))",
@@ -2825,7 +2857,7 @@ mod tests {
     fn exact_authorization_resumes_only_the_pending_host_call() {
         let mut runtime = TypedRuntime::new();
         let mut host = RecordingHost::default();
-        let first = runtime.execute_with_handler(
+        let first = runtime.execute_source_with_handler(
             ProgramLanguage::Lisp,
             "allow-once.lisp",
             "(begin (file-read (path \"Cargo.toml\")) (file-read (path \"Cargo.lock\")))",
@@ -2868,7 +2900,7 @@ mod tests {
         // This binding deliberately fails file reads. A successful result
         // therefore proves that `VmResume` did not invoke it again.
         let mut host = FailingFileHost::default();
-        let pending = runtime.execute_with_handler(
+        let pending = runtime.execute_source_with_handler(
             ProgramLanguage::Lisp,
             "external-result.lisp",
             "(file-read (path \"Cargo.toml\"))",
@@ -2917,7 +2949,7 @@ mod tests {
     fn external_effect_result_rejects_wrong_sequence_and_result_arity() {
         let mut runtime = TypedRuntime::new();
         let mut host = FailingFileHost::default();
-        let pending = runtime.execute_with_handler(
+        let pending = runtime.execute_source_with_handler(
             ProgramLanguage::Lisp,
             "external-result-errors.lisp",
             "(file-read (path \"Cargo.toml\"))",
@@ -2951,7 +2983,7 @@ mod tests {
     fn definition_does_not_commit_before_its_capability_boundary_completes() {
         let mut runtime = TypedRuntime::new();
         let mut host = RecordingHost::default();
-        let pending = runtime.execute_with_handler(
+        let pending = runtime.execute_source_with_handler(
             ProgramLanguage::Lisp,
             "definition-approval.lisp",
             "(define (record (text : string)) (mem-store text)) (record \"memo\")",
@@ -2989,7 +3021,7 @@ mod tests {
     fn resume_failure_preserves_the_acknowledged_effect_journal_prefix() {
         let mut runtime = TypedRuntime::new();
         let mut host = FailingFileHost::default();
-        let pending = runtime.execute_with_handler(
+        let pending = runtime.execute_source_with_handler(
             ProgramLanguage::Lisp,
             "resume-failure.lisp",
             "(begin (say \"before approval\") (file-read (path \"Cargo.toml\")))",
@@ -3039,7 +3071,7 @@ mod tests {
     fn yield_returns_a_resumable_vm_boundary() {
         let mut runtime = TypedRuntime::new();
         let mut host = RecordingHost::default();
-        let yielded = runtime.execute_with_handler(
+        let yielded = runtime.execute_source_with_handler(
             ProgramLanguage::Lisp,
             "model-response.lisp",
             "(begin (say \"before\") (yield) (say \"after\"))",
@@ -3063,7 +3095,7 @@ mod tests {
     fn emitted_events_have_stable_serializable_sequence_across_resume() {
         let mut runtime = TypedRuntime::new();
         let mut host = RecordingHost::default();
-        let yielded = runtime.execute_with_handler(
+        let yielded = runtime.execute_source_with_handler(
             ProgramLanguage::Lisp,
             "events.lisp",
             "(begin (say \"first\") (yield) (say \"second\"))",
@@ -3094,9 +3126,9 @@ mod tests {
     #[test]
     fn lisp_and_forth_share_one_typed_stack() {
         let mut runtime = TypedRuntime::new();
-        let lisp = runtime.execute(ProgramLanguage::Lisp, "a.lisp", "(+ 2 3)", 1_000);
+        let lisp = runtime.execute_source(ProgramLanguage::Lisp, "a.lisp", "(+ 2 3)", 1_000);
         assert_eq!(lisp.values, vec![TypedValue::Int(5)]);
-        let forth = runtime.execute(ProgramLanguage::Forth, "b.forth", "2 *", 1_000);
+        let forth = runtime.execute_source(ProgramLanguage::Forth, "b.forth", "2 *", 1_000);
         assert_eq!(forth.values, vec![TypedValue::Int(10)]);
         assert_eq!(runtime.stack(), &[TypedValue::Int(10)]);
     }
@@ -3104,7 +3136,7 @@ mod tests {
     #[test]
     fn failure_preserves_acknowledged_output_events_but_rolls_back_vm_stack() {
         let mut runtime = TypedRuntime::new();
-        let execution = runtime.execute(
+        let execution = runtime.execute_source(
             ProgramLanguage::Forth,
             "partial-effect.forth",
             "s\" visible before failure\" say 0 0 /",
@@ -3130,7 +3162,7 @@ mod tests {
             ),
         ] {
             let mut runtime = TypedRuntime::new();
-            let execution = runtime.execute(language, "output", source, 1_000);
+            let execution = runtime.execute_source(language, "output", source, 1_000);
             assert_eq!(execution.status, TypedExecutionStatus::Completed);
             assert_eq!(execution.output, "firstsecond");
             assert!(execution.values.is_empty());
@@ -3141,7 +3173,7 @@ mod tests {
     #[test]
     fn explicit_cpu_defer_runs_a_captured_lisp_closure_on_a_private_worker_stack() {
         let mut runtime = TypedRuntime::new();
-        let execution = runtime.execute(
+        let execution = runtime.execute_source(
             ProgramLanguage::Lisp,
             "defer.lisp",
             "(let ((value 21)) (defer :cpu (lambda () (* value 2))))",
@@ -3167,7 +3199,7 @@ mod tests {
     #[test]
     fn cooperative_fiber_yields_repeatedly_then_returns() {
         let mut runtime = TypedRuntime::new();
-        let execution = runtime.execute(
+        let execution = runtime.execute_source(
             ProgramLanguage::Lisp,
             "producer.lisp",
             "(let ((fiber (defer (lambda () (begin (yield 3) (yield 5) 8))))) \
@@ -3199,7 +3231,7 @@ mod tests {
     #[test]
     fn cooperative_fiber_join_discards_yields_and_returns_terminal_value() {
         let mut runtime = TypedRuntime::new();
-        let execution = runtime.execute(
+        let execution = runtime.execute_source(
             ProgramLanguage::Lisp,
             "join.lisp",
             "(fiber-join (defer (lambda () (begin (yield 1) (yield 2) 42))))",
@@ -3213,7 +3245,7 @@ mod tests {
     #[test]
     fn producer_tombstone_lives_until_the_last_duplicate_handle_is_dropped() {
         let mut runtime = TypedRuntime::new();
-        let joined = runtime.execute(
+        let joined = runtime.execute_source(
             ProgramLanguage::Forth,
             "duplicate-producer.forth",
             ": producer ( S -- S int ! infer ) 1 yield 42 ; \
@@ -3232,7 +3264,7 @@ mod tests {
         ));
         assert_eq!(runtime.checkpoint().unwrap().producer_fibers.len(), 1);
 
-        let dropped = runtime.execute(
+        let dropped = runtime.execute_source(
             ProgramLanguage::Forth,
             "drop-producer.forth",
             "swap drop",
@@ -3246,7 +3278,7 @@ mod tests {
     #[test]
     fn producer_collection_traces_handles_captured_by_live_continuations() {
         let mut runtime = TypedRuntime::new();
-        let deferred = runtime.execute(
+        let deferred = runtime.execute_source(
             ProgramLanguage::Lisp,
             "nested-producers.lisp",
             "(let ((inner (defer (lambda () (begin (yield 1) 7))))) \
@@ -3265,7 +3297,8 @@ mod tests {
         ));
         assert_eq!(runtime.checkpoint().unwrap().producer_fibers.len(), 2);
 
-        let dropped = runtime.execute(ProgramLanguage::Forth, "drop-outer.forth", "drop", 5_000);
+        let dropped =
+            runtime.execute_source(ProgramLanguage::Forth, "drop-outer.forth", "drop", 5_000);
         assert_eq!(
             dropped.status,
             TypedExecutionStatus::Completed,
@@ -3279,7 +3312,7 @@ mod tests {
     #[test]
     fn cooperative_fiber_handle_and_continuation_survive_checkpoint() {
         let mut runtime = TypedRuntime::new();
-        let deferred = runtime.execute(
+        let deferred = runtime.execute_source(
             ProgramLanguage::Lisp,
             "persist.lisp",
             "(defer (lambda () (begin (yield 7) 9)))",
@@ -3294,7 +3327,7 @@ mod tests {
         let checkpoint = runtime.checkpoint().expect("producer is VM-checkpointable");
         let mut restored = TypedRuntime::from_checkpoint(checkpoint)
             .expect("producer module and continuation reverify");
-        let next = restored.execute(
+        let next = restored.execute_source(
             ProgramLanguage::Forth,
             "next.forth",
             "dup fiber-next",
@@ -3311,7 +3344,7 @@ mod tests {
     #[test]
     fn coforth_can_defer_and_advance_the_same_producer_protocol() {
         let mut runtime = TypedRuntime::new();
-        let execution = runtime.execute(
+        let execution = runtime.execute_source(
             ProgramLanguage::Forth,
             "producer.forth",
             ": producer ( S -- S int ! infer ) 4 yield 6 ; \
@@ -3334,7 +3367,7 @@ mod tests {
     #[test]
     fn failed_program_rolls_back_a_producer_advance() {
         let mut runtime = TypedRuntime::new();
-        let deferred = runtime.execute(
+        let deferred = runtime.execute_source(
             ProgramLanguage::Lisp,
             "rollback.lisp",
             "(defer (lambda () (begin (yield 7) 9)))",
@@ -3342,7 +3375,7 @@ mod tests {
         );
         assert_eq!(deferred.status, TypedExecutionStatus::Completed);
 
-        let failed = runtime.execute(
+        let failed = runtime.execute_source(
             ProgramLanguage::Forth,
             "failed-next.forth",
             "dup fiber-next drop 1 0 /",
@@ -3351,7 +3384,7 @@ mod tests {
         assert_eq!(failed.status, TypedExecutionStatus::Failed);
         assert!(matches!(runtime.stack(), [TypedValue::Fiber { .. }]));
 
-        let retried = runtime.execute(
+        let retried = runtime.execute_source(
             ProgramLanguage::Forth,
             "retry-next.forth",
             "dup fiber-next",
@@ -3368,7 +3401,7 @@ mod tests {
     #[test]
     fn cancelled_producer_reports_a_stable_error_on_later_use() {
         let mut runtime = TypedRuntime::new();
-        let deferred = runtime.execute(
+        let deferred = runtime.execute_source(
             ProgramLanguage::Lisp,
             "cancel.lisp",
             "(defer (lambda () (begin (yield 7) 9)))",
@@ -3376,7 +3409,7 @@ mod tests {
         );
         assert_eq!(deferred.status, TypedExecutionStatus::Completed);
 
-        let cancelled = runtime.execute(
+        let cancelled = runtime.execute_source(
             ProgramLanguage::Forth,
             "cancel.forth",
             "dup fiber-cancel drop",
@@ -3385,7 +3418,7 @@ mod tests {
         assert_eq!(cancelled.status, TypedExecutionStatus::Completed);
         assert!(matches!(runtime.stack(), [TypedValue::Fiber { .. }]));
 
-        let next = runtime.execute(
+        let next = runtime.execute_source(
             ProgramLanguage::Forth,
             "cancelled-next.forth",
             "dup fiber-next",
@@ -3398,7 +3431,7 @@ mod tests {
     #[test]
     fn outer_suspension_carries_uncommitted_producer_state() {
         let mut runtime = TypedRuntime::new();
-        let suspended = runtime.execute(
+        let suspended = runtime.execute_source(
             ProgramLanguage::Lisp,
             "outer-yield.lisp",
             "(let ((fiber (defer (lambda () (begin (yield 11) 13))))) \
@@ -3420,7 +3453,7 @@ mod tests {
         ));
         assert_eq!(runtime.producer_fibers.len(), 1);
 
-        let next = runtime.execute(
+        let next = runtime.execute_source(
             ProgramLanguage::Forth,
             "outer-next.forth",
             "dup fiber-next",
@@ -3437,7 +3470,7 @@ mod tests {
     #[test]
     fn checkpoint_rejects_a_forged_producer_handle() {
         let mut runtime = TypedRuntime::new();
-        let execution = runtime.execute(
+        let execution = runtime.execute_source(
             ProgramLanguage::Lisp,
             "forged.lisp",
             "(defer (lambda () (begin (yield 1) 2)))",
@@ -3459,7 +3492,7 @@ mod tests {
     #[test]
     fn cpu_task_handle_survives_a_later_turn_and_joins_without_sharing_stacks() {
         let mut runtime = TypedRuntime::new();
-        let deferred = runtime.execute(
+        let deferred = runtime.execute_source(
             ProgramLanguage::Lisp,
             "defer.lisp",
             "(let ((value 21)) (defer :cpu (lambda () (* value 2))))",
@@ -3473,7 +3506,8 @@ mod tests {
         runtime.cpu_fibers.scheduler.join(id).unwrap();
         let concurrent_snapshot = runtime.clone();
 
-        let joined = runtime.execute(ProgramLanguage::Forth, "join.forth", "task-join", 1_000);
+        let joined =
+            runtime.execute_source(ProgramLanguage::Forth, "join.forth", "task-join", 1_000);
         assert_eq!(joined.status, TypedExecutionStatus::Completed);
         assert_eq!(joined.values, vec![TypedValue::Int(42)]);
         assert_eq!(runtime.stack(), &[TypedValue::Int(42)]);
@@ -3485,7 +3519,7 @@ mod tests {
     #[test]
     fn completed_cpu_task_poll_preserves_handle_and_typed_result() {
         let mut runtime = TypedRuntime::new();
-        let deferred = runtime.execute(
+        let deferred = runtime.execute_source(
             ProgramLanguage::Lisp,
             "defer.lisp",
             "(defer :cpu (lambda () 9))",
@@ -3499,7 +3533,8 @@ mod tests {
             .scheduler
             .join(uuid::Uuid::parse_str(id).unwrap())
             .unwrap();
-        let polled = runtime.execute(ProgramLanguage::Forth, "poll.forth", "task-poll", 1_000);
+        let polled =
+            runtime.execute_source(ProgramLanguage::Forth, "poll.forth", "task-poll", 1_000);
         assert_eq!(polled.status, TypedExecutionStatus::Completed);
         assert_eq!(
             polled.values,
@@ -3523,7 +3558,7 @@ mod tests {
         );
         assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 1);
 
-        let joined = runtime.execute(
+        let joined = runtime.execute_source(
             ProgramLanguage::Forth,
             "poll-join.forth",
             "\"task\" record-get unwrap task-join",
@@ -3537,7 +3572,7 @@ mod tests {
     #[test]
     fn cancelling_a_cpu_task_consumes_its_handle_without_blocking_the_run() {
         let mut runtime = TypedRuntime::new();
-        let cancelled = runtime.execute(
+        let cancelled = runtime.execute_source(
             ProgramLanguage::Lisp,
             "cancel.lisp",
             "(let ((task (defer :cpu (lambda () (begin (yield) 9))))) (task-cancel task))",
@@ -3552,7 +3587,7 @@ mod tests {
     #[test]
     fn failed_program_releases_cpu_tasks_spawned_only_in_its_working_state() {
         let mut runtime = TypedRuntime::new();
-        let failed = runtime.execute(
+        let failed = runtime.execute_source(
             ProgramLanguage::Lisp,
             "failed-cpu-task.lisp",
             "(begin (defer :cpu (lambda () 9)) (/ 1 0))",
@@ -3566,7 +3601,7 @@ mod tests {
     #[test]
     fn cpu_task_leases_trace_duplicate_handles_nested_in_typed_values() {
         let mut runtime = TypedRuntime::new();
-        let deferred = runtime.execute(
+        let deferred = runtime.execute_source(
             ProgramLanguage::Lisp,
             "nested-cpu-task.lisp",
             "(let ((task (defer :cpu (lambda () 9)))) (list task task))",
@@ -3580,7 +3615,8 @@ mod tests {
         );
         assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 1);
 
-        let dropped = runtime.execute(ProgramLanguage::Forth, "drop-task-list.forth", "drop", 10);
+        let dropped =
+            runtime.execute_source(ProgramLanguage::Forth, "drop-task-list.forth", "drop", 10);
         assert_eq!(dropped.status, TypedExecutionStatus::Completed);
         assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 0);
     }
@@ -3588,7 +3624,7 @@ mod tests {
     #[test]
     fn forth_definition_persists_and_is_callable_from_lisp() {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = runtime.execute_source(
             ProgramLanguage::Forth,
             "words.forth",
             ": square ( S int -- S int ! pure ) dup * ;",
@@ -3596,7 +3632,7 @@ mod tests {
         );
         assert_eq!(definition.status, TypedExecutionStatus::Completed);
         assert!(runtime.functions().contains_key("square"));
-        let call = runtime.execute(ProgramLanguage::Lisp, "call.lisp", "(square 9)", 1_000);
+        let call = runtime.execute_source(ProgramLanguage::Lisp, "call.lisp", "(square 9)", 1_000);
         assert_eq!(call.status, TypedExecutionStatus::Completed);
         assert_eq!(call.values, vec![TypedValue::Int(81)]);
     }
@@ -3604,7 +3640,7 @@ mod tests {
     #[test]
     fn rejected_definition_does_not_enter_dictionary() {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = runtime.execute_source(
             ProgramLanguage::Forth,
             "words.forth",
             ": dishonest ( S string -- S ! pure ) say ;",
@@ -3618,7 +3654,7 @@ mod tests {
     #[test]
     fn lisp_definition_persists_and_is_callable_from_forth() {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = runtime.execute_source(
             ProgramLanguage::Lisp,
             "words.lisp",
             "(define (triple (x : int)) (* x 3))",
@@ -3626,7 +3662,7 @@ mod tests {
         );
         assert_eq!(definition.status, TypedExecutionStatus::Completed);
         assert!(runtime.functions().contains_key("triple"));
-        let call = runtime.execute(ProgramLanguage::Forth, "call.forth", "7 triple", 1_000);
+        let call = runtime.execute_source(ProgramLanguage::Forth, "call.forth", "7 triple", 1_000);
         assert_eq!(call.status, TypedExecutionStatus::Completed);
         assert_eq!(call.values, vec![TypedValue::Int(21)]);
     }
@@ -3634,7 +3670,7 @@ mod tests {
     #[test]
     fn recursive_lisp_definition_persists_for_later_program_runs() {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = runtime.execute_source(
             ProgramLanguage::Lisp,
             "words.lisp",
             "(define (factorial (n : int)) : int \
@@ -3644,7 +3680,8 @@ mod tests {
         assert_eq!(definition.status, TypedExecutionStatus::Completed);
         assert!(runtime.functions().contains_key("factorial"));
 
-        let call = runtime.execute(ProgramLanguage::Forth, "call.forth", "6 factorial", 1_000);
+        let call =
+            runtime.execute_source(ProgramLanguage::Forth, "call.forth", "6 factorial", 1_000);
         assert_eq!(call.status, TypedExecutionStatus::Completed);
         assert_eq!(call.values, vec![TypedValue::Int(720)]);
     }
@@ -3652,7 +3689,7 @@ mod tests {
     #[test]
     fn pure_mutually_recursive_lisp_functions_are_visible_during_compilation() {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = runtime.execute_source(
             ProgramLanguage::Lisp,
             "words.lisp",
             "(define (even? (n : int)) : bool \
@@ -3662,7 +3699,7 @@ mod tests {
             1_000,
         );
         assert_eq!(definition.status, TypedExecutionStatus::Completed);
-        let call = runtime.execute(ProgramLanguage::Forth, "call.forth", "42 even?", 1_000);
+        let call = runtime.execute_source(ProgramLanguage::Forth, "call.forth", "42 even?", 1_000);
         assert_eq!(call.status, TypedExecutionStatus::Completed);
         assert_eq!(call.values, vec![TypedValue::Bool(true)]);
     }
@@ -3670,7 +3707,7 @@ mod tests {
     #[test]
     fn recursive_forth_definition_persists_for_later_program_runs() {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = runtime.execute_source(
             ProgramLanguage::Forth,
             "words.forth",
             ": factorial ( S n:int -- S int ! pure ) \
@@ -3680,7 +3717,8 @@ mod tests {
         assert_eq!(definition.status, TypedExecutionStatus::Completed);
         assert!(runtime.functions().contains_key("factorial"));
 
-        let call = runtime.execute(ProgramLanguage::Lisp, "call.lisp", "(factorial 6)", 1_000);
+        let call =
+            runtime.execute_source(ProgramLanguage::Lisp, "call.lisp", "(factorial 6)", 1_000);
         assert_eq!(call.status, TypedExecutionStatus::Completed);
         assert_eq!(call.values, vec![TypedValue::Int(720)]);
     }
@@ -3688,7 +3726,7 @@ mod tests {
     #[test]
     fn pure_mutually_recursive_forth_words_are_visible_during_compilation() {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = runtime.execute_source(
             ProgramLanguage::Forth,
             "words.forth",
             ": even? ( S n:int -- S bool ! pure ) \
@@ -3698,7 +3736,7 @@ mod tests {
             1_000,
         );
         assert_eq!(definition.status, TypedExecutionStatus::Completed);
-        let call = runtime.execute(ProgramLanguage::Lisp, "call.lisp", "(even? 42)", 1_000);
+        let call = runtime.execute_source(ProgramLanguage::Lisp, "call.lisp", "(even? 42)", 1_000);
         assert_eq!(call.status, TypedExecutionStatus::Completed);
         assert_eq!(call.values, vec![TypedValue::Bool(true)]);
     }
@@ -3706,7 +3744,7 @@ mod tests {
     #[test]
     fn forth_quotation_references_a_typed_word_and_executes_it() {
         let mut runtime = TypedRuntime::new();
-        let result = runtime.execute(
+        let result = runtime.execute_source(
             ProgramLanguage::Forth,
             "quotation.forth",
             ": square ( S int -- S int ! pure ) dup * ; 9 ['] square execute",
@@ -3720,7 +3758,7 @@ mod tests {
     fn missing_capability_suspends_before_stack_mutation() {
         let mut runtime = TypedRuntime::new();
         let before = runtime.stack().to_vec();
-        let result = runtime.execute(
+        let result = runtime.execute_source(
             ProgramLanguage::Lisp,
             "memory.lisp",
             "(mem-store \"remember this\")",
@@ -3736,9 +3774,9 @@ mod tests {
     #[test]
     fn runtime_failure_rolls_back_stack() {
         let mut runtime = TypedRuntime::new();
-        runtime.execute(ProgramLanguage::Forth, "a.forth", "7", 1_000);
+        runtime.execute_source(ProgramLanguage::Forth, "a.forth", "7", 1_000);
         let before = runtime.stack().to_vec();
-        let result = runtime.execute(ProgramLanguage::Forth, "b.forth", "0 /", 1_000);
+        let result = runtime.execute_source(ProgramLanguage::Forth, "b.forth", "0 /", 1_000);
         assert_eq!(result.status, TypedExecutionStatus::Failed);
         assert_eq!(runtime.stack(), before);
     }
@@ -3746,20 +3784,21 @@ mod tests {
     #[test]
     fn checkpoint_round_trips_stack_and_verified_definitions() {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = runtime.execute_source(
             ProgramLanguage::Forth,
             "definition.forth",
             ": square ( S int -- S int ! pure ) dup * ;",
             1_000,
         );
         assert_eq!(definition.status, TypedExecutionStatus::Completed);
-        runtime.execute(ProgramLanguage::Forth, "seed.forth", "6", 1_000);
+        runtime.execute_source(ProgramLanguage::Forth, "seed.forth", "6", 1_000);
 
         let checkpoint = runtime.checkpoint().expect("pure VM state checkpoints");
         assert!(serde_json::to_string(&checkpoint).is_ok());
         let mut restored = TypedRuntime::from_checkpoint(checkpoint)
             .expect("persisted definitions are reverified on restore");
-        let result = restored.execute(ProgramLanguage::Lisp, "call.lisp", "(square 6)", 1_000);
+        let result =
+            restored.execute_source(ProgramLanguage::Lisp, "call.lisp", "(square 6)", 1_000);
 
         assert_eq!(result.status, TypedExecutionStatus::Completed);
         assert_eq!(restored.stack(), &[TypedValue::Int(6), TypedValue::Int(36)]);
@@ -3768,7 +3807,7 @@ mod tests {
     #[test]
     fn checkpoint_round_trips_lisp_closure_bodies_and_captures() {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = runtime.execute_source(
             ProgramLanguage::Lisp,
             "closure-definition.lisp",
             "(define (make-adder (n : int)) (lambda ((x : int)) (+ n x)))",
@@ -3783,7 +3822,7 @@ mod tests {
             .any(|name| name.starts_with("lambda$")));
         let mut restored = TypedRuntime::from_checkpoint(checkpoint)
             .expect("generated lambda bodies restore with their public definition");
-        let result = restored.execute(
+        let result = restored.execute_source(
             ProgramLanguage::Lisp,
             "closure-call.lisp",
             "((make-adder 7) 35)",
@@ -3797,7 +3836,7 @@ mod tests {
     #[test]
     fn checkpoint_round_trips_forth_quotation_bodies_and_captures() {
         let mut runtime = TypedRuntime::new();
-        let definition = runtime.execute(
+        let definition = runtime.execute_source(
             ProgramLanguage::Forth,
             "quotation-definition.forth",
             ": make-adder ( S n:int -- S fn<int,int> ! pure ) \
@@ -3813,7 +3852,7 @@ mod tests {
             .any(|name| name.starts_with("quote$")));
         let mut restored = TypedRuntime::from_checkpoint(checkpoint)
             .expect("generated quotation bodies restore with their public definition");
-        let result = restored.execute(
+        let result = restored.execute_source(
             ProgramLanguage::Forth,
             "quotation-call.forth",
             "35 7 make-adder execute",
@@ -3827,7 +3866,7 @@ mod tests {
     #[test]
     fn checkpoint_round_trips_a_closure_bearing_record_across_frontends() {
         let mut runtime = TypedRuntime::new();
-        let created = runtime.execute(
+        let created = runtime.execute_source(
             ProgramLanguage::Lisp,
             "record-closure.lisp",
             "{ :run (lambda ((x : int)) (+ x 1)) }",
@@ -3844,7 +3883,7 @@ mod tests {
         let checkpoint = serde_json::from_str(&encoded).expect("checkpoint must deserialize");
         let mut restored = TypedRuntime::from_checkpoint(checkpoint)
             .expect("closure body and record value must be reverified on restore");
-        let invoked = restored.execute(
+        let invoked = restored.execute_source(
             ProgramLanguage::Forth,
             "record-closure.forth",
             "\"run\" record-get unwrap 41 swap execute",
@@ -3870,7 +3909,7 @@ mod tests {
     #[test]
     fn checkpoint_restore_refuses_to_shadow_a_core_word() {
         let mut runtime = TypedRuntime::new();
-        runtime.execute(
+        runtime.execute_source(
             ProgramLanguage::Forth,
             "definition.forth",
             ": square ( S int -- S int ! pure ) dup * ;",
@@ -3890,7 +3929,7 @@ mod tests {
     #[test]
     fn closure_capabilities_compose_into_the_caller() {
         let mut runtime = TypedRuntime::new();
-        let result = runtime.execute(
+        let result = runtime.execute_source(
             ProgramLanguage::Lisp,
             "closure.lisp",
             "(let ((store (lambda ((text : string)) (mem-store text)))) (store \"memo\"))",
@@ -3907,7 +3946,7 @@ mod tests {
     #[test]
     fn declaration_cannot_hide_an_inferred_capability() {
         let mut runtime = TypedRuntime::new();
-        let result = runtime.execute_with_declaration(
+        let result = runtime.execute_source_with_declaration(
             ProgramLanguage::Lisp,
             "response.lisp",
             "(say \"hidden effect\")",
@@ -3922,9 +3961,10 @@ mod tests {
     #[test]
     fn lisp_while_is_metered_and_transactional() {
         let mut runtime = TypedRuntime::new();
-        runtime.execute(ProgramLanguage::Lisp, "seed.lisp", "7", 1_000);
+        runtime.execute_source(ProgramLanguage::Lisp, "seed.lisp", "7", 1_000);
         let before = runtime.stack().to_vec();
-        let result = runtime.execute(ProgramLanguage::Lisp, "loop.lisp", "(while true 1)", 20);
+        let result =
+            runtime.execute_source(ProgramLanguage::Lisp, "loop.lisp", "(while true 1)", 20);
         assert_eq!(result.status, TypedExecutionStatus::Failed);
         assert_eq!(result.diagnostics[0].code, "E-LIMIT-001");
         assert_eq!(runtime.stack(), before);
@@ -3933,7 +3973,7 @@ mod tests {
     #[test]
     fn lisp_while_records_unreached_body_capabilities_without_requesting_them() {
         let mut runtime = TypedRuntime::new();
-        let result = runtime.execute(
+        let result = runtime.execute_source(
             ProgramLanguage::Lisp,
             "loop.lisp",
             "(while false (mem-store \"never runs\"))",
