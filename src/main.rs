@@ -2559,7 +2559,7 @@ fn vm_wire_system_prompt() -> String {
     const VM_WIRE_BOOT: &str = include_str!("../vocabulary/BOOT.md");
     format!(
         "{}\n\n{}",
-        finch::generators::claude::CODING_SYSTEM_PROMPT,
+        finch::generators::CODING_SYSTEM_PROMPT,
         VM_WIRE_BOOT
     )
 }

@@ -55,7 +55,7 @@ fn source_only_wire_system() -> String {
     format!(
         "{}\n\n{}\n\nNo introspection tools are attached to this source-only conformance request. \
          The complete canonical language package follows; use it directly.\n\n{}\n\n{}\n\n{}",
-        finch::generators::claude::CODING_SYSTEM_PROMPT,
+        finch::generators::CODING_SYSTEM_PROMPT,
         BOOT_CAPSULE,
         VM_LANGUAGE_DEFINITION,
         LISP_LANGUAGE_DEFINITION,

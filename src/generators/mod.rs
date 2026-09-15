@@ -21,9 +21,13 @@ pub(crate) fn validate_response_model(model: &str) -> Result<()> {
 }
 
 // Re-export implementations
-pub mod claude;
-pub mod daemon_local;
-pub mod qwen;
+mod claude;
+mod daemon_local;
+mod qwen;
+
+pub use claude::{ClaudeGenerator, CODING_SYSTEM_PROMPT};
+pub use daemon_local::DaemonLocalGenerator;
+pub use qwen::QwenGenerator;
 
 /// Associates a configured profile name with a generator without changing its
 /// provider-specific response metadata.
@@ -209,6 +213,7 @@ impl ToolUse {
 mod tests {
     use super::*;
     use crate::claude::ContentBlock;
+    use std::path::{Path, PathBuf};
 
     fn make_tool_use(id: &str, name: &str) -> ToolUse {
         ToolUse {
@@ -419,5 +424,95 @@ mod tests {
         assert_eq!(response.text, "The answer is 42");
         assert!(response.tool_uses.is_empty());
         assert_eq!(response.content_blocks.len(), 1);
+    }
+    #[test]
+    fn generators_facade_keeps_child_modules_private() {
+        let facade = include_str!("mod.rs");
+        let published = facade
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| line.starts_with("pub mod "))
+            .collect::<Vec<_>>();
+        assert!(
+            published.is_empty(),
+            "generators facade must keep child modules private; found: {published:?}"
+        );
+    }
+
+    #[test]
+    fn generators_callers_use_facade_not_child_modules() {
+        let children = ["claude", "daemon_local", "qwen"];
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let generators = root.join("src/generators");
+        let mut hits = Vec::new();
+        for tree in ["src", "tests"] {
+            collect_generators_child_imports(
+                &root.join(tree),
+                &root,
+                &generators,
+                &children,
+                &mut hits,
+            );
+        }
+        assert!(
+            hits.is_empty(),
+            "callers outside src/generators must use crate::generators::Item, not child modules; found: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn generators_facade_reexports_caller_types() {
+        let _ = std::any::type_name::<ClaudeGenerator>();
+        let _ = std::any::type_name::<DaemonLocalGenerator>();
+        let _ = CODING_SYSTEM_PROMPT;
+    }
+
+    fn collect_generators_child_imports(
+        dir: &Path,
+        root: &Path,
+        generators: &Path,
+        children: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        if dir.starts_with(generators) {
+            return;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                hits.push(format!("failed to read {}: {error}", dir.display()));
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_generators_child_imports(&path, root, generators, children, hits);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                hits.push(format!("failed to read {}", path.display()));
+                continue;
+            };
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for child in children {
+                    for prefix in ["crate::generators::", "finch::generators::"] {
+                        let needle = [prefix, child, "::"].concat();
+                        if line.contains(&needle) {
+                            let rel = path.strip_prefix(root).unwrap_or(&path);
+                            hits.push(format!("{}:{}", rel.display(), index + 1));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

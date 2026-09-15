@@ -2192,8 +2192,7 @@ impl Repl {
 
         // Create generators
         use crate::generators::{
-            claude::ClaudeGenerator, daemon_local::DaemonLocalGenerator, qwen::QwenGenerator,
-            ProfiledGenerator,
+            ClaudeGenerator, DaemonLocalGenerator, ProfiledGenerator, QwenGenerator,
         };
 
         // Everything from here to `EventLoop::new` was inside the 6.4 ms that

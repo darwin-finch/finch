@@ -258,12 +258,10 @@ impl ProviderResolver {
             let client = self.daemon_client.clone().ok_or_else(|| {
                 anyhow::anyhow!("NoEligibleModel: local profile requires a running daemon")
             })?;
-            return Ok(Arc::new(
-                crate::generators::daemon_local::DaemonLocalGenerator::new(
-                    client,
-                    entry.profile_name(),
-                ),
-            ));
+            return Ok(Arc::new(crate::generators::DaemonLocalGenerator::new(
+                client,
+                entry.profile_name(),
+            )));
         }
         let provider: Arc<dyn crate::providers::LlmProvider> = if let Some(config) = &self.config {
             let resolver = self
@@ -279,9 +277,8 @@ impl ProviderResolver {
             Arc::from(crate::providers::create_provider_from_entry(entry)?)
         };
         let client = crate::claude::ClaudeClient::with_shared_provider(provider);
-        let inner: Arc<dyn Generator> = Arc::new(crate::generators::claude::ClaudeGenerator::new(
-            Arc::new(client),
-        ));
+        let inner: Arc<dyn Generator> =
+            Arc::new(crate::generators::ClaudeGenerator::new(Arc::new(client)));
         Ok(Arc::new(crate::generators::ProfiledGenerator::new(
             entry.profile_name(),
             inner,

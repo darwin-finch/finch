@@ -90,11 +90,9 @@ impl EventLoop {
 
             match client.local_model_status().await {
                 Ok(crate::client::LocalModelStatus::Ready(model)) => {
-                    let generator: Arc<dyn Generator> =
-                        Arc::new(crate::generators::daemon_local::DaemonLocalGenerator::new(
-                            client,
-                            entry.profile_name(),
-                        ));
+                    let generator: Arc<dyn Generator> = Arc::new(
+                        crate::generators::DaemonLocalGenerator::new(client, entry.profile_name()),
+                    );
                     self.model_selection.activate(target_index, generator).await;
                     self.output_manager.write_info(format!(
                         "✓ Switched to {} · {} (conversation preserved)",
@@ -112,7 +110,7 @@ impl EventLoop {
                     ));
 
                     let local_generator: Arc<dyn Generator> =
-                        Arc::new(crate::generators::daemon_local::DaemonLocalGenerator::new(
+                        Arc::new(crate::generators::DaemonLocalGenerator::new(
                             Arc::clone(&client),
                             entry.profile_name(),
                         ));
