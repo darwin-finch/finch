@@ -76,6 +76,9 @@ pub struct LlmLoop {
     enable_summarization: bool,
     auto_compact_enabled: bool,
     wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
+    /// Session-scoped committed conversation summary. Reused across turns so
+    /// the summarised request prefix stays byte-stable for prompt caching.
+    summary_cache: crate::cli::conversation_compactor::SharedSummaryCache,
 }
 
 impl LlmLoop {
@@ -169,6 +172,9 @@ impl LlmLoop {
             enable_summarization,
             auto_compact_enabled,
             wire_metrics_logger,
+            summary_cache: Arc::new(std::sync::Mutex::new(
+                crate::cli::conversation_compactor::SummaryCache::new(),
+            )),
         }
     }
 
@@ -260,6 +266,7 @@ impl LlmLoop {
         let persona_system_prompt = self.active_persona.read().await.to_system_message();
         // Always use the capable cloud model for summarisation, regardless of routing.
         let summary_gen = Arc::clone(&claude_gen);
+        let summary_cache = Arc::clone(&self.summary_cache);
         let tool_call_history = Arc::clone(&self.tool_call_history);
         let pinned_generators = Arc::clone(&self.pinned_generators);
         let terminal_query_states = Arc::clone(&query_states);
@@ -298,6 +305,7 @@ impl LlmLoop {
                 enable_summarization,
                 auto_compact_enabled,
                 summary_gen,
+                summary_cache,
                 tool_call_history,
                 wire_metrics_logger,
                 persona_system_prompt,

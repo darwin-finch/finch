@@ -681,23 +681,25 @@ Match the code style in src/lib.rs.
 When `enable_summarization = true` in `[features]`, messages dropped by the sliding window are summarised via a provider call and injected as a `[Summary of earlier context: ...]` prefix:
 
 ```
-all_msgs (full history)
+history (full stored conversation)
     │
-    ├─ dropped (older msgs) ──► ConversationCompactor.summarize()
+    ├─ plan_summary ──► committed range still covers the drop point?
+    │        │ yes: reuse the committed bytes (no provider call)
+    │        └ no: summarise history[..input_end] ──► commit new range
     │                                   ↓
     │                        [Summary of earlier context: ...]  (user msg)
     │                        "Understood."                      (assistant ack)
     │
-    └─ window (recent N) ───► [window messages]
-                                   │
-                                   └─► final_msgs = [prefix pair] + [window]
+    └─ apply_sliding_window ──► window (recent N) ──► final_msgs = [prefix pair] + [window]
 ```
 
-The prefix pair keeps the required alternating user→assistant role ordering expected by all providers. Failure is non-fatal: if the summarisation call fails, the plain window is used and a warning is logged.
+The summary is committed to a range that only moves when the window slides past its end (`SummaryCache`, per session), so the same bytes are reused for several turns and re-summarisation happens once per genuine slide instead of once per turn. This keeps the head of the message array byte-stable, which is what lets a prompt cache reuse the prefix; the stable system/context message always precedes the summary pair. The committed range never under-covers the drop point, so no dropped message is lost, and a boundary fingerprint invalidates the cache if the history is replaced underneath it.
+
+The prefix pair keeps the required alternating user→assistant role ordering expected by all providers. Failure is non-fatal: if the summarisation call fails, nothing is committed, the plain window is used, a warning is logged, and the next turn retries.
 
 **Key Files:**
 - `src/cli/conversation.rs` - `ConversationHistory`
-- `src/cli/conversation_compactor.rs` - `ConversationCompactor`, `inject_summary_prefix()`, `format_messages_for_summary()`
+- `src/cli/conversation_compactor.rs` - `ConversationCompactor` (`plan_summary`/`commit_summary`), `SummaryCache`, `inject_summary_prefix()`, `format_messages_for_summary()`
 - `src/cli/repl_event/event_loop.rs` - `apply_sliding_window()`, compactor hook (line ~1295)
 
 ### 13. Semantic Memory (`NeuralEmbeddingEngine`)
