@@ -57,9 +57,10 @@ root Finch application ──→ finch-language + finch-vm + host runtime/policy
 - **`finch-coforth`** owns only the Co-Forth reader, stack-oriented syntax objects, surface grammar,
   and translation to the same semantic-construction protocol. It has no separate semantic subset.
 - **`finch-language`** becomes the compilation facade and dependency-driven orchestrator. It chooses
-  a frontend, registers declarations/modules, schedules elaboration and CTFE jobs, seals interfaces,
-  and returns a verified module. It is allowed to be small initially because it owns a durable
-  integration boundary that grows with the compiler rather than a one-function extraction.
+  a frontend, registers declarations/modules, and schedules elaboration/CTFE/lowering with
+  `await require(symbol, stage)` promises (not an event bus; see the language design). It seals
+  interfaces and returns a verified module. It is allowed to be small initially because it owns a
+  durable integration boundary that grows with the compiler rather than a one-function extraction.
 - **`finch-vm`** consumes `ModuleVerified` values and owns the reference interpreter, resumable
   execution machinery, and execution ABI. Source compilation is injected by the application; the
   VM does not select or call a frontend. Host policy/checkpoint orchestration may remain temporarily
