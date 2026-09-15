@@ -1,15 +1,15 @@
 use super::*;
-use crate::brain::store::{
+use crate::brain::{
     AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
     BrainEvent, BrainEventKind, BrainId, BrainSnapshot, ProgramLanguage,
 };
-use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
+use crate::brain::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 
 async fn connect_test_brain_socket(
     server: &Arc<crate::server::AgentServer>,
     address: std::net::SocketAddr,
     brain: &str,
-    attachment: &crate::brain::store::BrainAttachment,
+    attachment: &crate::brain::BrainAttachment,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     use futures::StreamExt;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -19,14 +19,14 @@ async fn connect_test_brain_socket(
     let parent = server
         .brain_credentials()
         .issue(
-            crate::brain::credential::BrainCredentialRequest {
+            crate::brain::BrainCredentialRequest {
                 issuer: "test".into(),
                 subject: attachment.subject.clone(),
                 brain_id: snapshot.brain_id,
                 brain: brain.into(),
                 environment_generation: snapshot.environment.generation,
                 role: attachment.role,
-                scopes: crate::brain::credential::default_participant_scopes(attachment.role),
+                scopes: crate::brain::default_participant_scopes(attachment.role),
                 delegation_chain: Vec::new(),
                 ttl_ms: 60_000,
             },
@@ -69,7 +69,7 @@ fn install_run_admission_pause(
 
 #[tokio::test(flavor = "current_thread")]
 async fn websocket_teardown_is_bounded_and_connection_scoped() {
-    use crate::brain::store::{BrainStore, ConnectionId};
+    use crate::brain::{BrainStore, ConnectionId};
     use crate::server::BrainLifecycleService;
 
     struct RetainingTurnRunner {
@@ -150,7 +150,7 @@ async fn websocket_teardown_is_bounded_and_connection_scoped() {
     let server = Arc::new(
         crate::server::AgentServer::for_brain_protocol_test(
             store,
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([59; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([59; 32]),
             "test-password".into(),
             temp.path(),
         )
@@ -167,14 +167,14 @@ async fn websocket_teardown_is_bounded_and_connection_scoped() {
     let parent_token = server
         .brain_credentials()
         .issue(
-            crate::brain::credential::BrainCredentialRequest {
+            crate::brain::BrainCredentialRequest {
                 issuer: "test".into(),
                 subject: attached.subject.clone(),
                 brain_id: pending.brain_id,
                 brain: "shared".into(),
                 environment_generation: pending.environment.generation,
                 role: attached.role,
-                scopes: crate::brain::credential::default_participant_scopes(attached.role),
+                scopes: crate::brain::default_participant_scopes(attached.role),
                 delegation_chain: Vec::new(),
                 ttl_ms: 60_000,
             },
@@ -307,7 +307,7 @@ async fn websocket_teardown_is_bounded_and_connection_scoped() {
                 )) {
                     assert_eq!(projected.runs.iter().find(|run| {
                         run.request_seq == request_seq
-                    }).unwrap().status, crate::brain::store::BrainRunStatus::AwaitingApproval);
+                    }).unwrap().status, crate::brain::BrainRunStatus::AwaitingApproval);
                     break;
                 }
             }
@@ -419,7 +419,7 @@ async fn websocket_teardown_is_bounded_and_connection_scoped() {
                 .iter()
                 .any(|run| {
                     run.request_seq == request_seq
-                        && run.status == crate::brain::store::BrainRunStatus::Cancelled
+                        && run.status == crate::brain::BrainRunStatus::Cancelled
                 })
             {
                 break;
@@ -435,7 +435,7 @@ async fn websocket_teardown_is_bounded_and_connection_scoped() {
         .iter()
         .find(|run| run.request_seq == request_seq)
         .unwrap();
-    assert_eq!(run.status, crate::brain::store::BrainRunStatus::Cancelled);
+    assert_eq!(run.status, crate::brain::BrainRunStatus::Cancelled);
     assert_eq!(
         disconnected
             .events
@@ -599,10 +599,7 @@ async fn websocket_teardown_is_bounded_and_connection_scoped() {
     let later_run = lifecycle
         .inspect_run("shared", later.run.unwrap().run_id)
         .unwrap();
-    assert_eq!(
-        later_run.status,
-        crate::brain::store::BrainRunStatus::Failed
-    );
+    assert_eq!(later_run.status, crate::brain::BrainRunStatus::Failed);
     assert_eq!(
         later_run.detail.as_deref(),
         Some("later prompt reached runner")
@@ -622,7 +619,7 @@ async fn websocket_teardown_is_bounded_and_connection_scoped() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn ordinary_websocket_disconnect_cancels_exact_runner_and_preserves_completed_run() {
-    use crate::brain::store::{BrainRunKind, BrainRunStatus, BrainStore};
+    use crate::brain::{BrainRunKind, BrainRunStatus, BrainStore};
     use crate::server::BrainLifecycleService;
     use futures::SinkExt;
 
@@ -632,7 +629,7 @@ async fn ordinary_websocket_disconnect_cancels_exact_runner_and_preserves_comple
                 tokio::sync::oneshot::Sender<crate::finch_ipc_capnp::brain_turn_control::Client>,
             >,
         >,
-        cancelled: tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>,
+        cancelled: tokio::sync::mpsc::UnboundedSender<crate::brain::RunId>,
         stop: Arc<tokio::sync::Notify>,
     }
     impl crate::finch_ipc_capnp::brain_runner::Server for DisconnectRunner {
@@ -679,7 +676,7 @@ async fn ordinary_websocket_disconnect_cancels_exact_runner_and_preserves_comple
                 });
             match parsed {
                 Ok(run_id) => {
-                    let _ = self.cancelled.send(crate::brain::store::RunId(run_id));
+                    let _ = self.cancelled.send(crate::brain::RunId(run_id));
                     self.stop.notify_waiters();
                     results.get().set_cancelled(true);
                     capnp::capability::Promise::ok(())
@@ -702,7 +699,7 @@ async fn ordinary_websocket_disconnect_cancels_exact_runner_and_preserves_comple
     let server = Arc::new(
         crate::server::AgentServer::for_brain_protocol_test(
             store,
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([61; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([61; 32]),
             "test-password".into(),
             temp.path(),
         )
@@ -1025,11 +1022,11 @@ async fn ordinary_websocket_disconnect_cancels_exact_runner_and_preserves_comple
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn effect_audit_websocket_disconnect_fences_start_bind_and_turn_enqueue_races() {
-    use crate::brain::store::{BrainRunStatus, BrainStore};
+    use crate::brain::{BrainRunStatus, BrainStore};
     use crate::server::BrainLifecycleService;
     use futures::SinkExt;
 
-    struct CancelBeforeTurnRunner(tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>);
+    struct CancelBeforeTurnRunner(tokio::sync::mpsc::UnboundedSender<crate::brain::RunId>);
     impl crate::finch_ipc_capnp::brain_runner::Server for CancelBeforeTurnRunner {
         fn run_program(
             self: capnp::capability::Rc<Self>,
@@ -1065,7 +1062,7 @@ async fn effect_audit_websocket_disconnect_fences_start_bind_and_turn_enqueue_ra
                 });
             match parsed {
                 Ok(run_id) => {
-                    let _ = self.0.send(crate::brain::store::RunId(run_id));
+                    let _ = self.0.send(crate::brain::RunId(run_id));
                     // Reproduce a real frontend that has not admitted Turn yet.
                     results.get().set_cancelled(false);
                     capnp::capability::Promise::ok(())
@@ -1087,7 +1084,7 @@ async fn effect_audit_websocket_disconnect_fences_start_bind_and_turn_enqueue_ra
     let server = Arc::new(
         crate::server::AgentServer::for_brain_protocol_test(
             BrainStore::with_root("box.local", Some(temp.path().into())),
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([62; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([62; 32]),
             "test-password".into(),
             temp.path(),
         )
@@ -1294,7 +1291,7 @@ fn driver_attachment(subject: &str) -> BrainAttachment {
         role: AttachmentRole::Driver,
         acknowledged_seq: 0,
         connected: true,
-        connection_id: Some(crate::brain::store::ConnectionId(uuid::Uuid::new_v4())),
+        connection_id: Some(crate::brain::ConnectionId(uuid::Uuid::new_v4())),
     }
 }
 
@@ -1320,9 +1317,9 @@ fn acknowledged_emit_effect(text: &str) -> crate::server::RunnerEffectRecord {
 
 #[test]
 fn participant_credentials_are_least_privilege_by_role() {
-    use crate::brain::credential::BrainCredentialScope;
+    use crate::brain::BrainCredentialScope;
 
-    let driver = crate::brain::credential::default_participant_scopes(AttachmentRole::Driver);
+    let driver = crate::brain::default_participant_scopes(AttachmentRole::Driver);
     assert!(driver.contains(&BrainCredentialScope::BrainRead));
     assert!(driver.contains(&BrainCredentialScope::BrainAttach));
     assert!(driver.contains(&BrainCredentialScope::BrainDetach));
@@ -1333,8 +1330,7 @@ fn participant_credentials_are_least_privilege_by_role() {
     assert!(!driver.contains(&BrainCredentialScope::EnvironmentAdmin));
     assert!(!driver.contains(&BrainCredentialScope::ComputeSubmit));
 
-    let consultant =
-        crate::brain::credential::default_participant_scopes(AttachmentRole::Consultant);
+    let consultant = crate::brain::default_participant_scopes(AttachmentRole::Consultant);
     assert!(consultant.contains(&BrainCredentialScope::BrainRead));
     assert!(consultant.contains(&BrainCredentialScope::BrainAttach));
     assert!(consultant.contains(&BrainCredentialScope::BrainDetach));
@@ -1342,11 +1338,11 @@ fn participant_credentials_are_least_privilege_by_role() {
     assert!(!consultant.contains(&BrainCredentialScope::BrainApprove));
     assert!(!consultant.contains(&BrainCredentialScope::BrainControl));
     assert!(
-        crate::brain::credential::permitted_participant_scopes(AttachmentRole::Consultant)
+        crate::brain::permitted_participant_scopes(AttachmentRole::Consultant)
             .contains(&BrainCredentialScope::BrainApprove)
     );
 
-    let observer = crate::brain::credential::default_participant_scopes(AttachmentRole::Observer);
+    let observer = crate::brain::default_participant_scopes(AttachmentRole::Observer);
     assert!(observer.contains(&BrainCredentialScope::BrainRead));
     assert!(observer.contains(&BrainCredentialScope::BrainAttach));
     assert!(observer.contains(&BrainCredentialScope::BrainDetach));
@@ -1354,8 +1350,7 @@ fn participant_credentials_are_least_privilege_by_role() {
     assert!(!observer.contains(&BrainCredentialScope::BrainSubmit));
     assert!(!observer.contains(&BrainCredentialScope::BrainApprove));
 
-    let driver_maximum =
-        crate::brain::credential::permitted_participant_scopes(AttachmentRole::Driver);
+    let driver_maximum = crate::brain::permitted_participant_scopes(AttachmentRole::Driver);
     assert!(driver_maximum.contains(&BrainCredentialScope::BrainControl));
     assert!(driver_maximum.contains(&BrainCredentialScope::EnvironmentAdmin));
     assert!(!driver_maximum.contains(&BrainCredentialScope::EnvironmentExecute));
@@ -1535,8 +1530,7 @@ fn restarted_snapshot_reinjects_durable_task_context() {
         BrainTaskPriority::High,
     )];
     {
-        let store =
-            crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
         store
             .push(
                 "shared",
@@ -1548,8 +1542,7 @@ fn restarted_snapshot_reinjects_durable_task_context() {
             .unwrap();
     }
 
-    let restarted =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let restarted = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     restarted
         .push(
             "shared",
@@ -1590,7 +1583,7 @@ fn task_context_encodes_adversarial_content_as_untrusted_data() {
 
 #[tokio::test]
 async fn task_submission_rejects_huge_or_ambiguous_lists_before_persistence() {
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let driver = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -1660,8 +1653,7 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
     let temp = tempfile::tempdir().unwrap();
     let (old_seq, new_seq);
     {
-        let store =
-            crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
         let pending = store
             .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
             .unwrap();
@@ -1700,10 +1692,10 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
             .start_run(
                 "shared",
                 &driver.subject,
-                crate::brain::store::BrainRunKind::Interactive,
+                crate::brain::BrainRunKind::Interactive,
                 old_seq,
                 driver.attachment_id,
-                crate::brain::store::BrainRunStatus::QueuedForEnvironment,
+                crate::brain::BrainRunStatus::QueuedForEnvironment,
             )
             .unwrap();
         store
@@ -1734,24 +1726,21 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
             .start_run(
                 "shared",
                 &driver.subject,
-                crate::brain::store::BrainRunKind::Interactive,
+                crate::brain::BrainRunKind::Interactive,
                 new_seq,
                 driver.attachment_id,
-                crate::brain::store::BrainRunStatus::QueuedForEnvironment,
+                crate::brain::BrainRunStatus::QueuedForEnvironment,
             )
             .unwrap();
     }
 
-    let restarted =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let restarted = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let snapshot = restarted.snapshot("shared").unwrap();
     assert_eq!(
         snapshot
             .runs
             .iter()
-            .filter(|run| {
-                run.status == crate::brain::store::BrainRunStatus::QueuedForEnvironment
-            })
+            .filter(|run| { run.status == crate::brain::BrainRunStatus::QueuedForEnvironment })
             .count(),
         2
     );
@@ -1766,7 +1755,7 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
     let server = Arc::new(
         crate::server::AgentServer::for_brain_protocol_test(
             restarted.clone(),
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([59; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([59; 32]),
             "test-password".into(),
             temp.path(),
         )
@@ -1911,11 +1900,8 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
         .iter()
         .find(|run| run.request_seq == new_seq)
         .unwrap();
-    assert_eq!(
-        old_run.status,
-        crate::brain::store::BrainRunStatus::Completed
-    );
-    assert_eq!(new_run.status, crate::brain::store::BrainRunStatus::Failed);
+    assert_eq!(old_run.status, crate::brain::BrainRunStatus::Completed);
+    assert_eq!(new_run.status, crate::brain::BrainRunStatus::Failed);
     assert_eq!(
         after_restart
             .events
@@ -1995,12 +1981,12 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
         .unwrap();
     assert_eq!(
         later.run.unwrap().status,
-        crate::brain::store::BrainRunStatus::Running
+        crate::brain::BrainRunStatus::Running
     );
     let final_snapshot = lifecycle.snapshot("shared").unwrap();
     assert!(final_snapshot.runs.iter().any(|run| {
         run.request_seq == later.accepted.seq
-            && run.status == crate::brain::store::BrainRunStatus::Failed
+            && run.status == crate::brain::BrainRunStatus::Failed
             && run.detail.as_deref() == Some("later prompt reached runner")
     }));
     assert!(lifecycle
@@ -2081,7 +2067,7 @@ fn brain_history_remains_conversation_data_not_system_text() {
         pending_schedule_dues: Vec::new(),
         effect_audits: Vec::new(),
     };
-    let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+    let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
     snapshot.events[1].run_id = Some(run_id);
     snapshot.events[2].run_id = Some(run_id);
     snapshot.events[3].run_id = Some(run_id);
@@ -2231,7 +2217,7 @@ fn brain_history_reconstructs_provider_tool_protocol() {
         pending_schedule_dues: Vec::new(),
         effect_audits: Vec::new(),
     };
-    let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+    let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
     for event in &mut snapshot.events[1..] {
         event.run_id = Some(run_id);
     }
@@ -2296,7 +2282,7 @@ fn named_brain_list_fields_expose_their_actual_semantics() {
 
 #[test]
 fn attachment_roles_bound_which_events_the_client_may_submit() {
-    use crate::brain::store::AttachmentRole;
+    use crate::brain::AttachmentRole;
 
     let prompt = BrainEventKind::Prompt {
         text: "hello".into(),
@@ -2395,7 +2381,7 @@ fn attachment_roles_bound_which_events_the_client_may_submit() {
 #[tokio::test]
 async fn approval_decision_is_durable_before_the_runner_resumes() {
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let request_seq = store
         .push(
             "shared",
@@ -2456,7 +2442,7 @@ async fn approval_decision_is_durable_before_the_runner_resumes() {
 #[tokio::test]
 async fn durable_approval_delivery_rejects_stale_and_recovers_uncertain_boundaries() {
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let request_seq = store
         .push(
             "shared",
@@ -2483,7 +2469,7 @@ async fn durable_approval_delivery_rejects_stale_and_recovers_uncertain_boundari
         .unwrap();
     let decision = serde_json::json!({"choice": "approve_once"});
     let mutation_id = uuid::Uuid::new_v4();
-    let receipt = crate::brain::store::BrainMutationReceipt {
+    let receipt = crate::brain::BrainMutationReceipt {
         mutation_id,
         attachment_id: attachment.attachment_id,
         expected_revision: snapshot.revision,
@@ -2539,11 +2525,11 @@ async fn durable_approval_delivery_rejects_stale_and_recovers_uncertain_boundari
         "stale environment consumed pending approval"
     );
 
-    let retry = |store: crate::brain::store::BrainStore,
+    let retry = |store: crate::brain::BrainStore,
                  approvals: crate::server::BrainApprovalBroker,
-                 attachment: crate::brain::store::BrainAttachment,
+                 attachment: crate::brain::BrainAttachment,
                  decision: serde_json::Value,
-                 receipt: crate::brain::store::BrainMutationReceipt| {
+                 receipt: crate::brain::BrainMutationReceipt| {
         std::thread::spawn(move || {
             commit_named_brain_approval_decision(
                 &store,
@@ -2611,7 +2597,7 @@ async fn durable_approval_delivery_rejects_stale_and_recovers_uncertain_boundari
         .unwrap()
         .seq;
     let snapshot = store.snapshot("shared").unwrap();
-    let receipt = crate::brain::store::BrainMutationReceipt {
+    let receipt = crate::brain::BrainMutationReceipt {
         mutation_id: uuid::Uuid::new_v4(),
         attachment_id: attachment.attachment_id,
         expected_revision: snapshot.revision,
@@ -2720,8 +2706,7 @@ async fn durable_approval_delivery_rejects_stale_and_recovers_uncertain_boundari
 #[tokio::test]
 async fn live_prompt_can_be_approved_while_its_turn_lane_is_held() {
     let temp = tempfile::tempdir().unwrap();
-    let store =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
     let pending = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -2856,18 +2841,18 @@ async fn live_prompt_can_be_approved_while_its_turn_lane_is_held() {
     let (request_seq, audience, expected_revision) = ready_rx.await.unwrap();
     let decision = serde_json::json!({"choice": "approve_once"});
     let mutation_id = uuid::Uuid::new_v4();
-    let receipt = crate::brain::store::BrainMutationReceipt {
+    let receipt = crate::brain::BrainMutationReceipt {
         mutation_id,
         attachment_id: driver.attachment_id,
         expected_revision,
         environment_generation: audience.environment_generation,
         command_sha256: "live-approval-decision".into(),
     };
-    let decide = |store: crate::brain::store::BrainStore,
+    let decide = |store: crate::brain::BrainStore,
                   runners: crate::server::BrainRunnerBroker,
                   approvals: crate::server::BrainApprovalBroker,
-                  driver: crate::brain::store::BrainAttachment,
-                  receipt: crate::brain::store::BrainMutationReceipt,
+                  driver: crate::brain::BrainAttachment,
+                  receipt: crate::brain::BrainMutationReceipt,
                   decision: serde_json::Value| {
         tokio::spawn(async move {
             submit_named_brain_event_with_authority_and_receipt(
@@ -2914,7 +2899,7 @@ async fn live_prompt_can_be_approved_while_its_turn_lane_is_held() {
     let prompt = prompt.unwrap().unwrap();
     assert_eq!(
         prompt.run.unwrap().status,
-        crate::brain::store::BrainRunStatus::Running
+        crate::brain::BrainRunStatus::Running
     );
     runner.await.unwrap();
 
@@ -2938,7 +2923,7 @@ async fn live_prompt_can_be_approved_while_its_turn_lane_is_held() {
             .filter(|event| matches!(
                 &event.kind,
                 BrainEventKind::MutationRecorded {
-                    outcome: crate::brain::store::BrainMutationOutcome::ApprovalDecisionDelivered {
+                    outcome: crate::brain::BrainMutationOutcome::ApprovalDecisionDelivered {
                         mutation_id: recorded, ..
                     },
                 } if *recorded == mutation_id
@@ -2953,21 +2938,21 @@ async fn live_prompt_can_be_approved_while_its_turn_lane_is_held() {
             .find(|run| run.request_seq == request_seq)
             .unwrap()
             .status,
-        crate::brain::store::BrainRunStatus::Completed,
+        crate::brain::BrainRunStatus::Completed,
     );
 }
 
 #[tokio::test]
 async fn driver_task_replacement_is_durable_without_starting_a_run() {
-    use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
+    use crate::brain::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let attachment = store
         .attach(
             "shared",
             "alice@box.local",
-            crate::brain::store::AttachmentRole::Driver,
+            crate::brain::AttachmentRole::Driver,
             None,
         )
         .unwrap();
@@ -2995,15 +2980,14 @@ async fn driver_task_replacement_is_durable_without_starting_a_run() {
     assert_eq!(store.snapshot("shared").unwrap().tasks, tasks);
     drop(store);
 
-    let restarted =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let restarted = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     assert_eq!(restarted.snapshot("shared").unwrap().tasks, tasks);
 }
 
 #[tokio::test]
 async fn wrong_attachment_cannot_consume_an_approval_decision() {
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let request_seq = store
         .push(
             "shared",
@@ -3056,7 +3040,7 @@ async fn wrong_attachment_cannot_consume_an_approval_decision() {
 #[test]
 fn final_turn_flush_deduplicates_live_approval_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let request_seq = store
         .push(
             "shared",
@@ -3182,7 +3166,7 @@ fn final_turn_flush_deduplicates_live_approval_lifecycle() {
 #[test]
 fn runner_cannot_substitute_the_daemon_selected_approval_audience() {
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let snapshot = store.snapshot("shared").unwrap();
     let requester = driver_attachment("alice@box.local");
     let expected = BrainApprovalAudience {
@@ -3226,7 +3210,7 @@ fn runner_cannot_substitute_the_daemon_selected_approval_audience() {
 
 #[test]
 fn runner_effect_journal_is_diagnostic_and_cannot_forge_audit_events() {
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let record = acknowledged_emit_effect("once");
     validate_runner_effect_journal(&[record.clone(), record.clone()]).unwrap();
     assert_eq!(
@@ -3253,7 +3237,7 @@ fn runner_effect_journal_is_diagnostic_and_cannot_forge_audit_events() {
 #[tokio::test]
 async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint() {
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let generation = store.environment().generation;
     let lease = store
         .acquire_runner_lease("shared", "console", generation, None, 60_000)
@@ -3275,10 +3259,10 @@ async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint(
         .start_run(
             "shared",
             "alice",
-            crate::brain::store::BrainRunKind::Interactive,
+            crate::brain::BrainRunKind::Interactive,
             request.seq,
             AttachmentId(uuid::Uuid::new_v4()),
-            crate::brain::store::BrainRunStatus::Running,
+            crate::brain::BrainRunStatus::Running,
         )
         .unwrap();
     let effect_record = acknowledged_emit_effect("frontend completed");
@@ -3374,8 +3358,7 @@ async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint(
 
     drop(restored);
     drop(store);
-    let restarted =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let restarted = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let restarted = restarted.snapshot("shared").unwrap();
     assert!(restarted
         .events
@@ -3390,7 +3373,7 @@ async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint(
 #[tokio::test]
 async fn named_brain_prompt_runs_the_full_turn_on_the_registered_frontend() {
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let prompt = store
         .push(
             "shared",
@@ -3406,10 +3389,10 @@ async fn named_brain_prompt_runs_the_full_turn_on_the_registered_frontend() {
         .start_run(
             "shared",
             &requester.subject,
-            crate::brain::store::BrainRunKind::Interactive,
+            crate::brain::BrainRunKind::Interactive,
             prompt_seq,
             requester.attachment_id,
-            crate::brain::store::BrainRunStatus::Running,
+            crate::brain::BrainRunStatus::Running,
         )
         .unwrap();
     let generation = store.environment().generation;
@@ -3578,7 +3561,7 @@ async fn named_brain_prompt_runs_the_full_turn_on_the_registered_frontend() {
 #[tokio::test]
 async fn failed_named_brain_turn_persists_partial_approval_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let prompt_seq = store
         .push(
             "shared",
@@ -3594,10 +3577,10 @@ async fn failed_named_brain_turn_persists_partial_approval_lifecycle() {
         .start_run(
             "shared",
             &requester.subject,
-            crate::brain::store::BrainRunKind::Interactive,
+            crate::brain::BrainRunKind::Interactive,
             prompt_seq,
             requester.attachment_id,
-            crate::brain::store::BrainRunStatus::Running,
+            crate::brain::BrainRunStatus::Running,
         )
         .unwrap();
     let lease = store
@@ -3676,8 +3659,7 @@ async fn failed_named_brain_turn_persists_partial_approval_lifecycle() {
         .any(|event| matches!(event.kind, BrainEventKind::EffectRecorded { .. })));
 
     drop(store);
-    let restarted =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let restarted = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     assert!(!restarted
         .snapshot("shared")
         .unwrap()
@@ -3688,7 +3670,7 @@ async fn failed_named_brain_turn_persists_partial_approval_lifecycle() {
 
 #[tokio::test]
 async fn named_brain_program_requires_callback_for_the_live_lease() {
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let generation = store.environment().generation;
     store
         .acquire_runner_lease("shared", "console", generation, None, 60_000)
@@ -3697,7 +3679,7 @@ async fn named_brain_program_requires_callback_for_the_live_lease() {
         &store,
         &crate::server::BrainRunnerBroker::default(),
         "shared",
-        crate::brain::store::RunId(uuid::Uuid::new_v4()),
+        crate::brain::RunId(uuid::Uuid::new_v4()),
         1,
         ProgramLanguage::Forth,
         "21 2 *",
@@ -3717,7 +3699,7 @@ async fn named_brain_program_requires_callback_for_the_live_lease() {
 
 #[tokio::test]
 async fn completed_handoff_rejects_the_previous_runner_callback() {
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let generation = store.environment().generation;
     let source = store
         .acquire_runner_lease("shared", "runner-a", generation, None, 60_000)
@@ -3743,7 +3725,7 @@ async fn completed_handoff_rejects_the_previous_runner_callback() {
         &store,
         &runners,
         "shared",
-        crate::brain::store::RunId(uuid::Uuid::new_v4()),
+        crate::brain::RunId(uuid::Uuid::new_v4()),
         1,
         ProgramLanguage::Forth,
         "21 2 *",
@@ -3759,7 +3741,7 @@ async fn completed_handoff_rejects_the_previous_runner_callback() {
 #[tokio::test]
 async fn queued_brain_run_resumes_on_runner_registration_and_survives_restart() {
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let pending = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -3784,17 +3766,17 @@ async fn queued_brain_run_resumes_on_runner_registration_and_survives_restart() 
         .start_run(
             "shared",
             &attachment.subject,
-            crate::brain::store::BrainRunKind::Interactive,
+            crate::brain::BrainRunKind::Interactive,
             request.seq,
             attachment.attachment_id,
-            crate::brain::store::BrainRunStatus::QueuedForEnvironment,
+            crate::brain::BrainRunStatus::QueuedForEnvironment,
         )
         .unwrap();
     drop(store);
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     assert_eq!(
         store.snapshot("shared").unwrap().runs[0].status,
-        crate::brain::store::BrainRunStatus::QueuedForEnvironment
+        crate::brain::BrainRunStatus::QueuedForEnvironment
     );
     let lease = store
         .acquire_runner_lease(
@@ -3855,7 +3837,7 @@ async fn queued_brain_run_resumes_on_runner_registration_and_survives_restart() 
     assert_eq!(snapshot.runs[0].run_id, run.run_id);
     assert_eq!(
         snapshot.runs[0].status,
-        crate::brain::store::BrainRunStatus::Completed
+        crate::brain::BrainRunStatus::Completed
     );
     assert!(snapshot.events.iter().any(|event| {
         matches!(
@@ -3870,17 +3852,16 @@ async fn queued_brain_run_resumes_on_runner_registration_and_survives_restart() 
     }));
 
     drop(store);
-    let restarted =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let restarted = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     assert_eq!(
         restarted.snapshot("shared").unwrap().runs[0].status,
-        crate::brain::store::BrainRunStatus::Completed
+        crate::brain::BrainRunStatus::Completed
     );
 }
 
 #[tokio::test]
 async fn queued_brain_run_stays_queued_without_the_registered_lease() {
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let attachment = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -3898,10 +3879,10 @@ async fn queued_brain_run_stays_queued_without_the_registered_lease() {
         .start_run(
             "shared",
             &attachment.subject,
-            crate::brain::store::BrainRunKind::Interactive,
+            crate::brain::BrainRunKind::Interactive,
             request.seq,
             attachment.attachment_id,
-            crate::brain::store::BrainRunStatus::QueuedForEnvironment,
+            crate::brain::BrainRunStatus::QueuedForEnvironment,
         )
         .unwrap();
     let lease = store
@@ -3927,7 +3908,7 @@ async fn queued_brain_run_stays_queued_without_the_registered_lease() {
     );
     assert_eq!(
         store.snapshot("shared").unwrap().runs[0].status,
-        crate::brain::store::BrainRunStatus::QueuedForEnvironment
+        crate::brain::BrainRunStatus::QueuedForEnvironment
     );
     assert!(!store
         .snapshot("shared")
@@ -3940,7 +3921,7 @@ async fn queued_brain_run_stays_queued_without_the_registered_lease() {
 #[tokio::test]
 async fn due_schedule_survives_offline_restart_and_executes_on_runner_registration() {
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let attachment = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -3954,7 +3935,7 @@ async fn due_schedule_survives_offline_restart_and_executes_on_runner_registrati
             crate::vm::EffectSet::pure(),
             1_000,
             None,
-            crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
+            crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
         )
         .unwrap();
 
@@ -3971,11 +3952,11 @@ async fn due_schedule_survives_offline_restart_and_executes_on_runner_registrati
     );
     assert_eq!(
         store.snapshot("shared").unwrap().runs[0].status,
-        crate::brain::store::BrainRunStatus::QueuedForEnvironment
+        crate::brain::BrainRunStatus::QueuedForEnvironment
     );
 
     drop(store);
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     let lease = store
         .acquire_runner_lease(
             "shared",
@@ -4044,7 +4025,7 @@ async fn due_schedule_survives_offline_restart_and_executes_on_runner_registrati
     assert_eq!(snapshot.runs.len(), 1);
     assert_eq!(
         snapshot.runs[0].status,
-        crate::brain::store::BrainRunStatus::Completed
+        crate::brain::BrainRunStatus::Completed
     );
     let due_seq = snapshot
         .events
@@ -4071,8 +4052,8 @@ async fn due_schedule_survives_offline_restart_and_executes_on_runner_registrati
 // duplicates of them drifted apart once already, and a boundary test that
 // seeds a Brain differently from the store tests is not testing the same
 // Brain.
-use crate::brain::store::directory_listing_for_tests as directory_listing;
-use crate::brain::store::seed_scheduled_brain_for_tests as seed_scheduled_brain;
+use crate::brain::directory_listing_for_tests as directory_listing;
+use crate::brain::seed_scheduled_brain_for_tests as seed_scheduled_brain;
 
 #[tokio::test]
 async fn deleted_brain_is_pruned_at_the_delivery_boundary_and_not_resurrected() {
@@ -4093,7 +4074,7 @@ async fn deleted_brain_is_pruned_at_the_delivery_boundary_and_not_resurrected() 
     // So the property is asserted here, at the boundary the daemon actually
     // calls, over one pass in the delivery loop's own shape.
     let temp = tempfile::tempdir().unwrap();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
     seed_scheduled_brain(&store, "vanished", 1_000);
     seed_scheduled_brain(&store, "survivor", 1_200);
     let survivor_id = store.snapshot("survivor").unwrap().brain_id;
@@ -4212,7 +4193,7 @@ async fn deleted_brain_is_pruned_at_the_delivery_boundary_and_not_resurrected() 
 
 #[tokio::test]
 async fn runner_failure_is_a_durable_failed_run_and_correlated_result() {
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let attachment = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -4230,10 +4211,10 @@ async fn runner_failure_is_a_durable_failed_run_and_correlated_result() {
         .start_run(
             "shared",
             &attachment.subject,
-            crate::brain::store::BrainRunKind::Interactive,
+            crate::brain::BrainRunKind::Interactive,
             request.seq,
             attachment.attachment_id,
-            crate::brain::store::BrainRunStatus::Running,
+            crate::brain::BrainRunStatus::Running,
         )
         .unwrap();
     let lease = store
@@ -4276,7 +4257,7 @@ async fn runner_failure_is_a_durable_failed_run_and_correlated_result() {
             && error.as_deref() == Some("frontend execution failed")
     ));
     let failed = &store.snapshot("shared").unwrap().runs[0];
-    assert_eq!(failed.status, crate::brain::store::BrainRunStatus::Failed);
+    assert_eq!(failed.status, crate::brain::BrainRunStatus::Failed);
     assert_eq!(failed.detail.as_deref(), Some("frontend execution failed"));
     assert!(!store
         .snapshot("shared")
@@ -4289,8 +4270,7 @@ async fn runner_failure_is_a_durable_failed_run_and_correlated_result() {
 #[tokio::test]
 async fn transport_neutral_submission_enforces_roles_and_creates_one_queued_run() {
     let temp = tempfile::tempdir().unwrap();
-    let store =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
     let runners = crate::server::BrainRunnerBroker::default();
     let approvals = crate::server::BrainApprovalBroker::default();
     let pending = store
@@ -4322,7 +4302,7 @@ async fn transport_neutral_submission_enforces_roles_and_creates_one_queued_run(
     assert_eq!(run.request_seq, outcome.accepted.seq);
     assert_eq!(
         run.status,
-        crate::brain::store::BrainRunStatus::QueuedForEnvironment
+        crate::brain::BrainRunStatus::QueuedForEnvironment
     );
     assert!(outcome.result.is_none());
     assert_eq!(store.snapshot("shared").unwrap().runs.len(), 1);
@@ -4365,8 +4345,7 @@ async fn transport_neutral_submission_enforces_roles_and_creates_one_queued_run(
 #[tokio::test]
 async fn speculative_prompt_is_sent_once_and_only_its_correlated_transcript_is_hidden_later() {
     let temp = tempfile::tempdir().unwrap();
-    let store =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
     let pending = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -4511,7 +4490,7 @@ async fn speculative_prompt_is_sent_once_and_only_its_correlated_transcript_is_h
             "shared",
             "daemon",
             queued.run_id,
-            crate::brain::store::BrainRunStatus::Running,
+            crate::brain::BrainRunStatus::Running,
             None,
         )
         .unwrap();
@@ -4536,8 +4515,7 @@ async fn speculative_prompt_is_sent_once_and_only_its_correlated_transcript_is_h
 #[tokio::test]
 async fn v13_completed_speculative_restart_backfills_context_isolation_end_to_end() {
     let temp = tempfile::tempdir().unwrap();
-    let store =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
     let original = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -4554,7 +4532,7 @@ async fn v13_completed_speculative_restart_backfills_context_isolation_end_to_en
             "shared",
             "daemon",
             queued.run_id,
-            crate::brain::store::BrainRunStatus::Running,
+            crate::brain::BrainRunStatus::Running,
             None,
         )
         .unwrap();
@@ -4623,7 +4601,7 @@ async fn v13_completed_speculative_restart_backfills_context_isolation_end_to_en
             "shared",
             "daemon",
             queued.run_id,
-            crate::brain::store::BrainRunStatus::Completed,
+            crate::brain::BrainRunStatus::Completed,
             None,
         )
         .unwrap();
@@ -4644,7 +4622,7 @@ async fn v13_completed_speculative_restart_backfills_context_isolation_end_to_en
     std::fs::write(&path, format!("{legacy}\n")).unwrap();
 
     let restarted =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
+        crate::brain::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
     let snapshot = restarted.snapshot("shared").unwrap();
     assert!(snapshot.events.iter().any(|event| {
         event.run_id == Some(queued.run_id) && matches!(event.kind, BrainEventKind::Result { .. })
@@ -4729,8 +4707,7 @@ async fn v13_completed_speculative_restart_backfills_context_isolation_end_to_en
 #[tokio::test]
 async fn daemon_projects_memory_only_after_the_successful_turn_is_committed() {
     let temp = tempfile::tempdir().unwrap();
-    let store =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
     let pending = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -4831,7 +4808,7 @@ async fn daemon_projects_memory_only_after_the_successful_turn_is_committed() {
                 .find(|run| run.run_id == run_id)
                 .unwrap()
                 .status,
-            crate::brain::store::BrainRunStatus::Completed
+            crate::brain::BrainRunStatus::Completed
         );
         assert!(snapshot.events.iter().any(|event| {
             matches!(
@@ -4848,13 +4825,10 @@ async fn daemon_projects_memory_only_after_the_successful_turn_is_committed() {
             .recv()
             .await
             .expect("daemon must acknowledge commit");
-        assert_eq!(
-            notice.status,
-            crate::brain::store::BrainRunStatus::Completed
-        );
+        assert_eq!(notice.status, crate::brain::BrainRunStatus::Completed);
         assert_eq!(
             callback_store.inspect_run("shared", run_id).unwrap().status,
-            crate::brain::store::BrainRunStatus::Completed
+            crate::brain::BrainRunStatus::Completed
         );
     });
 
@@ -4872,7 +4846,7 @@ async fn daemon_projects_memory_only_after_the_successful_turn_is_committed() {
     .unwrap();
     assert_eq!(
         outcome.run.unwrap().status,
-        crate::brain::store::BrainRunStatus::Running
+        crate::brain::BrainRunStatus::Running
     );
     assert!(matches!(
         outcome.result.unwrap().kind,
@@ -4883,7 +4857,7 @@ async fn daemon_projects_memory_only_after_the_successful_turn_is_committed() {
 
 #[tokio::test]
 async fn runner_registration_can_replay_committed_memory_idempotently() {
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let driver = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -4900,10 +4874,10 @@ async fn runner_registration_can_replay_committed_memory_idempotently() {
         .start_run(
             "shared",
             &driver.subject,
-            crate::brain::store::BrainRunKind::Interactive,
+            crate::brain::BrainRunKind::Interactive,
             prompt.seq,
             driver.attachment_id,
-            crate::brain::store::BrainRunStatus::Running,
+            crate::brain::BrainRunStatus::Running,
         )
         .unwrap();
     let program = store
@@ -4932,7 +4906,7 @@ async fn runner_registration_can_replay_committed_memory_idempotently() {
             "shared",
             "daemon",
             run.run_id,
-            crate::brain::store::BrainRunStatus::Completed,
+            crate::brain::BrainRunStatus::Completed,
             None,
         )
         .unwrap();
@@ -4986,9 +4960,9 @@ async fn runner_registration_can_replay_committed_memory_idempotently() {
 /// Seed `count` completed runs whose rendered output is `out {i}` and
 /// whose program source is `(say "out {i}")`, then take a runner lease.
 fn seed_completed_brain_runs(
-    store: &crate::brain::store::BrainStore,
+    store: &crate::brain::BrainStore,
     count: usize,
-) -> crate::brain::store::BrainRunnerLease {
+) -> crate::brain::BrainRunnerLease {
     let driver = store
         .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
         .unwrap();
@@ -5006,10 +4980,10 @@ fn seed_completed_brain_runs(
             .start_run(
                 "shared",
                 &driver.subject,
-                crate::brain::store::BrainRunKind::Interactive,
+                crate::brain::BrainRunKind::Interactive,
                 prompt.seq,
                 driver.attachment_id,
-                crate::brain::store::BrainRunStatus::Running,
+                crate::brain::BrainRunStatus::Running,
             )
             .unwrap();
         let program = store
@@ -5038,7 +5012,7 @@ fn seed_completed_brain_runs(
                 "shared",
                 "daemon",
                 run.run_id,
-                crate::brain::store::BrainRunStatus::Completed,
+                crate::brain::BrainRunStatus::Completed,
                 None,
             )
             .unwrap();
@@ -5061,7 +5035,7 @@ async fn replay_skips_one_unprojectable_run_and_continues() {
     // rendered output is rejected as conflicting content. Aborting the loop
     // on that skipped every later completed run in the Brain too — on every
     // reconnect, forever.
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let lease = seed_completed_brain_runs(&store, 2);
     let runners = crate::server::BrainRunnerBroker::default();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5118,7 +5092,7 @@ async fn replay_aborts_when_the_runner_is_unavailable() {
     // remaining run, so continuing costs one full IPC round trip and one log
     // line per completed run, under the execution lock this function holds,
     // with nothing to gain. It must abort at the first one.
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let lease = seed_completed_brain_runs(&store, 4);
     let runners = crate::server::BrainRunnerBroker::default();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5171,7 +5145,7 @@ async fn replay_aborts_when_the_runner_declares_a_systemic_condition() {
     // per-turn and the pass paid a full IPC round trip and a log line for
     // every completed run in the Brain, under the execution lock, with
     // nothing to gain.
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let lease = seed_completed_brain_runs(&store, 6);
     let runners = crate::server::BrainRunnerBroker::default();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5220,7 +5194,7 @@ async fn replay_aborts_when_the_runner_declares_a_systemic_condition() {
 
 #[tokio::test]
 async fn participant_message_is_durable_context_without_creating_a_run() {
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let runners = crate::server::BrainRunnerBroker::default();
     let approvals = crate::server::BrainApprovalBroker::default();
     let consultant = store
@@ -5306,7 +5280,7 @@ async fn participant_message_is_durable_context_without_creating_a_run() {
 // the endpoint, and reverting the handler left the whole suite green.
 // A store-level test of `count_unhydrated` has exactly that shape.
 
-use crate::brain::store::BrainStore;
+use crate::brain::BrainStore;
 
 /// A server state root whose `brains/` holds `count` genuinely loadable
 /// Brains, plus optionally one whose event log defeats the loader.
@@ -5349,7 +5323,7 @@ fn health_probe_server(state: &std::path::Path) -> Arc<crate::server::AgentServe
     Arc::new(
         crate::server::AgentServer::for_brain_protocol_test(
             store,
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([61; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([61; 32]),
             "test-password".into(),
             state,
         )

@@ -1191,10 +1191,7 @@ async fn main() -> Result<()> {
     // One name identifies the actual home Brain. Explicit names attach by name;
     // generated names include a short uniqueness suffix so a new console cannot
     // silently inherit an old Brain's memory and event history.
-    let brain_name = args
-        .brain
-        .clone()
-        .unwrap_or_else(finch::brain::names::generate);
+    let brain_name = args.brain.clone().unwrap_or_else(finch::brain::generate);
 
     let mut repl = {
         let _phase = finch::startup::phase(finch::startup::PHASE_REPL_NEW);
@@ -3251,7 +3248,7 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
 
 /// Handle `finch brain` subcommands against the default on-disk store.
 fn run_brain_command(cmd: BrainCommand) -> Result<()> {
-    let store = finch::brain::store::BrainStore::new("cli");
+    let store = finch::brain::BrainStore::new("cli");
     let daemon_running = if matches!(cmd, BrainCommand::Rm { .. }) {
         finch::daemon::DaemonLifecycle::new()?.is_running()
     } else {
@@ -3262,7 +3259,7 @@ fn run_brain_command(cmd: BrainCommand) -> Result<()> {
 
 fn execute_brain_command(
     cmd: BrainCommand,
-    store: &finch::brain::store::BrainStore,
+    store: &finch::brain::BrainStore,
     daemon_running: bool,
     out: &mut impl Write,
 ) -> Result<()> {
@@ -3273,7 +3270,7 @@ fn execute_brain_command(
 }
 
 fn list_named_brains(
-    store: &finch::brain::store::BrainStore,
+    store: &finch::brain::BrainStore,
     json: bool,
     out: &mut impl Write,
 ) -> Result<()> {
@@ -3320,12 +3317,12 @@ fn format_brain_bytes(bytes: u64) -> String {
 }
 
 fn remove_named_brain(
-    store: &finch::brain::store::BrainStore,
+    store: &finch::brain::BrainStore,
     name: &str,
     daemon_running: bool,
     out: &mut impl Write,
 ) -> Result<()> {
-    let name = finch::brain::store::BrainStore::validate_name(name)?.to_string();
+    let name = finch::brain::BrainStore::validate_name(name)?.to_string();
     if !store.list_names_unhydrated().contains(&name) {
         anyhow::bail!("brain '{name}' not found");
     }
@@ -3732,15 +3729,15 @@ mod tests {
         );
     }
 
-    fn isolated_brain_store() -> (tempfile::TempDir, finch::brain::store::BrainStore) {
+    fn isolated_brain_store() -> (tempfile::TempDir, finch::brain::BrainStore) {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("brains");
         std::fs::create_dir_all(&root).expect("create brains root");
-        let store = finch::brain::store::BrainStore::with_root("cli-test", Some(root));
+        let store = finch::brain::BrainStore::with_root("cli-test", Some(root));
         (temp, store)
     }
 
-    fn plant_unhydrated_brain(store: &finch::brain::store::BrainStore, name: &str) {
+    fn plant_unhydrated_brain(store: &finch::brain::BrainStore, name: &str) {
         let root = store.root().expect("on-disk store");
         std::fs::create_dir_all(root.join(name)).expect("plant Brain directory");
     }
@@ -3837,12 +3834,12 @@ mod tests {
     fn brain_ls_json_reports_turns_size_attachments_and_live_agents() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("brains");
-        let writer = finch::brain::store::BrainStore::with_root("cli-test", Some(root.clone()));
+        let writer = finch::brain::BrainStore::with_root("cli-test", Some(root.clone()));
         writer
             .push(
                 "busy-brain",
                 "alice",
-                finch::brain::store::BrainEventKind::Prompt {
+                finch::brain::BrainEventKind::Prompt {
                     text: "hello".into(),
                 },
             )
@@ -3851,7 +3848,7 @@ mod tests {
             .push(
                 "busy-brain",
                 "alice",
-                finch::brain::store::BrainEventKind::Prompt {
+                finch::brain::BrainEventKind::Prompt {
                     text: "again".into(),
                 },
             )
@@ -3862,7 +3859,7 @@ mod tests {
             .attach(
                 "busy-brain",
                 "alice@box.local",
-                finch::brain::store::AttachmentRole::Driver,
+                finch::brain::AttachmentRole::Driver,
                 None,
             )
             .expect("attach");
@@ -3877,14 +3874,14 @@ mod tests {
             .start_run(
                 "busy-brain",
                 "alice@box.local",
-                finch::brain::store::BrainRunKind::Subagent,
+                finch::brain::BrainRunKind::Subagent,
                 prompt_seq,
                 attachment.attachment_id,
-                finch::brain::store::BrainRunStatus::Running,
+                finch::brain::BrainRunStatus::Running,
             )
             .expect("start subagent");
 
-        let store = finch::brain::store::BrainStore::with_root("cli-test", Some(root));
+        let store = finch::brain::BrainStore::with_root("cli-test", Some(root));
 
         let mut out = Vec::new();
         execute_brain_command(BrainCommand::Ls { json: true }, &store, false, &mut out)

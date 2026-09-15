@@ -238,7 +238,7 @@ impl TodoJournalReceiver {
 /// Frontend-local selector for the Brain that owns model-facing task writes.
 pub struct TodoJournalTarget { … }
 impl TodoJournalTarget {
-    pub fn set(&self, selected: Option<crate::brain::remote::AttachedBrainClient>);
+    pub fn set(&self, selected: Option<crate::brain::AttachedBrainClient>);
 }
 /// Send-safe model-tool endpoint for the frontend-local Brain journal worker.
 pub struct TodoJournalWriter { … }

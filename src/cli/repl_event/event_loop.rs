@@ -171,7 +171,7 @@ enum BrainAttachmentRoute {
         brain: String,
     },
     RemoteInvitation {
-        target: crate::brain::remote::RemoteBrainTarget,
+        target: crate::brain::RemoteBrainTarget,
         invitation: String,
     },
 }
@@ -182,7 +182,7 @@ fn brain_attachment_route(value: &str, invitation: Option<String>) -> Result<Bra
             "remote Brain attachments require `/brain join NAME@MACHINE[:PORT] INVITE`; use `/brain attach NAME` for a Brain on this daemon",
         )?;
         return Ok(BrainAttachmentRoute::RemoteInvitation {
-            target: crate::brain::remote::RemoteBrainTarget::parse(value)?,
+            target: crate::brain::RemoteBrainTarget::parse(value)?,
             invitation,
         });
     }
@@ -190,7 +190,7 @@ fn brain_attachment_route(value: &str, invitation: Option<String>) -> Result<Bra
         invitation.is_none(),
         "Brain invitation targets must include NAME@MACHINE[:PORT]"
     );
-    crate::brain::store::BrainStore::validate_name(value)?;
+    crate::brain::BrainStore::validate_name(value)?;
     Ok(BrainAttachmentRoute::LocalIpc {
         brain: value.to_string(),
     })
@@ -285,7 +285,7 @@ pub struct EventLoop {
 
     /// Cancellation controls for typed programs delegated by the Brain daemon.
     pending_named_brain_programs:
-        std::collections::HashMap<crate::brain::store::RunId, tokio_util::sync::CancellationToken>,
+        std::collections::HashMap<crate::brain::RunId, tokio_util::sync::CancellationToken>,
 
     /// Source/output already rendered while this frontend serviced its home
     /// Brain callback. Matching canonical events advance this marker without
@@ -296,7 +296,7 @@ pub struct EventLoop {
     /// projection for each Brain. A watch snapshot and its buffered live tail
     /// can overlap; suppress that overlap here without changing the durable
     /// event log or hiding later lifecycle transitions.
-    brain_projection_revisions: std::collections::HashMap<crate::brain::store::BrainId, u64>,
+    brain_projection_revisions: std::collections::HashMap<crate::brain::BrainId, u64>,
 
     /// Canonical tool calls replay into one grouped unit per Brain turn.
     remote_brain_tool_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
@@ -304,7 +304,7 @@ pub struct EventLoop {
     /// one RunId update this same selectable work unit instead of rendering as
     /// unrelated flat messages.
     remote_brain_run_units:
-        std::collections::HashMap<crate::brain::store::RunId, RemoteBrainRunProjection>,
+        std::collections::HashMap<crate::brain::RunId, RemoteBrainRunProjection>,
     remote_brain_tool_rows: std::collections::HashMap<String, usize>,
     remote_brain_approval_rows: std::collections::HashMap<String, usize>,
     queued_remote_brain_approvals: std::collections::VecDeque<RemoteBrainApproval>,
@@ -406,17 +406,17 @@ pub struct EventLoop {
 
     /// Explicit destination for prompts and VM programs while attached.
     /// This is singular by design: host effects are never broadcast.
-    active_remote_brain: Option<crate::brain::remote::AttachedBrainClient>,
+    active_remote_brain: Option<crate::brain::AttachedBrainClient>,
 
     /// Durable attachment to this console's home Brain. Ordinary input uses
     /// this attachment whenever no foreign Brain is selected, so the runner
     /// console and remote drivers project the same canonical event log.
-    home_brain: Option<crate::brain::remote::AttachedBrainClient>,
+    home_brain: Option<crate::brain::AttachedBrainClient>,
 
     /// Whether this frontend currently holds the daemon-issued lease for its
     /// home Brain. The UI never infers runner status from local process role.
     home_runner_lease_active: bool,
-    home_runner_lease_id: Option<crate::brain::store::RunnerLeaseId>,
+    home_runner_lease_id: Option<crate::brain::RunnerLeaseId>,
     /// Exact durable runner target, retained while its callback is offline.
     runner_reconnect_target: Option<RunnerReconnectTarget>,
     /// Exact Brain currently served by this frontend's ProgramRuntime. This
@@ -567,7 +567,7 @@ fn finch_addressed_prompt(input: &str) -> Option<&str> {
     (!prompt.is_empty()).then_some(prompt)
 }
 
-fn approval_audience_summary(audience: &crate::brain::store::BrainApprovalAudience) -> String {
+fn approval_audience_summary(audience: &crate::brain::BrainApprovalAudience) -> String {
     format!(
         "Brain: {} ({})\nApproval audience: {} ({:?}, attachment {})\nEnvironment generation: {}",
         audience.brain,
@@ -595,7 +595,7 @@ fn vm_approval_choices(prompt: &crate::vm::ApprovalPrompt) -> Vec<crate::vm::App
 
 fn vm_approval_dialog(
     prompt: &crate::vm::ApprovalPrompt,
-    audience: Option<&crate::brain::store::BrainApprovalAudience>,
+    audience: Option<&crate::brain::BrainApprovalAudience>,
     runtime: &crate::runtime::ProgramRuntime,
 ) -> crate::cli::tui::Dialog {
     use crate::cli::tui::{Dialog, DialogOption};
@@ -669,7 +669,7 @@ struct DeferredVmApproval {
 
 struct PendingNamedBrainTurn {
     brain: String,
-    run_id: crate::brain::store::RunId,
+    run_id: crate::brain::RunId,
     response_tx: tokio::sync::oneshot::Sender<
         std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
     >,
@@ -687,7 +687,7 @@ struct PendingNamedBrainTurn {
     /// this set is empty so late physical outcomes can be audited without
     /// publishing their ToolResult into conversation history.
     active_tool_ids: std::collections::HashSet<String>,
-    approval_audience: crate::brain::store::BrainApprovalAudience,
+    approval_audience: crate::brain::BrainApprovalAudience,
     approval_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>>,
     /// Daemon-issued authority retained for the whole provider/tool loop.
     /// Query metadata carries a clone to each submitted ProgramRun.
@@ -737,7 +737,7 @@ async fn resume_named_brain_program_boundaries(
     runtime: &crate::runtime::ProgramRuntime,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     control_tx: Option<mpsc::UnboundedSender<crate::server::RunnerProgramControlRequest>>,
-    language: crate::brain::store::ProgramLanguage,
+    language: crate::brain::ProgramLanguage,
     interaction: crate::server::RunnerProgramInteraction,
     fixed_grant_ceiling: Option<crate::vm::EffectSet>,
     effects: std::sync::mpsc::Receiver<crate::runtime::VmEffectEnvelope>,
@@ -821,7 +821,7 @@ async fn resume_named_brain_program_boundaries(
 async fn execute_named_brain_schedule_effect(
     runtime: &crate::runtime::ProgramRuntime,
     control_tx: &mpsc::UnboundedSender<crate::server::RunnerProgramControlRequest>,
-    language: crate::brain::store::ProgramLanguage,
+    language: crate::brain::ProgramLanguage,
     fixed_grant_ceiling: Option<&crate::vm::EffectSet>,
     effect: &crate::vm::VmSideEffect,
 ) -> anyhow::Result<Vec<crate::vm::TypedValue>> {
@@ -853,7 +853,7 @@ async fn execute_named_brain_schedule_effect(
                     grant_ceiling,
                     next_due_ms,
                     interval_ms: None,
-                    delivery_policy: crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
+                    delivery_policy: crate::brain::BrainScheduleDeliveryPolicy::Coalesce,
                     response_tx,
                 })
                 .map_err(|_| anyhow::anyhow!("named Brain schedule control disconnected"))?;
@@ -887,8 +887,8 @@ async fn execute_named_brain_schedule_effect(
                     "id": schedule.schedule_id.0,
                     "created_by": schedule.created_by,
                     "language": match schedule.language {
-                        crate::brain::store::ProgramLanguage::Forth => "forth",
-                        crate::brain::store::ProgramLanguage::Lisp => "lisp",
+                        crate::brain::ProgramLanguage::Forth => "forth",
+                        crate::brain::ProgramLanguage::Lisp => "lisp",
                     },
                     "next_due_ms": schedule.next_due_ms,
                     "interval_ms": schedule.interval_ms,
@@ -922,22 +922,20 @@ async fn execute_named_brain_schedule_effect(
 
 fn schedule_id_argument(
     arguments: &[crate::vm::TypedValue],
-) -> anyhow::Result<crate::brain::store::ScheduleId> {
+) -> anyhow::Result<crate::brain::ScheduleId> {
     let [crate::vm::TypedValue::Resource { kind, handle, .. }] = arguments else {
         anyhow::bail!("schedule operation requires one schedule resource");
     };
     anyhow::ensure!(kind == "schedule", "resource is not a schedule");
-    Ok(crate::brain::store::ScheduleId(uuid::Uuid::parse_str(
-        handle,
-    )?))
+    Ok(crate::brain::ScheduleId(uuid::Uuid::parse_str(handle)?))
 }
 
 #[derive(Clone)]
 struct RemoteBrainApproval {
-    client: crate::brain::remote::AttachedBrainClient,
+    client: crate::brain::AttachedBrainClient,
     request_seq: u64,
     approval_id: String,
-    audience: crate::brain::store::BrainApprovalAudience,
+    audience: crate::brain::BrainApprovalAudience,
     kind: RemoteBrainApprovalKind,
 }
 
@@ -977,8 +975,8 @@ struct RemoteBrainRunProjection {
 }
 
 fn brain_run_group_label(
-    run_id: crate::brain::store::RunId,
-    kind: Option<crate::brain::store::BrainRunKind>,
+    run_id: crate::brain::RunId,
+    kind: Option<crate::brain::BrainRunKind>,
 ) -> String {
     kind.map(|kind| format!("{kind:?} run {}", run_id.0))
         .unwrap_or_else(|| format!("Brain run {}", run_id.0))
@@ -986,13 +984,10 @@ fn brain_run_group_label(
 
 fn ensure_remote_brain_run_projection<'a>(
     output_manager: &crate::cli::output_manager::OutputManager,
-    projections: &'a mut std::collections::HashMap<
-        crate::brain::store::RunId,
-        RemoteBrainRunProjection,
-    >,
-    run_id: crate::brain::store::RunId,
-    kind: Option<crate::brain::store::BrainRunKind>,
-    status: crate::brain::store::BrainRunStatus,
+    projections: &'a mut std::collections::HashMap<crate::brain::RunId, RemoteBrainRunProjection>,
+    run_id: crate::brain::RunId,
+    kind: Option<crate::brain::BrainRunKind>,
+    status: crate::brain::BrainRunStatus,
 ) -> &'a mut RemoteBrainRunProjection {
     projections.entry(run_id).or_insert_with(|| {
         let label = brain_run_group_label(run_id, kind);
@@ -1023,13 +1018,10 @@ fn ensure_remote_brain_run_projection<'a>(
 /// strips durable run contents from the shadow buffer.
 fn project_remote_brain_run_event(
     output_manager: &crate::cli::output_manager::OutputManager,
-    projections: &mut std::collections::HashMap<
-        crate::brain::store::RunId,
-        RemoteBrainRunProjection,
-    >,
-    event: &crate::brain::store::BrainEvent,
+    projections: &mut std::collections::HashMap<crate::brain::RunId, RemoteBrainRunProjection>,
+    event: &crate::brain::BrainEvent,
 ) -> bool {
-    use crate::brain::store::{BrainEventKind, BrainRunKind, BrainRunStatus, ProgramLanguage};
+    use crate::brain::{BrainEventKind, BrainRunKind, BrainRunStatus, ProgramLanguage};
 
     let Some(run_id) = event.run_id else {
         return false;
@@ -1234,7 +1226,7 @@ fn project_remote_brain_run_event(
 }
 
 struct LocalBrainProjection {
-    run_id: crate::brain::store::RunId,
+    run_id: crate::brain::RunId,
     source: String,
     output: String,
     tool_ids: std::collections::HashSet<String>,
@@ -1245,7 +1237,7 @@ struct LocalBrainProjection {
 }
 
 fn failed_local_brain_projection(
-    run_id: crate::brain::store::RunId,
+    run_id: crate::brain::RunId,
     turn_events: &[crate::server::RunnerTurnEvent],
     transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
 ) -> LocalBrainProjection {
@@ -1281,7 +1273,7 @@ fn failed_local_brain_projection(
 
 fn register_named_brain_turn_projection(
     projections: &mut std::collections::VecDeque<LocalBrainProjection>,
-    run_id: crate::brain::store::RunId,
+    run_id: crate::brain::RunId,
     result: &std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
     transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
 ) {
@@ -1333,7 +1325,7 @@ fn named_brain_wire_source(
     initial_message_count: usize,
 ) -> anyhow::Result<(
     String,
-    crate::brain::store::ProgramLanguage,
+    crate::brain::ProgramLanguage,
     Vec<crate::claude::Message>,
 )> {
     anyhow::ensure!(
@@ -1362,8 +1354,8 @@ fn named_brain_wire_source(
         "named Brain turn produced no wire source"
     );
     let language = match crate::programs::ProgramLanguage::infer_wire_source(&source)? {
-        crate::programs::ProgramLanguage::Forth => crate::brain::store::ProgramLanguage::Forth,
-        crate::programs::ProgramLanguage::Lisp => crate::brain::store::ProgramLanguage::Lisp,
+        crate::programs::ProgramLanguage::Forth => crate::brain::ProgramLanguage::Forth,
+        crate::programs::ProgramLanguage::Lisp => crate::brain::ProgramLanguage::Lisp,
     };
     Ok((source, language, continuation_messages))
 }
@@ -1371,7 +1363,7 @@ fn named_brain_wire_source(
 #[allow(clippy::too_many_arguments)]
 fn assemble_named_brain_turn(
     projections: &mut std::collections::VecDeque<LocalBrainProjection>,
-    run_id: crate::brain::store::RunId,
+    run_id: crate::brain::RunId,
     messages: anyhow::Result<Vec<crate::claude::Message>>,
     program_runtime: &crate::runtime::ProgramRuntime,
     output: String,
@@ -1424,24 +1416,24 @@ enum LocalProjectionMatch {
 }
 
 impl LocalBrainProjection {
-    fn observe(&mut self, event: &crate::brain::store::BrainEvent) -> LocalProjectionMatch {
+    fn observe(&mut self, event: &crate::brain::BrainEvent) -> LocalProjectionMatch {
         if event.run_id != Some(self.run_id) {
             return LocalProjectionMatch::None;
         }
         match &event.kind {
-            crate::brain::store::BrainEventKind::ToolCall { tool_id, .. }
-            | crate::brain::store::BrainEventKind::ToolResult { tool_id, .. }
+            crate::brain::BrainEventKind::ToolCall { tool_id, .. }
+            | crate::brain::BrainEventKind::ToolResult { tool_id, .. }
                 if self.tool_ids.contains(tool_id) =>
             {
                 LocalProjectionMatch::Suppress
             }
-            crate::brain::store::BrainEventKind::ApprovalRequested { approval_id, .. }
-            | crate::brain::store::BrainEventKind::ApprovalDecided { approval_id, .. }
+            crate::brain::BrainEventKind::ApprovalRequested { approval_id, .. }
+            | crate::brain::BrainEventKind::ApprovalDecided { approval_id, .. }
                 if self.approval_ids.contains(approval_id) =>
             {
                 LocalProjectionMatch::Suppress
             }
-            crate::brain::store::BrainEventKind::Program { source, .. }
+            crate::brain::BrainEventKind::Program { source, .. }
                 if event.sender == "provider"
                     && self.program_seq.is_none()
                     && self.source == *source =>
@@ -1449,7 +1441,7 @@ impl LocalBrainProjection {
                 self.program_seq = Some(event.seq);
                 LocalProjectionMatch::Suppress
             }
-            crate::brain::store::BrainEventKind::Result {
+            crate::brain::BrainEventKind::Result {
                 request_seq,
                 output,
                 error,
@@ -1460,7 +1452,7 @@ impl LocalBrainProjection {
             {
                 LocalProjectionMatch::SuppressAndComplete
             }
-            crate::brain::store::BrainEventKind::Result { error: Some(_), .. } if self.failed => {
+            crate::brain::BrainEventKind::Result { error: Some(_), .. } if self.failed => {
                 LocalProjectionMatch::SuppressAndComplete
             }
             _ => LocalProjectionMatch::None,
@@ -1470,13 +1462,10 @@ impl LocalBrainProjection {
 
 fn project_remote_brain_live_run_event(
     output_manager: &crate::cli::output_manager::OutputManager,
-    projections: &mut std::collections::HashMap<
-        crate::brain::store::RunId,
-        RemoteBrainRunProjection,
-    >,
+    projections: &mut std::collections::HashMap<crate::brain::RunId, RemoteBrainRunProjection>,
     local_projections: &mut std::collections::VecDeque<LocalBrainProjection>,
     selected_brain_is_home: bool,
-    event: &crate::brain::store::BrainEvent,
+    event: &crate::brain::BrainEvent,
 ) -> bool {
     if event.run_id.is_none() {
         return false;
@@ -1489,17 +1478,17 @@ fn project_remote_brain_live_run_event(
     if projection_match != LocalProjectionMatch::None {
         if let Some(projection) = projections.get_mut(&event.run_id.expect("checked above")) {
             match &event.kind {
-                crate::brain::store::BrainEventKind::ToolCall { tool_id, .. }
-                | crate::brain::store::BrainEventKind::ToolResult { tool_id, .. } => {
+                crate::brain::BrainEventKind::ToolCall { tool_id, .. }
+                | crate::brain::BrainEventKind::ToolResult { tool_id, .. } => {
                     projection.locally_rendered_tool_ids.insert(tool_id.clone());
                 }
-                crate::brain::store::BrainEventKind::ApprovalRequested { approval_id, .. }
-                | crate::brain::store::BrainEventKind::ApprovalDecided { approval_id, .. } => {
+                crate::brain::BrainEventKind::ApprovalRequested { approval_id, .. }
+                | crate::brain::BrainEventKind::ApprovalDecided { approval_id, .. } => {
                     projection
                         .locally_rendered_approval_ids
                         .insert(approval_id.clone());
                 }
-                crate::brain::store::BrainEventKind::Program { .. } => {
+                crate::brain::BrainEventKind::Program { .. } => {
                     projection.locally_rendered_program = true;
                 }
                 _ => {}
@@ -2512,7 +2501,7 @@ impl EventLoop {
                                 let event_tx = self.event_tx.clone();
                                 tokio::task::spawn_local(async move {
                                     if let Err(error) = client
-                                        .push(crate::brain::store::BrainEventKind::ApprovalDecided {
+                                        .push(crate::brain::BrainEventKind::ApprovalDecided {
                                             request_seq: pending.request_seq,
                                             approval_id: pending.approval_id,
                                             decision,
@@ -2843,7 +2832,7 @@ impl EventLoop {
     ) -> Result<()> {
         if self.selected_brain().is_some() {
             return self
-                .push_remote_brain(crate::brain::store::BrainEventKind::Prompt { text: input })
+                .push_remote_brain(crate::brain::BrainEventKind::Prompt { text: input })
                 .await;
         }
 
@@ -3292,7 +3281,7 @@ impl EventLoop {
         round_token: ToolRoundToken,
         tool_id: String,
         proposal: DeferredProposal,
-        approval_audience: Option<crate::brain::store::BrainApprovalAudience>,
+        approval_audience: Option<crate::brain::BrainApprovalAudience>,
     ) {
         let event_tx = self.event_tx.clone();
         let runtime = Arc::clone(&self.program_runtime);
@@ -3553,7 +3542,7 @@ impl EventLoop {
         self.todo_journal_target.set(self.home_brain.clone());
         if let Some(home) = self.home_brain.as_ref() {
             let snapshot = home.snapshot().await?;
-            self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
+            self.render_remote_brain_message(crate::brain::BrainWireMessage::Snapshot {
                 brain: snapshot.clone(),
             })
             .await?;
@@ -3621,13 +3610,13 @@ impl EventLoop {
         self.render_tui().await
     }
 
-    fn selected_brain(&self) -> Option<&crate::brain::remote::AttachedBrainClient> {
+    fn selected_brain(&self) -> Option<&crate::brain::AttachedBrainClient> {
         self.active_remote_brain
             .as_ref()
             .or(self.home_brain.as_ref())
     }
 
-    fn selected_brain_mut(&mut self) -> Option<&mut crate::brain::remote::AttachedBrainClient> {
+    fn selected_brain_mut(&mut self) -> Option<&mut crate::brain::AttachedBrainClient> {
         self.active_remote_brain
             .as_mut()
             .or(self.home_brain.as_mut())
@@ -3642,7 +3631,7 @@ impl EventLoop {
             .is_some_and(|client| client.target.display_name() == target)
     }
 
-    async fn push_remote_brain(&mut self, kind: crate::brain::store::BrainEventKind) -> Result<()> {
+    async fn push_remote_brain(&mut self, kind: crate::brain::BrainEventKind) -> Result<()> {
         let Some(client) = self.selected_brain().cloned() else {
             return Ok(());
         };
@@ -3739,9 +3728,9 @@ impl EventLoop {
 
     fn ensure_remote_brain_run_projection(
         &mut self,
-        run_id: crate::brain::store::RunId,
-        kind: Option<crate::brain::store::BrainRunKind>,
-        status: crate::brain::store::BrainRunStatus,
+        run_id: crate::brain::RunId,
+        kind: Option<crate::brain::BrainRunKind>,
+        status: crate::brain::BrainRunStatus,
     ) -> &mut RemoteBrainRunProjection {
         ensure_remote_brain_run_projection(
             &self.output_manager,
@@ -4184,10 +4173,10 @@ pub(crate) fn plan_mode_indicator(mode: &ReplMode) -> &'static str {
 }
 
 fn brain_context_text(
-    event: &crate::brain::store::BrainEvent,
+    event: &crate::brain::BrainEvent,
     local_machine: Option<&str>,
 ) -> Option<String> {
-    use crate::brain::store::BrainEventKind;
+    use crate::brain::BrainEventKind;
 
     let text = match &event.kind {
         BrainEventKind::Prompt { text } | BrainEventKind::ParticipantMessage { text } => text,
@@ -4215,7 +4204,7 @@ fn brain_context_text(
 
 fn project_brain_context(
     status_bar: &crate::cli::status_bar::StatusBar,
-    events: &[crate::brain::store::BrainEvent],
+    events: &[crate::brain::BrainEvent],
     depth: usize,
     local_machine: Option<&str>,
 ) {
@@ -4242,15 +4231,15 @@ fn project_brain_context(
 }
 
 fn projected_brain_context_lines(
-    events: &[crate::brain::store::BrainEvent],
+    events: &[crate::brain::BrainEvent],
     depth: usize,
     local_machine: Option<&str>,
 ) -> Vec<String> {
     let speculative_run_ids = events
         .iter()
         .filter_map(|event| match &event.kind {
-            crate::brain::store::BrainEventKind::RunStarted { run }
-                if run.kind == crate::brain::store::BrainRunKind::Speculative =>
+            crate::brain::BrainEventKind::RunStarted { run }
+                if run.kind == crate::brain::BrainRunKind::Speculative =>
             {
                 Some(run.run_id)
             }
@@ -4274,29 +4263,25 @@ fn projected_brain_context_lines(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BrainRunGroupProjection {
-    run_id: crate::brain::store::RunId,
-    kind: crate::brain::store::BrainRunKind,
-    status: crate::brain::store::BrainRunStatus,
+    run_id: crate::brain::RunId,
+    kind: crate::brain::BrainRunKind,
+    status: crate::brain::BrainRunStatus,
     event_seqs: Vec<u64>,
 }
 
 /// Snapshot form of the same RunId grouping used by the live shadow buffer.
 /// A snapshot replay and its live tail therefore select one run hierarchy,
 /// rather than drawing Program/Result events as unrelated rows.
-fn projected_brain_run_groups(
-    events: &[crate::brain::store::BrainEvent],
-) -> Vec<BrainRunGroupProjection> {
+fn projected_brain_run_groups(events: &[crate::brain::BrainEvent]) -> Vec<BrainRunGroupProjection> {
     let mut groups = events
         .iter()
         .filter_map(|event| match &event.kind {
-            crate::brain::store::BrainEventKind::RunStarted { run } => {
-                Some(BrainRunGroupProjection {
-                    run_id: run.run_id,
-                    kind: run.kind,
-                    status: run.status,
-                    event_seqs: Vec::new(),
-                })
-            }
+            crate::brain::BrainEventKind::RunStarted { run } => Some(BrainRunGroupProjection {
+                run_id: run.run_id,
+                kind: run.kind,
+                status: run.status,
+                event_seqs: Vec::new(),
+            }),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -4308,7 +4293,7 @@ fn projected_brain_run_groups(
             continue;
         };
         group.event_seqs.push(event.seq);
-        if let crate::brain::store::BrainEventKind::RunStatusChanged { status, .. } = event.kind {
+        if let crate::brain::BrainEventKind::RunStatusChanged { status, .. } = event.kind {
             group.status = status;
         }
     }
@@ -4317,13 +4302,10 @@ fn projected_brain_run_groups(
 
 fn project_remote_brain_snapshot_runs(
     output_manager: &crate::cli::output_manager::OutputManager,
-    projections: &mut std::collections::HashMap<
-        crate::brain::store::RunId,
-        RemoteBrainRunProjection,
-    >,
+    projections: &mut std::collections::HashMap<crate::brain::RunId, RemoteBrainRunProjection>,
     local_projections: &mut std::collections::VecDeque<LocalBrainProjection>,
     selected_brain_is_home: bool,
-    events: &[crate::brain::store::BrainEvent],
+    events: &[crate::brain::BrainEvent],
 ) {
     for group in projected_brain_run_groups(events) {
         ensure_remote_brain_run_projection(
@@ -4350,8 +4332,8 @@ fn project_remote_brain_snapshot_runs(
 /// have buffered some of those same events. Sequence numbers are authoritative
 /// within a Brain, so only a strictly newer event should affect UI chrome.
 fn advance_brain_projection_revision(
-    revisions: &mut std::collections::HashMap<crate::brain::store::BrainId, u64>,
-    brain_id: crate::brain::store::BrainId,
+    revisions: &mut std::collections::HashMap<crate::brain::BrainId, u64>,
+    brain_id: crate::brain::BrainId,
     revision: u64,
 ) -> bool {
     let projected = revisions.entry(brain_id).or_default();
@@ -4366,8 +4348,8 @@ fn advance_brain_projection_revision(
 /// Presence and runner ownership are projected into the status line from the
 /// snapshot itself; replaying their historical transitions pollutes scrollback
 /// and can duplicate the first live event delivered after subscription.
-fn replay_event_belongs_in_transcript(event: &crate::brain::store::BrainEvent) -> bool {
-    use crate::brain::store::BrainEventKind;
+fn replay_event_belongs_in_transcript(event: &crate::brain::BrainEvent) -> bool {
+    use crate::brain::BrainEventKind;
 
     !matches!(
         event.kind,

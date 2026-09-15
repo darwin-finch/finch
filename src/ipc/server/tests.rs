@@ -13,15 +13,13 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
     let local = tokio::task::LocalSet::new();
     runtime.block_on(local.run_until(async {
         let temp = tempfile::tempdir().unwrap();
-        let store = crate::brain::store::BrainStore::with_root(
-            "box.local",
-            Some(temp.path().join("brains")),
-        );
+        let store =
+            crate::brain::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
         let attachment = store
             .attach(
                 "shared",
                 "alice",
-                crate::brain::store::AttachmentRole::Driver,
+                crate::brain::AttachmentRole::Driver,
                 None,
             )
             .unwrap();
@@ -29,7 +27,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
             .push(
                 "shared",
                 "alice",
-                crate::brain::store::BrainEventKind::Prompt {
+                crate::brain::BrainEventKind::Prompt {
                     text: "effect".into(),
                 },
             )
@@ -38,10 +36,10 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
             .start_run(
                 "shared",
                 "alice",
-                crate::brain::store::BrainRunKind::Interactive,
+                crate::brain::BrainRunKind::Interactive,
                 prompt.seq,
                 attachment.attachment_id,
-                crate::brain::store::BrainRunStatus::Running,
+                crate::brain::BrainRunStatus::Running,
             )
             .unwrap();
         let lease = store
@@ -54,7 +52,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
         let server = std::sync::Arc::new(
             crate::server::AgentServer::for_brain_protocol_test(
                 store.clone(),
-                crate::brain::credential::BrainCredentialAuthority::ephemeral([44; 32]),
+                crate::brain::BrainCredentialAuthority::ephemeral([44; 32]),
                 "test-password".into(),
                 temp.path(),
             )
@@ -167,7 +165,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
                 "shared",
                 "daemon",
                 run.run_id,
-                crate::brain::store::BrainRunStatus::Cancelled,
+                crate::brain::BrainRunStatus::Cancelled,
                 Some("turn cancelled before host completion".into()),
             )
             .unwrap();
@@ -197,23 +195,21 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
                         ref outcome_kind
                     }
                 } if outcome_kind == "acknowledged"));
-        assert!(!snapshot.events.iter().any(|event| matches!(
-            event.kind,
-            crate::brain::store::BrainEventKind::ToolResult { .. }
-        )));
+        assert!(!snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, crate::brain::BrainEventKind::ToolResult { .. })));
 
         // Reconstruct the raw server capability after a daemon/store
         // reload. The original callback and lease are stale and the run
         // is terminal, but a caller that lost the original reserve ACK
         // must still learn that its exact identity is durably fenced.
-        let restarted = crate::brain::store::BrainStore::with_root(
-            "box.local",
-            Some(temp.path().join("brains")),
-        );
+        let restarted =
+            crate::brain::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
         let restarted_server = std::sync::Arc::new(
             crate::server::AgentServer::for_brain_protocol_test(
                 restarted.clone(),
-                crate::brain::credential::BrainCredentialAuthority::ephemeral([45; 32]),
+                crate::brain::BrainCredentialAuthority::ephemeral([45; 32]),
                 "test-password".into(),
                 temp.path(),
             )
@@ -646,20 +642,19 @@ async fn broken_runner_connection_declares_itself_unavailable_to_memory_replay()
     // dropping the prefix from `forward_runner_request` fails here rather
     // than passing on a literal a test supplied itself.
     let temp = tempfile::tempdir().unwrap();
-    let store =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
     store
         .attach(
             "shared",
             "alice",
-            crate::brain::store::AttachmentRole::Driver,
+            crate::brain::AttachmentRole::Driver,
             None,
         )
         .unwrap();
     let server = std::sync::Arc::new(
         crate::server::AgentServer::for_brain_protocol_test(
             store.clone(),
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([46; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([46; 32]),
             "test-password".into(),
             temp.path(),
         )
@@ -668,9 +663,9 @@ async fn broken_runner_connection_declares_itself_unavailable_to_memory_replay()
 
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     let request = crate::server::RunnerMemoryProjectionRequest {
-        brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+        brain_id: crate::brain::BrainId(uuid::Uuid::new_v4()),
         brain: "shared".into(),
-        run_id: crate::brain::store::RunId(uuid::Uuid::new_v4()),
+        run_id: crate::brain::RunId(uuid::Uuid::new_v4()),
         request_seq: 1,
         prompt: "remember this".into(),
         rendered: "remembered".into(),
@@ -702,13 +697,12 @@ async fn raw_effect_eof_states(
     mature_history: bool,
 ) -> Vec<crate::runtime::EffectAuditState> {
     let temp = tempfile::tempdir().unwrap();
-    let store =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
     let attachment = store
         .attach(
             "shared",
             "alice",
-            crate::brain::store::AttachmentRole::Driver,
+            crate::brain::AttachmentRole::Driver,
             None,
         )
         .unwrap();
@@ -716,7 +710,7 @@ async fn raw_effect_eof_states(
         .push(
             "shared",
             "alice",
-            crate::brain::store::BrainEventKind::Prompt {
+            crate::brain::BrainEventKind::Prompt {
                 text: "effect eof".into(),
             },
         )
@@ -725,10 +719,10 @@ async fn raw_effect_eof_states(
         .start_run(
             "shared",
             "alice",
-            crate::brain::store::BrainRunKind::Interactive,
+            crate::brain::BrainRunKind::Interactive,
             prompt.seq,
             attachment.attachment_id,
-            crate::brain::store::BrainRunStatus::Running,
+            crate::brain::BrainRunStatus::Running,
         )
         .unwrap();
     let lease = store
@@ -742,7 +736,7 @@ async fn raw_effect_eof_states(
     let server = std::sync::Arc::new(
         crate::server::AgentServer::for_brain_protocol_test(
             store.clone(),
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([45; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([45; 32]),
             "test-password".into(),
             temp.path(),
         )
@@ -753,7 +747,7 @@ async fn raw_effect_eof_states(
         brain: "shared".into(),
         run_id: run.run_id,
         request_seq: prompt.seq,
-        language: crate::brain::store::ProgramLanguage::Forth,
+        language: crate::brain::ProgramLanguage::Forth,
         source: "noop".into(),
         interaction: crate::server::RunnerProgramInteraction::Interactive,
         grant_ceiling: None,
@@ -786,22 +780,21 @@ async fn partial_frame_connection_teardown_fixture(
     fail_audit_batch: bool,
 ) -> (
     tempfile::TempDir,
-    crate::brain::store::BrainStore,
+    crate::brain::BrainStore,
     std::sync::Arc<crate::server::AgentServer>,
     uuid::Uuid,
-    crate::brain::store::RunnerLeaseId,
+    crate::brain::RunnerLeaseId,
     anyhow::Result<()>,
 ) {
     use tokio::io::AsyncWriteExt;
 
     let temp = tempfile::tempdir().unwrap();
-    let store =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
     let attachment = store
         .attach(
             "shared",
             "alice",
-            crate::brain::store::AttachmentRole::Driver,
+            crate::brain::AttachmentRole::Driver,
             None,
         )
         .unwrap();
@@ -809,7 +802,7 @@ async fn partial_frame_connection_teardown_fixture(
         .push(
             "shared",
             "alice",
-            crate::brain::store::BrainEventKind::Prompt {
+            crate::brain::BrainEventKind::Prompt {
                 text: "partial frame".into(),
             },
         )
@@ -818,10 +811,10 @@ async fn partial_frame_connection_teardown_fixture(
         .start_run(
             "shared",
             "alice",
-            crate::brain::store::BrainRunKind::Interactive,
+            crate::brain::BrainRunKind::Interactive,
             prompt.seq,
             attachment.attachment_id,
-            crate::brain::store::BrainRunStatus::Running,
+            crate::brain::BrainRunStatus::Running,
         )
         .unwrap();
     let lease = store
@@ -833,7 +826,7 @@ async fn partial_frame_connection_teardown_fixture(
             "shared",
             run.run_id,
             lease.lease_id,
-            Some(crate::brain::store::ConnectionId(connection_id)),
+            Some(crate::brain::ConnectionId(connection_id)),
         )
         .unwrap();
     store
@@ -878,7 +871,7 @@ async fn partial_frame_connection_teardown_fixture(
     let server = std::sync::Arc::new(
         crate::server::AgentServer::for_brain_protocol_test(
             store.clone(),
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([49; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([49; 32]),
             "test-password".into(),
             temp.path(),
         )
@@ -998,15 +991,13 @@ async fn effect_audit_connection_teardown_closes_admission_and_drains_pre_snapsh
     tokio::task::LocalSet::new()
         .run_until(async {
             let temp = tempfile::tempdir().unwrap();
-            let store = crate::brain::store::BrainStore::with_root(
-                "box.local",
-                Some(temp.path().join("brains")),
-            );
+            let store =
+                crate::brain::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
             let attachment = store
                 .attach(
                     "shared",
                     "alice",
-                    crate::brain::store::AttachmentRole::Driver,
+                    crate::brain::AttachmentRole::Driver,
                     None,
                 )
                 .unwrap();
@@ -1014,7 +1005,7 @@ async fn effect_audit_connection_teardown_closes_admission_and_drains_pre_snapsh
                 .push(
                     "shared",
                     "alice",
-                    crate::brain::store::BrainEventKind::Prompt {
+                    crate::brain::BrainEventKind::Prompt {
                         text: "queued teardown race".into(),
                     },
                 )
@@ -1023,10 +1014,10 @@ async fn effect_audit_connection_teardown_closes_admission_and_drains_pre_snapsh
                 .start_run(
                     "shared",
                     "alice",
-                    crate::brain::store::BrainRunKind::Interactive,
+                    crate::brain::BrainRunKind::Interactive,
                     prompt.seq,
                     attachment.attachment_id,
-                    crate::brain::store::BrainRunStatus::Running,
+                    crate::brain::BrainRunStatus::Running,
                 )
                 .unwrap();
             let lease = store
@@ -1035,7 +1026,7 @@ async fn effect_audit_connection_teardown_closes_admission_and_drains_pre_snapsh
             let server = std::sync::Arc::new(
                 crate::server::AgentServer::for_brain_protocol_test(
                     store.clone(),
-                    crate::brain::credential::BrainCredentialAuthority::ephemeral([50; 32]),
+                    crate::brain::BrainCredentialAuthority::ephemeral([50; 32]),
                     "test-password".into(),
                     temp.path(),
                 )
@@ -1072,7 +1063,7 @@ async fn effect_audit_connection_teardown_closes_admission_and_drains_pre_snapsh
                         "shared",
                         run_id,
                         lease_id,
-                        Some(crate::brain::store::ConnectionId(connection_id)),
+                        Some(crate::brain::ConnectionId(connection_id)),
                     )
                     .unwrap();
                 queued_store
@@ -1176,21 +1167,20 @@ async fn raw_normal_effect_state(
     remote_disconnect_error: bool,
 ) -> (
     tempfile::TempDir,
-    crate::brain::store::BrainStore,
+    crate::brain::BrainStore,
     std::sync::Arc<crate::server::AgentServer>,
-    crate::brain::store::RunnerLeaseId,
+    crate::brain::RunnerLeaseId,
     tokio::sync::mpsc::UnboundedReceiver<crate::server::RunnerRequest>,
     crate::runtime::EffectAuditState,
     Option<super::finch_ipc_capnp::brain_host_effect_permit::Client>,
 ) {
     let temp = tempfile::tempdir().unwrap();
-    let store =
-        crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
     let attachment = store
         .attach(
             "shared",
             "alice",
-            crate::brain::store::AttachmentRole::Driver,
+            crate::brain::AttachmentRole::Driver,
             None,
         )
         .unwrap();
@@ -1198,7 +1188,7 @@ async fn raw_normal_effect_state(
         .push(
             "shared",
             "alice",
-            crate::brain::store::BrainEventKind::Prompt {
+            crate::brain::BrainEventKind::Prompt {
                 text: "normal effect".into(),
             },
         )
@@ -1207,10 +1197,10 @@ async fn raw_normal_effect_state(
         .start_run(
             "shared",
             "alice",
-            crate::brain::store::BrainRunKind::Interactive,
+            crate::brain::BrainRunKind::Interactive,
             prompt.seq,
             attachment.attachment_id,
-            crate::brain::store::BrainRunStatus::Running,
+            crate::brain::BrainRunStatus::Running,
         )
         .unwrap();
     let lease = store
@@ -1219,7 +1209,7 @@ async fn raw_normal_effect_state(
     let server = std::sync::Arc::new(
         crate::server::AgentServer::for_brain_protocol_test(
             store.clone(),
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([46; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([46; 32]),
             "test-password".into(),
             temp.path(),
         )
@@ -1244,7 +1234,7 @@ async fn raw_normal_effect_state(
         brain: "shared".into(),
         run_id: run.run_id,
         request_seq: prompt.seq,
-        language: crate::brain::store::ProgramLanguage::Forth,
+        language: crate::brain::ProgramLanguage::Forth,
         source: "noop".into(),
         interaction: crate::server::RunnerProgramInteraction::Interactive,
         grant_ceiling: None,
@@ -1348,14 +1338,14 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                 let temp = tempfile::tempdir().unwrap();
                 let task_output = temp.path().join("task-output");
                 std::fs::create_dir_all(&task_output).unwrap();
-                let store = crate::brain::store::BrainStore::with_root(
+                let store = crate::brain::BrainStore::with_root(
                     "box.local",
                     Some(temp.path().join("brains")),
                 );
                 let server = std::sync::Arc::new(
                     crate::server::AgentServer::for_brain_protocol_test(
                         store.clone(),
-                        crate::brain::credential::BrainCredentialAuthority::ephemeral([48; 32]),
+                        crate::brain::BrainCredentialAuthority::ephemeral([48; 32]),
                         "test-password".into(),
                         temp.path(),
                     )
@@ -1461,7 +1451,7 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                     .brain_attach(
                         "shared",
                         "alice",
-                        crate::brain::store::AttachmentRole::Driver,
+                        crate::brain::AttachmentRole::Driver,
                         None,
                     )
                     .await
@@ -1475,7 +1465,7 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                         .brain_submit(
                             "shared",
                             &submit_attachment,
-                            crate::brain::store::BrainEventKind::Prompt {
+                            crate::brain::BrainEventKind::Prompt {
                                 text: "apply one provider effect".into(),
                             },
                         )
@@ -1496,7 +1486,7 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                     .unwrap()
                     .runs
                     .into_iter()
-                    .find(|run| run.status == crate::brain::store::BrainRunStatus::Running)
+                    .find(|run| run.status == crate::brain::BrainRunStatus::Running)
                     .expect("daemon did not create the active provider run");
                 let cancelled = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
@@ -1507,7 +1497,7 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                 .unwrap();
                 assert_eq!(
                     cancelled.status,
-                    crate::brain::store::BrainRunStatus::Cancelled
+                    crate::brain::BrainRunStatus::Cancelled
                 );
                 let submission = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
@@ -1561,7 +1551,7 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                             ref outcome_kind
                         }
                     } if outcome_kind == "acknowledged"));
-                let restarted = crate::brain::store::BrainStore::with_root(
+                let restarted = crate::brain::BrainStore::with_root(
                     "box.local",
                     Some(temp.path().join("brains")),
                 );
@@ -1583,11 +1573,11 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                     } if outcome_kind == "acknowledged"));
                 assert!(!snapshot.events.iter().any(|event| matches!(
                     event.kind,
-                    crate::brain::store::BrainEventKind::ToolResult { .. }
-                        | crate::brain::store::BrainEventKind::Result { .. }
-                        | crate::brain::store::BrainEventKind::Program { .. }
-                        | crate::brain::store::BrainEventKind::RuntimeCommitted { .. }
-                        | crate::brain::store::BrainEventKind::EffectRecorded { .. }
+                    crate::brain::BrainEventKind::ToolResult { .. }
+                        | crate::brain::BrainEventKind::Result { .. }
+                        | crate::brain::BrainEventKind::Program { .. }
+                        | crate::brain::BrainEventKind::RuntimeCommitted { .. }
+                        | crate::brain::BrainEventKind::EffectRecorded { .. }
                 )));
                 assert_eq!(
                     serde_json::to_value(conversation.read().await.get_messages()).unwrap(),
@@ -1705,14 +1695,14 @@ fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation
             let _socket_path = supervised_proof.is_none().then(|| {
                 crate::ipc::transport::set_test_sock_path(socket_path.clone())
             });
-            let store = crate::brain::store::BrainStore::with_root(
+            let store = crate::brain::BrainStore::with_root(
                 "box.local",
                 Some(temp.path().join("brains")),
             );
             let server = std::sync::Arc::new(
                 crate::server::AgentServer::for_brain_protocol_test(
                     store.clone(),
-                    crate::brain::credential::BrainCredentialAuthority::ephemeral([91; 32]),
+                    crate::brain::BrainCredentialAuthority::ephemeral([91; 32]),
                     "test-password".into(),
                     temp.path(),
                 )
@@ -1745,7 +1735,7 @@ fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation
                 .brain_attach(
                     "shared",
                     "alice",
-                    crate::brain::store::AttachmentRole::Driver,
+                    crate::brain::AttachmentRole::Driver,
                     None,
                 )
                 .await
@@ -1794,14 +1784,14 @@ fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation
                     if current.events.iter().any(|event| {
                         matches!(
                             &event.kind,
-                            crate::brain::store::BrainEventKind::ApprovalRequested {
+                            crate::brain::BrainEventKind::ApprovalRequested {
                                 approval_id, ..
                             } if approval_id == "socket-approval"
                         )
                     }) {
                         assert_eq!(
                             store.inspect_run("shared", run.run_id).unwrap().status,
-                            crate::brain::store::BrainRunStatus::AwaitingApproval
+                            crate::brain::BrainRunStatus::AwaitingApproval
                         );
                         break;
                     }
@@ -1872,7 +1862,7 @@ fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation
                 .brain_attach(
                     "shared",
                     "alice",
-                    crate::brain::store::AttachmentRole::Driver,
+                    crate::brain::AttachmentRole::Driver,
                     Some(attachment.attachment_id),
                 )
                 .await
@@ -1898,7 +1888,7 @@ fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation
                     .iter()
                     .filter(|event| matches!(
                         event.kind,
-                        crate::brain::store::BrainEventKind::RunStatusChanged {
+                        crate::brain::BrainEventKind::RunStatusChanged {
                             run_id, status, ..
                         } if run_id == run.run_id && status.is_terminal()
                     ))
@@ -1949,17 +1939,17 @@ impl super::finch_ipc_capnp::finch_daemon::Server for BrainTestDaemon {
     }
 }
 
-fn test_approval_audience() -> crate::brain::store::BrainApprovalAudience {
-    crate::brain::store::BrainApprovalAudience {
-        brain_id: crate::brain::store::BrainId(
+fn test_approval_audience() -> crate::brain::BrainApprovalAudience {
+    crate::brain::BrainApprovalAudience {
+        brain_id: crate::brain::BrainId(
             uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
         ),
         brain: "shared".into(),
-        attachment_id: crate::brain::store::AttachmentId(
+        attachment_id: crate::brain::AttachmentId(
             uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
         ),
         subject: "alice@box.local".into(),
-        role: crate::brain::store::AttachmentRole::Driver,
+        role: crate::brain::AttachmentRole::Driver,
         environment_generation: 3,
     }
 }
@@ -1989,7 +1979,7 @@ fn effect_record() -> crate::server::RunnerEffectRecord {
 #[tokio::test]
 async fn runner_lifecycle_capability_rejects_a_replaced_lease() {
     let root = tempfile::tempdir().unwrap().keep();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(root));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(root));
     let runners = crate::server::BrainRunnerBroker::default();
     let lifecycle = crate::server::BrainLifecycleService::new(
         store.clone(),
@@ -2001,7 +1991,7 @@ async fn runner_lifecycle_capability_rejects_a_replaced_lease() {
         .attach(
             "shared",
             "alice",
-            crate::brain::store::AttachmentRole::Driver,
+            crate::brain::AttachmentRole::Driver,
             None,
         )
         .unwrap();
@@ -2034,7 +2024,7 @@ async fn runner_lifecycle_capability_rejects_a_replaced_lease() {
 #[tokio::test]
 async fn disconnected_ipc_connection_rebinds_its_durable_runner_lease() {
     let root = tempfile::tempdir().unwrap().keep();
-    let store = crate::brain::store::BrainStore::with_root("box.local", Some(root));
+    let store = crate::brain::BrainStore::with_root("box.local", Some(root));
     let runners = crate::server::BrainRunnerBroker::default();
     let lifecycle = crate::server::BrainLifecycleService::new(
         store.clone(),
@@ -2102,7 +2092,7 @@ fn local_initialization_clients_require_their_active_driver_connection() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     runtime.block_on(local.run_until(async {
-        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let store = crate::brain::BrainStore::with_root("box.local", None);
         let runners = crate::server::BrainRunnerBroker::default();
         let lifecycle = crate::server::BrainLifecycleService::new(
             store,
@@ -2116,18 +2106,16 @@ fn local_initialization_clients_require_their_active_driver_connection() {
                 connection_id: uuid::Uuid::new_v4(),
             });
         let ipc = crate::ipc::IpcClient::from_test_client(daemon);
-        let target =
-            crate::brain::remote::RemoteBrainTarget::local("shared", "127.0.0.1:1").unwrap();
-        let mut driver =
-            crate::brain::remote::AttachedBrainClient::local(target.clone(), ipc.clone());
+        let target = crate::brain::RemoteBrainTarget::local("shared", "127.0.0.1:1").unwrap();
+        let mut driver = crate::brain::AttachedBrainClient::local(target.clone(), ipc.clone());
         driver
-            .attach("alice", crate::brain::store::AttachmentRole::Driver, None)
+            .attach("alice", crate::brain::AttachmentRole::Driver, None)
             .await
             .unwrap();
         let mut events = driver.watch().await.unwrap();
         assert!(matches!(
             events.recv().await.unwrap(),
-            crate::brain::store::BrainWireMessage::Snapshot { .. }
+            crate::brain::BrainWireMessage::Snapshot { .. }
         ));
         assert!(driver
             .schedule_initialization(1_000)
@@ -2139,15 +2127,15 @@ fn local_initialization_clients_require_their_active_driver_connection() {
         driver.disconnect().await.unwrap();
         assert!(driver.schedule_initialization(2_000).await.is_err());
 
-        let mut consultant = crate::brain::remote::AttachedBrainClient::local(target, ipc);
+        let mut consultant = crate::brain::AttachedBrainClient::local(target, ipc);
         consultant
-            .attach("bob", crate::brain::store::AttachmentRole::Consultant, None)
+            .attach("bob", crate::brain::AttachmentRole::Consultant, None)
             .await
             .unwrap();
         let mut consultant_events = consultant.watch().await.unwrap();
         assert!(matches!(
             consultant_events.recv().await.unwrap(),
-            crate::brain::store::BrainWireMessage::Snapshot { .. }
+            crate::brain::BrainWireMessage::Snapshot { .. }
         ));
         assert!(consultant.schedule_initialization(3_000).await.is_err());
     }));
@@ -2384,12 +2372,11 @@ fn supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path() {
         let prepared = super::prepare_ipc_listener().await.unwrap();
         assert!(!prepared.remove_on_shutdown);
 
-        let store =
-            crate::brain::store::BrainStore::with_root("box.local", Some(proof.root.clone()));
+        let store = crate::brain::BrainStore::with_root("box.local", Some(proof.root.clone()));
         let server = std::sync::Arc::new(
             crate::server::AgentServer::for_brain_protocol_test(
                 store,
-                crate::brain::credential::BrainCredentialAuthority::ephemeral([92; 32]),
+                crate::brain::BrainCredentialAuthority::ephemeral([92; 32]),
                 "test-password".into(),
                 &proof.home,
             )

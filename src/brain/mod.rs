@@ -4,12 +4,37 @@
 //! the named Brain service. There is deliberately no second client-local
 //! "Brain session" or hidden context-injection path here.
 
-pub mod credential;
+mod credential;
 pub(crate) mod effect_audit_archive;
-pub mod names;
-pub mod remote;
-pub mod store;
-pub mod tasks;
+
+// Re-export the caller-facing items of the private children so callers use
+// `crate::brain::Item` and never name a child module.
+pub use credential::{
+    default_participant_scopes, permitted_participant_scopes, BrainCredentialAuthority,
+    BrainCredentialClaims, BrainCredentialRequest, BrainCredentialScope, BrainInvitationClaims,
+    BrainInvitationRequest,
+};
+pub use names::generate;
+pub use remote::{
+    AttachedBrainClient, RemoteBrainCapabilities, RemoteBrainClient, RemoteBrainTarget,
+};
+#[cfg(test)]
+pub(crate) use store::{directory_listing_for_tests, seed_scheduled_brain_for_tests};
+pub(crate) use store::{unix_millis, EffectAuditAuthorityGrant};
+pub use store::{
+    AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
+    BrainEvent, BrainEventKind, BrainId, BrainInitialization, BrainMutationOutcome,
+    BrainMutationReceipt, BrainProgram, BrainRun, BrainRunCancellationReservation, BrainRunKind,
+    BrainRunStatus, BrainRunnerHandoff, BrainRunnerLease, BrainSchedule,
+    BrainScheduleDeliveryPolicy, BrainScheduleDue, BrainScheduleModuleIdentity, BrainSnapshot,
+    BrainStore, BrainWireMessage, ConnectionId, ProgramLanguage, RunId, RunnerHandoffId,
+    RunnerLeaseId, ScheduleId,
+};
+pub use tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
+mod names;
+mod remote;
+mod store;
+mod tasks;
 
 #[doc(hidden)]
 pub struct IsolatedTestProof {
@@ -2478,5 +2503,100 @@ mod isolation_tests {
         drop(original_listener);
         outsider.kill().unwrap();
         outsider.wait().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod facade_scan_tests {
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn brain_facade_keeps_child_modules_private() {
+        let facade = include_str!("mod.rs");
+        let published = facade
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| line.starts_with("pub mod "))
+            .collect::<Vec<_>>();
+        assert!(
+            published.is_empty(),
+            "brain facade must keep child modules private; found: {published:?}"
+        );
+    }
+
+    #[test]
+    fn brain_callers_use_facade_not_child_modules() {
+        let children = ["credential", "names", "remote", "store", "tasks"];
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let brain = root.join("src/brain");
+        let mut hits = Vec::new();
+        for tree in ["src", "tests"] {
+            collect_brain_child_imports(&root.join(tree), &root, &brain, &children, &mut hits);
+        }
+        assert!(
+            hits.is_empty(),
+            "callers outside src/brain must use crate::brain::Item, not child modules; found: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn brain_facade_reexports_caller_types() {
+        let _ = std::any::type_name::<super::BrainStore>();
+        let _ = std::any::type_name::<super::BrainId>();
+        let _ = std::any::type_name::<super::BrainEvent>();
+        let _ = std::any::type_name::<super::BrainTask>();
+        let _ = std::any::type_name::<super::BrainCredentialAuthority>();
+        let _ = std::any::type_name::<super::RemoteBrainClient>();
+        let _ = super::generate;
+        let _ = super::unix_millis;
+    }
+
+    fn collect_brain_child_imports(
+        dir: &Path,
+        root: &Path,
+        brain: &Path,
+        children: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        if dir.starts_with(brain) {
+            return;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                hits.push(format!("failed to read {}: {error}", dir.display()));
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_brain_child_imports(&path, root, brain, children, hits);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                hits.push(format!("failed to read {}", path.display()));
+                continue;
+            };
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for child in children {
+                    for prefix in ["crate::brain::", "finch::brain::"] {
+                        let needle = [prefix, child, "::"].concat();
+                        if line.contains(&needle) {
+                            let rel = path.strip_prefix(root).unwrap_or(&path);
+                            hits.push(format!("{}:{}", rel.display(), index + 1));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

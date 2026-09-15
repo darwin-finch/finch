@@ -14,7 +14,7 @@ fn normalize_environment_machine(machine: &str) -> String {
 }
 
 fn verify_frontend_environment(
-    expected: &crate::brain::store::BrainEnvironment,
+    expected: &crate::brain::BrainEnvironment,
     actual_machine: &str,
     actual_workspace: &std::path::Path,
 ) -> Result<()> {
@@ -42,24 +42,24 @@ fn verify_frontend_environment(
 }
 
 fn participant_attachment_label(
-    attachment: &crate::brain::store::BrainAttachment,
+    attachment: &crate::brain::BrainAttachment,
 ) -> String {
     let id = attachment.attachment_id.0.to_string();
     format!("{} [{}]", attachment.subject, &id[..8])
 }
 
 fn reconnect_runner_lease_id(
-    retained: Option<crate::brain::store::RunnerLeaseId>,
-    snapshot: &crate::brain::store::BrainSnapshot,
+    retained: Option<crate::brain::RunnerLeaseId>,
+    snapshot: &crate::brain::BrainSnapshot,
     subject: &str,
-) -> Result<Option<crate::brain::store::RunnerLeaseId>> {
+) -> Result<Option<crate::brain::RunnerLeaseId>> {
     if retained.is_some_and(|lease_id| snapshot.runner_lease_was_handed_off(lease_id)) {
         anyhow::bail!("runner lease handed off to another frontend");
     }
     let observed = snapshot
         .runner_lease
         .as_ref()
-        .filter(|lease| lease.expires_ms > crate::brain::store::unix_millis());
+        .filter(|lease| lease.expires_ms > crate::brain::unix_millis());
     match observed {
         Some(lease) if lease.subject != subject => anyhow::bail!(
             "Brain runner lease belongs to another subject ({})",
@@ -73,11 +73,11 @@ fn reconnect_runner_lease_id(
 }
 
 fn lease_id_after_registration(
-    retained: Option<crate::brain::store::RunnerLeaseId>,
-    registered: Option<crate::brain::store::RunnerLeaseId>,
+    retained: Option<crate::brain::RunnerLeaseId>,
+    registered: Option<crate::brain::RunnerLeaseId>,
     active: bool,
     handed_off: bool,
-) -> Option<crate::brain::store::RunnerLeaseId> {
+) -> Option<crate::brain::RunnerLeaseId> {
     if handed_off {
         None
     } else if active {
@@ -89,12 +89,12 @@ fn lease_id_after_registration(
 
 struct HomeRunnerRegistration {
     target: RunnerReconnectTarget,
-    registration: std::result::Result<crate::brain::store::RunnerLeaseId, String>,
+    registration: std::result::Result<crate::brain::RunnerLeaseId, String>,
 }
 
 fn initialization_schedule_message(
-    schedule: &crate::brain::store::BrainSchedule,
-    status: Option<crate::brain::store::BrainRunStatus>,
+    schedule: &crate::brain::BrainSchedule,
+    status: Option<crate::brain::BrainRunStatus>,
 ) -> String {
     let schedule_id = schedule.schedule_id.0.to_string();
     if schedule.active {
@@ -104,7 +104,7 @@ fn initialization_schedule_message(
         );
     }
     match status {
-        Some(crate::brain::store::BrainRunStatus::Completed) => format!(
+        Some(crate::brain::BrainRunStatus::Completed) => format!(
             "reviewed Brain initialization already completed as {}",
             &schedule_id[..8]
         ),
@@ -121,7 +121,7 @@ fn initialization_schedule_message(
 }
 
 fn verify_local_frontend_environment(
-    expected: &crate::brain::store::BrainEnvironment,
+    expected: &crate::brain::BrainEnvironment,
 ) -> Result<()> {
     let machine = hostname::get()
         .ok()
@@ -232,8 +232,8 @@ impl EventLoop {
         ipc: crate::ipc::IpcClient,
         brain: String,
         subject: String,
-        environment: crate::brain::store::BrainEnvironment,
-        mut lease_id: Option<crate::brain::store::RunnerLeaseId>,
+        environment: crate::brain::BrainEnvironment,
+        mut lease_id: Option<crate::brain::RunnerLeaseId>,
         initial_had_lease: bool,
     ) {
         let event_tx = self.event_tx.clone();
@@ -329,24 +329,24 @@ impl EventLoop {
             .daemon_base_url
             .as_deref()
             .context("local daemon is unavailable")?;
-        let target = crate::brain::remote::RemoteBrainTarget::local(&self.session_label, base)?;
+        let target = crate::brain::RemoteBrainTarget::local(&self.session_label, base)?;
         let ipc = self
             .ipc_client
             .as_ref()
             .context("Cap'n Proto daemon connection unavailable")?
             .clone();
-        let mut client = crate::brain::remote::AttachedBrainClient::local(target, ipc);
+        let mut client = crate::brain::AttachedBrainClient::local(target, ipc);
         client
             .attach_persistent(
                 &self.participant_subject,
-                crate::brain::store::AttachmentRole::Driver,
+                crate::brain::AttachmentRole::Driver,
                 &self.session_label,
             )
             .await?;
         let mut incoming = client.watch_with_errors().await?;
         let snapshot = match incoming.recv().await {
-            Some(Ok(crate::brain::store::BrainWireMessage::Snapshot { brain })) => brain,
-            Some(Ok(crate::brain::store::BrainWireMessage::Event { .. })) => {
+            Some(Ok(crate::brain::BrainWireMessage::Snapshot { brain })) => brain,
+            Some(Ok(crate::brain::BrainWireMessage::Event { .. })) => {
                 anyhow::bail!("home Brain event stream did not begin with a snapshot")
             }
             Some(Err(error)) => {
@@ -359,7 +359,7 @@ impl EventLoop {
         client.acknowledge(snapshot.revision).await?;
         self.home_brain = Some(client);
         self.todo_journal_target.set(self.home_brain.clone());
-        self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
+        self.render_remote_brain_message(crate::brain::BrainWireMessage::Snapshot {
             brain: snapshot.clone(),
         })
         .await?;
@@ -636,10 +636,10 @@ impl EventLoop {
         #[derive(serde::Deserialize)]
         struct NamedBrainSummary {
             name: String,
-            environment: crate::brain::store::BrainEnvironment,
+            environment: crate::brain::BrainEnvironment,
             event_revision: u64,
             retained_programs: usize,
-            runner: Option<crate::brain::store::BrainRunnerLease>,
+            runner: Option<crate::brain::BrainRunnerLease>,
         }
 
         let brains = match reqwest::Client::new()
@@ -741,11 +741,11 @@ impl EventLoop {
             .daemon_base_url
             .as_deref()
             .context("local daemon is unavailable")?;
-        let target = crate::brain::remote::RemoteBrainTarget::local(&target, base)?;
+        let target = crate::brain::RemoteBrainTarget::local(&target, base)?;
         let password = crate::config::load_config()
             .map(|config| config.server.brain_password)
             .unwrap_or_default();
-        let client = crate::brain::remote::RemoteBrainClient::new(target.clone(), password)?;
+        let client = crate::brain::RemoteBrainClient::new(target.clone(), password)?;
         let snapshot = client.create().await?;
         self.output_manager.write_info(format!(
             "created {} in {}:{} (generation {})",
@@ -815,7 +815,7 @@ impl EventLoop {
         } else {
             let snapshot = client.snapshot().await?;
             snapshot.events.iter().rev().find_map(|event| match &event.kind {
-                crate::brain::store::BrainEventKind::ScheduleDue { due }
+                crate::brain::BrainEventKind::ScheduleDue { due }
                     if due.schedule_id == schedule.schedule_id =>
                 {
                     snapshot
@@ -834,7 +834,7 @@ impl EventLoop {
 
     async fn handle_brain_say(&mut self, text: String) -> Result<()> {
         anyhow::ensure!(self.selected_brain().is_some(), "no Brain is attached");
-        self.push_remote_brain(crate::brain::store::BrainEventKind::ParticipantMessage { text })
+        self.push_remote_brain(crate::brain::BrainEventKind::ParticipantMessage { text })
             .await
     }
 
@@ -941,11 +941,11 @@ impl EventLoop {
             self.output_manager.write_info("⚠️  Daemon not connected.");
             return self.render_tui().await;
         };
-        let target = crate::brain::remote::RemoteBrainTarget::local(&name, base)?;
+        let target = crate::brain::RemoteBrainTarget::local(&name, base)?;
         let password = crate::config::load_config()
             .map(|config| config.server.brain_password)
             .unwrap_or_default();
-        let client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        let client = crate::brain::RemoteBrainClient::new(target, password)?;
         match client.archive(&self.participant_subject).await {
             Ok(archived_to) => {
                 let destination = archived_to.as_deref().unwrap_or("in-memory archive");
@@ -960,9 +960,9 @@ impl EventLoop {
     }
 
     fn selected_handoff(
-        snapshot: &crate::brain::store::BrainSnapshot,
+        snapshot: &crate::brain::BrainSnapshot,
         requested: Option<&str>,
-    ) -> Result<crate::brain::store::BrainRunnerHandoff> {
+    ) -> Result<crate::brain::BrainRunnerHandoff> {
         let handoff = snapshot
             .runner_handoff
             .clone()
@@ -978,25 +978,25 @@ impl EventLoop {
 
     async fn remote_handoff_control_client(
         &self,
-        target: crate::brain::remote::RemoteBrainTarget,
+        target: crate::brain::RemoteBrainTarget,
     ) -> Result<(
-        crate::brain::remote::RemoteBrainClient,
-        tokio::sync::mpsc::UnboundedReceiver<crate::brain::store::BrainWireMessage>,
+        crate::brain::RemoteBrainClient,
+        tokio::sync::mpsc::UnboundedReceiver<crate::brain::BrainWireMessage>,
     )> {
         let password = crate::config::load_config()
             .map(|config| config.server.brain_password)
             .unwrap_or_default();
-        let mut client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        let mut client = crate::brain::RemoteBrainClient::new(target, password)?;
         client
             .authorize_runner_handoff_control(
                 &self.participant_subject,
-                crate::brain::store::AttachmentRole::Driver,
+                crate::brain::AttachmentRole::Driver,
             )
             .await?;
         client
             .attach(
                 &self.participant_subject,
-                crate::brain::store::AttachmentRole::Driver,
+                crate::brain::AttachmentRole::Driver,
                 None,
             )
             .await?;
@@ -1087,7 +1087,7 @@ impl EventLoop {
     async fn restore_runner_after_failed_handoff(
         &mut self,
         ipc: &crate::ipc::IpcClient,
-        previous: Option<(String, crate::brain::store::BrainEnvironment)>,
+        previous: Option<(String, crate::brain::BrainEnvironment)>,
     ) -> Result<()> {
         let Some((brain, environment)) = previous else {
             return Ok(());
@@ -1142,7 +1142,7 @@ impl EventLoop {
     async fn fail_handoff_and_restore_runner(
         &mut self,
         ipc: &crate::ipc::IpcClient,
-        previous: Option<(String, crate::brain::store::BrainEnvironment)>,
+        previous: Option<(String, crate::brain::BrainEnvironment)>,
         error: anyhow::Error,
     ) -> anyhow::Error {
         match self
@@ -1176,7 +1176,7 @@ impl EventLoop {
                 .daemon_base_url
                 .as_deref()
                 .context("local daemon is unavailable")?;
-            let local = crate::brain::remote::RemoteBrainTarget::local(&snapshot.name, base)?;
+            let local = crate::brain::RemoteBrainTarget::local(&snapshot.name, base)?;
             anyhow::ensure!(
                 selected_target.address == local.address,
                 "runner handoff acceptance must run on the Brain environment host"
@@ -1298,7 +1298,7 @@ mod brain_handler_tests {
     #[test]
     fn frontend_environment_requires_the_exact_machine_and_workspace() {
         let temp = tempfile::tempdir().unwrap();
-        let expected = crate::brain::store::BrainEnvironment {
+        let expected = crate::brain::BrainEnvironment {
             machine: "workstation.local".into(),
             workspace: temp.path().to_path_buf(),
             generation: 1,
@@ -1319,12 +1319,12 @@ mod brain_handler_tests {
 
     #[test]
     fn participant_label_distinguishes_two_consoles_for_one_subject() {
-        let attachment = crate::brain::store::BrainAttachment {
-            attachment_id: crate::brain::store::AttachmentId(
+        let attachment = crate::brain::BrainAttachment {
+            attachment_id: crate::brain::AttachmentId(
                 uuid::Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap(),
             ),
             subject: "alice@workstation.local".into(),
-            role: crate::brain::store::AttachmentRole::Driver,
+            role: crate::brain::AttachmentRole::Driver,
             acknowledged_seq: 0,
             connected: true,
             connection_id: None,
@@ -1337,8 +1337,8 @@ mod brain_handler_tests {
 
     #[test]
     fn runner_reconnect_recovers_lease_hidden_by_failed_initial_registration() {
-        let observed_id = crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4());
-        let observed = crate::brain::store::BrainRunnerLease {
+        let observed_id = crate::brain::RunnerLeaseId(uuid::Uuid::new_v4());
+        let observed = crate::brain::BrainRunnerLease {
             lease_id: observed_id,
             subject: "runner/frontend-stable".into(),
             environment_generation: 1,
@@ -1363,8 +1363,8 @@ mod brain_handler_tests {
             None
         );
 
-        let foreign = crate::brain::store::BrainRunnerLease {
-            lease_id: crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4()),
+        let foreign = crate::brain::BrainRunnerLease {
+            lease_id: crate::brain::RunnerLeaseId(uuid::Uuid::new_v4()),
             subject: "another/frontend".into(),
             environment_generation: 1,
             acquired_ms: 10,
@@ -1383,7 +1383,7 @@ mod brain_handler_tests {
 
     #[test]
     fn callback_loss_retains_lease_identity_until_an_explicit_handoff() {
-        let lease_id = crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4());
+        let lease_id = crate::brain::RunnerLeaseId(uuid::Uuid::new_v4());
         assert_eq!(
             lease_id_after_registration(Some(lease_id), None, false, false),
             Some(lease_id)
@@ -1396,16 +1396,16 @@ mod brain_handler_tests {
 
     #[test]
     fn handed_off_runner_lease_cannot_fall_back_to_a_new_identity() {
-        let old_id = crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4());
-        let handoff_id = crate::brain::store::RunnerHandoffId(uuid::Uuid::new_v4());
-        let target_lease = crate::brain::store::BrainRunnerLease {
-            lease_id: crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4()),
+        let old_id = crate::brain::RunnerLeaseId(uuid::Uuid::new_v4());
+        let handoff_id = crate::brain::RunnerHandoffId(uuid::Uuid::new_v4());
+        let target_lease = crate::brain::BrainRunnerLease {
+            lease_id: crate::brain::RunnerLeaseId(uuid::Uuid::new_v4()),
             subject: "target/frontend".into(),
             environment_generation: 1,
             acquired_ms: 10,
             expires_ms: u64::MAX,
         };
-        let handoff = crate::brain::store::BrainRunnerHandoff {
+        let handoff = crate::brain::BrainRunnerHandoff {
             handoff_id,
             from_lease_id: old_id,
             requested_by: "source/frontend".into(),
@@ -1415,10 +1415,10 @@ mod brain_handler_tests {
             expires_ms: 20,
         };
         let events = vec![
-            test_runner_event(crate::brain::store::BrainEventKind::RunnerHandoffRequested {
+            test_runner_event(crate::brain::BrainEventKind::RunnerHandoffRequested {
                 handoff,
             }),
-            test_runner_event(crate::brain::store::BrainEventKind::RunnerHandoffCompleted {
+            test_runner_event(crate::brain::BrainEventKind::RunnerHandoffCompleted {
                 handoff_id,
                 lease: target_lease.clone(),
             }),
@@ -1431,13 +1431,13 @@ mod brain_handler_tests {
     }
 
     fn test_runner_snapshot(
-        runner_lease: Option<crate::brain::store::BrainRunnerLease>,
-        events: Vec<crate::brain::store::BrainEvent>,
-    ) -> crate::brain::store::BrainSnapshot {
-        crate::brain::store::BrainSnapshot {
-            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+        runner_lease: Option<crate::brain::BrainRunnerLease>,
+        events: Vec<crate::brain::BrainEvent>,
+    ) -> crate::brain::BrainSnapshot {
+        crate::brain::BrainSnapshot {
+            brain_id: crate::brain::BrainId(uuid::Uuid::new_v4()),
             name: "shared".into(),
-            environment: crate::brain::store::BrainEnvironment {
+            environment: crate::brain::BrainEnvironment {
                 machine: "box.local".into(),
                 workspace: std::path::PathBuf::from("/tmp"),
                 generation: 1,
@@ -1457,11 +1457,11 @@ mod brain_handler_tests {
     }
 
     fn test_runner_event(
-        kind: crate::brain::store::BrainEventKind,
-    ) -> crate::brain::store::BrainEvent {
-        crate::brain::store::BrainEvent {
+        kind: crate::brain::BrainEventKind,
+    ) -> crate::brain::BrainEvent {
+        crate::brain::BrainEvent {
             schema_version: 1,
-            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+            brain_id: crate::brain::BrainId(uuid::Uuid::new_v4()),
             seq: 1,
             environment_generation: 1,
             sender: "test".into(),

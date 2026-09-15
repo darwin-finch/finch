@@ -112,12 +112,8 @@ impl EventLoop {
                 .await;
             let brain_language = request.language;
             let language = match brain_language {
-                crate::brain::store::ProgramLanguage::Forth => {
-                    crate::programs::ProgramLanguage::Forth
-                }
-                crate::brain::store::ProgramLanguage::Lisp => {
-                    crate::programs::ProgramLanguage::Lisp
-                }
+                crate::brain::ProgramLanguage::Forth => crate::programs::ProgramLanguage::Forth,
+                crate::brain::ProgramLanguage::Lisp => crate::programs::ProgramLanguage::Lisp,
             };
             let submission = crate::runtime::ProgramSubmission {
                 language,
@@ -288,7 +284,7 @@ impl EventLoop {
             .ensure_remote_brain_run_projection(
                 request.run_id,
                 None,
-                crate::brain::store::BrainRunStatus::Running,
+                crate::brain::BrainRunStatus::Running,
             )
             .unit
             .clone();
@@ -396,7 +392,7 @@ impl EventLoop {
                 let Some(notice) = commit_rx.recv().await else {
                     return;
                 };
-                if notice.status == crate::brain::store::BrainRunStatus::Completed {
+                if notice.status == crate::brain::BrainRunStatus::Completed {
                     let _ = event_tx.send(ReplEvent::FrontendRestartReady {
                         brain,
                         run_id,
@@ -441,7 +437,7 @@ impl EventLoop {
     pub(super) async fn restart_frontend_after_brain_commit(
         &mut self,
         brain: String,
-        run_id: crate::brain::store::RunId,
+        run_id: crate::brain::RunId,
         restart: crate::tools::DeferredFrontendRestart,
     ) -> Result<()> {
         anyhow::ensure!(
@@ -567,18 +563,18 @@ impl EventLoop {
                 target.brain = brain;
                 (
                     target.clone(),
-                    crate::brain::remote::AttachedBrainClient::local(target, ipc),
+                    crate::brain::AttachedBrainClient::local(target, ipc),
                     false,
                 )
             }
             BrainAttachmentRoute::RemoteInvitation { target, invitation } => {
-                let remote = crate::brain::remote::RemoteBrainClient::new_with_invitation(
+                let remote = crate::brain::RemoteBrainClient::new_with_invitation(
                     target.clone(),
                     invitation,
                 )?;
                 (
                     target,
-                    crate::brain::remote::AttachedBrainClient::remote(remote),
+                    crate::brain::AttachedBrainClient::remote(remote),
                     true,
                 )
             }
@@ -601,7 +597,7 @@ impl EventLoop {
             client
                 .attach_persistent(
                     &self.participant_subject,
-                    crate::brain::store::AttachmentRole::Driver,
+                    crate::brain::AttachmentRole::Driver,
                     &self.session_label,
                 )
                 .await
@@ -627,8 +623,8 @@ impl EventLoop {
             }
         };
         let snapshot = match incoming.recv().await {
-            Some(crate::brain::store::BrainWireMessage::Snapshot { brain }) => brain,
-            Some(crate::brain::store::BrainWireMessage::Event { .. }) => {
+            Some(crate::brain::BrainWireMessage::Snapshot { brain }) => brain,
+            Some(crate::brain::BrainWireMessage::Event { .. }) => {
                 self.output_manager.write_info(format!(
                     "brain attach {}: event stream did not begin with a snapshot",
                     client.target.display_name()
@@ -653,7 +649,7 @@ impl EventLoop {
         self.todo_journal_target
             .set(self.active_remote_brain.clone());
         self.update_remote_brain_status(runner_online);
-        self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
+        self.render_remote_brain_message(crate::brain::BrainWireMessage::Snapshot {
             brain: snapshot,
         })
         .await?;
@@ -689,9 +685,9 @@ impl EventLoop {
             );
         }
         let role = match role.to_ascii_lowercase().as_str() {
-            "driver" => crate::brain::store::AttachmentRole::Driver,
-            "consultant" => crate::brain::store::AttachmentRole::Consultant,
-            "observer" => crate::brain::store::AttachmentRole::Observer,
+            "driver" => crate::brain::AttachmentRole::Driver,
+            "consultant" => crate::brain::AttachmentRole::Consultant,
+            "observer" => crate::brain::AttachmentRole::Observer,
             _ => anyhow::bail!("role must be driver, consultant, or observer"),
         };
         let home = self
@@ -702,20 +698,19 @@ impl EventLoop {
             .daemon_base_url
             .as_deref()
             .context("this console is not connected to its local daemon")?;
-        let target =
-            crate::brain::remote::RemoteBrainTarget::local(&home.target.brain, daemon_base_url)?;
+        let target = crate::brain::RemoteBrainTarget::local(&home.target.brain, daemon_base_url)?;
         let config = crate::config::load_config().context("load Brain collaboration settings")?;
         anyhow::ensure!(
             config.server.advertise,
             "remote Brain collaboration is disabled; enable LAN discovery/advertisement before issuing an invitation"
         );
-        let recipient_target = crate::brain::remote::RemoteBrainTarget::invitation_recipient(
+        let recipient_target = crate::brain::RemoteBrainTarget::invitation_recipient(
             &home.target.brain,
             &home.target.machine,
             &config.server.brain_bind_address,
         )?;
         let password = config.server.brain_password;
-        let client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        let client = crate::brain::RemoteBrainClient::new(target, password)?;
         let ttl_ms = ttl_minutes
             .map(|minutes| {
                 minutes
@@ -724,7 +719,7 @@ impl EventLoop {
             })
             .transpose()?;
         let (invitation, claims) = client.issue_invitation(role, ttl_ms).await?;
-        let invitation_client = crate::brain::remote::RemoteBrainClient::new_with_invitation(
+        let invitation_client = crate::brain::RemoteBrainClient::new_with_invitation(
             recipient_target.clone(),
             invitation.clone(),
         )?;
@@ -743,10 +738,10 @@ impl EventLoop {
 
     pub(super) async fn render_remote_brain_message(
         &mut self,
-        message: crate::brain::store::BrainWireMessage,
+        message: crate::brain::BrainWireMessage,
     ) -> Result<()> {
         match message {
-            crate::brain::store::BrainWireMessage::Snapshot { brain } => {
+            crate::brain::BrainWireMessage::Snapshot { brain } => {
                 self.update_remote_brain_status(brain.runner_lease.is_some());
                 let local_machine = self
                     .selected_brain()
@@ -791,7 +786,7 @@ impl EventLoop {
                     brain.revision,
                 );
             }
-            crate::brain::store::BrainWireMessage::Event { event } => {
+            crate::brain::BrainWireMessage::Event { event } => {
                 if !advance_brain_projection_revision(
                     &mut self.brain_projection_revisions,
                     event.brain_id,
@@ -800,10 +795,10 @@ impl EventLoop {
                     return Ok(());
                 }
                 match &event.kind {
-                    crate::brain::store::BrainEventKind::RunnerLeaseAcquired { .. } => {
+                    crate::brain::BrainEventKind::RunnerLeaseAcquired { .. } => {
                         self.update_remote_brain_status(true);
                     }
-                    crate::brain::store::BrainEventKind::RunnerLeaseReleased { .. } => {
+                    crate::brain::BrainEventKind::RunnerLeaseReleased { .. } => {
                         self.update_remote_brain_status(false);
                     }
                     _ => {}
@@ -830,11 +825,8 @@ impl EventLoop {
         self.render_tui().await
     }
 
-    pub(super) fn observe_remote_brain_approval(
-        &mut self,
-        event: &crate::brain::store::BrainEvent,
-    ) {
-        use crate::brain::store::BrainEventKind;
+    pub(super) fn observe_remote_brain_approval(&mut self, event: &crate::brain::BrainEvent) {
+        use crate::brain::BrainEventKind;
 
         match &event.kind {
             BrainEventKind::ApprovalRequested {
@@ -917,11 +909,8 @@ impl EventLoop {
         }
     }
 
-    pub(super) async fn render_remote_brain_event(
-        &mut self,
-        event: &crate::brain::store::BrainEvent,
-    ) {
-        use crate::brain::store::BrainEventKind;
+    pub(super) async fn render_remote_brain_event(&mut self, event: &crate::brain::BrainEvent) {
+        use crate::brain::BrainEventKind;
         let selected_brain_is_home = self.selected_brain_is_home();
         if project_remote_brain_live_run_event(
             &self.output_manager,
@@ -987,7 +976,7 @@ impl EventLoop {
                     .as_deref()
                     .map(|detail| format!("{}: {detail}", format!("{status:?}").to_lowercase()))
                     .unwrap_or_else(|| format!("{status:?}").to_lowercase());
-                if *status == crate::brain::store::BrainRunStatus::Failed {
+                if *status == crate::brain::BrainRunStatus::Failed {
                     projection.unit.fail_row(projection.status_row, summary);
                 } else {
                     projection.unit.complete_row(projection.status_row, summary);
@@ -1004,8 +993,8 @@ impl EventLoop {
                 if let Some(run_id) = event.run_id {
                     let projection = self.ensure_remote_brain_run_projection(
                         run_id,
-                        Some(crate::brain::store::BrainRunKind::Speculative),
-                        crate::brain::store::BrainRunStatus::QueuedForEnvironment,
+                        Some(crate::brain::BrainRunKind::Speculative),
+                        crate::brain::BrainRunStatus::QueuedForEnvironment,
                     );
                     let row = projection.unit.add_activity_row("prompt");
                     projection.unit.complete_row_with_body(
@@ -1185,11 +1174,11 @@ impl EventLoop {
                     let projection = self.ensure_remote_brain_run_projection(
                         run_id,
                         None,
-                        crate::brain::store::BrainRunStatus::Running,
+                        crate::brain::BrainRunStatus::Running,
                     );
                     let language = match language {
-                        crate::brain::store::ProgramLanguage::Forth => "Co-Forth",
-                        crate::brain::store::ProgramLanguage::Lisp => "Lisp",
+                        crate::brain::ProgramLanguage::Forth => "Co-Forth",
+                        crate::brain::ProgramLanguage::Lisp => "Lisp",
                     };
                     let row = projection.program_row.unwrap_or_else(|| {
                         projection
@@ -1208,8 +1197,8 @@ impl EventLoop {
                     return;
                 }
                 let language = match language {
-                    crate::brain::store::ProgramLanguage::Forth => "forth",
-                    crate::brain::store::ProgramLanguage::Lisp => "lisp",
+                    crate::brain::ProgramLanguage::Forth => "forth",
+                    crate::brain::ProgramLanguage::Lisp => "lisp",
                 };
                 let unit = self
                     .output_manager
@@ -1237,7 +1226,7 @@ impl EventLoop {
                     let projection = self.ensure_remote_brain_run_projection(
                         run_id,
                         None,
-                        crate::brain::store::BrainRunStatus::Running,
+                        crate::brain::BrainRunStatus::Running,
                     );
                     let row = projection.unit.add_activity_row("result");
                     if let Some(error) = error {

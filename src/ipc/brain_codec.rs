@@ -1,11 +1,11 @@
-use crate::brain::store::{
+use crate::brain::{
     AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
     BrainEvent, BrainEventKind, BrainId, BrainProgram, BrainRun, BrainRunKind, BrainRunStatus,
     BrainRunnerHandoff, BrainRunnerLease, BrainSchedule, BrainScheduleDeliveryPolicy,
     BrainScheduleDue, BrainScheduleModuleIdentity, BrainSnapshot, BrainWireMessage, ConnectionId,
     ProgramLanguage, RunId, RunnerHandoffId, RunnerLeaseId, ScheduleId,
 };
-use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
+use crate::brain::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
 use sha2::Digest;
 
@@ -1431,16 +1431,16 @@ pub(super) fn encode_event(
         BrainEventKind::MutationRecorded { outcome } => {
             let mut recorded = builder.init_mutation_recorded();
             match outcome {
-                crate::brain::store::BrainMutationOutcome::RunCancellationReserved { run_id } => {
+                crate::brain::BrainMutationOutcome::RunCancellationReserved { run_id } => {
                     recorded.set_run_cancellation_reserved(&run_id.0.to_string())
                 }
-                crate::brain::store::BrainMutationOutcome::RunAlreadyCancelled { run_id } => {
+                crate::brain::BrainMutationOutcome::RunAlreadyCancelled { run_id } => {
                     recorded.set_run_already_cancelled(&run_id.0.to_string())
                 }
-                crate::brain::store::BrainMutationOutcome::RunCancellationNoop { run_id } => {
+                crate::brain::BrainMutationOutcome::RunCancellationNoop { run_id } => {
                     recorded.set_run_cancellation_noop(&run_id.0.to_string())
                 }
-                crate::brain::store::BrainMutationOutcome::RunCancellationDispatching {
+                crate::brain::BrainMutationOutcome::RunCancellationDispatching {
                     run_id,
                     mutation_id,
                 } => {
@@ -1448,7 +1448,7 @@ pub(super) fn encode_event(
                     progress.set_run_id(&run_id.0.to_string());
                     progress.set_mutation_id(&mutation_id.to_string());
                 }
-                crate::brain::store::BrainMutationOutcome::RunCancellationReconciled {
+                crate::brain::BrainMutationOutcome::RunCancellationReconciled {
                     run_id,
                     mutation_id,
                 } => {
@@ -1456,13 +1456,13 @@ pub(super) fn encode_event(
                     progress.set_run_id(&run_id.0.to_string());
                     progress.set_mutation_id(&mutation_id.to_string());
                 }
-                crate::brain::store::BrainMutationOutcome::ScheduleCancellationNoop {
-                    schedule_id,
-                } => recorded.set_schedule_cancellation_noop(&schedule_id.0.to_string()),
-                crate::brain::store::BrainMutationOutcome::HandoffCancellationNoop {
-                    handoff_id,
-                } => recorded.set_handoff_cancellation_noop(&handoff_id.0.to_string()),
-                crate::brain::store::BrainMutationOutcome::ApprovalDecisionDelivered {
+                crate::brain::BrainMutationOutcome::ScheduleCancellationNoop { schedule_id } => {
+                    recorded.set_schedule_cancellation_noop(&schedule_id.0.to_string())
+                }
+                crate::brain::BrainMutationOutcome::HandoffCancellationNoop { handoff_id } => {
+                    recorded.set_handoff_cancellation_noop(&handoff_id.0.to_string())
+                }
+                crate::brain::BrainMutationOutcome::ApprovalDecisionDelivered {
                     request_seq,
                     approval_id,
                     mutation_id,
@@ -1667,7 +1667,7 @@ pub(super) fn decode_event(
     use finch_ipc_capnp::brain_event::Which;
     let kind = match reader.which()? {
         Which::MutationRecorded(recorded) => {
-            use crate::brain::store::BrainMutationOutcome;
+            use crate::brain::BrainMutationOutcome;
             use finch_ipc_capnp::brain_mutation_outcome::Which as Outcome;
             let outcome = match recorded?.which()? {
                 Outcome::RunCancellationReserved(value) => {
@@ -1697,7 +1697,7 @@ pub(super) fn decode_event(
                 }
                 Outcome::ScheduleCancellationNoop(value) => {
                     BrainMutationOutcome::ScheduleCancellationNoop {
-                        schedule_id: crate::brain::store::ScheduleId(parse_uuid(value?)?),
+                        schedule_id: crate::brain::ScheduleId(parse_uuid(value?)?),
                     }
                 }
                 Outcome::HandoffCancellationNoop(value) => {
@@ -1904,7 +1904,7 @@ pub(super) fn decode_event(
             .then(|| reader.get_mutation())
             .transpose()?
             .map(|mutation| -> anyhow::Result<_> {
-                Ok(crate::brain::store::BrainMutationReceipt {
+                Ok(crate::brain::BrainMutationReceipt {
                     mutation_id: parse_uuid(mutation.get_mutation_id()?)?,
                     attachment_id: AttachmentId(parse_uuid(mutation.get_attachment_id()?)?),
                     expected_revision: mutation.get_expected_revision(),
@@ -2293,7 +2293,7 @@ mod tests {
                 text: "inspect it".into(),
             },
         );
-        accepted.mutation = Some(crate::brain::store::BrainMutationReceipt {
+        accepted.mutation = Some(crate::brain::BrainMutationReceipt {
             mutation_id: uuid::Uuid::new_v4(),
             attachment_id: attachment.attachment_id,
             expected_revision: 4,
