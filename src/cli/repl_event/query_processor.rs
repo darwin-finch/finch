@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
-use crate::claude::ContentBlock;
 use crate::cli::conversation::ConversationHistory;
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::repl::ReplMode;
@@ -16,6 +15,7 @@ use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::TuiRenderer;
 use crate::generators::{Generator, StreamChunk};
 use crate::models::GeneratorState;
+use crate::providers::ContentBlock;
 use crate::router::Router;
 use crate::tools::{ToolDefinition, ToolUse};
 
@@ -258,13 +258,13 @@ fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
 }
 
 fn wire_repair_messages(
-    messages: &[crate::claude::Message],
+    messages: &[crate::providers::Message],
     rejected_source: &str,
     diagnostic: &str,
-) -> Vec<crate::claude::Message> {
+) -> Vec<crate::providers::Message> {
     let mut repair_messages = messages.to_vec();
-    repair_messages.push(crate::claude::Message::assistant(rejected_source));
-    repair_messages.push(crate::claude::Message::user(
+    repair_messages.push(crate::providers::Message::assistant(rejected_source));
+    repair_messages.push(crate::providers::Message::user(
         crate::programs::wire_repair_request(rejected_source, diagnostic),
     ));
     repair_messages
@@ -275,7 +275,7 @@ fn wire_repair_messages(
 /// still provider turns and must receive the complete VM wire ABI. Reuse the
 /// most recent human text when possible; the fallback still produces the
 /// provider-neutral boot manifest when only tool-result blocks remain.
-fn vm_manifest_query(messages: &[crate::claude::Message], query: &str) -> String {
+fn vm_manifest_query(messages: &[crate::providers::Message], query: &str) -> String {
     if !query.trim().is_empty() {
         return query.to_string();
     }
@@ -383,7 +383,7 @@ async fn execute_wire_with_single_repair(
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     cancel: tokio_util::sync::CancellationToken,
     generator: Arc<dyn Generator>,
-    messages: &[crate::claude::Message],
+    messages: &[crate::providers::Message],
     source: String,
     metrics_logger: Option<&crate::metrics::MetricsLogger>,
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
@@ -1352,7 +1352,7 @@ pub(crate) async fn process_query_with_tools(
                     tracing::debug!("[EVENT_LOOP] Query state updated, staging assistant message");
                     // Keep the tool-bearing assistant message invisible until
                     // all matching results can be committed atomically.
-                    let assistant_message = crate::claude::Message {
+                    let assistant_message = crate::providers::Message {
                         role: "assistant".to_string(),
                         content: blocks.clone(),
                     };
@@ -1606,7 +1606,7 @@ pub(crate) async fn process_query_with_tools(
                     .await;
                 // Keep the tool-bearing assistant message invisible until
                 // all matching results can be committed atomically.
-                let assistant_message = crate::claude::Message {
+                let assistant_message = crate::providers::Message {
                     role: "assistant".to_string(),
                     content: response.content_blocks.clone(),
                 };
@@ -1781,12 +1781,12 @@ fn should_stream_responses(streaming_enabled: bool, provider_supports_streaming:
 }
 
 fn inject_persona_system_prompt(
-    messages: &mut Vec<crate::claude::Message>,
+    messages: &mut Vec<crate::providers::Message>,
     persona_system_prompt: String,
 ) {
     messages.insert(
         0,
-        crate::claude::Message {
+        crate::providers::Message {
             role: "system".to_string(),
             content: vec![ContentBlock::Text {
                 text: persona_system_prompt,
@@ -1796,7 +1796,7 @@ fn inject_persona_system_prompt(
 }
 
 fn inject_vm_manifest(
-    messages: &mut Vec<crate::claude::Message>,
+    messages: &mut Vec<crate::providers::Message>,
     manifest: &crate::programs::VmManifest,
 ) -> bool {
     let protocol = manifest.prompt_block();
@@ -1824,7 +1824,7 @@ fn inject_vm_manifest(
     // message. Do not fall back to smuggling the protocol into the user turn.
     messages.insert(
         0,
-        crate::claude::Message {
+        crate::providers::Message {
             role: "system".to_string(),
             content: vec![ContentBlock::Text { text: section }],
         },
@@ -1862,9 +1862,9 @@ fn fallback_vm_manifest() -> crate::programs::VmManifest {
 /// this, removing the orphan and following assistant would orphan the *next*
 /// tool_result; using a generic placeholder instead loses the task semantics.
 pub(crate) fn apply_sliding_window(
-    msgs: Vec<crate::claude::Message>,
+    msgs: Vec<crate::providers::Message>,
     max: usize,
-) -> Vec<crate::claude::Message> {
+) -> Vec<crate::providers::Message> {
     let keep_from = if max == 0 || msgs.len() <= max {
         0
     } else {
@@ -1924,7 +1924,7 @@ pub(crate) fn apply_sliding_window(
         if window.first().map(|m| m.role.as_str()) == Some("assistant") {
             window.insert(
                 0,
-                boundary_request.clone().unwrap_or_else(|| crate::claude::Message {
+                boundary_request.clone().unwrap_or_else(|| crate::providers::Message {
                     role: "user".to_string(),
                     content: vec![ContentBlock::Text {
                         text: "[Internal context boundary: this is not a new user request. Continue the retained tool-call transcript and complete its existing request.]".to_string(),
@@ -1994,7 +1994,7 @@ pub(crate) fn apply_sliding_window(
             if text_blocks.is_empty() {
                 window.remove(i);
             } else {
-                window[i] = crate::claude::Message {
+                window[i] = crate::providers::Message {
                     role: "assistant".to_string(),
                     content: text_blocks,
                 };
@@ -2053,7 +2053,7 @@ mod tests {
     impl Generator for PacedStreamGenerator {
         async fn generate(
             &self,
-            _messages: Vec<crate::claude::Message>,
+            _messages: Vec<crate::providers::Message>,
             _tools: Option<Vec<ToolDefinition>>,
         ) -> anyhow::Result<crate::generators::GeneratorResponse> {
             anyhow::bail!("paced streaming fixture must not use non-streaming generation")
@@ -2061,7 +2061,7 @@ mod tests {
 
         async fn generate_stream(
             &self,
-            _messages: Vec<crate::claude::Message>,
+            _messages: Vec<crate::providers::Message>,
             _tools: Option<Vec<ToolDefinition>>,
         ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
         {
@@ -2440,7 +2440,7 @@ mod tests {
 
     #[test]
     fn persona_is_request_local_and_owns_one_system_instruction() {
-        let original = vec![crate::claude::Message::user("hello")];
+        let original = vec![crate::providers::Message::user("hello")];
         let mut request = original.clone();
 
         inject_persona_system_prompt(&mut request, "CUSTOM PERSONA".into());
@@ -2465,9 +2465,9 @@ mod tests {
         custom.behavior.system_prompt = "CUSTOM OVERRIDE CONTENT".into();
         let reloaded = crate::config::Persona::load_builtin("analyst").unwrap();
 
-        let mut custom_request = vec![crate::claude::Message::user("first")];
+        let mut custom_request = vec![crate::providers::Message::user("first")];
         inject_persona_system_prompt(&mut custom_request, custom.to_system_message());
-        let mut reloaded_request = vec![crate::claude::Message::user("second")];
+        let mut reloaded_request = vec![crate::providers::Message::user("second")];
         inject_persona_system_prompt(&mut reloaded_request, reloaded.to_system_message());
 
         assert!(custom_request[0]
@@ -2636,7 +2636,7 @@ mod tests {
         conversation
             .write()
             .await
-            .add_message(crate::claude::Message {
+            .add_message(crate::providers::Message {
                 role: "user".into(),
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "tool-1".into(),
@@ -2703,7 +2703,7 @@ mod tests {
     impl Generator for SingleRepairGenerator {
         async fn generate(
             &self,
-            messages: Vec<crate::claude::Message>,
+            messages: Vec<crate::providers::Message>,
             _tools: Option<Vec<ToolDefinition>>,
         ) -> anyhow::Result<crate::generators::GeneratorResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -2733,7 +2733,7 @@ mod tests {
 
         async fn generate_stream(
             &self,
-            _messages: Vec<crate::claude::Message>,
+            _messages: Vec<crate::providers::Message>,
             _tools: Option<Vec<ToolDefinition>>,
         ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
         {
@@ -2760,7 +2760,7 @@ mod tests {
     impl Generator for BlockingRepairGenerator {
         async fn generate(
             &self,
-            _messages: Vec<crate::claude::Message>,
+            _messages: Vec<crate::providers::Message>,
             _tools: Option<Vec<ToolDefinition>>,
         ) -> anyhow::Result<crate::generators::GeneratorResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -2770,7 +2770,7 @@ mod tests {
 
         async fn generate_stream(
             &self,
-            _messages: Vec<crate::claude::Message>,
+            _messages: Vec<crate::providers::Message>,
             _tools: Option<Vec<ToolDefinition>>,
         ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
         {
@@ -2795,7 +2795,7 @@ mod tests {
 
     #[test]
     fn fallback_manifest_injects_the_vm_bootstrap_without_memtree() {
-        let mut messages = vec![crate::claude::Message {
+        let mut messages = vec![crate::providers::Message {
             role: "user".to_string(),
             content: vec![ContentBlock::Text {
                 text: "add two numbers".to_string(),
@@ -2830,13 +2830,13 @@ mod tests {
     #[test]
     fn manifest_joins_an_existing_system_instruction_not_the_user_turn() {
         let mut messages = vec![
-            crate::claude::Message {
+            crate::providers::Message {
                 role: "system".to_string(),
                 content: vec![ContentBlock::Text {
                     text: "You are Finch's coding assistant.".to_string(),
                 }],
             },
-            crate::claude::Message::user("say hello"),
+            crate::providers::Message::user("say hello"),
         ];
 
         assert!(inject_vm_manifest(&mut messages, &fallback_vm_manifest()));
@@ -2851,8 +2851,8 @@ mod tests {
     #[test]
     fn empty_tool_continuation_reuses_the_human_query_for_the_vm_manifest() {
         let messages = vec![
-            crate::claude::Message::user("hello finch"),
-            crate::claude::Message::assistant(""),
+            crate::providers::Message::user("hello finch"),
+            crate::providers::Message::assistant(""),
         ];
 
         assert_eq!(vm_manifest_query(&messages, ""), "hello finch");
@@ -3150,7 +3150,7 @@ mod tests {
             event_tx,
             tokio_util::sync::CancellationToken::new(),
             generator.clone(),
-            &[crate::claude::Message::user("reply")],
+            &[crate::providers::Message::user("reply")],
             source.clone(),
             Some(&metrics),
             None,
@@ -3216,7 +3216,7 @@ mod tests {
             event_tx,
             cancel,
             generator.clone(),
-            &[crate::claude::Message::user("reply")],
+            &[crate::providers::Message::user("reply")],
             source.clone(),
             None,
             None,
@@ -3253,7 +3253,7 @@ mod tests {
                     event_tx,
                     cancel,
                     generator,
-                    &[crate::claude::Message::user("reply")],
+                    &[crate::providers::Message::user("reply")],
                     source,
                     None,
                     None,
@@ -3279,7 +3279,7 @@ mod tests {
 
     #[test]
     fn wire_repair_prompt_preserves_the_rejected_program_and_requires_raw_source() {
-        let messages = vec![crate::claude::Message::user("say hello")];
+        let messages = vec![crate::providers::Message::user("say hello")];
         let repair = wire_repair_messages(&messages, "Hello!", "E-LINK-002: unknown word");
         assert_eq!(repair.len(), 3);
         assert_eq!(repair[1].role, "assistant");
@@ -3432,7 +3432,7 @@ mod tests {
             .await
             .stage_assistant(
                 query_id,
-                crate::claude::Message {
+                crate::providers::Message {
                     role: "assistant".to_string(),
                     content: vec![
                         ContentBlock::ToolUse {

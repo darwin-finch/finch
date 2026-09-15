@@ -575,7 +575,7 @@ pub enum BrainEventKind {
         /// Exact ordered provider/tool continuation. Legacy results decode as
         /// empty and retain their historical projection.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        continuation_messages: Vec<crate::claude::Message>,
+        continuation_messages: Vec<crate::providers::Message>,
         /// Provider identity/accounting captured at the completed invocation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         invocation_metadata: Option<crate::providers::InvocationMetadata>,

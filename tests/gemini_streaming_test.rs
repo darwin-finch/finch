@@ -7,10 +7,10 @@
 // 4. Multiple parts in a single response are handled correctly
 
 use anyhow::Result;
-use finch::claude::ContentBlock;
-use finch::claude::Message;
 use finch::generators::StreamChunk;
+use finch::providers::ContentBlock;
 use finch::providers::GeminiProvider;
+use finch::providers::Message;
 use finch::providers::{CapabilitySupport, LlmProvider, ProviderBackend, ProviderRequest};
 
 /// Test Gemini's exact attested optional capabilities.

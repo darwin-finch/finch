@@ -1,6 +1,6 @@
 // Conversation history manager for multi-turn interactions
 
-use crate::claude::{ContentBlock, Message};
+use crate::providers::{ContentBlock, Message};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -686,7 +686,7 @@ impl<'a> ConversationCompactor<'a> {
     ///
     /// Returns the compacted conversation history or an error if compaction fails
     pub async fn compact(&self, history: &mut ConversationHistory) -> anyhow::Result<()> {
-        use crate::claude::types::ContentBlock;
+        use crate::providers::ContentBlock;
         use crate::providers::ProviderRequest;
 
         // Check if compaction is needed

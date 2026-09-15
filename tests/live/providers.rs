@@ -7,7 +7,7 @@
 // Run all: ./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_
 // Run one: ./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 ANTHROPIC_API_KEY=... cargo test -- --include-ignored live_claude_minimal
 
-use finch::claude::Message;
+use finch::providers::Message;
 use finch::providers::ProviderRequest;
 
 use crate::{live_tests_enabled, make_provider, resolve_api_key};

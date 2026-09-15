@@ -16,8 +16,9 @@ use super::types::{
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::claude::retry::{with_retry, NonRetriableError};
 use crate::claude::streaming::StreamEvent;
-use crate::claude::types::{ContentBlock, MessageRequest};
+use crate::claude::MessageRequest;
 use crate::config::DEFAULT_CLAUDE_MODEL;
+use crate::providers::ContentBlock;
 
 const CLAUDE_API_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -152,7 +153,7 @@ impl ClaudeProvider {
             anyhow::bail!("{}", msg);
         }
 
-        let message_response: crate::claude::types::MessageResponse = response
+        let message_response: crate::claude::MessageResponse = response
             .json()
             .await
             .context("Failed to parse Claude API response")?;
@@ -532,9 +533,9 @@ mod tests {
         )
         .unwrap();
         let mut stream = provider
-            .send_message_stream_once(&ProviderRequest::new(vec![crate::claude::Message::user(
-                "inspect",
-            )]))
+            .send_message_stream_once(&ProviderRequest::new(vec![
+                crate::providers::Message::user("inspect"),
+            ]))
             .await
             .unwrap();
         let mut tool_blocks = 0;
@@ -562,8 +563,8 @@ mod tests {
 
     #[test]
     fn provider_request_boundary_observes_only_complete_tool_pairs() {
-        use crate::claude::{ContentBlock, Message};
         use crate::cli::ConversationHistory;
+        use crate::providers::{ContentBlock, Message};
 
         let provider = ClaudeProvider::new("test-key".to_string()).unwrap();
         let query_id = uuid::Uuid::new_v4();
@@ -628,7 +629,7 @@ mod tests {
 
         provider
             .send_message(&ProviderRequest::new(vec![
-                crate::claude::types::Message::user("hello"),
+                crate::providers::Message::user("hello"),
             ]))
             .await
             .unwrap();

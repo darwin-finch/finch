@@ -13,4 +13,8 @@
 ## Key files
 
 - `src/claude/client.rs` — `ClaudeClient`, `send_message()`, `send_message_stream()`
-- `src/claude/types.rs` — API request/response types
+- `src/claude/types.rs` — Claude-API request/response envelopes only
+  (`MessageRequest`, `MessageResponse`). The universal conversation types
+  (`Message`, `ContentBlock`, `ImageSource`) live in
+  `crate::providers::wire_types` and are used through the providers facade;
+  this client consumes them like any other transport.

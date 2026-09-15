@@ -10,8 +10,8 @@
 //
 // Run: ./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_impcpd
 
-use finch::claude::Message;
 use finch::planning::{CritiqueItem, IMPCPD_METHODOLOGY};
+use finch::providers::Message;
 use finch::providers::ProviderRequest;
 
 use crate::{all_available_providers, live_tests_enabled, make_provider, resolve_api_key};

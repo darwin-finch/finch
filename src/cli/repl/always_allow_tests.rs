@@ -20,7 +20,7 @@ struct NameAuditGenerator;
 impl Generator for NameAuditGenerator {
     async fn generate(
         &self,
-        _messages: Vec<crate::claude::Message>,
+        _messages: Vec<crate::providers::Message>,
         _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<GeneratorResponse> {
         anyhow::bail!("name-audit generator is not invoked")
@@ -28,7 +28,7 @@ impl Generator for NameAuditGenerator {
 
     async fn generate_stream(
         &self,
-        _messages: Vec<crate::claude::Message>,
+        _messages: Vec<crate::providers::Message>,
         _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<
         Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,

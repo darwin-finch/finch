@@ -186,13 +186,13 @@ mod tests {
     fn request_system_messages_reach_native_provider_system_field_once() {
         let client = ClaudeClient::with_provider(Box::new(ConfiguredProvider));
         let request = MessageRequest::with_context(vec![
-            crate::claude::Message::with_content(
+            crate::providers::Message::with_content(
                 "system",
-                vec![crate::claude::ContentBlock::text(
+                vec![crate::providers::ContentBlock::text(
                     "SELECTED PERSONA\n\n## Finch VM wire protocol\nWIRE",
                 )],
             ),
-            crate::claude::Message::user("Hello"),
+            crate::providers::Message::user("Hello"),
         ])
         .with_system("PROVIDER BOOT");
 

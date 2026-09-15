@@ -1,7 +1,7 @@
 //! Bounded child-agent scheduler with structured fork/join results.
 
-use crate::claude::{ContentBlock, Message};
 use crate::generators::Generator;
+use crate::providers::{ContentBlock, Message};
 use crate::runtime::ProgramRuntime;
 // The boundary vocabulary lives below this module; re-exported so existing callers keep working.
 pub use crate::runtime::{

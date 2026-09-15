@@ -83,7 +83,7 @@ impl QueryStateManager {
     /// Publish a text-only provider completion while holding the same state lock used by cancellation.
     pub async fn try_publish_completion(&self, query_id: Uuid, response: String, source_for_history: String, conversation: &Arc<RwLock<crate::cli::conversation::ConversationHistory>>) -> bool;
     /// Atomically publish a provider completion with its ordered opaque continuation blocks intact.
-    pub async fn try_publish_completion_content(&self, query_id: Uuid, response: String, content: Vec<crate::claude::ContentBlock>, conversation: &Arc<RwLock<crate::cli::conversation::ConversationHistory>>) -> bool;
+    pub async fn try_publish_completion_content(&self, query_id: Uuid, response: String, content: Vec<crate::providers::ContentBlock>, conversation: &Arc<RwLock<crate::cli::conversation::ConversationHistory>>) -> bool;
     /// Update the state of a query
     pub async fn update_state(&self, query_id: Uuid, state: QueryState);
     /// Create a new query state manager

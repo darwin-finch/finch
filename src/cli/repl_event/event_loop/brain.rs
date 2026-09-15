@@ -253,7 +253,7 @@ impl EventLoop {
 
         let mut context = request.context;
         if context.is_empty() {
-            context.push(crate::claude::Message::user(request.prompt.clone()));
+            context.push(crate::providers::Message::user(request.prompt.clone()));
         }
         self.conversation
             .write()

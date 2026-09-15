@@ -8,8 +8,8 @@ use reqwest::{header, Client};
 use std::time::Duration;
 use tracing::{debug, error, info};
 
-use crate::claude::{ContentBlock, Message};
 use crate::daemon::ensure_daemon_running;
+use crate::providers::{ContentBlock, Message};
 use crate::server::openai_types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionDefinition, Tool,
 };

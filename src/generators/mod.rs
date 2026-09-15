@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::claude::{ContentBlock, Message};
+use crate::providers::{ContentBlock, Message};
 use crate::tools::ToolDefinition;
 
 pub(crate) const MAX_RESPONSE_MODEL_BYTES: usize = 256;
@@ -212,7 +212,7 @@ impl ToolUse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::ContentBlock;
+    use crate::providers::ContentBlock;
     use std::path::{Path, PathBuf};
 
     fn make_tool_use(id: &str, name: &str) -> ToolUse {

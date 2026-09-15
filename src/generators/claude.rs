@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::claude::{ClaudeClient, ContentBlock, Message, MessageRequest};
+use crate::claude::{ClaudeClient, MessageRequest};
 use crate::context::{collect_instructions, InstructionSources};
+use crate::providers::{ContentBlock, Message};
 use crate::tools::ToolDefinition;
 
 use super::{

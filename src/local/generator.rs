@@ -118,7 +118,7 @@ impl TemplateGenerator {
     /// Calls the callback for each generated token with (token_id, token_text).
     pub fn generate_streaming<F>(
         &mut self,
-        messages: &[crate::claude::Message],
+        messages: &[crate::providers::Message],
         token_callback: F,
     ) -> Result<Option<crate::generators::GeneratorResponse>>
     where
@@ -131,7 +131,7 @@ impl TemplateGenerator {
             .find(|m| m.role == "user")
             .and_then(|m| {
                 m.content.iter().find_map(|block| match block {
-                    crate::claude::ContentBlock::Text { text } => Some(text.as_str()),
+                    crate::providers::ContentBlock::Text { text } => Some(text.as_str()),
                     _ => None,
                 })
             })
@@ -146,7 +146,7 @@ impl TemplateGenerator {
 
                     let response = crate::generators::GeneratorResponse {
                         text: neural_response.clone(),
-                        content_blocks: vec![crate::claude::ContentBlock::Text {
+                        content_blocks: vec![crate::providers::ContentBlock::Text {
                             text: neural_response.clone(),
                         }],
                         tool_uses: vec![],

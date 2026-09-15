@@ -123,9 +123,9 @@ async fn exec_node(
 
     let text_result = match generator
         .generate(
-            vec![crate::claude::Message {
+            vec![crate::providers::Message {
                 role: "user".to_string(),
-                content: vec![crate::claude::ContentBlock::Text { text: prompt }],
+                content: vec![crate::providers::ContentBlock::Text { text: prompt }],
             }],
             None,
         )
