@@ -30,6 +30,24 @@ impl ClaudeProvider {
     /// Create with custom default model
     pub fn with_model(mut self, model: impl Into<String>) -> Self;
 }
+/// Content block - supports text, image, tool_use, and tool_result
+pub enum ContentBlock { Text, Image, ToolUse, ToolResult, OpaqueReasoning }
+impl ContentBlock {
+    /// Extract text from text block
+    pub fn as_text(&self) -> Option<&str>;
+    /// Create a base64 image content block
+    pub fn image(media_type: impl Into<String>, base64_data: impl Into<String>) -> Self;
+    /// Check if this is a text block
+    pub fn is_text(&self) -> bool;
+    /// Check if this is a tool use block
+    pub fn is_tool_use(&self) -> bool;
+    /// Create an opaque provider continuation block.
+    pub fn opaque_reasoning(encrypted_content: impl Into<String>) -> Self;
+    /// Create a text content block
+    pub fn text(text: impl Into<String>) -> Self;
+    /// Create a tool result content block
+    pub fn tool_result(tool_use_id: String, content: String, is_error: Option<bool>) -> Self;
+}
 /// Context limits for a model, preserving the unit used by the boundary.
 pub struct ContextWindowCapability { … }
 impl ContextWindowCapability {
@@ -64,10 +82,33 @@ impl GeminiProvider {
     /// Create with custom default model
     pub fn with_model(mut self, model: impl Into<String>) -> Self;
 }
+/// Source for an image content block
+pub struct ImageSource { … }
 /// Provider-neutral identity and accounting for one completed inference.
 pub struct InvocationMetadata { … }
 impl InvocationMetadata {
     pub fn validate(&self) -> anyhow::Result<()>;
+}
+pub struct Message { … }
+impl Message {
+    /// Add a content block to this message
+    pub fn add_content(mut self, block: ContentBlock) -> Self;
+    /// Add tool result to this message
+    pub fn add_tool_result(mut self, tool_use_id: String, result: String, is_error: bool) -> Self;
+    /// Create an assistant message with text content
+    pub fn assistant(content: impl Into<String>) -> Self;
+    /// Check if message contains tool results
+    pub fn has_tool_results(&self) -> bool;
+    /// Check if message has no text content
+    pub fn is_empty_text(&self) -> bool;
+    /// Extract text from the message
+    pub fn text(&self) -> String;
+    /// Extract text content from this message
+    pub fn text_content(&self) -> String;
+    /// Create a user message with text content
+    pub fn user(content: impl Into<String>) -> Self;
+    /// Create a message with rich content blocks
+    pub fn with_content(role: impl Into<String>, content: Vec<ContentBlock>) -> Self;
 }
 /// Capabilities of one exact provider/model pair.
 pub struct ModelCapabilities { … }

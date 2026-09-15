@@ -346,14 +346,14 @@ struct ProviderSubmitProgramGenerator {
 impl crate::generators::Generator for ProviderSubmitProgramGenerator {
     async fn generate(
         &self,
-        _messages: Vec<crate::claude::Message>,
+        _messages: Vec<crate::providers::Message>,
         _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<crate::generators::GeneratorResponse> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         anyhow::ensure!(call == 0, "provider continuation escaped cancellation");
         Ok(crate::generators::GeneratorResponse {
             text: String::new(),
-            content_blocks: vec![crate::claude::ContentBlock::ToolUse {
+            content_blocks: vec![crate::providers::ContentBlock::ToolUse {
                 id: "effect-tool".into(),
                 name: "submit_program".into(),
                 input: self.input.clone(),
@@ -379,7 +379,7 @@ impl crate::generators::Generator for ProviderSubmitProgramGenerator {
 
     async fn generate_stream(
         &self,
-        _messages: Vec<crate::claude::Message>,
+        _messages: Vec<crate::providers::Message>,
         _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<
         Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
@@ -2162,30 +2162,30 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         super::super::brain_codec::encode_continuation_messages(
             result.reborrow().init_continuation_messages(3),
             &[
-                crate::claude::Message::with_content(
+                crate::providers::Message::with_content(
                     "assistant",
                     vec![
-                        crate::claude::ContentBlock::opaque_reasoning("opaque-tool-token"),
-                        crate::claude::ContentBlock::ToolUse {
+                        crate::providers::ContentBlock::opaque_reasoning("opaque-tool-token"),
+                        crate::providers::ContentBlock::ToolUse {
                             id: "tool-1".into(),
                             name: "search_word".into(),
                             input: serde_json::json!({"query":"fib"}),
                         },
                     ],
                 ),
-                crate::claude::Message::with_content(
+                crate::providers::Message::with_content(
                     "user",
-                    vec![crate::claude::ContentBlock::tool_result(
+                    vec![crate::providers::ContentBlock::tool_result(
                         "tool-1".into(),
                         "found".into(),
                         None,
                     )],
                 ),
-                crate::claude::Message::with_content(
+                crate::providers::Message::with_content(
                     "assistant",
                     vec![
-                        crate::claude::ContentBlock::opaque_reasoning("opaque-runner-token"),
-                        crate::claude::ContentBlock::text("(say \"done\")"),
+                        crate::providers::ContentBlock::opaque_reasoning("opaque-runner-token"),
+                        crate::providers::ContentBlock::text("(say \"done\")"),
                     ],
                 ),
             ],
@@ -2285,8 +2285,8 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
     assert!(matches!(
         decoded.continuation_messages.last().unwrap().content.as_slice(),
         [
-            crate::claude::ContentBlock::OpaqueReasoning { encrypted_content },
-            crate::claude::ContentBlock::Text { text },
+            crate::providers::ContentBlock::OpaqueReasoning { encrypted_content },
+            crate::providers::ContentBlock::Text { text },
         ] if encrypted_content == "opaque-runner-token" && text == "(say \"done\")"
     ));
     assert_eq!(

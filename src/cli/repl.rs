@@ -143,7 +143,7 @@ pub fn startup_identity_line() -> String {
 #[cfg(test)]
 mod disabled_training_tests {
     use super::*;
-    use crate::claude::ContentBlock;
+    use crate::providers::ContentBlock;
     use crate::providers::{
         CapabilitySupport, ModelCapabilities, ProviderBackend, ProviderResponse,
         ReasoningCapability, StreamChunk, ValidatedProviderRequest,
@@ -1087,7 +1087,10 @@ impl Repl {
         // that might emit tracing logs.
         if config.tui_enabled && is_interactive {
             // Disable stdout on the global OutputManager
-            // All output will go to buffer; TUI will render via insert_before()
+            // All output goes to the buffer; the TUI drains it via
+            // flush_output_safe() — complete messages are committed once into
+            // native scrollback above the live area, and live rows are erased
+            // and redrawn in place
             (*output_manager_arc).disable_stdout();
         }
 
@@ -1301,7 +1304,7 @@ impl Repl {
     async fn call_teacher(
         &self,
         request: &MessageRequest,
-    ) -> Result<crate::claude::types::MessageResponse> {
+    ) -> Result<crate::claude::MessageResponse> {
         use crate::providers::ProviderRequest;
 
         // Extract system message from messages array if not already set
@@ -1311,7 +1314,7 @@ impl Repl {
             for msg in &request.messages {
                 if msg.role == "system" && sys.is_none() {
                     sys = msg.content.iter().find_map(|c| {
-                        if let crate::claude::ContentBlock::Text { text } = c {
+                        if let crate::providers::ContentBlock::Text { text } = c {
                             Some(text.clone())
                         } else {
                             None
@@ -1360,7 +1363,7 @@ impl Repl {
             for msg in &request.messages {
                 if msg.role == "system" && sys.is_none() {
                     sys = msg.content.iter().find_map(|c| {
-                        if let crate::claude::ContentBlock::Text { text } = c {
+                        if let crate::providers::ContentBlock::Text { text } = c {
                             Some(text.clone())
                         } else {
                             None
@@ -3468,7 +3471,7 @@ impl Repl {
                 };
 
                 // Add as a Message with system role
-                use crate::claude::{ContentBlock, Message};
+                use crate::providers::{ContentBlock, Message};
                 let system_msg = Message {
                     role: "system".to_string(),
                     content: vec![ContentBlock::Text {
@@ -4463,7 +4466,7 @@ impl Repl {
         self.output_status("📝 Generating conversation summary...");
 
         // Get summary from teacher
-        use crate::claude::types::Message;
+        use crate::providers::Message;
         use crate::providers::ProviderRequest;
 
         let request = ProviderRequest::new(vec![Message::user(summary_prompt)]);
@@ -4485,7 +4488,7 @@ impl Repl {
                 // Add summary as a system message to maintain context
                 let system_msg = Message::with_content(
                     "system",
-                    vec![crate::claude::types::ContentBlock::text(format!(
+                    vec![crate::providers::ContentBlock::text(format!(
                         "Previous conversation summary: {}",
                         summary.trim()
                     ))],

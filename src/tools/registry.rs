@@ -84,6 +84,12 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// List all alias keys (compatibility spellings accepted at dispatch time
+    /// but absent from [`Self::definitions`]).
+    pub fn alias_names(&self) -> Vec<String> {
+        self.aliases.keys().cloned().collect()
+    }
+
     /// Every name accepted at dispatch time: canonical registered names plus
     /// the alias spellings mapped by [`Self::register_alias`].
     ///
@@ -207,6 +213,20 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"tool1".to_string()));
         assert!(names.contains(&"tool2".to_string()));
+    }
+
+    #[test]
+    fn test_registry_alias_names_lists_dispatch_only_spellings() {
+        let mut registry = ToolRegistry::new();
+        registry.register_alias("TodoRead", "todo_read");
+
+        let aliases = registry.alias_names();
+        assert_eq!(
+            aliases,
+            vec!["TodoRead".to_string()],
+            "alias_names must list alias keys so policy conformance tests can \
+             report which dispatch-only spellings exist"
+        );
     }
 
     /// `dispatch_names` must list canonical names and alias spellings, once

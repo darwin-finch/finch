@@ -9,10 +9,10 @@ pub mod patterns;
 pub use generator::{GeneratedResponse, TemplateGenerator};
 pub use patterns::{PatternClassifier, QueryPattern};
 
-use crate::claude::Message;
 use crate::generators::GeneratorResponse;
 use crate::models::GeneratorModel;
 use crate::models::LocalModelAdapter;
+use crate::providers::Message;
 use crate::tools::ToolDefinition;
 use crate::training::batch_trainer::BatchTrainer;
 use anyhow::Result;
@@ -154,7 +154,7 @@ impl LocalGenerator {
             .find(|m| m.role == "user")
             .and_then(|m| {
                 m.content.iter().find_map(|block| match block {
-                    crate::claude::ContentBlock::Text { text } => Some(text.as_str()),
+                    crate::providers::ContentBlock::Text { text } => Some(text.as_str()),
                     _ => None,
                 })
             })
@@ -168,7 +168,7 @@ impl LocalGenerator {
 
                 let response = GeneratorResponse {
                     text: generated.text.clone(),
-                    content_blocks: vec![crate::claude::ContentBlock::Text {
+                    content_blocks: vec![crate::providers::ContentBlock::Text {
                         text: generated.text.clone(),
                     }],
                     tool_uses: vec![], // TODO: Support tool use when integrated with QwenGenerator

@@ -12,10 +12,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::claude::types::{ContentBlock, Message, MessageRequest};
 use crate::claude::ClaudeClient;
+use crate::claude::MessageRequest;
 use crate::config::{Config, Persona};
 use crate::generators::CODING_SYSTEM_PROMPT;
+use crate::providers::{ContentBlock, Message};
 use crate::tools::ToolDefinition;
 use crate::tools::{
     BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,

@@ -101,12 +101,29 @@ impl MemoryClassifier {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    fn is_noise(&self, content: &str) -> bool {
+    /// Whether the content is template noise that must never become a memory.
+    ///
+    /// The insert-time line: the length floor plus every recall-time rule.
+    pub fn is_noise(&self, content: &str) -> bool {
         // Hard minimum: anything under 20 chars is almost certainly not memorable
         if content.len() < 20 {
             return true;
         }
+        self.is_recall_noise(content)
+    }
 
+    /// Whether recall must hold this text back.
+    ///
+    /// Public because recall holds the same line as insert: a store built
+    /// before this classifier existed already carries greetings and acks in
+    /// `tree_nodes`, and nothing rewrites stored rows — so recall filters with
+    /// the predicate below rather than letting the old rows back out.
+    ///
+    /// Deliberately WITHOUT the 20-character floor: the measured store's
+    /// smallest node is 23 characters, so the floor never earned its keep
+    /// there, while a legacy store can legitimately hold short memories that
+    /// say something.
+    pub fn is_recall_noise(&self, content: &str) -> bool {
         // Pure acknowledgment phrases — check lowercased, stripped of trailing punctuation
         const NOISE: &[&str] = &[
             "ok",
@@ -142,7 +159,23 @@ impl MemoryClassifier {
 
         let lower = content.to_lowercase();
         let s = lower.trim().trim_end_matches(['.', '!', '?']);
-        NOISE.contains(&s)
+        if NOISE.contains(&s) {
+            return true;
+        }
+
+        // Template openings that clear the length floor and the exact-match
+        // list above (#415): "You're welcome, Shammah!" is 25 characters, and
+        // the assistant's greeting came back as if it were a memory. Match the
+        // template shape at the START of the text, so a substantive reply that
+        // merely contains one of the phrases survives.
+        if s.starts_with("you're welcome") || s.starts_with("you are welcome") {
+            return true;
+        }
+        if s.starts_with("hello") && s.contains("how can i help") {
+            return true;
+        }
+
+        false
     }
 
     fn classify(&self, content: &str) -> MemoryImportance {
@@ -329,6 +362,45 @@ mod tests {
         assert!(classifier()
             .process("user", "short message here!")
             .is_none());
+    }
+
+    #[test]
+    fn test_youre_welcome_ack_is_discarded() {
+        // #415 defect 4. The reference store recalled "You're welcome,
+        // Shammah!" as a memory: 25 characters, so it cleared the length
+        // floor, and the exact-match ack list only catches the bare phrase.
+        assert!(
+            classifier()
+                .process("assistant", "You're welcome, Shammah!")
+                .is_none(),
+            "an assistant ack must not be stored as a memory"
+        );
+    }
+
+    #[test]
+    fn test_assistant_greeting_template_is_discarded() {
+        // #415 defect 4. The measured recall block handed the model its own
+        // past greeting back as "relevant context".
+        assert!(
+            classifier()
+                .process("assistant", "Hello, Shammah! How can I help you today?")
+                .is_none(),
+            "a greeting template must not be stored as a memory"
+        );
+    }
+
+    #[test]
+    fn test_substantive_reply_is_not_discarded_as_noise() {
+        // Guard against over-filtering while the ack and greeting rules above
+        // are in place: an answer that merely mentions an ack phrase, and a
+        // substantive reply that happens to open with a greeting word, must
+        // both survive.
+        let substantive = "The bug was that the greeting filter matched real \
+answers; the fix lives in src/memory/quality.rs.";
+        assert!(
+            classifier().process("assistant", substantive).is_some(),
+            "real content must not be discarded as noise: {substantive}"
+        );
     }
 
     // ── Classification ───────────────────────────────────────────────────────

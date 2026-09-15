@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use super::openai_types::*;
 use super::AgentServer;
-use crate::claude::{ContentBlock, Message};
+use crate::providers::{ContentBlock, Message};
 use crate::router::RouteDecision;
 use crate::tools::ToolDefinition as InternalToolDefinition;
 use crate::tools::ToolInputSchema;
@@ -493,9 +493,9 @@ fn provider_profile_name(model: &str) -> Result<&str, &'static str> {
 async fn forward_to_cloud(
     server: &AgentServer,
     provider_name: Option<&str>,
-    messages: Vec<crate::claude::Message>,
+    messages: Vec<crate::providers::Message>,
     tools: Option<Vec<InternalToolDefinition>>,
-) -> anyhow::Result<Vec<crate::claude::ContentBlock>> {
+) -> anyhow::Result<Vec<crate::providers::ContentBlock>> {
     if let Some(provider) = server.provider_for_name(provider_name) {
         let mut req = crate::providers::ProviderRequest::new(messages);
         if let Some(tools) = tools {

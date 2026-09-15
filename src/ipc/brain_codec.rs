@@ -154,7 +154,7 @@ fn decode_json_value_at(
 
 pub(super) fn encode_messages(
     mut builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
-    messages: &[crate::claude::Message],
+    messages: &[crate::providers::Message],
 ) -> anyhow::Result<()> {
     for (message_index, message) in messages.iter().enumerate() {
         let mut encoded_message = builder.reborrow().get(message_index as u32);
@@ -163,14 +163,14 @@ pub(super) fn encode_messages(
         for (block_index, block) in message.content.iter().enumerate() {
             let mut encoded_block = content.reborrow().get(block_index as u32);
             match block {
-                crate::claude::ContentBlock::Text { text } => encoded_block.set_text(text),
-                crate::claude::ContentBlock::ToolUse { id, name, input } => {
+                crate::providers::ContentBlock::Text { text } => encoded_block.set_text(text),
+                crate::providers::ContentBlock::ToolUse { id, name, input } => {
                     let mut tool = encoded_block.init_tool_use();
                     tool.set_id(id);
                     tool.set_name(name);
                     encode_json_value(tool.reborrow().init_input(), input)?;
                 }
-                crate::claude::ContentBlock::ToolResult {
+                crate::providers::ContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     is_error,
@@ -180,13 +180,13 @@ pub(super) fn encode_messages(
                     result.set_content(content);
                     result.set_is_error(is_error.unwrap_or(false));
                 }
-                crate::claude::ContentBlock::Image { source } => {
+                crate::providers::ContentBlock::Image { source } => {
                     let mut image = encoded_block.init_image();
                     image.set_source_type(&source.source_type);
                     image.set_media_type(&source.media_type);
                     image.set_data(&source.data);
                 }
-                crate::claude::ContentBlock::OpaqueReasoning { encrypted_content } => {
+                crate::providers::ContentBlock::OpaqueReasoning { encrypted_content } => {
                     encoded_block.set_thinking(encrypted_content);
                 }
             }
@@ -197,7 +197,7 @@ pub(super) fn encode_messages(
 
 pub(super) fn decode_messages(
     messages: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
-) -> anyhow::Result<Vec<crate::claude::Message>> {
+) -> anyhow::Result<Vec<crate::providers::Message>> {
     let mut decoded = Vec::with_capacity(messages.len() as usize);
     for message in messages.iter() {
         let role = text(message.get_role()?)?;
@@ -205,12 +205,12 @@ pub(super) fn decode_messages(
         for block in message.get_content()?.iter() {
             use finch_ipc_capnp::content_block::Which;
             match block.which()? {
-                Which::Text(value) => content.push(crate::claude::ContentBlock::Text {
+                Which::Text(value) => content.push(crate::providers::ContentBlock::Text {
                     text: text(value?)?,
                 }),
                 Which::ToolUse(value) => {
                     let value = value?;
-                    content.push(crate::claude::ContentBlock::ToolUse {
+                    content.push(crate::providers::ContentBlock::ToolUse {
                         id: text(value.get_id()?)?,
                         name: text(value.get_name()?)?,
                         input: decode_json_value(value.get_input()?)?,
@@ -218,21 +218,21 @@ pub(super) fn decode_messages(
                 }
                 Which::ToolResult(value) => {
                     let value = value?;
-                    content.push(crate::claude::ContentBlock::ToolResult {
+                    content.push(crate::providers::ContentBlock::ToolResult {
                         tool_use_id: text(value.get_tool_use_id()?)?,
                         content: text(value.get_content()?)?,
                         is_error: Some(value.get_is_error()),
                     });
                 }
                 Which::Thinking(value) => {
-                    content.push(crate::claude::ContentBlock::OpaqueReasoning {
+                    content.push(crate::providers::ContentBlock::OpaqueReasoning {
                         encrypted_content: text(value?)?,
                     });
                 }
                 Which::Image(value) => {
                     let value = value?;
-                    content.push(crate::claude::ContentBlock::Image {
-                        source: crate::claude::types::ImageSource {
+                    content.push(crate::providers::ContentBlock::Image {
+                        source: crate::providers::ImageSource {
                             source_type: text(value.get_source_type()?)?,
                             media_type: text(value.get_media_type()?)?,
                             data: text(value.get_data()?)?,
@@ -241,7 +241,7 @@ pub(super) fn decode_messages(
                 }
             }
         }
-        decoded.push(crate::claude::Message { role, content });
+        decoded.push(crate::providers::Message { role, content });
     }
     Ok(decoded)
 }
@@ -297,14 +297,14 @@ pub(super) fn decode_invocation_metadata(
 
 pub(super) fn encode_continuation_messages(
     builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
-    messages: &[crate::claude::Message],
+    messages: &[crate::providers::Message],
 ) -> anyhow::Result<()> {
     encode_messages(builder, messages)
 }
 
 pub(super) fn decode_continuation_messages(
     messages: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
-) -> anyhow::Result<Vec<crate::claude::Message>> {
+) -> anyhow::Result<Vec<crate::providers::Message>> {
     let decoded = decode_messages(messages)?;
     anyhow::ensure!(
         decoded
@@ -1984,26 +1984,26 @@ mod tests {
             "line": 42,
             "flags": [true, false],
         });
-        let messages = vec![crate::claude::Message {
+        let messages = vec![crate::providers::Message {
             role: "assistant".into(),
             content: vec![
-                crate::claude::ContentBlock::Text {
+                crate::providers::ContentBlock::Text {
                     text: "checking".into(),
                 },
-                crate::claude::ContentBlock::ToolUse {
+                crate::providers::ContentBlock::ToolUse {
                     id: "tool-1".into(),
                     name: "read".into(),
                     input: expected_input.clone(),
                 },
-                crate::claude::ContentBlock::ToolResult {
+                crate::providers::ContentBlock::ToolResult {
                     tool_use_id: "tool-1".into(),
                     content: "contents".into(),
                     is_error: Some(false),
                 },
-                crate::claude::ContentBlock::OpaqueReasoning {
+                crate::providers::ContentBlock::OpaqueReasoning {
                     encrypted_content: "opaque-continuation".into(),
                 },
-                crate::claude::ContentBlock::image("image/png", "aW1hZ2U="),
+                crate::providers::ContentBlock::image("image/png", "aW1hZ2U="),
             ],
         }];
         let mut message = capnp::message::Builder::new_default();
@@ -2031,16 +2031,16 @@ mod tests {
         assert_eq!(decoded[0].role, "assistant");
         assert!(matches!(
             &decoded[0].content[0],
-            crate::claude::ContentBlock::Text { text } if text == "checking"
+            crate::providers::ContentBlock::Text { text } if text == "checking"
         ));
         assert!(matches!(
             &decoded[0].content[1],
-            crate::claude::ContentBlock::ToolUse { id, name, input }
+            crate::providers::ContentBlock::ToolUse { id, name, input }
                 if id == "tool-1" && name == "read" && input == &expected_input
         ));
         assert!(matches!(
             &decoded[0].content[2],
-            crate::claude::ContentBlock::ToolResult {
+            crate::providers::ContentBlock::ToolResult {
                 tool_use_id,
                 content,
                 is_error: Some(false),
@@ -2048,12 +2048,12 @@ mod tests {
         ));
         assert!(matches!(
             &decoded[0].content[3],
-            crate::claude::ContentBlock::OpaqueReasoning { encrypted_content }
+            crate::providers::ContentBlock::OpaqueReasoning { encrypted_content }
                 if encrypted_content == "opaque-continuation"
         ));
         assert!(matches!(
             &decoded[0].content[4],
-            crate::claude::ContentBlock::Image { source }
+            crate::providers::ContentBlock::Image { source }
                 if source.source_type == "base64"
                     && source.media_type == "image/png"
                     && source.data == "aW1hZ2U="
@@ -2239,11 +2239,11 @@ mod tests {
                 request_seq: 5,
                 output: "done".into(),
                 error: Some("example".into()),
-                continuation_messages: vec![crate::claude::Message::with_content(
+                continuation_messages: vec![crate::providers::Message::with_content(
                     "assistant",
                     vec![
-                        crate::claude::ContentBlock::opaque_reasoning("opaque-restart-token"),
-                        crate::claude::ContentBlock::text("(say \"done\")"),
+                        crate::providers::ContentBlock::opaque_reasoning("opaque-restart-token"),
+                        crate::providers::ContentBlock::text("(say \"done\")"),
                     ],
                 )],
                 invocation_metadata: Some(crate::providers::InvocationMetadata {

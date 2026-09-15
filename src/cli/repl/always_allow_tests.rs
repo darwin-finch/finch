@@ -20,7 +20,7 @@ struct NameAuditGenerator;
 impl Generator for NameAuditGenerator {
     async fn generate(
         &self,
-        _messages: Vec<crate::claude::Message>,
+        _messages: Vec<crate::providers::Message>,
         _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<GeneratorResponse> {
         anyhow::bail!("name-audit generator is not invoked")
@@ -28,7 +28,7 @@ impl Generator for NameAuditGenerator {
 
     async fn generate_stream(
         &self,
-        _messages: Vec<crate::claude::Message>,
+        _messages: Vec<crate::providers::Message>,
         _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<
         Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
@@ -138,6 +138,56 @@ fn test_always_allow_list_entries_are_registered_tools_or_aliases() {
         unknown.is_empty(),
         "always-allow list grants approval to names nothing registers: {unknown:?}. \
          Each entry must be a Tool::name() or a register_alias key from the owner REPL catalog."
+    );
+}
+
+#[test]
+fn test_peer_permission_policy_tables_name_only_registered_tools_or_aliases() {
+    // The peer hard-deny in permissions.rs once matched "restart"/"spawn" —
+    // names no Tool::name() or register_alias key produces — so the deny arm
+    // was unreachable in production while the invariant tests passed on their
+    // own literals. This test pins every permission policy table whose names
+    // the REPL catalog must register, so a third drift cannot land silently.
+    // PEER_HARD_DENY_TOOLS is pinned against the Tool implementations
+    // themselves in tools::permissions::tests, because `spawn_task` is
+    // TaskTool's registered name but has no REPL registration point (subagent
+    // loops build their tool lists in build_subagent_tools).
+    let catalog = owner_repl_catalog();
+    let registry = &catalog.registry;
+    let tables: [(&str, &[&str]); 3] = [
+        (
+            "PEER_SILENT_ALLOW_TOOLS",
+            crate::tools::PEER_SILENT_ALLOW_TOOLS,
+        ),
+        (
+            "PEER_REVIEWED_CHANGESET_TOOLS",
+            crate::tools::PEER_REVIEWED_CHANGESET_TOOLS,
+        ),
+        ("VM_DISCOVERY_TOOLS", crate::tools::VM_DISCOVERY_TOOLS),
+    ];
+    let mut unregistered: Vec<String> = Vec::new();
+    for (table, names) in tables {
+        for name in names {
+            if !registry.has_tool(name) {
+                unregistered.push(format!("{table} names '{name}'"));
+            }
+        }
+    }
+    // Single-name special cases in check_tool_use / check_peer_tool_use.
+    for name in ["submit_program", "bash"] {
+        if !registry.has_tool(name) {
+            unregistered.push(format!("peer/owner special case names '{name}'"));
+        }
+    }
+    assert!(
+        unregistered.is_empty(),
+        "permission policy tables grant or deny names nothing registers \
+         (same drift class as the peer hard-deny in issue #452 and \
+         legacy_tool_effect in issue #26): {unregistered:?}. \
+         Registered names: {:?}; alias keys: {:?}. \
+         Each policy entry must be a Tool::name() or a register_alias key.",
+        registry.tool_names(),
+        registry.alias_names()
     );
 }
 

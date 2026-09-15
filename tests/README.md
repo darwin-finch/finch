@@ -68,9 +68,12 @@ Run the isolation harness's own regression checks with:
 ```
 
 **Requirements:**
-- Daemon binary built (`cargo build --release`)
 - Loopback networking
 - A live teacher credential only for the ignored query smoke
+
+The tests spawn `env!("CARGO_BIN_EXE_finch")`
+(`tests/daemon_integration_test.rs`), so `cargo test` builds the binary it
+needs; no separate `cargo build --release` is required.
 
 Each test daemon uses the supervisor's disposable HOME, per-suite Unix socket,
 inherited port-zero listener, and sealed random Brain password. Its RAII guard
@@ -169,22 +172,18 @@ required credential and run `./scripts/test_tool_passthrough.sh`.
 
 ## CI/CD Integration
 
-For automated testing in CI:
+CI runs the same gates from `.github/workflows/ci.yml` (build, formatting,
+clippy, and `cargo test --all-targets`, which compiles the integration tests
+and their `CARGO_BIN_EXE_finch` daemon binary) and
+`.github/workflows/issue-56-brain-isolation.yml`, which drives the isolation
+harness and supervised tests through `./scripts/test_brains.sh`, including the
+ignored daemon spawn/health smoke:
 
-```yaml
-# .github/workflows/test.yml
-- name: Verify Brain isolation harness
-  run: ./scripts/test_brain_isolation.sh
-- name: Run unit tests
-  run: ./scripts/test_brains.sh cargo test --lib
-
-- name: Run integration tests (non-ignored)
-  run: ./scripts/test_brains.sh cargo test --test '*'
-
-- name: Run daemon tests
-  run: |
-    cargo build --release
-    ./scripts/test_brains.sh cargo test --test daemon_integration_test -- --ignored
+```bash
+./scripts/test_brain_isolation.sh
+./scripts/test_brains.sh cargo test --lib
+./scripts/test_brains.sh cargo test --test '*'
+./scripts/test_brains.sh cargo test --test daemon_integration_test test_daemon_spawn_and_health -- --exact --ignored
 ```
 
 ## Future Improvements

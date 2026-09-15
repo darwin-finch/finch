@@ -7,11 +7,11 @@
 //
 // Run: ./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_parity
 
-use finch::claude::Message;
 use finch::programs::{
     wire_repair_request, ExecutionEffect, ProgramLanguage, BOOT_CAPSULE, FORTH_LANGUAGE_DEFINITION,
     LISP_LANGUAGE_DEFINITION, VM_LANGUAGE_DEFINITION,
 };
+use finch::providers::Message;
 use finch::providers::ProviderRequest;
 use finch::runtime::ExecutionStatus;
 use finch::runtime::{ProgramRuntime, ProgramSubmission};

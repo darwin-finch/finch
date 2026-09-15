@@ -3,8 +3,8 @@
 // These tools allow the primary LLM to delegate queries to other LLMs
 // (Claude, GPT-4, Grok, etc.) when needed.
 
-use crate::claude::types::Message;
 use crate::llms::LLM;
+use crate::providers::Message;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{Context, Result};

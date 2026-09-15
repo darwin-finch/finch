@@ -1,7 +1,10 @@
 # Multi-Provider Configuration
 
-Finch supports multiple cloud AI providers (Claude, OpenAI, Grok, Gemini, Mistral, Groq) and the
-local ONNX model, all configured through a unified `[[providers]]` array in `~/.finch/config.toml`.
+Finch's configuration accepts entries for multiple cloud AI providers (Claude, OpenAI, Grok,
+Gemini, Mistral, Groq, and others — see the provider entry types in `src/config/provider.rs`) and
+the local ONNX model, all configured through a unified `[[providers]]` array in
+`~/.finch/config.toml`. Configuration support is not end-to-end conformance: routing and
+provider parity remain active work (see the root `README.md` provider section).
 
 The easiest way to configure providers is the interactive setup wizard:
 

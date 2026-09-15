@@ -21,7 +21,6 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::claude::ContentBlock;
 use crate::cli::commands::{format_help, Command};
 use crate::cli::conversation::{ConversationHistory, ToolRoundProgress, ToolRoundToken};
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
@@ -32,6 +31,7 @@ use crate::feedback::{FeedbackEntry, FeedbackLogger, FeedbackRating};
 use crate::generators::Generator;
 use crate::models::GeneratorState;
 use crate::models::NeuralEmbeddingEngine;
+use crate::providers::ContentBlock;
 use crate::review::store::DiffStore;
 use crate::router::Router;
 use crate::tools::ToolDefinition;
@@ -1321,12 +1321,12 @@ fn register_named_brain_turn_projection(
 }
 
 fn named_brain_wire_source(
-    messages: Vec<crate::claude::Message>,
+    messages: Vec<crate::providers::Message>,
     initial_message_count: usize,
 ) -> anyhow::Result<(
     String,
     crate::brain::ProgramLanguage,
-    Vec<crate::claude::Message>,
+    Vec<crate::providers::Message>,
 )> {
     anyhow::ensure!(
         initial_message_count <= messages.len(),
@@ -1347,7 +1347,7 @@ fn named_brain_wire_source(
     let source = assistant
         .content
         .iter()
-        .filter_map(crate::claude::ContentBlock::as_text)
+        .filter_map(crate::providers::ContentBlock::as_text)
         .collect::<String>();
     anyhow::ensure!(
         !source.trim().is_empty(),
@@ -1364,7 +1364,7 @@ fn named_brain_wire_source(
 fn assemble_named_brain_turn(
     projections: &mut std::collections::VecDeque<LocalBrainProjection>,
     run_id: crate::brain::RunId,
-    messages: anyhow::Result<Vec<crate::claude::Message>>,
+    messages: anyhow::Result<Vec<crate::providers::Message>>,
     program_runtime: &crate::runtime::ProgramRuntime,
     output: String,
     turn_events: Vec<crate::server::RunnerTurnEvent>,
@@ -2928,9 +2928,9 @@ impl EventLoop {
             .add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
         self.render_tui().await?;
 
-        let messages = vec![crate::claude::Message {
+        let messages = vec![crate::providers::Message {
             role: "user".to_string(),
-            content: vec![crate::claude::ContentBlock::Text { text: query }],
+            content: vec![crate::providers::ContentBlock::Text { text: query }],
         }];
 
         let mut rx = match ipc.query_stream(messages, vec![]).await {
@@ -4375,7 +4375,7 @@ include!("brain_handler.rs");
 /// then finds the user message that immediately preceded it.
 ///
 /// Returns `("", "")` if no assistant response is found.
-pub(crate) fn find_last_exchange(messages: &[crate::claude::Message]) -> (String, String) {
+pub(crate) fn find_last_exchange(messages: &[crate::providers::Message]) -> (String, String) {
     let mut last_response = String::new();
     let mut last_query = String::new();
     let mut found_response = false;

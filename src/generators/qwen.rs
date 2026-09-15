@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
-use crate::claude::{ContentBlock, Message};
 use crate::local::LocalGenerator;
 use crate::models::TextTokenizer;
 use crate::models::{ToolCallParser, ToolPromptFormatter};
+use crate::providers::{ContentBlock, Message};
 use crate::tools::ToolExecutor;
 use crate::tools::ToolUse as ToolsToolUse;
 use crate::tools::{ToolDefinition, ToolResult}; // Import with alias to avoid confusion

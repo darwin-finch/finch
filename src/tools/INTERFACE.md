@@ -364,6 +364,8 @@ pub struct ToolPermissionConfig { … }
 /// Registry of available tools
 pub struct ToolRegistry { … }
 impl ToolRegistry {
+    /// List all alias keys (compatibility spellings accepted at dispatch time but absent from [`Self::definitions`]).
+    pub fn alias_names(&self) -> Vec<String>;
     /// Get all tool definitions (for Claude API)
     pub fn definitions(&self) -> Vec<ToolDefinition>;
     /// Every name accepted at dispatch time: canonical registered names plus the alias spellings mapped by [`Self::register_alias`].
@@ -448,4 +450,17 @@ pub(crate) fn resume_terminal_after_editor() { … }
 pub(crate) fn run_editor(path: &Path) -> Result<std::process::ExitStatus> { … }
 pub(crate) fn suspend_terminal_for_editor() { … }
 pub fn todo_journal(projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>) -> (TodoJournalWriter, TodoJournalTarget, TodoJournalReceiver) { … }
+```
+
+## Constants
+
+```rust
+/// Registered tool names a peer is hard-denied regardless of configuration.
+pub const PEER_HARD_DENY_TOOLS: &[&str] = &["restart_session", "spawn_task"];
+/// Registered tool names through which a peer proposes file changes.
+pub const PEER_REVIEWED_CHANGESET_TOOLS: &[&str] = &["write", "edit", "patch"];
+/// Registered tool names a peer may invoke silently, without an approval dialog: read-only examination plus scheduler-local agent control.
+pub const PEER_SILENT_ALLOW_TOOLS: &[&str] = &[ "read", "glob", "grep", "get_vm_state", "get_language_definition", "search_vm_vocabulary", "inspect_vm_word", "search_word", "inspect_word", "search_vocabulary", "inspect_program", "spawn_agent", "await_agent", "poll_agent", "cancel_agent", ];
+/// Registered tools that only inspect Finch's own typed runtime metadata.
+pub const VM_DISCOVERY_TOOLS: &[&str] = &[ "get_vm_state", "get_language_definition", "search_vm_vocabulary", "inspect_vm_word", "search_word", "inspect_word", "search_vocabulary", "inspect_program", ];
 ```

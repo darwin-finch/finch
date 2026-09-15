@@ -1759,14 +1759,16 @@ impl finch_daemon::Server for FinchDaemonImpl {
                         let mut r = receiver.on_chunk_request();
                         let mut encoded = r.get().init_chunk().init_content_block_complete();
                         match block {
-                            crate::claude::ContentBlock::Text { text } => encoded.set_text(&text),
-                            crate::claude::ContentBlock::Image { source } => {
+                            crate::providers::ContentBlock::Text { text } => {
+                                encoded.set_text(&text)
+                            }
+                            crate::providers::ContentBlock::Image { source } => {
                                 let mut image = encoded.init_image();
                                 image.set_source_type(&source.source_type);
                                 image.set_media_type(&source.media_type);
                                 image.set_data(&source.data);
                             }
-                            crate::claude::ContentBlock::ToolUse { id, name, input } => {
+                            crate::providers::ContentBlock::ToolUse { id, name, input } => {
                                 let mut tool = encoded.init_tool_use();
                                 tool.set_id(&id);
                                 tool.set_name(&name);
@@ -1776,7 +1778,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
                                 )
                                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
                             }
-                            crate::claude::ContentBlock::ToolResult {
+                            crate::providers::ContentBlock::ToolResult {
                                 tool_use_id,
                                 content,
                                 is_error,
@@ -1786,7 +1788,9 @@ impl finch_daemon::Server for FinchDaemonImpl {
                                 result.set_content(&content);
                                 result.set_is_error(is_error.unwrap_or(false));
                             }
-                            crate::claude::ContentBlock::OpaqueReasoning { encrypted_content } => {
+                            crate::providers::ContentBlock::OpaqueReasoning {
+                                encrypted_content,
+                            } => {
                                 encoded.set_thinking(&encrypted_content);
                             }
                         }

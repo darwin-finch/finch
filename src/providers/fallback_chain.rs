@@ -294,7 +294,7 @@ impl ProviderBackend for FallbackChain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::types::ContentBlock;
+    use crate::providers::ContentBlock;
     use crate::tools::{ToolDefinition, ToolInputSchema};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

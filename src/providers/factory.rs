@@ -1235,7 +1235,7 @@ mod tests {
             .unwrap()
             .default_provider()
             .send_message(&ProviderRequest::new(vec![
-                crate::claude::types::Message::user("startup"),
+                crate::providers::Message::user("startup"),
             ]))
             .await
             .unwrap();
@@ -1277,7 +1277,7 @@ mod tests {
         )
         .unwrap()
         .send_message(&ProviderRequest::new(vec![
-            crate::claude::types::Message::user("switch"),
+            crate::providers::Message::user("switch"),
         ]))
         .await
         .unwrap();

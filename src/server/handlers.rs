@@ -18,7 +18,7 @@ mod node;
 mod runs;
 
 use super::{AgentServer, BrainSubmissionError, BrainSubmissionOutcome};
-use crate::claude::{ContentBlock, Message};
+use crate::providers::{ContentBlock, Message};
 pub use credentials::*;
 pub use lifecycle::*;
 pub use node::*;
@@ -1153,7 +1153,7 @@ fn push_named_brain_run_result(
     run_id: crate::brain::RunId,
     request_seq: u64,
     result: anyhow::Result<String>,
-    continuation_messages: Vec<crate::claude::Message>,
+    continuation_messages: Vec<crate::providers::Message>,
     invocation_metadata: Option<crate::providers::InvocationMetadata>,
 ) -> anyhow::Result<crate::brain::BrainEvent> {
     if let Some(metadata) = &invocation_metadata {
@@ -1464,7 +1464,7 @@ fn named_brain_provider_messages_at(
                     || {
                         vec![Message::with_content(
                             "assistant",
-                            vec![crate::claude::ContentBlock::ToolUse {
+                            vec![crate::providers::ContentBlock::ToolUse {
                                 id: tool_id.clone(),
                                 name: name.clone(),
                                 input: input.clone(),
@@ -1485,7 +1485,7 @@ fn named_brain_provider_messages_at(
                     || {
                         vec![Message::with_content(
                             "user",
-                            vec![crate::claude::ContentBlock::ToolResult {
+                            vec![crate::providers::ContentBlock::ToolResult {
                                 tool_use_id: tool_id.clone(),
                                 content: output.clone(),
                                 is_error: is_error.then_some(true),
@@ -1557,8 +1557,8 @@ fn named_brain_provider_messages_at(
     let mut messages: Vec<Message> = Vec::with_capacity(projected.len());
     for mut message in projected {
         let block_kind = message.content.first().map(|block| match block {
-            crate::claude::ContentBlock::ToolUse { .. } => 1,
-            crate::claude::ContentBlock::ToolResult { .. } => 2,
+            crate::providers::ContentBlock::ToolUse { .. } => 1,
+            crate::providers::ContentBlock::ToolResult { .. } => 2,
             _ => 0,
         });
         let merge = messages.last().is_some_and(|previous| {
@@ -1567,8 +1567,8 @@ fn named_brain_provider_messages_at(
                 && previous.content.iter().all(|block| {
                     matches!(
                         (block_kind, block),
-                        (Some(1), crate::claude::ContentBlock::ToolUse { .. })
-                            | (Some(2), crate::claude::ContentBlock::ToolResult { .. })
+                        (Some(1), crate::providers::ContentBlock::ToolUse { .. })
+                            | (Some(2), crate::providers::ContentBlock::ToolResult { .. })
                     )
                 })
         });

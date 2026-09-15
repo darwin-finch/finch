@@ -3,8 +3,8 @@
 // These types abstract over provider-specific formats (Claude, OpenAI, Gemini, etc.)
 // allowing the rest of the codebase to work with a unified interface.
 
-use crate::claude::types::{ContentBlock, Message};
 use crate::config::ReasoningEffort;
+use crate::providers::{ContentBlock, Message};
 use crate::tools::ToolDefinition;
 use serde::{Deserialize, Serialize};
 
@@ -512,7 +512,7 @@ impl ProviderRequest {
     /// such histories with a 400 error. This method trims those orphaned tail
     /// messages so the fallback provider sees a clean conversation.
     pub fn sanitize_messages(&mut self) {
-        use crate::claude::types::ContentBlock;
+        use crate::providers::ContentBlock;
 
         loop {
             // Find the last assistant message index
@@ -689,7 +689,7 @@ impl ProviderRequest {
         // tool_use (in the preceding assistant message) was just dropped.
         // All providers reject tool_result without a matching tool_use, so
         // strip any such orphaned pairs from the front of the window.
-        use crate::claude::types::ContentBlock;
+        use crate::providers::ContentBlock;
         loop {
             if self.messages.len() <= 1 {
                 break;
@@ -879,7 +879,7 @@ pub use crate::generators::StreamChunk;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::types::Message;
+    use crate::providers::Message;
 
     fn user_msg(text: &str) -> Message {
         Message::user(text)
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_large_image_replaced_with_placeholder() {
-        use crate::claude::types::ContentBlock;
+        use crate::providers::ContentBlock;
         // Create a base64 string larger than 4 MB limit
         let large_data = "A".repeat(5_000_000);
         let mut req = ProviderRequest::new(vec![Message::with_content(
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_small_image_kept() {
-        use crate::claude::types::ContentBlock;
+        use crate::providers::ContentBlock;
         let small_data = "iVBORw0KGgo="; // tiny valid base64
         let mut req = ProviderRequest::new(vec![Message::with_content(
             "user",

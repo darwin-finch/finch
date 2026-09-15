@@ -129,7 +129,7 @@ pub struct RunnerTurnRequest {
     pub run_id: RunId,
     pub request_seq: u64,
     pub prompt: String,
-    pub context: Vec<crate::claude::Message>,
+    pub context: Vec<crate::providers::Message>,
     pub approval_audience: crate::brain::BrainApprovalAudience,
     pub approval_connection_id: Option<crate::brain::ConnectionId>,
     /// Reverse approval bridge installed by the Cap'n Proto client adapter.
@@ -152,7 +152,7 @@ pub struct RunnerTurnResult {
     pub language: ProgramLanguage,
     pub output: String,
     /// Exact ordered provider/tool continuation messages, including opaque reasoning.
-    pub continuation_messages: Vec<crate::claude::Message>,
+    pub continuation_messages: Vec<crate::providers::Message>,
     /// Completed provider identity/accounting for durable Brain provenance.
     pub invocation_metadata: Option<crate::providers::InvocationMetadata>,
     pub turn_events: Vec<RunnerTurnEvent>,
@@ -869,7 +869,7 @@ impl BrainRunnerBroker {
         run_id: RunId,
         request_seq: u64,
         prompt: String,
-        context: Vec<crate::claude::Message>,
+        context: Vec<crate::providers::Message>,
         approval_audience: crate::brain::BrainApprovalAudience,
         approval_connection_id: Option<crate::brain::ConnectionId>,
     ) -> Result<RunnerTurnResult> {
@@ -1376,7 +1376,7 @@ mod tests {
                 run_id,
                 8,
                 "double it".into(),
-                vec![crate::claude::Message::user("21")],
+                vec![crate::providers::Message::user("21")],
                 test_approval_audience(),
                 Some(crate::brain::ConnectionId(uuid::Uuid::new_v4())),
             )

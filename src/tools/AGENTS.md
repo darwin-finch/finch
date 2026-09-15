@@ -21,7 +21,11 @@ capsule does not take that split. Add no new reverse edges.
 **Permissions are authority.** Peer and constitutional rules in `permissions.rs` are invariants,
 not defaults to relax. Facade changes must not alter allowlist behavior: `is_readonly_bash()`
 still rejects shell operators, peers still cannot restart or spawn, and write/edit/patch still
-surface as AskUser. See the root [Security invariant](../../CLAUDE.md#security).
+surface as AskUser. See the root [Security invariant](../../CLAUDE.md#security). The peer
+hard-deny and allow tables are keyed on registered tool names (`PEER_HARD_DENY_TOOLS`,
+`PEER_SILENT_ALLOW_TOOLS`, `PEER_REVIEWED_CHANGESET_TOOLS`, `VM_DISCOVERY_TOOLS`); conformance
+tests in this subtree and in `src/cli/repl/always_allow_tests.rs` fail if a policy table names
+anything no `Tool` registers or alias key covers.
 
 **A tool name is not an instruction.** Implementations receive model-supplied names, paths, and
 schemas as data. MCP names are namespaced before they reach the registry; do not invent a second

@@ -2038,11 +2038,13 @@ fn brain_history_remains_conversation_data_not_system_text() {
                     request_seq: 2,
                     output: "answer".into(),
                     error: None,
-                    continuation_messages: vec![crate::claude::Message::with_content(
+                    continuation_messages: vec![crate::providers::Message::with_content(
                         "assistant",
                         vec![
-                            crate::claude::ContentBlock::opaque_reasoning("opaque-restart-token"),
-                            crate::claude::ContentBlock::text("(say \"answer\")"),
+                            crate::providers::ContentBlock::opaque_reasoning(
+                                "opaque-restart-token",
+                            ),
+                            crate::providers::ContentBlock::text("(say \"answer\")"),
                         ],
                     )],
                     invocation_metadata: Some(crate::providers::InvocationMetadata {
@@ -2081,8 +2083,8 @@ fn brain_history_remains_conversation_data_not_system_text() {
     assert!(matches!(
         messages[1].content.as_slice(),
         [
-            crate::claude::ContentBlock::OpaqueReasoning { encrypted_content },
-            crate::claude::ContentBlock::Text { text },
+            crate::providers::ContentBlock::OpaqueReasoning { encrypted_content },
+            crate::providers::ContentBlock::Text { text },
         ] if encrypted_content == "opaque-restart-token" && text == "(say \"answer\")"
     ));
     assert_eq!(messages[2].role, "user");
@@ -2164,42 +2166,42 @@ fn brain_history_reconstructs_provider_tool_protocol() {
                     output: "done".into(),
                     error: None,
                     continuation_messages: vec![
-                        crate::claude::Message::with_content(
+                        crate::providers::Message::with_content(
                             "assistant",
                             vec![
-                                crate::claude::ContentBlock::opaque_reasoning("opaque-tool"),
-                                crate::claude::ContentBlock::ToolUse {
+                                crate::providers::ContentBlock::opaque_reasoning("opaque-tool"),
+                                crate::providers::ContentBlock::ToolUse {
                                     id: "tool-1".into(),
                                     name: "search_word".into(),
                                     input: serde_json::json!({"query":"fib"}),
                                 },
-                                crate::claude::ContentBlock::ToolUse {
+                                crate::providers::ContentBlock::ToolUse {
                                     id: "tool-2".into(),
                                     name: "get_vm_state".into(),
                                     input: serde_json::json!({}),
                                 },
                             ],
                         ),
-                        crate::claude::Message::with_content(
+                        crate::providers::Message::with_content(
                             "user",
                             vec![
-                                crate::claude::ContentBlock::tool_result(
+                                crate::providers::ContentBlock::tool_result(
                                     "tool-1".into(),
                                     "found fib".into(),
                                     None,
                                 ),
-                                crate::claude::ContentBlock::tool_result(
+                                crate::providers::ContentBlock::tool_result(
                                     "tool-2".into(),
                                     "revision 7".into(),
                                     None,
                                 ),
                             ],
                         ),
-                        crate::claude::Message::with_content(
+                        crate::providers::Message::with_content(
                             "assistant",
                             vec![
-                                crate::claude::ContentBlock::opaque_reasoning("opaque-final"),
-                                crate::claude::ContentBlock::text("(say \"done\")"),
+                                crate::providers::ContentBlock::opaque_reasoning("opaque-final"),
+                                crate::providers::ContentBlock::text("(say \"done\")"),
                             ],
                         ),
                     ],
@@ -2227,9 +2229,9 @@ fn brain_history_reconstructs_provider_tool_protocol() {
     assert!(matches!(
         &messages[1].content[..],
         [
-            crate::claude::ContentBlock::OpaqueReasoning { encrypted_content },
-            crate::claude::ContentBlock::ToolUse { id, name, .. },
-            crate::claude::ContentBlock::ToolUse { id: id2, name: name2, .. }
+            crate::providers::ContentBlock::OpaqueReasoning { encrypted_content },
+            crate::providers::ContentBlock::ToolUse { id, name, .. },
+            crate::providers::ContentBlock::ToolUse { id: id2, name: name2, .. }
         ] if encrypted_content == "opaque-tool"
             && id == "tool-1" && name == "search_word"
             && id2 == "tool-2" && name2 == "get_vm_state"
@@ -2237,19 +2239,19 @@ fn brain_history_reconstructs_provider_tool_protocol() {
     assert!(matches!(
         &messages[3].content[..],
         [
-            crate::claude::ContentBlock::OpaqueReasoning { encrypted_content },
-            crate::claude::ContentBlock::Text { text },
+            crate::providers::ContentBlock::OpaqueReasoning { encrypted_content },
+            crate::providers::ContentBlock::Text { text },
         ] if encrypted_content == "opaque-final" && text == "(say \"done\")"
     ));
     assert!(matches!(
         &messages[2].content[..],
         [
-            crate::claude::ContentBlock::ToolResult {
+            crate::providers::ContentBlock::ToolResult {
                 tool_use_id,
                 content,
                 is_error: None,
             },
-            crate::claude::ContentBlock::ToolResult {
+            crate::providers::ContentBlock::ToolResult {
                 tool_use_id: tool_use_id2,
                 content: content2,
                 is_error: None,
