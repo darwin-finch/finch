@@ -6848,6 +6848,72 @@ impl BrainStore {
         Ok(())
     }
 
+    /// Override the durable byte ceiling of this Brain's active effect-audit
+    /// journal so a regression can reach the bound without writing 48 MiB.
+    #[cfg(test)]
+    pub(crate) fn set_effect_audit_journal_max_bytes_for_test(
+        &self,
+        name: &str,
+        bytes: u64,
+    ) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brain_id = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .context("Brain was removed concurrently")?
+            .brain_id;
+        self.with_effect_audit_storage_mut(name, brain_id, |storage| {
+            storage.active.set_max_bytes_for_test(bytes);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Size of this Brain's active effect-audit journal file on disk.
+    #[cfg(test)]
+    pub(crate) fn effect_audit_journal_bytes_for_test(&self, name: &str) -> Result<u64> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brain_id = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .context("Brain was removed concurrently")?
+            .brain_id;
+        Ok(self
+            .with_effect_audit_storage_mut(name, brain_id, |storage| storage.active.file_bytes())?
+            .unwrap_or(0))
+    }
+
+    /// Canonical sequence numbers currently held by this Brain's active
+    /// effect-audit journal, in ascending order.
+    #[cfg(test)]
+    pub(crate) fn effect_audit_journal_seqs_for_test(&self, name: &str) -> Result<Vec<u64>> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brain_id = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .context("Brain was removed concurrently")?
+            .brain_id;
+        Ok(self
+            .with_effect_audit_storage_mut(name, brain_id, |storage| {
+                Ok(storage
+                    .active
+                    .load()?
+                    .into_iter()
+                    .map(|(seq, _)| seq)
+                    .collect::<Vec<_>>())
+            })?
+            .unwrap_or_default())
+    }
+
     #[cfg(test)]
     fn fail_event_batches_for_test(&self, count: usize) {
         self.fail_event_batches
