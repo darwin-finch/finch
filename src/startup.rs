@@ -217,14 +217,14 @@ declare_names! {
 ///
 /// Note what is and is not being cited. That requirement is written in #364
 /// and its precedent is #242's four attempts, the last repaired by
-/// `a0ea2c64`; it is **not** a rule in `AGENTS.md`.
-/// PR #391, "docs(agents): write down the no-wall-clock-assertion rule",
-/// proposed adding it and was closed DO NOT MERGE on the ground that a
-/// blanket prohibition is not what `a0ea2c64` established and conflicts with
-/// coarse liveness bounds Finch does accept elsewhere. Two earlier revisions
-/// of this module cited this rule to a document that does not contain it,
-/// which in the one module whose subject is falsifiability is worth saying
-/// out loud rather than quietly correcting a third time.
+/// `a0ea2c64`. The narrow form now lives in `AGENTS.md`'s Testing section
+/// (#399). PR #391, "docs(agents): write down the no-wall-clock-assertion
+/// rule", proposed a blanket prohibition and was closed DO NOT MERGE, because
+/// that is not what `a0ea2c64` established and it conflicts with coarse
+/// liveness bounds Finch does accept elsewhere. Two earlier revisions of this
+/// module cited a blanket rule to a document that did not contain it, which
+/// in the one module whose subject is falsifiability is worth saying out
+/// loud rather than quietly correcting a third time.
 ///
 /// A budget makes a slow phase visible and nameable; it is not a gate.
 const DEFAULT_SLOW_PHASE: Duration = Duration::from_millis(150);

@@ -147,6 +147,19 @@ fn load_config() -> Result<Config> {
 - **Test the hostile timing and restart cases** for concurrent or durable behavior: cancellation,
   disconnect, timeout, late completion, replacement connection, retry, restart, and replay as
   applicable. Assert exact-once terminal state and absence of post-terminal effects.
+- **Do not use precision or comparative timing as the sole correctness oracle** when
+  deterministic state, event, or order assertions are available. Assert the structural fact
+  instead: hydration state, resident counts, phase order, event sequence, exactly-once
+  terminal state. Commit `a0ea2c64` ("assert hydration state, not a wall-clock ratio") is
+  the precedent for the prohibited shape — a ratio of two measured durations that passed
+  on a fast machine with the defect present and failed on a loaded one without it. That
+  commit repaired one flaky test; it did not establish this rule. Coarse liveness bounds
+  whose failure message says the run hung rather than that it was slow remain permitted
+  (supervisor, service-discovery, and provider-isolation timeouts already work this way).
+  Explicitly authorised benchmark or budget guards, paired with semantic assertions, also
+  remain permitted: #282 (two-cell spreadsheet exhausts memory) keeps a coarse elapsed
+  bound next to semantic error assertions, and #242 (prompt-first TUI startup) requires a
+  documented warm-start latency and RSS budget with a CI guard.
 - **A green unrelated suite is not regression evidence** — name the test that reproduces the bug
   in the commit message and GitHub verification comment, and record why it failed before the fix.
 - **Manual verification does not replace regression coverage** — document any manual evidence, but
