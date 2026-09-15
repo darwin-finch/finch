@@ -44,6 +44,7 @@ mod autocomplete_widget;
 mod dialog;
 mod dialog_widget;
 mod input_widget; // kept, used by wizard helpers
+mod mouse_capture;
 mod scrollback; // kept for future use
 mod shadow_buffer; // kept – good architecture for future diffing
 mod status_widget;
@@ -1432,6 +1433,11 @@ pub struct TuiRenderer {
     /// Guards the idle-case redraw in flush_output_safe() to eliminate
     /// unconditional erase+draw every 33 ms tick when nothing changed.
     live_area_dirty: bool,
+
+    /// Whether this renderer currently holds mouse tracking. Held while
+    /// click-to-toggle should work; released on a wheel so native scrollback
+    /// is reachable (#441).
+    mouse_tracking: mouse_capture::MouseTracking,
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -1485,6 +1491,7 @@ impl TuiRenderer {
             typing_words: Vec::new(),
             pre_typing_mode: PosetPanelMode::Forth,
             live_area_dirty: true,
+            mouse_tracking: mouse_capture::MouseTracking::Held,
         }
     }
 
@@ -1597,6 +1604,7 @@ impl TuiRenderer {
             pre_typing_mode: PosetPanelMode::Forth,
 
             live_area_dirty: true,
+            mouse_tracking: mouse_capture::MouseTracking::Held,
         })
     }
 
@@ -2496,6 +2504,7 @@ impl TuiRenderer {
     pub fn resume(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
         let _ = execute!(io::stdout(), crossterm::event::EnableMouseCapture);
+        self.mouse_tracking = mouse_capture::MouseTracking::Held;
         // Force a full redraw so the REPL live area reappears.
         self.active_rows = 0;
         self.pending_viewport_size = None;
@@ -2523,6 +2532,7 @@ impl TuiRenderer {
         self.pending_viewport_size = None;
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
+        self.mouse_tracking = mouse_capture::MouseTracking::Held;
         Ok(())
     }
 }
@@ -2550,7 +2560,11 @@ impl TuiRenderer {
             self.render()?;
 
             if event::poll(Duration::from_millis(100))? {
-                match event::read()? {
+                let event = event::read()?;
+                if matches!(event, Event::Key(_)) {
+                    self.restore_mouse_tracking_after_interaction();
+                }
+                match event {
                     Event::Key(key)
                         if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE =>
                     {
@@ -2595,7 +2609,7 @@ impl TuiRenderer {
                         // using the terminal's new dimensions without erasing scrollback.
                         let _ = self.handle_resize(w, h);
                     }
-                    Event::Mouse(mouse) if self.handle_accordion_mouse(mouse) => {
+                    Event::Mouse(mouse) if self.handle_mouse(mouse) => {
                         self.render()?;
                     }
                     _ => {}
@@ -2685,6 +2699,45 @@ impl TuiRenderer {
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
         true
+    }
+
+    /// Wheel ticks release mouse tracking so native scrollback is reachable;
+    /// other mouse events keep the existing accordion click-to-toggle path.
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let mut stdout = io::stdout();
+        self.handle_mouse_to(mouse, &mut stdout)
+    }
+
+    fn handle_mouse_to(&mut self, mouse: MouseEvent, out: &mut impl Write) -> bool {
+        if mouse_capture::is_wheel(mouse.kind) {
+            // A dialog owns the live area: native scroll would move Yes/No
+            // off-screen, and the restoring keypress would be dialog input.
+            // Leave the wheel for the dialog (ignored today; body scroll later).
+            if self.active_dialog.is_none() && self.active_tabbed_dialog.is_none() {
+                self.release_mouse_tracking_to(out);
+            }
+            return false;
+        }
+        self.handle_accordion_mouse(mouse)
+    }
+
+    /// Restore mouse tracking after a keypress or paste so clicks work again.
+    pub(crate) fn restore_mouse_tracking_after_interaction(&mut self) {
+        if !self.is_active {
+            return;
+        }
+        let mut stdout = io::stdout();
+        self.mouse_tracking =
+            mouse_capture::restore_after_interaction(&mut stdout, self.mouse_tracking);
+        let _ = stdout.flush();
+    }
+
+    fn release_mouse_tracking_to(&mut self, out: &mut impl Write) {
+        if !self.is_active {
+            return;
+        }
+        self.mouse_tracking = mouse_capture::release_for_native_scroll(out, self.mouse_tracking);
+        let _ = out.flush();
     }
 
     pub fn add_trait_message(&mut self, message: MessageRef) -> MessageId {
@@ -4057,6 +4110,124 @@ mod tests {
 
     fn assert_vt(condition: bool, message: &str, terminal: &VtOracle) {
         assert!(condition, "{message}\n{}", terminal.diagnostic());
+    }
+
+    fn renderer_owning_mouse_capture() -> TuiRenderer {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer = TuiRenderer::new_headless(output, Arc::new(StatusBar::new()), colors);
+        renderer.is_active = true;
+        renderer
+    }
+
+    fn wheel_up() -> MouseEvent {
+        MouseEvent {
+            kind: event::MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn disable_mouse_capture_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        execute!(&mut bytes, event::DisableMouseCapture).expect("encode DisableMouseCapture");
+        bytes
+    }
+
+    /// A Confirm dialog owns the live area, so a wheel must not release
+    /// tracking. Native scroll would move Yes/No off-screen (#435 at a
+    /// different layer), and the restoring keypress would be dialog input.
+    #[test]
+    fn test_handle_mouse_scroll_up_with_confirm_dialog_does_not_release_mouse_tracking_for_native_scrollback(
+    ) {
+        let mut renderer = renderer_owning_mouse_capture();
+        renderer.active_dialog = Some(Dialog::confirm("Approve this tool?", true));
+        let mut bytes = Vec::new();
+        renderer.handle_mouse_to(wheel_up(), &mut bytes);
+        assert_eq!(
+            renderer.mouse_tracking,
+            mouse_capture::MouseTracking::Held,
+            "INVARIANT: mouse tracking is released for native scrollback only \
+             when the live area is the transcript/input, not when a dialog owns \
+             it (#441 / F1). A Confirm dialog was open; tracking was {:?}. \
+             terminal received {bytes:?}",
+            renderer.mouse_tracking
+        );
+        assert!(
+            bytes.is_empty(),
+            "INVARIANT: a wheel over a Confirm dialog must not emit \
+             DisableMouseCapture, so Yes/No stay on-screen (#441 / F1). \
+             terminal received {bytes:?}"
+        );
+        renderer.is_active = false;
+    }
+
+    /// A tabbed dialog owns the live area the same way Confirm does.
+    #[test]
+    fn test_handle_mouse_scroll_up_with_tabbed_dialog_does_not_release_mouse_tracking_for_native_scrollback(
+    ) {
+        let mut renderer = renderer_owning_mouse_capture();
+        renderer.active_tabbed_dialog = Some(TabbedDialog::new(
+            vec![crate::cli::llm_dialogs::Question {
+                question: "Which path?".into(),
+                header: "Path".into(),
+                options: vec![
+                    crate::cli::llm_dialogs::QuestionOption {
+                        label: "A".into(),
+                        description: "first".into(),
+                        markdown: None,
+                    },
+                    crate::cli::llm_dialogs::QuestionOption {
+                        label: "B".into(),
+                        description: "second".into(),
+                        markdown: None,
+                    },
+                ],
+                multi_select: false,
+            }],
+            None,
+        ));
+        let mut bytes = Vec::new();
+        renderer.handle_mouse_to(wheel_up(), &mut bytes);
+        assert_eq!(
+            renderer.mouse_tracking,
+            mouse_capture::MouseTracking::Held,
+            "INVARIANT: a tabbed dialog owns the live area, so a wheel must \
+             not release mouse tracking (#441 / F1). tracking was {:?}. \
+             terminal received {bytes:?}",
+            renderer.mouse_tracking
+        );
+        assert!(
+            bytes.is_empty(),
+            "INVARIANT: a wheel over a tabbed dialog must not emit \
+             DisableMouseCapture (#441 / F1). terminal received {bytes:?}"
+        );
+        renderer.is_active = false;
+    }
+
+    /// The no-dialog path still releases, so F1 cannot be satisfied by
+    /// disabling native scroll altogether.
+    #[test]
+    fn test_handle_mouse_scroll_up_without_dialog_releases_mouse_tracking_for_native_scrollback() {
+        let mut renderer = renderer_owning_mouse_capture();
+        let mut bytes = Vec::new();
+        renderer.handle_mouse_to(wheel_up(), &mut bytes);
+        assert_eq!(
+            renderer.mouse_tracking,
+            mouse_capture::MouseTracking::ReleasedForNativeScroll,
+            "INVARIANT: with no dialog, a wheel still releases mouse tracking \
+             so native scrollback is reachable (#441). tracking was {:?}. \
+             terminal received {bytes:?}",
+            renderer.mouse_tracking
+        );
+        assert_eq!(
+            bytes,
+            disable_mouse_capture_bytes(),
+            "INVARIANT: the no-dialog release is DisableMouseCapture (#441). \
+             terminal received {bytes:?}"
+        );
+        renderer.is_active = false;
     }
 
     #[test]
