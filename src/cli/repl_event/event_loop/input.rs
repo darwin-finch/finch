@@ -103,6 +103,27 @@ Rules:\n\
                         self.output_manager.write_info(text);
                         self.render_tui().await?;
                     }
+                    Command::Usage => {
+                        let detail = self
+                            .session_usage
+                            .format_session_detail(Some(&self.session_usage_pricing));
+                        self.output_manager.write_info(detail);
+                        self.render_tui().await?;
+                    }
+                    Command::UsageReset => {
+                        self.session_usage.reset();
+                        self.checkpoint_session_usage();
+                        // The zeroed total leaves the status strip instead of
+                        // showing a fake zero burn; the next response starts a
+                        // new running total.
+                        self.status_bar
+                            .remove_line(&crate::cli::status_bar::StatusLineType::SessionUsage);
+                        self.output_manager.write_info(
+                            "Session usage reset. The next response starts a new running total."
+                                .to_string(),
+                        );
+                        self.render_tui().await?;
+                    }
                     Command::Training => {
                         use crate::cli::commands::format_training;
                         let router = Arc::clone(&self.router);

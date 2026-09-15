@@ -36,6 +36,10 @@ impl<'a> StatusWidget<'a> {
                     .fg(self.colors.ui.cursor.to_color())
                     .add_modifier(Modifier::BOLD)
             }
+            StatusLineType::SessionUsage => {
+                // Session-cumulative burn: subdued informational line
+                Style::default().fg(Color::Cyan)
+            }
             StatusLineType::MemoryContext => {
                 // Memory context: subtle teal/cyan
                 Style::default().fg(Color::Cyan)
