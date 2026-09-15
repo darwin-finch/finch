@@ -1298,7 +1298,7 @@ pub(crate) async fn process_query_with_tools(
                 query_states
                     .set_invocation_metadata(
                         query_id,
-                        crate::providers::types::InvocationMetadata {
+                        crate::providers::InvocationMetadata {
                             requested_model: generator.model_name().to_string(),
                             resolved_model: generator.model_name().to_string(),
                             actual_model: actual_model.clone(),
@@ -1555,7 +1555,7 @@ pub(crate) async fn process_query_with_tools(
             query_states
                 .set_invocation_metadata(
                     query_id,
-                    crate::providers::types::InvocationMetadata {
+                    crate::providers::InvocationMetadata {
                         requested_model: generator.model_name().to_string(),
                         resolved_model: generator.model_name().to_string(),
                         actual_model: response.metadata.model.clone(),

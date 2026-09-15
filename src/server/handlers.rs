@@ -1157,7 +1157,7 @@ fn push_named_brain_run_result(
     request_seq: u64,
     result: anyhow::Result<String>,
     continuation_messages: Vec<crate::claude::Message>,
-    invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
+    invocation_metadata: Option<crate::providers::InvocationMetadata>,
 ) -> anyhow::Result<crate::brain::store::BrainEvent> {
     if let Some(metadata) = &invocation_metadata {
         metadata.validate()?;

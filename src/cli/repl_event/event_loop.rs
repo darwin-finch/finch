@@ -1379,7 +1379,7 @@ fn assemble_named_brain_turn(
     effect_journal: Vec<crate::server::RunnerEffectRecord>,
     commit_ack: Option<crate::server::RunnerTurnCommitAck>,
     transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
-    invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
+    invocation_metadata: Option<crate::providers::InvocationMetadata>,
     initial_message_count: usize,
 ) -> std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError> {
     let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {

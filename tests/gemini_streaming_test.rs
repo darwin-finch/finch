@@ -10,7 +10,7 @@ use anyhow::Result;
 use finch::claude::ContentBlock;
 use finch::claude::Message;
 use finch::generators::StreamChunk;
-use finch::providers::gemini::GeminiProvider;
+use finch::providers::GeminiProvider;
 use finch::providers::{CapabilitySupport, LlmProvider, ProviderBackend, ProviderRequest};
 
 /// Test Gemini's exact attested optional capabilities.

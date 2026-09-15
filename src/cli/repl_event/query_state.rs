@@ -67,7 +67,7 @@ pub struct QueryMetadata {
 
     /// Completed provider identity/accounting retained until a named-Brain
     /// turn crosses its durable daemon commit boundary.
-    pub invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
+    pub invocation_metadata: Option<crate::providers::InvocationMetadata>,
 
     /// When this query was created
     pub created_at: std::time::Instant,
@@ -232,7 +232,7 @@ impl QueryStateManager {
     pub async fn set_invocation_metadata(
         &self,
         query_id: Uuid,
-        invocation: crate::providers::types::InvocationMetadata,
+        invocation: crate::providers::InvocationMetadata,
     ) {
         if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
             metadata.invocation_metadata = Some(invocation);

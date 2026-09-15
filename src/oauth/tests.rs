@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::EndpointFamily;
-use crate::providers::chatgpt_oauth::{
+use crate::providers::{
     ChatGptDeviceEndpointError, OpenAiChatGptOAuthDialect, OpenAiTokenVerifier,
     VerifiedOpenAiClaims,
 };

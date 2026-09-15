@@ -490,7 +490,7 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
 /// Validate the complete provider/credential metadata graph and every named
 /// transport before secret resolution, provider construction, or selection
 /// shortcuts can perform external work.
-pub(crate) fn preflight_provider_config(config: &Config) -> Result<()> {
+pub fn preflight_provider_config(config: &Config) -> Result<()> {
     config.validate()?;
     if let Some((index, _)) = config
         .providers

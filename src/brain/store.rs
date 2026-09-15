@@ -578,7 +578,7 @@ pub enum BrainEventKind {
         continuation_messages: Vec<crate::claude::Message>,
         /// Provider identity/accounting captured at the completed invocation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
+        invocation_metadata: Option<crate::providers::InvocationMetadata>,
     },
     /// Content-addressed typed-VM state committed after one accepted program.
     /// This is an internal Brain event, not a request to replay source after

@@ -17,7 +17,7 @@ use crate::config::{CredentialProvider, ProviderCredential};
 use crate::oauth::{
     FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthDialect, OAuthTokenRecord,
 };
-use crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect;
+use crate::providers::OpenAiChatGptOAuthDialect;
 use chrono::Utc;
 
 /// Default descriptor-anchored Finch store. No foreign application path is
@@ -185,7 +185,7 @@ impl ChatGptAuthService {
         &self,
     ) -> Result<
         OAuthClient<
-            OpenAiChatGptOAuthDialect<crate::providers::openai_jwks::OpenAiJwksVerifier>,
+            OpenAiChatGptOAuthDialect<crate::providers::OpenAiJwksVerifier>,
             FileOAuthCredentialStore,
         >,
     > {
@@ -500,7 +500,7 @@ where
 mod tests {
     use super::*;
     use crate::config::{AudienceBinding, CredentialKind, EndpointFamily};
-    use crate::providers::chatgpt_oauth::{OpenAiTokenVerifier, VerifiedOpenAiClaims};
+    use crate::providers::{OpenAiTokenVerifier, VerifiedOpenAiClaims};
     use chrono::{TimeDelta, Utc};
     use std::collections::BTreeSet;
     use std::sync::Mutex;

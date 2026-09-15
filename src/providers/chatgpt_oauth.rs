@@ -31,11 +31,11 @@ pub const CHATGPT_OAUTH_PROTOCOL_REVISION: &str =
     "openai-codex-public-client@94cbbddafc1776d5e377bca1b05932c697e82238+finch-binding-v2";
 pub const CHATGPT_SUBSCRIPTION_SERVICE_REVISION: &str =
     "chatgpt-codex-service@6478a751fde8884b2fdc76486fe23175a8e795d4";
-pub(crate) const OPENAI_PUBLIC_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const OPENAI_PUBLIC_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub(crate) const OPENAI_AUTH_ORIGIN: &str = "https://auth.openai.com";
 const CHATGPT_SERVICE_ORIGIN: &str = "https://chatgpt.com";
 pub const CHATGPT_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-pub(crate) const REQUIRED_TOKEN_ISSUER: &str = "https://auth.openai.com";
+pub const REQUIRED_TOKEN_ISSUER: &str = "https://auth.openai.com";
 /// Access-token `aud` minted by the pinned Codex public-client revision. This
 /// is token authority metadata, not permission to send the token to that URL.
 pub(crate) const OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE: &str = "https://api.openai.com/v1";

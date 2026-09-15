@@ -612,7 +612,7 @@ impl Default for ConversationHistory {
 ///
 /// ```text
 /// use crate::cli::conversation::{ConversationHistory, ConversationCompactor};
-/// use crate::providers::fallback_chain::FallbackChain;
+/// use crate::providers::FallbackChain;
 ///
 /// let mut history = ConversationHistory::new();
 /// // ... add many messages ...
@@ -646,7 +646,7 @@ impl Default for ConversationHistory {
 #[allow(dead_code)]
 pub struct ConversationCompactor<'a> {
     /// Fallback chain for API calls
-    fallback_chain: &'a crate::providers::fallback_chain::FallbackChain,
+    fallback_chain: &'a crate::providers::FallbackChain,
     /// Number of recent messages to keep intact (default: 4)
     keep_recent_count: usize,
     /// Compaction threshold as percentage of max tokens (default: 0.8 = 80%)
@@ -656,7 +656,7 @@ pub struct ConversationCompactor<'a> {
 #[allow(dead_code)]
 impl<'a> ConversationCompactor<'a> {
     /// Create a new conversation compactor
-    pub fn new(fallback_chain: &'a crate::providers::fallback_chain::FallbackChain) -> Self {
+    pub fn new(fallback_chain: &'a crate::providers::FallbackChain) -> Self {
         Self {
             fallback_chain,
             keep_recent_count: 4, // Keep last 4 messages (2 turns)
@@ -666,7 +666,7 @@ impl<'a> ConversationCompactor<'a> {
 
     /// Create with custom settings
     pub fn with_settings(
-        fallback_chain: &'a crate::providers::fallback_chain::FallbackChain,
+        fallback_chain: &'a crate::providers::FallbackChain,
         keep_recent_count: usize,
         threshold_percent: f32,
     ) -> Self {

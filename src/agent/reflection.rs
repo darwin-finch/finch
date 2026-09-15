@@ -244,8 +244,8 @@ git_email = "vesper@local.finch"
         // The early-exit path (empty tasks) returns before calling the teacher API.
         // We use a mock provider that panics if called, proving no API call is made.
         use crate::claude::ClaudeClient;
-        use crate::providers::types::{ProviderRequest, ProviderResponse, StreamChunk};
         use crate::providers::{ProviderBackend, ValidatedProviderRequest};
+        use crate::providers::{ProviderRequest, ProviderResponse, StreamChunk};
         use anyhow::Result;
         use tokio::sync::mpsc::Receiver;
 

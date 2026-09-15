@@ -93,7 +93,7 @@ pub(super) fn advance_catalog_refresh_if_done(state: &mut WizardState) {
         return;
     };
     if generation != *catalog_generation
-        || selection_identity != model_catalog::profile_cache_identity(&current_profile)
+        || selection_identity != profile_cache_identity(&current_profile)
     {
         return;
     }

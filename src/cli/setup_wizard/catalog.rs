@@ -209,7 +209,7 @@ pub(super) fn detect_xai_api_key() -> Option<String> {
 
 /// Known model names for cloud providers (used for cycling in ConfigureRemote dialog)
 pub(super) fn known_models_for(provider: &str) -> Vec<String> {
-    model_catalog::static_fallback(provider)
+    static_fallback(provider)
 }
 
 pub(super) fn model_catalog_profile(
@@ -708,7 +708,7 @@ pub(super) fn provider_entry_from_remote_model(
                 tenant: None,
                 project: None,
                 account: None,
-                required_scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+                required_scopes: crate::providers::chatgpt_required_scopes(),
             },
             model,
             base_url: None,

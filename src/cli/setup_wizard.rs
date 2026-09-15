@@ -28,9 +28,11 @@ mod tests;
 
 use crate::config::{CoreMlConfig, ExecutionTarget, ProviderEntry, TeacherEntry};
 use crate::models::{get_repository, InferenceProvider, ModelFamily, ModelSize};
-use crate::providers::endpoints::ProviderEndpoints;
-use crate::providers::model_catalog::{
-    self, CatalogAuth, CatalogSource, ModelCatalog, ModelCatalogProfile,
+use crate::providers::ProviderEndpoints;
+use crate::providers::{
+    default_cache_dir, fallback_catalog, profile_cache_identity, read_cache, refresh_from_config,
+    refresh_with_fallback, static_fallback, CatalogAuth, CatalogSource, ModelCatalog,
+    ModelCatalogProfile, STATIC_FALLBACK_AS_OF,
 };
 use crate::service::discovery_client::{DiscoveredService, ServiceDiscoveryClient};
 use anyhow::{Context, Result};

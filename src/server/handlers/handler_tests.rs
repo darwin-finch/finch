@@ -2059,7 +2059,7 @@ fn brain_history_remains_conversation_data_not_system_text() {
                             crate::claude::ContentBlock::text("(say \"answer\")"),
                         ],
                     )],
-                    invocation_metadata: Some(crate::providers::types::InvocationMetadata {
+                    invocation_metadata: Some(crate::providers::InvocationMetadata {
                         requested_model: "gpt-5.6".into(),
                         resolved_model: "gpt-5.6".into(),
                         actual_model: "gpt-5.6-sol".into(),

@@ -927,7 +927,7 @@ pub(super) fn format_catalog_label(
         CatalogSource::Cache => "local cache".to_string(),
         CatalogSource::StaticFallback => format!(
             "bundled fallback snapshot (as of {}; incomplete)",
-            model_catalog::STATIC_FALLBACK_AS_OF
+            STATIC_FALLBACK_AS_OF
         ),
     };
     let refreshed = if *catalog_source == CatalogSource::StaticFallback {
