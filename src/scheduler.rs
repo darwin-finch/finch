@@ -3810,4 +3810,35 @@ mod tests {
             outcome.diagnostics
         );
     }
+
+    #[tokio::test]
+    async fn test_peer_child_restart_session_is_hard_denied_not_asked() {
+        // The peer child-tool authority boundary (execute_child_tool) must
+        // hard-deny the name RestartTool actually registers. Before the
+        // hard-deny was keyed on registered names this call fell through to
+        // AskUser and surfaced as "owner approval required" — a default, not
+        // the deny the invariant claims.
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::RestartTool)];
+        let name = tools[0].name().to_string();
+        assert_eq!(
+            name, "restart_session",
+            "precondition: RestartTool must register restart_session for this \
+             test to exercise the production deny path"
+        );
+        let err = execute_child_tool(&tools, &name, serde_json::json!({}))
+            .await
+            .expect_err("a peer child must not be able to execute the restart tool");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("permission denied:"),
+            "invariant: a peer calling '{name}' must be hard-denied at the child \
+             tool authority boundary, not routed to an owner approval default; \
+             got: {msg}"
+        );
+        assert!(
+            !msg.contains("owner approval required"),
+            "invariant: an AskUser fallback for '{name}' means the peer hard-deny \
+             arm never fired for the real tool name; got: {msg}"
+        );
+    }
 }

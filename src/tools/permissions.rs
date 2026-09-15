@@ -10,6 +10,69 @@ use tracing::{debug, warn};
 
 use crate::programs::ExecutionEffect;
 
+/// Registered tools that only inspect Finch's own typed runtime metadata.
+/// They neither access the workspace nor cross a host-effect boundary, so a
+/// provider must be able to use them to discover the VM protocol without
+/// interrupting the user for an approval dialog.
+///
+/// Every entry must be a name some `Tool` registers or an alias key;
+/// conformance-tested in `src/cli/repl/always_allow_tests.rs`.
+pub const VM_DISCOVERY_TOOLS: &[&str] = &[
+    "get_vm_state",
+    "get_language_definition",
+    "search_vm_vocabulary",
+    "inspect_vm_word",
+    "search_word",
+    "inspect_word",
+    "search_vocabulary",
+    "inspect_program",
+];
+
+/// Registered tool names a peer is hard-denied regardless of configuration.
+///
+/// Keyed on the names the `Tool` implementations register — `restart_session`
+/// (`implementations/restart.rs`) and `spawn_task` (`implementations/spawn.rs`)
+/// — not on unregistered literals, so a rename cannot silently strand the deny
+/// arm (the regression that made `test_peer_cannot_restart` and
+/// `test_peer_cannot_spawn` pass while proving nothing). Peer agent
+/// coordination (`spawn_agent`, `await_agent`, `poll_agent`, `cancel_agent`)
+/// is scheduler-local and enforces task-tree ownership itself, so those names
+/// stay on [`PEER_SILENT_ALLOW_TOOLS`].
+///
+/// Every entry must be a name some `Tool` registers or an alias key;
+/// conformance-tested in `src/cli/repl/always_allow_tests.rs`.
+pub const PEER_HARD_DENY_TOOLS: &[&str] = &["restart_session", "spawn_task"];
+
+/// Registered tool names a peer may invoke silently, without an approval
+/// dialog: read-only examination plus scheduler-local agent control.
+///
+/// Every entry must be a name some `Tool` registers or an alias key;
+/// conformance-tested in `src/cli/repl/always_allow_tests.rs`.
+pub const PEER_SILENT_ALLOW_TOOLS: &[&str] = &[
+    "read",
+    "glob",
+    "grep",
+    "get_vm_state",
+    "get_language_definition",
+    "search_vm_vocabulary",
+    "inspect_vm_word",
+    "search_word",
+    "inspect_word",
+    "search_vocabulary",
+    "inspect_program",
+    "spawn_agent",
+    "await_agent",
+    "poll_agent",
+    "cancel_agent",
+];
+
+/// Registered tool names through which a peer proposes file changes. Each
+/// surfaces as AskUser so a human reviews the diff before anything applies.
+///
+/// Every entry must be a name some `Tool` registers or an alias key;
+/// conformance-tested in `src/cli/repl/always_allow_tests.rs`.
+pub const PEER_REVIEWED_CHANGESET_TOOLS: &[&str] = &["write", "edit", "patch"];
+
 /// Permission decision for a tool execution
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermissionCheck {
@@ -157,17 +220,7 @@ impl PermissionManager {
         // neither access the workspace nor cross a host-effect boundary, so a
         // provider must be able to use them to discover the VM protocol
         // without interrupting the user for an approval dialog.
-        if matches!(
-            tool_name,
-            "get_vm_state"
-                | "get_language_definition"
-                | "search_vm_vocabulary"
-                | "inspect_vm_word"
-                | "search_word"
-                | "inspect_word"
-                | "search_vocabulary"
-                | "inspect_program"
-        ) {
+        if VM_DISCOVERY_TOOLS.contains(&tool_name) {
             return PermissionCheck::Allow;
         }
 
@@ -199,8 +252,10 @@ impl PermissionManager {
 
     /// Asymmetric permission check for AI peers.
     fn check_peer_tool_use(&self, tool_name: &str, input: &Value) -> PermissionCheck {
-        // Hard deny: peer cannot restart/recompile/kill the session
-        if matches!(tool_name, "restart" | "spawn") {
+        // Hard deny: a peer cannot restart/recompile/kill the session or spawn
+        // processes. Keyed on the registered tool names in PEER_HARD_DENY_TOOLS
+        // so an unregistered spelling can never silently replace the deny.
+        if PEER_HARD_DENY_TOOLS.contains(&tool_name) {
             return PermissionCheck::Deny("Peer cannot restart or spawn processes".to_string());
         }
 
@@ -209,49 +264,37 @@ impl PermissionManager {
             return PermissionCheck::Deny(reason);
         }
 
-        match tool_name {
-            // Silent allow: read-only examination and scheduler-local control.
-            // Agent tools enforce task-tree ownership themselves.
-            "read"
-            | "glob"
-            | "grep"
-            | "get_vm_state"
-            | "get_language_definition"
-            | "search_vm_vocabulary"
-            | "inspect_vm_word"
-            | "search_word"
-            | "inspect_word"
-            | "search_vocabulary"
-            | "inspect_program"
-            | "spawn_agent"
-            | "await_agent"
-            | "poll_agent"
-            | "cancel_agent" => PermissionCheck::Allow,
-
-            // The typed broker, not this compatibility tool gate, authorizes
-            // every concrete host effect inferred from a submitted program.
-            "submit_program" => PermissionCheck::Allow,
-
-            // Write/edit/patch: require an explicit reviewed changeset.
-            "write" | "edit" | "patch" => {
-                PermissionCheck::AskUser("Model proposes a file change — review diff".to_string())
-            }
-
-            // Bash: allow read-only commands silently, ask for everything else
-            "bash" => {
-                let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                if is_readonly_bash(command) {
-                    PermissionCheck::Allow
-                } else {
-                    PermissionCheck::AskUser(
-                        "Peer wants to run a shell command — approve?".to_string(),
-                    )
-                }
-            }
-
-            // Everything else: ask
-            _ => PermissionCheck::AskUser(format!("Peer wants to use '{}' — approve?", tool_name)),
+        // Silent allow: read-only examination and scheduler-local control.
+        // Agent tools enforce task-tree ownership themselves.
+        if PEER_SILENT_ALLOW_TOOLS.contains(&tool_name) {
+            return PermissionCheck::Allow;
         }
+
+        // The typed broker, not this compatibility tool gate, authorizes
+        // every concrete host effect inferred from a submitted program.
+        if tool_name == "submit_program" {
+            return PermissionCheck::Allow;
+        }
+
+        // Write/edit/patch: require an explicit reviewed changeset.
+        if PEER_REVIEWED_CHANGESET_TOOLS.contains(&tool_name) {
+            return PermissionCheck::AskUser(
+                "Model proposes a file change — review diff".to_string(),
+            );
+        }
+
+        // Bash: allow read-only commands silently, ask for everything else
+        if tool_name == "bash" {
+            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            return if is_readonly_bash(command) {
+                PermissionCheck::Allow
+            } else {
+                PermissionCheck::AskUser("Peer wants to run a shell command — approve?".to_string())
+            };
+        }
+
+        // Everything else: ask
+        PermissionCheck::AskUser(format!("Peer wants to use '{}' — approve?", tool_name))
     }
 
     /// Apply constitutional constraints (safety checks)
@@ -624,30 +667,106 @@ mod tests {
 
     // ── ExecutorRole::Peer tests ──────────────────────────────────────────────
 
+    /// Null provider — fails on any actual call; used to construct TaskTool
+    /// so the test can read the name the real tool implementation registers.
+    struct NullProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::ProviderBackend for NullProvider {
+        async fn send_message_validated(
+            &self,
+            _req: crate::providers::ValidatedProviderRequest,
+        ) -> anyhow::Result<crate::providers::ProviderResponse> {
+            anyhow::bail!("null provider")
+        }
+        async fn send_message_stream_validated(
+            &self,
+            _req: crate::providers::ValidatedProviderRequest,
+        ) -> anyhow::Result<
+            tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>,
+        > {
+            anyhow::bail!("null provider")
+        }
+        fn name(&self) -> &str {
+            "null"
+        }
+        fn default_model(&self) -> &str {
+            "null"
+        }
+    }
+
     #[test]
     fn test_peer_cannot_restart() {
         let mgr = PermissionManager::for_peer();
+        // Exercise the name the real RestartTool registers, not a literal: a
+        // deny arm keyed on a name no tool registers is unreachable in
+        // production and would let a peer call fall through to AskUser.
+        let name = crate::tools::Tool::name(&crate::tools::implementations::restart::RestartTool);
         let input = serde_json::json!({});
+        let check = mgr.check_tool_use(name, &input);
         assert!(
-            matches!(
-                mgr.check_tool_use("restart", &input),
-                PermissionCheck::Deny(_)
-            ),
-            "Peer must not be allowed to restart"
+            matches!(check, PermissionCheck::Deny(_)),
+            "invariant: a peer must be hard-denied for '{name}', the tool name \
+             RestartTool registers; got {check:?} (AskUser means the hard-deny \
+             arm is unreachable for the real tool name)"
         );
     }
 
     #[test]
     fn test_peer_cannot_spawn() {
         let mgr = PermissionManager::for_peer();
+        // Exercise the name the real TaskTool registers, not a literal.
+        let task_tool =
+            crate::tools::implementations::spawn::TaskTool::new(std::sync::Arc::new(NullProvider));
+        let name = crate::tools::Tool::name(&task_tool);
         let input = serde_json::json!({});
+        let check = mgr.check_tool_use(name, &input);
         assert!(
-            matches!(
-                mgr.check_tool_use("spawn", &input),
-                PermissionCheck::Deny(_)
-            ),
-            "Peer must not be allowed to spawn processes"
+            matches!(check, PermissionCheck::Deny(_)),
+            "invariant: a peer must be hard-denied for '{name}', the tool name \
+             TaskTool registers; got {check:?} (AskUser means the hard-deny \
+             arm is unreachable for the real tool name)"
         );
+    }
+
+    #[test]
+    fn test_peer_hard_deny_table_names_are_declared_by_real_tool_implementations() {
+        // Conformance against the same drift class as the original defect:
+        // every name in PEER_HARD_DENY_TOOLS must be a name the real Tool
+        // implementations register, and the table must name exactly the
+        // restart/spawn tools — otherwise the deny arm has drifted onto an
+        // unregistered literal (unreachable in production) or a registered
+        // name has lost its deny.
+        let task_tool =
+            crate::tools::implementations::spawn::TaskTool::new(std::sync::Arc::new(NullProvider));
+        let mut declared: Vec<String> = vec![
+            crate::tools::Tool::name(&crate::tools::implementations::restart::RestartTool)
+                .to_string(),
+            crate::tools::Tool::name(&task_tool).to_string(),
+        ];
+        declared.sort();
+        let mut table: Vec<String> = PEER_HARD_DENY_TOOLS
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect();
+        table.sort();
+        assert_eq!(
+            table, declared,
+            "PEER_HARD_DENY_TOOLS must name exactly the tool names the restart \
+             and spawn Tool implementations register (declared = {declared:?}, \
+             table = {table:?})"
+        );
+    }
+
+    #[test]
+    fn test_peer_silent_allow_covers_every_vm_discovery_tool() {
+        for tool in VM_DISCOVERY_TOOLS {
+            assert!(
+                PEER_SILENT_ALLOW_TOOLS.contains(tool),
+                "{tool} is VM discovery and must stay silently allowed for peers; \
+                 PEER_SILENT_ALLOW_TOOLS = {PEER_SILENT_ALLOW_TOOLS:?}"
+            );
+        }
     }
 
     #[test]
