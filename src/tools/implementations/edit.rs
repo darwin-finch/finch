@@ -1265,44 +1265,33 @@ mod tests {
         );
     }
 
-    /// F2 (#482): `FileDiff::from_texts` re-parses its own rendering, so a
-    /// removed line beginning `-- ` is re-read as a `--- ` file header and
-    /// disappears. Common in SQL, Lua, Haskell and Ada.
+    /// Header-looking SQL comments must appear in the review artifact. The
+    /// shared FileDiff model used to drop a removed `-- ` line by re-parsing
+    /// its own unified output as a file header.
     #[tokio::test]
-    async fn test_removed_line_starting_with_double_dash_is_refused() {
+    async fn test_removed_line_starting_with_double_dash_appears_in_review() {
         let source = "SELECT 1;\n-- keep totals\n-- and averages\nSELECT 2;\n";
         let (_dir, path) = temp_file("q.sql", source);
-        let opened = Arc::new(Mutex::new(false));
-        let flag = opened.clone();
-        let error = review_and_apply_edit(
+        let seen = Arc::new(Mutex::new(None));
+        let result = review_and_apply_edit(
             &path,
             "-- keep totals\n-- and averages\n",
             "",
             false,
-            move |a: String| {
-                *flag.lock().unwrap() = true;
-                Box::pin(async move { Ok(Some(a)) })
-                    as std::pin::Pin<
-                        Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>,
-                    >
-            },
+            capturing_editor(seen.clone(), Some),
         )
         .await
-        .expect_err("a diff that swallowed a removed line must be refused");
+        .expect("header-looking SQL comments must be reviewable");
 
+        let artifact = seen.lock().unwrap().clone().expect("editor was opened");
         assert!(
-            !*opened.lock().unwrap(),
-            "the reviewer must not be shown a diff missing the lines being deleted; \
-             error: {error}"
-        );
-        assert!(
-            error.to_string().contains("#482"),
-            "the interim refusal must name the module defect, got: {error}"
+            artifact.contains("--- keep totals") && artifact.contains("--- and averages"),
+            "the review must show the removed '-- ' lines; artifact:\n{artifact}"
         );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            source,
-            "a refused edit must leave the file untouched"
+            "SELECT 1;\nSELECT 2;\n",
+            "approving the SQL comment deletion must apply it; tool said: {result}"
         );
     }
 
