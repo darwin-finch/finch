@@ -19,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::runtime::effect_log::{EffectAuditIdentity, EffectAuditTransition};
+use crate::runtime::{EffectAuditIdentity, EffectAuditTransition};
 
 const MANIFEST_VERSION: u32 = 1;
 pub(crate) const MAX_REPLAY_EPOCH_RECORDS: u64 = 32_768;

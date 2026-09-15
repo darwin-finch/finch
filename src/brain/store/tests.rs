@@ -3955,10 +3955,7 @@ async fn reviewed_initialization_module_is_typed_and_pure() {
         })
         .await
         .unwrap();
-    assert_eq!(
-        outcome.status,
-        crate::runtime::outcome::ExecutionStatus::Completed
-    );
+    assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
     assert!(outcome.inferred_capabilities.is_empty());
     assert!(outcome.vm_side_effects.is_empty());
 }
@@ -5274,10 +5271,7 @@ async fn named_brain_restores_one_typed_runtime_without_replaying_source() {
         })
         .await
         .unwrap();
-    assert_eq!(
-        outcome.status,
-        crate::runtime::outcome::ExecutionStatus::Completed
-    );
+    assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
     let committed_revision = outcome.output_revision;
     let committed = store
         .commit_runtime("brain", 1, outcome.output_revision, &runtime)
@@ -5323,10 +5317,7 @@ async fn named_brain_restores_one_typed_runtime_without_replaying_source() {
         })
         .await
         .unwrap();
-    assert_eq!(
-        outcome.status,
-        crate::runtime::outcome::ExecutionStatus::Completed
-    );
+    assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
     assert_eq!(outcome.values, vec![crate::programs::ProgramValue::Int(49)]);
     assert_eq!(outcome.output_revision, committed_revision + 1);
 }
@@ -5720,10 +5711,7 @@ async fn named_brain_persists_denial_without_a_vm_commit() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        denied.status,
-        crate::runtime::outcome::ExecutionStatus::Failed
-    );
+    assert_eq!(denied.status, crate::runtime::ExecutionStatus::Failed);
 
     let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
     let restored = restarted.program_runtime("brain").unwrap();
@@ -5770,10 +5758,7 @@ async fn named_brain_persists_host_authorization_even_when_the_run_rolls_back() 
         })
         .await
         .unwrap();
-    assert_eq!(
-        failed.status,
-        crate::runtime::outcome::ExecutionStatus::Failed
-    );
+    assert_eq!(failed.status, crate::runtime::ExecutionStatus::Failed);
     assert_eq!(runtime.revision(), 0, "failed VM state must roll back");
 
     let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
@@ -6103,15 +6088,15 @@ fn effect_audit_permit_precedes_host_outcome_and_survives_turn_terminalization()
             &grant,
             Some(&permit),
             identity,
-            crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged {
+            crate::runtime::EffectAuditTerminalOutcome::Acknowledged {
                 response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
             },
         )
         .unwrap();
     let snapshot = store.snapshot("shared").unwrap();
     assert!(matches!(snapshot.effect_audits[0].state,
-            crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+            crate::runtime::EffectAuditState::Terminal {
+                outcome: crate::runtime::EffectAuditTerminalOutcome::Redacted {
                     ref outcome_kind
                 }
             } if outcome_kind == "acknowledged"));
@@ -6123,7 +6108,7 @@ fn effect_audit_permit_precedes_host_outcome_and_survives_turn_terminalization()
         .flatten()
         .unwrap();
     assert!(matches!(fence,
-            crate::runtime::effect_log::EffectAuditTransition::Fence {
+            crate::runtime::EffectAuditTransition::Fence {
                 ref outcome_kind, ..
             } if outcome_kind == "acknowledged"));
     assert!(!snapshot
@@ -6283,9 +6268,8 @@ fn effect_audit_request_end_reconciles_before_and_after_physical_boundary() {
         .any(|entry| entry.intent.identity == unbegun
             && matches!(
                 entry.state,
-                crate::runtime::effect_log::EffectAuditState::Terminal {
-                    outcome:
-                        crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+                crate::runtime::EffectAuditState::Terminal {
+                    outcome: crate::runtime::EffectAuditTerminalOutcome::AbandonedNotApplied
                 }
             )));
     assert!(snapshot
@@ -6294,9 +6278,8 @@ fn effect_audit_request_end_reconciles_before_and_after_physical_boundary() {
         .any(|entry| entry.intent.identity == begun
             && matches!(
                 entry.state,
-                crate::runtime::effect_log::EffectAuditState::Terminal {
-                    outcome:
-                        crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
+                crate::runtime::EffectAuditState::Terminal {
+                    outcome: crate::runtime::EffectAuditTerminalOutcome::UncertainProcessLoss
                 }
             )));
 }
@@ -6335,14 +6318,14 @@ fn effect_audit_connection_teardown_batch_is_exact_idempotent_and_retryable() {
         entry.intent.identity == unbegun
             && matches!(
                 entry.state,
-                crate::runtime::effect_log::EffectAuditState::IntentAccepted
+                crate::runtime::EffectAuditState::IntentAccepted
             )
     }));
     assert!(failed.effect_audits.iter().any(|entry| {
         entry.intent.identity == begun
             && matches!(
                 entry.state,
-                crate::runtime::effect_log::EffectAuditState::AwaitingHostResult
+                crate::runtime::EffectAuditState::AwaitingHostResult
             )
     }));
 
@@ -6368,8 +6351,8 @@ fn effect_audit_connection_teardown_batch_is_exact_idempotent_and_retryable() {
         .iter()
         .any(|entry| entry.intent.identity == unbegun
             && matches!(entry.state,
-                    crate::runtime::effect_log::EffectAuditState::Terminal {
-                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted {
+                    crate::runtime::EffectAuditState::Terminal {
+                        outcome: crate::runtime::EffectAuditTerminalOutcome::Compacted {
                             ref outcome_kind, ..
                         }
                     } if outcome_kind == "abandoned_not_applied")));
@@ -6378,8 +6361,8 @@ fn effect_audit_connection_teardown_batch_is_exact_idempotent_and_retryable() {
         .iter()
         .any(|entry| entry.intent.identity == begun
             && matches!(entry.state,
-                    crate::runtime::effect_log::EffectAuditState::Terminal {
-                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted {
+                    crate::runtime::EffectAuditState::Terminal {
+                        outcome: crate::runtime::EffectAuditTerminalOutcome::Compacted {
                             ref outcome_kind, ..
                         }
                     } if outcome_kind == "uncertain_process_loss")));
@@ -6407,7 +6390,7 @@ fn audit_bound_fixture(
     BrainStore,
     BrainRunnerLease,
     EffectAuditAuthorityGrant,
-    Vec<crate::runtime::effect_log::EffectAuditIdentity>,
+    Vec<crate::runtime::EffectAuditIdentity>,
 ) {
     let store = BrainStore::with_root("box.local", Some(root.to_path_buf()));
     let (_run, lease, grant) = audit_run_fixture(&store);
@@ -7008,7 +6991,7 @@ fn effect_audit_epochs_bound_active_history_and_fence_replay_after_restart() {
                 &grant,
                 Some(&permit),
                 identity,
-                crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged {
+                crate::runtime::EffectAuditTerminalOutcome::Acknowledged {
                     response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
                 },
             )
@@ -7092,7 +7075,7 @@ fn effect_audit_stale_successor_cannot_start_but_original_permit_can_finish() {
             &grant,
             Some(&permit),
             identity,
-            crate::runtime::effect_log::EffectAuditTerminalOutcome::FailedPartial {
+            crate::runtime::EffectAuditTerminalOutcome::FailedPartial {
                 detail: "host reported a partial write".into(),
             },
         )
@@ -7130,11 +7113,11 @@ fn effect_audit_restart_reconciles_without_reapplication() {
         .flatten()
         .unwrap();
     assert!(matches!(unbegun_fence,
-            crate::runtime::effect_log::EffectAuditTransition::Fence {
+            crate::runtime::EffectAuditTransition::Fence {
                 ref outcome_kind, ..
             } if outcome_kind == "abandoned_not_applied"));
     assert!(matches!(begun_fence,
-            crate::runtime::effect_log::EffectAuditTransition::Fence {
+            crate::runtime::EffectAuditTransition::Fence {
                 ref outcome_kind, ..
             } if outcome_kind == "uncertain_process_loss"));
 }

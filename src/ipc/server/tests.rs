@@ -125,7 +125,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
         assert!(repeated_begin.to_string().contains("already begun"));
         assert!(matches!(
             store.snapshot("shared").unwrap().effect_audits[0].state,
-            crate::runtime::effect_log::EffectAuditState::AwaitingHostResult
+            crate::runtime::EffectAuditState::AwaitingHostResult
         ));
         let mut invalid_terminal = reservation.not_applied_request();
         invalid_terminal.get().set_reason("too late");
@@ -192,8 +192,8 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
 
         let snapshot = store.snapshot("shared").unwrap();
         assert!(matches!(snapshot.effect_audits[0].state,
-                crate::runtime::effect_log::EffectAuditState::Terminal {
-                    outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                crate::runtime::EffectAuditState::Terminal {
+                    outcome: crate::runtime::EffectAuditTerminalOutcome::Redacted {
                         ref outcome_kind
                     }
                 } if outcome_kind == "acknowledged"));
@@ -700,7 +700,7 @@ async fn raw_effect_eof_states(
     begin: bool,
     count: usize,
     mature_history: bool,
-) -> Vec<crate::runtime::effect_log::EffectAuditState> {
+) -> Vec<crate::runtime::EffectAuditState> {
     let temp = tempfile::tempdir().unwrap();
     let store =
         crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
@@ -941,16 +941,14 @@ async fn effect_audit_partial_frame_connection_teardown_reconciles_before_and_af
                 .collect::<Vec<_>>();
             assert!(states.iter().any(|state| matches!(
                 state,
-                crate::runtime::effect_log::EffectAuditState::Terminal {
-                    outcome:
-                        crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+                crate::runtime::EffectAuditState::Terminal {
+                    outcome: crate::runtime::EffectAuditTerminalOutcome::AbandonedNotApplied
                 }
             )));
             assert!(states.iter().any(|state| matches!(
                 state,
-                crate::runtime::effect_log::EffectAuditState::Terminal {
-                    outcome:
-                        crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
+                crate::runtime::EffectAuditState::Terminal {
+                    outcome: crate::runtime::EffectAuditTerminalOutcome::UncertainProcessLoss
                 }
             )));
         })
@@ -998,150 +996,153 @@ async fn effect_audit_teardown_transaction_failure_keeps_authority_fenced_until_
 #[tokio::test(flavor = "current_thread")]
 async fn effect_audit_connection_teardown_closes_admission_and_drains_pre_snapshot_dispatch() {
     tokio::task::LocalSet::new()
-            .run_until(async {
-                let temp = tempfile::tempdir().unwrap();
-                let store = crate::brain::store::BrainStore::with_root(
-                    "box.local",
-                    Some(temp.path().join("brains")),
-                );
-                let attachment = store
-                    .attach(
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local",
+                Some(temp.path().join("brains")),
+            );
+            let attachment = store
+                .attach(
+                    "shared",
+                    "alice",
+                    crate::brain::store::AttachmentRole::Driver,
+                    None,
+                )
+                .unwrap();
+            let prompt = store
+                .push(
+                    "shared",
+                    "alice",
+                    crate::brain::store::BrainEventKind::Prompt {
+                        text: "queued teardown race".into(),
+                    },
+                )
+                .unwrap();
+            let run = store
+                .start_run(
+                    "shared",
+                    "alice",
+                    crate::brain::store::BrainRunKind::Interactive,
+                    prompt.seq,
+                    attachment.attachment_id,
+                    crate::brain::store::BrainRunStatus::Running,
+                )
+                .unwrap();
+            let lease = store
+                .acquire_runner_lease("shared", "runner", 1, None, 300_000)
+                .unwrap();
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store.clone(),
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([50; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                )
+                .unwrap(),
+            );
+            let connection_id = uuid::Uuid::new_v4();
+            let runners = server.brain_runners();
+            runners
+                .claim_connection_identity(connection_id, "runner@box.local/queued")
+                .unwrap();
+            runners
+                .claim_connection_lease(connection_id, "shared", lease.lease_id)
+                .unwrap();
+            let (callback_tx, _callback_rx) = tokio::sync::mpsc::unbounded_channel();
+            runners
+                .register_for_connection(connection_id, "shared", lease.lease_id, callback_tx)
+                .unwrap();
+            let admission = runners
+                .connection_dispatch_admission(connection_id)
+                .unwrap();
+            let queued_dispatch = admission
+                .try_enter()
+                .expect("live connection admits queued callback dispatch");
+            let run_id = run.run_id;
+            let lease_id = lease.lease_id;
+            let release = std::sync::Arc::new(tokio::sync::Notify::new());
+            let release_task = std::sync::Arc::clone(&release);
+            let queued_store = store.clone();
+            let queued = tokio::task::spawn_local(async move {
+                let _queued_dispatch = queued_dispatch;
+                release_task.notified().await;
+                let grant = queued_store
+                    .issue_effect_audit_authority(
                         "shared",
-                        "alice",
-                        crate::brain::store::AttachmentRole::Driver,
-                        None,
+                        run_id,
+                        lease_id,
+                        Some(crate::brain::store::ConnectionId(connection_id)),
                     )
                     .unwrap();
-                let prompt = store
-                    .push(
-                        "shared",
-                        "alice",
-                        crate::brain::store::BrainEventKind::Prompt {
-                            text: "queued teardown race".into(),
+                queued_store
+                    .reserve_effect_audit(
+                        &grant,
+                        uuid::Uuid::new_v4(),
+                        crate::vm::VmSideEffect {
+                            protocol_version: 1,
+                            sequence: 0,
+                            requirement: crate::vm::CapabilityRequirement {
+                                capability: crate::vm::CapabilityKind::SessionEmit,
+                                selector: crate::vm::ResourceSelector::None,
+                            },
+                            output: Vec::new(),
+                            event: crate::vm::HostSideEffect::Emit {
+                                text: "queued".into(),
+                            },
+                            origin: crate::vm::SourceOrigin::generated("queued-before-teardown"),
                         },
                     )
-                    .unwrap();
-                let run = store
-                    .start_run(
-                        "shared",
-                        "alice",
-                        crate::brain::store::BrainRunKind::Interactive,
-                        prompt.seq,
-                        attachment.attachment_id,
-                        crate::brain::store::BrainRunStatus::Running,
-                    )
-                    .unwrap();
-                let lease = store
-                    .acquire_runner_lease("shared", "runner", 1, None, 300_000)
-                    .unwrap();
-                let server = std::sync::Arc::new(
-                    crate::server::AgentServer::for_brain_protocol_test(
-                        store.clone(),
-                        crate::brain::credential::BrainCredentialAuthority::ephemeral([50; 32]),
-                        "test-password".into(),
-                        temp.path(),
-                    )
-                    .unwrap(),
-                );
-                let connection_id = uuid::Uuid::new_v4();
-                let runners = server.brain_runners();
-                runners
-                    .claim_connection_identity(connection_id, "runner@box.local/queued")
-                    .unwrap();
-                runners
-                    .claim_connection_lease(connection_id, "shared", lease.lease_id)
-                    .unwrap();
-                let (callback_tx, _callback_rx) = tokio::sync::mpsc::unbounded_channel();
-                runners
-                    .register_for_connection(connection_id, "shared", lease.lease_id, callback_tx)
-                    .unwrap();
-                let admission = runners
-                    .connection_dispatch_admission(connection_id)
-                    .unwrap();
-                let queued_dispatch = admission
-                    .try_enter()
-                    .expect("live connection admits queued callback dispatch");
-                let run_id = run.run_id;
-                let lease_id = lease.lease_id;
-                let release = std::sync::Arc::new(tokio::sync::Notify::new());
-                let release_task = std::sync::Arc::clone(&release);
-                let queued_store = store.clone();
-                let queued = tokio::task::spawn_local(async move {
-                    let _queued_dispatch = queued_dispatch;
-                    release_task.notified().await;
-                    let grant = queued_store
-                        .issue_effect_audit_authority(
-                            "shared",
-                            run_id,
-                            lease_id,
-                            Some(crate::brain::store::ConnectionId(connection_id)),
-                        )
-                        .unwrap();
-                    queued_store
-                        .reserve_effect_audit(
-                            &grant,
-                            uuid::Uuid::new_v4(),
-                            crate::vm::VmSideEffect {
-                                protocol_version: 1,
-                                sequence: 0,
-                                requirement: crate::vm::CapabilityRequirement {
-                                    capability: crate::vm::CapabilityKind::SessionEmit,
-                                    selector: crate::vm::ResourceSelector::None,
-                                },
-                                output: Vec::new(),
-                                event: crate::vm::HostSideEffect::Emit {
-                                    text: "queued".into(),
-                                },
-                                origin: crate::vm::SourceOrigin::generated(
-                                    "queued-before-teardown",
-                                ),
-                            },
-                        )
-                        .unwrap()
-                });
+                    .unwrap()
+            });
 
-                let teardown = runners.begin_connection_teardown(connection_id);
-                assert!(
-                    admission.try_enter().is_none(),
-                    "teardown must reject new callback work before the audit snapshot"
-                );
-                release.notify_one();
-                teardown.wait_quiesced().await;
-                let identity = queued.await.unwrap();
-                assert_eq!(
-                    store
-                        .reconcile_effect_audits_for_disconnected_leases(
-                            "shared",
-                            &[lease_id],
-                        )
-                        .unwrap(),
-                    1
-                );
-                teardown.finish().unwrap();
-                let snapshot = store.snapshot("shared").unwrap();
-                assert!(snapshot.effect_audits.iter().any(|entry|
-                    entry.intent.identity == identity
-                        && matches!(entry.state,
-                            crate::runtime::effect_log::EffectAuditState::Terminal {
-                                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
-                            })));
-                assert!(snapshot.effect_audits.iter().all(|entry| entry.state.is_terminal()));
-            })
-            .await;
+            let teardown = runners.begin_connection_teardown(connection_id);
+            assert!(
+                admission.try_enter().is_none(),
+                "teardown must reject new callback work before the audit snapshot"
+            );
+            release.notify_one();
+            teardown.wait_quiesced().await;
+            let identity = queued.await.unwrap();
+            assert_eq!(
+                store
+                    .reconcile_effect_audits_for_disconnected_leases("shared", &[lease_id],)
+                    .unwrap(),
+                1
+            );
+            teardown.finish().unwrap();
+            let snapshot = store.snapshot("shared").unwrap();
+            assert!(snapshot
+                .effect_audits
+                .iter()
+                .any(|entry| entry.intent.identity == identity
+                    && matches!(
+                        entry.state,
+                        crate::runtime::EffectAuditState::Terminal {
+                            outcome:
+                                crate::runtime::EffectAuditTerminalOutcome::AbandonedNotApplied
+                        }
+                    )));
+            assert!(snapshot
+                .effect_audits
+                .iter()
+                .all(|entry| entry.state.is_terminal()));
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn effect_audit_raw_frontend_eof_reconciles_before_and_after_application_boundary() {
     assert!(matches!(
         raw_effect_eof_states(false, 1, false).await.remove(0),
-        crate::runtime::effect_log::EffectAuditState::Terminal {
-            outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+        crate::runtime::EffectAuditState::Terminal {
+            outcome: crate::runtime::EffectAuditTerminalOutcome::AbandonedNotApplied
         }
     ));
     assert!(matches!(
         raw_effect_eof_states(true, 1, false).await.remove(0),
-        crate::runtime::effect_log::EffectAuditState::Terminal {
-            outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
+        crate::runtime::EffectAuditState::Terminal {
+            outcome: crate::runtime::EffectAuditTerminalOutcome::UncertainProcessLoss
         }
     ));
 }
@@ -1152,7 +1153,7 @@ async fn effect_audit_max_quota_raw_eof_terminalizes_once_within_teardown_bound(
         std::time::Duration::from_secs(2),
         raw_effect_eof_states(
             false,
-            crate::runtime::effect_log::MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
+            crate::runtime::MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
             true,
         ),
     )
@@ -1160,12 +1161,12 @@ async fn effect_audit_max_quota_raw_eof_terminalizes_once_within_teardown_bound(
     .expect("max-quota runner EOF exceeded the two-second teardown bound");
     assert_eq!(
         states.len(),
-        crate::runtime::effect_log::MAX_ACTIVE_EFFECT_AUDITS_PER_RUN
+        crate::runtime::MAX_ACTIVE_EFFECT_AUDITS_PER_RUN
     );
     assert!(states.into_iter().all(|state| matches!(
         state,
-        crate::runtime::effect_log::EffectAuditState::Terminal {
-            outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+        crate::runtime::EffectAuditState::Terminal {
+            outcome: crate::runtime::EffectAuditTerminalOutcome::AbandonedNotApplied
         }
     )));
 }
@@ -1179,7 +1180,7 @@ async fn raw_normal_effect_state(
     std::sync::Arc<crate::server::AgentServer>,
     crate::brain::store::RunnerLeaseId,
     tokio::sync::mpsc::UnboundedReceiver<crate::server::RunnerRequest>,
-    crate::runtime::effect_log::EffectAuditState,
+    crate::runtime::EffectAuditState,
     Option<super::finch_ipc_capnp::brain_host_effect_permit::Client>,
 ) {
     let temp = tempfile::tempdir().unwrap();
@@ -1287,8 +1288,8 @@ async fn effect_audit_normal_return_abandons_only_unbegun_and_allows_late_finish
     assert!(permit.is_none());
     assert!(matches!(
         state,
-        crate::runtime::effect_log::EffectAuditState::Terminal {
-            outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+        crate::runtime::EffectAuditState::Terminal {
+            outcome: crate::runtime::EffectAuditTerminalOutcome::AbandonedNotApplied
         }
     ));
 
@@ -1296,7 +1297,7 @@ async fn effect_audit_normal_return_abandons_only_unbegun_and_allows_late_finish
         raw_normal_effect_state(true, false).await;
     assert!(matches!(
         state,
-        crate::runtime::effect_log::EffectAuditState::AwaitingHostResult
+        crate::runtime::EffectAuditState::AwaitingHostResult
     ));
     let permit = permit.expect("begun normal-return effect retained its detached permit");
     let mut finish = permit.finish_request();
@@ -1304,8 +1305,8 @@ async fn effect_audit_normal_return_abandons_only_unbegun_and_allows_late_finish
     finish.send().promise.await.unwrap();
     assert!(
         matches!(store.snapshot("shared").unwrap().effect_audits[0].state,
-            crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+            crate::runtime::EffectAuditState::Terminal {
+                outcome: crate::runtime::EffectAuditTerminalOutcome::Redacted {
                     ref outcome_kind
                 }
             } if outcome_kind == "acknowledged")
@@ -1322,7 +1323,7 @@ async fn effect_audit_remote_disconnected_exception_does_not_claim_transport_tea
     );
     assert!(matches!(
         state,
-        crate::runtime::effect_log::EffectAuditState::AwaitingHostResult
+        crate::runtime::EffectAuditState::AwaitingHostResult
     ));
     let permit = permit.expect("begun effect retains its detached completion authority");
     let mut finish = permit.finish_request();
@@ -1330,8 +1331,8 @@ async fn effect_audit_remote_disconnected_exception_does_not_claim_transport_tea
     finish.send().promise.await.unwrap();
     assert!(
         matches!(store.snapshot("shared").unwrap().effect_audits[0].state,
-                crate::runtime::effect_log::EffectAuditState::Terminal {
-                    outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                crate::runtime::EffectAuditState::Terminal {
+                    outcome: crate::runtime::EffectAuditTerminalOutcome::Redacted {
                         ref outcome_kind
                     }
                 } if outcome_kind == "acknowledged")
@@ -1534,9 +1535,9 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                     if snapshot.effect_audits.first().is_some_and(|audit| {
                         matches!(
                             audit.state,
-                            crate::runtime::effect_log::EffectAuditState::Terminal {
+                            crate::runtime::EffectAuditState::Terminal {
                                 outcome:
-                                    crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                                    crate::runtime::EffectAuditTerminalOutcome::Redacted {
                                         ref outcome_kind
                                     }
                             } if outcome_kind == "acknowledged"
@@ -1555,8 +1556,8 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                 assert_eq!(physical_effects.load(std::sync::atomic::Ordering::SeqCst), 1);
                 assert_eq!(provider_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
                 assert!(matches!(snapshot.effect_audits[0].state,
-                    crate::runtime::effect_log::EffectAuditState::Terminal {
-                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                    crate::runtime::EffectAuditState::Terminal {
+                        outcome: crate::runtime::EffectAuditTerminalOutcome::Redacted {
                             ref outcome_kind
                         }
                     } if outcome_kind == "acknowledged"));
@@ -1575,8 +1576,8 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                     snapshot.effect_audits[0].intent.identity
                 );
                 assert!(matches!(replayed.effect_audits[0].state,
-                    crate::runtime::effect_log::EffectAuditState::Terminal {
-                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted {
+                    crate::runtime::EffectAuditState::Terminal {
+                        outcome: crate::runtime::EffectAuditTerminalOutcome::Compacted {
                             ref outcome_kind, ..
                         }
                     } if outcome_kind == "acknowledged"));

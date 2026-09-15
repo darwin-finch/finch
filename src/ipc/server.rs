@@ -115,14 +115,14 @@ impl BrainEffectAuditRpcAuthority {
 
 struct BrainEffectReservationImpl {
     authority: BrainEffectAuditRpcAuthority,
-    identity: crate::runtime::effect_log::EffectAuditIdentity,
+    identity: crate::runtime::EffectAuditIdentity,
     begun: std::cell::Cell<bool>,
 }
 
 struct BrainHostEffectPermitImpl {
     authority: BrainEffectAuditRpcAuthority,
-    permit: std::sync::Arc<crate::runtime::effect_log::HostEffectPermit>,
-    finished: std::cell::RefCell<Option<crate::runtime::effect_log::EffectAuditTerminalOutcome>>,
+    permit: std::sync::Arc<crate::runtime::HostEffectPermit>,
+    finished: std::cell::RefCell<Option<crate::runtime::EffectAuditTerminalOutcome>>,
 }
 
 fn require_approval_connection(
@@ -576,7 +576,7 @@ impl finch_ipc_capnp::brain_effect_reservation::Server for BrainEffectReservatio
             &self.authority.grant,
             None,
             self.identity,
-            crate::runtime::effect_log::EffectAuditTerminalOutcome::NotApplied { reason },
+            crate::runtime::EffectAuditTerminalOutcome::NotApplied { reason },
         ) {
             Ok(()) => Promise::ok(()),
             Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
@@ -600,11 +600,9 @@ impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermit
                 .map_err(anyhow::Error::from)
                 .and_then(|values| crate::ipc::checkpoint_codec::decode_value_list(values, 0))
             {
-                Ok(values) => {
-                    crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged {
-                        response: crate::runtime::VmResumeResponse::Result { values },
-                    }
-                }
+                Ok(values) => crate::runtime::EffectAuditTerminalOutcome::Acknowledged {
+                    response: crate::runtime::VmResumeResponse::Result { values },
+                },
                 Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
             },
             Ok(Which::NotApplied(reason)) => {
@@ -613,7 +611,7 @@ impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermit
                         Ok(reason) => reason.to_string(),
                         Err(error) => return Promise::err(error),
                     };
-                crate::runtime::effect_log::EffectAuditTerminalOutcome::NotApplied { reason }
+                crate::runtime::EffectAuditTerminalOutcome::NotApplied { reason }
             }
             Ok(Which::FailedPartial(detail)) => {
                 let detail =
@@ -621,7 +619,7 @@ impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermit
                         Ok(detail) => detail.to_string(),
                         Err(error) => return Promise::err(error),
                     };
-                crate::runtime::effect_log::EffectAuditTerminalOutcome::FailedPartial { detail }
+                crate::runtime::EffectAuditTerminalOutcome::FailedPartial { detail }
             }
             Err(error) => return Promise::err(error.into()),
         };
@@ -1599,7 +1597,7 @@ async fn execute_typed_forth_ipc(program: String) -> Result<(Vec<i64>, String)> 
             budget: None,
         })
         .await?;
-    if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
+    if outcome.status != crate::runtime::ExecutionStatus::Completed {
         let diagnostic = outcome
             .diagnostics
             .first()

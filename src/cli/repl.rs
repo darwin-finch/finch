@@ -27,9 +27,7 @@ use crate::models::{BootstrapLoader, GeneratorState, ModelProgress, Sampler, Sam
 use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
 #[cfg(target_os = "macos")]
-use crate::runtime::automation::{
-    permission_context_key, permission_target_description, AutomationState,
-};
+use crate::runtime::{permission_context_key, permission_target_description, AutomationState};
 use crate::tools::ToolPattern;
 use crate::tools::ToolPermissionConfig;
 use crate::tools::{generate_tool_signature, ApprovalSource, ToolSignature};

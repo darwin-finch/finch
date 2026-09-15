@@ -456,10 +456,7 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
         // break so an interactive shell prompt cannot join the last fragment.
         print!("{presentation}");
     }
-    if !matches!(
-        outcome.status,
-        finch::runtime::outcome::ExecutionStatus::Completed
-    ) {
+    if !matches!(outcome.status, finch::runtime::ExecutionStatus::Completed) {
         let detail = if outcome.required_capabilities.is_empty() {
             outcome
                 .diagnostics
@@ -538,7 +535,7 @@ async fn run_direct_typed_source_with_json(
     } else if let Some(presentation) = terminal_script_presentation(&outcome.output) {
         print!("{presentation}");
     }
-    if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
+    if outcome.status == finch::runtime::ExecutionStatus::Completed {
         return Ok(());
     }
     let detail = outcome
@@ -742,10 +739,7 @@ mod script_tests {
         let outcome = execute_one_shot_wire_source(&runtime, "(say \"daemon wire executed\")")
             .await
             .unwrap();
-        assert_eq!(
-            outcome.status,
-            finch::runtime::outcome::ExecutionStatus::Completed
-        );
+        assert_eq!(outcome.status, finch::runtime::ExecutionStatus::Completed);
         assert_eq!(outcome.output, "daemon wire executed");
     }
 
@@ -2251,7 +2245,7 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     // Running it here keeps the daemon and --cloud-only paths semantically
     // identical without handing workspace/UI authority to the daemon.
     let outcome = match execute_one_shot_wire_source(&program_runtime, &response).await {
-        Ok(outcome) if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed => {
+        Ok(outcome) if outcome.status == finch::runtime::ExecutionStatus::Completed => {
             finish_wire_metric(
                 wire_metrics.as_ref(),
                 &mut wire_metric,
@@ -2330,7 +2324,7 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             return Err(error);
         }
     };
-    if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
+    if outcome.status == finch::runtime::ExecutionStatus::Completed {
         finish_wire_metric(
             wire_metrics.as_ref(),
             &mut wire_metric,
@@ -2452,7 +2446,7 @@ async fn run_query_teacher_only(
                     return Err(error);
                 }
             };
-            if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
+            if outcome.status == finch::runtime::ExecutionStatus::Completed {
                 finish_wire_metric(
                     wire_metrics.as_ref(),
                     &mut wire_metric,
@@ -2577,7 +2571,7 @@ fn vm_wire_system_prompt() -> String {
 async fn execute_one_shot_wire_source(
     program_runtime: &finch::runtime::ProgramRuntime,
     source: &str,
-) -> Result<finch::runtime::outcome::ExecutionOutcome> {
+) -> Result<finch::runtime::ExecutionOutcome> {
     let language = finch::programs::ProgramLanguage::infer_wire_source(source)?;
     program_runtime
         .submit_typed_only(finch::runtime::ProgramSubmission {
@@ -2598,8 +2592,8 @@ async fn execute_one_shot_wire_source(
 /// interactive VM-wire receiver: only a rejected, effect-free source program
 /// may be corrected once.  Execution, approval, and partial-effect outcomes
 /// are never replayed merely because a model can generate another response.
-fn can_repair_one_shot_wire_outcome(outcome: &finch::runtime::outcome::ExecutionOutcome) -> bool {
-    use finch::runtime::outcome::ExecutionStatus;
+fn can_repair_one_shot_wire_outcome(outcome: &finch::runtime::ExecutionOutcome) -> bool {
+    use finch::runtime::ExecutionStatus;
 
     outcome.status == ExecutionStatus::Failed
         && outcome.side_effects.is_empty()
@@ -3533,7 +3527,7 @@ mod tests {
             }
             assert_eq!(
                 outcome.status,
-                finch::runtime::outcome::ExecutionStatus::AuthorizationRequired,
+                finch::runtime::ExecutionStatus::AuthorizationRequired,
                 "{line}\n  diagnostics: {diagnostics}"
             );
         }

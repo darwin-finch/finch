@@ -127,7 +127,7 @@ pub enum ReplEvent {
     /// owns final status/error projection and the corresponding redraw.
     TypedProgramComplete {
         output_unit: Arc<WorkUnit>,
-        result: std::result::Result<crate::runtime::outcome::ExecutionOutcome, String>,
+        result: std::result::Result<crate::runtime::ExecutionOutcome, String>,
     },
 
     /// Streaming response completed (used for non-streaming path)

@@ -8,11 +8,11 @@ use anyhow::{Context, Result};
 use tokio::sync::{mpsc, oneshot};
 
 // The audit protocol itself lives with the runtime that speaks it; this module services it.
-pub use crate::runtime::effect_audit::{
+pub use crate::runtime::{
     RunnerEffectAuditControl, RunnerEffectAuditReservation, RunnerHostEffectOutcome,
     RunnerHostEffectPermit,
 };
-pub(crate) use crate::runtime::effect_audit::{
+pub(crate) use crate::runtime::{
     RunnerEffectAuditControlRequest, RunnerEffectAuditReservationRequest,
     RunnerHostEffectFinishRequest,
 };

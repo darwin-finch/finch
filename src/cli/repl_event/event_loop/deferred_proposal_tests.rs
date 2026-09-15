@@ -180,10 +180,7 @@ async fn proposal_decision_resumes_the_saved_effect_without_replaying_source() {
     .await
     .unwrap();
 
-    assert_eq!(
-        completed.status,
-        crate::runtime::outcome::ExecutionStatus::Completed
-    );
+    assert_eq!(completed.status, crate::runtime::ExecutionStatus::Completed);
     assert_eq!(completed.vm_side_effects.len(), 1);
     assert!(matches!(
         completed.values.as_slice(),

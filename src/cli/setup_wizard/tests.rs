@@ -387,7 +387,7 @@ fn test_gui_permission_keys_separate_passive_check_from_prompt_request() {
 #[cfg(target_os = "macos")]
 #[test]
 fn gui_toggle_persists_consent_without_claiming_prompt_granted_access() {
-    use crate::runtime::automation::{
+    use crate::runtime::{
         AutomationAvailability, AutomationPermissionResult, AutomationPromptDisposition,
         AutomationState,
     };

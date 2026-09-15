@@ -109,7 +109,7 @@ async fn execute_direct_wire_response(
     cancel: tokio_util::sync::CancellationToken,
     source: String,
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
-) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+) -> anyhow::Result<crate::runtime::ExecutionOutcome> {
     let submission = direct_wire_submission(runtime, source)?;
     anyhow::ensure!(
         !cancel.is_cancelled(),
@@ -152,8 +152,8 @@ async fn execute_direct_wire_response(
 pub(super) async fn resume_interactive_boundaries(
     runtime: &crate::runtime::ProgramRuntime,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
-    mut outcome: crate::runtime::outcome::ExecutionOutcome,
-) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+    mut outcome: crate::runtime::ExecutionOutcome,
+) -> anyhow::Result<crate::runtime::ExecutionOutcome> {
     loop {
         outcome = resume_interactive_yields(runtime, outcome).await?;
         let Some(prompt) = outcome.approval_prompts.first().cloned() else {
@@ -180,8 +180,8 @@ pub(super) async fn resume_interactive_boundaries(
 /// first approval boundary; the denial remains in the effect journal.
 pub(super) async fn resume_noninteractive_boundaries(
     runtime: &crate::runtime::ProgramRuntime,
-    mut outcome: crate::runtime::outcome::ExecutionOutcome,
-) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+    mut outcome: crate::runtime::ExecutionOutcome,
+) -> anyhow::Result<crate::runtime::ExecutionOutcome> {
     loop {
         outcome = resume_interactive_yields(runtime, outcome).await?;
         let Some(prompt) = outcome.approval_prompts.first().cloned() else {
@@ -208,9 +208,9 @@ pub(super) async fn resume_noninteractive_boundaries(
 /// Durable timer/I/O/message wakeups belong to the later daemon scheduler.
 async fn resume_interactive_yields(
     runtime: &crate::runtime::ProgramRuntime,
-    mut outcome: crate::runtime::outcome::ExecutionOutcome,
-) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
-    while outcome.status == crate::runtime::outcome::ExecutionStatus::Suspended
+    mut outcome: crate::runtime::ExecutionOutcome,
+) -> anyhow::Result<crate::runtime::ExecutionOutcome> {
+    while outcome.status == crate::runtime::ExecutionStatus::Suspended
         && matches!(
             runtime.pending_typed_execution(outcome.execution_id)?,
             Some(crate::runtime::PendingTypedExecutionInfo {
@@ -234,8 +234,8 @@ async fn resume_interactive_yields(
 /// that it never began an external operation.  In particular, an approval,
 /// suspension, cancellation, timeout, or journaled host effect is an execution
 /// boundary rather than a syntax-editing opportunity.
-fn is_repairable_wire_outcome(outcome: &crate::runtime::outcome::ExecutionOutcome) -> bool {
-    use crate::runtime::outcome::ExecutionStatus;
+fn is_repairable_wire_outcome(outcome: &crate::runtime::ExecutionOutcome) -> bool {
+    use crate::runtime::ExecutionStatus;
 
     if outcome.status != ExecutionStatus::Failed
         || !outcome.side_effects.is_empty()
@@ -349,7 +349,7 @@ mod rendered {
 use rendered::RenderedTurn;
 
 pub(super) fn runner_effect_records(
-    outcome: &crate::runtime::outcome::ExecutionOutcome,
+    outcome: &crate::runtime::ExecutionOutcome,
 ) -> Vec<crate::server::RunnerEffectRecord> {
     outcome
         .effect_journal
@@ -416,7 +416,7 @@ async fn execute_wire_with_single_repair(
 
     let mut effect_journal = Vec::new();
     let (diagnostic, repairable) = match initial {
-        Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
+        Ok(outcome) if outcome.status == crate::runtime::ExecutionStatus::Completed => {
             if outcome.output.is_empty() {
                 metric.first_pass_valid = false;
                 metric.failure_class = Some(crate::metrics::WireFailureClass::MissingOutputEffect);
@@ -569,7 +569,7 @@ async fn execute_wire_with_single_repair(
     )
     .await
     {
-        Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
+        Ok(outcome) if outcome.status == crate::runtime::ExecutionStatus::Completed => {
             effect_journal.extend(runner_effect_records(&outcome));
             metric.repaired_successfully = !outcome.output.is_empty();
             metric.terminal_failure = outcome.output.is_empty();
@@ -2869,19 +2869,13 @@ mod tests {
         let lisp = direct_wire_submission(&runtime, "(say \"hello\")".to_string()).unwrap();
         assert_eq!(lisp.language, crate::programs::ProgramLanguage::Lisp);
         let outcome = runtime.submit_typed_only(lisp).await.unwrap();
-        assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed
-        );
+        assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
         assert_eq!(outcome.output, "hello");
 
         let forth = direct_wire_submission(&runtime, "s\"world\" say".to_string()).unwrap();
         assert_eq!(forth.language, crate::programs::ProgramLanguage::Forth);
         let outcome = runtime.submit_typed_only(forth).await.unwrap();
-        assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed
-        );
+        assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
         assert_eq!(outcome.output, "world");
     }
 
@@ -2905,10 +2899,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            complete.status,
-            crate::runtime::outcome::ExecutionStatus::Completed
-        );
+        assert_eq!(complete.status, crate::runtime::ExecutionStatus::Completed);
         assert_eq!(complete.output, "onetwothree");
         event_tx
             .send(ReplEvent::VmOutputComplete {
@@ -2965,10 +2956,7 @@ mod tests {
         let (outcome, ()) = tokio::join!(execution, cancel_after_prefix);
         let outcome = outcome.unwrap();
 
-        assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Cancelled
-        );
+        assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Cancelled);
         assert_eq!(outcome.output, "before");
         assert_eq!(outcome.effect_journal.len(), 1);
         assert!(matches!(
@@ -3018,10 +3006,7 @@ mod tests {
         .await
         .unwrap();
         rejection.await.unwrap();
-        assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Failed
-        );
+        assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Failed);
         assert!(outcome
             .diagnostics
             .iter()
@@ -3066,10 +3051,7 @@ mod tests {
             .await
             .expect("approved execution should resume")
             .unwrap();
-        assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed
-        );
+        assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
         assert!(matches!(
             outcome.values.as_slice(),
             [crate::programs::ProgramValue::Bytes(bytes)] if !bytes.is_empty()
@@ -3101,17 +3083,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             suspended.status,
-            crate::runtime::outcome::ExecutionStatus::AuthorizationRequired
+            crate::runtime::ExecutionStatus::AuthorizationRequired
         );
         assert_eq!(suspended.approval_prompts.len(), 1);
 
         let denied = resume_noninteractive_boundaries(&runtime, suspended)
             .await
             .unwrap();
-        assert_eq!(
-            denied.status,
-            crate::runtime::outcome::ExecutionStatus::Failed
-        );
+        assert_eq!(denied.status, crate::runtime::ExecutionStatus::Failed);
         assert!(runtime
             .pending_typed_execution(denied.execution_id)
             .unwrap()
@@ -3325,11 +3304,11 @@ mod tests {
             "E-LIMIT-001: fuel exhausted"
         ));
 
-        let mut outcome = crate::runtime::outcome::ExecutionOutcome::failed(
+        let mut outcome = crate::runtime::ExecutionOutcome::failed(
             Uuid::nil(),
             0,
             crate::programs::ExecutionEffect::Pure,
-            crate::runtime::outcome::ExecutionBackend::TypedVm,
+            crate::runtime::ExecutionBackend::TypedVm,
             "E-TYPE-002: expected int",
             0,
         );

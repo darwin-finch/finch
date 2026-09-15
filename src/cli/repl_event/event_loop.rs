@@ -741,8 +741,8 @@ async fn resume_named_brain_program_boundaries(
     interaction: crate::server::RunnerProgramInteraction,
     fixed_grant_ceiling: Option<crate::vm::EffectSet>,
     effects: std::sync::mpsc::Receiver<crate::runtime::VmEffectEnvelope>,
-    mut outcome: crate::runtime::outcome::ExecutionOutcome,
-) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+    mut outcome: crate::runtime::ExecutionOutcome,
+) -> anyhow::Result<crate::runtime::ExecutionOutcome> {
     loop {
         outcome = match interaction {
             crate::server::RunnerProgramInteraction::Interactive => {
@@ -1522,8 +1522,8 @@ fn deferred_vm_approval_from_tool_result(
     result: &anyhow::Result<String>,
 ) -> Option<DeferredVmApproval> {
     let content = result.as_ref().ok()?;
-    let outcome: crate::runtime::outcome::ExecutionOutcome = serde_json::from_str(content).ok()?;
-    if outcome.status != crate::runtime::outcome::ExecutionStatus::AuthorizationRequired {
+    let outcome: crate::runtime::ExecutionOutcome = serde_json::from_str(content).ok()?;
+    if outcome.status != crate::runtime::ExecutionStatus::AuthorizationRequired {
         return None;
     }
     Some(DeferredVmApproval {
@@ -1537,17 +1537,15 @@ fn runner_effect_records_from_tool_result(
     result
         .as_ref()
         .ok()
-        .and_then(|output| {
-            serde_json::from_str::<crate::runtime::outcome::ExecutionOutcome>(output).ok()
-        })
+        .and_then(|output| serde_json::from_str::<crate::runtime::ExecutionOutcome>(output).ok())
         .map(|outcome| super::query_processor::runner_effect_records(&outcome))
         .unwrap_or_default()
 }
 
 fn deferred_proposal_from_tool_result(result: &anyhow::Result<String>) -> Option<DeferredProposal> {
     let content = result.as_ref().ok()?;
-    let outcome: crate::runtime::outcome::ExecutionOutcome = serde_json::from_str(content).ok()?;
-    if outcome.status != crate::runtime::outcome::ExecutionStatus::Suspended {
+    let outcome: crate::runtime::ExecutionOutcome = serde_json::from_str(content).ok()?;
+    if outcome.status != crate::runtime::ExecutionStatus::Suspended {
         return None;
     }
     let effect = outcome.vm_side_effects.iter().rev().find(|effect| {
@@ -1608,7 +1606,7 @@ async fn resume_deferred_proposal(
     runtime: &crate::runtime::ProgramRuntime,
     proposal: &DeferredProposal,
     decision: crate::tools::ProposalDecision,
-) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+) -> anyhow::Result<crate::runtime::ExecutionOutcome> {
     runtime
         .resume_typed_execution_with_effect_result(
             proposal.handle.execution_id,
