@@ -1,6 +1,7 @@
 # Claude Client
 
-**Purpose:** Forward queries to the Claude API.
+**Purpose:** Compatibility facade that forwards queries through the configured default provider —
+Claude, OpenAI, Grok, or any other `LlmProvider` (`src/claude/client.rs::with_shared_provider`).
 
 ## Features
 

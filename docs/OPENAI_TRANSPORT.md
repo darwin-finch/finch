@@ -13,9 +13,10 @@ not from the provider display name alone.
   marker. The first valid stream event also publishes the provider-reported
   actual model through the provider-neutral stream metadata chunk; the same
   model field is returned by the non-streaming path and survives daemon IPC.
-  That additive union changes the frontend/daemon contract, so IPC generation
-  4 rejects a generation-3 peer during the ping handshake before any query or
-  stream begins; users must restart a daemon built from the older generation.
+  That additive union changes the frontend/daemon contract, so the current IPC
+  generation (`IPC_PROTOCOL_VERSION`, 8, in `src/ipc/mod.rs`) rejects a
+  generation-7 peer during the ping handshake before any query or stream
+  begins; users must restart a daemon built from the older generation.
 - GPT-4o and OpenAI-compatible xAI, Groq, Mistral, Ollama, remote-Finch, and
   custom endpoints retain the historical compatible request and parser shape.
 
