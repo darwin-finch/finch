@@ -35,7 +35,7 @@ use std::time::Duration;
 use tui_textarea::TextArea;
 
 use super::{OutputManager, StatusBar, StatusLineType};
-use crate::cli::messages::{MessageId, MessageRef, MessageStatus};
+use crate::cli::messages::{MessageId, MessageRef, MessageStatus, TranscriptRowKind};
 // Sub-modules
 mod accordion;
 pub mod activity;
@@ -1921,15 +1921,14 @@ impl TuiRenderer {
         Ok(())
     }
 
-    /// Return the whole uncommitted transcript suffix in order.
-    ///
-    /// A completed message may still be waiting to enter permanent scrollback
-    /// behind an earlier live message.  It must remain in the redraw area in
-    /// that state: filtering this list to `InProgress` made a received VM
-    /// program disappear as soon as the provider stream ended, while its
-    /// program-output WorkUnit was still running.
+    /// Uncommitted suffix in order, minus completed program source once a
+    /// later program-output row has body. Replaced IR stays in the manager.
     fn find_live_messages(&self) -> Vec<MessageRef> {
-        uncommitted_suffix(self.output_manager.get_messages(), &self.printed_ids)
+        let messages = self.output_manager.get_messages();
+        without_replaced_program_source(
+            uncommitted_suffix(messages.clone(), &self.printed_ids),
+            &messages,
+        )
     }
 }
 
@@ -1967,6 +1966,119 @@ fn uncommitted_suffix(
         .into_iter()
         .filter(|message| !printed_ids.contains(&message.id()))
         .collect()
+}
+
+fn later_program_output(
+    messages: &[MessageRef],
+    index: usize,
+    colors: &ColorScheme,
+) -> Option<(bool, MessageStatus)> {
+    messages[index + 1..].iter().find_map(|later| {
+        later.transcript_row(colors).and_then(|row| {
+            (row.kind == TranscriptRowKind::Output)
+                .then_some((row.body.iter().any(|line| !line.is_empty()), later.status()))
+        })
+    })
+}
+
+fn is_completed_program_source(message: &MessageRef, colors: &ColorScheme) -> bool {
+    message.status() == MessageStatus::Complete
+        && message
+            .transcript_row(colors)
+            .is_some_and(|row| row.kind == TranscriptRowKind::Program)
+}
+
+/// Completed program source whose nearest later program-output row has body.
+fn replaced_completed_program_source_ids(messages: &[MessageRef]) -> HashSet<MessageId> {
+    let colors = ColorScheme::default();
+    let mut replaced = HashSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        if !is_completed_program_source(message, &colors) {
+            continue;
+        }
+        if later_program_output(messages, index, &colors).is_some_and(|(has_body, _)| has_body) {
+            replaced.insert(message.id());
+        }
+    }
+    replaced
+}
+
+fn defer_completed_program_source(messages: &[MessageRef], index: usize) -> bool {
+    let colors = ColorScheme::default();
+    if !is_completed_program_source(&messages[index], &colors) {
+        return false;
+    }
+    later_program_output(messages, index, &colors)
+        .is_some_and(|(has_body, status)| status == MessageStatus::InProgress && !has_body)
+}
+
+fn without_replaced_program_source(
+    selected: Vec<MessageRef>,
+    all: &[MessageRef],
+) -> Vec<MessageRef> {
+    let replaced = replaced_completed_program_source_ids(all);
+    selected
+        .into_iter()
+        .filter(|message| !replaced.contains(&message.id()))
+        .collect()
+}
+
+fn visible_printed_messages(
+    messages: &[MessageRef],
+    printed_ids: &HashSet<MessageId>,
+) -> Vec<MessageRef> {
+    without_replaced_program_source(
+        messages
+            .iter()
+            .filter(|message| printed_ids.contains(&message.id()))
+            .cloned()
+            .collect(),
+        messages,
+    )
+}
+
+struct CanonicalCommitPlan {
+    emit: Vec<MessageRef>,
+    consume_without_emit: Vec<MessageId>,
+}
+
+/// Completed prefix of unprinted messages. Replaced program source is consumed
+/// without writing so it cannot block later output or reappear in history.
+fn plan_canonical_commit(
+    messages: &[MessageRef],
+    printed_ids: &HashSet<MessageId>,
+) -> CanonicalCommitPlan {
+    let replaced = replaced_completed_program_source_ids(messages);
+    let mut emit = Vec::new();
+    let mut consume_without_emit = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if printed_ids.contains(&message.id()) {
+            continue;
+        }
+        match message.status() {
+            MessageStatus::InProgress => break,
+            MessageStatus::Complete | MessageStatus::Failed => {
+                if replaced.contains(&message.id()) {
+                    consume_without_emit.push(message.id());
+                } else if defer_completed_program_source(messages, index) {
+                    // Stay in the live suffix until the paired output has body
+                    // or completes empty.
+                    break;
+                } else {
+                    emit.push(message.clone());
+                }
+            }
+        }
+    }
+    CanonicalCommitPlan {
+        emit,
+        consume_without_emit,
+    }
+}
+
+fn swap_completed_program_source_for_output(messages: Vec<MessageRef>) -> Vec<MessageRef> {
+    let all = messages.clone();
+    without_replaced_program_source(messages, &all)
 }
 
 /// Select the newest transcript rows that fit in a visible viewport slice.
@@ -2197,45 +2309,28 @@ impl TuiRenderer {
     /// Commits newly-completed messages to permanent scrollback, then redraws.
     pub fn flush_output_safe(&mut self, _output_manager: &OutputManager) -> Result<()> {
         let messages = self.output_manager.get_messages();
-
-        let unprinted: Vec<MessageRef> = messages
-            .iter()
-            .filter(|msg| !self.printed_ids.contains(&msg.id()))
-            .cloned()
-            .collect();
-        let committable = committable_prefix_len(unprinted.iter().map(|msg| msg.status()));
-
-        let mut to_commit: Vec<MessageRef> = Vec::new();
-        for msg in unprinted.into_iter().take(committable) {
-            match msg.status() {
-                MessageStatus::Complete | MessageStatus::Failed => {
-                    to_commit.push(msg);
-                }
-                MessageStatus::InProgress => {
-                    unreachable!("committable prefix excludes live messages")
-                }
-            }
-        }
+        let plan = plan_canonical_commit(&messages, &self.printed_ids);
 
         // Re-establish trustworthy live-area coordinates before committing a
         // completion that raced resize. The completed message remains in the
         // uncommitted suffix until its canonical bytes are actually written.
         if self.viewport_invalidated {
             self.redraw_full_viewport()?;
-            if to_commit.is_empty() {
+            if plan.emit.is_empty() && plan.consume_without_emit.is_empty() {
                 self.live_area_dirty = false;
                 return Ok(());
             }
         }
 
-        if !to_commit.is_empty() {
+        if !plan.emit.is_empty() {
             let mut stdout = io::stdout();
             prepare_canonical_commit_guarded(&mut stdout)?;
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
+            self.printed_ids.extend(plan.consume_without_emit);
             let commit_result = commit_complete_messages(
                 &mut stdout,
-                &to_commit,
+                &plan.emit,
                 &mut self.accordion,
                 &self.colors,
                 &mut self.printed_ids,
@@ -2250,6 +2345,10 @@ impl TuiRenderer {
             self.redraw_full_viewport_inner(true)?;
             self.live_area_dirty = false;
         } else {
+            if !plan.consume_without_emit.is_empty() {
+                self.printed_ids.extend(plan.consume_without_emit);
+                self.live_area_dirty = true;
+            }
             // Only redraw when something actually changed: a message is streaming
             // (InProgress) or explicit state mutation marked the area dirty.
             // This eliminates the unconditional erase+draw every 33 ms tick that
@@ -2537,12 +2636,8 @@ impl TuiRenderer {
         height: usize,
     ) {
         let transcript_budget = height.saturating_sub(live_rows);
-        let printed = self
-            .output_manager
-            .get_messages()
-            .into_iter()
-            .filter(|message| self.printed_ids.contains(&message.id()))
-            .collect::<Vec<_>>();
+        let messages = self.output_manager.get_messages();
+        let printed = visible_printed_messages(&messages, &self.printed_ids);
         let transcript =
             viewport_tail_rendered_lines(&self.projected_lines(printed), width, transcript_budget);
         let transcript_rows = transcript
@@ -2769,13 +2864,9 @@ impl TuiRenderer {
             .min(term_height);
         let transcript_budget = term_height.saturating_sub(live_rows);
 
+        let messages = self.output_manager.get_messages();
         let transcript = self
-            .projected_lines(
-                self.output_manager
-                    .get_messages()
-                    .into_iter()
-                    .filter(|message| self.printed_ids.contains(&message.id())),
-            )
+            .projected_lines(visible_printed_messages(&messages, &self.printed_ids))
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>();
@@ -3960,7 +4051,7 @@ mod tests {
     use super::*;
     use crate::cli::command_autocomplete::CommandRegistry;
     use crate::cli::diff::{summarize_files, DiffColorMode, FileDiff};
-    use crate::cli::messages::{Message, MessageRef, WorkUnit};
+    use crate::cli::messages::{Message, MessageId, MessageRef, WorkUnit};
     use crate::cli::tui::vt_oracle::{VtColor, VtOracle, VtStyle};
     use crate::theme::ColorTheme;
 
@@ -4479,7 +4570,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_program_source_stays_live_behind_running_output() {
+    fn completed_program_source_swaps_for_visible_output() {
         let source = Arc::new(WorkUnit::new("source"));
         source.set_program_source("lisp");
         source.set_response("(say \"hello\")");
@@ -4491,19 +4582,252 @@ mod tests {
 
         let source_ref: MessageRef = source.clone();
         let output_ref: MessageRef = output.clone();
-        let messages = vec![source_ref.clone(), output_ref.clone()];
-        let live = uncommitted_suffix(messages, &HashSet::new());
-        assert_eq!(live.len(), 2);
-        assert!(live[0]
-            .format(&ColorScheme::default())
-            .contains("(say \"hello\")"));
-        assert_eq!(live[1].format(&ColorScheme::default()), "hello");
-
-        let mut printed = HashSet::new();
-        printed.insert(source_ref.id());
-        let live = uncommitted_suffix(vec![source_ref, output_ref], &printed);
-        assert_eq!(live.len(), 1);
+        let manager_messages = vec![source_ref.clone(), output_ref.clone()];
+        let live = swap_completed_program_source_for_output(uncommitted_suffix(
+            manager_messages.clone(),
+            &HashSet::new(),
+        ));
+        assert_eq!(live.len(), 1, "output replaces completed IR as the turn");
         assert_eq!(live[0].format(&ColorScheme::default()), "hello");
+
+        let empty_output = Arc::new(WorkUnit::new("empty-output"));
+        empty_output.set_program_output();
+        let empty_ref: MessageRef = empty_output;
+        let waiting = swap_completed_program_source_for_output(vec![source_ref, empty_ref]);
+        assert_eq!(
+            waiting.len(),
+            2,
+            "completed IR stays until program output has a body"
+        );
+
+        let streaming = Arc::new(WorkUnit::new("streaming"));
+        streaming.set_program_source("lisp");
+        streaming.set_response("(say");
+        let streaming_ref: MessageRef = streaming.clone();
+        let ir_only = swap_completed_program_source_for_output(vec![streaming_ref.clone()]);
+        assert_eq!(
+            ir_only.len(),
+            1,
+            "IR stays visible while it is still streaming"
+        );
+
+        let streaming_with_output =
+            swap_completed_program_source_for_output(vec![streaming_ref, output_ref]);
+        assert_eq!(
+            streaming_with_output.len(),
+            2,
+            "InProgress source stays visible beside output that already has a body"
+        );
+        assert!(
+            streaming
+                .transcript_row(&ColorScheme::default())
+                .is_some_and(|row| row.default_expanded),
+            "source stays expanded only while InProgress"
+        );
+
+        let tool = Arc::new(WorkUnit::new("tool"));
+        let source_one = Arc::new(WorkUnit::new("source-one"));
+        source_one.set_program_source("lisp");
+        source_one.set_response("(say \"one\")");
+        source_one.set_complete();
+        let output_one = Arc::new(WorkUnit::new("output-one"));
+        output_one.set_program_output();
+        let source_two = Arc::new(WorkUnit::new("source-two"));
+        source_two.set_program_source("lisp");
+        source_two.set_response("(say \"two\")");
+        source_two.set_complete();
+        let output_two = Arc::new(WorkUnit::new("output-two"));
+        output_two.set_program_output();
+        output_two.append_response("hello");
+        let tool_ref: MessageRef = tool;
+        let source_one_ref: MessageRef = source_one.clone();
+        let output_one_ref: MessageRef = output_one;
+        let source_two_ref: MessageRef = source_two.clone();
+        let output_two_ref: MessageRef = output_two;
+        let overlapping = swap_completed_program_source_for_output(vec![
+            tool_ref,
+            source_one_ref,
+            output_one_ref,
+            source_two_ref,
+            output_two_ref,
+        ]);
+        let overlapping_ids: Vec<MessageId> =
+            overlapping.iter().map(|message| message.id()).collect();
+        assert!(
+            overlapping_ids.contains(&source_one.id()),
+            "empty-output source stays visible when a later turn's output has body; ids={overlapping_ids:?}"
+        );
+        assert!(
+            !overlapping_ids.contains(&source_two.id()),
+            "completed IR whose own later output has body is hidden; ids={overlapping_ids:?}"
+        );
+    }
+
+    #[test]
+    fn completed_program_source_is_not_a_second_visible_item_after_commit() {
+        let colors = ColorScheme::default();
+        let manager = Arc::new(OutputManager::new(colors.clone()));
+        manager.disable_stdout();
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::clone(&manager),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+
+        let source = Arc::new(WorkUnit::new("source"));
+        source.set_program_source("lisp");
+        source.set_response("(say \"hello\")");
+        source.set_complete();
+        let output = Arc::new(WorkUnit::new("output"));
+        output.set_program_output();
+        output.append_response("hello");
+        manager.add_trait_message(source.clone());
+        manager.add_trait_message(output.clone());
+
+        let messages = manager.get_messages();
+        let plan = plan_canonical_commit(&messages, &renderer.printed_ids);
+        let emit_text = plan
+            .emit
+            .iter()
+            .map(|message| message.format(&colors))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.emit.iter().all(|message| message.id() != source.id()),
+            "completed IR must not enter native history once output has body; emit={emit_text}"
+        );
+        assert!(
+            plan.consume_without_emit.contains(&source.id()),
+            "replaced IR must be consumed so later output can commit; consume={:?}",
+            plan.consume_without_emit
+        );
+
+        let mut staged = Vec::new();
+        renderer.printed_ids.extend(plan.consume_without_emit);
+        if !plan.emit.is_empty() {
+            commit_complete_messages(
+                &mut staged,
+                &plan.emit,
+                &mut renderer.accordion,
+                &colors,
+                &mut renderer.printed_ids,
+                8,
+            )
+            .expect("commit replaced-turn prefix");
+        }
+        let staged_text = String::from_utf8(staged).unwrap();
+        assert!(
+            !staged_text.contains("Program source") && !staged_text.contains("(say \"hello\")"),
+            "canonical bytes must not contain IR after swap; staged={staged_text:?}"
+        );
+
+        output.set_complete();
+        let messages = manager.get_messages();
+        let plan = plan_canonical_commit(&messages, &renderer.printed_ids);
+        let mut staged = Vec::new();
+        renderer.printed_ids.extend(plan.consume_without_emit);
+        commit_complete_messages(
+            &mut staged,
+            &plan.emit,
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            8,
+        )
+        .expect("commit program output");
+        let staged_text = String::from_utf8(staged).unwrap();
+        assert!(
+            staged_text.contains("hello"),
+            "native history must contain program output; staged={staged_text:?}"
+        );
+        assert!(
+            !staged_text.contains("Program source") && !staged_text.contains("(say \"hello\")"),
+            "native history must not contain IR after output commits; staged={staged_text:?}"
+        );
+
+        let printed = visible_printed_messages(&manager.get_messages(), &renderer.printed_ids);
+        let projected = printed
+            .iter()
+            .flat_map(|message| renderer.accordion.render_message(message, &colors))
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            projected.contains("hello"),
+            "reconstructed viewport must show program output; projected={projected:?}"
+        );
+        assert!(
+            !projected.contains("Program source") && !projected.contains("(say \"hello\")"),
+            "reconstructed viewport must not show a second Program source item; projected={projected:?}"
+        );
+
+        let retained = manager.get_messages();
+        assert_eq!(
+            retained.len(),
+            2,
+            "source remains in the manager after it leaves the transcript"
+        );
+        assert!(
+            retained
+                .iter()
+                .any(|message| message.content().contains("(say \"hello\")")),
+            "manager still holds IR for inspect/copy; contents={:?}",
+            retained.iter().map(|m| m.content()).collect::<Vec<_>>()
+        );
+
+        let waiting_manager = Arc::new(OutputManager::new(colors.clone()));
+        waiting_manager.disable_stdout();
+        let waiting_source = Arc::new(WorkUnit::new("waiting-source"));
+        waiting_source.set_program_source("lisp");
+        waiting_source.set_response("(say \"hello\")");
+        waiting_source.set_complete();
+        let empty_output = Arc::new(WorkUnit::new("empty-output"));
+        empty_output.set_program_output();
+        waiting_manager.add_trait_message(waiting_source.clone());
+        waiting_manager.add_trait_message(empty_output.clone());
+        let waiting_messages = waiting_manager.get_messages();
+        let waiting_plan = plan_canonical_commit(&waiting_messages, &HashSet::new());
+        assert!(
+            waiting_plan
+                .emit
+                .iter()
+                .all(|message| message.id() != waiting_source.id())
+                && !waiting_plan
+                    .consume_without_emit
+                    .contains(&waiting_source.id()),
+            "completed IR must not commit while paired output is still empty and live; emit={} consume={:?}",
+            waiting_plan
+                .emit
+                .iter()
+                .map(|message| message.format(&colors))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            waiting_plan.consume_without_emit
+        );
+        let waiting_live = swap_completed_program_source_for_output(waiting_messages.clone());
+        assert!(
+            waiting_live
+                .iter()
+                .any(|message| message.id() == waiting_source.id()),
+            "empty live output keeps source visible until a body arrives"
+        );
+
+        empty_output.set_complete();
+        let empty_complete_plan =
+            plan_canonical_commit(&waiting_manager.get_messages(), &HashSet::new());
+        assert!(
+            empty_complete_plan
+                .emit
+                .iter()
+                .any(|message| message.id() == waiting_source.id()),
+            "completed IR stays on the commit path when output finishes empty; emit={}",
+            empty_complete_plan
+                .emit
+                .iter()
+                .map(|message| message.format(&colors))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
     }
 
     #[test]
