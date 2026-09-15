@@ -16,10 +16,18 @@ signature. Child modules are private (`alignment`, `chatgpt_oauth`,
 list in `src/providers/mod.rs` is the whole public surface. Callers outside this
 directory use `crate::providers::Item`; they must not name `providers::<child>::`.
 
-**Dependencies:** `claude` (message types for the Claude transport), `config` (provider
+**Dependencies:** `config` (provider
 entry and teacher types), `oauth` (dialect-facing credential types), `tools`,
 `models`, `generators` (streaming chunks). `crate::cli::ConversationHistory` appears
 only inside `claude.rs` tests.
+
+**Owns the universal wire types.** `wire_types` defines `Message`, `ContentBlock`,
+and `ImageSource` — the provider-neutral conversation vocabulary every caller
+uses (`crate::providers::Message`). The Claude HTTP client in `src/claude`
+consumes these types like any other transport and keeps only its own
+`MessageRequest`/`MessageResponse` envelopes; it must not re-export the trio
+under claude paths. `wire_type_boundary_tests` in `mod.rs` fails if a caller
+reaches the trio through a claude path.
 
 **Invariants:**
 

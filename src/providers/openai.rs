@@ -19,8 +19,8 @@ use super::types::{
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::claude::retry::{with_retry, NonRetriableError};
-use crate::claude::types::{ContentBlock, ImageSource};
 use crate::config::ReasoningEffort;
+use crate::providers::{ContentBlock, ImageSource};
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -2303,7 +2303,7 @@ mod tests {
         let provider = canonical_test_provider(server.url());
         let mut rx = provider
             .send_message_stream_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
             .await
@@ -2322,7 +2322,7 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_gpt_5_6_posts_exact_current_chat_completions_json() {
-        use crate::claude::types::{ContentBlock, Message};
+        use crate::providers::{ContentBlock, Message};
         use crate::tools::{ToolDefinition, ToolInputSchema};
 
         let mut server = mockito::Server::new_async().await;
@@ -2449,7 +2449,7 @@ mod tests {
             .with_reasoning_effort(ReasoningEffort::High);
         let validated = crate::providers::validate_provider_request(
             &alias,
-            &ProviderRequest::new(vec![crate::claude::Message::with_content(
+            &ProviderRequest::new(vec![crate::providers::Message::with_content(
                 "user",
                 vec![ContentBlock::image("image/png", VALID_PNG_BASE64)],
             )]),
@@ -2495,7 +2495,7 @@ mod tests {
             ))
             .create_async()
             .await;
-        let request = ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+        let request = ProviderRequest::new(vec![crate::providers::Message::user("hello")])
             .with_model("gpt-5.6-sol");
         let response = canonical_test_provider(nonstream_server.url())
             .send_message_once(&request)
@@ -2554,7 +2554,7 @@ mod tests {
         let provider = canonical_test_provider(server.url());
         let mut rx = provider
             .send_message_stream_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("use tools")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("use tools")])
                     .with_model("gpt-5.6-sol"),
             )
             .await
@@ -2593,7 +2593,7 @@ mod tests {
         let provider = canonical_test_provider(server.url());
         let mut rx = provider
             .send_message_stream_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
             .await
@@ -2616,7 +2616,7 @@ mod tests {
         let provider = canonical_test_provider(url);
         let rx = provider
             .send_message_stream_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
             .await
@@ -2646,7 +2646,7 @@ mod tests {
 
         let response = provider
             .send_message_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
             .await
@@ -2676,7 +2676,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(3),
             provider.send_message_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             ),
         )
@@ -2711,7 +2711,7 @@ mod tests {
             .unwrap();
         let error = provider
             .send_message_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
             .await
@@ -2734,7 +2734,7 @@ mod tests {
         let request = tokio::spawn(async move {
             provider
                 .send_message(
-                    &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                         .with_model("gpt-5.6-sol"),
                 )
                 .await
@@ -2773,7 +2773,7 @@ mod tests {
             .unwrap();
         let mut rx = provider
             .send_message_stream_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
             .await
@@ -2812,7 +2812,7 @@ mod tests {
             let provider = canonical_test_provider(server.url());
             let mut rx = provider
                 .send_message_stream_once(
-                    &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                         .with_model("gpt-5.6-sol"),
                 )
                 .await
@@ -2931,7 +2931,7 @@ mod tests {
                 .await;
             let error = canonical_test_provider(server.url())
                 .send_message_once(
-                    &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                         .with_model("gpt-5.6-sol"),
                 )
                 .await
@@ -3072,17 +3072,18 @@ mod tests {
                 > 1
         );
         validate_jpeg(&progressive).unwrap();
-        let progressive_request = ProviderRequest::new(vec![crate::claude::Message::with_content(
-            "user",
-            vec![ContentBlock::image(
-                "image/jpeg",
-                VALID_PROGRESSIVE_MULTI_SCAN_JPEG_BASE64,
-            )],
-        )])
-        .with_model("gpt-5.6-sol");
+        let progressive_request =
+            ProviderRequest::new(vec![crate::providers::Message::with_content(
+                "user",
+                vec![ContentBlock::image(
+                    "image/jpeg",
+                    VALID_PROGRESSIVE_MULTI_SCAN_JPEG_BASE64,
+                )],
+            )])
+            .with_model("gpt-5.6-sol");
         provider.to_openai_request(&progressive_request).unwrap();
         assert!(validate_jpeg(&progressive[..progressive.len() - 2]).is_err());
-        let bad_base64 = ProviderRequest::new(vec![crate::claude::Message::with_content(
+        let bad_base64 = ProviderRequest::new(vec![crate::providers::Message::with_content(
             "user",
             vec![ContentBlock::image("image/png", "not base64")],
         )])
@@ -3092,7 +3093,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid base64"));
-        let bad_mime = ProviderRequest::new(vec![crate::claude::Message::with_content(
+        let bad_mime = ProviderRequest::new(vec![crate::providers::Message::with_content(
             "user",
             vec![ContentBlock::image("image/webp", "AAAA")],
         )])
@@ -3103,7 +3104,7 @@ mod tests {
             .to_string()
             .contains("unsupported"));
         for (media_type, data) in [("image/png", "iVBORw0KGgo="), ("image/jpeg", "/9j/")] {
-            let truncated = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            let truncated = ProviderRequest::new(vec![crate::providers::Message::with_content(
                 "user",
                 vec![ContentBlock::image(media_type, data)],
             )])
@@ -3111,7 +3112,7 @@ mod tests {
             assert!(provider.to_openai_request(&truncated).is_err());
         }
         for corrupt in [corrupted_png(true), corrupted_png(false)] {
-            let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            let request = ProviderRequest::new(vec![crate::providers::Message::with_content(
                 "user",
                 vec![ContentBlock::image("image/png", corrupt)],
             )])
@@ -3140,7 +3141,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("8 MB"));
-        let mismatch = ProviderRequest::new(vec![crate::claude::Message::with_content(
+        let mismatch = ProviderRequest::new(vec![crate::providers::Message::with_content(
             "user",
             vec![ContentBlock::tool_result(
                 "missing".into(),
@@ -3163,7 +3164,7 @@ mod tests {
             ContentBlock::image("image/png", VALID_PNG_BASE64),
             ContentBlock::tool_result("call_x".into(), "result".into(), None),
         ] {
-            let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            let request = ProviderRequest::new(vec![crate::providers::Message::with_content(
                 "assistant",
                 vec![block],
             )])
@@ -3175,7 +3176,7 @@ mod tests {
                 .contains("assistant message contained an unsupported content block"));
         }
 
-        let user_tool_call = ProviderRequest::new(vec![crate::claude::Message::with_content(
+        let user_tool_call = ProviderRequest::new(vec![crate::providers::Message::with_content(
             "user",
             vec![ContentBlock::ToolUse {
                 id: "call_x".into(),
@@ -3190,7 +3191,7 @@ mod tests {
             .to_string()
             .contains("user message contained an unsupported content block"));
 
-        let scalar_arguments = ProviderRequest::new(vec![crate::claude::Message::with_content(
+        let scalar_arguments = ProviderRequest::new(vec![crate::providers::Message::with_content(
             "assistant",
             vec![ContentBlock::ToolUse {
                 id: "call_x".into(),
@@ -3213,7 +3214,7 @@ mod tests {
         );
         let matched = |input| {
             ProviderRequest::new(vec![
-                crate::claude::Message::with_content(
+                crate::providers::Message::with_content(
                     "assistant",
                     vec![ContentBlock::ToolUse {
                         id: "call_x".into(),
@@ -3221,7 +3222,7 @@ mod tests {
                         input,
                     }],
                 ),
-                crate::claude::Message::with_content(
+                crate::providers::Message::with_content(
                     "user",
                     vec![ContentBlock::tool_result(
                         "call_x".into(),
@@ -3251,7 +3252,7 @@ mod tests {
         .unwrap();
         let compatible_request = compatible
             .to_openai_request(
-                &ProviderRequest::new(vec![crate::claude::Message::with_content(
+                &ProviderRequest::new(vec![crate::providers::Message::with_content(
                     "assistant",
                     vec![ContentBlock::ToolUse {
                         id: "call_x".into(),
@@ -3280,7 +3281,7 @@ mod tests {
             corrupted_png(false),
             base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_IMAGE_BYTES + 1]),
         ] {
-            let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            let request = ProviderRequest::new(vec![crate::providers::Message::with_content(
                 "user",
                 vec![ContentBlock::image("image/png", data)],
             )])
@@ -3289,12 +3290,12 @@ mod tests {
             assert!(error.to_string().len() < 256);
         }
         for request in [
-            ProviderRequest::new(vec![crate::claude::Message::with_content(
+            ProviderRequest::new(vec![crate::providers::Message::with_content(
                 "assistant",
                 vec![ContentBlock::image("image/png", VALID_PNG_BASE64)],
             )])
             .with_model("gpt-5.6-sol"),
-            ProviderRequest::new(vec![crate::claude::Message::with_content(
+            ProviderRequest::new(vec![crate::providers::Message::with_content(
                 "user",
                 vec![ContentBlock::ToolUse {
                     id: "call_x".into(),
@@ -3303,7 +3304,7 @@ mod tests {
                 }],
             )])
             .with_model("gpt-5.6-sol"),
-            ProviderRequest::new(vec![crate::claude::Message::with_content(
+            ProviderRequest::new(vec![crate::providers::Message::with_content(
                 "assistant",
                 vec![ContentBlock::ToolUse {
                     id: "call_x".into(),
@@ -3329,7 +3330,7 @@ mod tests {
             ],
         ] {
             let request = ProviderRequest::new(vec![
-                crate::claude::Message::with_content(
+                crate::providers::Message::with_content(
                     "assistant",
                     vec![ContentBlock::ToolUse {
                         id: "call_x".into(),
@@ -3337,7 +3338,7 @@ mod tests {
                         input: serde_json::json!({}),
                     }],
                 ),
-                crate::claude::Message::with_content("user", blocks),
+                crate::providers::Message::with_content("user", blocks),
             ])
             .with_model("gpt-5.6-sol");
             assert_eq!(
@@ -3360,12 +3361,12 @@ mod tests {
     #[tokio::test]
     async fn canonical_request_and_response_payload_limits_hold_at_http_boundary() {
         let provider = canonical_test_provider("http://127.0.0.1:1".into());
-        let empty =
-            ProviderRequest::new(vec![crate::claude::Message::user("")]).with_model("gpt-5.6-sol");
+        let empty = ProviderRequest::new(vec![crate::providers::Message::user("")])
+            .with_model("gpt-5.6-sol");
         let empty_size = serde_json::to_vec(&provider.to_openai_request(&empty).unwrap())
             .unwrap()
             .len();
-        let exact = ProviderRequest::new(vec![crate::claude::Message::user(
+        let exact = ProviderRequest::new(vec![crate::providers::Message::user(
             "a".repeat(MAX_REQUEST_BYTES - empty_size),
         )])
         .with_model("gpt-5.6-sol");
@@ -3392,7 +3393,7 @@ mod tests {
         let provider = canonical_test_provider(server.url());
         let error = provider
             .send_message_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
             .await
@@ -3427,14 +3428,14 @@ mod tests {
         let tool_secret = "TOOL_ARGUMENT_PRIVATE_VALUE";
         let reasoning_secret = "REASONING_PRIVATE_VALUE";
         let request = ProviderRequest::new(vec![
-            crate::claude::Message::with_content(
+            crate::providers::Message::with_content(
                 "user",
                 vec![
                     ContentBlock::text(prompt_secret),
                     ContentBlock::image("image/png", VALID_PNG_BASE64),
                 ],
             ),
-            crate::claude::Message::with_content(
+            crate::providers::Message::with_content(
                 "assistant",
                 vec![ContentBlock::ToolUse {
                     id: "call_secret".into(),
@@ -3445,7 +3446,7 @@ mod tests {
                     }),
                 }],
             ),
-            crate::claude::Message::with_content(
+            crate::providers::Message::with_content(
                 "user",
                 vec![ContentBlock::tool_result(
                     "call_secret".into(),
@@ -3528,7 +3529,7 @@ mod tests {
             let provider = canonical_test_provider(server.url());
             let error = provider
                 .send_message_once(
-                    &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                         .with_model("gpt-5.6-sol"),
                 )
                 .await
@@ -3574,7 +3575,7 @@ mod tests {
         let provider = canonical_test_provider(server.url());
         let error = provider
             .send_message_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
             .await
@@ -3607,7 +3608,7 @@ mod tests {
         let provider = canonical_test_provider(server.url());
         let error = provider
             .send_message_once(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                &ProviderRequest::new(vec![crate::providers::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
             .await
@@ -3617,17 +3618,17 @@ mod tests {
         assert!(!error.contains("MALICIOUS_PRIVATE_VALUE"));
 
         let huge = "REQUEST_PRIVATE_VALUE".repeat(50_000);
-        let invalid_role = ProviderRequest::new(vec![crate::claude::Message::with_content(
+        let invalid_role = ProviderRequest::new(vec![crate::providers::Message::with_content(
             huge.clone(),
             vec![ContentBlock::text("x")],
         )])
         .with_model("gpt-5.6-sol");
-        let invalid_mime = ProviderRequest::new(vec![crate::claude::Message::with_content(
+        let invalid_mime = ProviderRequest::new(vec![crate::providers::Message::with_content(
             "user",
             vec![ContentBlock::image(huge.clone(), "AAAA")],
         )])
         .with_model("gpt-5.6-sol");
-        let duplicate_ids = ProviderRequest::new(vec![crate::claude::Message::with_content(
+        let duplicate_ids = ProviderRequest::new(vec![crate::providers::Message::with_content(
             "assistant",
             vec![
                 ContentBlock::ToolUse {
@@ -3643,7 +3644,7 @@ mod tests {
             ],
         )])
         .with_model("gpt-5.6-sol");
-        let unknown_result = ProviderRequest::new(vec![crate::claude::Message::with_content(
+        let unknown_result = ProviderRequest::new(vec![crate::providers::Message::with_content(
             "user",
             vec![ContentBlock::tool_result(huge.clone(), "x".into(), None)],
         )])
@@ -3720,9 +3721,9 @@ mod tests {
         )
         .unwrap();
         let response = provider
-            .send_message_once(&ProviderRequest::new(vec![crate::claude::Message::user(
-                "hello",
-            )]))
+            .send_message_once(&ProviderRequest::new(vec![
+                crate::providers::Message::user("hello"),
+            ]))
             .await
             .unwrap();
         assert_eq!(response.tool_uses()[0].input, serde_json::json!({}));
@@ -3751,9 +3752,9 @@ mod tests {
         )
         .unwrap();
         let mut rx = provider
-            .send_message_stream_once(&ProviderRequest::new(vec![crate::claude::Message::user(
-                "hello",
-            )]))
+            .send_message_stream_once(&ProviderRequest::new(vec![
+                crate::providers::Message::user("hello"),
+            ]))
             .await
             .unwrap();
         let mut text = String::new();
@@ -3790,7 +3791,7 @@ mod tests {
 
         provider
             .send_message(&ProviderRequest::new(vec![
-                crate::claude::types::Message::user("hello"),
+                crate::providers::Message::user("hello"),
             ]))
             .await
             .unwrap();
@@ -3830,8 +3831,8 @@ mod tests {
     #[test]
     fn test_to_openai_request_system_prompt() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
-        use crate::claude::types::Message;
         use crate::providers::types::ProviderRequest;
+        use crate::providers::Message;
         let req =
             ProviderRequest::new(vec![Message::user("hello")]).with_system("You are helpful.");
         let openai_req = provider.to_openai_request(&req).unwrap();
@@ -3849,8 +3850,8 @@ mod tests {
     #[test]
     fn test_to_openai_request_no_system_prompt() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
-        use crate::claude::types::Message;
         use crate::providers::types::ProviderRequest;
+        use crate::providers::Message;
         let req = ProviderRequest::new(vec![Message::user("hello")]);
         let openai_req = provider.to_openai_request(&req).unwrap();
         // No system message — first message is user
@@ -3862,8 +3863,8 @@ mod tests {
     #[test]
     fn test_to_openai_request_tool_calls_included() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
-        use crate::claude::types::{ContentBlock, Message};
         use crate::providers::types::ProviderRequest;
+        use crate::providers::{ContentBlock, Message};
         let req = ProviderRequest::new(vec![
             Message::user("run ls"),
             Message::with_content(
@@ -3893,8 +3894,8 @@ mod tests {
     #[test]
     fn test_to_openai_request_tool_result_becomes_tool_role() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
-        use crate::claude::types::{ContentBlock, Message};
         use crate::providers::types::ProviderRequest;
+        use crate::providers::{ContentBlock, Message};
         let req = ProviderRequest::new(vec![
             Message::user("run ls"),
             Message::with_content(
@@ -3935,8 +3936,8 @@ mod tests {
     #[test]
     fn test_empty_tool_result_gets_placeholder() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
-        use crate::claude::types::{ContentBlock, Message};
         use crate::providers::types::ProviderRequest;
+        use crate::providers::{ContentBlock, Message};
         let req = ProviderRequest::new(vec![Message::with_content(
             "user",
             vec![ContentBlock::ToolResult {
@@ -3960,8 +3961,8 @@ mod tests {
     #[test]
     fn test_to_openai_request_empty_user_text_skipped() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
-        use crate::claude::types::{ContentBlock, Message};
         use crate::providers::types::ProviderRequest;
+        use crate::providers::{ContentBlock, Message};
         // A user message with only whitespace text should not generate a "user" message
         let req = ProviderRequest::new(vec![Message::with_content(
             "user",
@@ -3989,7 +3990,8 @@ mod tests {
             .unwrap()
             .with_model("gpt-5.6-sol")
             .with_reasoning_effort(ReasoningEffort::High);
-        let request = ProviderRequest::new(vec![crate::claude::Message::user("reason carefully")]);
+        let request =
+            ProviderRequest::new(vec![crate::providers::Message::user("reason carefully")]);
         let openai_request = provider.to_openai_request(&request).unwrap();
 
         assert_eq!(openai_request.model, "gpt-5.6-sol");
@@ -4285,7 +4287,7 @@ mod tests {
         )];
         let blocks = finalize_tool_calls(&acc, true).unwrap();
         assert_eq!(blocks.len(), 1);
-        if let crate::claude::types::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
+        if let crate::providers::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
             assert_eq!(id, "call_1");
             assert_eq!(name, "bash");
             assert_eq!(input["command"].as_str().unwrap(), "ls");
@@ -4354,7 +4356,7 @@ mod tests {
         // Finalize
         let blocks = finalize_tool_calls(&acc, true).unwrap();
         assert_eq!(blocks.len(), 1);
-        if let crate::claude::types::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
+        if let crate::providers::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
             assert_eq!(id, "call_xyz");
             assert_eq!(name, "bash");
             assert_eq!(input["command"].as_str().unwrap(), "echo test");

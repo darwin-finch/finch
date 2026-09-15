@@ -7,7 +7,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use super::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
-use crate::claude::types::{ContentBlock, Message};
+use crate::providers::{ContentBlock, Message};
 
 /// Teacher session with context tracking
 ///
@@ -415,7 +415,7 @@ fn count_tool_results(messages: &[Message]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::types::ContentBlock;
+    use crate::providers::ContentBlock;
     use crate::providers::{
         CapabilitySupport, ModelCapabilities, ProviderBackend, ReasoningCapability,
         ValidatedProviderRequest,

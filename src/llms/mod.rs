@@ -3,8 +3,8 @@
 // This module provides a unified interface for working with ANY LLM
 // (local or remote) as primary, with other LLMs available as tools.
 
-use crate::claude::types::Message;
 use crate::config::TeacherEntry;
+use crate::providers::Message;
 use crate::providers::{self, LlmProvider, ProviderRequest};
 use anyhow::{Context, Result};
 use std::collections::HashMap;

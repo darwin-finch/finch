@@ -4,7 +4,7 @@ struct NeverCompletes;
 impl crate::generators::Generator for NeverCompletes {
     async fn generate(
         &self,
-        _messages: Vec<crate::claude::Message>,
+        _messages: Vec<crate::providers::Message>,
         _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<crate::generators::GeneratorResponse> {
         std::future::pending().await
@@ -12,7 +12,7 @@ impl crate::generators::Generator for NeverCompletes {
 
     async fn generate_stream(
         &self,
-        _messages: Vec<crate::claude::Message>,
+        _messages: Vec<crate::providers::Message>,
         _tools: Option<Vec<crate::tools::ToolDefinition>>,
     ) -> anyhow::Result<
         Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
@@ -387,8 +387,8 @@ fn admitting_llm_channel() -> (
 
 #[tokio::test]
 async fn continuation_is_admitted_exactly_once_for_one_complete_validated_round() {
-    use crate::claude::{ContentBlock, Message};
     use crate::cli::conversation::ToolRoundProgress;
+    use crate::providers::{ContentBlock, Message};
 
     let query_id = uuid::Uuid::new_v4();
     let mut conversation =
@@ -467,7 +467,7 @@ async fn continuation_is_admitted_exactly_once_for_one_complete_validated_round(
 
 #[tokio::test]
 async fn closed_worker_leaves_complete_round_staged_and_provider_invisible() {
-    use crate::claude::{ContentBlock, Message};
+    use crate::providers::{ContentBlock, Message};
     let query_id = uuid::Uuid::new_v4();
     let mut history = crate::cli::conversation::ConversationHistory::new();
     let token = history
@@ -504,7 +504,7 @@ async fn closed_worker_leaves_complete_round_staged_and_provider_invisible() {
 
 #[tokio::test]
 async fn worker_exit_after_commit_rolls_complete_pair_back_to_stage() {
-    use crate::claude::{ContentBlock, Message};
+    use crate::providers::{ContentBlock, Message};
     let query_id = uuid::Uuid::new_v4();
     let mut history = crate::cli::conversation::ConversationHistory::new();
     let token = history
@@ -567,7 +567,7 @@ async fn worker_exit_after_commit_rolls_complete_pair_back_to_stage() {
 
 #[tokio::test]
 async fn checkpoint_failure_revokes_spawned_continuation_and_restores_live_history() {
-    use crate::claude::{ContentBlock, Message};
+    use crate::providers::{ContentBlock, Message};
     let query_id = uuid::Uuid::new_v4();
     let mut history = crate::cli::conversation::ConversationHistory::new();
     let token = history
@@ -858,9 +858,9 @@ fn test_issue_652_lifecycle_provider_spawn_stays_in_originating_work_unit() {
                 .await
                 .stage_assistant(
                     query_id,
-                    crate::claude::Message {
+                    crate::providers::Message {
                         role: "assistant".into(),
-                        content: vec![crate::claude::ContentBlock::ToolUse {
+                        content: vec![crate::providers::ContentBlock::ToolUse {
                             id: tool_id.clone(),
                             name: "spawn_agent".into(),
                             input: serde_json::json!({"task": "inspect lifecycle grouping"}),
@@ -1018,15 +1018,15 @@ fn test_issue_652_lifecycle_nested_interleaved_roots_keep_ownership() {
                 .await
                 .stage_assistant(
                     query_id,
-                    crate::claude::Message {
+                    crate::providers::Message {
                         role: "assistant".into(),
                         content: vec![
-                            crate::claude::ContentBlock::ToolUse {
+                            crate::providers::ContentBlock::ToolUse {
                                 id: first_tool_id.clone(),
                                 name: "spawn_agent".into(),
                                 input: serde_json::json!({"task": "first root task"}),
                             },
-                            crate::claude::ContentBlock::ToolUse {
+                            crate::providers::ContentBlock::ToolUse {
                                 id: second_tool_id.clone(),
                                 name: "spawn_agent".into(),
                                 input: serde_json::json!({"task": "second root task"}),
@@ -2000,13 +2000,13 @@ fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
 
 #[test]
 fn named_brain_continuation_preserves_multi_text_and_opaque_order() {
-    let initial = crate::claude::Message::user("prompt");
-    let continuation = crate::claude::Message::with_content(
+    let initial = crate::providers::Message::user("prompt");
+    let continuation = crate::providers::Message::with_content(
         "assistant",
         vec![
-            crate::claude::ContentBlock::text("(say \""),
-            crate::claude::ContentBlock::opaque_reasoning("opaque-between-text"),
-            crate::claude::ContentBlock::text("done\")"),
+            crate::providers::ContentBlock::text("(say \""),
+            crate::providers::ContentBlock::opaque_reasoning("opaque-between-text"),
+            crate::providers::ContentBlock::text("done\")"),
         ],
     );
     let (source, language, captured) =
@@ -2542,8 +2542,8 @@ fn test_presentplan_label_uses_first_heading_only() {
 
 // --- find_last_exchange ---
 
-fn user_msg(text: &str) -> crate::claude::Message {
-    crate::claude::Message {
+fn user_msg(text: &str) -> crate::providers::Message {
+    crate::providers::Message {
         role: "user".to_string(),
         content: vec![ContentBlock::Text {
             text: text.to_string(),
@@ -2551,8 +2551,8 @@ fn user_msg(text: &str) -> crate::claude::Message {
     }
 }
 
-fn assistant_msg(text: &str) -> crate::claude::Message {
-    crate::claude::Message {
+fn assistant_msg(text: &str) -> crate::providers::Message {
+    crate::providers::Message {
         role: "assistant".to_string(),
         content: vec![ContentBlock::Text {
             text: text.to_string(),
@@ -2607,7 +2607,7 @@ fn find_last_exchange_skips_empty_assistant_text() {
         assistant_msg("Real answer"),
         user_msg("Ignored"),
         // Assistant message with empty text (e.g., tool-only response)
-        crate::claude::Message {
+        crate::providers::Message {
             role: "assistant".to_string(),
             content: vec![ContentBlock::Text {
                 text: "   ".to_string(),
@@ -2631,7 +2631,7 @@ fn find_last_exchange_assistant_only_no_preceding_user() {
 
 // --- apply_sliding_window ---
 
-fn make_msgs(roles: &[&str]) -> Vec<crate::claude::Message> {
+fn make_msgs(roles: &[&str]) -> Vec<crate::providers::Message> {
     roles
         .iter()
         .enumerate()
@@ -2714,7 +2714,7 @@ fn test_sliding_window_minimum_guard_prevents_empty() {
 /// All providers reject `tool_result` blocks without a matching `tool_use`.
 #[test]
 fn test_sliding_window_strips_orphaned_tool_result_at_boundary() {
-    use crate::claude::Message;
+    use crate::providers::Message;
 
     // Build:
     //   [0] user "question"          ← will be dropped by window
@@ -2794,7 +2794,7 @@ fn test_sliding_window_strips_orphaned_tool_result_at_boundary() {
 /// The fix inserts a placeholder user turn instead of cascading.
 #[test]
 fn test_sliding_window_all_tool_rounds_no_cascade_orphan() {
-    use crate::claude::Message;
+    use crate::providers::Message;
 
     // Build a conversation that is ENTIRELY tool round-trips:
     //   [0] user "query"               ← outside window (dropped by slice)
@@ -2872,7 +2872,7 @@ fn test_sliding_window_all_tool_rounds_no_cascade_orphan() {
 /// any text content, so the conversation sent to the provider is clean.
 #[test]
 fn test_sliding_window_strips_orphaned_tool_use() {
-    use crate::claude::Message;
+    use crate::providers::Message;
 
     // Simulate a cancelled query: assistant wrote tool_uses but the
     // corresponding tool_result user message was never added.

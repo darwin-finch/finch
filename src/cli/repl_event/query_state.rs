@@ -4,8 +4,8 @@
 //! through its lifecycle: pending → streaming → awaiting tool results → done.
 //! Each query has associated `WorkUnit` rows that drive the live TUI display.
 
-use crate::claude::Message;
 use crate::cli::messages::WorkUnit;
+use crate::providers::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -175,7 +175,7 @@ impl QueryStateManager {
         self.try_publish_completion_content(
             query_id,
             response,
-            vec![crate::claude::ContentBlock::Text {
+            vec![crate::providers::ContentBlock::Text {
                 text: source_for_history,
             }],
             conversation,
@@ -189,7 +189,7 @@ impl QueryStateManager {
         &self,
         query_id: Uuid,
         response: String,
-        content: Vec<crate::claude::ContentBlock>,
+        content: Vec<crate::providers::ContentBlock>,
         conversation: &Arc<RwLock<crate::cli::conversation::ConversationHistory>>,
     ) -> bool {
         let mut states = self.states.write().await;
@@ -207,7 +207,7 @@ impl QueryStateManager {
         conversation
             .write()
             .await
-            .add_message(crate::claude::Message {
+            .add_message(crate::providers::Message {
                 role: "assistant".to_string(),
                 content,
             });

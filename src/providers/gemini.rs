@@ -18,7 +18,7 @@ use super::types::{
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::claude::retry::{with_retry, NonRetriableError};
-use crate::claude::types::ContentBlock;
+use crate::providers::ContentBlock;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";

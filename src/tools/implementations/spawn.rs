@@ -8,7 +8,7 @@
 // Multiple TaskTool calls in a single model response can be executed in
 // parallel by the executor (see executor.rs).
 
-use crate::claude::types::{ContentBlock, Message};
+use crate::providers::{ContentBlock, Message};
 use crate::providers::{LlmProvider, ProviderRequest};
 use crate::tools::implementations::bash::BashTool;
 use crate::tools::implementations::glob::GlobTool;
@@ -444,7 +444,7 @@ mod tests {
             &self,
             req: crate::providers::ValidatedProviderRequest,
         ) -> anyhow::Result<crate::providers::ProviderResponse> {
-            use crate::claude::types::ContentBlock;
+            use crate::providers::ContentBlock;
             use crate::providers::ProviderResponse;
             let _req = req.into_request_for(self)?;
             self.backend_calls.fetch_add(1, Ordering::SeqCst);

@@ -3,9 +3,10 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::claude::types::{Message, MessageRequest};
 use crate::claude::ClaudeClient;
+use crate::claude::MessageRequest;
 use crate::config::Persona;
+use crate::providers::Message;
 
 /// Sends completed task summaries to the teacher API and patches the persona file
 pub struct ReflectionEngine {

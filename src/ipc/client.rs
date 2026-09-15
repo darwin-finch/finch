@@ -10,7 +10,6 @@ use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::claude::{ContentBlock, Message};
 use crate::generators::StreamChunk;
 use crate::ipc::brain_codec::{
     decode_approval_audience, decode_attachment, decode_brain_wire_reader, decode_event,
@@ -23,6 +22,7 @@ use crate::ipc::schema::finch_ipc_capnp::{
     stream_receiver,
 };
 use crate::ipc::transport::sock_path;
+use crate::providers::{ContentBlock, Message};
 use crate::tools::{ToolDefinition, ToolUse};
 
 pub struct BrainRunnerBootstrap {
@@ -1687,7 +1687,7 @@ fn decode_stream_content_block(
         Which::Image(value) => {
             let value = value?;
             Ok(ContentBlock::Image {
-                source: crate::claude::types::ImageSource {
+                source: crate::providers::ImageSource {
                     source_type: value
                         .get_source_type()?
                         .to_str()

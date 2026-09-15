@@ -2358,7 +2358,8 @@ async fn run_query_teacher_only(
     program_runtime: Arc<finch::runtime::ProgramRuntime>,
     show_program: bool,
 ) -> Result<()> {
-    use finch::claude::{ContentBlock, Message, MessageRequest};
+    use finch::claude::MessageRequest;
+    use finch::providers::{ContentBlock, Message};
 
     eprintln!("⚠️  Running in teacher-only mode (no local model)");
 

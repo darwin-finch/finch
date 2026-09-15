@@ -13,6 +13,9 @@ mod endpoints;
 mod model_catalog;
 mod types;
 
+// The provider-neutral conversation wire vocabulary shared by every caller
+mod wire_types;
+
 // Provider implementations
 mod chatgpt_oauth;
 mod chatgpt_subscription;
@@ -68,6 +71,7 @@ pub use types::{
     ProviderRequest, ProviderResponse, ProviderUsage, ReasoningCapability, StreamChunk,
     WireProtocol, WireProtocolCapability,
 };
+pub use wire_types::{ContentBlock, ImageSource, Message};
 
 mod validated_boundary;
 
@@ -188,7 +192,7 @@ pub trait LlmProvider: ProviderBackend {
 impl<T> LlmProvider for T where T: ProviderBackend + ?Sized {}
 
 /// Helper to convert provider response to format compatible with existing code
-impl From<ProviderResponse> for crate::claude::types::MessageResponse {
+impl From<ProviderResponse> for crate::claude::MessageResponse {
     fn from(response: ProviderResponse) -> Self {
         Self {
             id: response.id,
@@ -348,5 +352,69 @@ mod capability_contract_tests {
             .to_string()
             .contains("supports at most 10000 output tokens, but 10001 were requested"));
         assert_eq!(output_provider.effects.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod wire_type_boundary_tests {
+    /// The universal wire types (`Message`, `ContentBlock`, `ImageSource`) are
+    /// reached through the providers facade, never through the Claude client
+    /// subtree. A stale `crate::claude::<trio>` or `crate::claude::types::<trio>`
+    /// reference outside `src/claude` re-couples every caller to the Claude
+    /// transport's file layout, which is exactly what the hoist out of
+    /// `claude::types` removed. Claude itself consumes the facade types, so the
+    /// scan excludes only `src/claude`'s own use of its envelopes.
+    #[test]
+    fn test_universal_wire_types_are_reached_through_the_providers_facade() {
+        let mut hits = Vec::new();
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for tree in ["src", "tests"] {
+            let root = manifest.join(tree);
+            collect_stale_claude_wire_paths(&root, &manifest.join("src/claude"), &mut hits);
+        }
+        assert!(
+            hits.is_empty(),
+            "universal wire types must be used via crate::providers, not the Claude client subtree; found: {hits:?}"
+        );
+    }
+
+    fn collect_stale_claude_wire_paths(
+        dir: &std::path::Path,
+        claude_root: &std::path::Path,
+        hits: &mut Vec<String>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.starts_with(claude_root) {
+                continue;
+            }
+            if path.is_dir() {
+                collect_stale_claude_wire_paths(&path, claude_root, hits);
+                continue;
+            }
+            let Some(name) = path.to_str() else {
+                continue;
+            };
+            if !name.ends_with(".rs") || name.ends_with("src/providers/mod.rs") {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (line_number, line) in contents.lines().enumerate() {
+                let stale = line.contains("crate::claude::types::")
+                    || line.contains("finch::claude::types::")
+                    || line.contains("use crate::claude::{")
+                        && line.contains("Message")
+                        && !line.contains("MessageRequest")
+                        && !line.contains("MessageResponse");
+                if stale {
+                    hits.push(format!("{}:{}: {}", name, line_number + 1, line.trim()));
+                }
+            }
+        }
     }
 }

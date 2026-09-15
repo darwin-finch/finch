@@ -25,11 +25,11 @@ use super::{
     CapabilitySupport, ModelCapabilities, ModelFeature, ProviderBackend, ProviderRequest,
     ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest, WireProtocol,
 };
-use crate::claude::{ContentBlock, Message};
 use crate::config::{
     AudienceBinding, CredentialProvider, EndpointFamily, ProviderCredential, ReasoningEffort,
 };
 use crate::oauth::{FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthTokenRecord};
+use crate::providers::{ContentBlock, Message};
 use crate::tools::ToolDefinition;
 
 pub const CHATGPT_INFERENCE_PROTOCOL_REVISION: &str =

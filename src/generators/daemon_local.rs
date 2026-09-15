@@ -6,8 +6,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::claude::{ContentBlock, Message};
 use crate::client::DaemonClient;
+use crate::providers::{ContentBlock, Message};
 use crate::tools::ToolDefinition;
 
 use super::{

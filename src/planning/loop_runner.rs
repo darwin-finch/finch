@@ -5,10 +5,10 @@ use crossterm::style::Stylize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::claude::Message;
 use crate::cli::tui::{Dialog, DialogOption, DialogResult, TuiRenderer};
 use crate::cli::OutputManager;
 use crate::generators::Generator;
+use crate::providers::Message;
 
 use super::personas::select_active_personas;
 use super::types::{

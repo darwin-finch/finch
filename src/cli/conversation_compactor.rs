@@ -27,8 +27,8 @@
 // * Failure is non-fatal: if summarisation fails the window is returned as-is
 //   with a warning logged (same behaviour as if the flag were off).
 
-use crate::claude::{ContentBlock, Message};
 use crate::generators::Generator;
+use crate::providers::{ContentBlock, Message};
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -141,7 +141,7 @@ pub fn format_messages_for_summary(messages: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::Message;
+    use crate::providers::Message;
 
     fn user(text: &str) -> Message {
         Message::user(text)

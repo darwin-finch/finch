@@ -218,11 +218,11 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::mpsc;
 
-    use crate::claude::Message;
     use crate::cli::conversation::ConversationHistory;
     use crate::generators::{
         GeneratorCapabilities, GeneratorResponse, ResponseMetadata, StreamChunk,
     };
+    use crate::providers::Message;
     use crate::tools::ToolDefinition;
 
     struct MockGenerator {

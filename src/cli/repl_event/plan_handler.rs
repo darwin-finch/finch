@@ -613,8 +613,8 @@ mod tests {
     ///   user      { ToolResult { tool_use_id: "abc123", content: "Plan approved..." } }
     ///
     /// which is valid for the Claude API.
-    fn build_present_plan_approved_conversation() -> Vec<crate::claude::Message> {
-        use crate::claude::{ContentBlock, Message};
+    fn build_present_plan_approved_conversation() -> Vec<crate::providers::Message> {
+        use crate::providers::{ContentBlock, Message};
 
         let tool_use_id = "abc123".to_string();
 
@@ -675,7 +675,7 @@ mod tests {
     fn test_present_plan_approve_tool_result_references_tool_use() {
         // Regression for GH #43: the ToolResult's tool_use_id must reference a
         // ToolUse that exists in the immediately preceding assistant message.
-        use crate::claude::ContentBlock;
+        use crate::providers::ContentBlock;
 
         let msgs = build_present_plan_approved_conversation();
         assert!(msgs.len() >= 2);
@@ -730,7 +730,7 @@ mod tests {
         // Documentary test: shows that the OLD buggy pattern (clear conversation,
         // add a plain user message, then add a ToolResult user message) produces
         // consecutive user messages — the invariant the fix avoids.
-        use crate::claude::{ContentBlock, Message};
+        use crate::providers::{ContentBlock, Message};
 
         // Simulate what the buggy code did after Approve + clear_context:
         //   conversation.clear()
