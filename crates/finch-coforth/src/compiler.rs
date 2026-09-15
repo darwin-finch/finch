@@ -19,6 +19,103 @@ fn record_parser_token_visit() {
     PARSER_TOKEN_VISITS.with(|visits| visits.set(visits.get() + 1));
 }
 
+/// The parser's sole handle on a token stream. The raw slice is private to
+/// this module, so no parser code can read a token except through the
+/// accessors below, and every accessor that yields a token records the read
+/// via `record_parser_token_visit`. This is the structural half of the
+/// one-consumption/no-rescan proof
+/// (`test_ast_repair_nested_quotations_consume_tokens_linearly`): a future
+/// direct `.iter()`, index scan, or sub-slice of parser tokens cannot bypass
+/// the accounting, because there is no unaccounted way in. In non-test builds
+/// `record_parser_token_visit` is a no-op and each accessor compiles to the
+/// plain slice operation it wraps, so production semantics are unchanged.
+mod token_view {
+    use super::{record_parser_token_visit, Token};
+
+    /// A borrowed window over a parser token stream. A window is only a slice
+    /// reference, so copying one is free; `range` narrows a window without
+    /// reading tokens, and reads through the narrowed window are recorded
+    /// individually.
+    #[derive(Clone, Copy)]
+    pub(super) struct TokenView<'tokens, 'source> {
+        atoms: &'tokens [Token<'source>],
+    }
+
+    impl<'tokens, 'source> TokenView<'tokens, 'source> {
+        /// Wrap a token slice as the parser's only view of it.
+        pub(super) fn new(atoms: &'tokens [Token<'source>]) -> Self {
+            Self { atoms }
+        }
+
+        /// Token count. Not a token read, so it records nothing.
+        pub(super) fn len(&self) -> usize {
+            self.atoms.len()
+        }
+
+        /// Borrow the token at `index`, recording the read. Panics on an
+        /// out-of-bounds index exactly like slice indexing does.
+        pub(super) fn at(&self, index: usize) -> &Token<'source> {
+            record_parser_token_visit();
+            &self.atoms[index]
+        }
+
+        /// Borrow the token at `index` if it exists, recording the read.
+        pub(super) fn get(&self, index: usize) -> Option<&Token<'source>> {
+            let token = self.atoms.get(index)?;
+            record_parser_token_visit();
+            Some(token)
+        }
+
+        /// Borrow the first token if any, recording the read.
+        pub(super) fn first(&self) -> Option<&Token<'source>> {
+            let token = self.atoms.first()?;
+            record_parser_token_visit();
+            Some(token)
+        }
+
+        /// Narrow the window to `range` without reading tokens. Panics on an
+        /// out-of-bounds range exactly like slice slicing does.
+        pub(super) fn range(&self, range: std::ops::Range<usize>) -> Self {
+            Self {
+                atoms: &self.atoms[range],
+            }
+        }
+
+        /// Iterate the window, recording one visit per token actually read.
+        pub(super) fn iter(&self) -> TokenIter<'tokens, 'source> {
+            TokenIter {
+                atoms: self.atoms,
+                index: 0,
+            }
+        }
+    }
+
+    /// Slice-order iterator over a window: yields what `std::slice::Iter`
+    /// yields, and records each token it actually yields.
+    pub(super) struct TokenIter<'tokens, 'source> {
+        atoms: &'tokens [Token<'source>],
+        index: usize,
+    }
+
+    impl<'tokens, 'source> Iterator for TokenIter<'tokens, 'source> {
+        type Item = &'tokens Token<'source>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let token = self.atoms.get(self.index)?;
+            self.index += 1;
+            record_parser_token_visit();
+            Some(token)
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let remaining = self.atoms.len() - self.index;
+            (remaining, Some(remaining))
+        }
+    }
+
+    impl ExactSizeIterator for TokenIter<'_, '_> {}
+}
+
 #[derive(Debug, Clone)]
 struct LocalBinding<'source> {
     name: &'source str,
@@ -406,18 +503,21 @@ impl<'source> ForthBodyAst<'source> {
 /// The delimiter index is built once, without inspecting a nested slice again.
 /// The cursor subsequently consumes every token exactly once, even when a
 /// quotation is an operand whose body is not semantically elaborated.
+/// `atoms` is a [`token_view::TokenView`]: the index pass, the cursor, the
+/// look-ahead, and every quotation-header scan all read tokens through its
+/// recorded accessors, so the no-rescan regression bounds the reads of the
+/// implementation that actually runs, not only of its instrumented calls.
 struct ForthParser<'tokens, 'source> {
-    atoms: &'tokens [Token<'source>],
+    atoms: token_view::TokenView<'tokens, 'source>,
     quotations: Vec<Option<(usize, usize)>>,
     cursor: usize,
 }
 
 impl<'tokens, 'source> ForthParser<'tokens, 'source> {
-    fn new(atoms: &'tokens [Token<'source>]) -> Self {
+    fn new(atoms: token_view::TokenView<'tokens, 'source>) -> Self {
         let mut quotations = vec![None; atoms.len()];
         let mut brackets: Vec<(usize, Option<usize>, bool)> = Vec::new();
         for (index, token) in atoms.iter().enumerate() {
-            record_parser_token_visit();
             match token.value {
                 TokenValue::Word("[") => brackets.push((index, None, false)),
                 TokenValue::Word("]") => {
@@ -449,7 +549,6 @@ impl<'tokens, 'source> ForthParser<'tokens, 'source> {
         let index = self.cursor;
         let token = self.atoms.get(index)?.clone();
         self.cursor += 1;
-        record_parser_token_visit();
         Some((index, token))
     }
 
@@ -464,7 +563,7 @@ impl<'tokens, 'source> ForthParser<'tokens, 'source> {
 fn parse_quotation_signature(
     source_id: &str,
     source: &str,
-    header: &[Token],
+    header: &token_view::TokenView<'_, '_>,
     origin: &SourceOrigin,
 ) -> Result<(StackSignature, bool), Vec<VmDiagnostic>> {
     let Some(separator) = header
@@ -488,8 +587,8 @@ fn parse_quotation_signature(
             origin.clone(),
         )]);
     }
-    let input = parse_stack_types(source_id, source, &header[..separator])?;
-    let output = parse_stack_types(source_id, source, &header[separator + 1..effect])?;
+    let input = parse_stack_types(source_id, source, &header.range(0..separator))?;
+    let output = parse_stack_types(source_id, source, &header.range(separator + 1..effect))?;
     if output.len() != 1 {
         return Err(vec![control_error(
             "E-CLOSURE-001",
@@ -500,13 +599,13 @@ fn parse_quotation_signature(
     let declares_pure = if effect == header.len() {
         false
     } else {
-        let annotation = &header[effect + 1..];
+        let annotation = header.range(effect + 1..header.len());
         if annotation.len() == 1
-            && matches!(&annotation[0].value, TokenValue::Word(word) if *word == "pure")
+            && matches!(&annotation.at(0).value, TokenValue::Word(word) if *word == "pure")
         {
             true
         } else if annotation.len() == 1
-            && matches!(&annotation[0].value, TokenValue::Word(word) if *word == "infer")
+            && matches!(&annotation.at(0).value, TokenValue::Word(word) if *word == "infer")
         {
             false
         } else {
@@ -2715,22 +2814,26 @@ fn parse_forth_module<'source>(
     source_id: &str,
     source: &'source str,
 ) -> Result<ForthModuleAst<'source>, Vec<VmDiagnostic>> {
-    let tokens = tokenize(source_id, source)?;
+    let raw_tokens = tokenize(source_id, source)?;
+    let tokens = token_view::TokenView::new(&raw_tokens);
     let mut definitions = Vec::new();
     let mut main_atoms = Vec::new();
     let mut cursor = 0;
     while cursor < tokens.len() {
-        if !token_is(&tokens[cursor], ":") {
-            main_atoms.push(tokens[cursor].clone());
+        let token = tokens
+            .get(cursor)
+            .expect("cursor is inside its token stream");
+        if !token_is(token, ":") {
+            main_atoms.push(token.clone());
             cursor += 1;
             continue;
         }
-        let definition_start = tokens[cursor].start;
+        let definition_start = token.start;
         let Some(name_token) = tokens.get(cursor + 1) else {
             return Err(vec![control_error(
                 "E-FORTH-DEF-003",
                 ": requires a word name",
-                origin(source_id, source, tokens[cursor].start, tokens[cursor].end),
+                origin(source_id, source, token.start, token.end),
             )]);
         };
         let TokenValue::Word(name) = &name_token.value else {
@@ -2757,7 +2860,7 @@ fn parse_forth_module<'source>(
             )]);
         }
         let close = (cursor + 3..tokens.len())
-            .find(|index| token_is(&tokens[*index], ")"))
+            .find(|index| tokens.get(*index).is_some_and(|token| token_is(token, ")")))
             .ok_or_else(|| {
                 vec![definition_error(
                     source_id,
@@ -2766,12 +2869,12 @@ fn parse_forth_module<'source>(
                     "unterminated typed word signature",
                 )]
             })?;
-        let signature_tokens = &tokens[cursor + 3..close];
+        let signature_tokens = tokens.range(cursor + 3..close);
         let (signature, declares_pure, locals) =
-            parse_definition_signature(source_id, source, signature_tokens, open)?;
+            parse_definition_signature(source_id, source, &signature_tokens, open)?;
         let body_start_index = close + 1;
         let end = (body_start_index..tokens.len())
-            .find(|index| token_is(&tokens[*index], ";"))
+            .find(|index| tokens.get(*index).is_some_and(|token| token_is(token, ";")))
             .ok_or_else(|| {
                 vec![definition_error(
                     source_id,
@@ -2780,18 +2883,19 @@ fn parse_forth_module<'source>(
                     "unterminated word definition",
                 )]
             })?;
-        if tokens[body_start_index..end]
+        if tokens
+            .range(body_start_index..end)
             .iter()
             .any(|token| token_is(token, ":"))
         {
             return Err(vec![definition_error(
                 source_id,
                 source,
-                &tokens[body_start_index],
+                tokens.at(body_start_index),
                 "nested word definitions are not allowed",
             )]);
         }
-        let definition_end = tokens[end].end;
+        let definition_end = tokens.at(end).end;
         definitions.push(ForthDefinitionAst {
             name,
             documentation: forth_definition_documentation(source, definition_start),
@@ -2800,7 +2904,7 @@ fn parse_forth_module<'source>(
             body: parse_forth_body(
                 source_id,
                 source,
-                &tokens[body_start_index..end],
+                tokens.range(body_start_index..end),
                 &locals,
                 &[],
             ),
@@ -2812,7 +2916,13 @@ fn parse_forth_module<'source>(
     }
     Ok(ForthModuleAst {
         definitions,
-        body: parse_forth_body(source_id, source, &main_atoms, &[], &[]),
+        body: parse_forth_body(
+            source_id,
+            source,
+            token_view::TokenView::new(&main_atoms),
+            &[],
+            &[],
+        ),
     })
 }
 
@@ -2822,15 +2932,16 @@ fn parse_forth_module<'source>(
 fn parse_forth_body<'source>(
     source_id: &str,
     source: &'source str,
-    atoms: &[Token<'source>],
+    atoms: token_view::TokenView<'_, 'source>,
     locals: &[LocalBinding<'source>],
     captures: &[LocalBinding<'source>],
 ) -> ForthBodyAst<'source> {
+    let end = atoms.len();
     parse_forth_body_cursor(
         &mut ForthParser::new(atoms),
         source_id,
         source,
-        atoms.len(),
+        end,
         locals,
         captures,
     )
@@ -2876,11 +2987,11 @@ fn parse_forth_body_cursor<'source>(
                 .iter()
                 .map(|capture| capture.binding.clone())
                 .collect::<Vec<_>>();
-            let quote_end = parser.atoms[close_index].end;
+            let quote_end = parser.atoms.at(close_index).end;
             let signature = parse_quotation_signature(
                 source_id,
                 source,
-                &parser.atoms[index + 1..pipe_index],
+                &parser.atoms.range(index + 1..pipe_index),
                 &origin(source_id, source, token.start, quote_end),
             );
             parser.advance_to(pipe_index + 1);
@@ -3005,7 +3116,7 @@ fn parse_forth_body_cursor<'source>(
                     | ForthSyntax::Continue
             );
             if matches!(syntax, ForthSyntax::RecordGet | ForthSyntax::RecordSet) {
-                field = previous.and_then(|index: usize| match &parser.atoms[index].value {
+                field = previous.and_then(|index: usize| match &parser.atoms.at(index).value {
                     TokenValue::String(field) => Some(Cow::Owned(field.clone())),
                     _ => None,
                 });
@@ -3216,7 +3327,7 @@ fn forth_definition_documentation(source: &str, definition_start: usize) -> Opti
 fn parse_definition_signature<'source>(
     source_id: &str,
     source: &str,
-    tokens: &[Token<'source>],
+    tokens: &token_view::TokenView<'_, 'source>,
     fallback: &Token,
 ) -> Result<(StackSignature, bool, Vec<LocalBinding<'source>>), Vec<VmDiagnostic>> {
     let separator = tokens
@@ -3232,17 +3343,25 @@ fn parse_definition_signature<'source>(
         })?;
     let effect = tokens.iter().position(|token| token_is(token, "!"));
     let output_end = effect.unwrap_or(tokens.len());
-    let input_tokens = &tokens[..separator];
-    let output_tokens = &tokens[separator + 1..output_end];
-    validate_preserved_stack_row(source_id, source, input_tokens, fallback, "input")?;
-    validate_preserved_stack_row(source_id, source, output_tokens, fallback, "output")?;
-    let (input, locals) = parse_input_stack_types(source_id, source, &input_tokens[1..])?;
-    let output = parse_stack_types(source_id, source, &output_tokens[1..])?;
+    let input_tokens = tokens.range(0..separator);
+    let output_tokens = tokens.range(separator + 1..output_end);
+    validate_preserved_stack_row(source_id, source, &input_tokens, fallback, "input")?;
+    validate_preserved_stack_row(source_id, source, &output_tokens, fallback, "output")?;
+    let (input, locals) = parse_input_stack_types(
+        source_id,
+        source,
+        &input_tokens.range(1..input_tokens.len()),
+    )?;
+    let output = parse_stack_types(
+        source_id,
+        source,
+        &output_tokens.range(1..output_tokens.len()),
+    )?;
     let declares_pure = if let Some(effect) = effect {
-        let annotation = &tokens[effect + 1..];
-        if annotation.len() == 1 && token_is(&annotation[0], "pure") {
+        let annotation = tokens.range(effect + 1..tokens.len());
+        if annotation.len() == 1 && token_is(annotation.at(0), "pure") {
             true
-        } else if annotation.len() == 1 && token_is(&annotation[0], "infer") {
+        } else if annotation.len() == 1 && token_is(annotation.at(0), "infer") {
             false
         } else {
             return Err(vec![definition_error(
@@ -3277,13 +3396,13 @@ fn parse_definition_signature<'source>(
 fn parse_input_stack_types<'source>(
     source_id: &str,
     source: &str,
-    tokens: &[Token<'source>],
+    tokens: &token_view::TokenView<'_, 'source>,
 ) -> Result<(Vec<Type>, Vec<LocalBinding<'source>>), Vec<VmDiagnostic>> {
     let mut types = Vec::with_capacity(tokens.len());
     let mut locals = Vec::new();
     let mut saw_named = false;
     let mut saw_unnamed = false;
-    for token in tokens {
+    for token in tokens.iter() {
         let TokenValue::Word(spelling) = &token.value else {
             return Err(vec![definition_error(
                 source_id,
@@ -3349,7 +3468,7 @@ fn parse_input_stack_types<'source>(
 fn parse_stack_types(
     source_id: &str,
     source: &str,
-    tokens: &[Token],
+    tokens: &token_view::TokenView<'_, '_>,
 ) -> Result<Vec<Type>, Vec<VmDiagnostic>> {
     tokens
         .iter()
@@ -3381,7 +3500,7 @@ fn parse_stack_types(
 fn validate_preserved_stack_row(
     source_id: &str,
     source: &str,
-    tokens: &[Token],
+    tokens: &token_view::TokenView<'_, '_>,
     fallback: &Token,
     side: &str,
 ) -> Result<(), Vec<VmDiagnostic>> {
@@ -3401,7 +3520,11 @@ fn validate_preserved_stack_row(
             format!("typed word signature {side} must begin with preserved stack row 'S'"),
         )]);
     }
-    if let Some(extra) = tokens[1..].iter().find(|token| token_is(token, "S")) {
+    if let Some(extra) = tokens
+        .range(1..tokens.len())
+        .iter()
+        .find(|token| token_is(token, "S"))
+    {
         return Err(vec![definition_error(
             source_id,
             source,
@@ -4414,13 +4537,28 @@ mod tests {
 
     #[test]
     fn test_ast_repair_nested_quotations_consume_tokens_linearly() {
+        // Every parser token read is recorded by `token_view::TokenView`: the
+        // raw slices are private to that module, so the count below cannot be
+        // bypassed by a direct `.iter()` or index scan the way hand-placed
+        // `record_parser_token_visit` hooks could. The bound is linear in the
+        // token count: module splitting, the delimiter-index pass, and the
+        // cursor each read every token at most once, and quotation-header
+        // scans, close-bracket spans, and the terminal look-ahead add only
+        // reads bounded by the number of quotations and operations. A direct
+        // nested-quotation rescan adds one read per rescanned token and must
+        // trip this bound. If a legitimate new pass pushes a parse over it,
+        // raise the factor here and name the pass in the commit.
         for prefix in ["", "['] "] {
             let source = format!("{prefix}{}1{}", "[ -- int | ".repeat(32), " ]".repeat(32));
             let tokens = tokenize("nested.forth", &source).unwrap().len();
             PARSER_TOKEN_VISITS.with(|visits| visits.set(0));
             let ast = parse_forth_module("nested.forth", &source).unwrap();
             let visits = PARSER_TOKEN_VISITS.with(|visits| visits.get());
-            assert!(visits <= 2 * tokens, "nested quotation parsing may index each token once and consume it once, including quotation reference operands: {tokens} tokens, {visits} visits, {} root nodes", ast.body.nodes.len());
+            assert!(
+                tokens <= visits && visits <= 4 * tokens,
+                "nested quotation parsing must read each token a bounded number of times and never rescan quotation spans, including quotation reference operands: {tokens} tokens, {visits} visits, {} root nodes",
+                ast.body.nodes.len()
+            );
         }
     }
 

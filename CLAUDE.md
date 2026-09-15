@@ -62,7 +62,7 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 
 ### TUI
 
-- **Scrollback deduplication: each message written via `insert_before()` exactly once** — check `scrollback.get_message(msg_id).is_none()` before calling (tests in `src/cli/tui/scrollback.rs`)
+- **Scrollback deduplication: each message is written to the terminal exactly once** — `commit_complete_messages` skips ids already in `printed_ids` and marks a message only after its staged bytes have been written, so a flush that reports an ambiguous error is never retried into a duplicate; after a resize clears the screen, `prepare_canonical_commit` removes the visible projection first so a re-commit cannot spool the row into native history twice — `canonical_commit_marks_only_after_success_and_follows_resize_clear` in `src/cli/tui/mod.rs`
 - **Dialog virtual rows stable after Other-row activation** — `test_multiselect_submit_button_emits_selection`, `test_o_key_moves_cursor_to_other_row` in `src/cli/tui/dialog.rs`
 - **Prose must never be executed as a typed program** — `is_clearly_forth` in `src/main.rs` decides this for `finch query`; a question mark, comma, apostrophe or leading capital disqualifies a line, and the apostrophe test runs before the operator-character test so an emphatic contraction is not claimed by `!` — `prose_about_a_forth_string_opener_is_not_executed_as_forth`, `test_contraction_with_emphasis_is_not_executed_as_forth`, `test_a_forth_line_with_an_operator_still_runs` in `src/main.rs`
 
