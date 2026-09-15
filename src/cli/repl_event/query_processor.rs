@@ -1145,9 +1145,9 @@ pub(crate) async fn process_query_with_tools(
         tracing::debug!("Generator supports streaming, attempting to stream");
 
         // Create a WorkUnit for this generation turn BEFORE streaming begins.
-        // The shadow-buffer / insert_before architecture requires the message to
-        // exist in output_manager before any blit cycles run — the WorkUnit's
-        // time-driven animation will be visible during streaming.
+        // The live area is erase-and-redraw, so the WorkUnit must exist in
+        // output_manager before the first frame — its time-driven animation
+        // stays visible during streaming, before any canonical commit.
         let named_brain_turn = query_states
             .get_metadata(query_id)
             .await
