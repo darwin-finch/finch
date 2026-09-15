@@ -2947,6 +2947,7 @@ impl Repl {
                         | "PresentPlan"
                         | "ask_user_question"
                         | "AskUserQuestion"
+                        | "enter_plan_mode"
                         | "EnterPlanMode"
                         | "ExitPlanMode"
                 )

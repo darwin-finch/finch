@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Planning mode no longer blocks the only `enter_plan_mode` name the model can emit.**
+  `ToolRegistry::definitions()` omits aliases, so the provider is shown
+  `enter_plan_mode` and never `EnterPlanMode`. The Planning allowlist had only
+  the alias, so after `/plan` the next `enter_plan_mode` call failed with
+  "not allowed in planning mode". Re-entering plan mode while already planning
+  is an idempotent no-op. (#26)
 - **`xlsx@` read the wrong cell on any sheet whose data does not start at A1.**
   Cell addresses are absolute, but the lookup used a range-relative position, so
   a sheet with a blank first row or column returned a neighbouring cell's value
