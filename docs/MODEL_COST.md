@@ -137,6 +137,42 @@ Do not use the outgoing flagship to summarize "random back and forth." That
 defeats the point. Local Qwen shipped by default is how this stays free when
 the user has no API.
 
+## Inline recap is the MemTree rollup
+
+Codex and Claude recap a session as a generated block (a compact turn, a
+sticky header, a `/compact` rewrite). That is the wrong surface here.
+
+Finch already puts the recap **at the bottom**, next to the composer, as a
+depth-sliced MemTree rollup (`StatusLineType::ContextLine` via
+`refresh_context_strip`). It is supposed to stay current as the session
+runs, not as a one-shot artifact you ask for. Parent nodes in the tree are
+the rollup; the footer is just that tree, sliced broad → now.
+
+That footer is currently broken. `conversation_summary` /
+`conversation_summary_for_session` pick truncated turn text by centroid.
+`MemTree::promote_leaf` keeps the first child's wording as a provisional
+parent label; the paper's LLM aggregation of children is not implemented
+([#250](https://github.com/darwin-finch/finch/issues/250),
+[#251](https://github.com/darwin-finch/finch/issues/251)). So the strip
+looks like a recap and reads like leftover utterances.
+
+The `compress` lane should maintain those parent summaries. Same rule as
+hot-swap compression: local Qwen when weights exist, never the flagship,
+never a second conversation. Summaries are derived, versioned, and
+regenerable; the transcript stays the source of truth
+([#141](https://github.com/darwin-finch/finch/issues/141) still owns not
+duplicating canonical turns in the strip). No local model today is a
+setup/wiring gap, not a reason to copy a recap block.
+
+Ticket: [#716](https://github.com/darwin-finch/finch/issues/716). Structure
+remains [#251](https://github.com/darwin-finch/finch/issues/251) /
+[#250](https://github.com/darwin-finch/finch/issues/250); lane-swap
+compression remains [#707](https://github.com/darwin-finch/finch/issues/707).
+
+Rejected: a Recap command, an assistant-turn recap, or moving the rollup
+into the transcript. The placement and the inline maintenance are what is
+working; the missing writer is the local compress model.
+
 ## Usage vs quota dialog
 
 A `/usage` (or Credentials/status) dialog should list **every named
