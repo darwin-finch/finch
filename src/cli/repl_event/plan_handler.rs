@@ -61,6 +61,12 @@ pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool 
                     | "todo_write"
                     | "TodoRead"
                     | "TodoWrite"
+                    // Re-entering planning while already planning is
+                    // idempotent (`EnterPlanModeTool::execute` returns
+                    // "already in planning mode" and changes nothing). The
+                    // canonical name is the only spelling the provider is
+                    // shown: `ToolRegistry::definitions()` omits aliases.
+                    | "enter_plan_mode"
                     | "EnterPlanMode"
                     | "ExitPlanMode"
             )
@@ -535,6 +541,47 @@ mod tests {
         assert!(
             is_tool_allowed_in_mode("ExitPlanMode", &mode),
             "ExitPlanMode must be allowed in planning mode"
+        );
+    }
+
+    /// Regression for #26: after `/plan`, the provider emits the canonical
+    /// registered name — the only spelling `ToolRegistry::definitions()`
+    /// shows, because that method omits dispatch-only aliases — and the gate
+    /// answered "Tool 'enter_plan_mode' is not allowed in planning mode".
+    /// The name is read from the tool, not written as a literal.
+    #[test]
+    fn test_plan_mode_allows_canonical_enter_plan_mode() {
+        use crate::tools::{EnterPlanModeTool, Tool, ToolRegistry};
+
+        let mode = planning_mode();
+        let registered = EnterPlanModeTool.name();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EnterPlanModeTool));
+        let shown: Vec<String> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(
+            shown.iter().any(|name| name == registered),
+            "invariant: definitions() must advertise the canonical registered name \
+             {registered:?} so the provider can emit it. shown={shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|name| name == "EnterPlanMode"),
+            "invariant: definitions() omits the dispatch-only alias EnterPlanMode; \
+             allowing only that alias leaves the only model-facing name blocked. \
+             shown={shown:?}"
+        );
+
+        assert!(
+            is_tool_allowed_in_mode(registered, &mode),
+            "invariant: the canonical registered name {registered:?} is the only \
+             spelling the provider is shown, and re-entering planning mode while \
+             already planning is an idempotent no-op — it must not be refused as \
+             a state-changing tool (#26). Legacy alias \"EnterPlanMode\" allowed = {}.",
+            is_tool_allowed_in_mode("EnterPlanMode", &mode),
         );
     }
 
