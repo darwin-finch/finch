@@ -390,7 +390,7 @@ impl ToolExecutor {
             Arc<tokio::sync::RwLock<crate::training::batch_trainer::BatchTrainer>>,
         >,
         local_generator: Option<Arc<tokio::sync::RwLock<crate::local::LocalGenerator>>>,
-        tokenizer: Option<Arc<crate::models::tokenizer::TextTokenizer>>,
+        tokenizer: Option<Arc<crate::models::TextTokenizer>>,
         repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
         live_output: Option<crate::tools::types::LiveOutput>,
@@ -576,7 +576,7 @@ impl ToolExecutor {
             Arc<tokio::sync::RwLock<crate::training::batch_trainer::BatchTrainer>>,
         >,
         local_generator: Option<Arc<tokio::sync::RwLock<crate::local::LocalGenerator>>>,
-        tokenizer: Option<Arc<crate::models::tokenizer::TextTokenizer>>,
+        tokenizer: Option<Arc<crate::models::TextTokenizer>>,
         repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
     ) -> Result<Vec<ToolResult>>

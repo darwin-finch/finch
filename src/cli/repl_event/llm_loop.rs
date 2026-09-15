@@ -19,7 +19,7 @@ use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::TuiRenderer;
 use crate::generators::Generator;
-use crate::models::bootstrap::GeneratorState;
+use crate::models::GeneratorState;
 use crate::router::Router;
 use crate::tools::ToolDefinition;
 

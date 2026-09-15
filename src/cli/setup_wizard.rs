@@ -27,8 +27,7 @@ mod state;
 mod tests;
 
 use crate::config::{CoreMlConfig, ExecutionTarget, ProviderEntry, TeacherEntry};
-use crate::models::compatibility;
-use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+use crate::models::{get_repository, InferenceProvider, ModelFamily, ModelSize};
 use crate::providers::endpoints::ProviderEndpoints;
 use crate::providers::model_catalog::{
     self, CatalogAuth, CatalogSource, ModelCatalog, ModelCatalogProfile,

@@ -933,7 +933,7 @@ mod tests {
         CredentialProvider, EndpointFamily, ExecutionTarget, ProviderCredential, ResolvedSecret,
     };
     use crate::config::{ProviderEntry, TeacherEntry};
-    use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+    use crate::models::{InferenceProvider, ModelFamily, ModelSize};
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

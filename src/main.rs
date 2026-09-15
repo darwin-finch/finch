@@ -981,6 +981,7 @@ async fn main() -> Result<()> {
     use finch::cli::global_output::{set_global_output, set_global_status};
     use finch::cli::{OutputManager, StatusBar};
     use finch::config::ColorScheme;
+    use finch::models::ModelProgress;
 
     let output_manager = Arc::new(OutputManager::new(ColorScheme::default()));
     let status_bar = Arc::new(StatusBar::new());
@@ -991,6 +992,7 @@ async fn main() -> Result<()> {
     // Set as global BEFORE init_tracing() to prevent lazy initialization
     set_global_output(output_manager.clone());
     set_global_status(status_bar.clone());
+    finch::models::install_model_progress(output_manager.clone() as Arc<dyn ModelProgress>);
 
     // Check if debug logging is enabled in config (before init_tracing)
     // This allows the debug_logging feature flag to control log verbosity
@@ -2733,7 +2735,7 @@ fn command_cancellation() -> tokio_util::sync::CancellationToken {
 }
 
 fn current_node_capabilities(has_teacher_api: bool) -> finch::node::NodeCapabilities {
-    use finch::models::model_selector::{ModelSelection, ModelSelector};
+    use finch::models::{ModelSelection, ModelSelector};
 
     let ram_gb = ModelSelector::get_total_ram_gb();
     let local_model = match ModelSelector::select_for_system() {

@@ -1,6 +1,6 @@
 // Backend Configuration - Device selection and model management
 
-use crate::models::unified_loader::{ModelFamily, ModelSize};
+use crate::models::{ModelFamily, ModelSize};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -178,7 +178,7 @@ pub struct BackendConfig {
 
     /// Inference provider (ONNX Runtime or Candle)
     #[serde(default = "default_inference_provider")]
-    pub inference_provider: crate::models::unified_loader::InferenceProvider,
+    pub inference_provider: crate::models::InferenceProvider,
 
     /// Selected execution target (where code runs: CoreML/CPU/CUDA)
     #[serde(alias = "device")] // Support old config field name
@@ -220,8 +220,8 @@ fn default_backend_enabled() -> bool {
     true
 }
 
-fn default_inference_provider() -> crate::models::unified_loader::InferenceProvider {
-    crate::models::unified_loader::InferenceProvider::Onnx // ONNX Runtime is the default
+fn default_inference_provider() -> crate::models::InferenceProvider {
+    crate::models::InferenceProvider::Onnx // ONNX Runtime is the default
 }
 
 fn default_model_family() -> ModelFamily {
@@ -365,15 +365,11 @@ impl BackendConfig {
         }
 
         // Use compatibility matrix to get repository
-        crate::models::compatibility::get_repository(
-            self.inference_provider,
-            self.model_family,
-            self.model_size,
-        )
-        .unwrap_or_else(|| {
-            // Fallback for compatibility
-            "onnx-community/Qwen2.5-1.5B-Instruct".to_string()
-        })
+        crate::models::get_repository(self.inference_provider, self.model_family, self.model_size)
+            .unwrap_or_else(|| {
+                // Fallback for compatibility
+                "onnx-community/Qwen2.5-1.5B-Instruct".to_string()
+            })
     }
 
     /// Get the effective execution target (resolve Auto to concrete target)

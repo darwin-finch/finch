@@ -19,7 +19,7 @@ use crate::cli::messages::WorkUnit;
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::ReplMode;
 use crate::local::LocalGenerator;
-use crate::models::tokenizer::TextTokenizer;
+use crate::models::TextTokenizer;
 use crate::tools::{generate_tool_signature, ToolExecutor};
 use crate::tools::{LiveOutput, LiveOutputSink, ToolUse};
 

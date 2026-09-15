@@ -58,7 +58,7 @@ struct TokenBuffer {
     /// Characters already sent to client (for incremental cleaning)
     sent_prefix: String,
     /// Cached adapter for this generation session
-    adapter: Option<Box<dyn crate::models::adapters::LocalModelAdapter>>,
+    adapter: Option<Box<dyn crate::models::LocalModelAdapter>>,
     /// Partial marker being accumulated (e.g., "<|im_")
     partial_marker: String,
 }
@@ -170,7 +170,7 @@ impl TokenBuffer {
 async fn buffer_and_clean_tokens(
     mut token_rx: mpsc::Receiver<String>,
     cleaned_tx: mpsc::Sender<String>,
-    adapter: Option<Box<dyn crate::models::adapters::LocalModelAdapter>>,
+    adapter: Option<Box<dyn crate::models::LocalModelAdapter>>,
 ) {
     let mut buffer = TokenBuffer::new();
     buffer.adapter = adapter;

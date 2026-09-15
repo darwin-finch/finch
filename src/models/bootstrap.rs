@@ -7,9 +7,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::generator_new::GeneratorModel;
+use super::progress::ModelProgress;
 use super::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize};
 use super::GeneratorConfig;
-use crate::cli::OutputManager;
 use crate::config::ExecutionTarget;
 
 /// Generator loading state for progressive bootstrap
@@ -84,12 +84,12 @@ impl GeneratorState {
 /// Background task that loads generator asynchronously
 pub struct BootstrapLoader {
     state: Arc<RwLock<GeneratorState>>,
-    output: Option<Arc<OutputManager>>,
+    output: Option<Arc<dyn ModelProgress>>,
 }
 
 impl BootstrapLoader {
     /// Create new bootstrap loader with shared state
-    pub fn new(state: Arc<RwLock<GeneratorState>>, output: Option<Arc<OutputManager>>) -> Self {
+    pub fn new(state: Arc<RwLock<GeneratorState>>, output: Option<Arc<dyn ModelProgress>>) -> Self {
         Self { state, output }
     }
 
@@ -318,6 +318,17 @@ mod tests {
 
         // Just verify creation works
         assert!(true);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_loader_accepts_injected_progress() {
+        let state = Arc::new(RwLock::new(GeneratorState::Initializing));
+        let loader = BootstrapLoader::new(
+            Arc::clone(&state),
+            Some(Arc::new(crate::models::SilentModelProgress)),
+        );
+        loader.set_not_available().await;
+        assert!(!state.read().await.is_ready());
     }
 
     #[tokio::test]

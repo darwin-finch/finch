@@ -1208,10 +1208,10 @@ mod tests {
 
     fn local_profile() -> ProviderEntry {
         ProviderEntry::Local {
-            inference_provider: crate::models::unified_loader::InferenceProvider::Onnx,
+            inference_provider: crate::models::InferenceProvider::Onnx,
             execution_target: crate::config::ExecutionTarget::Auto,
-            model_family: crate::models::unified_loader::ModelFamily::Qwen2,
-            model_size: crate::models::unified_loader::ModelSize::Medium,
+            model_family: crate::models::ModelFamily::Qwen2,
+            model_size: crate::models::ModelSize::Medium,
             model_repo: None,
             model_path: None,
             enabled: true,

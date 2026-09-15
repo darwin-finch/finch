@@ -1135,7 +1135,7 @@ pub(super) fn render_configure_local_overlay(
     ];
 
     // Preview line: RAM estimate + resolved model repo
-    let repo_preview = compatibility::get_repository(inference_provider, family, size)
+    let repo_preview = get_repository(inference_provider, family, size)
         .map(|r| format!("→ {}", r))
         .unwrap_or_else(|| "(no model available for this combination)".to_string());
 

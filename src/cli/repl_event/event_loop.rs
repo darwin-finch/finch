@@ -30,7 +30,7 @@ use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::{spawn_input_task, TuiRenderer};
 use crate::feedback::{FeedbackEntry, FeedbackLogger, FeedbackRating};
 use crate::generators::Generator;
-use crate::models::bootstrap::GeneratorState;
+use crate::models::GeneratorState;
 use crate::models::NeuralEmbeddingEngine;
 use crate::review::store::DiffStore;
 use crate::router::Router;

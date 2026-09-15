@@ -19,7 +19,7 @@ use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::TuiRenderer;
 use crate::local::LocalGenerator;
-use crate::models::bootstrap::GeneratorState;
+use crate::models::GeneratorState;
 
 /// Who is talking, as what, and in which mode.
 pub struct SessionParts {

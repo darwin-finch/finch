@@ -2,7 +2,7 @@
 
 use crate::config::backend::ExecutionTarget;
 use crate::config::credential::{CredentialBinding, CredentialProvider};
-use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+use crate::models::{InferenceProvider, ModelFamily, ModelSize};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

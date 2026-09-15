@@ -5,11 +5,11 @@
 // Phase 3: Style transfer and quality matching
 
 use crate::local::patterns::PatternClassifier;
-use crate::models::adapters::{AdapterRegistry, LocalModelAdapter};
-use crate::models::learning::{
-    LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData,
-};
 use crate::models::GeneratorModel;
+use crate::models::{
+    AdapterRegistry, LearningModel, LocalModelAdapter, ModelExpectation, ModelPrediction,
+    ModelStats, PredictionData,
+};
 use crate::training::batch_trainer::BatchTrainer;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -296,7 +296,7 @@ impl TemplateGenerator {
             .map_err(|_| anyhow::anyhow!("Generator model is locked"))?;
 
         // Get ONNX model backend
-        use crate::models::loaders::onnx::LoadedOnnxModel;
+        use crate::models::LoadedOnnxModel;
         use crate::models::TextGeneration;
 
         let onnx_model = gen
@@ -351,7 +351,7 @@ impl TemplateGenerator {
     /// Get the model adapter for external use (e.g., streaming cleaning)
     pub fn get_adapter(&self) -> Box<dyn LocalModelAdapter> {
         // Get adapter for the same family (cheap clone - just vtable pointer)
-        use crate::models::adapters::AdapterRegistry;
+        use crate::models::AdapterRegistry;
         AdapterRegistry::get_adapter(self.model_adapter.family_name())
     }
 

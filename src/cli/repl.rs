@@ -21,9 +21,9 @@ use crate::config::Config;
 use crate::feedback::{FeedbackEntry, FeedbackLogger};
 use crate::local::LocalGenerator;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
-use crate::models::tokenizer::TextTokenizer;
+use crate::models::TextTokenizer;
 use crate::models::ThresholdValidator;
-use crate::models::{BootstrapLoader, GeneratorState, Sampler, SamplingConfig};
+use crate::models::{BootstrapLoader, GeneratorState, ModelProgress, Sampler, SamplingConfig};
 use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
 #[cfg(target_os = "macos")]
@@ -564,7 +564,7 @@ pub struct Repl {
     models_dir: Option<PathBuf>,
     // Qwen model bootstrap (progressive loading)
     bootstrap_loader: Arc<BootstrapLoader>,
-    tokenizer: Arc<crate::models::tokenizer::TextTokenizer>,
+    tokenizer: Arc<crate::models::TextTokenizer>,
     // Tool execution
     tool_executor: Arc<tokio::sync::Mutex<ToolExecutor>>,
     tool_definitions: Vec<ToolDefinition>, // Cached tool definitions for Claude API
@@ -1096,7 +1096,7 @@ impl Repl {
         let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
         let bootstrap_loader = Arc::new(BootstrapLoader::new(
             Arc::clone(&generator_state),
-            Some(Arc::new(output_manager.clone())),
+            Some(Arc::new(output_manager.clone()) as Arc<dyn ModelProgress>),
         ));
         let local_generator = Arc::new(RwLock::new(LocalGenerator::new()));
 

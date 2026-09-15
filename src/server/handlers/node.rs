@@ -149,7 +149,7 @@ pub async fn handle_node_info_from_state_directory(
 }
 
 pub(super) fn current_node_capabilities(has_teacher_api: bool) -> crate::node::NodeCapabilities {
-    use crate::models::model_selector::{ModelSelection, ModelSelector};
+    use crate::models::{ModelSelection, ModelSelector};
 
     let ram_gb = ModelSelector::get_total_ram_gb();
     let local_model = match ModelSelector::select_for_system() {

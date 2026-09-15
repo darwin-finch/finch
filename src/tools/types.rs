@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::cli::ConversationHistory;
 use crate::cli::ReplMode;
 use crate::local::LocalGenerator;
-use crate::models::tokenizer::TextTokenizer;
+use crate::models::TextTokenizer;
 use crate::runtime::VmEffectEnvelope;
 use crate::training::batch_trainer::BatchTrainer;
 use crate::vm::VmSideEffect;

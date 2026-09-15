@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::claude::{ContentBlock, Message};
 use crate::local::LocalGenerator;
-use crate::models::tokenizer::TextTokenizer;
+use crate::models::TextTokenizer;
 use crate::models::{ToolCallParser, ToolPromptFormatter};
 use crate::tools::ToolExecutor;
 use crate::tools::ToolUse as ToolsToolUse;

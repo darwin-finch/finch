@@ -11,8 +11,8 @@ pub use patterns::{PatternClassifier, QueryPattern};
 
 use crate::claude::Message;
 use crate::generators::GeneratorResponse;
-use crate::models::adapters::LocalModelAdapter;
 use crate::models::GeneratorModel;
+use crate::models::LocalModelAdapter;
 use crate::tools::ToolDefinition;
 use crate::training::batch_trainer::BatchTrainer;
 use anyhow::Result;
@@ -233,13 +233,13 @@ impl LocalGenerator {
 
     /// Save local generator to file
     pub fn save<P: AsRef<std::path::Path>>(&self, path: P) -> Result<()> {
-        use crate::models::learning::LearningModel;
+        use crate::models::LearningModel;
         self.response_generator.save(path.as_ref())
     }
 
     /// Load local generator from file
     pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        use crate::models::learning::LearningModel;
+        use crate::models::LearningModel;
         let response_generator = TemplateGenerator::load(path.as_ref())?;
         // TemplateGenerator contains its own pattern_classifier, so we create a fresh one
         // for the LocalGenerator's copy (they stay in sync via learning)
