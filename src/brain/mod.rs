@@ -1080,6 +1080,11 @@ pub(crate) fn supervised_test_subprocess_command() -> std::process::Command {
 }
 
 #[cfg(all(test, unix))]
+/// Observable pathname version for accidental-race detection, not a
+/// non-repeating identity. Linux may reuse the inode after unlink and rebind
+/// (#633, socket identity can repeat). The deliberate replacement boundary is
+/// the connected peer's kernel process-group membership in
+/// [`authenticate_isolated_test_peer`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IsolatedTestSocketIdentity {
     device: u64,
@@ -2334,9 +2339,18 @@ mod isolation_tests {
         let proof = isolated_test_proof().unwrap();
         let outside = proof.socket_root.join("outside.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&outside).unwrap();
-        let socket = proof.ipc_socket.clone();
+        // Not `proof.ipc_socket`: the supervisor binds that path before this process starts, so
+        // `symlink` there fails with `AlreadyExists` and the assertion below never runs. The
+        // validator accepts any path inside the socket root, so a name this test owns proves the
+        // same thing — that a socket path which is really a symlink is refused.
+        let socket = proof.socket_root.join("candidate.sock");
         std::os::unix::fs::symlink(&outside, &socket).unwrap();
-        assert!(validate_isolated_test_socket(&proof, &socket).is_err());
+        let rejected = validate_isolated_test_socket(&proof, &socket);
+        assert!(
+            rejected.is_err(),
+            "a symlinked socket path must be refused, got {:?}",
+            rejected.map(|identity| format!("{identity:?}"))
+        );
     }
 
     #[test]
@@ -2346,13 +2360,35 @@ mod isolation_tests {
         }
         let proof = isolated_test_proof().unwrap();
         let socket = proof.socket_root.join("swap.sock");
+        let replacement_path = proof.socket_root.join("swap-replacement.sock");
+        // Two sockets bound at once have distinct inodes by definition. Unlink
+        // and rebind at one name can reuse the inode on Linux, so that sequence
+        // cannot prove the identity changed (#633, socket identity can repeat).
+        // `(device, inode)` stays best-effort accidental-race detection; the
+        // deliberate replacement boundary is peer process-group membership.
         let first = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&replacement_path).unwrap();
         let before = validate_isolated_test_socket(&proof, &socket).unwrap();
+        let replacement_identity =
+            validate_isolated_test_socket(&proof, &replacement_path).unwrap();
+        assert_ne!(
+            before, replacement_identity,
+            "two simultaneously bound sockets must have distinct identities; \
+             original={before:?} replacement={replacement_identity:?}"
+        );
         drop(first);
         std::fs::remove_file(&socket).unwrap();
-        let _replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::rename(&replacement_path, &socket).unwrap();
         let after = validate_isolated_test_socket(&proof, &socket).unwrap();
-        assert_ne!(before, after);
+        assert_eq!(
+            after, replacement_identity,
+            "rename must place the replacement identity at the original name; \
+             after={after:?} replacement={replacement_identity:?}"
+        );
+        assert_ne!(
+            before, after,
+            "pathname identity must observe the swap; before={before:?} after={after:?}"
+        );
     }
 
     #[test]
@@ -2360,6 +2396,10 @@ mod isolation_tests {
         use std::os::unix::process::CommandExt as _;
         const SOCKET_ENV: &str = "FINCH_TEST_OUTSIDER_SOCKET";
         const READY_ENV: &str = "FINCH_TEST_OUTSIDER_READY";
+        // Production isolation boundary for a deliberate same-user replacement:
+        // real Unix connect, outsider in a new process group, metadata-invisible
+        // A→B→A pathname swap. `(device, inode)` is restored, so identity cannot
+        // be the rejection signal; kernel peer process-group membership is.
         if !supervisor_contract_present() {
             return;
         }
@@ -2422,9 +2462,18 @@ mod isolation_tests {
         std::fs::remove_file(&socket).unwrap();
         std::fs::rename(&original_name, &socket).unwrap();
         let after = validate_isolated_test_socket(&proof, &socket).unwrap();
-        assert_eq!(before, after, "fixture must reproduce an A-to-B-to-A swap");
+        assert_eq!(
+            before, after,
+            "A-to-B-to-A pathname swap must restore the original identity so \
+             peer process-group membership is the rejection signal; \
+             before={before:?} after={after:?}"
+        );
         let result = authenticate_isolated_test_peer(&stream);
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "connected peer outside the supervisor process group must be \
+             rejected even when pathname identity is restored; result={result:?}"
+        );
         drop(stream);
         drop(original_listener);
         outsider.kill().unwrap();
