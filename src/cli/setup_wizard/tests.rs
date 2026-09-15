@@ -3880,6 +3880,7 @@ fn test_provider_editor_identity_table_matches_catalog() {
         (crate::config::CredentialProvider::GeminiAiStudio, "gemini"),
         (crate::config::CredentialProvider::Mistral, "mistral"),
         (crate::config::CredentialProvider::Groq, "groq"),
+        (crate::config::CredentialProvider::Openrouter, "openrouter"),
     ];
 
     for (credential_provider, expected_editor) in cases {
