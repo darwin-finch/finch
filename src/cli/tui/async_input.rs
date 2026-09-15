@@ -241,16 +241,7 @@ pub fn spawn_input_task(
                                         tui.pending_dialog_result =
                                             Some(crate::cli::tui::DialogResult::Cancelled);
                                     }
-                                    let input = tui.input_textarea.lines().join("\n");
-                                    if !input.trim().is_empty() {
-                                        // Add to command history
-                                        tui.command_history.push(input.clone());
-                                        tui.history_index = None;
-                                        tui.history_draft = None; // Clear any saved draft
-
-                                        // Clear textarea for next input and render immediately
-                                        // so the input area visually clears on Enter (like Claude Code).
-                                        tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                    if let Some(input) = tui.take_submitted_input() {
                                         first_event_modified_input = true; // triggers render below
                                         Ok(Some(input))
                                     } else {
@@ -373,70 +364,18 @@ pub fn spawn_input_task(
                                         Ok(Some("/plan".to_string()))
                                     }
                                     (KeyCode::Up, KeyModifiers::NONE) => {
-                                        // Check cursor position - only navigate history if at top line
-                                        let (cursor_row, _cursor_col) = tui.input_textarea.cursor();
-
-                                        if cursor_row == 0 {
-                                            // At top line - navigate history backwards (older commands)
-                                            if let Some(idx) = tui.history_index {
-                                                if idx > 0 {
-                                                    tui.history_index = Some(idx - 1);
-                                                    let cmd = &tui.command_history[idx - 1];
-                                                    tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
-                                                    first_event_modified_input = true;
-                                                }
-                                            } else if !tui.command_history.is_empty() {
-                                                // Save current input as draft before entering history
-                                                let current_text =
-                                                    tui.input_textarea.lines().join("\n");
-                                                if !current_text.trim().is_empty() {
-                                                    tui.history_draft = Some(current_text);
-                                                }
-
-                                                tui.history_index =
-                                                    Some(tui.command_history.len() - 1);
-                                                let cmd = &tui.command_history
-                                                    [tui.command_history.len() - 1];
-                                                tui.input_textarea =
-                                                    TuiRenderer::create_clean_textarea_with_text(
-                                                        cmd,
-                                                    );
-                                                first_event_modified_input = true;
-                                            }
+                                        if tui.recall_older_history() {
+                                            first_event_modified_input = true;
                                         } else {
-                                            // Not at top - move cursor up within textarea
                                             tui.input_textarea.input(Event::Key(key));
                                             first_event_modified_input = true;
                                         }
                                         Ok(None)
                                     }
                                     (KeyCode::Down, KeyModifiers::NONE) => {
-                                        // Check cursor position - only navigate history if at bottom line
-                                        let (cursor_row, _cursor_col) = tui.input_textarea.cursor();
-                                        let num_lines = tui.input_textarea.lines().len();
-                                        let last_line = num_lines.saturating_sub(1);
-
-                                        if cursor_row >= last_line {
-                                            // At bottom line - navigate history forwards (newer commands)
-                                            if let Some(idx) = tui.history_index {
-                                                if idx < tui.command_history.len() - 1 {
-                                                    tui.history_index = Some(idx + 1);
-                                                    let cmd = &tui.command_history[idx + 1];
-                                                    tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
-                                                } else {
-                                                    // At newest entry - restore draft or clear
-                                                    tui.history_index = None;
-                                                    if let Some(draft) = tui.history_draft.take() {
-                                                        tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&draft);
-                                                    } else {
-                                                        tui.input_textarea =
-                                                            TuiRenderer::create_clean_textarea();
-                                                    }
-                                                }
-                                                first_event_modified_input = true;
-                                            }
+                                        if tui.recall_newer_history() {
+                                            first_event_modified_input = true;
                                         } else {
-                                            // Not at bottom - move cursor down within textarea
                                             tui.input_textarea.input(Event::Key(key));
                                             first_event_modified_input = true;
                                         }
@@ -559,13 +498,7 @@ pub fn spawn_input_task(
                                         tui.update_ghost_text();
                                     } else {
                                         // Plain Enter: collect submission and stop draining.
-                                        let input = tui.input_textarea.lines().join("\n");
-                                        if !input.trim().is_empty() {
-                                            tui.command_history.push(input.clone());
-                                            tui.history_index = None;
-                                            tui.history_draft = None;
-                                            tui.input_textarea =
-                                                TuiRenderer::create_clean_textarea();
+                                        if let Some(input) = tui.take_submitted_input() {
                                             had_input = true; // render the cleared input
                                             batch_submit = Some(input);
                                         }

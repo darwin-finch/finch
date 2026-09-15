@@ -776,6 +776,34 @@ fn dispatch_completion_key(
     true
 }
 
+/// Expand the selected slash completion into the composer before submit.
+///
+/// Up/Down only move `AutocompleteState::selected_index`; they do not rewrite
+/// the textarea. Enter used to join the typed prefix (`/` → Help). When the
+/// pane currently owns keyboard selection, apply that row first so Enter runs
+/// the highlighted command.
+fn apply_selected_completion_for_submit(
+    textarea: &mut TextArea<'static>,
+    autocomplete: &mut AutocompleteState,
+    ghost_text: &mut Option<String>,
+) -> bool {
+    if !autocomplete.is_interactive() {
+        return false;
+    }
+    let Some(command_name) = autocomplete
+        .get_selected()
+        .map(|command| command.name.to_string())
+    else {
+        return false;
+    };
+    if !replace_textarea_command(textarea, &command_name) {
+        return false;
+    }
+    autocomplete.hide();
+    *ghost_text = None;
+    true
+}
+
 fn route_tab_key(
     textarea: &mut TextArea<'static>,
     autocomplete: &mut AutocompleteState,
@@ -2473,13 +2501,9 @@ impl TuiRenderer {
                             self.input_textarea.input(Event::Key(key));
                         }
                         (KeyCode::Enter, _) => {
-                            let input = self.input_textarea.lines().join("\n");
-                            if input.trim().is_empty() {
+                            let Some(input) = self.take_submitted_input() else {
                                 continue;
-                            }
-                            self.command_history.push(input.clone());
-                            self.history_index = None;
-                            self.input_textarea = Self::create_clean_textarea();
+                            };
                             self.render()?;
                             return Ok(Some(input));
                         }
@@ -2835,6 +2859,14 @@ impl TuiRenderer {
     }
 
     pub fn update_ghost_text(&mut self) {
+        // Recalled history lines are already complete. Showing the slash
+        // dropdown would steal the next Up/Down from history navigation.
+        if self.history_index.is_some() {
+            self.autocomplete_state.hide();
+            self.ghost_text = None;
+            self.live_area_dirty = true;
+            return;
+        }
         let (matches, ghost) = command_completion_at_cursor(
             self.input_textarea.lines(),
             self.input_textarea.cursor(),
@@ -2868,6 +2900,9 @@ impl TuiRenderer {
     }
 
     pub(crate) fn handle_completion_key(&mut self, code: KeyCode) -> bool {
+        if self.history_index.is_some() && matches!(code, KeyCode::Up | KeyCode::Down) {
+            return false;
+        }
         if !dispatch_completion_key(
             &mut self.input_textarea,
             &mut self.autocomplete_state,
@@ -2878,6 +2913,92 @@ impl TuiRenderer {
         }
         self.mark_dirty();
         true
+    }
+
+    fn apply_history_line(&mut self, cmd: &str) {
+        self.input_textarea = Self::create_clean_textarea_with_text(cmd);
+        self.autocomplete_state.hide();
+        self.ghost_text = None;
+        self.live_area_dirty = true;
+    }
+
+    /// Walk toward older commands when the cursor is on the first composer row.
+    /// Returns false when the key should move the textarea cursor instead.
+    pub(crate) fn recall_older_history(&mut self) -> bool {
+        let (cursor_row, _) = self.input_textarea.cursor();
+        if cursor_row != 0 {
+            return false;
+        }
+        if let Some(idx) = self.history_index {
+            if idx > 0 {
+                self.history_index = Some(idx - 1);
+                let cmd = self.command_history[idx - 1].clone();
+                self.apply_history_line(&cmd);
+            }
+            return true;
+        }
+        if self.command_history.is_empty() {
+            return true;
+        }
+        let current_text = self.input_textarea.lines().join("\n");
+        if !current_text.trim().is_empty() {
+            self.history_draft = Some(current_text);
+        }
+        let last = self.command_history.len() - 1;
+        self.history_index = Some(last);
+        let cmd = self.command_history[last].clone();
+        self.apply_history_line(&cmd);
+        true
+    }
+
+    /// Walk toward newer commands when the cursor is on the last composer row.
+    /// Returns false when the key should move the textarea cursor instead.
+    pub(crate) fn recall_newer_history(&mut self) -> bool {
+        let (cursor_row, _) = self.input_textarea.cursor();
+        let last_line = self.input_textarea.lines().len().saturating_sub(1);
+        if cursor_row < last_line {
+            return false;
+        }
+        let Some(idx) = self.history_index else {
+            return true;
+        };
+        if idx < self.command_history.len() - 1 {
+            self.history_index = Some(idx + 1);
+            let cmd = self.command_history[idx + 1].clone();
+            self.apply_history_line(&cmd);
+        } else {
+            self.history_index = None;
+            if let Some(draft) = self.history_draft.take() {
+                self.input_textarea = Self::create_clean_textarea_with_text(&draft);
+            } else {
+                self.input_textarea = Self::create_clean_textarea();
+            }
+            self.autocomplete_state.hide();
+            self.ghost_text = None;
+            self.live_area_dirty = true;
+        }
+        true
+    }
+
+    /// Apply any highlighted slash completion, then take the composer line.
+    pub(crate) fn take_submitted_input(&mut self) -> Option<String> {
+        let _ = apply_selected_completion_for_submit(
+            &mut self.input_textarea,
+            &mut self.autocomplete_state,
+            &mut self.ghost_text,
+        );
+        let input = self.input_textarea.lines().join("\n");
+        if input.trim().is_empty() {
+            return None;
+        }
+        self.command_history.push(input.clone());
+        self.history_index = None;
+        self.history_draft = None;
+        self.input_textarea = Self::create_clean_textarea();
+        self.autocomplete_state.hide();
+        self.ghost_text = None;
+        self.live_area_dirty = true;
+        Some(input)
     }
 
     pub(crate) fn handle_tab_key(&mut self, key: KeyEvent) -> bool {
@@ -4935,6 +5056,156 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(format!("/brain {}", second.unwrap()), selected);
+    }
+
+    fn headless_renderer() -> TuiRenderer {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        TuiRenderer::new_headless(output, status, colors)
+    }
+
+    #[test]
+    fn enter_runs_the_highlighted_slash_command_not_the_typed_prefix() {
+        let mut renderer = headless_renderer();
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("/");
+        renderer.update_ghost_text();
+        completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);
+        assert!(
+            renderer.autocomplete_state.is_interactive(),
+            "slash completions must own Up/Down after the pane paints"
+        );
+        assert_eq!(
+            renderer.autocomplete_state.get_selected().unwrap().name,
+            "/help"
+        );
+
+        assert!(renderer.handle_completion_key(KeyCode::Down));
+        let selected = renderer
+            .autocomplete_state
+            .get_selected()
+            .expect("Down must keep a selected command")
+            .name
+            .to_string();
+        assert_ne!(
+            selected, "/help",
+            "the bug is Enter ignoring the highlighted row after Up/Down"
+        );
+        assert_eq!(renderer.input_textarea.lines(), ["/"]);
+
+        let submitted = renderer
+            .take_submitted_input()
+            .expect("Enter must submit the highlighted command");
+        assert_eq!(
+            submitted, selected,
+            "Enter must apply the selected completion before submit; composer was still '/' which parses as Help"
+        );
+        assert!(
+            !matches!(
+                crate::cli::commands::Command::parse(&submitted),
+                Some(crate::cli::commands::Command::Help)
+            ),
+            "submitted {submitted:?} must not be the Help catch-all"
+        );
+    }
+
+    #[test]
+    fn enter_does_not_apply_unpainted_slash_completion() {
+        let mut renderer = headless_renderer();
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("/");
+        renderer.update_ghost_text();
+        assert!(
+            renderer.autocomplete_state.visible && !renderer.autocomplete_state.is_interactive(),
+            "matches exist but the pane has not been painted"
+        );
+
+        let submitted = renderer.take_submitted_input().unwrap();
+        assert_eq!(
+            submitted, "/",
+            "Enter must not apply a completion the user could not see"
+        );
+        assert!(matches!(
+            crate::cli::commands::Command::parse(&submitted),
+            Some(crate::cli::commands::Command::Help)
+        ));
+    }
+
+    #[test]
+    fn bare_slash_enter_still_runs_help_via_the_first_match() {
+        let mut renderer = headless_renderer();
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("/");
+        renderer.update_ghost_text();
+        completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);
+
+        let submitted = renderer.take_submitted_input().unwrap();
+        assert_eq!(submitted, "/help");
+        assert!(matches!(
+            crate::cli::commands::Command::parse(&submitted),
+            Some(crate::cli::commands::Command::Help)
+        ));
+    }
+
+    #[test]
+    fn history_up_through_a_slash_command_does_not_steal_the_next_up() {
+        let mut renderer = headless_renderer();
+        renderer.command_history = vec!["hello".to_string(), "/help".to_string()];
+
+        assert!(renderer.recall_older_history());
+        assert_eq!(renderer.input_textarea.lines(), ["/help"]);
+        renderer.update_ghost_text();
+        assert!(
+            !renderer.autocomplete_state.visible,
+            "recalling a slash command must not open the completion pane"
+        );
+        assert!(
+            !renderer.handle_completion_key(KeyCode::Up),
+            "Up must remain history navigation while browsing recalled commands"
+        );
+
+        assert!(renderer.recall_older_history());
+        assert_eq!(
+            renderer.input_textarea.lines(),
+            ["hello"],
+            "the next Up after a slash history item must continue through history"
+        );
+    }
+
+    #[test]
+    fn painted_slash_completions_cannot_capture_up_while_history_is_active() {
+        let mut renderer = headless_renderer();
+        renderer.command_history = vec!["hello".to_string(), "/help".to_string()];
+        assert!(renderer.recall_older_history());
+        renderer
+            .autocomplete_state
+            .show_matches(renderer.command_registry.match_prefix("/"));
+        completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);
+        assert!(renderer.autocomplete_state.is_interactive());
+
+        assert!(
+            !renderer.handle_completion_key(KeyCode::Up),
+            "a painted completion pane must not wrap-select while history_index is set"
+        );
+        assert!(renderer.recall_older_history());
+        assert_eq!(renderer.input_textarea.lines(), ["hello"]);
+    }
+
+    #[test]
+    fn leaving_slash_history_restores_the_draft_and_allows_completions() {
+        let mut renderer = headless_renderer();
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("/");
+        renderer.command_history = vec!["/help".to_string()];
+
+        assert!(renderer.recall_older_history());
+        assert_eq!(renderer.input_textarea.lines(), ["/help"]);
+        assert!(renderer.recall_newer_history());
+        assert_eq!(renderer.input_textarea.lines(), ["/"]);
+        assert!(renderer.history_index.is_none());
+
+        renderer.update_ghost_text();
+        assert!(
+            renderer.autocomplete_state.visible,
+            "restored slash draft must show completions again"
+        );
     }
 
     #[test]
