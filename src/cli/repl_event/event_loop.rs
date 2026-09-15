@@ -3680,7 +3680,7 @@ impl EventLoop {
                 let mut summary = tool_approval_summary(tool_use);
                 summary.push_str("\n\n");
                 summary.push_str(&approval_audience_summary(&pending.audience));
-                crate::cli::tui::Dialog::tool_approval(&tool_use.name, &summary)
+                super::tool_display::assemble_tool_approval(tool_use, &summary)
             }
             RemoteBrainApprovalKind::Vm { prompt, .. } => vm_approval_dialog(
                 prompt,
@@ -4501,25 +4501,7 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::ToolUse) -> String 
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let line_count = content.lines().count();
-            let is_new = !std::path::Path::new(path).exists();
-            if is_new {
-                let preview: String = content.lines().take(5).collect::<Vec<_>>().join("\n");
-                let truncated = if line_count > 5 {
-                    format!("\n… ({} lines total)", line_count)
-                } else {
-                    String::new()
-                };
-                format!("Create {}\n{}{}", path, preview, truncated)
-            } else {
-                // Show unified diff against existing file
-                let existing = std::fs::read_to_string(path).unwrap_or_default();
-                format!(
-                    "Overwrite {}\n{}",
-                    path,
-                    unified_diff_summary(&existing, content, 3)
-                )
-            }
+            super::tool_display::write_approval_summary(path, content)
         }
         "edit" | "Edit" => {
             let path = tool_use
@@ -4527,104 +4509,14 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::ToolUse) -> String 
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            let old = tool_use
-                .input
-                .get("old_string")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
             let new = tool_use
                 .input
                 .get("new_string")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!("Edit {}\n{}", path, unified_diff_summary(old, new, 2))
+            super::tool_display::edit_approval_summary(path, new)
         }
         _ => format!("Execute {} tool", tool_name),
-    }
-}
-
-/// Produce a compact unified-diff-style summary between `before` and `after`.
-/// Shows up to `context` lines of context around each change.
-fn unified_diff_summary(before: &str, after: &str, context: usize) -> String {
-    let before_lines: Vec<&str> = before.lines().collect();
-    let after_lines: Vec<&str> = after.lines().collect();
-
-    // Simple LCS-based diff: find changed regions
-    let mut hunks: Vec<String> = Vec::new();
-    let mut i = 0;
-    let mut j = 0;
-    let mut current_hunk: Vec<String> = Vec::new();
-    let mut in_hunk = false;
-    let max_lines = 40; // cap total output
-    let mut total = 0;
-
-    // Build a simple line-by-line diff without external crates:
-    // walk both sides, emit - / + lines for mismatches
-    while i < before_lines.len() || j < after_lines.len() {
-        if total >= max_lines {
-            current_hunk.push(format!("  … (diff truncated)"));
-            break;
-        }
-        match (before_lines.get(i), after_lines.get(j)) {
-            (Some(a), Some(b)) if a == b => {
-                if in_hunk {
-                    current_hunk.push(format!("  {}", a));
-                    // End hunk after `context` unchanged lines
-                    let trail = current_hunk
-                        .iter()
-                        .rev()
-                        .take_while(|l| l.starts_with("  "))
-                        .count();
-                    if trail > context {
-                        hunks.push(current_hunk.join("\n"));
-                        current_hunk = Vec::new();
-                        in_hunk = false;
-                    }
-                }
-                i += 1;
-                j += 1;
-            }
-            (Some(a), Some(_b)) => {
-                if !in_hunk {
-                    // Add context before
-                    let start = i.saturating_sub(context);
-                    for ctx_line in before_lines[start..i].iter() {
-                        current_hunk.push(format!("  {}", ctx_line));
-                    }
-                    in_hunk = true;
-                }
-                current_hunk.push(format!("- {}", a));
-                current_hunk.push(format!("+ {}", _b));
-                total += 2;
-                i += 1;
-                j += 1;
-            }
-            (Some(a), None) => {
-                if !in_hunk {
-                    in_hunk = true;
-                }
-                current_hunk.push(format!("- {}", a));
-                total += 1;
-                i += 1;
-            }
-            (None, Some(b)) => {
-                if !in_hunk {
-                    in_hunk = true;
-                }
-                current_hunk.push(format!("+ {}", b));
-                total += 1;
-                j += 1;
-            }
-            (None, None) => break,
-        }
-    }
-    if !current_hunk.is_empty() {
-        hunks.push(current_hunk.join("\n"));
-    }
-    if hunks.is_empty() {
-        "(no changes)".to_string()
-    } else {
-        hunks.join("\n---\n")
     }
 }
 

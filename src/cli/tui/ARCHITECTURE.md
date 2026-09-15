@@ -28,6 +28,7 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
 - `MultiSelect` — Space toggles; Enter on virtual Submit row emits `DialogResult::Selected`
 - `TextInput` — Enter submits
 - `Confirm` — `y`/`n` or Enter/Esc
+- Approval payload is a bounded, scrollable region. `dialog_lines` pins Yes/No/Cancel so a long write never moves the controls off-screen. Write approvals summarise path, size, and create-vs-overwrite; the full preview stays behind body scroll.
 
 Virtual row helpers:
 - `dialog.submit_virtual_index()` — MultiSelect: `options.len() + (1 if allow_custom)`
@@ -39,6 +40,6 @@ Virtual row helpers:
 - `src/cli/tui/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`
 - `src/cli/tui/accordion.rs` — retained semantic projection, focus, and hit regions
 - `src/cli/tui/scrollback.rs` — `ScrollbackBuffer`
-- `src/cli/tui/dialog.rs` — Dialog state machine (7 regression tests)
+- `src/cli/tui/dialog.rs` — Dialog state machine and approval control pin
 - `src/cli/tui/input_widget.rs` — Input area (tui-textarea)
 - `src/cli/tui/status_widget.rs` — Status bar

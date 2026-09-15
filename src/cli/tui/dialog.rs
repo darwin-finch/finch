@@ -302,6 +302,26 @@ impl Dialog {
         }
     }
 
+    /// Option rows in the control suffix, not counting rules or the Cancel row.
+    ///
+    /// Used to distinguish "too many options" (top-clip) from a write approval
+    /// whose chrome is one row over the budget (pin the suffix tail).
+    pub(crate) fn option_row_count(&self) -> usize {
+        match &self.dialog_type {
+            DialogType::Select {
+                options,
+                allow_custom,
+                ..
+            } => options.len() + usize::from(*allow_custom),
+            DialogType::MultiSelect {
+                options,
+                allow_custom,
+                ..
+            } => options.len() + usize::from(*allow_custom),
+            DialogType::Confirm { .. } | DialogType::TextInput { .. } => 1,
+        }
+    }
+
     /// Handle a key event and return a result if the dialog should close
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Option<DialogResult> {
         // Priority 0: Scroll the body section (when not in custom mode). Laptop
@@ -770,9 +790,120 @@ impl DialogResult {
     }
 }
 
+/// Keep the control suffix (options, buttons, rules) inside `max_rows` and
+/// clip the payload prefix when a long title or body would overflow.
+///
+/// `control_start` is the structural line index of the options divider, supplied
+/// by the renderer — not inferred from painted glyphs. Pin whenever the suffix
+/// fits (`control_phys <= max_rows`), including an exact fill with no payload.
+/// If chrome makes the suffix one or more rows over but the options themselves
+/// fit, keep the suffix tail so Yes/No stay. Top-clip + marker only when there
+/// are too many options to present.
+pub(crate) fn pin_dialog_controls(
+    lines: Vec<String>,
+    control_start: usize,
+    max_rows: usize,
+    width: usize,
+    option_row_count: usize,
+) -> Vec<String> {
+    let width = width.max(1);
+    let rows_of = |line: &str| super::shadow_buffer::physical_rows(line, width);
+    let total: usize = lines.iter().map(|line| rows_of(line)).sum();
+    if total <= max_rows {
+        return lines;
+    }
+
+    let start = control_start.min(lines.len());
+    let suffix = &lines[start..];
+    let control_phys: usize = suffix.iter().map(|line| rows_of(line)).sum();
+    if control_phys <= max_rows {
+        let budget = max_rows - control_phys;
+        let mut kept = Vec::new();
+        let mut used = 0;
+        for line in &lines[..start] {
+            let rows = rows_of(line);
+            if used + rows > budget {
+                break;
+            }
+            used += rows;
+            kept.push(line.clone());
+        }
+        kept.extend(suffix.iter().cloned());
+        return kept;
+    }
+
+    if option_row_count < max_rows {
+        return take_last_physical(suffix, max_rows, width);
+    }
+
+    let budget = max_rows.saturating_sub(1);
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for line in lines {
+        let rows = rows_of(&line);
+        if used + rows > budget {
+            break;
+        }
+        used += rows;
+        kept.push(line);
+    }
+    kept.push(super::shadow_buffer::truncate_to_columns(
+        "… dialog clipped to viewport; use navigation keys …",
+        width,
+    ));
+    kept
+}
+
+fn take_last_physical(lines: &[String], max_rows: usize, width: usize) -> Vec<String> {
+    let rows_of = |line: &str| super::shadow_buffer::physical_rows(line, width);
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for line in lines.iter().rev() {
+        let rows = rows_of(line);
+        if used + rows > max_rows {
+            break;
+        }
+        used += rows;
+        kept.push(line.clone());
+    }
+    kept.reverse();
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                match chars.peek() {
+                    Some('[') => {
+                        chars.next();
+                        for nc in chars.by_ref() {
+                            if nc.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        chars.next();
+                        for nc in chars.by_ref() {
+                            if nc == '\x07' || nc == '\x1b' {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
 
     #[test]
     fn test_dialog_option_creation() {
@@ -1947,5 +2078,324 @@ mod tests {
         for ch in '1'..='9' {
             dialog.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
+    }
+
+    fn visible_dialog_text(lines: &[String]) -> String {
+        lines
+            .iter()
+            .map(|line| strip_sgr(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn control_row(lines: &[String], needle: &str) -> Option<usize> {
+        lines
+            .iter()
+            .position(|line| strip_sgr(line).contains(needle))
+    }
+
+    fn plan_approval_frame(
+        dialog: &Dialog,
+        width: usize,
+        height: usize,
+    ) -> super::super::LiveFrame {
+        let input = vec!["draft stays hidden".to_string()];
+        let mut autocomplete = super::super::AutocompleteState::new();
+        let inputs = super::super::LiveFrameInputs {
+            terminal_width: width,
+            terminal_height: height,
+            input_lines: &input,
+            input_cursor: (0, 0),
+            ghost_text: None,
+            effective_status: "approval pending",
+            cwd_label: "~/repos/finch",
+            session_label: "jade-river",
+            dialog: Some(dialog),
+            render_error: false,
+            task_rows: &[],
+            tracked_rows: &[],
+            live_rendered: &[],
+        };
+        super::super::plan_live_frame(&inputs, &mut autocomplete)
+    }
+
+    /// A minified HTML write used to push approve/deny off-screen before the
+    /// payload was bounded. One long line wraps into hundreds of title rows.
+    fn huge_html_write_dialog() -> (Dialog, usize) {
+        let html = format!(
+            "<!DOCTYPE html>{}",
+            " <div class=\"doc\">page content</div>".repeat(800)
+        );
+        let payload_bytes = html.len();
+        let dialog = Dialog::tool_approval("Write", &format!("Create docs.html\n{html}"));
+        (dialog, payload_bytes)
+    }
+
+    #[test]
+    fn test_long_write_payload_keeps_approval_controls_visible() {
+        let (dialog, payload_bytes) = huge_html_write_dialog();
+        let width = 80;
+        let height = 16;
+        let lines = super::super::TuiRenderer::dialog_lines(&dialog, width, height);
+        let painted: usize = lines
+            .iter()
+            .map(|line| super::super::shadow_buffer::physical_rows(line, width))
+            .sum();
+        let visible = visible_dialog_text(&lines);
+        let yes_row = control_row(&lines, "1. Yes");
+        let no_row = control_row(&lines, "No");
+        assert!(
+            yes_row.is_some() && no_row.is_some() && painted <= height,
+            "approval controls must stay in the viewport: height={height} painted={painted} \
+             payload_bytes={payload_bytes} yes_row={yes_row:?} no_row={no_row:?}\n{visible}"
+        );
+        assert!(
+            yes_row.unwrap() < lines.len() && no_row.unwrap() < lines.len(),
+            "control rows must be inside the painted dialog: yes_row={yes_row:?} \
+             no_row={no_row:?} painted_lines={} height={height} payload_bytes={payload_bytes}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn test_long_write_payload_live_frame_keeps_controls_on_screen() {
+        let (dialog, payload_bytes) = huge_html_write_dialog();
+        let width = 80;
+        let height = 16;
+        let frame = plan_approval_frame(&dialog, width, height);
+        let painted = frame.physical_rows(width);
+        let visible = visible_dialog_text(&frame.lines);
+        let yes_row = control_row(&frame.lines, "1. Yes");
+        let no_row = control_row(&frame.lines, "No");
+        assert!(
+            yes_row.is_some() && no_row.is_some() && painted <= height,
+            "plan_live_frame must keep approve/deny on-screen: viewport={width}x{height} \
+             painted={painted} payload_bytes={payload_bytes} yes_row={yes_row:?} \
+             no_row={no_row:?}\n{visible}"
+        );
+    }
+
+    #[test]
+    fn test_long_body_scroll_moves_payload_not_controls() {
+        let body = (0..400)
+            .map(|i| format!("payload-line-{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut dialog = Dialog::tool_approval(
+            "Write",
+            "overwrite docs.html, 12 KB, replacing existing content",
+        )
+        .with_body(body);
+        let width = 72;
+        let height = 18;
+
+        let top = super::super::TuiRenderer::dialog_lines(&dialog, width, height);
+        let top_text = visible_dialog_text(&top);
+        let yes_top = control_row(&top, "1. Yes");
+        assert!(
+            yes_top.is_some() && top_text.contains("No"),
+            "controls must be visible before scrolling: viewport={width}x{height} \
+             yes_row={yes_top:?} painted={}\n{top_text}",
+            top.len()
+        );
+
+        dialog.body_scroll_offset = 80;
+        let scrolled = super::super::TuiRenderer::dialog_lines(&dialog, width, height);
+        let scrolled_text = visible_dialog_text(&scrolled);
+        let yes_scrolled = control_row(&scrolled, "1. Yes");
+        assert!(
+            yes_scrolled.is_some() && scrolled_text.contains("No"),
+            "scrolling the payload must not move controls off-screen: viewport={width}x{height} \
+             yes_row={yes_scrolled:?} offset={}\n{scrolled_text}",
+            dialog.body_scroll_offset
+        );
+        assert!(
+            top_text.contains("payload-line-000"),
+            "top window must show the first payload line: viewport={width}x{height}\n{top_text}"
+        );
+        assert!(
+            !scrolled_text.contains("payload-line-000"),
+            "scrolling must drop the first payload line: offset={} viewport={width}x{height}\n\
+             {scrolled_text}",
+            dialog.body_scroll_offset
+        );
+        assert!(
+            scrolled_text.contains("payload-line-080"),
+            "scrolling must show a later payload line: offset={} viewport={width}x{height}\n\
+             {scrolled_text}",
+            dialog.body_scroll_offset
+        );
+        let no_top = control_row(&top, "4. No");
+        let no_scrolled = control_row(&scrolled, "4. No");
+        assert_eq!(
+            yes_top.map(|row| top.len() - row),
+            yes_scrolled.map(|row| scrolled.len() - row),
+            "Yes must occupy the same trailing row after scroll: top={yes_top:?} \
+             scrolled={yes_scrolled:?} viewport={width}x{height}"
+        );
+        assert_eq!(
+            no_top.map(|row| top.len() - row),
+            no_scrolled.map(|row| scrolled.len() - row),
+            "No must occupy the same trailing row after scroll: top={no_top:?} \
+             scrolled={no_scrolled:?} viewport={width}x{height}"
+        );
+    }
+
+    #[test]
+    fn test_write_approval_summarises_instead_of_dumping_html() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("docs.html");
+        let html = format!(
+            "<!DOCTYPE html>{}",
+            " <div class=\"doc\">page content</div>".repeat(800)
+        );
+        let tool = crate::tools::ToolUse::new(
+            "write".into(),
+            serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "content": html
+            }),
+        );
+        let summary = crate::cli::repl_event::event_loop::tool_approval_summary(&tool);
+        assert!(
+            !summary.contains("<!DOCTYPE") && !summary.contains("page content"),
+            "write approval must summarise, not dump the file: {summary:?}"
+        );
+        assert!(
+            summary.contains("docs.html") && summary.contains("create"),
+            "write approval must lead with path and created-vs-overwritten: {summary:?}"
+        );
+        assert!(
+            summary.contains("KB") || summary.contains("bytes") || summary.contains("MB"),
+            "write approval must include a byte count: {summary:?}"
+        );
+
+        let dialog = crate::cli::repl_event::tool_display::tool_approval_dialog(
+            &tool,
+            &summary,
+            &crate::theme::ColorScheme::default(),
+            crate::cli::diff::DiffColorMode::NoColor,
+        );
+        assert!(
+            dialog.body.is_some(),
+            "full content must remain reachable behind the body disclosure"
+        );
+        let width = 80;
+        let height = 16;
+        let lines = super::super::TuiRenderer::dialog_lines(&dialog, width, height);
+        let visible = visible_dialog_text(&lines);
+        let yes_row = control_row(&lines, "1. Yes");
+        assert!(
+            yes_row.is_some() && visible.contains("No"),
+            "assembled write approval must keep controls visible: height={height} \
+             payload_bytes={} yes_row={yes_row:?}\n{visible}",
+            html.len()
+        );
+    }
+
+    #[test]
+    fn test_long_payload_does_not_shift_other_row_virtual_index() {
+        let body = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut dialog =
+            Dialog::select_with_custom("T", vec![DialogOption::new("A")]).with_body(body);
+        assert_eq!(
+            dialog.cancel_virtual_index(),
+            Some(2),
+            "Select layout is options | Other | Cancel"
+        );
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        assert!(
+            dialog.custom_mode_active,
+            "o must still activate the Other row when the payload is long"
+        );
+        assert_eq!(
+            dialog.current_cursor(),
+            Some(1),
+            "Other-row activation must keep virtual indices stable"
+        );
+        assert_eq!(dialog.cancel_virtual_index(), Some(2));
+    }
+
+    #[test]
+    fn test_exact_fit_viewport_keeps_approval_controls_visible() {
+        // Write-approval suffix is 8 painted rows at width 80 (options divider,
+        // four options, buttons divider, Cancel, bottom rule). plan_live_frame
+        // spends one row on the session separator, so an 8-row terminal gives
+        // the dialog 7 rows. Pin must keep Yes/No even when chrome is one row
+        // over, not top-clip to a marker.
+        let (dialog, payload_bytes) = huge_html_write_dialog();
+        let width = 80;
+        let height = 8;
+        let dialog_budget = 7;
+
+        let lines = super::super::TuiRenderer::dialog_lines(&dialog, width, dialog_budget);
+        let painted: usize = lines
+            .iter()
+            .map(|line| super::super::shadow_buffer::physical_rows(line, width))
+            .sum();
+        let visible = visible_dialog_text(&lines);
+        let yes_row = control_row(&lines, "1. Yes");
+        let no_row = control_row(&lines, "4. No");
+        assert!(
+            yes_row.is_some() && no_row.is_some() && painted <= dialog_budget,
+            "exact-fit pin must keep approve/deny: max_rows={dialog_budget} painted={painted} \
+             payload_bytes={payload_bytes} yes_row={yes_row:?} no_row={no_row:?}\n{visible}"
+        );
+        assert!(
+            !visible.contains("dialog clipped to viewport"),
+            "exact-fit suffix must not take the too-many-options top-clip: \
+             max_rows={dialog_budget} payload_bytes={payload_bytes}\n{visible}"
+        );
+
+        let frame = plan_approval_frame(&dialog, width, height);
+        let frame_painted = frame.physical_rows(width);
+        let frame_text = visible_dialog_text(&frame.lines);
+        let frame_yes = control_row(&frame.lines, "1. Yes");
+        let frame_no = control_row(&frame.lines, "4. No");
+        assert!(
+            frame_yes.is_some() && frame_no.is_some() && frame_painted <= height,
+            "plan_live_frame 80x8 must keep approve/deny: painted={frame_painted} \
+             payload_bytes={payload_bytes} yes_row={frame_yes:?} no_row={frame_no:?}\n{frame_text}"
+        );
+        assert!(
+            !frame_text.contains("dialog clipped to viewport"),
+            "live-frame exact-fit must not show the clip marker: height={height} \
+             payload_bytes={payload_bytes}\n{frame_text}"
+        );
+    }
+
+    #[test]
+    fn test_markdown_body_bullets_do_not_steal_approval_controls() {
+        let decoy = format!(
+            "● 1. Yes\n○ spoofed option\n{}\n{}",
+            "─".repeat(40),
+            (0..200)
+                .map(|i| format!("markdown-item-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let dialog = Dialog::tool_approval("Write", "create docs.html, 12 bytes").with_body(decoy);
+        let width = 80;
+        let height = 16;
+        let lines = super::super::TuiRenderer::dialog_lines(&dialog, width, height);
+        let painted: usize = lines
+            .iter()
+            .map(|line| super::super::shadow_buffer::physical_rows(line, width))
+            .sum();
+        let visible = visible_dialog_text(&lines);
+        let no_row = control_row(&lines, "4. No");
+        let cancel_row = control_row(&lines, "[ Cancel ]");
+        assert!(
+            no_row.is_some() && cancel_row.is_some() && painted <= height,
+            "structural pin must ignore payload bullets: height={height} painted={painted} \
+             no_row={no_row:?} cancel_row={cancel_row:?}\n{visible}"
+        );
+        assert!(
+            !visible.contains("dialog clipped to viewport"),
+            "a bullet in the body must not inflate the suffix into the top-clip path:\n{visible}"
+        );
     }
 }

@@ -3172,6 +3172,19 @@ impl TuiRenderer {
         dialog: &Dialog,
         box_width: usize,
     ) -> Result<usize> {
+        Self::draw_dialog_with_control_start(out, dialog, box_width).map(|(rows, _)| rows)
+    }
+
+    /// Paint a dialog and report the logical line index where the control
+    /// suffix starts (the options divider after title/help/body).
+    ///
+    /// That index is structural: options always follow the body, so a markdown
+    /// payload that happens to contain `●` cannot shift the pin.
+    fn draw_dialog_with_control_start(
+        out: &mut impl io::Write,
+        dialog: &Dialog,
+        box_width: usize,
+    ) -> Result<(usize, usize)> {
         // Wrap width inside the 2-space left indent (no right border to reserve for).
         let inner = box_width.saturating_sub(2).max(1);
 
@@ -3256,6 +3269,7 @@ impl TuiRenderer {
             }
         }
 
+        let control_start = rows;
         execute!(out, Print(&rule), Print("\r\n"))?;
         rows += 1;
 
@@ -3441,7 +3455,7 @@ impl TuiRenderer {
         execute!(out, Print(&rule), Print("\r\n"))?;
         rows += 2; // buttons row + bottom rule
 
-        Ok(rows)
+        Ok((rows, control_start))
     }
 
     fn draw_dialog_inline_static(out: &mut impl io::Write, dialog: &Dialog) -> Result<usize> {
@@ -3477,42 +3491,33 @@ impl TuiRenderer {
     /// undercount left the top of the dialog unerased and the box redrew one
     /// row lower on every tick: the cascading duplicate dialogs. Measuring the
     /// emitted lines removes the possibility of the two disagreeing.
-    fn dialog_lines(dialog: &Dialog, width: usize, max_rows: usize) -> Vec<String> {
+    ///
+    /// When the payload (title/body) overflows, the option/button suffix is
+    /// pinned so approve/deny stay reachable. Too many options still clip from
+    /// the top and show the viewport marker.
+    pub(crate) fn dialog_lines(dialog: &Dialog, width: usize, max_rows: usize) -> Vec<String> {
         if max_rows == 0 {
             return Vec::new();
         }
         let width = width.max(1);
         let mut rendered = Vec::new();
-        if Self::draw_dialog_inline_static_with_width(&mut rendered, dialog, width).is_err() {
-            return Vec::new();
-        }
+        let control_start = match Self::draw_dialog_with_control_start(&mut rendered, dialog, width)
+        {
+            Ok((_, start)) => start,
+            Err(_) => return Vec::new(),
+        };
         let text = String::from_utf8_lossy(&rendered).into_owned();
         let all = text
             .split_terminator("\r\n")
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let rows_of = |line: &str| shadow_buffer::physical_rows(line, width);
-        if all.iter().map(|line| rows_of(line)).sum::<usize>() <= max_rows {
-            return all;
-        }
-
-        // Keep whole lines while they fit, reserving one row for the marker.
-        let budget = max_rows.saturating_sub(1);
-        let mut kept = Vec::new();
-        let mut used = 0;
-        for line in all {
-            let rows = rows_of(&line);
-            if used + rows > budget {
-                break;
-            }
-            used += rows;
-            kept.push(line);
-        }
-        kept.push(ellipsize(
-            "… dialog clipped to viewport; use navigation keys …",
+        dialog::pin_dialog_controls(
+            all,
+            control_start,
+            max_rows,
             width,
-        ));
-        kept
+            dialog.option_row_count(),
+        )
     }
 
     /// Show a blocking dialog (used when no async event loop is running).

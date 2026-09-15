@@ -283,8 +283,6 @@ impl EventLoop {
             crate::cli::repl_event::events::ConfirmationResult,
         >,
     ) -> Result<()> {
-        use crate::cli::tui::Dialog;
-
         tracing::debug!("[EVENT_LOOP] Requesting tool approval: {}", tool_use.name);
 
         let approval_audience = self
@@ -340,14 +338,13 @@ impl EventLoop {
         }
 
         // Create approval dialog — compact 3-option style matching Claude Code UX
-        let tool_name = &tool_use.name;
         let mut summary = tool_approval_summary(&tool_use);
         if let Some(audience) = approval_audience {
             summary.push_str("\n\n");
             summary.push_str(&approval_audience_summary(&audience));
         }
 
-        let dialog = Dialog::tool_approval(tool_name, &summary);
+        let dialog = super::super::tool_display::assemble_tool_approval(&tool_use, &summary);
 
         // Set dialog in TUI (non-blocking - will be handled by async_input task)
         let mut tui = self.tui_renderer.lock().await;
