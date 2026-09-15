@@ -20,7 +20,8 @@ pub mod repl_event; // Phase 2-3: Event loop infrastructure
 pub mod setup_wizard; // First-run setup wizard (API keys + device selection)
 mod status_bar;
 pub mod suggestions; // Contextual prompt suggestions (like Claude Code)
-pub mod tui; // Phase 2: Terminal UI
+pub mod tui;
+mod usage; // Phase 2: Terminal UI
 
 pub use commands::handle_command;
 pub use conversation::ConversationHistory;

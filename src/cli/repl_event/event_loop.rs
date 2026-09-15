@@ -377,6 +377,21 @@ pub struct EventLoop {
     /// Stable UUID for this session — assigned at startup, printed on exit.
     session_uuid: Uuid,
 
+    /// Session-cumulative token burn for this Brain. Accumulated from the
+    /// usage counts generators already report (`ReplEvent::StatsUpdate`),
+    /// restored from disk at startup, and checkpointed after every recorded
+    /// turn so attach/resume keeps the running total. A local observation of
+    /// provider-reported usage only — never a billing statement.
+    session_usage: crate::cli::usage::SessionUsageLedger,
+
+    /// Where the usage ledger checkpoints. `None` disables persistence.
+    session_usage_path: Option<std::path::PathBuf>,
+
+    /// Price data for the clearly-labeled cost estimate. Empty until the
+    /// model catalog or a provider entry carries price fields, so the status
+    /// line stays tokens-only today.
+    session_usage_pricing: crate::cli::usage::ModelPricingTable,
+
     /// Working directory at startup (for terminal title)
     cwd: String,
 
@@ -536,6 +551,46 @@ fn runner_subject_from(participant: &str, frontend_id: Uuid) -> String {
     let mut base = participant.chars().take(keep).collect::<String>();
     base.push_str(&suffix);
     base
+}
+
+/// Frontend-owned checkpoint location for this Brain's cumulative usage:
+/// `~/.finch/usage/<brain>.usage.json`. The Brain store owns its own
+/// authoritative state; this sidecar is the frontend's session observation.
+fn default_session_usage_path(brain_label: &str) -> Option<std::path::PathBuf> {
+    let safe: String = brain_label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    dirs::home_dir().map(|home| {
+        home.join(".finch")
+            .join("usage")
+            .join(format!("{safe}.usage.json"))
+    })
+}
+
+/// Restore the persisted running total. A damaged checkpoint must never block
+/// startup: log it and begin from zero rather than failing the session.
+fn load_session_usage(
+    path: &Option<std::path::PathBuf>,
+    brain_label: &str,
+) -> crate::cli::usage::SessionUsageLedger {
+    let Some(path) = path else {
+        return Default::default();
+    };
+    match crate::cli::usage::SessionUsageLedger::load(path) {
+        Ok(Some(ledger)) => ledger,
+        Ok(None) => Default::default(),
+        Err(error) => {
+            tracing::warn!("Starting session usage from zero for Brain '{brain_label}': {error:#}");
+            Default::default()
+        }
+    }
 }
 
 fn participant_display_name(subject: &str, local_machine: Option<&str>) -> String {
@@ -1873,7 +1928,12 @@ impl EventLoop {
         let participant_subject = local_participant_subject();
         let runner_subject = runner_subject_from(&participant_subject, Uuid::new_v4());
 
-        Self {
+        // Restore this Brain's running token total so attach/resume keeps the
+        // same cumulative burn instead of starting from zero each session.
+        let session_usage_path = default_session_usage_path(&session_label);
+        let session_usage = load_session_usage(&session_usage_path, &session_label);
+
+        let event_loop = Self {
             event_rx,
             event_tx,
             input_rx,
@@ -1937,6 +1997,9 @@ impl EventLoop {
             participant_subject,
             runner_subject,
             session_uuid,
+            session_usage,
+            session_usage_path,
+            session_usage_pricing: crate::cli::usage::ModelPricingTable::empty(),
             cwd: String::new(), // populated at the start of run()
             context_lines,
             max_verbatim_messages,
@@ -1970,7 +2033,18 @@ impl EventLoop {
             llm_rx: Some(llm_rx),
             #[cfg(test)]
             effect_audit_test_wrapper: None,
+        };
+
+        // A restored total must be visible from the first render, before any
+        // new provider turn has run.
+        if !event_loop.session_usage.is_empty() {
+            event_loop.status_bar.update_session_usage(
+                &event_loop.session_usage,
+                Some(&event_loop.session_usage_pricing),
+            );
         }
+
+        event_loop
     }
 
     #[cfg(test)]
@@ -2734,6 +2808,7 @@ impl EventLoop {
 
         // Save conversation to ~/.finch/sessions/<uuid>.json and print the UUID.
         // The user can resume with: finch --resume <uuid>
+        self.checkpoint_session_usage();
         if let Some(home) = dirs::home_dir() {
             let sessions_dir = home.join(".finch").join("sessions");
             if std::fs::create_dir_all(&sessions_dir).is_ok() {
@@ -3821,6 +3896,27 @@ impl EventLoop {
             return Ok(());
         };
         history.save(path)
+    }
+
+    /// Durably checkpoint the session-cumulative usage ledger. Best-effort:
+    /// a failed write is logged and never fails the event loop, because the
+    /// next recorded turn or shutdown retries.
+    fn checkpoint_session_usage(&self) {
+        let Some(path) = self.session_usage_path.as_ref() else {
+            return;
+        };
+        if let Err(error) = self.session_usage.save(path) {
+            tracing::warn!(
+                "Failed to persist session usage to {}: {error:#}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_session_usage_for_tests(&mut self, path: Option<std::path::PathBuf>) {
+        self.session_usage = crate::cli::usage::SessionUsageLedger::default();
+        self.session_usage_path = path;
     }
 
     fn report_checkpoint_error(&self, context: &str, error: &anyhow::Error) {

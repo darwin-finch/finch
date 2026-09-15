@@ -15,6 +15,9 @@ use std::sync::{Arc, RwLock};
 pub enum StatusLineType {
     /// Session label shown permanently (e.g. "◆ swift-falcon · ~/repos/finch")
     SessionLabel,
+    /// Session-cumulative token burn for this Brain
+    /// ("this session: 182k in / 31k out, ~$1.40 est")
+    SessionUsage,
     /// Memory context: engine type + recall info ("🧠 neural · 142 memories · recalled 3")
     MemoryContext,
     /// Conversation topic derived from MemTree overall centroid ("📋 <topic>")
@@ -99,6 +102,13 @@ impl StatusBar {
         if let Some(content) = lines.get(&StatusLineType::SessionLabel) {
             result.push(StatusLine {
                 line_type: StatusLineType::SessionLabel,
+                content: content.clone(),
+            });
+        }
+
+        if let Some(content) = lines.get(&StatusLineType::SessionUsage) {
+            result.push(StatusLine {
+                line_type: StatusLineType::SessionUsage,
                 content: content.clone(),
             });
         }
@@ -370,6 +380,19 @@ impl StatusBar {
         self.remove_line(&StatusLineType::LiveStats);
     }
 
+    /// Replace the session-cumulative usage line for this Brain. Tokens are
+    /// always measured; the cost estimate appears only when price data exists.
+    pub fn update_session_usage(
+        &self,
+        ledger: &crate::cli::usage::SessionUsageLedger,
+        pricing: Option<&crate::cli::usage::ModelPricingTable>,
+    ) {
+        self.update_line(
+            StatusLineType::SessionUsage,
+            ledger.format_status_line(pricing),
+        );
+    }
+
     /// Replace the child activity aggregate in place. With no active children
     /// the bounded live status disappears instead of becoming session history.
     pub fn update_agent_activity(
@@ -421,6 +444,67 @@ impl Clone for StatusBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ledger_with(input_tokens: u32, output_tokens: u32) -> crate::cli::usage::SessionUsageLedger {
+        let mut ledger = crate::cli::usage::SessionUsageLedger::default();
+        ledger.record_turn("claude-sonnet-4-6", Some(1500), Some(300));
+        ledger.record_turn(
+            "qwen-local",
+            Some(input_tokens - 1500),
+            Some(output_tokens - 300),
+        );
+        ledger
+    }
+
+    #[test]
+    fn test_session_usage_line_renders_after_session_label() {
+        let status = StatusBar::new();
+        status.update_line(StatusLineType::MemoryContext, "Memory");
+        status.update_session_usage(&ledger_with(182_000, 31_000), None);
+        status.update_line(StatusLineType::SessionLabel, "Session");
+
+        let lines = status.get_lines();
+        assert_eq!(
+            lines.len(),
+            3,
+            "session usage must render as its own ordered line; lines={lines:?}"
+        );
+        assert_eq!(lines[0].line_type, StatusLineType::SessionLabel);
+        assert_eq!(lines[1].line_type, StatusLineType::SessionUsage);
+        assert_eq!(
+            lines[1].content, "this session: 182k in / 31k out",
+            "the readout must match the issue's example format; lines={lines:?}"
+        );
+        assert_eq!(lines[2].line_type, StatusLineType::MemoryContext);
+    }
+
+    #[test]
+    fn test_update_session_usage_estimates_cost_only_with_pricing() {
+        let mut pricing = crate::cli::usage::ModelPricingTable::empty();
+        pricing.insert("claude-sonnet-4-6", 3.0, 15.0);
+        let mut ledger = crate::cli::usage::SessionUsageLedger::default();
+        ledger.record_turn("claude-sonnet-4-6", Some(182_000), Some(31_000));
+
+        let status = StatusBar::new();
+        status.update_session_usage(&ledger, Some(&pricing));
+        let line = status
+            .get_line(&StatusLineType::SessionUsage)
+            .expect("session usage line must exist after an update");
+        assert!(
+            line.contains(", ~$1.01 est"),
+            "priced burn must show a clearly-labeled estimate; line={line:?}"
+        );
+
+        let unpriced_status = StatusBar::new();
+        unpriced_status.update_session_usage(&ledger, None);
+        let line = unpriced_status
+            .get_line(&StatusLineType::SessionUsage)
+            .expect("session usage line must exist after an update");
+        assert!(
+            !line.contains('$'),
+            "absent price data must not fabricate a cost; line={line:?}"
+        );
+    }
 
     #[test]
     fn test_basic_operations() {
