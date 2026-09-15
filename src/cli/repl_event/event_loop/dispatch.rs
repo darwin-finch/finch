@@ -527,9 +527,8 @@ impl EventLoop {
                 result,
             } => {
                 match result {
-                    Ok(outcome)
-                        if outcome.status
-                            == crate::runtime::outcome::ExecutionStatus::Completed => {}
+                    Ok(outcome) if outcome.status == crate::runtime::ExecutionStatus::Completed => {
+                    }
                     Ok(outcome) => {
                         let detail =
                             outcome.diagnostics.first().cloned().unwrap_or_else(|| {

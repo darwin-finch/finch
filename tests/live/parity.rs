@@ -13,7 +13,7 @@ use finch::programs::{
     LISP_LANGUAGE_DEFINITION, VM_LANGUAGE_DEFINITION,
 };
 use finch::providers::ProviderRequest;
-use finch::runtime::outcome::ExecutionStatus;
+use finch::runtime::ExecutionStatus;
 use finch::runtime::{ProgramRuntime, ProgramSubmission};
 use std::time::Duration;
 

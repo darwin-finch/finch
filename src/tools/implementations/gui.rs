@@ -1,9 +1,9 @@
 //! Compatibility tools for native macOS automation.
 //!
-//! The implementation lives in `runtime::automation` so direct tools and VM
+//! The implementation lives in the runtime automation broker so direct tools and VM
 //! programs use the same availability checks and host API path.
 
-use crate::runtime::automation::{AutomationBroker, AutomationRequest};
+use crate::runtime::{AutomationBroker, AutomationRequest};
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};

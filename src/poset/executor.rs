@@ -209,7 +209,7 @@ async fn run_compiled(
             budget: None,
         })
         .await?;
-    if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
+    if outcome.status != crate::runtime::ExecutionStatus::Completed {
         let detail = outcome
             .vm_diagnostics
             .first()

@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
-use crate::runtime::automation::{
+use crate::runtime::{
     permission_context_key, permission_target_description, AutomationAvailability,
     AutomationBroker, AutomationPermissionResult, AutomationPromptContext,
     AutomationPromptDisposition, AutomationState,

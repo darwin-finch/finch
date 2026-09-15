@@ -1,18 +1,56 @@
 //! Provider-neutral execution service for Finch's Forth and Lisp VMs.
 
-pub mod agent_vm;
+mod agent_vm;
+mod agents;
+mod archive_store;
+mod automation;
+mod context;
+mod effect_audit;
+mod effect_log;
 mod host;
-use host::*;
-
-pub mod agents;
-pub mod archive_store;
-pub mod automation;
-pub mod context;
-pub mod effect_audit;
-pub mod effect_log;
 mod hostio;
 mod mcp;
-pub mod outcome;
+mod outcome;
+
+use host::*;
+
+pub use agent_vm::{parse_task_id, AgentVmBinding};
+pub use agents::{
+    AgentActivitySnapshot, AgentBudget, AgentContextReference, AgentEvent, AgentIdentity,
+    AgentRole, AgentSpawning, AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec, AgentTaskStatus,
+    AgentUsage, AgentUsageState, NoAgentSpawning,
+};
+pub(crate) use agents::{
+    MAX_CONTEXT_ARTIFACT_BYTES, MAX_CONTEXT_FIELD_BYTES, MAX_CONTEXT_REFERENCES,
+    MAX_CONTEXT_TOTAL_BYTES, MAX_DEPTH, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, MAX_TURNS,
+};
+pub use archive_store::{ProgramRuntimeArchiveStore, ProgramRuntimeAuthorityStore};
+pub use automation::{
+    permission_context_key, permission_target_description, AutomationAvailability,
+    AutomationBroker, AutomationPermissionResult, AutomationPromptContext,
+    AutomationPromptDisposition, AutomationRequest, AutomationState,
+};
+pub use context::{ExecutionBudget, ExecutionContext};
+pub use effect_audit::{
+    RunnerEffectAuditControl, RunnerEffectAuditReservation, RunnerHostEffectOutcome,
+    RunnerHostEffectPermit,
+};
+pub(crate) use effect_audit::{
+    RunnerEffectAuditControlRequest, RunnerEffectAuditReservationRequest,
+    RunnerHostEffectFinishRequest,
+};
+pub(crate) use effect_log::replay_fence_transition;
+pub use effect_log::{
+    EffectAuditAuthority, EffectAuditEntry, EffectAuditIdentity, EffectAuditIntent,
+    EffectAuditReducer, EffectAuditState, EffectAuditTerminalOutcome, EffectAuditTransition,
+    HostEffectPermit, VmEffectDeliveryLog, EFFECT_AUDIT_REPLAY_INDEX_BUDGET_BYTES,
+    MAX_ACTIVE_EFFECT_AUDITS_PER_BRAIN, MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
+    MAX_ACTIVE_EFFECT_AUDIT_BYTES_PER_BRAIN, MAX_EFFECT_AUDIT_INTENT_BYTES,
+    MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN, MAX_EFFECT_AUDIT_OUTCOME_BYTES,
+    MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN, MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES,
+    MAX_EFFECT_AUDIT_REPLAY_FENCE_TRANSITION_BYTES,
+};
+pub use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 
 use crate::programs::{ExecutionEffect, ProgramCompilerContext, ProgramLanguage, ProgramValue};
 pub(crate) use hostio::workbook_cell_to_string;
@@ -35,10 +73,6 @@ use crate::vm::{
     VmDiagnostic, VmSideEffect,
 };
 use anyhow::{bail, Context, Result};
-use automation::AutomationBroker;
-use automation::AutomationRequest;
-use context::{ExecutionBudget, ExecutionContext};
-use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 use serde::{Deserialize, Serialize};
 #[cfg(any(
     target_os = "linux",

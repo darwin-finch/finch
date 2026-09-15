@@ -95,7 +95,7 @@ the MCP client should not have to load tool execution and permissions to get the
 | **`memory`** (1): MemTree storage and retrieval | `src/memory`, `memory_status.rs`, `workbook.rs` | Capsule [`src/memory/AGENTS.md`](src/memory/AGENTS.md), interface [`src/memory/INTERFACE.md`](src/memory/INTERFACE.md) |
 | **`tools-mcp`** (0): the client for external Model Context Protocol servers | `src/tools/mcp` | Capsule [`src/tools/mcp/AGENTS.md`](src/tools/mcp/AGENTS.md), interface [`src/tools/mcp/INTERFACE.md`](src/tools/mcp/INTERFACE.md), [user guide](docs/MCP_USER_GUIDE.md) |
 | **`tools`** (1): tool execution, permissions, GUI automation | `src/tools` except `mcp` | Capsule [`src/tools/AGENTS.md`](src/tools/AGENTS.md), interface [`src/tools/INTERFACE.md`](src/tools/INTERFACE.md); [Tool execution and permissions](src/tools/EXECUTION.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
-| **`runtime`** (2): the program runtime service and task-graph execution | `src/runtime`, `poset`; composition adapter [`src/program_registry.rs`](src/program_registry.rs) | None yet |
+| **`runtime`** (2): the program runtime service and task-graph execution | `src/runtime`, `poset`; composition adapter [`src/program_registry.rs`](src/program_registry.rs) | Capsule [`src/runtime/AGENTS.md`](src/runtime/AGENTS.md), interface [`src/runtime/INTERFACE.md`](src/runtime/INTERFACE.md) |
 | **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | Capsule [`src/models/AGENTS.md`](src/models/AGENTS.md), interface [`src/models/INTERFACE.md`](src/models/INTERFACE.md); [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
 | **`providers`** (3): provider graph and wire transports, OAuth, planning prompts | `src/providers`, `claude`, `oauth`, `llms`, `planning` | OAuth capsule [`src/oauth/AGENTS.md`](src/oauth/AGENTS.md), interface [`src/oauth/INTERFACE.md`](src/oauth/INTERFACE.md); [Claude client](src/claude/CLIENT.md), [OAuth boundary](docs/OAUTH.md), [ChatGPT subscription transport](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md), [OpenAI transport](docs/OPENAI_TRANSPORT.md) |
 | **`transport`** (3): Cap'n Proto IPC, node identity, service discovery | `src/ipc`, `node`, `network`, `service`, `node_name.rs`; `schema/` | Node capsule [`src/node/AGENTS.md`](src/node/AGENTS.md), interface [`src/node/INTERFACE.md`](src/node/INTERFACE.md); wire schema in [`schema/finch_ipc.capnp`](schema/finch_ipc.capnp) |
@@ -129,11 +129,10 @@ every top-level module still belongs to one strongly connected component (see th
 [snapshot](#snapshot)).
 
 Two-way edges that block the next extractions, one import each way. `vm` has no outgoing edge
-since [#584](https://github.com/darwin-finch/finch/issues/584):
-
-| Edge | Evidence |
-|------|----------|
-| `runtime` ↔ `brain` | `src/runtime/scheduler.rs` imports `brain::store::RunId`; `src/brain/store.rs` imports `runtime` |
+since [#584](https://github.com/darwin-finch/finch/issues/584). The former `runtime` ↔ `brain`
+loop is gone: production `src/runtime` no longer imports `brain` (there is no
+`src/runtime/scheduler.rs` and no `RunId` import). `src/brain/store.rs` still imports `runtime`,
+which is the intended direction (runtime layer 2, brain layer 4).
 
 Memory has no two-way edge and no production `crate::` import. Callers inject
 `EmbeddingEngine`; `models::neural_embedding` owns ONNX Runtime (`ort`), `tokenizers`, and

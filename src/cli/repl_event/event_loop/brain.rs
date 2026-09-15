@@ -185,7 +185,7 @@ impl EventLoop {
                 };
                 let effect_journal =
                     crate::cli::repl_event::query_processor::runner_effect_records(&outcome);
-                if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
+                if outcome.status != crate::runtime::ExecutionStatus::Completed {
                     return Err(crate::server::RunnerProgramError {
                         message: format!(
                             "named Brain ProgramRun ended as {:?}: {}",

@@ -4,12 +4,12 @@ use crate::claude::{ContentBlock, Message};
 use crate::generators::Generator;
 use crate::runtime::ProgramRuntime;
 // The boundary vocabulary lives below this module; re-exported so existing callers keep working.
-pub use crate::runtime::agents::{
+pub use crate::runtime::{
     AgentActivitySnapshot, AgentBudget, AgentContextReference, AgentEvent, AgentIdentity,
     AgentRole, AgentSpawning, AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec, AgentTaskStatus,
     AgentUsage, AgentUsageState,
 };
-pub(crate) use crate::runtime::agents::{
+pub(crate) use crate::runtime::{
     MAX_CONTEXT_ARTIFACT_BYTES, MAX_CONTEXT_FIELD_BYTES, MAX_CONTEXT_REFERENCES,
     MAX_CONTEXT_TOTAL_BYTES, MAX_DEPTH, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, MAX_TURNS,
 };
@@ -2119,7 +2119,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome.status,
-            crate::runtime::outcome::ExecutionStatus::AuthorizationRequired
+            crate::runtime::ExecutionStatus::AuthorizationRequired
         );
         assert!(outcome
             .required_capabilities
@@ -2273,7 +2273,7 @@ mod tests {
 
         assert_eq!(
             outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed,
+            crate::runtime::ExecutionStatus::Completed,
             "{:?}",
             outcome.diagnostics
         );
@@ -2304,7 +2304,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed,
+            crate::runtime::ExecutionStatus::Completed,
             "{:?}",
             outcome.diagnostics
         );
@@ -2380,7 +2380,7 @@ mod tests {
         let (status, spawned) = outcome
             .expect("agent-await deadlocked on a single-worker runtime")
             .expect("submit");
-        assert_eq!(status, crate::runtime::outcome::ExecutionStatus::Completed);
+        assert_eq!(status, crate::runtime::ExecutionStatus::Completed);
         assert_eq!(spawned, 1, "no child task was ever scheduled");
     }
 
@@ -2407,14 +2407,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed
-        );
-        assert_eq!(
-            outcome.backend,
-            crate::runtime::outcome::ExecutionBackend::TypedVm
-        );
+        assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
+        assert_eq!(outcome.backend, crate::runtime::ExecutionBackend::TypedVm);
         assert_eq!(scheduler.tasks.read().await.len(), 1);
     }
 
@@ -2463,10 +2457,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed
-        );
+        assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
         let Some(crate::programs::ProgramValue::Record(fields)) = outcome.values.first() else {
             panic!("agent-await must return a typed result record");
         };
@@ -2543,7 +2534,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed,
+            crate::runtime::ExecutionStatus::Completed,
             "{:?}",
             outcome.diagnostics
         );
@@ -2620,10 +2611,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Failed
-        );
+        assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Failed);
         assert!(outcome
             .diagnostics
             .iter()
@@ -2667,7 +2655,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed,
+            crate::runtime::ExecutionStatus::Completed,
             "{:?}",
             outcome.diagnostics
         );
@@ -2908,7 +2896,7 @@ mod tests {
         runtime: Arc<ProgramRuntime>,
         max_turns: usize,
         timeout_ms: u64,
-    ) -> crate::runtime::outcome::ExecutionOutcome {
+    ) -> crate::runtime::ExecutionOutcome {
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             runtime.submit(crate::runtime::ProgramSubmission {
@@ -2929,11 +2917,11 @@ mod tests {
     }
 
     fn typed_result_fields(
-        outcome: &crate::runtime::outcome::ExecutionOutcome,
+        outcome: &crate::runtime::ExecutionOutcome,
     ) -> Vec<(String, crate::programs::ProgramValue)> {
         assert_eq!(
             outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed,
+            crate::runtime::ExecutionStatus::Completed,
             "invariant: agent-await completes the typed program even when the child terminates unsuccessfully; outcome_status={:?} outcome_diagnostics={:?} values={:?}",
             outcome.status,
             outcome.diagnostics,
@@ -2952,7 +2940,7 @@ mod tests {
     /// alongside `expected_status`, and that its diagnostics name the accounting
     /// an operator needs.
     fn assert_typed_child_accounting(
-        outcome: &crate::runtime::outcome::ExecutionOutcome,
+        outcome: &crate::runtime::ExecutionOutcome,
         expected_status: &str,
         expected_turns: usize,
         diagnostic_fragments: &[&str],
