@@ -12,9 +12,10 @@ Documentation follows the same semantic waist as the workspace:
 
 - Shared value, ownership, concept, effect, module, and source-to-IR rules stay here. No one crate
   can define them independently.
-- `crates/finch-colisp/docs/` owns implemented CoLisp reader grammar and frontend lowering details.
-- `crates/finch-coforth/docs/` owns implemented Co-Forth reader grammar and frontend lowering
-  details.
+- `crates/finch-colisp/docs/` owns implemented CoLisp reader grammar and how that reader
+  submits the shared construction protocol. It does not own typed-stack-IR lowering.
+- `crates/finch-coforth/docs/` owns implemented Co-Forth reader grammar and the same
+  construction-protocol submission. It does not own typed-stack-IR lowering.
 - `crates/finch-vm-core/docs/` owns implemented typed-IR schema, verifier contracts, diagnostics,
   and versioning details.
 - `crates/finch-vm/docs/` owns implemented interpreter, fiber, checkpoint, and execution semantics.
