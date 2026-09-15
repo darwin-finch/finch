@@ -17,8 +17,10 @@ Callers outside this directory use `crate::models::Item`; they must not name `bo
 neural embeddings), and `tools` (prompt/parser types). Production code under `src/models/**`
 must not name `crate::cli`. Bootstrap and download take a models-owned [`ModelProgress`]
 port; CLI implements it and injects it at composition roots (`BootstrapLoader::new`,
-`install_model_progress`). Do not extract `finch-models` until remaining edges are measured
-and this reverse edge stays gone.
+`install_model_progress` in `run_daemon` and interactive `main`). The daemon process is
+the one that loads and downloads models; interactive `main` returns before that install.
+Do not extract `finch-models` until remaining edges are measured and this reverse edge
+stays gone.
 
 **Loaders are experimental.** Configuration variants and loader code are not proof of
 end-to-end provider or local-model conformance. Do not change ONNX/Candle/loader/routing/training

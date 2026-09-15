@@ -51,7 +51,8 @@ pub use neural_embedding::{select_memory_embedding_engine, NeuralEmbeddingEngine
 #[allow(deprecated)]
 pub use persistence::{load_model_metadata, model_exists, save_model_with_metadata, ModelMetadata};
 pub use progress::{
-    install_model_progress, DownloadProgressDisplay, ModelProgress, SilentModelProgress,
+    install_model_progress, installed_model_progress, DownloadProgressDisplay, ModelProgress,
+    SilentModelProgress,
 };
 pub use sampling::{ComparisonResult, QueryCategory, Sampler, SamplingConfig, SamplingDecision};
 pub use threshold_router::{
@@ -87,16 +88,26 @@ mod tests {
     #[test]
     fn models_production_sources_do_not_import_cli() {
         let needle = ["crate::", "cli"].concat();
+        let group = ["crate:", ":{"].concat();
+        let cli_path = ["cli", "::"].concat();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/models");
         let mut hits = Vec::new();
-        collect_cli_imports(&root, &root, &needle, &mut hits);
+        collect_cli_imports(&root, &root, &needle, &group, &cli_path, &mut hits);
+        let grouped = [group.as_str(), "cli", "::...}"].concat();
         assert!(
             hits.is_empty(),
-            "models production code must not import {needle}; found: {hits:?}"
+            "models production code must not import {needle} or {grouped}; found: {hits:?}"
         );
     }
 
-    fn collect_cli_imports(root: &Path, dir: &Path, needle: &str, hits: &mut Vec<String>) {
+    fn collect_cli_imports(
+        root: &Path,
+        dir: &Path,
+        needle: &str,
+        group: &str,
+        cli_path: &str,
+        hits: &mut Vec<String>,
+    ) {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) => {
@@ -107,7 +118,7 @@ mod tests {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                collect_cli_imports(root, &path, needle, hits);
+                collect_cli_imports(root, &path, needle, group, cli_path, hits);
                 continue;
             }
             if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
@@ -117,16 +128,39 @@ mod tests {
                 hits.push(format!("failed to read {}", path.display()));
                 continue;
             };
+            let mut in_crate_group = false;
             for (index, line) in source.lines().enumerate() {
                 let trimmed = line.trim_start();
                 if trimmed.starts_with("//") {
                     continue;
                 }
-                if line.contains(needle) {
+                let grouped_cli = in_crate_group && crate_group_names_cli(trimmed, cli_path);
+                if line.contains(needle) || grouped_cli {
                     let rel = path.strip_prefix(root).unwrap_or(&path);
                     hits.push(format!("{}:{}", rel.display(), index + 1));
                 }
+                if trimmed.contains(group) {
+                    in_crate_group = true;
+                    if crate_group_names_cli(trimmed, cli_path) {
+                        let rel = path.strip_prefix(root).unwrap_or(&path);
+                        let hit = format!("{}:{}", rel.display(), index + 1);
+                        if !hits.contains(&hit) {
+                            hits.push(hit);
+                        }
+                    }
+                }
+                if in_crate_group && trimmed.contains('}') {
+                    in_crate_group = false;
+                }
             }
         }
+    }
+
+    fn crate_group_names_cli(line: &str, cli_path: &str) -> bool {
+        let trimmed = line.trim();
+        trimmed.contains(cli_path)
+            || trimmed == "cli"
+            || trimmed.starts_with("cli,")
+            || trimmed.starts_with("cli}")
     }
 }

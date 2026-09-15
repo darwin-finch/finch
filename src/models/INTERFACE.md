@@ -322,7 +322,7 @@ impl Sampler {
 pub struct SamplingConfig { … }
 /// Sampling decision
 pub struct SamplingDecision { … }
-/// No-op sink used when no host is attached (daemon, tests, unattended download).
+/// No-op sink used when no host is attached (tests, unattended download).
 pub struct SilentModelProgress;
 /// Text tokenizer (stub for compatibility)  Phase 4: This is a stub.
 pub struct TextTokenizer;
@@ -513,6 +513,8 @@ pub fn get_repository(provider: InferenceProvider, family: ModelFamily, size: Mo
 pub fn get_supported_targets(family: ModelFamily) -> Vec<ExecutionTarget> { … }
 /// Install the process-wide download progress sink at a composition root.
 pub fn install_model_progress(progress: Arc<dyn ModelProgress>) { … }
+/// Currently installed host sink, if any.
+pub fn installed_model_progress() -> Option<Arc<dyn ModelProgress>> { … }
 /// Check if a model family is compatible with an execution target
 pub fn is_compatible(family: ModelFamily, target: ExecutionTarget) -> bool { … }
 /// Stub: Metal availability check removed (Phase 4)

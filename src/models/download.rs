@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 use super::model_selector::QwenSize;
-use super::progress::download_progress_sink;
+use super::progress::attach_download_progress;
 
 /// Download progress events sent via channel
 #[derive(Debug, Clone)]
@@ -70,8 +70,7 @@ impl ModelDownloader {
         let (tx, rx) = mpsc::channel();
 
         // Host-injected progress (CLI TUI, or silent when none is installed)
-        let progress_msg = download_progress_sink()
-            .start_download_progress(format!("Downloading {}", repo_id), 100);
+        let progress_msg = attach_download_progress(repo_id);
 
         // Send starting event
         tx.send(DownloadProgress::Starting {

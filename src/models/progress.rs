@@ -28,7 +28,10 @@ pub trait ModelProgress: Send + Sync {
     ) -> Arc<dyn DownloadProgressDisplay>;
 }
 
-/// No-op sink used when no host is attached (daemon, tests, unattended download).
+/// No-op sink used when no host is attached (tests, unattended download).
+///
+/// Loader processes must not rely on this. `run_daemon` and interactive `main`
+/// install a reporting host before download or bootstrap.
 pub struct SilentModelProgress;
 
 struct SilentDownloadProgress;
@@ -63,13 +66,25 @@ pub fn install_model_progress(progress: Arc<dyn ModelProgress>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(progress);
 }
 
-/// Progress sink for download, falling back to [`SilentModelProgress`].
-pub(crate) fn download_progress_sink() -> Arc<dyn ModelProgress> {
+/// Currently installed host sink, if any.
+///
+/// `None` means download uses [`SilentModelProgress`]. Composition roots that
+/// load or download models must install a reporting host first.
+pub fn installed_model_progress() -> Option<Arc<dyn ModelProgress>> {
     INSTALLED_PROGRESS
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
-        .unwrap_or_else(|| Arc::new(SilentModelProgress))
+}
+
+/// Progress sink for download, falling back to [`SilentModelProgress`].
+pub(crate) fn download_progress_sink() -> Arc<dyn ModelProgress> {
+    installed_model_progress().unwrap_or_else(|| Arc::new(SilentModelProgress))
+}
+
+/// Attach determinate download progress the way [`super::ModelDownloader::download_model`] does.
+pub(crate) fn attach_download_progress(repo_id: &str) -> Arc<dyn DownloadProgressDisplay> {
+    download_progress_sink().start_download_progress(format!("Downloading {repo_id}"), 100)
 }
 
 #[cfg(test)]
@@ -147,5 +162,28 @@ mod tests {
             sink.lines.lock().unwrap().as_slice(),
             ["⏳ Loading Qwen..."]
         );
+    }
+
+    #[test]
+    fn download_progress_sink_uses_installed_host_not_silent_fallback() {
+        let recording = Arc::new(RecordingProgress {
+            lines: Mutex::new(Vec::new()),
+            downloads: Mutex::new(Vec::new()),
+        });
+        let previous = installed_model_progress();
+        install_model_progress(Arc::clone(&recording) as Arc<dyn ModelProgress>);
+        assert!(
+            installed_model_progress().is_some(),
+            "install_model_progress must latch a host sink; otherwise download is SilentModelProgress"
+        );
+        let handle = attach_download_progress("onnx-community/test-model");
+        handle.complete();
+        assert_eq!(
+            recording.downloads.lock().unwrap().as_slice(),
+            ["Downloading onnx-community/test-model"]
+        );
+        *INSTALLED_PROGRESS
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = previous;
     }
 }
