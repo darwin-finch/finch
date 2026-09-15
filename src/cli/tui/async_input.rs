@@ -155,6 +155,7 @@ pub fn spawn_input_task(
                     // Process first event
                     let first_event_result = match crossterm::event::read() {
                         Ok(Event::Key(key)) => {
+                            tui.restore_mouse_tracking_after_interaction();
                             // Priority 0: /quit always exits immediately.
                             // Send a Cap'n Proto binary ControlMessage { quit } to the quit
                             // watcher task — do NOT go through the event loop channel, because
@@ -458,6 +459,7 @@ pub fn spawn_input_task(
                         // so they don't trigger a submit.  This is the correct Claude
                         // Code-style paste behavior.
                         Ok(Event::Paste(text)) => {
+                            tui.restore_mouse_tracking_after_interaction();
                             // Replace each \n with a manual newline insertion so
                             // tui-textarea keeps them as in-buffer newlines.
                             for ch in text.chars() {
@@ -479,7 +481,7 @@ pub fn spawn_input_task(
                             Ok(None)
                         }
                         Ok(Event::Mouse(mouse)) => {
-                            if tui.handle_accordion_mouse(mouse) {
+                            if tui.handle_mouse(mouse) {
                                 first_event_needs_render = true;
                             }
                             Ok(None)
@@ -511,6 +513,7 @@ pub fn spawn_input_task(
                     while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
                         match crossterm::event::read() {
                             Ok(Event::Key(key)) => {
+                                tui.restore_mouse_tracking_after_interaction();
                                 if tui.handle_accordion_key(key) {
                                     needs_render = true;
                                     continue;
@@ -583,7 +586,7 @@ pub fn spawn_input_task(
                                 }
                             }
                             Ok(Event::Mouse(mouse)) => {
-                                if tui.handle_accordion_mouse(mouse) {
+                                if tui.handle_mouse(mouse) {
                                     needs_render = true;
                                 }
                             }
