@@ -45,6 +45,10 @@ impl MemTree {
 /// Classifies and pre-processes a conversation turn for MemTree storage.
 pub struct MemoryClassifier;
 impl MemoryClassifier {
+    /// Whether the content is template noise that must never become a memory.
+    pub fn is_noise(&self, content: &str) -> bool;
+    /// Whether recall must hold this text back.
+    pub fn is_recall_noise(&self, content: &str) -> bool;
     pub fn new() -> Self;
     /// Decide whether to add this turn to MemTree, and if so: - what key content to store (extracted/compressed prose) - which importance tier to assign  Returns `N…
     pub fn process(&self, role: &str, content: &str) -> Option<(String, MemoryImportance)>;
@@ -99,7 +103,7 @@ impl MemorySystem {
     pub async fn load_lisp_defines(&self) -> Result<Vec<String>>;
     /// Current monotonic registry generation used to invalidate stale manifests.
     pub async fn program_registry_generation(&self) -> Result<u64>;
-    /// Query memory for relevant context
+    /// Query memory for relevant context.
     pub async fn query(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<String>>;
     /// Query semantic memory while retaining a stable reference to the canonical stored turn behind every new-format leaf.
     pub async fn query_with_sources(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<MemorySearchResult>>;

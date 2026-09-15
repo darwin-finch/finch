@@ -18,7 +18,7 @@ pub use quality::{MemoryClassifier, MemoryImportance};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -792,6 +792,98 @@ fn source_metadata_for_node(
         run_id: row.get(5)?,
         request_seq: optional_request_seq(row.get(6)?)?,
     }))
+}
+
+/// One stored turn with everything recall rendering needs beyond the public
+/// source metadata: the raw content and the ordering timestamp.
+struct RecallTurn {
+    source: MemorySourceMetadata,
+    content: String,
+    timestamp: i64,
+}
+
+fn recall_turn_from_row(row: &rusqlite::Row<'_>) -> Result<RecallTurn> {
+    Ok(RecallTurn {
+        source: MemorySourceMetadata {
+            source_id: row.get(0)?,
+            role: row.get(1)?,
+            model: row.get(2)?,
+            session_id: row.get(3)?,
+            brain_id: row.get(4)?,
+            run_id: row.get(5)?,
+            request_seq: optional_request_seq(row.get(6)?)?,
+        },
+        content: row.get(7)?,
+        timestamp: row.get(8)?,
+    })
+}
+
+fn recall_turn_by_id(conn: &Connection, conversation_id: &str) -> Result<Option<RecallTurn>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.role, c.model, c.session_id,
+                c.brain_id, c.run_id, c.request_seq, c.content, c.timestamp
+         FROM conversations c
+         WHERE c.id = ?1",
+    )?;
+    let mut rows = stmt.query([conversation_id])?;
+    match rows.next()? {
+        None => Ok(None),
+        Some(row) => Ok(Some(recall_turn_from_row(row)?)),
+    }
+}
+
+/// The stored turn this one replies to, or that replies to this one.
+///
+/// Scoped to the session and to the two conversation roles: `session_id` is
+/// what every captured turn carries, and a NULL session cannot bound "the
+/// exchange" against interleaved other sessions, so such turns stay single.
+/// Closest in time wins, which pairs adjacent turns and survives a follow-up
+/// exchange after the first.
+fn counterpart_turn(conn: &Connection, turn: &RecallTurn) -> Result<Option<RecallTurn>> {
+    let Some(session_id) = turn.source.session_id.as_deref() else {
+        return Ok(None);
+    };
+    if turn.source.role != "user" && turn.source.role != "assistant" {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.role, c.model, c.session_id,
+                c.brain_id, c.run_id, c.request_seq, c.content, c.timestamp
+         FROM conversations c
+         WHERE c.session_id = ?1
+           AND c.role IN ('user', 'assistant')
+           AND c.role != ?2
+           AND c.id != ?3
+         ORDER BY ABS(c.timestamp - ?4) ASC, c.id ASC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![
+        session_id,
+        turn.source.role,
+        turn.source.source_id,
+        turn.timestamp
+    ])?;
+    match rows.next()? {
+        None => Ok(None),
+        Some(row) => Ok(Some(recall_turn_from_row(row)?)),
+    }
+}
+
+/// Render one recalled memory the way a prompt consumes it: labelled with who
+/// said it, and joined with the turn it replies to.
+///
+/// The exchange is rendered with the user's half first regardless of which
+/// half was retrieved, so both halves collapse to one entry under the
+/// rendered-text dedup in `query`.
+fn render_recall_entry(primary: &RecallTurn, counterpart: Option<&RecallTurn>) -> String {
+    let Some(other) = counterpart else {
+        return format!("{}: {}", primary.source.role, primary.content);
+    };
+    if primary.source.role == "user" {
+        format!("user: {}\nassistant: {}", primary.content, other.content)
+    } else {
+        format!("user: {}\nassistant: {}", other.content, primary.content)
+    }
 }
 
 impl MemorySystem {
@@ -1575,14 +1667,54 @@ impl MemorySystem {
         (leaves, tree.max_depth(), widest)
     }
 
-    /// Query memory for relevant context
+    /// Query memory for relevant context.
+    ///
+    /// Each entry is rendered for injection into a prompt: labelled with the
+    /// role that produced it, joined with the turn it replies to, and free of
+    /// the template noise older stores carry. Both halves of one exchange
+    /// render as that one exchange, so a question never arrives severed from
+    /// its answer and never occupies two entries.
     pub async fn query(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<String>> {
         let results = self.query_with_sources(query_text, top_k).await?;
-        let texts: Vec<String> = results.into_iter().map(|result| result.text).collect();
+        let classifier = MemoryClassifier::new();
+        let conn = self.db.lock().await;
+        let mut rendered: Vec<String> = Vec::with_capacity(results.len());
+        let mut seen: HashSet<String> = HashSet::with_capacity(results.len());
+        for result in results {
+            // The salience gate at recall, not only at insert (#415). A store
+            // built before the classifier existed carries greetings and acks
+            // in `tree_nodes`; nothing rewrites stored rows, so recall holds
+            // the same line the classifier holds today.
+            if classifier.is_recall_noise(result.text.trim()) {
+                continue;
+            }
+            let entry = match result.source.as_ref() {
+                // A legacy leaf with no conversation row cannot be attributed
+                // or paired; its bare text is all that is known.
+                None => result.text.clone(),
+                Some(source) => {
+                    let turn = recall_turn_by_id(&conn, &source.source_id)?.unwrap_or_else(|| {
+                        RecallTurn {
+                            source: source.clone(),
+                            content: result.text.clone(),
+                            timestamp: 0,
+                        }
+                    });
+                    let counterpart = counterpart_turn(&conn, &turn)?;
+                    render_recall_entry(&turn, counterpart.as_ref())
+                }
+            };
+            // One entry per distinct rendered memory: duplicated leaf rows and
+            // both halves of one exchange render the same string.
+            if seen.insert(entry.clone()) {
+                rendered.push(entry);
+            }
+        }
+        drop(conn);
 
-        tracing::debug!("Memory query returned {} results", texts.len());
+        tracing::debug!("Memory query returned {} results", rendered.len());
 
-        Ok(texts)
+        Ok(rendered)
     }
 
     /// Query semantic memory while retaining a stable reference to the
@@ -4090,7 +4222,7 @@ mod tests {
         assert!(
             live_results
                 .iter()
-                .any(|result| result == POST_READY_ABORT_WRITE),
+                .any(|result| result.ends_with(POST_READY_ABORT_WRITE)),
             "the successful post-abort write must be searchable in the live MemTree; \
              status={:?}, results={live_results:?}",
             memory.hydration_status()
@@ -4572,7 +4704,7 @@ mod tests {
 
         let results = reopened.query(STRANDED_TURN, Some(8)).await?;
         assert!(
-            results.iter().any(|result| result == STRANDED_TURN),
+            results.iter().any(|result| result.ends_with(STRANDED_TURN)),
             "the repaired turn must be reachable by semantic recall, not merely \
              carry a database row; results={results:?}, source_row={projected:?}, \
              status={:?}",
@@ -6555,6 +6687,315 @@ mod tests {
             retry_error.to_string().contains("cycles:"),
             "the retry must fail the SAME way, not on a foreign-key violation or \
              a masked reload error; got {retry_error}"
+        );
+        Ok(())
+    }
+
+    // ── #415: MemTree recall defects ─────────────────────────────────────────
+
+    /// The question and the answer of one stored exchange, used by the
+    /// recall tests below. Both are long enough to clear the classifier's
+    /// 20-character floor and carry no ack or greeting shape.
+    const PAIRED_QUESTION: &str = "What is the deployment token for the staging cluster?";
+    const PAIRED_ANSWER: &str =
+        "The staging deployment token is stored in the Employee vault, not in \
+         the repository.";
+
+    /// Seed a store created through the real schema with crafted legacy
+    /// `tree_nodes` rows: one root plus one leaf per entry, written the way
+    /// persistence serialises embeddings (little-endian f32). A reopen then
+    /// hydrates exactly these rows, which is the production path a store
+    /// built by an older binary takes.
+    fn seed_legacy_tree_rows(db_path: &std::path::Path, leaves: &[(&str, u8)]) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        let engine = TfIdfEmbedding::new();
+        let root_bytes: Vec<u8> = vec![0.0f32; engine.dimension()]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        conn.execute(
+            "INSERT INTO tree_nodes
+                 (node_id, parent_id, text, embedding, level, created_at, importance)
+             VALUES (0, NULL, 'ROOT', ?1, 0, 0, 0)",
+            params![root_bytes],
+        )?;
+        for (index, (text, importance)) in leaves.iter().enumerate() {
+            let embedding = engine.embed(text)?;
+            let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+            conn.execute(
+                "INSERT INTO tree_nodes
+                     (node_id, parent_id, text, embedding, level, created_at, importance)
+                 VALUES (?1, 0, ?2, ?3, 1, 0, ?4)",
+                params![index as i64 + 1, text, bytes, i64::from(*importance)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// #415 defect 1 at the persistence boundary. Leaves-only retrieval stops
+    /// an internal node's provisional label from surfacing, but a store built
+    /// before insertion was fixed already holds the same text on several
+    /// leaves — the reference host measured 5 distinct texts across 11 of 27
+    /// nodes — and hydration loads every row, so recall spent its top-k
+    /// budget on duplicates. Replayed here through a real store reopen.
+    #[tokio::test]
+    async fn test_recall_from_a_legacy_store_with_duplicate_leaf_rows_returns_each_memory_once(
+    ) -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        {
+            // Create the schema, then drop the handle so the rows below are
+            // the only content the reopen hydrates.
+            let _warm = MemorySystem::new(MemoryConfig {
+                db_path: temp.path().to_path_buf(),
+                ..Default::default()
+            })?;
+        }
+        let text = "The signing key lives in the Employee vault, never in the \
+                    repository.";
+        seed_legacy_tree_rows(temp.path(), &[(text, 1), (text, 1)])?;
+
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        memory.ensure_hydrated().await?;
+
+        let results = memory.query(text, Some(5)).await?;
+        let copies = results.iter().filter(|r| r.contains(text)).count();
+        assert_eq!(
+            copies, 1,
+            "the same memory must be recalled once even when a legacy store \
+             holds it on several leaves; got {results:?}"
+        );
+        Ok(())
+    }
+
+    /// #415 defect 4 at the persistence boundary. The reference store's tree
+    /// was built before the quality classifier existed, so greetings and acks
+    /// sit in `tree_nodes` at importance 1 and recall handed them back as
+    /// memories. Nothing rewrites stored rows, so the salience gate must hold
+    /// at recall, not only at insert.
+    #[tokio::test]
+    async fn test_recall_excludes_noise_stored_by_older_builds() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        {
+            let _warm = MemorySystem::new(MemoryConfig {
+                db_path: temp.path().to_path_buf(),
+                ..Default::default()
+            })?;
+        }
+        seed_legacy_tree_rows(
+            temp.path(),
+            &[
+                ("You're welcome, Shammah!", 1),
+                (
+                    "The signing key lives in the Employee vault, never in \
+                     the repository.",
+                    1,
+                ),
+            ],
+        )?;
+
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        memory.ensure_hydrated().await?;
+
+        let results = memory
+            .query("The signing key lives in the Employee vault", Some(5))
+            .await?;
+        assert!(
+            results.iter().all(|r| !r.contains("You're welcome")),
+            "recall must not hand back an ack a pre-classifier build stored; \
+             got {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.contains("signing key lives in the Employee vault")),
+            "the substantive memory must still be recalled; got {results:?}"
+        );
+        Ok(())
+    }
+
+    /// #415 defect 2. Recall stripped the role, so the model could not tell
+    /// which turns were the user's and which were its own — it was handed its
+    /// own past greeting as "relevant context". The role lives in the
+    /// `conversations` row every new-format leaf points at, so recall can
+    /// attribute without changing what is stored.
+    #[tokio::test]
+    async fn test_recall_labels_the_role_of_the_stored_turn() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        // Separate sessions, so neither turn has a counterpart to pair with
+        // and the role label is asserted on its own.
+        memory
+            .insert_conversation(
+                "user",
+                PAIRED_QUESTION,
+                Some("test-model"),
+                Some("session-question"),
+            )
+            .await?;
+        memory
+            .insert_conversation(
+                "assistant",
+                PAIRED_ANSWER,
+                Some("test-model"),
+                Some("session-answer"),
+            )
+            .await?;
+
+        let for_question = memory
+            .query("deployment token for the staging cluster", Some(5))
+            .await?;
+        assert!(
+            for_question
+                .iter()
+                .any(|r| r.starts_with("user: ") && r.contains("staging cluster")),
+            "a recalled user turn must be labelled as the user's; got \
+             {for_question:?}"
+        );
+
+        let for_answer = memory
+            .query("staging deployment token Employee vault", Some(5))
+            .await?;
+        assert!(
+            for_answer
+                .iter()
+                .any(|r| r.starts_with("assistant: ") && r.contains("Employee vault")),
+            "a recalled assistant turn must be labelled as the assistant's; \
+             got {for_answer:?}"
+        );
+        Ok(())
+    }
+
+    /// #415 defect 3. The exchange is split across separate leaves, so
+    /// retrieving one half returned a question the model cannot see the
+    /// answer to — worse than recalling nothing.
+    #[tokio::test]
+    async fn test_a_recalled_question_brings_its_answer() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        memory
+            .insert_conversation(
+                "user",
+                PAIRED_QUESTION,
+                Some("test-model"),
+                Some("session-pair"),
+            )
+            .await?;
+        memory
+            .insert_conversation(
+                "assistant",
+                PAIRED_ANSWER,
+                Some("test-model"),
+                Some("session-pair"),
+            )
+            .await?;
+
+        let results = memory
+            .query("deployment token for the staging cluster", Some(5))
+            .await?;
+        assert!(
+            results.iter().any(|r| r.starts_with("user: ")
+                && r.contains(PAIRED_QUESTION)
+                && r.contains("assistant: ")
+                && r.contains(PAIRED_ANSWER)),
+            "a recalled question must arrive with its answer; got {results:?}"
+        );
+        Ok(())
+    }
+
+    /// #415 defect 3 from the other side: recalling the answer half of an
+    /// exchange must bring the question it replied to.
+    #[tokio::test]
+    async fn test_a_recalled_answer_brings_its_question() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        memory
+            .insert_conversation(
+                "user",
+                PAIRED_QUESTION,
+                Some("test-model"),
+                Some("session-pair"),
+            )
+            .await?;
+        memory
+            .insert_conversation(
+                "assistant",
+                PAIRED_ANSWER,
+                Some("test-model"),
+                Some("session-pair"),
+            )
+            .await?;
+
+        let results = memory
+            .query("where is the staging deployment token stored", Some(5))
+            .await?;
+        assert!(
+            results.iter().any(|r| r.starts_with("user: ")
+                && r.contains(PAIRED_QUESTION)
+                && r.contains(PAIRED_ANSWER)),
+            "a recalled answer must arrive with the question it replies to; \
+             got {results:?}"
+        );
+        Ok(())
+    }
+
+    /// #415 defect 3, dedup complement. Both halves of one exchange are
+    /// separate leaves and a query that matches both used to return the
+    /// question and the answer as two entries; now each half renders the
+    /// whole exchange, so recall must collapse them to one.
+    #[tokio::test]
+    async fn test_recalling_both_halves_of_one_exchange_injects_it_once() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        memory
+            .insert_conversation(
+                "user",
+                PAIRED_QUESTION,
+                Some("test-model"),
+                Some("session-pair"),
+            )
+            .await?;
+        memory
+            .insert_conversation(
+                "assistant",
+                PAIRED_ANSWER,
+                Some("test-model"),
+                Some("session-pair"),
+            )
+            .await?;
+
+        let results = memory
+            .query("the staging deployment token", Some(5))
+            .await?;
+        assert_eq!(
+            results.len(),
+            1,
+            "both halves of one exchange render the same exchange and must be \
+             injected once; got {results:?}"
+        );
+        assert!(
+            results
+                .first()
+                .is_some_and(|r| r.contains(PAIRED_QUESTION) && r.contains(PAIRED_ANSWER)),
+            "the single injected entry must carry the whole exchange; got \
+             {results:?}"
         );
         Ok(())
     }
