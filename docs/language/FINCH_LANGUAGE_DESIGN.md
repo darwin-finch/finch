@@ -165,6 +165,42 @@ elaborated AST/HIR -- instantiation + post-order lowering --> typed stack IR
 typed stack IR -- independent security verification --> executable module
 ```
 
+### Abstraction boundaries (do not collapse)
+
+There are **two** handoffs. Treating them as one is how frontends end up emitting IR and the VM ends up selecting CoLisp vs Co-Forth.
+
+**1. Frontend → compiler: shared structured syntax, not IR.**
+
+Each frontend owns a private parse tree (CoLisp `Val`/`SpannedVal`, Co-Forth's span-preserving module tree). That tree does **not** enter `finch-vm`, `src/runtime`, Brain, or the TUI. The frontend submits span-bearing structured syntax through the versioned semantic-construction protocol (builder calls: declare a function, unresolved call, match, closure, generic application, effect syntax). That protocol is the **shared** input the dependency scheduler elaborates. It is not a public HIR-node ABI, and it cannot mint `FunctionCertified`, `ModuleSealed`, or `ModuleVerified`.
+
+This is the SDC lesson: parse AST is frontend-private; the compiler scheduler runs on **symbols and phases** derived from those builder submissions (`Declared → SignatureReady → BodyTyped → Lowered → FunctionCertified`). Forward references are `require(symbol, SignatureReady)` (a promise the scheduler fulfills). Parallel files publish skeletons independently. Two files importing one module intern **one** in-flight module job; they do not each lower IR and contend in the VM.
+
+**2. Compiler → execute: typed stack IR, not AST.**
+
+`finch-language` (the compiler door) is the only place that lowers. `finch-vm` (interpreter, fibers, checkpoints), later Cranelift, `programs`, and `src/runtime` consume **`ModuleVerified` IR**. They do not take frontend trees, builder traces, or compiler-private HIR. Application composition submits either source plus a language tag to `finch-language`, or an already-verified module to `finch-vm`. It never compiles by importing `finch-colisp` or `finch-coforth`.
+
+The VM fiber scheduler is a **different** machine from the compiler job scheduler. Compiler jobs may eventually be self-hosted as CoLisp fibers that yield `CompilerNeed`; they still lower to IR before anything executes.
+
+**3. Interpreter and Cranelift: the same IR waist.**
+
+The interpreter and the later Cranelift handoff consume the **same** Finch typed stack IR. They do not take AST, builder traces, or `require(symbol, stage)`. CLIF is a hidden, rebuildable backend IR behind Cranelift; it is not the program-exchange format and is not a second language.
+
+```text
+finch-language
+  await require(...) → lower → FunctionCertified → ModuleVerified
+                         │
+                         ├─→ interpreter (tier 0)
+                         └─→ CLIF → native (later)
+```
+
+Shared across both backends: IR types, verifier, source maps, trap/safepoint metadata, capability request sites, and the effect/resume ABI (native shims stay capability-bound). Not shared: the compiler scheduler, frontend trees, or CLIF.
+
+The interpreter **runs** only `ModuleVerified`. Native lowering **may start** from `FunctionCertified` as a quarantined cache, discarded if the module certificate never issues. An first implementation may wait for `ModuleVerified` for both.
+
+**Crate split that keeps the scheduler shareable.** `require` only works if the elaboratable tree, the symbol/phase table, and lowering live together (`finch-language`, with types in `finch-vm-core`). Frontends do not own that scheduler; they publish builder submissions. `finch-vm` does not own it either: it is an IR backend, like Cranelift. Splitting at IR is the intended waist. Splitting with AST inside `finch-vm`, or with frontends emitting IR, makes `require` impossible or forces every execution change to load the compiler.
+
+**Why not “shared AST into the VM instead of IR”.** Putting the elaboratable tree in `finch-vm` makes the interpreter a compiler, forces every Brain/runtime change to load elaborator state, and gives native lowering a second source of truth. The shared tree belongs to `finch-language`. The shared **executable** waist is typed stack IR. Today’s tree is inverted: frontends still lower privately and the VM still re-exports `compile_forth` / `compile_lisp`. That inversion is debt, not the target.
+
 Shared lowering helpers enforce Lisp/Co-Forth parity without requiring an intermediate tree for its
 own sake. Source-defined generics and compile-time templates are the concrete feature that can
 justify one small shared parametric HIR: a concrete typed runtime instruction stream is too late to
@@ -331,32 +367,40 @@ through monotonic readiness phases:
 Declared -> SignatureReady -> BodyTyped -> Lowered -> FunctionCertified
 ```
 
-A job that requires another symbol at a particular phase yields an explicit compiler continuation
-such as `Needs(symbol_id, SignatureReady)`. The scheduler advances the dependency and resumes the
-requester. Generic instantiation creates or reuses a synthetic job keyed by immutable module and
+The scheduler API is `require(symbol, stage)`, not an event bus. It returns a promise whose
+other end the scheduler owns; analysis **awaits** that promise. There are no
+`SymbolReady` pub/sub listeners, callback tables, or ad hoc “pass completed” broadcasts.
+
+```text
+let sig = await require(f, SignatureReady);
+// type-check this call against sig
+let ir  = await require(f, Lowered);
+```
+
+What that means operationally:
+
+- If `f` is already at `stage`, the promise is already resolved.
+- If not, the current job parks and the scheduler runs `f`'s job until that stage (or a cycle/fuel
+  failure). Interning means a second `require(f, stage)` awaits the **same** promise, which is how
+  two files importing one module share work instead of contending.
+- Mutual recursion is legal when both sides can reach `SignatureReady` without each other's
+  bodies. Awaiting a job that is already awaiting you at an unmet stage is a cycle; report the
+  full chain with source origins.
+- Lowering is just `await require(self, BodyTyped)` then emit stack IR, then
+  `FunctionCertified`. It is not a second scheduler.
+
+This is the same graph SDC encodes with stackful fibers so `require` looks synchronous
+([`scheduler.d`](https://github.com/snazzy-d/sdc/blob/master/src/d/semantic/scheduler.d)). Finch's
+Rust bootstrap should use explicit promises/jobs (`Ready` vs `Needs { symbol, stage }`) rather
+than native fiber stacks: deterministic order, cycle traces, fuel, cancellation, and tests
+without a second stack runtime. The self-hosted compiler may later write the same `await require`
+as a CoLisp fiber that yields `CompilerNeed`; that is still this scheduler, not the VM's runtime
+fiber scheduler and not an event architecture.
+
+Generic instantiation creates or reuses a synthetic job keyed by immutable module and
 definition identity, type/value arguments, and resolved concept evidence. That job may emit shared
 evidence-passing IR or a selected concrete specialization; semantic resolution does not require
-code multiplication. Phase-aware dependency traces distinguish legal
-mutual recursion, whose declared signatures break the cycle, from impossible compile-time value or
-layout cycles and report the complete chain with source origins.
-
-This is the useful architectural lesson from [SDC's semantic
-scheduler](https://github.com/snazzy-d/sdc/blob/master/src/d/semantic/scheduler.d): its source uses
-stackful fibers to make `require(symbol, phase)` read synchronously while dependent symbols advance
-on demand. Finch should initially implement the same dependency semantics with explicit resumable
-compiler jobs rather than native fiber stacks. That preserves deterministic scheduling, cycle
-diagnostics, fuel limits, and straightforward tests/serialization without making the Rust bootstrap
-depend on a second stack runtime.
-
-The eventual self-hosted compiler may express those same jobs directly as typed CoLisp fibers over
-the shared resumable-execution primitive, conceptually
-`fiber<CompilerNeed,CompilerResolution,T>`. A semantic function calls `require(symbol, phase)` in
-direct style; that operation yields `CompilerNeed`, the dependency scheduler advances or diagnoses
-the requested job, and resumption supplies `CompilerResolution`. The VM performs the continuation
-lowering, so compiler source does not manually encode every semantic state transition. This is a
-compiler use of the public typed fiber mechanism, not a second scheduler, OS thread, or LLM-agent
-abstraction; it must produce the same deterministic job graph and diagnostics as the explicit
-bootstrap implementation.
+code multiplication.
 
 Compilation may therefore be pipelined rather than separated by whole-module barriers:
 
@@ -3544,6 +3588,10 @@ CLIF
         ↓ Cranelift code generation
 native code
 ```
+
+The interpreter and Cranelift are two backends of this same Finch IR, not two languages.
+See [Abstraction boundaries](#abstraction-boundaries-do-not-collapse). CLIF never becomes
+the handoff from `finch-language`.
 
 Finch IR is the durable semantic and verification boundary. CLIF is target/backend-oriented and
 normally a rebuildable compilation artifact. Do not serialize CLIF as the program-exchange ABI or
