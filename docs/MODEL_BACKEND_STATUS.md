@@ -14,17 +14,23 @@
 
 ---
 
-## Current Status: ONNX Runtime is the working path
+## Status: ONNX Runtime is the default path (dated investigation, not conformance)
+
+The statuses below record what the backend investigation observed, not a current
+end-to-end conformance claim. Loader configuration is a configuration surface;
+local routing and provider parity remain open under
+[#74](https://github.com/darwin-finch/finch/issues/74) and
+[#98](https://github.com/darwin-finch/finch/issues/98).
 
 | Backend | Status | Notes |
 |---------|--------|-------|
-| **ONNX + CoreML EP (macOS)** | ✅ Working | Primary path; ops dispatch to ANE/GPU/CPU per-op |
-| **ONNX + CPU (Linux)** | ✅ Working | Clean CPU fallback on Linux |
-| **ONNX + CUDA (Linux)** | ✅ Working | Standard CUDA execution provider |
-| **Candle CPU (Linux)** | ✅ Working | Alternative backend; Qwen2 only |
-| **Candle CUDA (Linux)** | ✅ Working | `--features candle-cuda` |
-| **Candle Metal (macOS)** | ❌ Broken | Missing layer-norm kernel; matmul edge cases; wrong/no output |
-| **candle-coreml (ANEMLL)** | ❌ Not viable | Wrong model format; niche 3rd-party crate |
+| **ONNX + CoreML EP (macOS)** | Recorded working in this investigation | Default macOS ONNX path in code (`onnx.rs` auto-selects CoreML); ops dispatch to ANE/GPU/CPU per-op |
+| **ONNX + CPU (Linux)** | Recorded working in this investigation | CPU EP is always registered as fallback |
+| **ONNX + CUDA (Linux)** | Code path exists; unvalidated here | Requires the non-default `cuda` cargo feature (`Cargo.toml [features]`), which gates ONNX Runtime's CUDA/TensorRT EPs |
+| **Candle CPU (Linux)** | Recorded working in this investigation | Qwen2 family only (`src/models/loaders/candle.rs`) |
+| **Candle CUDA (Linux)** | Not built in this repository | There is no `candle-cuda` cargo feature; `candle-core` is declared without its `cuda` feature, so Candle has no CUDA build here. The Candle device path that exists sits behind the non-default `cuda` feature (`candle.rs::get_device`) |
+| **Candle Metal (macOS)** | ❌ Broken (investigation) | Missing layer-norm kernel; matmul edge cases; wrong/no output |
+| **candle-coreml (ANEMLL)** | ❌ Not viable (investigation) | Wrong model format; niche 3rd-party crate |
 
 ---
 

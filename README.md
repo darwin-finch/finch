@@ -159,9 +159,13 @@ same as end-to-end conformance: provider routing and model selection are still b
 [#98](https://github.com/darwin-finch/finch/issues/98), and
 [#104](https://github.com/darwin-finch/finch/issues/104).
 
-ChatGPT consumer subscriptions are not an authentication mechanism for Finch. Legacy
-`chatgpt_subscription` configuration is rejected with migration guidance; subscription/device
-authentication remains unresolved and must not be inferred from OpenAI API-key support.
+ChatGPT consumer subscriptions authenticate through Finch's device-login flow and a Finch-native
+HTTP transport (`finch auth login`; see
+[docs/OAUTH.md](docs/OAUTH.md) and
+[docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md)). That flow is a
+compatibility boundary, not an OpenAI-supported third-party integration. Legacy Codex app-server
+`chatgpt_subscription` configuration is rejected with migration guidance; subscription
+authentication must not be inferred from OpenAI API-key support.
 
 ### Local inference
 
@@ -259,8 +263,11 @@ capabilities. Finch has no automatic LoRA training path; see
 
 - Finch is experimental and is not presented as release-ready or production-ready.
 - Provider and local-model behavior is not yet uniform; verify the exact profile and model you use.
-- There is no supported ChatGPT subscription/device-auth flow and no live-model claim for any
-  unreleased or unverified model.
+- ChatGPT subscription/device auth uses Finch's device-login flow and its Finch-native transport
+  ([docs/OAUTH.md](docs/OAUTH.md),
+  [docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md)); it is a
+  compatibility boundary, not an OpenAI-supported third-party integration, and carries no
+  live-model claim for any unreleased or unverified model.
 - The server supports a small endpoint subset, not the full OpenAI API and not `/v1/responses`.
 - Image-input/output support is not documented as available.
 - Finch does not automatically update itself, train LoRA adapters, or turn feedback into training.

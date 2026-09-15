@@ -19,8 +19,8 @@
 
 **Benefits**:
 - ✅ **Extensible** - Add new capabilities without modifying Finch
-- ✅ **Standard** - Works with hundreds of existing MCP servers
-- ✅ **Secure** - Tools run in separate processes with permission control
+- ✅ **Configured transports** - Finch connects to the MCP servers you configure over stdio; Streamable HTTP is not implemented, and legacy SSE configuration is rejected (`src/tools/mcp/`)
+- ✅ **Isolated** - Each configured server runs as a separate process
 - ✅ **Simple** - Configure via TOML, use via natural language
 
 **Examples of what you can do**:

@@ -5,10 +5,12 @@ Finch's tested and release toolchain is exactly Rust 1.98.0. The repository-owne
 targets used by supported CI and release builds. Authoritative CI and release workflows must pin
 the same version; `tests/toolchain_contract.sh` rejects drift or an unqualified moving `stable`.
 
-This tested/release version is not an MSRV claim. Finch has not established or continuously tested
-the oldest compiler capable of building the current dependency graph, so `Cargo.toml` intentionally
-does not declare `rust-version`. Versions below 1.98.0 are unsupported until a dedicated lower-bound
-matrix supplies evidence for a truthful MSRV.
+This tested/release version is not an MSRV claim. `Cargo.toml` declares `rust-version = "1.98"`
+(the pinned channel's major.minor), and `tests/toolchain_contract.sh` rejects drift between that
+declared floor and `rust-toolchain.toml`. The field records the floor Finch actually pins and
+tests; it is not evidence for the oldest compiler capable of building the current dependency
+graph. Versions below 1.98.0 are unsupported until a dedicated lower-bound matrix supplies
+evidence for a truthful MSRV.
 
 The pin makes compiler and formatter selection reproducible. It does not claim reproducible
 dependency resolution or byte-identical release artifacts; dependency policy belongs to #150.
