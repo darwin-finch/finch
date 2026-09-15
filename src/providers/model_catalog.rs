@@ -118,6 +118,7 @@ pub fn static_fallback(provider: &str) -> Vec<String> {
         "gemini" => &["gemini-2.5-flash"],
         "mistral" => &["mistral-large-2512"],
         "groq" => &["openai/gpt-oss-120b"],
+        "openrouter" => &["z-ai/glm-5.3-flash"],
         _ => &[],
     };
     models.iter().map(|model| (*model).to_string()).collect()
@@ -293,6 +294,13 @@ pub async fn refresh_from_config(
             "/v1/models",
             CatalogAuth::Bearer,
             "groq",
+        ),
+        CredentialProvider::Openrouter => (
+            "https://openrouter.ai/api",
+            "/v1/chat/completions",
+            "/v1/models",
+            CatalogAuth::Bearer,
+            "openrouter",
         ),
         _ => bail!(
             "provider profile '{profile_name}' does not have a supported named-credential catalogue transport"

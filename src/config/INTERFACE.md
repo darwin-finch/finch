@@ -89,14 +89,14 @@ pub enum CredentialKind { ApiKey, Bearer, OauthDevice, OauthBrowserPkce, CloudId
 /// Persisted lifecycle metadata.
 pub enum CredentialLifecycle { Active, Revoked, LegacyAmbiguous }
 /// Provider/account namespace.
-pub enum CredentialProvider { Anthropic, OpenaiPlatform, ChatgptSubscription, Xai, GeminiAiStudio, GoogleVertex, Mistral, Groq }
+pub enum CredentialProvider { Anthropic, OpenaiPlatform, ChatgptSubscription, Xai, GeminiAiStudio, GoogleVertex, Mistral, Groq, Openrouter }
 impl CredentialProvider {
     pub fn as_str(self) -> &'static str;
 }
 /// Dialog color configuration Re-exported from `theme`.
 pub struct DialogColors { … }
 /// Normalized service family.
-pub enum EndpointFamily { AnthropicApi, OpenaiPlatform, ChatgptSubscription, XaiApi, GeminiAiStudio, GoogleVertex, MistralApi, GroqApi, Custom }
+pub enum EndpointFamily { AnthropicApi, OpenaiPlatform, ChatgptSubscription, XaiApi, GeminiAiStudio, GoogleVertex, MistralApi, GroqApi, OpenrouterApi, Custom }
 /// Production resolver for explicit `env:VARIABLE_NAME` opaque references.
 pub struct EnvironmentCredentialResolver;
 /// Execution target for inference (hardware where code runs)  All targets use ONNX Runtime as the inference provider.
@@ -153,7 +153,7 @@ impl Persona {
 /// Secret-free, named provider credential metadata.
 pub struct ProviderCredential { … }
 /// A single provider entry — either a cloud API or a local inference backend.
-pub enum ProviderEntry { Credentialed, LegacyChatgptSubscription, Claude, Openai, Grok, Gemini, Mistral, Groq, Ollama, RemoteDaemon, Local }
+pub enum ProviderEntry { Credentialed, LegacyChatgptSubscription, Claude, Openai, Grok, Gemini, Mistral, Groq, Openrouter, Ollama, RemoteDaemon, Local }
 impl ProviderEntry {
     /// API key for cloud variants; `None` for Local, Ollama, and RemoteDaemon.
     pub fn api_key(&self) -> Option<&str>;

@@ -74,6 +74,12 @@ pub(super) const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "openai/gpt-oss-120b",
         "get key at console.groq.com",
     ),
+    (
+        "openrouter",
+        "OpenRouter",
+        "z-ai/glm-5.3-flash",
+        "get key at openrouter.ai/keys",
+    ),
 ];
 
 /// Return the setup editor registered for an exact persisted provider identity.
@@ -118,6 +124,11 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
             ..
         }
         | ProviderEntry::Groq { .. } => Some("groq"),
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::Openrouter,
+            ..
+        }
+        | ProviderEntry::Openrouter { .. } => Some("openrouter"),
         _ => None,
     }
 }
@@ -266,7 +277,7 @@ pub(super) fn model_catalog_profile(
             )
         }
         (
-            "openai" | "grok" | "mistral" | "groq",
+            "openai" | "grok" | "mistral" | "groq" | "openrouter",
             Some(ProviderEntry::Credentialed {
                 base_url,
                 chat_path,
@@ -288,6 +299,11 @@ pub(super) fn model_catalog_profile(
                 ),
                 "groq" => (
                     "https://api.groq.com/openai",
+                    "/v1/chat/completions",
+                    "/v1/models",
+                ),
+                "openrouter" => (
+                    "https://openrouter.ai/api",
                     "/v1/chat/completions",
                     "/v1/models",
                 ),
@@ -336,6 +352,26 @@ pub(super) fn model_catalog_profile(
         ),
         ("mistral", _) => (
             "https://api.mistral.ai",
+            "/v1/chat/completions",
+            "/v1/models",
+            CatalogAuth::Bearer,
+        ),
+        (
+            "openrouter",
+            Some(ProviderEntry::Openrouter {
+                base_url,
+                chat_path,
+                models_path,
+                ..
+            }),
+        ) => (
+            base_url.as_deref().unwrap_or("https://openrouter.ai/api"),
+            chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+            models_path.as_deref().unwrap_or("/v1/models"),
+            CatalogAuth::Bearer,
+        ),
+        ("openrouter", _) => (
+            "https://openrouter.ai/api",
             "/v1/chat/completions",
             "/v1/models",
             CatalogAuth::Bearer,
@@ -634,6 +670,19 @@ pub(super) fn provider_entry_from_remote_model(
         Some(ProviderEntry::Groq { .. }) => ProviderEntry::Groq {
             api_key: api_key.to_string(),
             model,
+            name,
+        },
+        Some(ProviderEntry::Openrouter {
+            base_url,
+            chat_path,
+            models_path,
+            ..
+        }) => ProviderEntry::Openrouter {
+            api_key: api_key.to_string(),
+            model,
+            base_url: base_url.clone(),
+            chat_path: chat_path.clone(),
+            models_path: models_path.clone(),
             name,
         },
         Some(ProviderEntry::Ollama { base_url, .. }) => ProviderEntry::Ollama {
