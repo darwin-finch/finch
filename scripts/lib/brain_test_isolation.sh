@@ -236,7 +236,13 @@ brain_test_isolation_is_active() {
       my $name = getsockname($socket);
       return 0 unless defined($name) && unpack_sockaddr_un($name) eq $expected_path;
       my @stat = stat($socket);
-      return @stat && "$stat[0]:$stat[1]" eq $expected_identity;
+      # The proof producer formats the listener identity unsigned
+      # (unsigned_identity: st_dev cast to u64). macOS sockets report
+      # st_dev = -1, so a signed stringify can never equal that form and
+      # this check could not pass on Darwin; normalize to the producer
+      # representation. The binding itself is unchanged: exact equality on
+      # the same device and inode (issue #432 finding).
+      return @stat && sprintf("%u:%u", $stat[0], $stat[1]) eq $expected_identity;
     }
     exit(
       verify_listener(110, $ARGV[0]) &&

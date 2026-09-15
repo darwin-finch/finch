@@ -18,7 +18,7 @@ source "$repo_root/scripts/lib/brain_test_isolation.sh"
 # explicitly.
 selected_cargo_target=''
 if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
-  supervisor_selection="$("$repo_root/scripts/test_brains.sh" bash -c \
+  supervisor_selection="$("$repo_root/scripts/test_brains.sh" bash -ec \
     'printf "%s\n%s\n" "$FINCH_TEST_SUPERVISOR_BIN" "$CARGO_TARGET_DIR"')"
   if [[ "$supervisor_selection" != *$'\n'* ]]; then
     echo "Brain isolation freshness probe omitted its Cargo target: supervisor=${supervisor_selection:-<unset>} target=<unset>" >&2
@@ -104,13 +104,13 @@ exercise_supervisor_substitution() {
   FINCH_SUBSTITUTION_CONTINUE="$substitution_continue" \
   FINCH_SUBSTITUTION_REJECTED="$substitution_rejected" \
   FINCH_SUBSTITUTION_RESTORED="$substitution_restored" \
-    FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" "$candidate" bash -c '
+    FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" "$candidate" bash -ec '
       : >"$FINCH_SUBSTITUTION_READY"
       for _ in {1..400}; do
         [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]] && break
         sleep 0.01
       done
-      [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]]
+      test -e "$FINCH_SUBSTITUTION_CONTINUE"
       if "$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof >/dev/null 2>&1; then
         exit 1
       fi
@@ -232,7 +232,7 @@ env -u FINCH_TEST_SUPERVISOR_BIN \
   FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR="$launcher_target" \
   FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
   FINCH_STALE_SUPERVISOR_RAN="$stale_supervisor_ran" FINCH_LAUNCHER_OBSERVED="$observed_stale_launcher" \
-  "$repo_root/scripts/test_brains.sh" bash -c \
+  "$repo_root/scripts/test_brains.sh" bash -ec \
   'printf "%s\n" "$FINCH_TEST_SUPERVISOR_BIN" >"$FINCH_LAUNCHER_OBSERVED"' \
   2>"$stale_launcher_diagnostic" || \
   stale_launcher_status=$?
@@ -352,7 +352,7 @@ run_concurrent_launcher() {
     FINCH_TEST_SUPERVISOR_PIN_READY_DIR="$pin_ready_dir" \
     FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE="$pin_continue_file" \
     FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
-    FINCH_PIN_RESULT="$result_file" "$repo_root/scripts/test_brains.sh" bash -c '
+    FINCH_PIN_RESULT="$result_file" "$repo_root/scripts/test_brains.sh" bash -ec '
       case "$(uname -s)" in
         Darwin) identity="$(stat -f "%d:%i" "$FINCH_TEST_SUPERVISOR_BIN")" ;;
         Linux) identity="$(stat -c "%d:%i" "$FINCH_TEST_SUPERVISOR_BIN")" ;;
@@ -407,7 +407,7 @@ created="$scratch/created-home"
 phase=sealed-proof-and-endpoints
 FINCH_TEST_BRAIN_ADDR=127.0.0.1:11436 FINCH_TEST_DAEMON_ADDR=127.0.0.1:11435 \
 FINCH_TEST_BRAIN_PASSWORD=ambient-password FINCH_CREATED_HOME="$created" \
-FINCH_PROOF_HELPER="$repo_root/scripts/lib/brain_test_isolation.sh" run_isolated bash -c '
+FINCH_PROOF_HELPER="$repo_root/scripts/lib/brain_test_isolation.sh" run_isolated bash -ec '
   source "$FINCH_PROOF_HELPER"
   brain_test_isolation_is_active
   test "$FINCH_BRAIN_TEST_ROOT" = "$HOME/.finch/brains"
@@ -416,11 +416,11 @@ FINCH_PROOF_HELPER="$repo_root/scripts/lib/brain_test_isolation.sh" run_isolated
   test "$FINCH_TEST_BRAIN_ADDR" != 127.0.0.1:11436
   test "$FINCH_TEST_DAEMON_ADDR" != 127.0.0.1:11435
   test "$FINCH_TEST_BRAIN_PASSWORD" != ambient-password
-  [[ "$FINCH_TEST_BRAIN_PASSWORD" =~ ^test-[0-9a-f]{32}$ ]]
-  ! printf attacker >&9
-  ! printf attacker >&108
-  ! sh -c ": >/dev/fd/9"
-  ! sh -c ": >/dev/fd/108"
+  [[ "$FINCH_TEST_BRAIN_PASSWORD" =~ ^test-[0-9a-f]{32}$ ]] || exit 1
+  if printf attacker >&9; then exit 1; fi
+  if printf attacker >&108; then exit 1; fi
+  if sh -c ": >/dev/fd/9"; then exit 1; fi
+  if sh -c ": >/dev/fd/108"; then exit 1; fi
   printf "%s\n" "$HOME" >"$FINCH_CREATED_HOME"
   printf test >"$FINCH_BRAIN_TEST_ROOT/test-created"
 '
@@ -439,7 +439,7 @@ XDG_CONFIG_HOME="$hostile_state/config" XDG_CACHE_HOME="$hostile_state/cache" \
 XDG_DATA_HOME="$hostile_state/data" XDG_STATE_HOME="$hostile_state/state" \
 HF_HOME="$hostile_state/hf" HUGGINGFACE_HUB_CACHE="$hostile_state/hub" \
 TRANSFORMERS_CACHE="$hostile_state/transformers" TMPDIR="$hostile_state/tmp" \
-FINCH_WIRE_CORPUS_PATH="$hostile_state/corpus.jsonl" run_isolated bash -c '
+FINCH_WIRE_CORPUS_PATH="$hostile_state/corpus.jsonl" run_isolated bash -ec '
   for variable in XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME \
     HF_HOME HUGGINGFACE_HUB_CACHE TRANSFORMERS_CACHE TMPDIR; do
     value="${!variable}"
@@ -463,7 +463,7 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 parallel_a="$scratch/parallel-a"
 parallel_b="$scratch/parallel-b"
 phase=parallel-supervisor-isolation
-FINCH_PARALLEL_RECORD="$parallel_a" run_isolated bash -c '
+FINCH_PARALLEL_RECORD="$parallel_a" run_isolated bash -ec '
   printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
     "$HOME" "$FINCH_BRAIN_TEST_ROOT" "$FINCH_TEST_SOCKET_ROOT" \
     "$FINCH_TEST_IPC_SOCKET" "$FINCH_TEST_BRAIN_ADDR" \
@@ -471,7 +471,7 @@ FINCH_PARALLEL_RECORD="$parallel_a" run_isolated bash -c '
     "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" >"$FINCH_PARALLEL_RECORD"
   sleep 0.2
 ' & parallel_pid_a=$!
-FINCH_PARALLEL_RECORD="$parallel_b" run_isolated bash -c '
+FINCH_PARALLEL_RECORD="$parallel_b" run_isolated bash -ec '
   printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
     "$HOME" "$FINCH_BRAIN_TEST_ROOT" "$FINCH_TEST_SOCKET_ROOT" \
     "$FINCH_TEST_IPC_SOCKET" "$FINCH_TEST_BRAIN_ADDR" \
@@ -498,11 +498,11 @@ printf '%s\n' forged "$fake_home" "$fake_home/.finch/brains" 0:0 0:0 \
   FINCH_BRAIN_TEST_ISOLATED=1 FINCH_BRAIN_TEST_PROOF_FD=9 \
     FINCH_BRAIN_TEST_TOKEN=forged FINCH_TEST_SUPERVISOR_PID="$$" \
     FINCH_PROOF_HELPER="$repo_root/scripts/lib/brain_test_isolation.sh" \
-    bash -c 'source "$FINCH_PROOF_HELPER"; ! brain_test_isolation_is_active'
+    bash -ec 'source "$FINCH_PROOF_HELPER"; ! brain_test_isolation_is_active'
 )
 
 phase=ordinary-nonzero-cleanup
-if run_isolated bash -c 'exit 23'; then exit 1; else test "$?" -eq 23; fi
+if run_isolated bash -ec 'exit 23'; then exit 1; else test "$?" -eq 23; fi
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 # A Rust panic after spawning a TERM-resistant descendant still leaves both
@@ -540,7 +540,7 @@ phase=timeout-descendant-cleanup
 timeout_status=0
 FINCH_TIMEOUT_TARGET_FILE="$timeout_target_file" \
 FINCH_TIMEOUT_DESCENDANT_PID_FILE="$timeout_descendant_pid_file" \
-FINCH_TIMEOUT_HOME_FILE="$timeout_home_file" run_isolated bash -c '
+FINCH_TIMEOUT_HOME_FILE="$timeout_home_file" run_isolated bash -ec '
   (trap "" TERM HUP INT; printf "%s\n" "$BASHPID" >"$FINCH_TIMEOUT_DESCENDANT_PID_FILE"; sleep 30) &
   printf "%s\n" "$HOME" >"$FINCH_TIMEOUT_HOME_FILE"
   printf "%s\n" "$FINCH_TEST_SUPERVISOR_PID" >"$FINCH_TIMEOUT_TARGET_FILE"
@@ -582,7 +582,7 @@ chmod +x "$inspection_bin/ps"
 inspection_observer_pid=$!
 if FINCH_DESCENDANT_PID_FILE="$inspection_pid" FINCH_OBSERVED_HOME="$inspection_home" \
   FINCH_SHADOW_PS_CALLED="$inspection_called" PATH="$inspection_bin:$PATH" \
-  run_isolated bash -c '
+  run_isolated bash -ec '
     printf "%s\n" "$HOME" >"$FINCH_OBSERVED_HOME"
     (trap "" TERM HUP INT; printf "%s\n" "$BASHPID" >"$FINCH_DESCENDANT_PID_FILE"; sleep 30) &
     exit 31
@@ -620,7 +620,7 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 # process group. The leader remains unreaped until that group is quiescent.
 normal_descendant_pid_file="$scratch/normal-descendant.pid"
 phase=normal-exit-term-resistant-descendant
-if FINCH_DESCENDANT_PID_FILE="$normal_descendant_pid_file" run_isolated bash -c '
+if FINCH_DESCENDANT_PID_FILE="$normal_descendant_pid_file" run_isolated bash -ec '
   (trap "" TERM HUP INT; echo "$BASHPID" >"$FINCH_DESCENDANT_PID_FILE"; sleep 30) &
   exit 29
 '; then
@@ -634,7 +634,7 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 phase=real-store-manifest-guard
 if FINCH_REAL_STORE="$fake_home/.finch/brains/existing" \
-  run_isolated bash -c 'printf changed >"$FINCH_REAL_STORE/events.jsonl"'; then
+  run_isolated bash -ec 'printf changed >"$FINCH_REAL_STORE/events.jsonl"'; then
   exit 1
 else
   test "$?" -eq 70
@@ -646,7 +646,7 @@ phase=real-node-id-manifest-guard
 node_diagnostic="$scratch/node-manifest-diagnostic"
 node_status=0
 FINCH_REAL_NODE_ID="$fake_home/.finch/node_id" \
-  run_isolated bash -c 'printf changed >"$FINCH_REAL_NODE_ID"' \
+  run_isolated bash -ec 'printf changed >"$FINCH_REAL_NODE_ID"' \
   2>"$node_diagnostic" || node_status=$?
 test "$node_status" -eq 70
 if rg -q 'real-home|node_id|keep node|FINCH_REAL_NODE_ID' "$node_diagnostic"; then
@@ -662,7 +662,7 @@ combined_status=0
 FINCH_REAL_NODE_ID="$fake_home/.finch/node_id" \
 FINCH_TEST_FORCE_MANIFEST_AFTER_ERROR=1 \
 FINCH_TEST_REPORT_NODE_AFTER=1 \
-  run_isolated bash -c '
+  run_isolated bash -ec '
     printf changed >"$FINCH_REAL_NODE_ID"
   ' >/dev/null 2>"$combined_diagnostic" || combined_status=$?
 test "$combined_status" -eq 70
@@ -683,7 +683,7 @@ phase=real-node-id-ancestor-swap-rejected
 moved_real_home="$scratch/real-home-moved"
 ancestor_status=0
 FINCH_REAL_HOME_PATH="$fake_home" FINCH_MOVED_REAL_HOME="$moved_real_home" \
-  run_isolated bash -c '
+  run_isolated bash -ec '
     mv "$FINCH_REAL_HOME_PATH" "$FINCH_MOVED_REAL_HOME"
     mkdir -p "$FINCH_REAL_HOME_PATH/.finch/brains"
     printf attacker >"$FINCH_REAL_HOME_PATH/.finch/node_id"
@@ -719,7 +719,7 @@ diagnostic="$scratch/manifest-diagnostic"
 phase=manifest-directory-status
 directory_status=0
 FINCH_REAL_STORE="$fake_home/.finch/brains" \
-  run_isolated bash -c 'mkdir "$FINCH_REAL_STORE/secret-directory"' \
+  run_isolated bash -ec 'mkdir "$FINCH_REAL_STORE/secret-directory"' \
   2>"$diagnostic" || directory_status=$?
 [[ "$directory_status" == 70 ]] || {
   echo "directory manifest adversary returned $directory_status, expected 70" >&2
@@ -735,7 +735,7 @@ rmdir "$fake_home/.finch/brains/secret-directory"
 phase=manifest-symlink-status
 symlink_status=0
 FINCH_REAL_STORE="$fake_home/.finch/brains" \
-  run_isolated bash -c \
+  run_isolated bash -ec \
   'ln -s /private/secret-target "$FINCH_REAL_STORE/secret-link"' \
   2>"$diagnostic" || symlink_status=$?
 [[ "$symlink_status" == 70 ]] || {
@@ -767,7 +767,7 @@ chmod "$original_mode" "$fake_home/.finch/brains/existing/events.jsonl"
 phase=manifest-fifo-status
 fifo_status=0
 FINCH_REAL_STORE="$fake_home/.finch/brains" \
-  run_isolated bash -c 'mkfifo "$FINCH_REAL_STORE/secret-fifo"' \
+  run_isolated bash -ec 'mkfifo "$FINCH_REAL_STORE/secret-fifo"' \
   2>"$diagnostic" || fifo_status=$?
 [[ "$fifo_status" == 70 ]] || {
   echo "FIFO manifest adversary returned $fifo_status, expected 70" >&2
@@ -812,7 +812,7 @@ race_path="$fake_home/.finch/brains/$race_name"
 race_status=0
 FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
   FINCH_TEST_MANIFEST_RACE_NAME="$race_name" FINCH_REAL_STORE="$fake_home/.finch/brains" \
-  "$supervisor" bash -c 'printf regular >"$FINCH_REAL_STORE/manifest-race-node"' \
+  "$supervisor" bash -ec 'printf regular >"$FINCH_REAL_STORE/manifest-race-node"' \
   2>"$diagnostic" || race_status=$?
 wait "$race_swapper_pid"
 [[ "$race_status" == 70 ]] || {
@@ -872,7 +872,7 @@ signal_status=0
 FINCH_STUBBORN_PID_FILE="$stubborn_pid_file" FINCH_STUBBORN_READY_FILE="$stubborn_ready_file" \
 FINCH_STUBBORN_TERM_FILE="$stubborn_term_file" FINCH_STUBBORN_TARGET_FILE="$stubborn_target_file" \
 FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" \
-FINCH_STUBBORN_TERM_PAUSE_AFTER_FIRST_FILE="$stubborn_later_pause_file" run_isolated bash -c '
+FINCH_STUBBORN_TERM_PAUSE_AFTER_FIRST_FILE="$stubborn_later_pause_file" run_isolated bash -ec '
   leader_pid=$BASHPID
   "$FINCH_TEST_SUPERVISOR_BIN" --child-stubborn-probe &
   while [[ ! -s "$FINCH_STUBBORN_READY_FILE" ]]; do sleep 0.005; done
@@ -1042,7 +1042,7 @@ sentinel_fifo="$scratch/sentinel.control"
 phase=unrelated-finch-sentinel
 mkfifo "$sentinel_fifo"
 exec 7<>"$sentinel_fifo"
-bash -c 'exec -a finch bash -c "read -r _"' <&7 & sentinel_pid=$!
+bash -ec 'exec -a finch bash -ec "read -r _"' <&7 & sentinel_pid=$!
 mock_finch="$scratch/mock-finch"
 printf '%s\n' '#!/bin/bash' 'while :; do sleep 1; done' >"$mock_finch"
 chmod +x "$mock_finch"
@@ -1075,5 +1075,26 @@ tests/no_external_provider_binary_test.rs:.process_group(0);
 EOF
 )"
 [[ "$escape_uses" == "$expected_escape_uses" ]]
+
+# set -e is not inherited across a bash process boundary, so an inline child
+# interpreter started without errexit observes only its last command's status:
+# every intermediate assertion in its body is inert. This guard is deliberate
+# exact-text matching, not a shell parser; the general shell scanner reviewed
+# for the macOS gate (the rejected #430 pass) false-certified AND/OR suffixes
+# and nested-delimiter forms, so the unguarded child-interpreter token is
+# forbidden outright instead of certified per body.
+phase=inline-bash-children-run-under-errexit
+scan_status=0
+rg -n 'bash [-]c' \
+  "$repo_root/scripts/test_brain_isolation.sh" \
+  "$repo_root/scripts/lib/brain_test_isolation.sh" || scan_status=$?
+if [[ "$scan_status" -eq 0 ]]; then
+  echo 'isolation harness or library spawned an inline child interpreter without errexit authority; every intermediate assertion in its body is inert' >&2
+  exit 1
+fi
+if [[ "$scan_status" -ne 1 ]]; then
+  echo "inline-child errexit scan could not run: rg exited $scan_status" >&2
+  exit "$scan_status"
+fi
 
 echo 'Brain test isolation regression checks passed.'
