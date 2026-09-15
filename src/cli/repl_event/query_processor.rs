@@ -2126,12 +2126,12 @@ mod tests {
             let query_id = query_states
                 .create_query(conversation.read().await.get_messages())
                 .await;
-            let run_id = crate::brain::store::RunId(Uuid::new_v4());
+            let run_id = crate::brain::RunId(Uuid::new_v4());
             query_states
                 .bind_brain_turn_provenance(
                     query_id,
                     super::super::query_state::BrainTurnProvenance {
-                        brain_id: crate::brain::store::BrainId(Uuid::new_v4()),
+                        brain_id: crate::brain::BrainId(Uuid::new_v4()),
                         run_id,
                         request_seq: 1,
                     },
@@ -2652,8 +2652,8 @@ mod tests {
             .bind_brain_turn_provenance(
                 query_id,
                 super::super::query_state::BrainTurnProvenance {
-                    brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
-                    run_id: crate::brain::store::RunId(uuid::Uuid::new_v4()),
+                    brain_id: crate::brain::BrainId(uuid::Uuid::new_v4()),
+                    run_id: crate::brain::RunId(uuid::Uuid::new_v4()),
                     request_seq: 9,
                 },
             )

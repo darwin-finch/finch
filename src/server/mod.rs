@@ -146,13 +146,13 @@ pub struct AgentServer {
     /// Append-only explicit user feedback. This is not a training queue.
     feedback_store: Arc<FeedbackLogger>,
     /// Authoritative event logs and program stacks for named shared brains.
-    brain_store: crate::brain::store::BrainStore,
+    brain_store: crate::brain::BrainStore,
     /// Send-safe bridge to frontend-owned Cap'n Proto runner callbacks.
     brain_runners: BrainRunnerBroker,
     /// Pending approval continuations keyed to their exact Brain attachment.
     brain_approvals: BrainApprovalBroker,
     /// Persistent signer and revocation ledger for scoped remote participants.
-    brain_credentials: crate::brain::credential::BrainCredentialAuthority,
+    brain_credentials: crate::brain::BrainCredentialAuthority,
     /// Application-owned MCP configuration and lazily connected transport for
     /// daemon-executed named-Brain programs. The transport is shared, while
     /// each Brain runtime installs its own verified vocabulary metadata.
@@ -413,7 +413,7 @@ impl AgentServer {
     pub(crate) fn for_brain_http_test(
         machine: &str,
         state_root: &std::path::Path,
-        brain_credentials: crate::brain::credential::BrainCredentialAuthority,
+        brain_credentials: crate::brain::BrainCredentialAuthority,
     ) -> Result<Self> {
         let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
         Ok(Self {
@@ -429,7 +429,7 @@ impl AgentServer {
             bootstrap_loader: Arc::new(BootstrapLoader::new(Arc::clone(&generator_state), None)),
             generator_state,
             feedback_store: Arc::new(FeedbackLogger::at(state_root.join("feedback.jsonl"))?),
-            brain_store: crate::brain::store::BrainStore::with_root(
+            brain_store: crate::brain::BrainStore::with_root(
                 machine,
                 Some(state_root.join("brains")),
             ),
@@ -447,7 +447,7 @@ impl AgentServer {
     pub(crate) fn for_supervised_brain_http_test(
         machine: &str,
         state_root: &std::path::Path,
-        brain_credentials: crate::brain::credential::BrainCredentialAuthority,
+        brain_credentials: crate::brain::BrainCredentialAuthority,
     ) -> Result<Self> {
         use anyhow::Context as _;
         let proof = crate::brain::isolated_test_proof()
@@ -462,8 +462,8 @@ impl AgentServer {
 
     #[cfg(test)]
     pub(crate) fn for_brain_protocol_test(
-        store: crate::brain::store::BrainStore,
-        credentials: crate::brain::credential::BrainCredentialAuthority,
+        store: crate::brain::BrainStore,
+        credentials: crate::brain::BrainCredentialAuthority,
         password: String,
         state_root: &std::path::Path,
     ) -> Result<Self> {
@@ -543,7 +543,7 @@ impl AgentServer {
             })?
             .join(".finch");
         let brain_credentials =
-            crate::brain::credential::BrainCredentialAuthority::load_or_create(&credential_state)?;
+            crate::brain::BrainCredentialAuthority::load_or_create(&credential_state)?;
         let mcp_servers = config.mcp_servers.clone();
 
         Ok(Self {
@@ -557,7 +557,7 @@ impl AgentServer {
             bootstrap_loader,
             generator_state,
             feedback_store: Arc::new(FeedbackLogger::new()?),
-            brain_store: crate::brain::store::BrainStore::new(machine),
+            brain_store: crate::brain::BrainStore::new(machine),
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
             brain_credentials,
@@ -637,7 +637,7 @@ impl AgentServer {
                     last_warm = tokio::time::Instant::now();
                 }
 
-                let now = crate::brain::store::unix_millis();
+                let now = crate::brain::unix_millis();
                 let sleep_for =
                     schedule_delivery::sleep_for(schedule_store.next_schedule_due_ms(), now);
                 if !sleep_for.is_zero() {
@@ -649,7 +649,7 @@ impl AgentServer {
                     }
                 }
 
-                let now = crate::brain::store::unix_millis();
+                let now = crate::brain::unix_millis();
                 let head_before = schedule_store.next_schedule_due_ms();
                 // Selection by due time, not by Brain: this names only the
                 // Brains that actually have work, without hydrating any.
@@ -659,7 +659,7 @@ impl AgentServer {
                         schedule_store.clone(),
                         schedule_runners.clone(),
                         name.clone(),
-                        crate::brain::store::unix_millis(),
+                        crate::brain::unix_millis(),
                     )
                     .await
                     {
@@ -674,7 +674,7 @@ impl AgentServer {
                 if schedule_delivery::should_back_off(
                     head_before,
                     head_after,
-                    crate::brain::store::unix_millis(),
+                    crate::brain::unix_millis(),
                 ) {
                     tokio::time::sleep(UNDELIVERED_RETRY).await;
                 }
@@ -850,7 +850,7 @@ impl AgentServer {
         self.started_at.elapsed()
     }
 
-    pub fn brain_store(&self) -> &crate::brain::store::BrainStore {
+    pub fn brain_store(&self) -> &crate::brain::BrainStore {
         &self.brain_store
     }
 
@@ -895,7 +895,7 @@ impl AgentServer {
         *self.brain_password.write().await = password;
     }
 
-    pub fn brain_credentials(&self) -> &crate::brain::credential::BrainCredentialAuthority {
+    pub fn brain_credentials(&self) -> &crate::brain::BrainCredentialAuthority {
         &self.brain_credentials
     }
 
@@ -1197,9 +1197,8 @@ mod tests {
         );
 
         for (cycle, query) in ["before restart", "after restart"].into_iter().enumerate() {
-            let authority = crate::brain::credential::BrainCredentialAuthority::ephemeral(
-                [cycle as u8 + 1; 32],
-            );
+            let authority =
+                crate::brain::BrainCredentialAuthority::ephemeral([cycle as u8 + 1; 32]);
             let server =
                 AgentServer::for_brain_http_test("feedback-fixture.local", temp.path(), authority)
                     .unwrap();
@@ -1238,7 +1237,7 @@ mod tests {
     async fn test_daemon_feedback_storage_failure_redacts_private_path() {
         let temp = tempfile::tempdir().unwrap();
         let state_root = temp.path().join("customer-secret-project");
-        let authority = crate::brain::credential::BrainCredentialAuthority::ephemeral([7; 32]);
+        let authority = crate::brain::BrainCredentialAuthority::ephemeral([7; 32]);
         let mut server =
             AgentServer::for_brain_http_test("feedback-fixture.local", &state_root, authority)
                 .unwrap();
@@ -1321,7 +1320,7 @@ mod tests {
                 observed_launches.fetch_add(1, Ordering::SeqCst);
             }),
         );
-        let authority = crate::brain::credential::BrainCredentialAuthority::ephemeral([8; 32]);
+        let authority = crate::brain::BrainCredentialAuthority::ephemeral([8; 32]);
         let server = Arc::new(
             AgentServer::for_brain_http_test("feedback-fixture.local", &state_root, authority)
                 .unwrap(),
@@ -1408,7 +1407,7 @@ mod tests {
 
     fn isolated_http_server() -> (tempfile::TempDir, Arc<AgentServer>) {
         let state = tempfile::tempdir().unwrap();
-        let credentials = crate::brain::credential::BrainCredentialAuthority::load_or_create(
+        let credentials = crate::brain::BrainCredentialAuthority::load_or_create(
             &state.path().join("credentials"),
         )
         .unwrap();
@@ -1884,7 +1883,7 @@ mod tests {
             .push(
                 &name,
                 "isolation-test",
-                crate::brain::store::BrainEventKind::Prompt {
+                crate::brain::BrainEventKind::Prompt {
                     text: "boundary proof".into(),
                 },
             )
@@ -1911,7 +1910,7 @@ mod tests {
         let result = AgentServer::for_supervised_brain_http_test(
             "containment.local",
             &requested,
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([71; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([71; 32]),
         );
         let error = match result {
             Ok(_) => panic!("parent traversal unexpectedly constructed a server"),
@@ -1940,7 +1939,7 @@ mod tests {
         let result = AgentServer::for_supervised_brain_http_test(
             "containment.local",
             &link,
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([72; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([72; 32]),
         );
         let error = match result {
             Ok(_) => panic!("symlink traversal unexpectedly constructed a server"),
@@ -1977,7 +1976,7 @@ mod tests {
         let mut server = AgentServer::for_brain_http_test(
             "containment.local",
             &pinned.path,
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([73; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([73; 32]),
         )
         .unwrap();
         server.supervised_state_root = Some(pinned.directory);
@@ -1987,7 +1986,7 @@ mod tests {
             .push(
                 &brain,
                 "containment-test",
-                crate::brain::store::BrainEventKind::Prompt {
+                crate::brain::BrainEventKind::Prompt {
                     text: "descriptor-pinned write".into(),
                 },
             )
@@ -2011,7 +2010,7 @@ mod tests {
         let error = match AgentServer::for_supervised_brain_http_test(
             "containment.local",
             &second,
-            crate::brain::credential::BrainCredentialAuthority::ephemeral([74; 32]),
+            crate::brain::BrainCredentialAuthority::ephemeral([74; 32]),
         ) {
             Ok(_) => panic!("a second fixture changed the process-relative root"),
             Err(error) => error,

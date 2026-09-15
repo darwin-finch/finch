@@ -16,8 +16,8 @@ use uuid::Uuid;
 /// run. This is never authentication or authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrainTurnProvenance {
-    pub brain_id: crate::brain::store::BrainId,
-    pub run_id: crate::brain::store::RunId,
+    pub brain_id: crate::brain::BrainId,
+    pub run_id: crate::brain::RunId,
     pub request_seq: u64,
 }
 

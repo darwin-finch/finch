@@ -652,7 +652,7 @@ fn invitation_join_rejects_a_bare_local_target() {
 async fn named_brain_schedule_effect_uses_the_run_scoped_control_proxy() {
     let runtime = crate::runtime::ProgramRuntime::new();
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
-    let schedule_id = crate::brain::store::ScheduleId(uuid::Uuid::new_v4());
+    let schedule_id = crate::brain::ScheduleId(uuid::Uuid::new_v4());
     tokio::spawn(async move {
         let crate::server::RunnerProgramControlRequest::CreateSchedule {
             language,
@@ -666,19 +666,19 @@ async fn named_brain_schedule_effect_uses_the_run_scoped_control_proxy() {
         else {
             panic!("expected schedule creation")
         };
-        assert_eq!(language, crate::brain::store::ProgramLanguage::Lisp);
+        assert_eq!(language, crate::brain::ProgramLanguage::Lisp);
         assert_eq!(source, "(say \"later\")");
         assert!(grant_ceiling.is_pure());
         assert_eq!(next_due_ms, 1_770_000_000_000);
         assert_eq!(interval_ms, None);
         assert_eq!(
             delivery_policy,
-            crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce
+            crate::brain::BrainScheduleDeliveryPolicy::Coalesce
         );
         response_tx
-            .send(Ok(crate::brain::store::BrainSchedule {
+            .send(Ok(crate::brain::BrainSchedule {
                 schedule_id,
-                initiating_attachment_id: crate::brain::store::AttachmentId(uuid::Uuid::new_v4()),
+                initiating_attachment_id: crate::brain::AttachmentId(uuid::Uuid::new_v4()),
                 created_by: "alice".into(),
                 grant_ceiling,
                 language,
@@ -711,7 +711,7 @@ async fn named_brain_schedule_effect_uses_the_run_scoped_control_proxy() {
     let values = super::execute_named_brain_schedule_effect(
         &runtime,
         &control_tx,
-        crate::brain::store::ProgramLanguage::Lisp,
+        crate::brain::ProgramLanguage::Lisp,
         Some(&crate::vm::EffectSet::pure()),
         &effect,
     )
@@ -1354,12 +1354,12 @@ fn test_issue_652_lifecycle_unbound_events_form_one_structured_activity_unit() {
 
 #[test]
 fn initialization_command_distinguishes_completed_one_shot() {
-    let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    let store = crate::brain::BrainStore::with_root("box.local", None);
     let attachment = store
         .attach(
             "shared",
             "alice",
-            crate::brain::store::AttachmentRole::Driver,
+            crate::brain::AttachmentRole::Driver,
             None,
         )
         .unwrap();
@@ -1373,10 +1373,8 @@ fn initialization_command_distinguishes_completed_one_shot() {
     assert!(initialization_schedule_message(&schedule, None).contains("scheduled"));
     let mut completed = schedule;
     completed.active = false;
-    let message = initialization_schedule_message(
-        &completed,
-        Some(crate::brain::store::BrainRunStatus::Completed),
-    );
+    let message =
+        initialization_schedule_message(&completed, Some(crate::brain::BrainRunStatus::Completed));
     assert!(message.contains("already completed"));
     assert!(!message.contains(" scheduled as "));
 }
@@ -1384,11 +1382,11 @@ fn initialization_command_distinguishes_completed_one_shot() {
 fn brain_event(
     seq: u64,
     sender: &str,
-    kind: crate::brain::store::BrainEventKind,
-) -> crate::brain::store::BrainEvent {
-    crate::brain::store::BrainEvent {
+    kind: crate::brain::BrainEventKind,
+) -> crate::brain::BrainEvent {
+    crate::brain::BrainEvent {
         schema_version: 1,
-        brain_id: crate::brain::store::BrainId(uuid::Uuid::nil()),
+        brain_id: crate::brain::BrainId(uuid::Uuid::nil()),
         seq,
         environment_generation: 1,
         sender: sender.into(),
@@ -1401,7 +1399,7 @@ fn brain_event(
 
 #[test]
 fn snapshot_replay_keeps_conversation_and_hides_presence_churn() {
-    use crate::brain::store::{AttachmentId, AttachmentRole, BrainEventKind, ConnectionId};
+    use crate::brain::{AttachmentId, AttachmentRole, BrainEventKind, ConnectionId};
 
     let prompt = brain_event(
         1,
@@ -1427,7 +1425,7 @@ fn snapshot_replay_keeps_conversation_and_hides_presence_churn() {
 
 #[test]
 fn brain_projection_suppresses_snapshot_live_overlap() {
-    let brain_id = crate::brain::store::BrainId(uuid::Uuid::new_v4());
+    let brain_id = crate::brain::BrainId(uuid::Uuid::new_v4());
     let mut revisions = std::collections::HashMap::new();
 
     assert!(advance_brain_projection_revision(
@@ -1449,8 +1447,8 @@ fn brain_projection_suppresses_snapshot_live_overlap() {
 
 #[test]
 fn brain_projection_keeps_later_transitions_and_brains_independent() {
-    let first = crate::brain::store::BrainId(uuid::Uuid::new_v4());
-    let second = crate::brain::store::BrainId(uuid::Uuid::new_v4());
+    let first = crate::brain::BrainId(uuid::Uuid::new_v4());
+    let second = crate::brain::BrainId(uuid::Uuid::new_v4());
     let mut revisions = std::collections::HashMap::new();
 
     assert!(advance_brain_projection_revision(&mut revisions, first, 20));
@@ -1460,7 +1458,7 @@ fn brain_projection_keeps_later_transitions_and_brains_independent() {
 
 #[test]
 fn canonical_brain_context_projects_conversation_without_program_source() {
-    use crate::brain::store::{BrainEventKind, ProgramLanguage};
+    use crate::brain::{BrainEventKind, ProgramLanguage};
     use crate::cli::status_bar::{StatusBar, StatusLineType};
 
     let events = vec![
@@ -1518,7 +1516,7 @@ fn canonical_brain_context_projects_conversation_without_program_source() {
 
 #[test]
 fn canonical_brain_context_ignores_failed_results_and_bounds_text() {
-    use crate::brain::store::BrainEventKind;
+    use crate::brain::BrainEventKind;
     use crate::cli::status_bar::{StatusBar, StatusLineType};
 
     let events = vec![
@@ -1558,7 +1556,7 @@ fn canonical_brain_context_ignores_failed_results_and_bounds_text() {
 
 #[test]
 fn canonical_brain_context_excludes_correlated_speculative_output() {
-    use crate::brain::store::{
+    use crate::brain::{
         AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
     };
     let run_id = RunId(uuid::Uuid::new_v4());
@@ -1612,7 +1610,7 @@ fn canonical_brain_context_excludes_correlated_speculative_output() {
 
 #[test]
 fn snapshot_groups_speculative_lifecycle_program_and_result_by_exact_run_id() {
-    use crate::brain::store::{
+    use crate::brain::{
         AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
         RunId,
     };
@@ -1683,7 +1681,7 @@ fn snapshot_groups_speculative_lifecycle_program_and_result_by_exact_run_id() {
 
 #[test]
 fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
-    use crate::brain::store::{BrainEventKind, BrainRunKind, BrainRunStatus, RunId};
+    use crate::brain::{BrainEventKind, BrainRunKind, BrainRunStatus, RunId};
     use crate::cli::messages::{Message, TranscriptRowKind};
 
     let output =
@@ -1760,7 +1758,7 @@ fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
 
 #[test]
 fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
-    use crate::brain::store::{
+    use crate::brain::{
         AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
     };
     use crate::cli::messages::{Message, TranscriptRowKind};
@@ -1845,7 +1843,7 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
 
 #[test]
 fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
-    use crate::brain::store::{
+    use crate::brain::{
         AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
         RunId,
     };
@@ -2014,7 +2012,7 @@ fn named_brain_continuation_preserves_multi_text_and_opaque_order() {
     let (source, language, captured) =
         super::named_brain_wire_source(vec![initial, continuation.clone()], 1).unwrap();
     assert_eq!(source, "(say \"done\")");
-    assert_eq!(language, crate::brain::store::ProgramLanguage::Lisp);
+    assert_eq!(language, crate::brain::ProgramLanguage::Lisp);
     assert_eq!(
         serde_json::to_value(captured).unwrap(),
         serde_json::to_value(vec![continuation]).unwrap()
@@ -2023,7 +2021,7 @@ fn named_brain_continuation_preserves_multi_text_and_opaque_order() {
 
 #[test]
 fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
-    use crate::brain::store::{
+    use crate::brain::{
         AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
     };
 
@@ -2216,7 +2214,7 @@ fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
 #[test]
 fn local_runner_projection_suppresses_matching_canonical_program_and_result() {
     let mut projection = LocalBrainProjection {
-        run_id: crate::brain::store::RunId(uuid::Uuid::nil()),
+        run_id: crate::brain::RunId(uuid::Uuid::nil()),
         source: "(say \"hello\")".into(),
         output: "hello".into(),
         tool_ids: std::collections::HashSet::new(),
@@ -2228,8 +2226,8 @@ fn local_runner_projection_suppresses_matching_canonical_program_and_result() {
     let mut program = brain_event(
         12,
         "provider",
-        crate::brain::store::BrainEventKind::Program {
-            language: crate::brain::store::ProgramLanguage::Lisp,
+        crate::brain::BrainEventKind::Program {
+            language: crate::brain::ProgramLanguage::Lisp,
             source: "(say \"hello\")".into(),
         },
     );
@@ -2240,7 +2238,7 @@ fn local_runner_projection_suppresses_matching_canonical_program_and_result() {
     let mut result = brain_event(
         14,
         "daemon",
-        crate::brain::store::BrainEventKind::Result {
+        crate::brain::BrainEventKind::Result {
             request_seq: 12,
             output: "hello".into(),
             error: None,
@@ -2258,7 +2256,7 @@ fn local_runner_projection_suppresses_matching_canonical_program_and_result() {
 #[test]
 fn local_runner_projection_does_not_hide_different_canonical_output() {
     let mut projection = LocalBrainProjection {
-        run_id: crate::brain::store::RunId(uuid::Uuid::nil()),
+        run_id: crate::brain::RunId(uuid::Uuid::nil()),
         source: "(say \"hello\")".into(),
         output: "hello".into(),
         tool_ids: std::collections::HashSet::new(),
@@ -2270,7 +2268,7 @@ fn local_runner_projection_does_not_hide_different_canonical_output() {
     let mut result = brain_event(
         14,
         "daemon",
-        crate::brain::store::BrainEventKind::Result {
+        crate::brain::BrainEventKind::Result {
             request_seq: 12,
             output: "different".into(),
             error: None,

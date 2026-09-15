@@ -3,7 +3,7 @@
 // Named-Brain sessions journal replacements before updating this local TUI
 // projection. Standalone tool tests may still use it without a Brain target.
 
-pub use crate::brain::tasks::{
+pub use crate::brain::{
     BrainTask as TodoItem, BrainTaskPriority as TodoPriority, BrainTaskStatus as TodoStatus,
 };
 use anyhow::Result;
@@ -41,18 +41,18 @@ impl TodoJournalWriter {
 /// tools communicate with it through the send-safe writer above.
 #[derive(Clone)]
 pub struct TodoJournalTarget {
-    selected: Rc<RefCell<Option<crate::brain::remote::AttachedBrainClient>>>,
+    selected: Rc<RefCell<Option<crate::brain::AttachedBrainClient>>>,
 }
 
 impl TodoJournalTarget {
-    pub fn set(&self, selected: Option<crate::brain::remote::AttachedBrainClient>) {
+    pub fn set(&self, selected: Option<crate::brain::AttachedBrainClient>) {
         *self.selected.borrow_mut() = selected;
     }
 }
 
 pub struct TodoJournalReceiver {
     rx: mpsc::UnboundedReceiver<TodoJournalRequest>,
-    selected: Rc<RefCell<Option<crate::brain::remote::AttachedBrainClient>>>,
+    selected: Rc<RefCell<Option<crate::brain::AttachedBrainClient>>>,
     projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>,
 }
 
@@ -67,7 +67,7 @@ impl TodoJournalReceiver {
                     Some(target) => {
                         let tasks = request.tasks;
                         match target
-                            .push(crate::brain::store::BrainEventKind::TaskListReplaced {
+                            .push(crate::brain::BrainEventKind::TaskListReplaced {
                                 tasks: tasks.clone(),
                             })
                             .await
@@ -91,9 +91,7 @@ pub fn todo_journal(
     projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>,
 ) -> (TodoJournalWriter, TodoJournalTarget, TodoJournalReceiver) {
     let (tx, rx) = mpsc::unbounded_channel::<TodoJournalRequest>();
-    let selected = Rc::new(RefCell::new(
-        None::<crate::brain::remote::AttachedBrainClient>,
-    ));
+    let selected = Rc::new(RefCell::new(None::<crate::brain::AttachedBrainClient>));
     (
         TodoJournalWriter { tx },
         TodoJournalTarget {

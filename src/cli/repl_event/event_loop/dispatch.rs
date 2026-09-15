@@ -791,8 +791,8 @@ impl EventLoop {
                 let is_current = self.selected_brain_matches(&target);
                 if is_current {
                     let acknowledged_seq = match &message {
-                        crate::brain::store::BrainWireMessage::Snapshot { brain } => brain.revision,
-                        crate::brain::store::BrainWireMessage::Event { event } => event.seq,
+                        crate::brain::BrainWireMessage::Snapshot { brain } => brain.revision,
+                        crate::brain::BrainWireMessage::Event { event } => event.seq,
                     };
                     self.render_remote_brain_message(message).await?;
                     if let Some(client) = self.selected_brain_mut() {
@@ -832,8 +832,8 @@ impl EventLoop {
                     return Ok(());
                 }
                 let acknowledged_seq = match &message {
-                    crate::brain::store::BrainWireMessage::Snapshot { brain } => brain.revision,
-                    crate::brain::store::BrainWireMessage::Event { event } => event.seq,
+                    crate::brain::BrainWireMessage::Snapshot { brain } => brain.revision,
+                    crate::brain::BrainWireMessage::Event { event } => event.seq,
                 };
                 if self.active_remote_brain.is_none() {
                     self.render_remote_brain_message(message).await?;

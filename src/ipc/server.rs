@@ -51,10 +51,10 @@ impl BrainRpcService {
         &self,
         brain: &str,
         subject: &str,
-        environment: &crate::brain::store::BrainEnvironment,
-        lease_id: Option<crate::brain::store::RunnerLeaseId>,
+        environment: &crate::brain::BrainEnvironment,
+        lease_id: Option<crate::brain::RunnerLeaseId>,
         ttl_ms: u64,
-    ) -> anyhow::Result<crate::brain::store::BrainRunnerLease> {
+    ) -> anyhow::Result<crate::brain::BrainRunnerLease> {
         self.runners
             .require_connection_identity(self.connection_id, subject)?;
         let reconnecting_lease = lease_id.is_some();
@@ -83,18 +83,18 @@ struct BrainTurnControlImpl {
     server: Arc<AgentServer>,
     brain: String,
     request_seq: u64,
-    expected_audience: crate::brain::store::BrainApprovalAudience,
-    expected_connection_id: Option<crate::brain::store::ConnectionId>,
+    expected_audience: crate::brain::BrainApprovalAudience,
+    expected_connection_id: Option<crate::brain::ConnectionId>,
     effect_audit: Option<BrainEffectAuditRpcAuthority>,
 }
 
 #[derive(Clone)]
 struct BrainEffectAuditRpcAuthority {
-    store: crate::brain::store::BrainStore,
-    grant: crate::brain::store::EffectAuditAuthorityGrant,
+    store: crate::brain::BrainStore,
+    grant: crate::brain::EffectAuditAuthorityGrant,
     runners: crate::server::BrainRunnerBroker,
     brain: String,
-    lease_id: crate::brain::store::RunnerLeaseId,
+    lease_id: crate::brain::RunnerLeaseId,
     connection_id: Option<uuid::Uuid>,
     active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -126,8 +126,8 @@ struct BrainHostEffectPermitImpl {
 }
 
 fn require_approval_connection(
-    connection_id: Option<crate::brain::store::ConnectionId>,
-) -> anyhow::Result<crate::brain::store::ConnectionId> {
+    connection_id: Option<crate::brain::ConnectionId>,
+) -> anyhow::Result<crate::brain::ConnectionId> {
     connection_id.context("approval audience has no live connection generation")
 }
 
@@ -136,8 +136,8 @@ pub(crate) fn test_turn_control_client(
     server: Arc<AgentServer>,
     brain: String,
     request_seq: u64,
-    expected_audience: crate::brain::store::BrainApprovalAudience,
-    expected_connection_id: Option<crate::brain::store::ConnectionId>,
+    expected_audience: crate::brain::BrainApprovalAudience,
+    expected_connection_id: Option<crate::brain::ConnectionId>,
 ) -> finch_ipc_capnp::brain_turn_control::Client {
     capnp_rpc::new_client(BrainTurnControlImpl {
         server,
@@ -181,8 +181,8 @@ pub(crate) async fn request_test_turn_approval(
     server: Arc<AgentServer>,
     brain: String,
     request_seq: u64,
-    expected_audience: crate::brain::store::BrainApprovalAudience,
-    expected_connection_id: Option<crate::brain::store::ConnectionId>,
+    expected_audience: crate::brain::BrainApprovalAudience,
+    expected_connection_id: Option<crate::brain::ConnectionId>,
     event: crate::server::RunnerTurnEvent,
 ) -> Result<serde_json::Value> {
     request_test_turn_approval_with_client(
@@ -204,7 +204,7 @@ pub(crate) async fn request_test_turn_approval(
 struct BrainProgramControlImpl {
     lifecycle: crate::server::BrainLifecycleService,
     brain: String,
-    run_id: crate::brain::store::RunId,
+    run_id: crate::brain::RunId,
     request_seq: u64,
     maximum_grant_ceiling: Option<crate::vm::EffectSet>,
     effect_audit: Option<BrainEffectAuditRpcAuthority>,
@@ -218,7 +218,7 @@ struct BrainRunnerControlImpl {
     runners: crate::server::BrainRunnerBroker,
     connection_id: uuid::Uuid,
     brain: String,
-    lease_id: crate::brain::store::RunnerLeaseId,
+    lease_id: crate::brain::RunnerLeaseId,
 }
 
 impl BrainRunnerControlImpl {
@@ -261,7 +261,7 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
             .map_err(anyhow::Error::from)
             .and_then(parse_uuid)
         {
-            Ok(value) => crate::brain::store::RunId(value),
+            Ok(value) => crate::brain::RunId(value),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let task_id = match params
@@ -308,7 +308,7 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
             .and_then(|value| value.to_str().map_err(anyhow::Error::from))
             .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::from))
         {
-            Ok(value) => crate::brain::store::RunId(value),
+            Ok(value) => crate::brain::RunId(value),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let status = match params.get_status() {
@@ -397,7 +397,7 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
             .and_then(|value| value.to_str().map_err(anyhow::Error::from))
             .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::from))
         {
-            Ok(id) => crate::brain::store::ScheduleId(id),
+            Ok(id) => crate::brain::ScheduleId(id),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let schedule = match self.lifecycle.inspect_schedule_for_run(
@@ -429,7 +429,7 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
             .and_then(|value| value.to_str().map_err(anyhow::Error::from))
             .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::from))
         {
-            Ok(id) => crate::brain::store::ScheduleId(id),
+            Ok(id) => crate::brain::ScheduleId(id),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         match self.lifecycle.cancel_schedule_for_run(
@@ -720,7 +720,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                             &brain,
                             "daemon",
                             run_id,
-                            crate::brain::store::BrainRunStatus::Running,
+                            crate::brain::BrainRunStatus::Running,
                             None,
                         )
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;
@@ -1470,55 +1470,55 @@ impl brain_service::Server for BrainRpcService {
 
 fn parse_attachment_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::store::AttachmentId, capnp::Error> {
+) -> Result<crate::brain::AttachmentId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::store::AttachmentId)
+        .map(crate::brain::AttachmentId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
 fn parse_connection_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::store::ConnectionId, capnp::Error> {
+) -> Result<crate::brain::ConnectionId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::store::ConnectionId)
+        .map(crate::brain::ConnectionId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
 fn parse_run_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::store::RunId, capnp::Error> {
+) -> Result<crate::brain::RunId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::store::RunId)
+        .map(crate::brain::RunId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
 fn parse_schedule_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::store::ScheduleId, capnp::Error> {
+) -> Result<crate::brain::ScheduleId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::store::ScheduleId)
+        .map(crate::brain::ScheduleId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
 fn parse_runner_lease_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::store::RunnerLeaseId, capnp::Error> {
+) -> Result<crate::brain::RunnerLeaseId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::store::RunnerLeaseId)
+        .map(crate::brain::RunnerLeaseId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
 fn parse_runner_handoff_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::store::RunnerHandoffId, capnp::Error> {
+) -> Result<crate::brain::RunnerHandoffId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::store::RunnerHandoffId)
+        .map(crate::brain::RunnerHandoffId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
@@ -1851,7 +1851,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
             Ok(value) => value,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let lease_id = crate::brain::store::RunnerLeaseId(lease_uuid);
+        let lease_id = crate::brain::RunnerLeaseId(lease_uuid);
         let runner = pry!(params.get_runner());
         if let Err(error) = self.server.brain_runners().require_connection_lease(
             self.connection_id,
@@ -1919,7 +1919,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
                         server,
                         request,
                         lease_id,
-                        Some(crate::brain::store::ConnectionId(registered_connection_id)),
+                        Some(crate::brain::ConnectionId(registered_connection_id)),
                     )
                     .await;
                 });
@@ -1994,52 +1994,50 @@ impl finch_daemon::Server for FinchDaemonImpl {
 }
 
 fn program_language_to_capnp(
-    language: crate::brain::store::ProgramLanguage,
+    language: crate::brain::ProgramLanguage,
 ) -> finch_ipc_capnp::ProgramLanguage {
     match language {
-        crate::brain::store::ProgramLanguage::Forth => finch_ipc_capnp::ProgramLanguage::Forth,
-        crate::brain::store::ProgramLanguage::Lisp => finch_ipc_capnp::ProgramLanguage::Lisp,
+        crate::brain::ProgramLanguage::Forth => finch_ipc_capnp::ProgramLanguage::Forth,
+        crate::brain::ProgramLanguage::Lisp => finch_ipc_capnp::ProgramLanguage::Lisp,
     }
 }
 
 fn attachment_role_from_capnp(
     role: finch_ipc_capnp::BrainAttachmentRole,
-) -> crate::brain::store::AttachmentRole {
+) -> crate::brain::AttachmentRole {
     match role {
-        finch_ipc_capnp::BrainAttachmentRole::Runner => crate::brain::store::AttachmentRole::Runner,
-        finch_ipc_capnp::BrainAttachmentRole::Driver => crate::brain::store::AttachmentRole::Driver,
+        finch_ipc_capnp::BrainAttachmentRole::Runner => crate::brain::AttachmentRole::Runner,
+        finch_ipc_capnp::BrainAttachmentRole::Driver => crate::brain::AttachmentRole::Driver,
         finch_ipc_capnp::BrainAttachmentRole::Consultant => {
-            crate::brain::store::AttachmentRole::Consultant
+            crate::brain::AttachmentRole::Consultant
         }
-        finch_ipc_capnp::BrainAttachmentRole::Observer => {
-            crate::brain::store::AttachmentRole::Observer
-        }
+        finch_ipc_capnp::BrainAttachmentRole::Observer => crate::brain::AttachmentRole::Observer,
     }
 }
 
 fn program_language_from_capnp(
     language: finch_ipc_capnp::ProgramLanguage,
-) -> crate::brain::store::ProgramLanguage {
+) -> crate::brain::ProgramLanguage {
     match language {
-        finch_ipc_capnp::ProgramLanguage::Forth => crate::brain::store::ProgramLanguage::Forth,
-        finch_ipc_capnp::ProgramLanguage::Lisp => crate::brain::store::ProgramLanguage::Lisp,
+        finch_ipc_capnp::ProgramLanguage::Forth => crate::brain::ProgramLanguage::Forth,
+        finch_ipc_capnp::ProgramLanguage::Lisp => crate::brain::ProgramLanguage::Lisp,
     }
 }
 
 fn decode_schedule_policy(
     policy: capnp::Result<finch_ipc_capnp::brain_schedule_delivery_policy::Reader<'_>>,
-) -> capnp::Result<crate::brain::store::BrainScheduleDeliveryPolicy> {
+) -> capnp::Result<crate::brain::BrainScheduleDeliveryPolicy> {
     let policy = policy?;
     match policy.get_kind()? {
         finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce => {
-            Ok(crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce)
+            Ok(crate::brain::BrainScheduleDeliveryPolicy::Coalesce)
         }
-        finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp => Ok(
-            crate::brain::store::BrainScheduleDeliveryPolicy::BoundedCatchUp {
+        finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp => {
+            Ok(crate::brain::BrainScheduleDeliveryPolicy::BoundedCatchUp {
                 max_catch_up: policy.get_max_catch_up(),
                 expires_after_ms: policy.get_expires_after_ms(),
-            },
-        ),
+            })
+        }
     }
 }
 
@@ -2047,8 +2045,8 @@ async fn forward_runner_request(
     runner: finch_ipc_capnp::brain_runner::Client,
     server: Arc<AgentServer>,
     request: crate::server::RunnerRequest,
-    lease_id: crate::brain::store::RunnerLeaseId,
-    connection_id: Option<crate::brain::store::ConnectionId>,
+    lease_id: crate::brain::RunnerLeaseId,
+    connection_id: Option<crate::brain::ConnectionId>,
 ) {
     match request {
         crate::server::RunnerRequest::Program(request) => {
@@ -2294,7 +2292,7 @@ pub(crate) async fn forward_test_runner_request(
         .snapshot(brain)
         .ok()
         .and_then(|snapshot| snapshot.runner_lease.map(|lease| lease.lease_id))
-        .unwrap_or(crate::brain::store::RunnerLeaseId(uuid::Uuid::nil()));
+        .unwrap_or(crate::brain::RunnerLeaseId(uuid::Uuid::nil()));
     forward_runner_request(runner, server, request, lease_id, None).await
 }
 
@@ -2646,7 +2644,7 @@ async fn handle_connection_with_id(
         .begin_connection_teardown(connection_id);
     teardown.wait_quiesced().await;
     let mut leases_by_brain =
-        std::collections::BTreeMap::<String, Vec<crate::brain::store::RunnerLeaseId>>::new();
+        std::collections::BTreeMap::<String, Vec<crate::brain::RunnerLeaseId>>::new();
     for (brain, lease_id) in &teardown.runner_leases {
         leases_by_brain
             .entry(brain.clone())

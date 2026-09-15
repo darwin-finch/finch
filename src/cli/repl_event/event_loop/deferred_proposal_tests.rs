@@ -4,18 +4,18 @@ fn test_pending_named_brain_turn() -> PendingNamedBrainTurn {
     let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
     PendingNamedBrainTurn {
         brain: "audit-test".into(),
-        run_id: crate::brain::store::RunId(uuid::Uuid::new_v4()),
+        run_id: crate::brain::RunId(uuid::Uuid::new_v4()),
         response_tx,
         turn_events: Vec::new(),
         effect_journal: Vec::new(),
         cancellation_requested: false,
         active_tool_ids: std::collections::HashSet::new(),
-        approval_audience: crate::brain::store::BrainApprovalAudience {
-            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+        approval_audience: crate::brain::BrainApprovalAudience {
+            brain_id: crate::brain::BrainId(uuid::Uuid::new_v4()),
             brain: "audit-test".into(),
-            attachment_id: crate::brain::store::AttachmentId(uuid::Uuid::new_v4()),
+            attachment_id: crate::brain::AttachmentId(uuid::Uuid::new_v4()),
             subject: "runner".into(),
-            role: crate::brain::store::AttachmentRole::Runner,
+            role: crate::brain::AttachmentRole::Runner,
             environment_generation: 1,
         },
         approval_tx: None,

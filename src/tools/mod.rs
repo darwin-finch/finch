@@ -13,7 +13,7 @@ mod registry;
 mod todo;
 mod types;
 
-pub use crate::brain::tasks::{
+pub use crate::brain::{
     BrainTask as TodoItem, BrainTaskPriority as TodoPriority, BrainTaskStatus as TodoStatus,
 };
 pub use executor::{generate_tool_signature, ApprovalSource, ToolExecutor, ToolSignature};

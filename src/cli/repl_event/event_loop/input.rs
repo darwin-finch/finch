@@ -473,8 +473,8 @@ Rules:\n\
                     }
                     Command::ForthEval(code) => {
                         if self.selected_brain().is_some() {
-                            self.push_remote_brain(crate::brain::store::BrainEventKind::Program {
-                                language: crate::brain::store::ProgramLanguage::Forth,
+                            self.push_remote_brain(crate::brain::BrainEventKind::Program {
+                                language: crate::brain::ProgramLanguage::Forth,
                                 source: code,
                             })
                             .await?;
@@ -639,8 +639,8 @@ Rules:\n\
         if input.trim().starts_with(": ") {
             if self.selected_brain().is_some() {
                 return self
-                    .push_remote_brain(crate::brain::store::BrainEventKind::Program {
-                        language: crate::brain::store::ProgramLanguage::Forth,
+                    .push_remote_brain(crate::brain::BrainEventKind::Program {
+                        language: crate::brain::ProgramLanguage::Forth,
                         source: input,
                     })
                     .await;
@@ -674,8 +674,8 @@ Rules:\n\
         if input.trim_start().starts_with('(') {
             if self.selected_brain().is_some() {
                 return self
-                    .push_remote_brain(crate::brain::store::BrainEventKind::Program {
-                        language: crate::brain::store::ProgramLanguage::Lisp,
+                    .push_remote_brain(crate::brain::BrainEventKind::Program {
+                        language: crate::brain::ProgramLanguage::Lisp,
                         source: input,
                     })
                     .await;

@@ -31,7 +31,7 @@ pub(super) async fn issue_named_brain_credential(
     Path(name): Path<String>,
     Json(request): Json<IssueNamedBrainCredentialRequest>,
 ) -> Result<Json<IssueNamedBrainCredentialResponse>, Response> {
-    if request.role == crate::brain::store::AttachmentRole::Runner {
+    if request.role == crate::brain::AttachmentRole::Runner {
         return Err(brain_auth_error(
             StatusCode::BAD_REQUEST,
             "runner authority cannot be minted as a participant credential",
@@ -61,7 +61,7 @@ pub(super) async fn issue_named_brain_credential(
                     snapshot.brain_id,
                     &name,
                     snapshot.environment.generation,
-                    crate::brain::credential::BrainCredentialScope::BrainControl,
+                    crate::brain::BrainCredentialScope::BrainControl,
                 )
                 .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
             require_unbound_administrative_credential(&claims)?;
@@ -73,8 +73,8 @@ pub(super) async fn issue_named_brain_credential(
         .min(MAX_BRAIN_CREDENTIAL_TTL_MS);
     let scopes = request
         .scopes
-        .unwrap_or_else(|| crate::brain::credential::default_participant_scopes(request.role));
-    let permitted = crate::brain::credential::permitted_participant_scopes(request.role);
+        .unwrap_or_else(|| crate::brain::default_participant_scopes(request.role));
+    let permitted = crate::brain::permitted_participant_scopes(request.role);
     if !scopes.is_subset(&permitted) {
         return Err(brain_auth_error(
             StatusCode::FORBIDDEN,
@@ -91,7 +91,7 @@ pub(super) async fn issue_named_brain_credential(
     let token = server
         .brain_credentials()
         .issue(
-            crate::brain::credential::BrainCredentialRequest {
+            crate::brain::BrainCredentialRequest {
                 issuer: snapshot.environment.machine.clone(),
                 subject: request.subject,
                 brain_id: snapshot.brain_id,
@@ -120,7 +120,7 @@ pub(super) async fn issue_named_brain_invitation(
     Path(name): Path<String>,
     Json(request): Json<IssueNamedBrainInvitationRequest>,
 ) -> Result<Json<IssueNamedBrainInvitationResponse>, Response> {
-    if request.role == crate::brain::store::AttachmentRole::Runner {
+    if request.role == crate::brain::AttachmentRole::Runner {
         return Err(brain_auth_error(
             StatusCode::BAD_REQUEST,
             "runner authority cannot be delegated through a Brain invitation",
@@ -150,7 +150,7 @@ pub(super) async fn issue_named_brain_invitation(
                     snapshot.brain_id,
                     &name,
                     snapshot.environment.generation,
-                    crate::brain::credential::BrainCredentialScope::BrainControl,
+                    crate::brain::BrainCredentialScope::BrainControl,
                 )
                 .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
             require_unbound_administrative_credential(&claims)?;
@@ -162,10 +162,9 @@ pub(super) async fn issue_named_brain_invitation(
         .min(MAX_BRAIN_INVITATION_TTL_MS);
     let scopes = request
         .scopes
-        .unwrap_or_else(|| crate::brain::credential::default_participant_scopes(request.role));
-    if !scopes.is_subset(&crate::brain::credential::permitted_participant_scopes(
-        request.role,
-    )) || !scopes.contains(&crate::brain::credential::BrainCredentialScope::BrainAttach)
+        .unwrap_or_else(|| crate::brain::default_participant_scopes(request.role));
+    if !scopes.is_subset(&crate::brain::permitted_participant_scopes(request.role))
+        || !scopes.contains(&crate::brain::BrainCredentialScope::BrainAttach)
     {
         return Err(brain_auth_error(
             StatusCode::FORBIDDEN,
@@ -182,7 +181,7 @@ pub(super) async fn issue_named_brain_invitation(
     let (invitation, claims) = server
         .brain_credentials()
         .issue_invitation(
-            crate::brain::credential::BrainInvitationRequest {
+            crate::brain::BrainInvitationRequest {
                 issuer: snapshot.environment.machine.clone(),
                 brain_id: snapshot.brain_id,
                 brain: name,
@@ -211,7 +210,7 @@ pub(super) async fn revoke_delegated_named_brain_credential(
         &server,
         &headers,
         &name,
-        crate::brain::credential::BrainCredentialScope::BrainControl,
+        crate::brain::BrainCredentialScope::BrainControl,
     )?;
     require_unbound_administrative_credential(&delegator)?;
     let now_ms = unix_epoch_millis();

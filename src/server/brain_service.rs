@@ -7,7 +7,7 @@
 use anyhow::{ensure, Result};
 use tokio::sync::broadcast;
 
-use crate::brain::store::{
+use crate::brain::{
     AttachmentId, AttachmentRole, BrainAttachment, BrainEnvironment, BrainEvent, BrainEventKind,
     BrainRun, BrainRunKind, BrainRunStatus, BrainRunnerHandoff, BrainRunnerLease, BrainSchedule,
     BrainScheduleDeliveryPolicy, BrainSnapshot, BrainStore, ConnectionId, ProgramLanguage, RunId,
@@ -31,7 +31,7 @@ pub enum BrainSubmissionError {
 #[derive(Debug)]
 pub struct BrainSubmissionOutcome {
     pub accepted: BrainEvent,
-    pub run: Option<crate::brain::store::BrainRun>,
+    pub run: Option<crate::brain::BrainRun>,
     pub result: Option<BrainEvent>,
 }
 
@@ -75,7 +75,7 @@ impl BrainLifecycleService {
         &self,
         request_seq: u64,
         approval_id: &str,
-        audience: crate::brain::store::BrainApprovalAudience,
+        audience: crate::brain::BrainApprovalAudience,
     ) -> anyhow::Result<crate::server::brain_approval::ApprovalRegistration> {
         self.approvals.register(request_seq, approval_id, audience)
     }
@@ -86,7 +86,7 @@ impl BrainLifecycleService {
         brain: &str,
         sender: &str,
         kind: BrainEventKind,
-    ) -> anyhow::Result<crate::brain::store::BrainEvent> {
+    ) -> anyhow::Result<crate::brain::BrainEvent> {
         self.store.push(brain, sender, kind)
     }
 
@@ -107,7 +107,7 @@ impl BrainLifecycleService {
         self.store.snapshot(brain)
     }
 
-    pub fn initialization(&self, brain: &str) -> Result<crate::brain::store::BrainInitialization> {
+    pub fn initialization(&self, brain: &str) -> Result<crate::brain::BrainInitialization> {
         self.store.initialization(brain)
     }
 
@@ -130,7 +130,7 @@ impl BrainLifecycleService {
         attachment_id: AttachmentId,
         connection_id: ConnectionId,
         next_due_ms: u64,
-        receipt: Option<crate::brain::store::BrainMutationReceipt>,
+        receipt: Option<crate::brain::BrainMutationReceipt>,
     ) -> Result<BrainSchedule> {
         self.store.schedule_initialization_with_receipt(
             brain,
@@ -366,7 +366,7 @@ impl BrainLifecycleService {
         next_due_ms: u64,
         interval_ms: Option<u64>,
         delivery_policy: BrainScheduleDeliveryPolicy,
-        mutation: Option<crate::brain::store::BrainMutationReceipt>,
+        mutation: Option<crate::brain::BrainMutationReceipt>,
     ) -> Result<BrainSchedule> {
         let attachment = self.connection(brain, attachment_id, connection_id)?;
         ensure!(
@@ -413,7 +413,7 @@ impl BrainLifecycleService {
         attachment_id: AttachmentId,
         connection_id: ConnectionId,
         schedule_id: ScheduleId,
-        receipt: Option<crate::brain::store::BrainMutationReceipt>,
+        receipt: Option<crate::brain::BrainMutationReceipt>,
     ) -> Result<bool> {
         let attachment = self.connection(brain, attachment_id, connection_id)?;
         ensure!(
@@ -647,8 +647,8 @@ impl BrainLifecycleService {
         let attachment = self
             .connection(brain, attachment_id, connection_id)
             .map_err(BrainSubmissionError::State)?;
-        let can_approve = crate::brain::credential::default_participant_scopes(attachment.role)
-            .contains(&crate::brain::credential::BrainCredentialScope::BrainApprove);
+        let can_approve = crate::brain::default_participant_scopes(attachment.role)
+            .contains(&crate::brain::BrainCredentialScope::BrainApprove);
         self.submit_for_attachment(brain, &attachment, kind, can_approve)
             .await
     }
@@ -714,7 +714,7 @@ impl BrainLifecycleService {
         let snapshot = self.snapshot(brain).map_err(BrainSubmissionError::State)?;
         let ready_lease = snapshot.runner_lease.filter(|lease| {
             lease.environment_generation == snapshot.environment.generation
-                && lease.expires_ms > crate::brain::store::unix_millis()
+                && lease.expires_ms > crate::brain::unix_millis()
                 && self.runners.has_registration(brain, lease.lease_id)
         });
         if let Some(lease) = ready_lease {
@@ -775,7 +775,7 @@ impl BrainLifecycleService {
         connection_id: ConnectionId,
         kind: BrainEventKind,
         can_approve: bool,
-        mutation: Option<crate::brain::store::BrainMutationReceipt>,
+        mutation: Option<crate::brain::BrainMutationReceipt>,
     ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
         if let BrainEventKind::SpeculativePrompt { text } = kind {
             return self
@@ -834,7 +834,7 @@ impl BrainLifecycleService {
         attachment_id: AttachmentId,
         connection_id: ConnectionId,
         run_id: RunId,
-        receipt: Option<crate::brain::store::BrainMutationReceipt>,
+        receipt: Option<crate::brain::BrainMutationReceipt>,
     ) -> Result<BrainRun> {
         let attachment = self.connection(brain, attachment_id, connection_id)?;
         ensure!(
@@ -893,7 +893,7 @@ impl BrainLifecycleService {
         brain: String,
         sender: String,
         run: BrainRun,
-        reserved: Option<crate::brain::store::BrainRunCancellationReservation>,
+        reserved: Option<crate::brain::BrainRunCancellationReservation>,
         mutation_id: Option<uuid::Uuid>,
     ) -> Result<BrainRun> {
         let needs_runner_reconciliation = reserved
@@ -918,7 +918,7 @@ impl BrainLifecycleService {
             let snapshot = self.snapshot(&brain)?;
             let lease = match snapshot
                 .runner_lease
-                .filter(|lease| lease.expires_ms > crate::brain::store::unix_millis())
+                .filter(|lease| lease.expires_ms > crate::brain::unix_millis())
             {
                 Some(lease) => lease,
                 None => {
@@ -1025,14 +1025,14 @@ impl BrainLifecycleService {
         let store = self.store.clone();
         tokio::spawn(async move {
             loop {
-                let delay_ms = expires_ms.saturating_sub(crate::brain::store::unix_millis());
+                let delay_ms = expires_ms.saturating_sub(crate::brain::unix_millis());
                 if delay_ms == 0 {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
             if store
-                .expire_runner_lease(&brain, lease_id, crate::brain::store::unix_millis())
+                .expire_runner_lease(&brain, lease_id, crate::brain::unix_millis())
                 .is_ok_and(|expired| expired)
             {
                 let _ = store.remove_if_unused(&brain);
@@ -1075,7 +1075,7 @@ impl BrainLifecycleService {
         expected_lease_id: RunnerLeaseId,
         environment: &BrainEnvironment,
         ttl_ms: u64,
-        mutation: Option<crate::brain::store::BrainMutationReceipt>,
+        mutation: Option<crate::brain::BrainMutationReceipt>,
     ) -> Result<BrainRunnerHandoff> {
         let handoff = self.store.request_runner_handoff_with_receipt(
             brain,
@@ -1094,14 +1094,14 @@ impl BrainLifecycleService {
         let store = self.store.clone();
         tokio::spawn(async move {
             loop {
-                let delay_ms = expires_ms.saturating_sub(crate::brain::store::unix_millis());
+                let delay_ms = expires_ms.saturating_sub(crate::brain::unix_millis());
                 if delay_ms == 0 {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
             if store
-                .expire_runner_handoff(&brain, handoff_id, crate::brain::store::unix_millis())
+                .expire_runner_handoff(&brain, handoff_id, crate::brain::unix_millis())
                 .is_ok_and(|expired| expired)
             {
                 let _ = store.remove_if_unused(&brain);
@@ -1149,7 +1149,7 @@ impl BrainLifecycleService {
         brain: &str,
         handoff_id: RunnerHandoffId,
         sender: &str,
-        receipt: Option<crate::brain::store::BrainMutationReceipt>,
+        receipt: Option<crate::brain::BrainMutationReceipt>,
     ) -> Result<()> {
         self.store
             .cancel_runner_handoff_with_receipt(brain, handoff_id, sender, receipt)?;
@@ -1330,7 +1330,7 @@ mod tests {
         assert_eq!(run_id, accepted_run.run_id);
         assert_eq!(turn.prompt, "look ahead");
 
-        let receipt = crate::brain::store::BrainMutationReceipt {
+        let receipt = crate::brain::BrainMutationReceipt {
             mutation_id: uuid::Uuid::new_v4(),
             attachment_id: driver_id,
             expected_revision: service.snapshot("shared").unwrap().revision,
@@ -1464,13 +1464,13 @@ mod tests {
             .start_run(
                 "shared",
                 "alice",
-                crate::brain::store::BrainRunKind::Speculative,
+                crate::brain::BrainRunKind::Speculative,
                 prompt.seq,
                 driver.attachment_id,
                 BrainRunStatus::Running,
             )
             .unwrap();
-        let receipt = crate::brain::store::BrainMutationReceipt {
+        let receipt = crate::brain::BrainMutationReceipt {
             mutation_id: uuid::Uuid::new_v4(),
             attachment_id: driver.attachment_id,
             expected_revision: service.snapshot("shared").unwrap().revision,
@@ -1903,7 +1903,7 @@ mod tests {
         let run_id = run.run_id;
         let request_seq = run.request_seq;
         let driver_id = driver.attachment_id;
-        let approval_audience = crate::brain::store::BrainApprovalAudience {
+        let approval_audience = crate::brain::BrainApprovalAudience {
             brain_id: service.store.snapshot("shared").unwrap().brain_id,
             brain: "shared".into(),
             attachment_id: driver_id,
@@ -2015,7 +2015,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         service.runners.register("shared", lease.lease_id, tx);
 
-        let stale_receipt = crate::brain::store::BrainMutationReceipt {
+        let stale_receipt = crate::brain::BrainMutationReceipt {
             mutation_id: uuid::Uuid::new_v4(),
             attachment_id: attachment.attachment_id,
             expected_revision: 0,
@@ -2216,7 +2216,7 @@ mod tests {
             .register(
                 request_seq,
                 "approval-1",
-                crate::brain::store::BrainApprovalAudience {
+                crate::brain::BrainApprovalAudience {
                     brain_id: snapshot.brain_id,
                     brain: snapshot.name,
                     attachment_id: consultant.attachment_id,
@@ -2541,7 +2541,7 @@ mod tests {
         assert_eq!(outcome.accepted.sender, "alice");
         assert_eq!(
             outcome.run.as_ref().unwrap().status,
-            crate::brain::store::BrainRunStatus::QueuedForEnvironment
+            crate::brain::BrainRunStatus::QueuedForEnvironment
         );
         assert!(outcome.result.is_none());
 

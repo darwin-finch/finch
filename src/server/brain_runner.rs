@@ -17,7 +17,7 @@ pub(crate) use crate::runtime::{
     RunnerHostEffectFinishRequest,
 };
 
-use crate::brain::store::{AttachmentId, ConnectionId, ProgramLanguage, RunId, RunnerLeaseId};
+use crate::brain::{AttachmentId, ConnectionId, ProgramLanguage, RunId, RunnerLeaseId};
 
 #[derive(Debug)]
 pub enum RunnerRequest {
@@ -29,7 +29,7 @@ pub enum RunnerRequest {
 
 #[derive(Debug)]
 pub struct RunnerMemoryProjectionRequest {
-    pub brain_id: crate::brain::store::BrainId,
+    pub brain_id: crate::brain::BrainId,
     pub brain: String,
     pub run_id: RunId,
     pub request_seq: u64,
@@ -74,15 +74,15 @@ pub enum RunnerProgramControlRequest {
         grant_ceiling: crate::vm::EffectSet,
         next_due_ms: u64,
         interval_ms: Option<u64>,
-        delivery_policy: crate::brain::store::BrainScheduleDeliveryPolicy,
-        response_tx: oneshot::Sender<Result<crate::brain::store::BrainSchedule, String>>,
+        delivery_policy: crate::brain::BrainScheduleDeliveryPolicy,
+        response_tx: oneshot::Sender<Result<crate::brain::BrainSchedule, String>>,
     },
     InspectSchedule {
-        schedule_id: crate::brain::store::ScheduleId,
-        response_tx: oneshot::Sender<Result<Option<crate::brain::store::BrainSchedule>, String>>,
+        schedule_id: crate::brain::ScheduleId,
+        response_tx: oneshot::Sender<Result<Option<crate::brain::BrainSchedule>, String>>,
     },
     CancelSchedule {
-        schedule_id: crate::brain::store::ScheduleId,
+        schedule_id: crate::brain::ScheduleId,
         response_tx: oneshot::Sender<Result<bool, String>>,
     },
 }
@@ -130,8 +130,8 @@ pub struct RunnerTurnRequest {
     pub request_seq: u64,
     pub prompt: String,
     pub context: Vec<crate::claude::Message>,
-    pub approval_audience: crate::brain::store::BrainApprovalAudience,
-    pub approval_connection_id: Option<crate::brain::store::ConnectionId>,
+    pub approval_audience: crate::brain::BrainApprovalAudience,
+    pub approval_connection_id: Option<crate::brain::ConnectionId>,
     /// Reverse approval bridge installed by the Cap'n Proto client adapter.
     /// Daemon-side broker requests leave this unset until they cross IPC.
     pub approval_tx: Option<mpsc::UnboundedSender<RunnerApprovalRequest>>,
@@ -164,7 +164,7 @@ pub struct RunnerTurnResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerTurnCommitNotice {
-    pub status: crate::brain::store::BrainRunStatus,
+    pub status: crate::brain::BrainRunStatus,
     pub detail: String,
 }
 
@@ -183,7 +183,7 @@ impl RunnerTurnCommitAck {
 
     pub fn acknowledge(
         &self,
-        status: crate::brain::store::BrainRunStatus,
+        status: crate::brain::BrainRunStatus,
         detail: impl Into<String>,
     ) -> Result<(), String> {
         self.tx
@@ -233,7 +233,7 @@ pub enum RunnerTurnEvent {
         approval_id: String,
         approval_kind: String,
         subject: String,
-        audience: crate::brain::store::BrainApprovalAudience,
+        audience: crate::brain::BrainApprovalAudience,
         detail: serde_json::Value,
     },
     ApprovalDecided {
@@ -870,8 +870,8 @@ impl BrainRunnerBroker {
         request_seq: u64,
         prompt: String,
         context: Vec<crate::claude::Message>,
-        approval_audience: crate::brain::store::BrainApprovalAudience,
-        approval_connection_id: Option<crate::brain::store::ConnectionId>,
+        approval_audience: crate::brain::BrainApprovalAudience,
+        approval_connection_id: Option<crate::brain::ConnectionId>,
     ) -> Result<RunnerTurnResult> {
         let registration = self
             .registrations
@@ -963,7 +963,7 @@ impl BrainRunnerBroker {
         &self,
         brain: &str,
         lease_id: RunnerLeaseId,
-        brain_id: crate::brain::store::BrainId,
+        brain_id: crate::brain::BrainId,
         run_id: RunId,
         request_seq: u64,
         prompt: String,
@@ -993,7 +993,7 @@ impl BrainRunnerBroker {
         &self,
         brain: &str,
         lease_id: RunnerLeaseId,
-        brain_id: crate::brain::store::BrainId,
+        brain_id: crate::brain::BrainId,
         run_id: RunId,
         request_seq: u64,
         prompt: String,
@@ -1109,13 +1109,13 @@ mod tests {
         RunnerLeaseId(uuid::Uuid::new_v4())
     }
 
-    fn test_approval_audience() -> crate::brain::store::BrainApprovalAudience {
-        crate::brain::store::BrainApprovalAudience {
-            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+    fn test_approval_audience() -> crate::brain::BrainApprovalAudience {
+        crate::brain::BrainApprovalAudience {
+            brain_id: crate::brain::BrainId(uuid::Uuid::new_v4()),
             brain: "brain".into(),
-            attachment_id: crate::brain::store::AttachmentId(uuid::Uuid::new_v4()),
+            attachment_id: crate::brain::AttachmentId(uuid::Uuid::new_v4()),
             subject: "driver@box.local".into(),
-            role: crate::brain::store::AttachmentRole::Driver,
+            role: crate::brain::AttachmentRole::Driver,
             environment_generation: 1,
         }
     }
@@ -1277,7 +1277,7 @@ mod tests {
     async fn memory_projection_is_correlated_to_the_registered_lease_and_run() {
         let broker = BrainRunnerBroker::default();
         let lease_id = lease();
-        let brain_id = crate::brain::store::BrainId(uuid::Uuid::new_v4());
+        let brain_id = crate::brain::BrainId(uuid::Uuid::new_v4());
         let run_id = RunId(uuid::Uuid::new_v4());
         let (tx, mut rx) = mpsc::unbounded_channel();
         broker.register("brain", lease_id, tx);
@@ -1378,7 +1378,7 @@ mod tests {
                 "double it".into(),
                 vec![crate::claude::Message::user("21")],
                 test_approval_audience(),
-                Some(crate::brain::store::ConnectionId(uuid::Uuid::new_v4())),
+                Some(crate::brain::ConnectionId(uuid::Uuid::new_v4())),
             )
             .await
             .unwrap();
