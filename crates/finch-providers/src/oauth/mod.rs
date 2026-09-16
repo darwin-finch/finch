@@ -524,6 +524,12 @@ where
             .store
             .load(reference)?
             .context("named OAuth credential secret is missing; sign in explicitly")?;
+        if record.mutation_pending {
+            bail!(
+                "OAuth credential `{}` has an interrupted token refresh; recover that named credential, then sign in again",
+                credential.name
+            );
+        }
         if !record_matches_descriptor(&record, &self.descriptor)
             || record.provider != credential.provider
             || record.kind != credential.kind
@@ -534,7 +540,6 @@ where
             || Some(record.account.as_str()) != credential.account.as_deref()
             || record.scopes != credential.scopes
             || record.revoked
-            || record.mutation_pending
             || record.expires_at <= Utc::now()
         {
             bail!("named OAuth credential metadata or lifecycle does not match its stored token binding");

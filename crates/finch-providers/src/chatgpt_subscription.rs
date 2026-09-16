@@ -285,15 +285,8 @@ impl ProductionCredentialSource {
             .store
             .load(&self.reference)?
             .context("Named ChatGPT subscription credential is missing; sign in explicitly")?;
+        diagnose_stored_chatgpt_record(&record, &self.expected_account, &self.reference)?;
         self.oauth.validate_existing_binding(&record)?;
-        if record.account != self.expected_account
-            || record.revoked
-            || record.mutation_pending
-            || record.access_token.is_empty()
-            || record.generation.is_empty()
-        {
-            bail!("Named ChatGPT subscription credential changed accounts");
-        }
         Ok(record)
     }
 
@@ -341,6 +334,46 @@ impl ChatGptCredentialSource for ProductionCredentialSource {
         self.refresh_generation(Some(rejected_generation), cancel)
             .await
     }
+}
+
+/// Classify a stored ChatGPT record before crypto or refresh.
+///
+/// `mutation_pending` is a crash marker from an interrupted refresh, not an
+/// account change. Finch does not refresh in the background; a query that
+/// starts rotation and then dies leaves this tombstone until explicit recover.
+fn diagnose_stored_chatgpt_record(
+    record: &OAuthTokenRecord,
+    expected_account: &str,
+    reference: &str,
+) -> Result<()> {
+    if record.mutation_pending {
+        bail!(
+            "ChatGPT credential `{reference}` has an interrupted token refresh \
+             (crash marker `mutation_pending`). Finch does not refresh while idle; \
+             a refresh that starts on a query and is interrupted will not retry \
+             until you recover. Run `finch auth recover chatgpt --credential {reference}` \
+             then `finch auth login chatgpt --credential {reference}`."
+        );
+    }
+    if record.revoked {
+        bail!(
+            "ChatGPT credential `{reference}` was revoked. \
+             Run `finch auth login chatgpt --credential {reference}` to sign in again."
+        );
+    }
+    if record.access_token.is_empty() || record.generation.is_empty() {
+        bail!(
+            "ChatGPT credential `{reference}` is missing usable token material. \
+             Sign in again with `finch auth login chatgpt --credential {reference}`."
+        );
+    }
+    if record.account != expected_account {
+        bail!(
+            "ChatGPT credential `{reference}` is bound to a different account than config. \
+             Sign in again with `finch auth login chatgpt --credential {reference}`."
+        );
+    }
+    Ok(())
 }
 
 fn lease_from_record(record: OAuthTokenRecord) -> Result<ChatGptCredentialLease> {
