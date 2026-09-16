@@ -674,6 +674,13 @@ impl EventLoop {
                         input_tokens,
                         output_tokens,
                     });
+                // Accumulate this response into the Brain's session-cumulative
+                // burn and surface the running total in the status line.
+                self.session_usage
+                    .record_turn(&model, input_tokens, output_tokens);
+                self.status_bar
+                    .update_session_usage(&self.session_usage, Some(&self.session_usage_pricing));
+                self.checkpoint_session_usage();
                 // Update status bar with live stats
                 self.status_bar
                     .update_live_stats(model, input_tokens, output_tokens, latency_ms);

@@ -20,6 +20,10 @@ pub enum Command {
     Memory,
     Debug,
     Training,
+    /// /usage — show this Brain's session-cumulative token burn
+    Usage,
+    /// /usage reset — explicitly zero the session-cumulative totals
+    UsageReset,
     Clear,
     Compact(Option<String>), // Clear with summary (optional instruction)
     PatternsList,
@@ -174,6 +178,9 @@ impl Command {
             "/memory" => return Some(Command::Memory),
             "/debug" => return Some(Command::Debug),
             "/training" => return Some(Command::Training),
+            // Session token accounting
+            "/usage" => return Some(Command::Usage),
+            "/usage reset" => return Some(Command::UsageReset),
             "/clear" | "/reset" => return Some(Command::Clear),
             "/compact" => return Some(Command::Compact(None)),
             // Feedback commands (simple form)
@@ -595,6 +602,10 @@ pub fn handle_command(
         Command::Memory => Ok(CommandOutput::Status(
             "Memory command should be handled in REPL.".to_string(),
         )),
+        // Session usage state lives in the event loop
+        Command::Usage | Command::UsageReset => Ok(CommandOutput::Status(
+            "Usage commands should be handled in REPL.".to_string(),
+        )),
         // MCP commands are handled directly in REPL
         Command::McpList | Command::McpTools(_) | Command::McpRefresh | Command::McpReload => Ok(
             CommandOutput::Status("MCP commands should be handled in REPL.".to_string()),
@@ -701,7 +712,9 @@ pub fn format_help() -> String {
          {cyan}  /debug{reset}             Toggle debug output\n\
          {cyan}  /metrics{reset}           Display usage statistics\n\
          {cyan}  /memory{reset}            Show memory usage (system and process)\n\
-         {cyan}  /training{reset}          Show routing statistics and disabled training status\n\n\
+          {cyan}  /training{reset}          Show routing statistics and disabled training status\n\
+          {cyan}  /usage{reset}             Show this Brain's session token burn (and cost when priced)\n\
+          {cyan}  /usage reset{reset}       Zero the session-cumulative totals\n\n\
          {yellow_bold}🤖 Provider Commands:{reset}\n\
          {cyan}  /model{reset}             Show current named model profile\n\
          {cyan}  /model list{reset}        List configured cloud and local profiles\n\
@@ -1428,6 +1441,28 @@ mod tests {
             Some(Command::Training)
         ));
         assert!(matches!(Command::parse("/clear"), Some(Command::Clear)));
+    }
+
+    #[test]
+    fn test_usage_commands_parse() {
+        assert!(
+            matches!(Command::parse("/usage"), Some(Command::Usage)),
+            "/usage must parse as the session-usage display command"
+        );
+        assert!(
+            matches!(Command::parse("/usage reset"), Some(Command::UsageReset)),
+            "/usage reset must parse as the explicit reset command"
+        );
+        assert!(
+            matches!(Command::parse("/usage reset."), Some(Command::UsageReset)),
+            "trailing punctuation is conversational cleanup and must not break the reset parse"
+        );
+        match Command::parse("/usage bogus") {
+            Some(Command::Usage) | Some(Command::UsageReset) => {
+                panic!("an unknown /usage subcommand must not be swallowed as display or reset")
+            }
+            _ => {}
+        }
     }
 
     #[test]

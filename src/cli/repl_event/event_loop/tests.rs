@@ -3722,3 +3722,155 @@ async fn test_mode_indicator_planning_executor_restricts_write_instead_of_waivin
         result.content
     );
 }
+
+// --- Session-cumulative token accounting (status line + per-Brain ledger) ---
+
+fn session_usage_test_event_loop() -> (super::EventLoop, tempfile::TempDir) {
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let state_dir =
+        tempfile::tempdir().expect("session-usage fixture: create isolated tool state directory");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        state_dir.path().join("patterns.json"),
+    )
+    .expect("session-usage fixture: construct inert tool executor");
+    let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+    let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+        generator,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        Arc::clone(&runtime),
+    );
+    // The per-Brain checkpoint must live in this test's own directory, never
+    // in the developer's real ~/.finch.
+    let usage_dir = tempfile::tempdir()
+        .expect("session-usage fixture: create isolated usage checkpoint directory");
+    event_loop.reset_session_usage_for_tests(Some(usage_dir.path().join("usage.json")));
+    (event_loop, usage_dir)
+}
+
+fn stats_update_event(model: &str, input: u32, output: u32) -> super::ReplEvent {
+    super::ReplEvent::StatsUpdate {
+        model: model.to_string(),
+        input_tokens: Some(input),
+        output_tokens: Some(output),
+        latency_ms: Some(10),
+        primary_allowance_used_percent: None,
+        secondary_allowance_used_percent: None,
+    }
+}
+
+#[tokio::test]
+async fn test_stats_update_accumulates_session_usage_into_status_line_and_persists() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, usage_dir) = session_usage_test_event_loop();
+
+            event_loop
+                .handle_event(stats_update_event("claude-sonnet-4-6", 1500, 300))
+                .await
+                .expect("first usage dispatch must succeed");
+            event_loop
+                .handle_event(stats_update_event("qwen-local", 2000, 500))
+                .await
+                .expect("second usage dispatch must succeed");
+
+            let ledger = &event_loop.session_usage;
+            assert_eq!(
+                (ledger.input_tokens, ledger.output_tokens, ledger.turns),
+                (3500, 800, 2),
+                "the ledger must accumulate every provider-reported turn exactly once; ledger={ledger:?}"
+            );
+
+            let line = event_loop
+                .status_bar
+                .get_line(&crate::cli::status_bar::StatusLineType::SessionUsage)
+                .expect("dispatching usage must surface the session readout in the status line");
+            assert_eq!(
+                line, "this session: 3.5k in / 800 out",
+                "the status line must show the cumulative tokens in the issue's format; line={line:?}"
+            );
+            assert!(
+                !line.contains('$'),
+                "no price source exists yet, so the readout must stay tokens-only; line={line:?}"
+            );
+
+            let checkpoint = usage_dir.path().join("usage.json");
+            let restored = crate::cli::usage::SessionUsageLedger::load(&checkpoint)
+                .expect("the checkpoint must be readable")
+                .expect("every recorded turn must reach the per-Brain checkpoint");
+            assert_eq!(
+                restored,
+                event_loop.session_usage,
+                "attach/resume must restore the exact running total; ledger={:?} checkpoint={restored:?}",
+                event_loop.session_usage
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_usage_reset_command_clears_session_totals_and_checkpoint() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, usage_dir) = session_usage_test_event_loop();
+
+            event_loop
+                .handle_event(stats_update_event("claude-sonnet-4-6", 1500, 300))
+                .await
+                .expect("usage dispatch must succeed before reset");
+
+            event_loop
+                .handle_user_input("/usage reset".to_string())
+                .await
+                .expect("the explicit reset command must dispatch");
+
+            let ledger = &event_loop.session_usage;
+            assert!(
+                ledger.is_empty(),
+                "/usage reset is the only path back to zero and must clear every total; ledger={ledger:?}"
+            );
+            assert_eq!(
+                event_loop
+                    .status_bar
+                    .get_line(&crate::cli::status_bar::StatusLineType::SessionUsage),
+                None,
+                "a zeroed ledger must leave the status strip instead of showing a fake zero burn"
+            );
+
+            let checkpoint = usage_dir.path().join("usage.json");
+            let restored = crate::cli::usage::SessionUsageLedger::load(&checkpoint)
+                .expect("the reset checkpoint must be readable")
+                .expect("reset must persist, or attach/resume would resurrect the old total");
+            assert!(
+                restored.is_empty(),
+                "the checkpoint must reflect the reset state; checkpoint={restored:?}"
+            );
+
+            // /usage after reset reports the empty state instead of zero rows.
+            event_loop
+                .handle_user_input("/usage".to_string())
+                .await
+                .expect("the display command must dispatch");
+            let messages: Vec<String> = event_loop
+                .output_manager
+                .get_messages()
+                .iter()
+                .map(|message| message.format(&crate::theme::ColorScheme::default()))
+                .collect();
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("No usage recorded this session yet.")),
+                "/usage must report the empty state; messages={messages:?}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("Session usage reset.")),
+                "the reset confirmation must reach the scrollback; messages={messages:?}"
+            );
+        })
+        .await;
+}
