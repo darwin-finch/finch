@@ -14,7 +14,7 @@
 // - Efficient updates (only changed cells)
 
 use crate::cli::messages::MessageRef;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 
 /// A single cell in the shadow buffer (character + style)
 #[derive(Debug, Clone, PartialEq)]
@@ -185,9 +185,11 @@ impl ShadowBuffer {
             let formatted = msg.format(colors);
             let lines: Vec<_> = formatted.lines().collect();
             for (line_index, line) in lines.iter().enumerate() {
-                let style = msg
-                    .background_style_for_line(colors, line_index, lines.len())
-                    .unwrap_or_default();
+                let style = overlay_sgr_style(
+                    line,
+                    msg.background_style_for_line(colors, line_index, lines.len())
+                        .unwrap_or_default(),
+                );
                 all_lines.push((line.to_string(), style));
             }
         }
@@ -445,6 +447,61 @@ pub fn truncate_to_columns(s: &str, columns: usize) -> String {
 /// WorkUnit wraps.
 pub fn physical_rows(s: &str, terminal_width: usize) -> usize {
     visible_length(s).max(1).div_ceil(terminal_width.max(1))
+}
+
+/// Overlay SGR from a themed diff line onto the transcript band style.
+///
+/// Diff paint emits 38;2 / 48;2 so add/remove/context fill the row. The
+/// shadow buffer previously stripped those codes and kept only the band,
+/// which made header and context land as near-white ink on a light band.
+fn overlay_sgr_style(line: &str, mut style: Style) -> Style {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let rest = &bytes[index + 2..];
+        let Some(end) = rest.iter().position(|&byte| byte == b'm') else {
+            break;
+        };
+        let params = std::str::from_utf8(&rest[..end]).unwrap_or("");
+        if params.is_empty() || params == "0" {
+            style = Style::default();
+        } else {
+            let numbers = params
+                .split(';')
+                .filter_map(|part| part.parse::<u8>().ok())
+                .collect::<Vec<_>>();
+            let mut cursor = 0;
+            while cursor < numbers.len() {
+                match numbers[cursor] {
+                    0 => style = Style::default(),
+                    38 if numbers.get(cursor + 1) == Some(&2) && numbers.len() > cursor + 4 => {
+                        style = style.fg(Color::Rgb(
+                            numbers[cursor + 2],
+                            numbers[cursor + 3],
+                            numbers[cursor + 4],
+                        ));
+                        cursor += 4;
+                    }
+                    48 if numbers.get(cursor + 1) == Some(&2) && numbers.len() > cursor + 4 => {
+                        style = style.bg(Color::Rgb(
+                            numbers[cursor + 2],
+                            numbers[cursor + 3],
+                            numbers[cursor + 4],
+                        ));
+                        cursor += 4;
+                    }
+                    _ => {}
+                }
+                cursor += 1;
+            }
+        }
+        index += 2 + end + 1;
+    }
+    style
 }
 
 /// Extract visible characters from string (strip ANSI codes)

@@ -441,23 +441,24 @@ impl FileDiff {
         } else {
             self.display_path().into()
         };
-        let mut out = format!(
+        let mut header = format!(
             "{}  +{} -{}",
             sanitize_terminal(&meta),
             self.count_label(self.added()),
             self.count_label(self.removed())
         );
         if self.binary {
-            out.push_str("  binary")
+            header.push_str("  binary")
         }
         if self.is_created() {
-            out.push_str("  created")
+            header.push_str("  created")
         } else if self.is_rename() {
-            out.push_str("  renamed")
+            header.push_str("  renamed")
         }
         if let Some(v) = &self.elided {
-            out.push_str(&format!("  [{}]", sanitize_terminal(v)))
+            header.push_str(&format!("  [{}]", sanitize_terminal(v)))
         }
+        let mut out = paint(header, colors, mode, Tone::Meta);
         let width = self
             .hunks
             .iter()
@@ -1065,24 +1066,41 @@ fn format_gutter_line(
         None => format!("{:width$} {marker} {text}", ""),
     }
 }
+fn scheme_is_dark(colors: &ColorScheme) -> bool {
+    matches!(
+        colors.message_band_style(MessageBand::Tool).fg,
+        Some(Color::Rgb(r, g, b))
+            if (r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000 > 127
+    )
+}
+
+/// Foreground and background for one diff tone. The background carries add /
+/// remove / context; the foreground is a contrasting readable ink, never the
+/// same near-white as an unpainted dialog or terminal default.
+fn tone_colors(dark: bool, tone: Tone) -> ((u8, u8, u8), (u8, u8, u8)) {
+    match (dark, tone) {
+        (true, Tone::Add) => ((236, 246, 238), (20, 72, 40)),
+        (true, Tone::Remove) => ((255, 236, 236), (88, 24, 28)),
+        (true, Tone::Hunk) => ((186, 214, 255), (28, 42, 64)),
+        (true, Tone::Meta) => ((210, 214, 220), (52, 56, 62)),
+        (true, Tone::Context) => ((220, 224, 230), (44, 48, 54)),
+        (false, Tone::Add) => ((12, 56, 28), (204, 240, 214)),
+        (false, Tone::Remove) => ((112, 16, 22), (255, 214, 214)),
+        (false, Tone::Hunk) => ((12, 48, 112), (220, 232, 250)),
+        (false, Tone::Meta) => ((48, 52, 58), (232, 234, 236)),
+        (false, Tone::Context) => ((28, 32, 38), (234, 236, 238)),
+    }
+}
+
 fn paint(text: String, colors: &ColorScheme, mode: DiffColorMode, tone: Tone) -> String {
     if mode == DiffColorMode::NoColor {
         return text;
     }
-    let dark = matches!(colors.message_band_style(MessageBand::Tool).fg,Some(Color::Rgb(r,g,b))if(r as u32*299+g as u32*587+b as u32*114)/1000>127);
-    let (r, g, b) = match (dark, tone) {
-        (true, Tone::Add) => (126, 231, 135),
-        (true, Tone::Remove) => (255, 123, 114),
-        (true, Tone::Hunk) => (121, 192, 255),
-        (true, Tone::Meta) => (139, 148, 158),
-        (true, Tone::Context) => (245, 247, 250),
-        (false, Tone::Add) => (0, 92, 38),
-        (false, Tone::Remove) => (179, 29, 40),
-        (false, Tone::Hunk) => (5, 80, 174),
-        (false, Tone::Meta) => (87, 96, 106),
-        (false, Tone::Context) => (18, 22, 28),
-    };
-    format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
+    let (fg, bg) = tone_colors(scheme_is_dark(colors), tone);
+    format!(
+        "\x1b[38;2;{};{};{};48;2;{};{};{}m{text}\x1b[0m",
+        fg.0, fg.1, fg.2, bg.0, bg.1, bg.2
+    )
 }
 
 #[cfg(test)]
@@ -1192,6 +1210,51 @@ mod tests {
             d.render(&ColorTheme::Dark.to_scheme(), DiffColorMode::Theme),
             d.render(&ColorTheme::Light.to_scheme(), DiffColorMode::Theme)
         )
+    }
+
+    fn sgr_triplet(kind: u8, rgb: (u8, u8, u8)) -> String {
+        format!("{kind};2;{};{};{}", rgb.0, rgb.1, rgb.2)
+    }
+
+    #[test]
+    fn themed_diff_fills_rows_with_backgrounds_not_foreground_only() {
+        let d = FileDiff::parse(SAMPLE).unwrap();
+        let dark = d.render(&ColorTheme::Dark.to_scheme(), DiffColorMode::Theme);
+        let light = d.render(&ColorTheme::Light.to_scheme(), DiffColorMode::Theme);
+        let (add_fg, add_bg) = tone_colors(true, Tone::Add);
+        let (remove_fg, remove_bg) = tone_colors(true, Tone::Remove);
+        let (context_fg, context_bg) = tone_colors(true, Tone::Context);
+        let (meta_fg, meta_bg) = tone_colors(true, Tone::Meta);
+        for (label, rendered, fg, bg) in [
+            ("add", &dark, add_fg, add_bg),
+            ("remove", &dark, remove_fg, remove_bg),
+            ("context", &dark, context_fg, context_bg),
+            ("header", &dark, meta_fg, meta_bg),
+        ] {
+            assert!(
+                rendered.contains(&sgr_triplet(38, fg)) && rendered.contains(&sgr_triplet(48, bg)),
+                "{label} must set contrasting ink and a filled background; rendered={rendered}"
+            );
+            let fg_luma = (fg.0 as u32 * 299 + fg.1 as u32 * 587 + fg.2 as u32 * 114) / 1000;
+            let bg_luma = (bg.0 as u32 * 299 + bg.1 as u32 * 587 + bg.2 as u32 * 114) / 1000;
+            assert!(
+                fg_luma.abs_diff(bg_luma) >= 80,
+                "{label} fg {fg:?} vs bg {bg:?} is too close (white-on-white / black-on-black)"
+            );
+        }
+        let header = dark.lines().next().expect("header row");
+        assert!(
+            header.contains(&sgr_triplet(48, meta_bg)),
+            "the top of the diff must carry the meta background, not unpainted default; header={header:?}"
+        );
+        assert!(
+            light.contains(&sgr_triplet(48, tone_colors(false, Tone::Add).1)),
+            "light theme must also fill add rows; light={light}"
+        );
+        assert!(
+            !dark.contains("38;2;245;247;250m") || dark.contains("48;2;"),
+            "near-white context ink without a fill is the reported white-on-white header/footer"
+        );
     }
     #[test]
     fn production_mode_honors_accessible_no_color_environment() {
