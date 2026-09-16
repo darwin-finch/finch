@@ -20,6 +20,39 @@ use std::time::Duration;
 use tempfile::Builder;
 use tokio::task::spawn_blocking;
 
+/// True when a prior REPL grant already covers this tool call.
+///
+/// The TUI dialog (including "Yes, and don't ask again for: edit:*") and
+/// AutoAccept are that grant. Opening `$EDITOR` again after it is what blocked
+/// autonomous iteration.
+pub fn interactive_review_already_granted(
+    skip_interactive_review: bool,
+    auto_accepts_host_effects: bool,
+) -> bool {
+    skip_interactive_review || auto_accepts_host_effects
+}
+
+/// True when this tool call must still block in `$EDITOR`.
+pub fn should_open_interactive_review(
+    skip_interactive_review: bool,
+    auto_accepts_host_effects: bool,
+) -> bool {
+    if cfg!(test) || !std::io::stdin().is_terminal() {
+        return false;
+    }
+    !interactive_review_already_granted(skip_interactive_review, auto_accepts_host_effects)
+}
+
+pub async fn context_should_open_interactive_review(
+    context: &crate::tools::types::ToolContext<'_>,
+) -> bool {
+    let auto_accepts = match &context.repl_mode {
+        Some(mode) => mode.read().await.auto_accepts_host_effects(),
+        None => false,
+    };
+    should_open_interactive_review(context.skip_interactive_review, auto_accepts)
+}
+
 /// Decision encoded in an editor-backed proposal file. The source remains
 /// untrusted and must still pass the normal tool/VM authorization path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1248,6 +1281,23 @@ mod tests {
                 .await
                 .unwrap(),
             ProposalDecision::Cancel
+        );
+    }
+
+    #[test]
+    fn granted_edit_star_does_not_open_editor() {
+        assert!(
+            interactive_review_already_granted(true, false),
+            "invariant: after the REPL grant (edit:* always, session, or one-time Yes), \
+             execute must not open $EDITOR again"
+        );
+        assert!(
+            interactive_review_already_granted(false, true),
+            "invariant: AutoAccept must not open $EDITOR; that is the autonomous path"
+        );
+        assert!(
+            !interactive_review_already_granted(false, false),
+            "invariant: without a grant, interactive TTY review still opens $EDITOR"
         );
     }
 }

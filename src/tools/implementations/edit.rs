@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
-use std::io::{IsTerminal, Read as _, Seek as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 
 use super::propose::open_review_artifact;
 use crate::cli::diff::FileDiff;
@@ -646,7 +646,7 @@ impl Tool for EditTool {
         }
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
+    async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String> {
         let file_path = input["file_path"]
             .as_str()
             .context("Missing file_path parameter")?;
@@ -658,8 +658,9 @@ impl Tool for EditTool {
             .context("Missing new_string parameter")?;
         let replace_all = input["replace_all"].as_bool().unwrap_or(false);
 
-        // Interactive: review the diff in $EDITOR before applying.
-        if std::io::stdin().is_terminal() {
+        // Interactive: review the diff in $EDITOR before applying — unless
+        // the REPL already granted this call (edit:*, AutoAccept, or Yes).
+        if super::propose::context_should_open_interactive_review(context).await {
             return review_and_apply_edit(
                 file_path,
                 old_string,
@@ -1565,9 +1566,34 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let result = tool.execute(input, &context).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_applies_when_repl_already_granted_review() {
+        let (dir, path) = temp_file("granted.txt", "alpha\n");
+        let mut context = crate::tools::types::ToolContext::default();
+        context.skip_interactive_review = true;
+        let result = EditTool
+            .execute(
+                serde_json::json!({
+                    "file_path": path,
+                    "old_string": "alpha",
+                    "new_string": "beta",
+                }),
+                &context,
+            )
+            .await
+            .expect("a granted edit:* / AutoAccept call must apply without $EDITOR");
+        let written = fs::read_to_string(&path).expect("read granted edit");
+        assert_eq!(
+            written, "beta\n",
+            "granted edit must write the replacement; diff={result:?} written={written:?}"
+        );
+        drop(dir);
     }
 }

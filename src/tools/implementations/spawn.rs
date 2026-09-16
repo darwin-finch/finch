@@ -353,6 +353,7 @@ async fn execute_subagent_tool(tools: &[Box<dyn Tool>], tool_use: &ToolUse) -> R
         live_output: None,
         effect_audit: None,
         poset: None,
+        skip_interactive_review: false,
     };
 
     tool.execute(tool_use.input.clone(), &context).await
