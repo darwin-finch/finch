@@ -2610,22 +2610,21 @@ pub(crate) fn encode_packed_delivery_envelopes(
         .collect()
 }
 
-/// Decode packed delivery frames. An empty list means the peer omitted them
-/// and the journal remains the source of envelopes. Non-empty lists fail
-/// closed unless every frame is ABI v1, an envelope, and an exact match of
-/// the corresponding journal `(execution_id, sequence, output row)`.
+/// Decode packed delivery frames. Generation 9 requires the packed payload:
+/// an empty list is admitted only when the journal is also empty. Otherwise
+/// every frame must be ABI v1, an envelope, and an exact match of the
+/// corresponding journal `(execution_id, sequence, output row)`.
 pub(crate) fn decode_packed_delivery_envelopes(
     frames: capnp::data_list::Reader<'_>,
     journal: &[crate::server::RunnerEffectRecord],
 ) -> Result<Vec<VmEffectEnvelope>> {
     if frames.len() == 0 {
-        return Ok(journal
-            .iter()
-            .map(|record| VmEffectEnvelope {
-                execution_id: record.execution_id,
-                effect: record.entry.effect.clone(),
-            })
-            .collect());
+        anyhow::ensure!(
+            journal.is_empty(),
+            "packed delivery omitted for {} journaled effect(s); IPC generation 9 requires RuntimeApplicationMessage envelopes",
+            journal.len()
+        );
+        return Ok(Vec::new());
     }
     anyhow::ensure!(
         frames.len() as usize == journal.len(),

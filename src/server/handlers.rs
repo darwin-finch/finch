@@ -1177,11 +1177,6 @@ fn push_named_brain_run_result(
     )
 }
 
-/// Validate the runner's diagnostic VM journal without treating it as durable
-/// audit authority. Physical host effects are recorded synchronously through
-/// the daemon-issued reserve/begin/finish capability before this result can
-/// arrive. Publishing this caller-provided summary as `EffectRecorded` would
-/// both duplicate that canonical audit and let a runner forge provenance.
 fn delivery_envelopes(
     records: &[crate::server::RunnerEffectRecord],
 ) -> Vec<crate::runtime::VmEffectEnvelope> {
@@ -1204,6 +1199,11 @@ fn admit_runner_effect_delivery(
     Ok(())
 }
 
+/// Validate the runner's diagnostic VM journal without treating it as durable
+/// audit authority. Physical host effects are recorded synchronously through
+/// the daemon-issued reserve/begin/finish capability before this result can
+/// arrive. Publishing this caller-provided summary as `EffectRecorded` would
+/// both duplicate that canonical audit and let a runner forge provenance.
 fn validate_runner_effect_journal(
     records: &[crate::server::RunnerEffectRecord],
 ) -> anyhow::Result<()> {

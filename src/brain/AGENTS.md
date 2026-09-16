@@ -5,7 +5,9 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 **Owns** `src/brain/`: `BrainStore` composition, the credential authority, remote brain clients,
 task records, and name generation. Persistence and coordination internals live in nested
 facades: [`journal`](journal/AGENTS.md), [`schedule`](schedule/AGENTS.md), [`run`](run/AGENTS.md),
-[`attachment`](attachment/AGENTS.md), and [`projection`](projection/AGENTS.md). The daemon
+[`attachment`](attachment/AGENTS.md), and [`projection`](projection/AGENTS.md). Named-Brain
+portable effect delivery lives beside the reducible checkpoint as
+`{root}/{name}/runtime/effects.jsonl` (`VmEffectDeliveryLog`, Brain-bound). The daemon
 subtree is owned from here but implemented in `src/daemon` (its own capsule). Server, IPC,
 client, and agent composition live outside this subtree.
 

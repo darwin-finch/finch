@@ -7646,3 +7646,47 @@ async fn program_runtime_from_brain_store_binds_the_delivery_log() {
         "effects observed by the bound runtime must land in the Brain delivery log; pending={pending:?}"
     );
 }
+
+#[test]
+fn archive_evicts_delivery_log_so_a_reused_name_does_not_leak() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("brains");
+    let store = BrainStore::with_root("box.local", Some(root.clone()));
+    store.snapshot("shared").unwrap();
+    let execution_id = uuid::Uuid::new_v4();
+    let first = delivery_envelope(execution_id, 0, "archived");
+    store
+        .record_effect_delivery("shared", &[first.clone()])
+        .unwrap();
+    let archived = store.archive("shared").unwrap().unwrap();
+    let archived_log = archived.join("runtime").join("effects.jsonl");
+    let archived_bytes = std::fs::read(&archived_log).unwrap();
+    assert!(
+        !archived_bytes.is_empty(),
+        "archived Brain must retain its delivery log"
+    );
+
+    store.snapshot("shared").unwrap();
+    let new_id = store.snapshot("shared").unwrap().brain_id.0;
+    let client = crate::runtime::DeliveryConsumerIdentity::new(new_id, uuid::Uuid::new_v4());
+    assert!(
+        store
+            .pending_effect_delivery("shared", client)
+            .unwrap()
+            .is_empty(),
+        "a reused name must open a new delivery log, not the archived Brain's"
+    );
+    let replacement = delivery_envelope(uuid::Uuid::new_v4(), 0, "replacement");
+    store
+        .record_effect_delivery("shared", &[replacement.clone()])
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&archived_log).unwrap(),
+        archived_bytes,
+        "recording on the reused name must not append into the archived effects.jsonl"
+    );
+    assert_eq!(
+        store.pending_effect_delivery("shared", client).unwrap(),
+        vec![replacement]
+    );
+}

@@ -14,9 +14,11 @@ not from the provider display name alone.
   actual model through the provider-neutral stream metadata chunk; the same
   model field is returned by the non-streaming path and survives daemon IPC.
   That additive union changes the frontend/daemon contract, so the current IPC
-  generation (`IPC_PROTOCOL_VERSION`, 8, in `src/ipc/mod.rs`) rejects a
-  generation-7 peer during the ping handshake before any query or stream
+  generation (`IPC_PROTOCOL_VERSION`, 9, in `src/ipc/mod.rs`) rejects a
+  generation-8 peer during the ping handshake before any query or stream
   begins; users must restart a daemon built from the older generation.
+  Generation 9 is the packed Runtime/Application effect-delivery /
+  `pendingDelivery` bump.
 - GPT-4o and OpenAI-compatible xAI, Groq, Mistral, Ollama, remote-Finch, and
   custom endpoints retain the historical compatible request and parser shape.
 

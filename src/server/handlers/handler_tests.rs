@@ -3417,6 +3417,129 @@ async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint(
 }
 
 #[tokio::test]
+async fn cancelled_late_program_completion_does_not_admit_delivery() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
+    let generation = store.environment().generation;
+    let lease = store
+        .acquire_runner_lease("shared", "console", generation, None, 60_000)
+        .unwrap();
+    let runners = crate::server::BrainRunnerBroker::default();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    runners.register("shared", lease.lease_id, tx);
+    let request = store
+        .push(
+            "shared",
+            "alice",
+            BrainEventKind::Program {
+                language: ProgramLanguage::Lisp,
+                source: "(define (double (n : int)) : int (* n 2))".into(),
+            },
+        )
+        .unwrap();
+    let run = store
+        .start_run(
+            "shared",
+            "alice",
+            crate::brain::BrainRunKind::Interactive,
+            request.seq,
+            AttachmentId(uuid::Uuid::new_v4()),
+            crate::brain::BrainRunStatus::Running,
+        )
+        .unwrap();
+    let effect_record = acknowledged_emit_effect("late-after-cancel");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let crate::server::RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
+            panic!("expected program request")
+        };
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: Some("late-cancel".into()),
+                source: request.source,
+                intent: "late completion after cancel".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.revision == outcome.output_revision)
+            .and_then(|snapshot| snapshot.checkpoint)
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        request
+            .response_tx
+            .send(Ok(crate::server::RunnerProgramResult {
+                output: "should not publish".into(),
+                runtime_revision: outcome.output_revision,
+                checkpoint,
+                effect_journal: vec![effect_record],
+            }))
+            .unwrap();
+    });
+
+    let dispatch = tokio::spawn({
+        let store = store.clone();
+        let runners = runners.clone();
+        let run_id = run.run_id;
+        let seq = request.seq;
+        async move {
+            dispatch_named_brain_program(
+                &store,
+                &runners,
+                "shared",
+                run_id,
+                seq,
+                ProgramLanguage::Lisp,
+                "(define (double (n : int)) : int (* n 2))",
+                crate::server::RunnerProgramInteraction::Interactive,
+                None,
+            )
+            .await
+        }
+    });
+    ready_rx.await.unwrap();
+    store
+        .reserve_run_publication_cancellation("shared", run.run_id)
+        .await
+        .unwrap();
+    release_tx.send(()).unwrap();
+    let error = dispatch.await.unwrap().unwrap_err();
+    assert!(
+        error.to_string().contains("cancelled"),
+        "late completion after cancel must fail closed, got {error:#}"
+    );
+    let snapshot = store.snapshot("shared").unwrap();
+    assert!(
+        !snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, BrainEventKind::Result { .. })),
+        "cancelled late completion must not publish a Result"
+    );
+    let client =
+        crate::runtime::DeliveryConsumerIdentity::new(snapshot.brain_id.0, uuid::Uuid::new_v4());
+    assert!(
+        store
+            .pending_effect_delivery("shared", client)
+            .unwrap()
+            .is_empty(),
+        "cancelled late completion must not admit the runner journal into the delivery log"
+    );
+}
+
+#[tokio::test]
 async fn named_brain_prompt_runs_the_full_turn_on_the_registered_frontend() {
     let temp = tempfile::tempdir().unwrap();
     let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));

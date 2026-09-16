@@ -4017,6 +4017,7 @@ impl BrainStore {
             .write()
             .expect("shared brain runtime lock poisoned")
             .remove(name);
+        self.forget_delivery_log(name);
         self.initializations
             .write()
             .expect("shared Brain initialization lock poisoned")
@@ -4145,6 +4146,7 @@ impl BrainStore {
             .write()
             .expect("shared brain runtime lock poisoned")
             .remove(name);
+        self.forget_delivery_log(name);
         self.initializations
             .write()
             .expect("shared Brain initialization lock poisoned")
@@ -4655,6 +4657,17 @@ impl BrainStore {
             .clone())
     }
 
+    fn forget_delivery_log(&self, name: &str) {
+        self.delivery_logs
+            .write()
+            .expect("shared brain delivery-log lock poisoned")
+            .remove(name);
+        self.effect_audit_storage
+            .lock()
+            .expect("effect-audit storage map poisoned")
+            .remove(name);
+    }
+
     fn bind_runtime_delivery_log(
         &self,
         name: &str,
@@ -4916,10 +4929,11 @@ impl BrainStore {
                 );
             }
         }
-        let restored = crate::runtime::ProgramRuntime::from_checkpoint_at_revision(
+        let restored = Arc::new(crate::runtime::ProgramRuntime::from_checkpoint_at_revision(
             checkpoint.clone(),
             runtime_revision,
-        )?;
+        )?);
+        self.bind_runtime_delivery_log(name, &restored)?;
         let encoded = crate::ipc::checkpoint_codec::encode_checkpoint_bytes(&checkpoint)?;
         let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
         self.write_runtime_checkpoint(name, &checkpoint_sha256, &encoded)?;
@@ -4930,7 +4944,7 @@ impl BrainStore {
         self.runtimes
             .write()
             .expect("shared brain runtime lock poisoned")
-            .insert(name.to_string(), Arc::new(restored));
+            .insert(name.to_string(), restored);
         let kind = BrainEventKind::RuntimeCommitted {
             request_seq,
             runtime_revision,

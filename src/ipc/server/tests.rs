@@ -1954,6 +1954,14 @@ fn test_approval_audience() -> crate::brain::BrainApprovalAudience {
     }
 }
 
+fn encode_test_packed_delivery(
+    mut encoded: capnp::data_list::Builder<'_>,
+    records: &[crate::server::RunnerEffectRecord],
+) {
+    let frames = super::super::checkpoint_codec::encode_packed_delivery_envelopes(records).unwrap();
+    encoded.set(0, &frames[0]);
+}
+
 fn effect_record() -> crate::server::RunnerEffectRecord {
     crate::server::RunnerEffectRecord {
         execution_id: uuid::Uuid::new_v4(),
@@ -2212,6 +2220,10 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
             &expected_effect.entry,
         )
         .unwrap();
+        encode_test_packed_delivery(
+            result.reborrow().init_delivery(1),
+            std::slice::from_ref(&expected_effect),
+        );
         let mut events = result.init_turn_events(4);
         let mut call = events.reborrow().get(0);
         call.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::Call);
@@ -2308,6 +2320,10 @@ fn runner_turn_error_keeps_partial_lifecycle() {
             &expected_effect.entry,
         )
         .unwrap();
+        encode_test_packed_delivery(
+            result.reborrow().init_delivery(1),
+            std::slice::from_ref(&expected_effect),
+        );
         let mut events = result.init_turn_events(1);
         let mut decision = events.reborrow().get(0);
         decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
@@ -2348,6 +2364,10 @@ fn runner_program_error_keeps_execute_once_effects() {
             &expected_effect.entry,
         )
         .unwrap();
+        encode_test_packed_delivery(
+            result.reborrow().init_delivery(1),
+            std::slice::from_ref(&expected_effect),
+        );
     }
     let reader = message
         .get_root_as_reader::<super::finch_ipc_capnp::brain_program_result::Reader>()
@@ -2415,6 +2435,206 @@ fn packed_delivery_on_runner_program_result_must_match_the_journal() {
         "mismatched output row must fail closed, got {}",
         error.message
     );
+}
+
+#[test]
+fn omitted_packed_delivery_with_a_journal_fails_closed() {
+    let expected_effect = effect_record();
+    let mut message = capnp::message::Builder::new_default();
+    {
+        let mut result =
+            message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
+        result.set_error("program failed after emit");
+        super::super::checkpoint_codec::encode_effect_record(
+            result.reborrow().init_effect_journal(1).get(0),
+            expected_effect.execution_id,
+            &expected_effect.entry,
+        )
+        .unwrap();
+    }
+    let reader = message
+        .get_root_as_reader::<super::finch_ipc_capnp::brain_program_result::Reader>()
+        .unwrap();
+    let error = decode_runner_program_result(Ok(reader)).unwrap_err();
+    assert!(
+        error.message.contains("packed delivery omitted")
+            || error.to_string().contains("packed delivery omitted"),
+        "generation 9 must fail closed when packed delivery is omitted, got {}",
+        error.message
+    );
+}
+
+fn ipc_delivery_envelope(
+    execution_id: uuid::Uuid,
+    sequence: u64,
+    text: &str,
+) -> crate::runtime::VmEffectEnvelope {
+    crate::runtime::VmEffectEnvelope {
+        execution_id,
+        effect: crate::vm::VmSideEffect {
+            protocol_version: 1,
+            sequence,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            output: Vec::new(),
+            event: crate::vm::HostSideEffect::Emit { text: text.into() },
+            origin: crate::vm::SourceOrigin::generated("ipc-delivery-test"),
+        },
+    }
+}
+
+fn ipc_delivery_envelopes(
+    messages: &[crate::runtime::RuntimeApplicationMessage],
+) -> Vec<crate::runtime::VmEffectEnvelope> {
+    messages
+        .iter()
+        .map(|message| match message {
+            crate::runtime::RuntimeApplicationMessage::Envelope { envelope } => envelope.clone(),
+            other => panic!("expected packed envelope, got {other:?}"),
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn register_brain_runner_replays_unacked_packed_delivery_and_ack_clears_it() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store =
+                crate::brain::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
+            store.snapshot("shared").unwrap();
+            let execution_id = uuid::Uuid::new_v4();
+            let first = ipc_delivery_envelope(execution_id, 0, "one");
+            let second = ipc_delivery_envelope(execution_id, 1, "two");
+            store
+                .record_effect_delivery("shared", &[first.clone(), second.clone()])
+                .unwrap();
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store.clone(),
+                    crate::brain::BrainCredentialAuthority::ephemeral([91; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                )
+                .unwrap(),
+            );
+            let daemon: super::finch_ipc_capnp::finch_daemon::Client = capnp_rpc::new_client(
+                FinchDaemonImpl::new(std::sync::Arc::clone(&server), uuid::Uuid::new_v4()),
+            );
+            let ipc = crate::ipc::IpcClient::from_test_client(daemon);
+            let snapshot = ipc.brain_snapshot("shared").await.unwrap();
+            let subject = "runner@box.local/frontend-delivery";
+            ipc.brain_claim_runner_identity(subject).await.unwrap();
+            let lease = ipc
+                .brain_acquire_runner("shared", subject, &snapshot.environment, None, 60_000)
+                .await
+                .unwrap();
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let bootstrap = ipc
+                .register_brain_runner("shared", lease.lease_id, event_tx)
+                .await
+                .unwrap();
+            assert_eq!(
+                ipc_delivery_envelopes(&bootstrap.pending_delivery),
+                vec![first.clone(), second.clone()],
+                "registerBrainRunner must replay the unacknowledged packed suffix"
+            );
+            assert!(ipc
+                .brain_acknowledge_effect_delivery(
+                    "shared",
+                    lease.lease_id.0,
+                    crate::runtime::DeliveryCursor::through(execution_id, 1),
+                )
+                .await
+                .unwrap());
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let replayed = ipc
+                .register_brain_runner("shared", lease.lease_id, event_tx)
+                .await
+                .unwrap();
+            assert!(
+                replayed.pending_delivery.is_empty(),
+                "ack through the runner consumer must clear pendingDelivery; pending={:?}",
+                replayed.pending_delivery
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pending_effect_delivery_survives_observer_disconnect_and_late_completion() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = crate::brain::BrainStore::with_root(
+                "box.local",
+                Some(temp.path().join("brains")),
+            );
+            store.snapshot("shared").unwrap();
+            let execution_id = uuid::Uuid::new_v4();
+            let envelope = ipc_delivery_envelope(execution_id, 0, "late");
+            store
+                .record_effect_delivery("shared", &[envelope.clone()])
+                .unwrap();
+            let observer = uuid::Uuid::new_v4();
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store.clone(),
+                    crate::brain::BrainCredentialAuthority::ephemeral([92; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                )
+                .unwrap(),
+            );
+            let first: super::finch_ipc_capnp::finch_daemon::Client =
+                capnp_rpc::new_client(FinchDaemonImpl::new(
+                    std::sync::Arc::clone(&server),
+                    uuid::Uuid::new_v4(),
+                ));
+            let first_ipc = crate::ipc::IpcClient::from_test_client(first);
+            assert_eq!(
+                ipc_delivery_envelopes(
+                    &first_ipc
+                        .brain_pending_effect_delivery("shared", observer)
+                        .await
+                        .unwrap()
+                ),
+                vec![envelope.clone()]
+            );
+            drop(first_ipc);
+
+            let replacement: super::finch_ipc_capnp::finch_daemon::Client =
+                capnp_rpc::new_client(FinchDaemonImpl::new(
+                    std::sync::Arc::clone(&server),
+                    uuid::Uuid::new_v4(),
+                ));
+            let replacement_ipc = crate::ipc::IpcClient::from_test_client(replacement);
+            let pending = replacement_ipc
+                .brain_pending_effect_delivery("shared", observer)
+                .await
+                .unwrap();
+            assert_eq!(
+                ipc_delivery_envelopes(&pending),
+                vec![envelope.clone()],
+                "disconnect must not drop unacked delivery; a replacement observer must replay the exact envelope"
+            );
+            assert!(replacement_ipc
+                .brain_acknowledge_effect_delivery(
+                    "shared",
+                    observer,
+                    crate::runtime::DeliveryCursor::through(execution_id, 0),
+                )
+                .await
+                .unwrap());
+            assert!(replacement_ipc
+                .brain_pending_effect_delivery("shared", observer)
+                .await
+                .unwrap()
+                .is_empty());
+        })
+        .await;
 }
 
 #[test]

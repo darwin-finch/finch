@@ -264,8 +264,6 @@ Known stale or unsupported claims in current-looking documents, awaiting repair 
 [#572](https://github.com/darwin-finch/finch/issues/572) unless noted:
 
 - [Rust toolchain](docs/RUST_TOOLCHAIN.md) contradicts the `rust-version` declared in `Cargo.toml`.
-- [OpenAI transport](docs/OPENAI_TRANSPORT.md) names a superseded IPC generation; the current one
-  is `IPC_PROTOCOL_VERSION` in `src/ipc/mod.rs`.
 - [Bootstrap loading](src/models/BOOTSTRAP.md) and [ONNX loader](src/models/ONNX.md) state
   unmeasured startup timing and treat loader variants as backend support.
 - [Local model/backend status](docs/MODEL_BACKEND_STATUS.md) is a dated investigation and names a
