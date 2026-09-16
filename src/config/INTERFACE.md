@@ -85,11 +85,11 @@ pub enum CredentialKind { ApiKey, Bearer, OauthDevice, OauthBrowserPkce, CloudId
 /// Persisted lifecycle metadata. Re-exported from `finch-providers`.
 pub enum CredentialLifecycle { Active, Revoked, LegacyAmbiguous }
 /// Provider/account namespace. Re-exported from `finch-providers`.
-pub enum CredentialProvider { Anthropic, OpenaiPlatform, ChatgptSubscription, Xai, GeminiAiStudio, GoogleVertex, Mistral, Groq, Openrouter }
+pub enum CredentialProvider { Anthropic, OpenaiPlatform, ChatgptSubscription, Xai, GrokSubscription, GeminiAiStudio, GoogleVertex, Mistral, Groq, Openrouter }
 /// Dialog color configuration Re-exported from `theme`.
 pub struct DialogColors { … }
 /// Normalized service family. Re-exported from `finch-providers`.
-pub enum EndpointFamily { AnthropicApi, OpenaiPlatform, ChatgptSubscription, XaiApi, GeminiAiStudio, GoogleVertex, MistralApi, GroqApi, OpenrouterApi, Custom }
+pub enum EndpointFamily { AnthropicApi, OpenaiPlatform, ChatgptSubscription, XaiApi, GrokSubscription, GeminiAiStudio, GoogleVertex, MistralApi, GroqApi, OpenrouterApi, Custom }
 /// Production resolver for explicit `env:VARIABLE_NAME` opaque references. Re-exported from `finch-providers`.
 pub struct EnvironmentCredentialResolver;
 /// Execution target for inference (hardware where code runs)  All targets use ONNX Runtime as the inference provider.

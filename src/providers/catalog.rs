@@ -201,6 +201,12 @@ mod tests {
                 AudienceBinding::custom(origin).unwrap(),
                 Some(origin.to_string()),
             ),
+            CredentialProvider::GrokSubscription => (
+                CredentialKind::OauthDevice,
+                "xai-grok",
+                AudienceBinding::custom(origin).unwrap(),
+                Some(origin.to_string()),
+            ),
             CredentialProvider::GoogleVertex => (
                 CredentialKind::CloudIdentity,
                 "google-cloud",
@@ -349,6 +355,10 @@ mod tests {
             (
                 CredentialProvider::ChatgptSubscription,
                 "ChatGPT subscription custom endpoints and paths are not supported",
+            ),
+            (
+                CredentialProvider::GrokSubscription,
+                "Grok subscription custom endpoints and paths are not supported",
             ),
             (
                 CredentialProvider::GoogleVertex,

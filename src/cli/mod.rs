@@ -8,6 +8,7 @@ mod conversation;
 pub mod conversation_compactor; // Infinite context: summarise dropped messages
 pub mod diff;
 pub mod global_output; // Phase 3.5: Global output system with macros
+pub mod grok_auth;
 mod input;
 pub mod llm_dialogs; // LLM-prompted user dialogs (AskUserQuestion)
 pub mod memtree_console; // Phase 4+: Tree-structured conversation interface

@@ -5,6 +5,7 @@
 //! `setup_wizard.rs` and the add-time spawn below) or flows through the types re-exported
 //! for the dialog. Nothing else in the wizard talks to either directly.
 
+use super::grok_recovery::grok_setup_references;
 use super::*;
 
 /// Secret-free recovery state shown after a ChatGPT setup ceremony terminates.
@@ -139,9 +140,31 @@ pub async fn validate_and_apply_for(
             "Legacy chatgpt_subscription profiles are unsupported because Finch no longer launches Codex app-server. Remove that profile and configure OpenAI Platform with an API key or another supported provider"
         );
     }
-    if chatgpt_setup_references(result).is_empty() {
+    if chatgpt_setup_references(result).is_empty() && grok_setup_references(result).is_empty() {
         apply_and_save(result)?;
         return Ok(SetupApplyOutcome::Saved);
+    }
+    if !grok_setup_references(result).is_empty() {
+        for reference in grok_setup_references(result) {
+            let Some(credential) = result
+                .credentials
+                .iter()
+                .find(|credential| credential.name == reference)
+            else {
+                anyhow::bail!(
+                    "Grok subscription '{reference}' was selected but is not signed in. Complete device login, or add the separate Grok API-key provider from console.x.ai. Finch will not silently switch billing modes"
+                );
+            };
+            if credential.provider != crate::config::CredentialProvider::GrokSubscription {
+                anyhow::bail!(
+                    "Grok subscription '{reference}' cannot use an xAI API-key credential"
+                );
+            }
+        }
+        if chatgpt_setup_references(result).is_empty() {
+            apply_and_save(result)?;
+            return Ok(SetupApplyOutcome::Saved);
+        }
     }
     let service = crate::cli::chatgpt_auth::ChatGptAuthService::production()?;
     let mut editor = TerminalChatGptSetupRecoveryEditor;
@@ -604,7 +627,7 @@ pub(super) fn spawn_add_time_chatgpt_device_flow(
                     .begin_named_credential(&reference, cancel.clone())
                     .await
                 {
-                    Ok(ChatGptNamedCredentialStart::Ensured(ensured)) => Ok(ensured),
+                    Ok(ChatGptNamedCredentialStart::Ensured(ensured)) => Ok(ensured.credential),
                     Ok(ChatGptNamedCredentialStart::AuthorizationRequired(device)) => {
                         *pending.lock().unwrap() = Some(DeviceAuthPresentation {
                             verification_uri: device.verification_uri.clone(),
@@ -614,6 +637,7 @@ pub(super) fn spawn_add_time_chatgpt_device_flow(
                         authenticator
                             .finish_named_credential(&reference, &device, cancel)
                             .await
+                            .map(|ensured| ensured.credential)
                     }
                     Err(error) => Err(error),
                 }

@@ -187,16 +187,26 @@ enum Command {
 enum AuthCommand {
     /// Show local, secret-free authentication status without network access
     Status {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub"])]
         provider: String,
-        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
+        #[arg(
+            long,
+            default_value = "chatgpt:default",
+            default_value_if("provider", "grok-sub", Some("grok-sub:default")),
+            value_parser = parse_credential_reference
+        )]
         credential: String,
     },
-    /// Start Finch-native ChatGPT device login
+    /// Start Finch-native ChatGPT or SuperGrok device login
     Login {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub"])]
         provider: String,
-        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
+        #[arg(
+            long,
+            default_value = "chatgpt:default",
+            default_value_if("provider", "grok-sub", Some("grok-sub:default")),
+            value_parser = parse_credential_reference
+        )]
         credential: String,
         /// Copy the one-time code to the clipboard
         #[arg(long)]
@@ -205,18 +215,28 @@ enum AuthCommand {
         #[arg(long)]
         open: bool,
     },
-    /// Revoke a named ChatGPT credential and retain a local tombstone
+    /// Revoke a named subscription credential and retain a local tombstone
     Logout {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub"])]
         provider: String,
-        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
+        #[arg(
+            long,
+            default_value = "chatgpt:default",
+            default_value_if("provider", "grok-sub", Some("grok-sub:default")),
+            value_parser = parse_credential_reference
+        )]
         credential: String,
     },
     /// Recover an interrupted local mutation as a signed-out tombstone
     Recover {
-        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt", "grok-sub"])]
         provider: String,
-        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
+        #[arg(
+            long,
+            default_value = "chatgpt:default",
+            default_value_if("provider", "grok-sub", Some("grok-sub:default")),
+            value_parser = parse_credential_reference
+        )]
         credential: String,
     },
 }
@@ -2713,26 +2733,39 @@ async fn run_setup() -> Result<()> {
     Ok(())
 }
 
+fn auth_provider(command: &AuthCommand) -> &str {
+    match command {
+        AuthCommand::Status { provider, .. }
+        | AuthCommand::Login { provider, .. }
+        | AuthCommand::Logout { provider, .. }
+        | AuthCommand::Recover { provider, .. } => provider,
+    }
+}
+
 async fn run_auth_command(command: AuthCommand) -> Result<()> {
+    match auth_provider(&command) {
+        "chatgpt" => run_chatgpt_auth(command).await,
+        "grok-sub" => run_grok_auth(command).await,
+        other => anyhow::bail!("unsupported auth provider {other}"),
+    }
+}
+
+async fn run_chatgpt_auth(command: AuthCommand) -> Result<()> {
     use finch::cli::chatgpt_auth::{
         render_status_line, save_named_credential, ChatGptAuthService, DeviceLoginPresentation,
     };
-    use tokio_util::sync::CancellationToken;
 
     let service = ChatGptAuthService::production()?;
     match command {
-        AuthCommand::Status {
-            provider: _,
-            credential,
-        } => {
+        AuthCommand::Status { credential, .. } => {
             let status = service.status(&credential)?;
             println!("{}", render_status_line(&status)?);
         }
         AuthCommand::Login {
-            provider: _,
             credential,
             copy,
             open,
+            ..
         } => {
             let cancel = command_cancellation();
             let metadata = service
@@ -2752,23 +2785,68 @@ async fn run_auth_command(command: AuthCommand) -> Result<()> {
             save_named_credential(config, metadata)?;
             println!("ChatGPT login saved credential {credential} for account {account}.");
         }
-        AuthCommand::Logout {
-            provider: _,
-            credential,
-        } => {
+        AuthCommand::Logout { credential, .. } => {
             let metadata = service.logout(&credential, command_cancellation()).await?;
             let config = load_config()?;
             save_named_credential(config, metadata)?;
             println!("ChatGPT credential {credential} was revoked and signed out.");
         }
-        AuthCommand::Recover {
-            provider: _,
-            credential,
-        } => {
+        AuthCommand::Recover { credential, .. } => {
             let metadata = service.recover(&credential)?;
             let config = load_config()?;
             save_named_credential(config, metadata)?;
             println!("Recovered ChatGPT credential {credential} as signed_out; run `finch auth login chatgpt --credential {credential}` to sign in again.");
+        }
+    }
+    Ok(())
+}
+
+async fn run_grok_auth(command: AuthCommand) -> Result<()> {
+    use finch::cli::grok_auth::{
+        render_status_line, save_named_credential, DeviceLoginPresentation, GrokAuthService,
+    };
+
+    let service = GrokAuthService::production()?;
+    match command {
+        AuthCommand::Status { credential, .. } => {
+            let status = service.status(&credential)?;
+            println!("{}", render_status_line(&status)?);
+        }
+        AuthCommand::Login {
+            credential,
+            copy,
+            open,
+            ..
+        } => {
+            let cancel = command_cancellation();
+            let metadata = service
+                .login(
+                    &credential,
+                    DeviceLoginPresentation {
+                        copy_code: copy,
+                        open_browser: open,
+                    },
+                    cancel,
+                )
+                .await?;
+            let account = metadata.account.clone().unwrap_or_default();
+            let config = load_config().context(
+                "Grok login succeeded, but Finch config is unavailable; rerun `finch setup` to bind the named credential",
+            )?;
+            save_named_credential(config, metadata)?;
+            println!("Grok login saved credential {credential} for account {account}.");
+        }
+        AuthCommand::Logout { credential, .. } => {
+            let metadata = service.logout(&credential, command_cancellation()).await?;
+            let config = load_config()?;
+            save_named_credential(config, metadata)?;
+            println!("Grok credential {credential} was revoked and signed out.");
+        }
+        AuthCommand::Recover { credential, .. } => {
+            let metadata = service.recover(&credential)?;
+            let config = load_config()?;
+            save_named_credential(config, metadata)?;
+            println!("Recovered Grok credential {credential} as signed_out; run `finch auth login grok-sub --credential {credential}` to sign in again.");
         }
     }
     Ok(())
@@ -3696,6 +3774,19 @@ mod tests {
             );
         }
         assert!(Args::try_parse_from(["finch", "auth", "login", "openai"]).is_err());
+        assert!(Args::try_parse_from(["finch", "auth", "login", "grok"]).is_err());
+
+        let grok = Args::try_parse_from(["finch", "auth", "login", "grok-sub"]).unwrap();
+        assert!(matches!(
+            grok.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login {
+                    provider,
+                    credential,
+                    ..
+                }
+            }) if provider == "grok-sub" && credential == "grok-sub:default"
+        ));
     }
 
     #[test]

@@ -15,7 +15,8 @@ use crate::config::{
     ResolvedCredential, TeacherEntry,
 };
 use finch_providers::{
-    ChatGptSubscriptionProvider, ClaudeProvider, GeminiProvider, OpenAIProvider,
+    ChatGptSubscriptionProvider, ClaudeProvider, GeminiProvider, GrokSubscriptionProvider,
+    OpenAIProvider,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -408,6 +409,9 @@ fn create_provider_from_resolved_entry(
         CredentialProvider::ChatgptSubscription => bail!(
             "ChatGPT subscription credentials are distinct from OpenAI Platform credentials, but no documented Finch-native subscription transport is currently available"
         ),
+        CredentialProvider::GrokSubscription => bail!(
+            "Grok subscription credentials are distinct from xAI Console API-key credentials and cannot be resolved as an environment secret"
+        ),
         CredentialProvider::GoogleVertex => bail!(
             "Google Vertex named credentials are modeled but its cloud-identity transport is not implemented"
         ),
@@ -431,7 +435,9 @@ fn resolve_named_graph(
         let credential = credentials
             .get(binding.credential_ref.as_str())
             .expect("Config::validate checked every named credential reference");
-        if credential.provider == CredentialProvider::ChatgptSubscription {
+        if credential.provider == CredentialProvider::ChatgptSubscription
+            || credential.provider == CredentialProvider::GrokSubscription
+        {
             continue;
         }
         let handle = resolve_named_credential(binding, credential, resolver)?;
@@ -473,6 +479,11 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
             if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
         {
             bail!("ChatGPT subscription custom endpoints and paths are not supported")
+        }
+        CredentialProvider::GrokSubscription
+            if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
+        {
+            bail!("Grok subscription custom endpoints and paths are not supported")
         }
         CredentialProvider::GoogleVertex => bail!(
             "Google Vertex named credentials are modeled but its cloud-identity transport is not implemented"
@@ -523,13 +534,14 @@ fn create_named_profiles_from_config_with_resolver(
             matches!(
                 entry,
                 ProviderEntry::Credentialed {
-                    provider: CredentialProvider::ChatgptSubscription,
+                    provider: CredentialProvider::ChatgptSubscription
+                        | CredentialProvider::GrokSubscription,
                     ..
                 }
             )
         })
     {
-        bail!("Injected credential resolvers cannot fabricate a refreshable ChatGPT subscription lease")
+        bail!("Injected credential resolvers cannot fabricate a refreshable subscription lease")
     }
     let resolved = resolve_named_graph(config, resolver)?;
     let credentials = crate::config::credential_index(config.credentials())?;
@@ -557,6 +569,18 @@ fn create_named_profiles_from_config_with_resolver(
                         unreachable!("credential binding implies credentialed entry")
                     };
                     Ok(Box::new(ChatGptSubscriptionProvider::production(
+                        metadata,
+                        model.as_deref(),
+                        *reasoning_effort,
+                    )?) as Box<dyn LlmProvider>)
+                } else if metadata.provider == CredentialProvider::GrokSubscription {
+                    if !production_oauth {
+                        bail!("Injected credential resolvers cannot fabricate a refreshable Grok subscription lease")
+                    }
+                    let ProviderEntry::Credentialed { model, reasoning_effort, .. } = entry else {
+                        unreachable!("credential binding implies credentialed entry")
+                    };
+                    Ok(Box::new(GrokSubscriptionProvider::production(
                         metadata,
                         model.as_deref(),
                         *reasoning_effort,
@@ -777,8 +801,10 @@ pub fn create_provider_profile_from_config_with_resolver(
         let credential = credentials
             .get(binding.credential_ref.as_str())
             .expect("Config::validate checked the selected named credential reference");
-        if credential.provider == CredentialProvider::ChatgptSubscription {
-            bail!("Injected credential resolvers cannot fabricate a refreshable ChatGPT subscription lease")
+        if credential.provider == CredentialProvider::ChatgptSubscription
+            || credential.provider == CredentialProvider::GrokSubscription
+        {
+            bail!("Injected credential resolvers cannot fabricate a refreshable subscription lease")
         }
         let handle = resolve_named_credential(binding, credential, resolver)?;
         let inner = create_provider_from_resolved_entry(entry, &handle)?;
@@ -1293,6 +1319,13 @@ mod tests {
                 CredentialKind::Bearer,
                 "openai-chatgpt",
                 EndpointFamily::ChatgptSubscription,
+                false,
+            ),
+            (
+                CredentialProvider::GrokSubscription,
+                CredentialKind::OauthDevice,
+                "xai-grok",
+                EndpointFamily::GrokSubscription,
                 false,
             ),
             (

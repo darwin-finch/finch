@@ -33,6 +33,7 @@ pub enum CredentialProvider {
     OpenaiPlatform,
     ChatgptSubscription,
     Xai,
+    GrokSubscription,
     GeminiAiStudio,
     GoogleVertex,
     Mistral,
@@ -47,6 +48,7 @@ impl CredentialProvider {
             Self::OpenaiPlatform => "openai_platform",
             Self::ChatgptSubscription => "chatgpt_subscription",
             Self::Xai => "xai",
+            Self::GrokSubscription => "grok_subscription",
             Self::GeminiAiStudio => "gemini_ai_studio",
             Self::GoogleVertex => "google_vertex",
             Self::Mistral => "mistral",
@@ -65,6 +67,7 @@ pub enum EndpointFamily {
     OpenaiPlatform,
     ChatgptSubscription,
     XaiApi,
+    GrokSubscription,
     GeminiAiStudio,
     GoogleVertex,
     MistralApi,
@@ -300,6 +303,11 @@ const CHATGPT_SESSION: &[CredentialKind] = &[
     CredentialKind::OauthBrowserPkce,
     CredentialKind::Bearer,
 ];
+const GROK_SESSION: &[CredentialKind] = &[
+    CredentialKind::OauthDevice,
+    CredentialKind::OauthBrowserPkce,
+    CredentialKind::Bearer,
+];
 
 pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor {
     match provider {
@@ -330,6 +338,13 @@ pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor
             kinds: API_KEY,
             family: EndpointFamily::XaiApi,
             standard_origin: "https://api.x.ai",
+        },
+        CredentialProvider::GrokSubscription => ProviderAuthDescriptor {
+            provider,
+            issuer: "xai-grok",
+            kinds: GROK_SESSION,
+            family: EndpointFamily::GrokSubscription,
+            standard_origin: "https://cli-chat-proxy.grok.com",
         },
         CredentialProvider::GeminiAiStudio => ProviderAuthDescriptor {
             provider,
@@ -634,6 +649,7 @@ mod tests {
             CredentialProvider::OpenaiPlatform,
             CredentialProvider::ChatgptSubscription,
             CredentialProvider::Xai,
+            CredentialProvider::GrokSubscription,
             CredentialProvider::GeminiAiStudio,
             CredentialProvider::GoogleVertex,
             CredentialProvider::Mistral,
@@ -689,6 +705,36 @@ mod tests {
         .contains("provider mismatch"));
         assert!(validate_binding(
             CredentialProvider::OpenaiPlatform,
+            None,
+            &binding(),
+            &subscription,
+            Utc::now()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_xai_api_and_grok_subscription_never_cross_bind() {
+        let api_key = credential(CredentialProvider::Xai, CredentialKind::ApiKey);
+        let subscription = credential(
+            CredentialProvider::GrokSubscription,
+            CredentialKind::OauthDevice,
+        );
+        let error = validate_binding(
+            CredentialProvider::GrokSubscription,
+            None,
+            &binding(),
+            &api_key,
+            Utc::now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("provider mismatch"),
+            "API-key credentials must not bind to the SuperGrok subscription lane: {error}"
+        );
+        assert!(validate_binding(
+            CredentialProvider::Xai,
             None,
             &binding(),
             &subscription,

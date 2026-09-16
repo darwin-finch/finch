@@ -66,6 +66,9 @@ fn adapters_do_not_import_or_invoke_tool_executor() {
         "gemini.rs",
         "chatgpt_subscription.rs",
         "chatgpt_subscription/tests.rs",
+        "grok_subscription.rs",
+        "grok_oauth.rs",
+        "grok_jwks.rs",
     ];
     let forbidden = ["ToolExecutor", "execute_tool("];
     let mut hits = Vec::new();

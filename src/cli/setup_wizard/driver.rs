@@ -280,6 +280,21 @@ pub(super) fn run_tabbed_wizard(
             None
         }
     };
+    state.grok_authenticator = match crate::cli::grok_auth::GrokAuthService::production() {
+        Ok(service) => {
+            Some(Arc::new(service)
+                as Arc<
+                    dyn crate::cli::grok_auth::GrokCredentialAuthenticator,
+                >)
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "Grok subscription device sign-in is unavailable in setup; the exchange will run when setup is saved"
+            );
+            None
+        }
+    };
 
     loop {
         terminal.draw(|f| {

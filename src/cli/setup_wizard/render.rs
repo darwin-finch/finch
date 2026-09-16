@@ -4,6 +4,7 @@
 //! `cli` except `crate::theme`.
 
 use super::chatgpt_recovery::{chatgpt_setup_failure_cause, chatgpt_setup_failure_summary};
+use super::grok_recovery::{grok_setup_failure_cause, grok_setup_failure_summary};
 use super::*;
 
 /// Render the tabbed wizard UI
@@ -421,28 +422,31 @@ pub(super) fn render_models_section(
             api_key,
             persisted,
             ..
-        } if provider.eq_ignore_ascii_case("chatgpt") => {
+        } if provider.eq_ignore_ascii_case("chatgpt")
+            || provider.eq_ignore_ascii_case("grok-sub") =>
+        {
             matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
         }
         ModelConfig::Remote { api_key, .. } => !api_key.is_empty(),
         ModelConfig::Local { .. } => true,
     };
 
-    let description_text = if matches!(
-        primary_model,
-        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("chatgpt")
-    ) {
-        "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate."
-            .to_string()
-    } else if has_key {
-        format!(
+    let description_text = match primary_model {
+        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("grok-sub") => {
+            "Grok subscription uses SuperGrok entitlement via device sign-in; xAI Console API keys are a separate provider and are never used automatically."
+                .to_string()
+        }
+        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("chatgpt") => {
+            "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate."
+                .to_string()
+        }
+        _ if has_key => format!(
             "Primary provider configured. Press A to add more providers ({} total).",
             1 + tool_models.len()
-        )
-    } else {
-        "Paste your API key below (E), or add a provider with A.\n\
+        ),
+        _ => "Paste your API key below (E), or add a provider with A.\n\
          No key yet? Get one at console.anthropic.com/keys"
-            .to_string()
+            .to_string(),
     };
     let description = Paragraph::new(description_text)
         .style(Style::default().fg(Color::Blue))
@@ -491,7 +495,9 @@ pub(super) fn render_models_section(
             model,
             ..
         } => {
-            let key_display = if provider.eq_ignore_ascii_case("chatgpt") {
+            let key_display = if provider.eq_ignore_ascii_case("chatgpt")
+                || provider.eq_ignore_ascii_case("grok-sub")
+            {
                 "Named device credential".to_string()
             } else if api_key.is_empty() {
                 "[Not configured]".to_string()
@@ -671,12 +677,19 @@ pub(super) fn render_models_section(
 pub(super) fn render_device_auth_overlay(
     f: &mut Frame,
     area: Rect,
+    provider_idx: usize,
     provider_name: &str,
     pending: &std::sync::Arc<std::sync::Mutex<Option<DeviceAuthPresentation>>>,
     outcome: &DeviceAuthOutcome,
 ) {
+    let provider_id = CLOUD_PROVIDERS[provider_idx.min(CLOUD_PROVIDERS.len() - 1)].0;
+    let title_text = if provider_id.eq_ignore_ascii_case("grok-sub") {
+        format!("Grok subscription device sign-in for {provider_name}")
+    } else {
+        format!("ChatGPT device sign-in for {provider_name}")
+    };
     let title = Line::from(Span::styled(
-        format!("ChatGPT device sign-in for {provider_name}"),
+        title_text,
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -684,7 +697,6 @@ pub(super) fn render_device_auth_overlay(
     let lines: Vec<Line> = match outcome.lock().unwrap().as_ref() {
         Some(Ok(ensured)) => {
             let account = ensured
-                .credential
                 .account
                 .as_deref()
                 .unwrap_or("the authorized account");
@@ -703,11 +715,15 @@ pub(super) fn render_device_auth_overlay(
             ]
         }
         Some(Err(failure)) => {
-            let cause = chatgpt_setup_failure_cause(failure);
+            let summary = if provider_id.eq_ignore_ascii_case("grok-sub") {
+                grok_setup_failure_summary(grok_setup_failure_cause(failure))
+            } else {
+                chatgpt_setup_failure_summary(chatgpt_setup_failure_cause(failure))
+            };
             vec![
                 title,
                 Line::from(""),
-                Line::from(chatgpt_setup_failure_summary(cause)),
+                Line::from(summary),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Enter: Retry sign-in | Esc: Back to provider details",
@@ -982,11 +998,12 @@ pub(super) fn render_add_provider_overlay(
         }
         // ── add-time ChatGPT device ceremony (#424) ──────────────────────────────────
         AddProviderStep::DeviceAuth {
+            provider_idx,
             name,
             pending,
             outcome,
             ..
-        } => render_device_auth_overlay(f, inner, name, pending, outcome),
+        } => render_device_auth_overlay(f, inner, *provider_idx, name, pending, outcome),
     }
 }
 

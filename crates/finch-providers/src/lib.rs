@@ -21,6 +21,11 @@ mod endpoints;
 mod fallback_chain;
 #[cfg(feature = "gemini")]
 mod gemini;
+#[cfg(feature = "grok_subscription")]
+mod grok_jwks;
+mod grok_oauth;
+#[cfg(feature = "grok_subscription")]
+mod grok_subscription;
 mod model_catalog;
 #[cfg(feature = "openai")]
 mod openai;
@@ -60,6 +65,16 @@ pub use endpoints::ProviderEndpoints;
 pub use fallback_chain::FallbackChain;
 #[cfg(feature = "gemini")]
 pub use gemini::GeminiProvider;
+#[cfg(feature = "grok_subscription")]
+pub use grok_jwks::GrokJwksVerifier;
+pub use grok_oauth::{
+    grok_required_scopes, GrokAuthStageError, GrokDeviceEndpointError, GrokSubscriptionService,
+    GrokTokenVerifier, VerifiedGrokClaims, XaiGrokOAuthDialect, GROK_OAUTH_PROTOCOL_REVISION,
+    GROK_REQUIRED_TOKEN_ISSUER, GROK_SESSION_TOKEN_HEADER, GROK_SUBSCRIPTION_BASE_URL,
+    XAI_PUBLIC_CLIENT_ID,
+};
+#[cfg(feature = "grok_subscription")]
+pub use grok_subscription::GrokSubscriptionProvider;
 pub use model_catalog::{
     default_cache_dir, fallback_catalog, profile_cache_identity, read_cache, refresh,
     refresh_with_fallback, static_fallback, CatalogAuth, CatalogSource, ModelCatalog,

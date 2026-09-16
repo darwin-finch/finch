@@ -38,6 +38,14 @@ pub struct EventProvenance { … }
 pub struct FallbackChain { … }
 /// Google Gemini API provider  Supports Gemini 2.0 Flash and other Gemini models. Re-exported from `finch-providers`.
 pub struct GeminiProvider { … }
+/// Secret-free stage markers for actionable device-login diagnostics. Re-exported from `finch-providers`.
+pub enum GrokAuthStageError { PollContract, TokenExchangeRejected, TokenExchangeContract, IdentityVerification, ClientBinding, AccountEntitlement }
+/// Status-only xAI device endpoint failures. Re-exported from `finch-providers`.
+pub enum GrokDeviceEndpointError { StartDisabledOrUnsupported, ClientRejected, StartRejected, PollRejected }
+/// Bounded, single-flight verifier for the exact pinned xAI issuer. Re-exported from `finch-providers`.
+pub struct GrokJwksVerifier { … }
+/// Finch-native SuperGrok subscription transport. Re-exported from `finch-providers`.
+pub struct GrokSubscriptionProvider { … }
 /// Source for an image content block Re-exported from `finch-providers`.
 pub struct ImageSource { … }
 /// Provider-neutral identity and accounting for one completed inference. Re-exported from `finch-providers`.
@@ -121,16 +129,25 @@ pub enum ToolOrigin { Semantic, ProviderNative }
 /// A request whose effective provider/model identity and optional capabilities were checked by Finch's non-overridable dispatch boundary. Re-exported from `finch-providers`.
 pub struct ValidatedProviderRequest { … }
 /// Signature-verified provider claims. Re-exported from `finch-providers`.
+pub struct VerifiedGrokClaims { … }
+/// Signature-verified provider claims. Re-exported from `finch-providers`.
 pub struct VerifiedOpenAiClaims { … }
 /// Request/response protocol used by the provider adapter for this model. Re-exported from `finch-providers`.
 pub enum WireProtocol { AnthropicMessages, OpenAiChatCompletions, OpenAiChatGptResponsesLite, GeminiGenerateContent }
 /// Known wire protocol and the evidence for that binding. Re-exported from `finch-providers`.
 pub struct WireProtocolCapability { … }
+/// Strict xAI-specific dialect; reusable OAuth state remains in `oauth`. Re-exported from `finch-providers`.
+pub struct XaiGrokOAuthDialect<V> { … }
 ```
 
 ## Traits
 
 ```rust
+/// Injected JWS/JWKS verification boundary. Re-exported from `finch-providers`.
+pub trait GrokTokenVerifier: Send + Sync {
+    fn preflight(&self) -> Result<()>;
+    async fn verify(&self, id_token: Option<&str>, access_token: &str, cancel: &CancellationToken) -> Result<VerifiedGrokClaims>;
+}
 /// Non-overridable validated dispatch API shared by every provider backend. Re-exported from `finch-providers`.
 pub trait LlmProvider: ProviderBackend {
     async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse>;
@@ -195,6 +212,8 @@ pub fn create_providers_from_entries(entries: &[ProviderEntry]) -> Result<Vec<Bo
 pub fn default_cache_dir() -> Result<PathBuf> { … }
 /// Re-exported from `finch-providers`.
 pub fn fallback_catalog(provider: &str, models_url: &str) -> ModelCatalog { … }
+/// Finch-local capability attached to a verified Grok subscription credential. Re-exported from `finch-providers`.
+pub fn grok_required_scopes() -> BTreeSet<String> { … }
 /// Validate the complete provider/credential metadata graph and every named transport before secret resolution, provider construction, or selection shortcuts ca…
 pub fn preflight_provider_config(config: &Config) -> Result<()> { … }
 /// Opaque full-width cache/request identity. Re-exported from `finch-providers`.
@@ -221,6 +240,14 @@ pub const CHATGPT_OAUTH_PROTOCOL_REVISION: &str = "openai-codex-public-client@94
 /// Default Claude model used when a transport does not override it. Re-exported from `finch-providers`.
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5";
 /// Re-exported from `finch-providers`.
+pub const GROK_OAUTH_PROTOCOL_REVISION: &str = "xai-grok-build-public-client@482711333c7195dc16a272777f86086d615e2afb+finch-binding-v1";
+/// Re-exported from `finch-providers`.
+pub const GROK_REQUIRED_TOKEN_ISSUER: &str = "https://auth.x.ai";
+/// Re-exported from `finch-providers`.
+pub const GROK_SESSION_TOKEN_HEADER: &str = "xai-grok-cli";
+/// Re-exported from `finch-providers`.
+pub const GROK_SUBSCRIPTION_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
+/// Re-exported from `finch-providers`.
 pub const OPENAI_PUBLIC_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Re-exported from `finch-providers`.
 pub const REQUIRED_TOKEN_ISSUER: &str = "https://auth.openai.com";
@@ -228,4 +255,6 @@ pub const REQUIRED_TOKEN_ISSUER: &str = "https://auth.openai.com";
 pub const STATIC_FALLBACK_AS_OF: &str = "2026-08-26";
 /// Prompt that normalizes output discipline across all LLM providers. Re-exported from `finch-providers`.
 pub const UNIVERSAL_ALIGNMENT_PROMPT: &str = "\ ## Output Discipline These rules override any stylistic defaults: 1. When asked for JSON, return ONLY the JSON. No markdown code fences. No prose before \ or after. The first character of your response must be `[` or `{`. 2. When given a numbered format (1. Step one\n2. Step two), follow it exactly. 3. When given field names or schema, use them verbatim — no renaming, no extras. 4. Do not add unsolicited caveats, disclaimers, or explanations unless the instruction \ explicitly requests them. 5. Treat every instruction as binding, not advisory."; /// Inject the alignment prompt into an existing system prompt, or return it standalone. /// /// The alignment instructions are prepended so they take priority over any other /// stylistic context in the system prompt. pub fn with_alignment(system: Option<&str>) -> String { match system { Some(existing) if !existing.trim().is_empty() => { format!("{}\n\n{}", UNIVERSAL_ALIGNMENT_PROMPT.trim(), existing) } _ => UNIVERSAL_ALIGNMENT_PROMPT.trim().to_string(), } } #[cfg(test)] mod tests { use super::*; #[test] fn test_with_alignment_no_system() { let result = with_alignment(None); assert!(result.contains("Output Discipline")); assert!(result.starts_with("## Output Discipline")); } #[test] fn test_with_alignment_empty_system() { let result = with_alignment(Some("")); // Empty system treated same as None — just the alignment prompt, no extra suffix assert!(result.contains("Output Discipline")); assert_eq!(result, UNIVERSAL_ALIGNMENT_PROMPT.trim()); } #[test] fn test_with_alignment_prepends_to_existing() { let result = with_alignment(Some("Be a helpful assistant.")); assert!(result.starts_with("## Output Discipline")); assert!(result.contains("Be a helpful assistant.")); // Alignment comes first let align_pos = result.find("Output Discipline").unwrap(); let system_pos = result.find("Be a helpful").unwrap(); assert!(align_pos < system_pos); } #[test] fn test_with_alignment_whitespace_only_system() { let result = with_alignment(Some(" \n ")); // Whitespace-only treated same as None assert!(result.starts_with("## Output Discipline")); } #[test] fn test_universal_alignment_prompt_has_json_rule() { assert!(UNIVERSAL_ALIGNMENT_PROMPT.contains("JSON")); assert!(UNIVERSAL_ALIGNMENT_PROMPT.contains("code fences")); } #[test] fn test_universal_alignment_prompt_has_numbered_format_rule() { assert!(UNIVERSAL_ALIGNMENT_PROMPT.contains("numbered format")); } }
+/// Re-exported from `finch-providers`.
+pub const XAI_PUBLIC_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 ```

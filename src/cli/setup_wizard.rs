@@ -14,11 +14,13 @@
 //! | [`render`] | drawing, one function per wizard section and overlay |
 //! | [`apply`] | from wizard state to a saved `crate::config::Config` |
 //! | [`chatgpt_recovery`] | the ChatGPT credential ceremony, its recovery loop, and the add-time device dialog flow (#424) |
+//! | [`grok_recovery`] | SuperGrok add-time device dialog and fail-closed API-key offer |
 
 mod apply;
 mod catalog;
 mod chatgpt_recovery;
 mod driver;
+mod grok_recovery;
 mod input;
 mod render;
 mod state;
@@ -26,9 +28,9 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-use crate::cli::chatgpt_auth::{
-    ChatGptCredentialAuthenticator, ChatGptNamedCredentialStart, EnsuredChatGptCredential,
-};
+#[cfg(test)]
+use crate::cli::chatgpt_auth::EnsuredChatGptCredential;
+use crate::cli::chatgpt_auth::{ChatGptCredentialAuthenticator, ChatGptNamedCredentialStart};
 use crate::config::{CoreMlConfig, ExecutionTarget, ProviderEntry, TeacherEntry};
 use crate::models::{get_repository, InferenceProvider, ModelFamily, ModelSize};
 use crate::providers::ProviderEndpoints;

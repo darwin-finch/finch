@@ -19,6 +19,8 @@ types. The Claude HTTP client in `src/claude` must not re-export that trio.
 
 **Invariants:** dialects, `ValidatedProviderRequest`, and adapter parsing belong to
 the crate. This facade only maps application configuration onto crate constructors.
+SuperGrok subscription construction is `GrokSubscriptionProvider::production`; it is
+not an OpenAI-compatible xAI Console API-key profile.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- providers::`; crate
 tests via `./scripts/test_brains.sh cargo test -p finch-providers --lib`; also
