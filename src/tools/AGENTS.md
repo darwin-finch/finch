@@ -3,8 +3,16 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/tools/` except `mcp`: the executor, registry, permission policy, persistent
-approval patterns, session task list, and the local tool implementations. Connecting to
+approval patterns, session task list, the event-loop-owned [`ToolLoop`](tool_loop.rs)
+protocol, and the local tool implementations. Connecting to
 external Model Context Protocol servers is the nested [`mcp`](mcp/AGENTS.md) capsule.
+
+**ToolLoop is the single execution lifecycle.** REPL and scheduler drive it.
+Generators and provider adapters never import or invoke `ToolExecutor`.
+Malformed arguments, duplicate ids, unknown tools, and unsupported tools fail
+closed with a typed result and never execute. Cancel, timeout, disconnect,
+retry, and late-result-after-terminal admit at most one execution and append
+at most one result.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
 modules are private, so the `pub use` list in `src/tools/mod.rs` is the whole public surface, and

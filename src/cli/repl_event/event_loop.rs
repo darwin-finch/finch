@@ -3279,6 +3279,9 @@ impl EventLoop {
             let _ = request.response_tx.send(Ok(false));
             return;
         }
+        self.tool_coordinator
+            .terminalize(query_id, crate::tools::ToolLoopTerminal::Cancelled)
+            .await;
         self.conversation.write().await.abort_staged(query_id);
         self.close_active_tool_rows(query_id, "cancelled remotely")
             .await;

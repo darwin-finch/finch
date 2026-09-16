@@ -11,6 +11,7 @@ mod patterns;
 mod permissions;
 mod registry;
 mod todo;
+mod tool_loop;
 mod types;
 
 pub use crate::brain::{
@@ -44,6 +45,10 @@ pub use permissions::{
 };
 pub use registry::{Tool, ToolRegistry};
 pub use todo::{todo_journal, TodoJournalReceiver, TodoJournalTarget, TodoJournalWriter, TodoList};
+pub use tool_loop::{
+    AdmitError, ObserveOutcome, PreparedCall, RejectReason, RejectedCall, ToolCatalog, ToolLoop,
+    ToolLoopIdentity, ToolLoopResult, ToolLoopTerminal, ValidatedCall,
+};
 pub use types::{
     ContentBlock, LiveOutput, LiveOutputSink, ToolContext, ToolDefinition, ToolInputSchema,
     ToolResult, ToolUse,

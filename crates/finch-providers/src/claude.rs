@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 
 use super::endpoints::ProviderEndpoints;
 use super::types::{
-    CapabilitySupport, ModelCapabilities, ProviderRequest, ProviderResponse, StreamChunk,
-    WireProtocol,
+    CapabilitySupport, EventProvenance, ModelCapabilities, ProviderRequest, ProviderResponse,
+    StreamChunk, WireProtocol,
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::anthropic::StreamEvent;
@@ -215,6 +215,7 @@ impl ClaudeProvider {
             anyhow::bail!("{}", msg);
         }
 
+        let model = request.model.clone();
         // Spawn task to parse SSE stream with block tracking
         tokio::spawn(async move {
             tracing::debug!("[STREAM] Streaming task started");
@@ -227,6 +228,7 @@ impl ClaudeProvider {
             let mut transport_end_seen = false;
             let mut receiver_closed = false;
             let mut stream_failed = false;
+            let mut sequence = 0u64;
 
             while let Some(chunk) = stream.next().await {
                 match chunk {
@@ -348,6 +350,29 @@ impl ClaudeProvider {
                                                         "input_json_delta" => {
                                                             if let Some(json) = delta.partial_json {
                                                                 builder.accumulated.push_str(&json);
+                                                                if let Some(id) = builder.id.clone()
+                                                                {
+                                                                    sequence += 1;
+                                                                    if tx
+                                                                        .send(Ok(StreamChunk::ToolCallDelta {
+                                                                            id,
+                                                                            name: builder.name.clone(),
+                                                                            arguments_delta: json,
+                                                                            provenance: EventProvenance {
+                                                                                provider: "claude".to_string(),
+                                                                                model: model.clone(),
+                                                                                event: "tool_call".to_string(),
+                                                                                sequence,
+                                                                                opaque_replay: None,
+                                                                            },
+                                                                        }))
+                                                                        .await
+                                                                        .is_err()
+                                                                    {
+                                                                        receiver_closed = true;
+                                                                        break;
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                         _ => {}
@@ -364,15 +389,44 @@ impl ClaudeProvider {
                                                         text: builder.accumulated,
                                                     },
                                                     "tool_use" => {
-                                                        let input = serde_json::from_str(
-                                                            &builder.accumulated,
-                                                        )
-                                                        .unwrap_or(serde_json::json!({}));
-                                                        ContentBlock::ToolUse {
-                                                            id: builder.id.unwrap_or_default(),
-                                                            name: builder.name.unwrap_or_default(),
-                                                            input,
-                                                        }
+                                                        let input = match serde_json::from_str::<
+                                                            serde_json::Value,
+                                                        >(
+                                                            &builder.accumulated
+                                                        ) {
+                                                            Ok(value) if value.is_object() => value,
+                                                            Ok(_) | Err(_) => {
+                                                                // Deltas already emitted. Do not
+                                                                // coerce malformed JSON to `{}`.
+                                                                continue;
+                                                            }
+                                                        };
+                                                        let id =
+                                                            builder.id.clone().unwrap_or_default();
+                                                        let name = builder
+                                                            .name
+                                                            .clone()
+                                                            .unwrap_or_default();
+                                                        sequence += 1;
+                                                        let _ = tx
+                                                            .send(Ok(
+                                                                StreamChunk::ToolCallComplete {
+                                                                    id: id.clone(),
+                                                                    name: name.clone(),
+                                                                    input: input.clone(),
+                                                                    provenance: EventProvenance {
+                                                                        provider: "claude"
+                                                                            .to_string(),
+                                                                        model: model.clone(),
+                                                                        event: "tool_call"
+                                                                            .to_string(),
+                                                                        sequence,
+                                                                        opaque_replay: None,
+                                                                    },
+                                                                },
+                                                            ))
+                                                            .await;
+                                                        ContentBlock::ToolUse { id, name, input }
                                                     }
                                                     _ => continue,
                                                 };
@@ -555,6 +609,64 @@ mod tests {
         assert_eq!(
             terminal_error.as_deref(),
             Some("Claude SSE ended before a terminal message_stop")
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_json_does_not_become_empty_object() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4\",\"usage\":{\"input_tokens\":1}}}\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-A\",\"name\":\"read\"}}\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\"\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "data: [DONE]\n",
+        );
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = ClaudeProvider::new_with_endpoints(
+            "test-key".to_string(),
+            &server.url(),
+            "/v1/messages",
+            "/v1/models",
+        )
+        .unwrap();
+        let mut stream = provider
+            .send_message_stream_once(&ProviderRequest::new(vec![crate::Message::user("inspect")]))
+            .await
+            .unwrap();
+        let mut tool_blocks = Vec::new();
+        let mut deltas = 0usize;
+        let mut completes = 0usize;
+        while let Some(item) = stream.recv().await {
+            match item {
+                Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { input, .. })) => {
+                    tool_blocks.push(input);
+                }
+                Ok(StreamChunk::ToolCallDelta { .. }) => deltas += 1,
+                Ok(StreamChunk::ToolCallComplete { .. }) => completes += 1,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(
+            deltas > 0,
+            "Claude must emit ToolCallDelta for input_json_delta"
+        );
+        assert_eq!(
+            completes, 0,
+            "malformed JSON must not emit ToolCallComplete"
+        );
+        assert!(
+            tool_blocks.is_empty(),
+            "malformed JSON must not coerce to ContentBlockComplete({{}}): {tool_blocks:?}"
         );
         mock.assert_async().await;
     }

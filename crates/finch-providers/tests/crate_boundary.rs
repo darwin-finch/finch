@@ -58,7 +58,7 @@ fn package_graph_does_not_include_finch() {
 }
 
 #[test]
-fn adapter_streaming_does_not_construct_thinking_or_toolcall_events() {
+fn adapters_do_not_import_or_invoke_tool_executor() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let adapters = [
         "claude.rs",
@@ -67,11 +67,7 @@ fn adapter_streaming_does_not_construct_thinking_or_toolcall_events() {
         "chatgpt_subscription.rs",
         "chatgpt_subscription/tests.rs",
     ];
-    let forbidden = [
-        "StreamChunk::ThinkingDelta",
-        "StreamChunk::ToolCallDelta",
-        "StreamChunk::ToolCallComplete",
-    ];
+    let forbidden = ["ToolExecutor", "execute_tool("];
     let mut hits = Vec::new();
     for adapter in adapters {
         let path = root.join(adapter);
@@ -90,10 +86,25 @@ fn adapter_streaming_does_not_construct_thinking_or_toolcall_events() {
     }
     assert!(
         hits.is_empty(),
-        "adapters must keep TextDelta + ContentBlockComplete; native \
-         ThinkingDelta/ToolCall* emission is #777 (finch-generation translates \
-         ContentBlockComplete(ToolUse)): {hits:?}"
+        "provider adapters parse and emit events; they must never own or invoke ToolExecutor: {hits:?}"
     );
+}
+
+#[test]
+fn openai_and_claude_emit_native_tool_call_events() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    for adapter in ["openai.rs", "claude.rs"] {
+        let source = std::fs::read_to_string(root.join(adapter))
+            .unwrap_or_else(|error| panic!("read {adapter}: {error}"));
+        assert!(
+            source.contains("StreamChunk::ToolCallDelta"),
+            "{adapter} must emit ToolCallDelta from native fragments"
+        );
+        assert!(
+            source.contains("StreamChunk::ToolCallComplete"),
+            "{adapter} must emit ToolCallComplete after validated JSON"
+        );
+    }
 }
 
 #[test]

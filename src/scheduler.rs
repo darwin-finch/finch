@@ -1,7 +1,7 @@
 //! Bounded child-agent scheduler with structured fork/join results.
 
 use crate::generators::Generator;
-use crate::providers::{ContentBlock, Message};
+use crate::providers::{ContentBlock, EventProvenance, Message};
 use crate::runtime::ProgramRuntime;
 // The boundary vocabulary lives below this module; re-exported so existing callers keep working.
 pub use crate::runtime::{
@@ -19,6 +19,9 @@ use crate::tools::{
     GetLanguageDefinitionTool, GetVmStateTool, InspectWordTool, SearchWordTool, SubmitProgramTool,
 };
 use crate::tools::{PermissionCheck, PermissionManager};
+use crate::tools::{
+    PreparedCall, ToolCatalog, ToolLoop, ToolLoopIdentity, ToolLoopResult, ToolLoopTerminal,
+};
 use crate::vm::EffectSet;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -402,6 +405,10 @@ pub struct AgentScheduler {
     /// for the task write lock used to publish the started attempt.
     #[cfg(test)]
     notify_before_attempt_lock: tokio::sync::Mutex<Option<Arc<Notify>>>,
+    /// Test-only rendezvous after a child tool has executed and before the
+    /// loop appends its result, so cancel can prove late-result ignore.
+    #[cfg(test)]
+    wait_before_tool_result_append: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 #[async_trait::async_trait]
@@ -460,6 +467,8 @@ impl AgentScheduler {
             wait_before_provider_poll: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             notify_before_attempt_lock: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            wait_before_tool_result_append: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -939,30 +948,114 @@ impl AgentScheduler {
                 return Ok(response.text);
             }
             messages.push(Message::with_content("assistant", response.content_blocks));
-            let mut results = Vec::with_capacity(response.tool_uses.len());
-            for tool_use in response.tool_uses {
-                self.set_active_tool(identity.task_id, Some(tool_use.name.clone()))
-                    .await;
-                let _ = self.events.send(AgentEvent::ToolStarted {
-                    task_id: identity.task_id,
-                    name: tool_use.name.clone(),
-                });
-                let execution = execute_child_tool(&tools, &tool_use.name, tool_use.input).await;
-                let (content, is_error) = match execution {
-                    Ok(content) => (content, false),
-                    Err(error) => (format!("Error: {error}"), true),
-                };
-                self.set_active_tool(identity.task_id, None).await;
-                let _ = self.events.send(AgentEvent::ToolCompleted {
-                    task_id: identity.task_id,
-                    name: tool_use.name,
-                    is_error,
-                });
-                results.push(ContentBlock::tool_result(
+            let catalog = ToolCatalog::offered(tools.iter().map(|tool| tool.name().to_string()));
+            let mut tool_loop = ToolLoop::new(
+                ToolLoopIdentity {
+                    provider: identity.provider_model.clone(),
+                    model: identity.provider_model.clone(),
+                    brain: None,
+                    run_id: identity.brain_run_id.map(|id| id.to_string()),
+                },
+                catalog,
+            );
+            for (index, tool_use) in response.tool_uses.into_iter().enumerate() {
+                tool_loop.observe_complete(
                     tool_use.id,
-                    content,
-                    is_error.then_some(true),
-                ));
+                    tool_use.name,
+                    tool_use.input,
+                    EventProvenance {
+                        provider: identity.provider_model.clone(),
+                        model: identity.provider_model.clone(),
+                        event: "tool_call".to_string(),
+                        sequence: index as u64 + 1,
+                        opaque_replay: None,
+                    },
+                );
+            }
+            let prepared = tool_loop.finish_observation();
+            let mut results = Vec::with_capacity(prepared.len());
+            for call in prepared {
+                if cancellation.is_cancelled() {
+                    tool_loop.terminalize(ToolLoopTerminal::Cancelled);
+                    bail!(
+                        "agent cancelled after consuming {} provider attempts",
+                        usage.usage.started_attempts
+                    );
+                }
+                match call {
+                    PreparedCall::Rejected(rejected) => {
+                        let result = ToolLoopResult::from_reject(&rejected);
+                        results.push(ContentBlock::tool_result(
+                            rejected.id,
+                            result.content,
+                            Some(true),
+                        ));
+                    }
+                    PreparedCall::Ready(validated) => {
+                        if tool_loop.admit_execution(&validated.id).is_err() {
+                            continue;
+                        }
+                        self.set_active_tool(identity.task_id, Some(validated.name.clone()))
+                            .await;
+                        let _ = self.events.send(AgentEvent::ToolStarted {
+                            task_id: identity.task_id,
+                            name: validated.name.clone(),
+                        });
+                        let execution = tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => {
+                                tool_loop.terminalize(ToolLoopTerminal::Cancelled);
+                                bail!(
+                                    "agent cancelled after consuming {} provider attempts",
+                                    usage.usage.started_attempts
+                                );
+                            }
+                            execution = execute_child_tool(
+                                &tools,
+                                &validated.name,
+                                validated.input,
+                            ) => execution,
+                        };
+                        let (content, is_error) = match execution {
+                            Ok(content) => (content, false),
+                            Err(error) => (format!("Error: {error}"), true),
+                        };
+                        self.set_active_tool(identity.task_id, None).await;
+                        #[cfg(test)]
+                        {
+                            let hook = self.wait_before_tool_result_append.lock().await.take();
+                            if let Some((waiting, resume)) = hook {
+                                waiting.notify_one();
+                                resume.notified().await;
+                            }
+                        }
+                        if cancellation.is_cancelled() {
+                            tool_loop.terminalize(ToolLoopTerminal::Cancelled);
+                            bail!(
+                                "agent cancelled after consuming {} provider attempts",
+                                usage.usage.started_attempts
+                            );
+                        }
+                        let appended = if is_error {
+                            ToolLoopResult::error(&validated.id, content)
+                        } else {
+                            ToolLoopResult::success(&validated.id, content)
+                        };
+                        let Some(appended) = tool_loop.append_result(appended) else {
+                            continue;
+                        };
+                        let _ = self.events.send(AgentEvent::ToolCompleted {
+                            task_id: identity.task_id,
+                            name: validated.name,
+                            is_error: appended.is_error,
+                        });
+                        results.push(ContentBlock::tool_result(
+                            appended.id,
+                            appended.content,
+                            appended.is_error.then_some(true),
+                        ));
+                    }
+                }
             }
             messages.push(Message::with_content("user", results));
         }
@@ -3839,6 +3932,367 @@ mod tests {
             !msg.contains("owner approval required"),
             "invariant: an AskUser fallback for '{name}' means the peer hard-deny \
              arm never fired for the real tool name; got: {msg}"
+        );
+    }
+
+    struct DuplicateIdGenerator {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Generator for DuplicateIdGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<GeneratorResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                let blocks = vec![
+                    ContentBlock::ToolUse {
+                        id: "dup".into(),
+                        name: "get_vm_state".into(),
+                        input: serde_json::json!({"n": 1}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "dup".into(),
+                        name: "get_vm_state".into(),
+                        input: serde_json::json!({"n": 2}),
+                    },
+                ];
+                return Ok(GeneratorResponse {
+                    text: String::new(),
+                    content_blocks: blocks,
+                    tool_uses: vec![
+                        ToolUse {
+                            id: "dup".into(),
+                            name: "get_vm_state".into(),
+                            input: serde_json::json!({"n": 1}),
+                        },
+                        ToolUse {
+                            id: "dup".into(),
+                            name: "get_vm_state".into(),
+                            input: serde_json::json!({"n": 2}),
+                        },
+                    ],
+                    metadata: ResponseMetadata {
+                        generator: "dup".into(),
+                        model: "dup".into(),
+                        confidence: None,
+                        stop_reason: Some("tool_use".into()),
+                        input_tokens: None,
+                        output_tokens: None,
+                        latency_ms: None,
+                        primary_allowance_used_percent: None,
+                        secondary_allowance_used_percent: None,
+                    },
+                });
+            }
+            Ok(GeneratorResponse {
+                text: "done after reject".into(),
+                content_blocks: vec![ContentBlock::text("done after reject")],
+                tool_uses: Vec::new(),
+                metadata: ResponseMetadata {
+                    generator: "dup".into(),
+                    model: "dup".into(),
+                    confidence: None,
+                    stop_reason: Some("end_turn".into()),
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(8),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "dup"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_duplicate_tool_id_fails_closed_without_execution() {
+        let provider = Arc::new(DuplicateIdGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let scheduler = attached_scheduler(
+            ProviderResolver::new(provider.clone()),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let mut events = scheduler.subscribe();
+        let identity = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "inspect".to_string(),
+                    role: AgentRole::Explore,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: Vec::new(),
+                    capability_grant_ids: None,
+                    budget: AgentBudget::default(),
+                },
+                None,
+            )
+            .await
+            .expect("child must spawn");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scheduler.wait(identity.task_id),
+        )
+        .await
+        .expect("duplicate-id child must terminalize")
+        .expect("wait must succeed");
+        assert_eq!(result.status, AgentTaskStatus::Completed);
+        let mut started = 0usize;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AgentEvent::ToolStarted { .. }) {
+                started += 1;
+            }
+        }
+        assert_eq!(
+            started, 0,
+            "duplicate tool-call ids must fail closed before child-tool execution; result={result:?}"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "typed reject must resume the generation turn rather than hang; calls={}",
+            provider.calls.load(Ordering::SeqCst)
+        );
+    }
+
+    struct OneShotToolGenerator {
+        calls: AtomicUsize,
+        first: Vec<ToolUse>,
+        final_text: &'static str,
+    }
+
+    #[async_trait]
+    impl Generator for OneShotToolGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<GeneratorResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                let blocks = self
+                    .first
+                    .iter()
+                    .map(|tool| ContentBlock::ToolUse {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        input: tool.input.clone(),
+                    })
+                    .collect();
+                return Ok(GeneratorResponse {
+                    text: String::new(),
+                    content_blocks: blocks,
+                    tool_uses: self.first.clone(),
+                    metadata: ResponseMetadata {
+                        generator: "oneshot".into(),
+                        model: "oneshot".into(),
+                        confidence: None,
+                        stop_reason: Some("tool_use".into()),
+                        input_tokens: None,
+                        output_tokens: None,
+                        latency_ms: None,
+                        primary_allowance_used_percent: None,
+                        secondary_allowance_used_percent: None,
+                    },
+                });
+            }
+            Ok(GeneratorResponse {
+                text: self.final_text.into(),
+                content_blocks: vec![ContentBlock::text(self.final_text)],
+                tool_uses: Vec::new(),
+                metadata: ResponseMetadata {
+                    generator: "oneshot".into(),
+                    model: "oneshot".into(),
+                    confidence: None,
+                    stop_reason: Some("end_turn".into()),
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(8),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "oneshot"
+        }
+    }
+
+    fn spawn_spec() -> AgentTaskSpec {
+        AgentTaskSpec {
+            task: "inspect".to_string(),
+            role: AgentRole::Explore,
+            background: None,
+            provider: None,
+            model: None,
+            context: Vec::new(),
+            capability_grant_ids: None,
+            budget: AgentBudget::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_unknown_child_tool_fails_closed_without_execution() {
+        let provider = Arc::new(OneShotToolGenerator {
+            calls: AtomicUsize::new(0),
+            first: vec![ToolUse {
+                id: "ghost".into(),
+                name: "ghost_child_tool".into(),
+                input: serde_json::json!({}),
+            }],
+            final_text: "done after unknown",
+        });
+        let scheduler = attached_scheduler(
+            ProviderResolver::new(provider.clone()),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let mut events = scheduler.subscribe();
+        let identity = scheduler
+            .spawn(spawn_spec(), None)
+            .await
+            .expect("child must spawn");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scheduler.wait(identity.task_id),
+        )
+        .await
+        .expect("unknown-tool child must terminalize")
+        .expect("wait must succeed");
+        assert_eq!(result.status, AgentTaskStatus::Completed);
+        assert!(
+            result.final_message.contains("done after unknown"),
+            "typed reject must resume generation; result={result:?}"
+        );
+        let mut started = 0usize;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AgentEvent::ToolStarted { .. }) {
+                started += 1;
+            }
+        }
+        assert_eq!(
+            started, 0,
+            "unknown child tool must never start execution; result={result:?}"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "unknown-tool reject must continue the turn; calls={}",
+            provider.calls.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_late_tool_result_after_cancel_is_dropped() {
+        let provider = Arc::new(OneShotToolGenerator {
+            calls: AtomicUsize::new(0),
+            first: vec![ToolUse {
+                id: "vm".into(),
+                name: "get_vm_state".into(),
+                input: serde_json::json!({}),
+            }],
+            final_text: "must not resume after cancel",
+        });
+        let scheduler = attached_scheduler(
+            ProviderResolver::new(provider.clone()),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let waiting = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *scheduler.wait_before_tool_result_append.lock().await =
+            Some((Arc::clone(&waiting), Arc::clone(&resume)));
+        let mut events = scheduler.subscribe();
+        let identity = scheduler
+            .spawn(spawn_spec(), None)
+            .await
+            .expect("child must spawn");
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+            .await
+            .expect("child must park after executing and before appending the result");
+        scheduler
+            .cancel(identity.task_id)
+            .await
+            .expect("cancel during late-result window must be accepted");
+        resume.notify_one();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scheduler.wait(identity.task_id),
+        )
+        .await
+        .expect("cancelled child must terminalize")
+        .expect("wait must succeed");
+        assert_eq!(
+            result.status,
+            AgentTaskStatus::Cancelled,
+            "late result after cancel must not complete the child; result={result:?}"
+        );
+        assert!(
+            !result
+                .final_message
+                .contains("must not resume after cancel"),
+            "cancelled child must not resume generation with a late tool result; result={result:?}"
+        );
+        let mut completed = 0usize;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AgentEvent::ToolCompleted { .. }) {
+                completed += 1;
+            }
+        }
+        assert_eq!(
+            completed, 0,
+            "late tool result after cancel must not be appended; result={result:?}"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "cancel in the append window must not start another provider turn; calls={}",
+            provider.calls.load(Ordering::SeqCst)
         );
     }
 }

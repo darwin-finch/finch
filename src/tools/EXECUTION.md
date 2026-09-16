@@ -38,6 +38,7 @@ The public surface is the facade in [`mod.rs`](mod.rs); callers outside this dir
 ## Key files
 
 - `src/tools/mod.rs` — private children and the `pub use` list
-- `src/tools/executor.rs` — `ToolExecutor`, multi-turn loop
+- `src/tools/tool_loop.rs` — event-loop-owned `ToolLoop` protocol (REPL + scheduler)
+- `src/tools/executor.rs` — `ToolExecutor`, host execution after ToolLoop admits a call
 - `src/tools/implementations/` — Individual tool implementations
 - `src/tools/permissions.rs` — `PermissionManager`, `ExecutorRole`, `is_readonly_bash()`

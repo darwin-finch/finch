@@ -18,9 +18,11 @@ use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::TuiRenderer;
 use crate::generators::{Generator, StreamChunk};
 use crate::models::GeneratorState;
-use crate::providers::ContentBlock;
+use crate::providers::{ContentBlock, EventProvenance};
 use crate::router::Router;
-use crate::tools::{ToolDefinition, ToolUse};
+use crate::tools::{
+    PreparedCall, ToolCatalog, ToolDefinition, ToolLoop, ToolLoopIdentity, ToolLoopResult, ToolUse,
+};
 
 /// Preserve a provider response as submitted wire source.
 ///
@@ -994,6 +996,124 @@ pub(super) async fn dispatch_tool_uses(
     }
 }
 
+fn tool_loop_for_query(
+    generator: &dyn Generator,
+    tool_definitions: &[ToolDefinition],
+    brain: Option<&super::query_state::BrainTurnProvenance>,
+) -> ToolLoop {
+    ToolLoop::new(
+        ToolLoopIdentity {
+            provider: generator.name().to_string(),
+            model: generator.model_name().to_string(),
+            brain: brain.map(|p| p.brain_id.0.to_string()),
+            run_id: brain.map(|p| p.run_id.0.to_string()),
+        },
+        ToolCatalog::offered(tool_definitions.iter().map(|tool| tool.name.clone())),
+    )
+}
+
+fn stream_tool_provenance(
+    generator: &dyn Generator,
+    model: Option<&str>,
+    sequence: u64,
+) -> EventProvenance {
+    EventProvenance {
+        provider: generator.name().to_string(),
+        model: model.unwrap_or(generator.model_name()).to_string(),
+        event: "tool_call".to_string(),
+        sequence,
+        opaque_replay: None,
+    }
+}
+
+fn merge_prepared_tool_blocks(blocks: &mut Vec<ContentBlock>, prepared: &[PreparedCall]) {
+    for call in prepared {
+        let already = blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == call.id()));
+        if !already {
+            blocks.push(ContentBlock::ToolUse {
+                id: call.id().to_string(),
+                name: call.name().to_string(),
+                input: call.input().clone(),
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_prepared_calls(
+    prepared: Vec<PreparedCall>,
+    query_id: Uuid,
+    round_token: crate::cli::conversation::ToolRoundToken,
+    work_unit: &Arc<crate::cli::messages::WorkUnit>,
+    mode: &Arc<RwLock<ReplMode>>,
+    tool_call_history: &Arc<
+        RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
+    >,
+    event_tx: &mpsc::UnboundedSender<ReplEvent>,
+    active_tool_uses: &ActiveToolUsesMap,
+    tui_renderer: &Arc<tokio::sync::Mutex<crate::cli::tui::TuiRenderer>>,
+    output_manager: &Arc<crate::cli::output_manager::OutputManager>,
+    query_states: &Arc<super::query_state::QueryStateManager>,
+    tool_coordinator: &super::tool_execution::ToolExecutionCoordinator,
+    memory_system: &Option<Arc<crate::memory::MemorySystem>>,
+    memory_recall: crate::memory_status::Recall,
+    session_label: &str,
+    cwd: &str,
+    status_bar: &Arc<crate::cli::StatusBar>,
+    context_lines: usize,
+) {
+    use super::tool_display::format_tool_label;
+
+    let mut ready = Vec::new();
+    for call in prepared {
+        match call {
+            PreparedCall::Rejected(rejected) => {
+                let label = format_tool_label(&rejected.name, &rejected.input);
+                let row_idx = work_unit.add_row(label);
+                work_unit.fail_row(row_idx, "rejected");
+                let result = ToolLoopResult::from_reject(&rejected);
+                let _ = event_tx.send(ReplEvent::ToolResult {
+                    query_id,
+                    round_token,
+                    tool_id: rejected.id,
+                    result: Err(anyhow::anyhow!("{}", result.content)),
+                });
+            }
+            PreparedCall::Ready(validated) => ready.push(ToolUse {
+                id: validated.id,
+                name: validated.name,
+                input: validated.input,
+            }),
+        }
+    }
+    if ready.is_empty() {
+        return;
+    }
+    dispatch_tool_uses(
+        ready,
+        query_id,
+        round_token,
+        work_unit,
+        mode,
+        tool_call_history,
+        event_tx,
+        active_tool_uses,
+        tui_renderer,
+        output_manager,
+        query_states,
+        tool_coordinator,
+        memory_system,
+        memory_recall,
+        session_label,
+        cwd,
+        status_bar,
+        context_lines,
+    )
+    .await;
+}
+
 /// Process a query with potential tool execution loop using unified generators.
 ///
 /// This is a free function (not a method) so it can be called from a
@@ -1209,6 +1329,15 @@ pub(crate) async fn process_query_with_tools(
                 let mut output_token_count: Option<u32> = None;
                 let mut primary_allowance_used_percent: Option<f32> = None;
                 let mut secondary_allowance_used_percent: Option<f32> = None;
+                let mut stream_sequence = 0u64;
+                let query_metadata = query_states.get_metadata(query_id).await;
+                let mut tool_loop = tool_loop_for_query(
+                    generator.as_ref(),
+                    tool_definitions.as_ref(),
+                    query_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.brain_turn_provenance.as_ref()),
+                );
 
                 while let Some(result) = rx.recv().await {
                     match result {
@@ -1251,11 +1380,26 @@ pub(crate) async fn process_query_with_tools(
                                 work_unit.set_response(&text);
                             }
                         }
-                        Ok(StreamChunk::ThinkingDelta { .. })
-                        | Ok(StreamChunk::ToolCallDelta { .. })
-                        | Ok(StreamChunk::ToolCallComplete { .. }) => {
-                            // Adapters do not emit these yet. Dual encoding
-                            // (here vs ContentBlockComplete) is owned by #776/#777.
+                        Ok(StreamChunk::ThinkingDelta { .. }) => {
+                            // Reasoning text is labelled by ReasoningKind at the
+                            // generation layer; this loop does not parse wire
+                            // formats to display it.
+                        }
+                        Ok(StreamChunk::ToolCallDelta {
+                            id,
+                            name,
+                            arguments_delta,
+                            provenance,
+                        }) => {
+                            tool_loop.observe_delta(id, name, arguments_delta, provenance);
+                        }
+                        Ok(StreamChunk::ToolCallComplete {
+                            id,
+                            name,
+                            input,
+                            provenance,
+                        }) => {
+                            tool_loop.observe_complete(id, name, input, provenance);
                         }
                         Ok(StreamChunk::ContentBlockComplete(block)) => {
                             tracing::debug!(
@@ -1270,6 +1414,19 @@ pub(crate) async fn process_query_with_tools(
                             );
                             if let ContentBlock::Text { text } = &block {
                                 completed_text.push_str(text);
+                            }
+                            if let ContentBlock::ToolUse { id, name, input } = &block {
+                                stream_sequence += 1;
+                                tool_loop.observe_complete(
+                                    id.clone(),
+                                    name.clone(),
+                                    input.clone(),
+                                    stream_tool_provenance(
+                                        generator.as_ref(),
+                                        actual_model.as_deref(),
+                                        stream_sequence,
+                                    ),
+                                );
                             }
                             blocks.push(block);
                         }
@@ -1336,23 +1493,12 @@ pub(crate) async fn process_query_with_tools(
 
                 tracing::debug!("[EVENT_LOOP] Streaming complete");
 
-                // Extract tools from blocks
-                tracing::debug!("[EVENT_LOOP] Extracting tools from blocks");
-                let tool_uses: Vec<ToolUse> = blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::ToolUse { id, name, input } => Some(ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        }),
-                        _ => None,
-                    })
-                    .collect();
+                tracing::debug!("[EVENT_LOOP] Settling observed tool calls");
+                let prepared = tool_loop.finish_observation();
+                merge_prepared_tool_blocks(&mut blocks, &prepared);
+                tracing::debug!("[EVENT_LOOP] Found {} tool uses", prepared.len());
 
-                tracing::debug!("[EVENT_LOOP] Found {} tool uses", tool_uses.len());
-
-                if !tool_uses.is_empty() {
+                if !prepared.is_empty() {
                     tracing::debug!("[EVENT_LOOP] Tools detected, updating query state");
                     // Text accompanying a tool-use response is provider
                     // scratch narration, not an executable Finch wire
@@ -1395,7 +1541,7 @@ pub(crate) async fn process_query_with_tools(
                         }
                     };
                     if !query_states
-                        .begin_tool_execution(query_id, tool_uses.len())
+                        .begin_tool_execution(query_id, prepared.len())
                         .await
                     {
                         conversation.write().await.abort_staged(query_id);
@@ -1405,9 +1551,12 @@ pub(crate) async fn process_query_with_tools(
                         "[EVENT_LOOP] Assistant message added, spawning tool executions"
                     );
 
-                    // Dispatch tools (loop detection, mode gating, inline handlers, spawn)
-                    dispatch_tool_uses(
-                        tool_uses,
+                    let tool_loop = std::sync::Arc::new(tokio::sync::Mutex::new(tool_loop));
+                    tool_coordinator
+                        .attach_loop(query_id, std::sync::Arc::clone(&tool_loop))
+                        .await;
+                    dispatch_prepared_calls(
+                        prepared,
                         query_id,
                         round_token,
                         &work_unit,
@@ -1601,28 +1750,39 @@ pub(crate) async fn process_query_with_tools(
                     .secondary_allowance_used_percent,
             });
 
-            // Convert GenToolUse to ToolUse
-            let tool_uses: Vec<ToolUse> = response
-                .tool_uses
-                .into_iter()
-                .map(|gen_tool| ToolUse {
-                    id: gen_tool.id,
-                    name: gen_tool.name,
-                    input: gen_tool.input,
-                })
-                .collect();
+            let query_metadata = query_states.get_metadata(query_id).await;
+            let mut tool_loop = tool_loop_for_query(
+                generator.as_ref(),
+                tool_definitions.as_ref(),
+                query_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.brain_turn_provenance.as_ref()),
+            );
+            for (index, gen_tool) in response.tool_uses.into_iter().enumerate() {
+                tool_loop.observe_complete(
+                    gen_tool.id,
+                    gen_tool.name,
+                    gen_tool.input,
+                    stream_tool_provenance(
+                        generator.as_ref(),
+                        Some(response.metadata.model.as_str()),
+                        index as u64 + 1,
+                    ),
+                );
+            }
+            let prepared = tool_loop.finish_observation();
 
-            if !tool_uses.is_empty() {
+            if !prepared.is_empty() {
                 work_unit.set_assistant_presentation();
                 work_unit.set_response("");
                 query_states
                     .set_tool_work_unit(query_id, Some(Arc::clone(&work_unit)))
                     .await;
-                // Keep the tool-bearing assistant message invisible until
-                // all matching results can be committed atomically.
+                let mut content = response.content_blocks.clone();
+                merge_prepared_tool_blocks(&mut content, &prepared);
                 let assistant_message = crate::providers::Message {
                     role: "assistant".to_string(),
-                    content: response.content_blocks.clone(),
+                    content,
                 };
                 let round_token = match conversation
                     .write()
@@ -1648,16 +1808,19 @@ pub(crate) async fn process_query_with_tools(
                     }
                 };
                 if !query_states
-                    .begin_tool_execution(query_id, tool_uses.len())
+                    .begin_tool_execution(query_id, prepared.len())
                     .await
                 {
                     conversation.write().await.abort_staged(query_id);
                     return;
                 }
 
-                // Dispatch tools (loop detection, mode gating, inline handlers, spawn)
-                dispatch_tool_uses(
-                    tool_uses,
+                let tool_loop = std::sync::Arc::new(tokio::sync::Mutex::new(tool_loop));
+                tool_coordinator
+                    .attach_loop(query_id, std::sync::Arc::clone(&tool_loop))
+                    .await;
+                dispatch_prepared_calls(
+                    prepared,
                     query_id,
                     round_token,
                     &work_unit,
@@ -2159,11 +2322,20 @@ mod tests {
         events: mpsc::UnboundedReceiver<ReplEvent>,
         task: tokio::task::JoinHandle<()>,
         colors: crate::theme::ColorScheme,
+        tool_coordinator: ToolExecutionCoordinator,
         _tempdir: tempfile::TempDir,
     }
 
     impl StreamingQueryHarness {
         async fn spawn(query: &str) -> Self {
+            Self::spawn_with(query, ToolRegistry::new(), Vec::new()).await
+        }
+
+        async fn spawn_with(
+            query: &str,
+            registry: ToolRegistry,
+            tool_definitions: Vec<ToolDefinition>,
+        ) -> Self {
             let colors = crate::theme::ColorScheme::default();
             let output = Arc::new(OutputManager::new(colors.clone()));
             output.disable_stdout();
@@ -2211,8 +2383,8 @@ mod tests {
 
             let tempdir = tempfile::tempdir().expect("create isolated tool-pattern directory");
             let executor = ToolExecutor::new(
-                ToolRegistry::new(),
-                PermissionManager::new(),
+                registry,
+                PermissionManager::new().with_default_rule(crate::tools::PermissionRule::Allow),
                 tempdir.path().join("patterns.json"),
             )
             .expect("construct inert tool executor");
@@ -2230,6 +2402,7 @@ mod tests {
             let (generator, stream_tx) = PacedStreamGenerator::new();
             let selected: Arc<dyn Generator> = generator.clone();
             let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let harness_coordinator = tool_coordinator.clone();
             let task = tokio::spawn(process_query_with_tools(
                 query_id,
                 query.to_string(),
@@ -2238,7 +2411,7 @@ mod tests {
                 Arc::clone(&selected),
                 Arc::new(Router::new(crate::models::ThresholdRouter::new())),
                 Arc::new(RwLock::new(GeneratorState::NotAvailable)),
-                Arc::new(Vec::new()),
+                Arc::new(tool_definitions),
                 conversation,
                 Arc::clone(&query_states),
                 tool_coordinator,
@@ -2277,6 +2450,7 @@ mod tests {
                 events,
                 task,
                 colors,
+                tool_coordinator: harness_coordinator,
                 _tempdir: tempdir,
             }
         }
@@ -2424,6 +2598,325 @@ mod tests {
                 .iter()
                 .any(|child| child.label.contains("status")),
             "named-Brain continuation lost the canonical status child: {row:?}"
+        );
+    }
+
+    struct CountingTool {
+        name: &'static str,
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for CountingTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn effect(&self) -> crate::programs::ExecutionEffect {
+            crate::programs::ExecutionEffect::WorkspaceRead
+        }
+
+        fn description(&self) -> &str {
+            "counts executions for ToolLoop production-boundary tests"
+        }
+
+        fn input_schema(&self) -> crate::tools::ToolInputSchema {
+            crate::tools::ToolInputSchema::simple(vec![("file_path", "path")])
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: &crate::tools::ToolContext<'_>,
+        ) -> anyhow::Result<String> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok("counted".to_string())
+        }
+    }
+
+    fn offered_read() -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "read".to_string(),
+            description: "read a file".to_string(),
+            input_schema: crate::tools::ToolInputSchema::simple(vec![("file_path", "path")]),
+        }]
+    }
+
+    fn stream_prov(sequence: u64) -> crate::providers::EventProvenance {
+        crate::providers::EventProvenance {
+            provider: "paced-stream".into(),
+            model: "paced-stream".into(),
+            event: "tool_call".into(),
+            sequence,
+            opaque_replay: None,
+        }
+    }
+
+    async fn collect_tool_results(
+        mut harness: StreamingQueryHarness,
+    ) -> Vec<(String, Result<String, String>)> {
+        harness.close_stream();
+        harness.task.await.expect("query task panicked");
+        let mut results = Vec::new();
+        while let Ok(event) = harness.events.try_recv() {
+            if let ReplEvent::ToolResult {
+                tool_id, result, ..
+            } = event
+            {
+                results.push((tool_id, result.map_err(|error| error.to_string())));
+            }
+        }
+        results
+    }
+
+    #[tokio::test]
+    async fn test_streaming_malformed_tool_args_fail_closed_without_execution() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CountingTool {
+            name: "read",
+            executions: Arc::clone(&executions),
+        }));
+        let mut harness =
+            StreamingQueryHarness::spawn_with("inspect", registry, offered_read()).await;
+        harness
+            .send(Ok(StreamChunk::ToolCallDelta {
+                id: "call-1".into(),
+                name: Some("read".into()),
+                arguments_delta: "{\"file_path\":".into(),
+                provenance: stream_prov(1),
+            }))
+            .await;
+        let results = collect_tool_results(harness).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "malformed arguments must never execute; results={results:?}"
+        );
+        assert_eq!(results.len(), 1, "typed result required: {results:?}");
+        assert!(
+            results[0]
+                .1
+                .as_ref()
+                .is_err_and(|error| error.contains("malformed arguments")),
+            "typed result must name malformed arguments: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_duplicate_tool_id_fails_closed_without_second_execution() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CountingTool {
+            name: "read",
+            executions: Arc::clone(&executions),
+        }));
+        let mut harness =
+            StreamingQueryHarness::spawn_with("inspect", registry, offered_read()).await;
+        let input_a = serde_json::json!({"file_path": "/tmp/a"});
+        let input_b = serde_json::json!({"file_path": "/tmp/b"});
+        harness
+            .send(Ok(StreamChunk::ToolCallComplete {
+                id: "call-1".into(),
+                name: "read".into(),
+                input: input_a,
+                provenance: stream_prov(1),
+            }))
+            .await;
+        harness
+            .send(Ok(StreamChunk::ToolCallComplete {
+                id: "call-1".into(),
+                name: "read".into(),
+                input: input_b,
+                provenance: stream_prov(2),
+            }))
+            .await;
+        let results = collect_tool_results(harness).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "duplicate id with conflicting payload must not execute; results={results:?}"
+        );
+        assert!(
+            results.iter().any(|(_, result)| {
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("duplicate tool-call id"))
+            }),
+            "duplicate id must produce a typed reject: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_unknown_tool_fails_closed_without_execution() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CountingTool {
+            name: "read",
+            executions: Arc::clone(&executions),
+        }));
+        let mut harness =
+            StreamingQueryHarness::spawn_with("inspect", registry, offered_read()).await;
+        harness
+            .send(Ok(StreamChunk::ContentBlockComplete(
+                ContentBlock::ToolUse {
+                    id: "call-ghost".into(),
+                    name: "not_offered".into(),
+                    input: serde_json::json!({}),
+                },
+            )))
+            .await;
+        let results = collect_tool_results(harness).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "unknown/unsupported tool must never execute; results={results:?}"
+        );
+        assert!(
+            results.iter().any(|(_, result)| {
+                result.as_ref().is_err_and(|error| {
+                    error.contains("not offered") || error.contains("unknown tool")
+                })
+            }),
+            "unsupported tool must produce a typed reject: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_late_result_after_cancel_is_dropped() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        struct GateTool {
+            executions: Arc<AtomicUsize>,
+            started: Arc<tokio::sync::Notify>,
+            resume: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for GateTool {
+            fn name(&self) -> &str {
+                "read"
+            }
+            fn effect(&self) -> crate::programs::ExecutionEffect {
+                crate::programs::ExecutionEffect::WorkspaceRead
+            }
+            fn description(&self) -> &str {
+                "blocks until the test releases it"
+            }
+            fn input_schema(&self) -> crate::tools::ToolInputSchema {
+                crate::tools::ToolInputSchema::simple(vec![("file_path", "path")])
+            }
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: &crate::tools::ToolContext<'_>,
+            ) -> anyhow::Result<String> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_one();
+                self.resume.notified().await;
+                Ok("late success".to_string())
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(GateTool {
+            executions: Arc::clone(&executions),
+            started: Arc::clone(&started),
+            resume: Arc::clone(&resume),
+        }));
+        let mut harness =
+            StreamingQueryHarness::spawn_with("inspect", registry, offered_read()).await;
+        harness
+            .send(Ok(StreamChunk::ToolCallComplete {
+                id: "call-1".into(),
+                name: "read".into(),
+                input: serde_json::json!({"file_path": "/tmp/a"}),
+                provenance: stream_prov(1),
+            }))
+            .await;
+        harness.close_stream();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("tool must start executing before cancel");
+        harness
+            .tool_coordinator
+            .terminalize(harness.query_id, crate::tools::ToolLoopTerminal::Cancelled)
+            .await;
+        resume.notify_one();
+        harness.task.await.expect("query task panicked");
+        let mut successes = Vec::new();
+        while let Ok(event) = harness.events.try_recv() {
+            if let ReplEvent::ToolResult {
+                result: Ok(content),
+                ..
+            } = event
+            {
+                successes.push(content);
+            }
+        }
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "cancel after admit still counts the in-flight execution"
+        );
+        assert!(
+            successes.is_empty(),
+            "late success after terminal must not append a result: {successes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_cancel_before_attach_does_not_execute() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CountingTool {
+            name: "read",
+            executions: Arc::clone(&executions),
+        }));
+        let mut harness =
+            StreamingQueryHarness::spawn_with("inspect", registry, offered_read()).await;
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        harness
+            .tool_coordinator
+            .arm_wait_before_attach(Arc::clone(&waiting), Arc::clone(&resume))
+            .await;
+        harness
+            .send(Ok(StreamChunk::ToolCallComplete {
+                id: "call-1".into(),
+                name: "read".into(),
+                input: serde_json::json!({"file_path": "/tmp/a"}),
+                provenance: stream_prov(1),
+            }))
+            .await;
+        harness.close_stream();
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiting.notified())
+            .await
+            .expect("query must park after begin_tool_execution and before attach_loop");
+        harness.query_states.cancel_query(harness.query_id).await;
+        harness
+            .tool_coordinator
+            .terminalize(harness.query_id, crate::tools::ToolLoopTerminal::Cancelled)
+            .await;
+        resume.notify_one();
+        harness.task.await.expect("query task panicked");
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "cancel that wins before attach_loop must not execute the tool"
+        );
+        let mut successes = Vec::new();
+        while let Ok(event) = harness.events.try_recv() {
+            if let ReplEvent::ToolResult {
+                result: Ok(content),
+                ..
+            } = event
+            {
+                successes.push(content);
+            }
+        }
+        assert!(
+            successes.is_empty(),
+            "cancel-before-attach must not append a success: {successes:?}"
         );
     }
 

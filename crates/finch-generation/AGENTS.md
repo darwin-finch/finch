@@ -37,8 +37,9 @@ application `Config`. Environmental effects are injected through
   conformance.
 - Provider-specific parsers stay in `finch-providers`. This crate translates
   `StreamChunk` into `GenerationEvent`, including
-  `ContentBlockComplete(ToolUse)` → `ToolCallComplete`. Native adapter
-  emission of `ThinkingDelta`/`ToolCallDelta` is issue #777.
+  `ContentBlockComplete(ToolUse)` → `ToolCallComplete`. OpenAI and Claude
+  also emit native `ToolCallDelta`/`ToolCallComplete`; the event loop's
+  ToolLoop treats dual encoding of the same id+input as one call.
 
 **Focused tests:**
 ```bash
@@ -54,8 +55,10 @@ application code. Finch-owned adapters (Claude, Qwen, daemon-local) stay in
 `src/generators`.
 
 **Named remainders (not this extraction):**
-- Unify REPL and scheduler tool loops behind one event-loop owner (#777).
-- Native adapter emission of thinking/tool-call deltas and IPC/UI projection (#777).
+- IPC projection of native `ThinkingDelta`/`ToolCallDelta` (schema still
+  carries tool calls as `ContentBlockComplete`).
+- Request construction still uses ad-hoc Claude-shaped `ToolDefinition`
+  schemas; bijective provider tool-binding tables are #241.
 - Local model architecture rewrite (ONNX/Candle/Qwen internals) is out of scope.
 - `generate_interfaces.py` matches `fn`, not `async fn` (hygiene Issue 6).
   `GenerationBackend::generate` and `Sleeper::sleep` are therefore absent from
@@ -67,4 +70,4 @@ application code. Finch-owned adapters (Claude, Qwen, daemon-local) stay in
   `GenerationEvent::Loading` is for backends to emit; the supervisor reports
   load state via `Readiness`.
 - Thread ports into `GenerationBackend::generate` and cancel-on-switch resource
-  accounting beyond the generation-id fence (#776 follow-up / #777).
+  accounting beyond the generation-id fence (#776 follow-up).

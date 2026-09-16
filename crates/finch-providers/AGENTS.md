@@ -27,11 +27,11 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
 - Tool calls become semantic `ToolUse` only after adapter validation.
 - Opaque reasoning/replay material is not display content.
 - Adapters emit `TextDelta` and `ContentBlockComplete` (plus usage/allowance/metadata).
-  `StreamChunk::{ThinkingDelta, ToolCallDelta, ToolCallComplete}` are crate-contract
-  placeholders. Generation-layer translation of `ContentBlockComplete(ToolUse)`
-  into `ToolCallComplete` lives in `finch-generation`. Native adapter emission
-  of thinking/tool-call deltas and IPC projection belong to #777. Do not flatten
-  per-adapter parsers into a lowest-common-denominator decoder.
+  OpenAI and Claude also emit native `ToolCallDelta` / `ToolCallComplete`.
+  Generation-layer translation of `ContentBlockComplete(ToolUse)` into
+  `ToolCallComplete` lives in `finch-generation`. Dual encoding of the same
+  id+input is one call at the ToolLoop. Do not flatten per-adapter parsers
+  into a lowest-common-denominator decoder. Do not add #241 wire-name tables.
 - OAuth cancellation, expiry, and denial are terminal; interrupted refresh
   recovers only as tombstones.
 - Secrets never appear in `Debug`, logs, or error text.

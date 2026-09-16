@@ -5,7 +5,9 @@ Supplements the root [`AGENTS.md`](../../../CLAUDE.md), which still applies in f
 **What this is.** The machinery behind the interactive REPL. A Tokio `select!` in
 `EventLoop::run` reads user input, provider output, and Brain traffic, turns each into a
 `ReplEvent`, and dispatches it. Everything here is driven by that one loop; nothing here talks to a
-provider or a tool directly.
+provider or a tool directly. Tool execution goes through [`crate::tools::ToolLoop`]
+(shared with the scheduler): stream events are observed, then admitted at most
+once.
 
 **Where the code lives.** `event_loop.rs` holds the `EventLoop` struct, `new`, and `run`. The
 handlers live beside it, grouped by what they handle, and are `pub(super)` so only the loop calls

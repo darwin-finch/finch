@@ -98,6 +98,12 @@ pub struct SessionParts { … }
 /// Coordinates concurrent tool execution for the event loop
 pub struct ToolExecutionCoordinator { … }
 impl ToolExecutionCoordinator {
+    /// Attach the event-loop-owned ToolLoop for this query's tool round.
+    pub async fn attach_loop(&self, query_id: Uuid, tool_loop: Arc<Mutex<ToolLoop>>);
+    /// Drop the round after the query has fully left the tool path.
+    pub async fn forget_loop(&self, query_id: Uuid);
+    /// End the round.
+    pub async fn terminalize(&self, query_id: Uuid, terminal: ToolLoopTerminal) -> bool;
     /// Create a new tool execution coordinator
     pub fn new(event_tx: mpsc::UnboundedSender<ReplEvent>, tool_executor: Arc<tokio::sync::Mutex<ToolExecutor>>, output_manager: Arc<OutputManager>, conversation: Arc<RwLock<ConversationHistory>>, local_generator: Arc<RwLock<LocalGenerator>>, tokenizer: Arc<TextTokenizer>, repl_mode: Arc<RwLock<ReplMode>>, plan_content: Arc<RwLock<Option<String>>>) -> Self;
     /// Spawn a task to execute a tool (concurrent, non-blocking)  This spawns a background task that: 1.

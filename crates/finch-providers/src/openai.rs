@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 
 use super::endpoints::ProviderEndpoints;
 use super::types::{
-    CapabilitySupport, ModelCapabilities, ModelFeature, ProviderRequest, ProviderResponse,
-    StreamChunk, WireProtocol,
+    CapabilitySupport, EventProvenance, ModelCapabilities, ModelFeature, ProviderRequest,
+    ProviderResponse, StreamChunk, WireProtocol,
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::retry::{with_retry, NonRetriableError};
@@ -406,6 +406,7 @@ fn validate_canonical_actual_model(model: &str) -> Result<()> {
 
 #[derive(Default)]
 struct CanonicalStreamState {
+    provider: String,
     response_id: Option<String>,
     model: Option<String>,
     terminal_reason: Option<String>,
@@ -413,6 +414,8 @@ struct CanonicalStreamState {
     done: bool,
     accumulated_text: String,
     tool_calls: Vec<(String, String, String)>,
+    tool_delta_emitted: Vec<bool>,
+    sequence: u64,
 }
 
 fn reject_unknown_keys(
@@ -587,6 +590,7 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
                 state
                     .tool_calls
                     .push((String::new(), String::new(), String::new()));
+                state.tool_delta_emitted.push(false);
             }
             if let Some(kind) = &delta.tool_type {
                 if kind != "function" {
@@ -603,26 +607,55 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
                     anyhow::bail!("OpenAI stream reused a function-call ID across indices");
                 }
             }
-            let call = &mut state.tool_calls[index];
-            if let Some(id) = &delta.id {
-                if !call.0.is_empty() && call.0 != *id {
-                    anyhow::bail!("OpenAI stream changed a function-call ID");
+            {
+                let call = &mut state.tool_calls[index];
+                if let Some(id) = &delta.id {
+                    if !call.0.is_empty() && call.0 != *id {
+                        anyhow::bail!("OpenAI stream changed a function-call ID");
+                    }
+                    call.0 = id.clone();
                 }
-                call.0 = id.clone();
+                if let Some(function) = &delta.function {
+                    if let Some(name) = &function.name {
+                        if !call.1.is_empty() && call.1 != *name {
+                            anyhow::bail!("OpenAI stream changed a function-call name");
+                        }
+                        call.1 = name.clone();
+                    }
+                    if let Some(arguments) = &function.arguments {
+                        if call.2.len().saturating_add(arguments.len()) > MAX_TOOL_ARGUMENT_BYTES {
+                            anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
+                        }
+                        call.2.push_str(arguments);
+                    }
+                }
             }
-            if let Some(function) = &delta.function {
-                if let Some(name) = &function.name {
-                    if !call.1.is_empty() && call.1 != *name {
-                        anyhow::bail!("OpenAI stream changed a function-call name");
-                    }
-                    call.1 = name.clone();
-                }
-                if let Some(arguments) = &function.arguments {
-                    if call.2.len().saturating_add(arguments.len()) > MAX_TOOL_ARGUMENT_BYTES {
-                        anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
-                    }
-                    call.2.push_str(arguments);
-                }
+            let (call_id, call_name, accumulated_args) = state.tool_calls[index].clone();
+            if !call_id.is_empty() {
+                let first_emission = !state.tool_delta_emitted[index];
+                state.tool_delta_emitted[index] = true;
+                let arguments_delta = if first_emission {
+                    accumulated_args
+                } else {
+                    delta
+                        .function
+                        .as_ref()
+                        .and_then(|function| function.arguments.clone())
+                        .unwrap_or_default()
+                };
+                let name = if call_name.is_empty() {
+                    None
+                } else {
+                    Some(call_name)
+                };
+                state.sequence += 1;
+                let sequence = state.sequence;
+                output.push(StreamChunk::ToolCallDelta {
+                    id: call_id,
+                    name,
+                    arguments_delta,
+                    provenance: tool_provenance(state, sequence),
+                });
             }
         }
     }
@@ -672,11 +705,31 @@ async fn publish_canonical_completion(
         .map_err(|_| anyhow::anyhow!("OpenAI stream receiver was dropped"))?;
     }
     for block in tool_blocks {
+        if let ContentBlock::ToolUse { id, name, input } = &block {
+            tx.send(Ok(StreamChunk::ToolCallComplete {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                provenance: tool_provenance(state, state.sequence.saturating_add(1)),
+            }))
+            .await
+            .map_err(|_| anyhow::anyhow!("OpenAI stream receiver was dropped"))?;
+        }
         tx.send(Ok(StreamChunk::ContentBlockComplete(block)))
             .await
             .map_err(|_| anyhow::anyhow!("OpenAI stream receiver was dropped"))?;
     }
     Ok(())
+}
+
+fn tool_provenance(state: &CanonicalStreamState, sequence: u64) -> EventProvenance {
+    EventProvenance {
+        provider: state.provider.clone(),
+        model: state.model.clone().unwrap_or_default(),
+        event: "tool_call".to_string(),
+        sequence,
+        opaque_replay: None,
+    }
 }
 
 fn sse_line_prefix_exceeds_limit(buffer: &[u8]) -> bool {
@@ -688,13 +741,17 @@ fn sse_line_prefix_exceeds_limit(buffer: &[u8]) -> bool {
 
 fn spawn_canonical_stream_parser(
     response: reqwest::Response,
+    provider: String,
 ) -> mpsc::Receiver<Result<StreamChunk>> {
     let (tx, rx) = mpsc::channel(100);
     tokio::spawn(async move {
         let mut stream = response.bytes_stream();
         let mut buffer: Vec<u8> = Vec::new();
         let mut total = 0usize;
-        let mut state = CanonicalStreamState::default();
+        let mut state = CanonicalStreamState {
+            provider,
+            ..CanonicalStreamState::default()
+        };
         loop {
             let next = tokio::select! {
                 biased;
@@ -877,37 +934,40 @@ fn accumulate_tool_call_delta(
 /// Convert the final accumulator into `ContentBlock::ToolUse` blocks.
 ///
 /// Each entry is `(id, name, json_arguments_string)`.
-/// Invalid JSON in the arguments is replaced with an empty object.
+/// Malformed JSON never becomes `{}`. Strict mode fails the stream;
+/// compatible mode skips the block so ToolLoop can fail closed from deltas.
 fn finalize_tool_calls(
     acc: &[(String, String, String)],
     strict: bool,
 ) -> Result<Vec<ContentBlock>> {
-    acc.iter()
+    let mut blocks = Vec::new();
+    for (id, name, args_str) in acc
+        .iter()
         .filter(|(id, name, _)| !id.is_empty() || !name.is_empty())
-        .map(|(id, name, args_str)| {
-            if strict && (id.is_empty() || name.is_empty()) {
-                anyhow::bail!("OpenAI stream ended with an incomplete function call");
-            }
-            if strict && args_str.len() > MAX_TOOL_ARGUMENT_BYTES {
-                anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
-            }
-            let input = if strict {
-                serde_json::from_str::<serde_json::Value>(args_str)
-                    .context("OpenAI returned malformed JSON function arguments")?
-            } else {
-                serde_json::from_str::<serde_json::Value>(args_str)
-                    .unwrap_or_else(|_| serde_json::json!({}))
-            };
-            if strict && !input.is_object() {
+    {
+        if strict && (id.is_empty() || name.is_empty()) {
+            anyhow::bail!("OpenAI stream ended with an incomplete function call");
+        }
+        if strict && args_str.len() > MAX_TOOL_ARGUMENT_BYTES {
+            anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
+        }
+        let input = match serde_json::from_str::<serde_json::Value>(args_str) {
+            Ok(value) if value.is_object() => value,
+            Ok(_) if strict => {
                 anyhow::bail!("OpenAI function arguments were not a JSON object");
             }
-            Ok(ContentBlock::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input,
-            })
-        })
-        .collect()
+            Err(_) if strict => {
+                anyhow::bail!("OpenAI returned malformed JSON function arguments");
+            }
+            Ok(_) | Err(_) => continue,
+        };
+        blocks.push(ContentBlock::ToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input,
+        });
+    }
+    Ok(blocks)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1412,8 +1472,16 @@ impl OpenAIProvider {
                             input
                         }
                         TransportRule::CompatibleChatCompletions => {
-                            serde_json::from_str(&tool_call.function.arguments)
-                                .unwrap_or_else(|_| serde_json::json!({}))
+                            if tool_call.function.arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+                                anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
+                            }
+                            let input: serde_json::Value =
+                                serde_json::from_str(&tool_call.function.arguments)
+                                    .context("OpenAI returned malformed JSON function arguments")?;
+                            if !input.is_object() {
+                                anyhow::bail!("OpenAI function arguments were not a JSON object");
+                            }
+                            input
                         }
                     };
                     content.push(ContentBlock::ToolUse {
@@ -1577,10 +1645,14 @@ impl OpenAIProvider {
             if !content_type.starts_with("text/event-stream") {
                 anyhow::bail!("OpenAI streaming response was not text/event-stream");
             }
-            return Ok(spawn_canonical_stream_parser(response));
+            return Ok(spawn_canonical_stream_parser(
+                response,
+                self.provider_name.clone(),
+            ));
         }
 
         // Compatible providers retain the permissive historical parser.
+        let provider_name = self.provider_name.clone();
         tokio::spawn(async move {
             tracing::debug!("[STREAM] OpenAI streaming task started");
             let mut stream = response.bytes_stream();
@@ -1590,6 +1662,9 @@ impl OpenAIProvider {
             // Each entry: (call_id, function_name, arguments_so_far).
             // Converted to ContentBlock::ToolUse when [DONE] arrives.
             let mut tool_call_acc: Vec<(String, String, String)> = Vec::new();
+            let mut tool_delta_emitted: Vec<bool> = Vec::new();
+            let mut sequence = 0u64;
+            let mut actual_model = String::new();
             #[allow(unused_assignments)]
             let mut done = false;
 
@@ -1640,7 +1715,9 @@ impl OpenAIProvider {
                                     };
                                     for block in blocks {
                                         if let ContentBlock::ToolUse {
-                                            ref name, ref id, ..
+                                            ref name,
+                                            ref id,
+                                            ref input,
                                         } = block
                                         {
                                             tracing::debug!(
@@ -1648,6 +1725,25 @@ impl OpenAIProvider {
                                                 name,
                                                 id
                                             );
+                                            sequence += 1;
+                                            if tx
+                                                .send(Ok(StreamChunk::ToolCallComplete {
+                                                    id: id.clone(),
+                                                    name: name.clone(),
+                                                    input: input.clone(),
+                                                    provenance: EventProvenance {
+                                                        provider: provider_name.clone(),
+                                                        model: actual_model.clone(),
+                                                        event: "tool_call".to_string(),
+                                                        sequence,
+                                                        opaque_replay: None,
+                                                    },
+                                                }))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
                                         }
                                         if tx
                                             .send(Ok(StreamChunk::ContentBlockComplete(block)))
@@ -1666,6 +1762,9 @@ impl OpenAIProvider {
                                 if let Ok(stream_chunk) =
                                     serde_json::from_str::<OpenAIStreamChunk>(json_str)
                                 {
+                                    if actual_model.is_empty() && !stream_chunk.model.is_empty() {
+                                        actual_model = stream_chunk.model.clone();
+                                    }
                                     if let Some(choice) = stream_chunk.choices.into_iter().next() {
                                         if let Some(content) = choice.delta.content {
                                             accumulated_text.push_str(&content);
@@ -1685,7 +1784,52 @@ impl OpenAIProvider {
                                         // for each tool call (identified by index).
                                         if let Some(tc_deltas) = choice.delta.tool_calls {
                                             for tc in tc_deltas {
+                                                let args_fragment = tc
+                                                    .function
+                                                    .as_ref()
+                                                    .and_then(|function| function.arguments.clone())
+                                                    .unwrap_or_default();
                                                 accumulate_tool_call_delta(&mut tool_call_acc, &tc);
+                                                while tool_delta_emitted.len() < tool_call_acc.len()
+                                                {
+                                                    tool_delta_emitted.push(false);
+                                                }
+                                                let idx = tc.index.unwrap_or(0);
+                                                let (id, name, accumulated) =
+                                                    tool_call_acc[idx].clone();
+                                                if id.is_empty() {
+                                                    continue;
+                                                }
+                                                let first = !tool_delta_emitted[idx];
+                                                tool_delta_emitted[idx] = true;
+                                                sequence += 1;
+                                                if tx
+                                                    .send(Ok(StreamChunk::ToolCallDelta {
+                                                        id,
+                                                        name: if name.is_empty() {
+                                                            None
+                                                        } else {
+                                                            Some(name)
+                                                        },
+                                                        arguments_delta: if first {
+                                                            accumulated
+                                                        } else {
+                                                            args_fragment
+                                                        },
+                                                        provenance: EventProvenance {
+                                                            provider: provider_name.clone(),
+                                                            model: actual_model.clone(),
+                                                            event: "tool_call".to_string(),
+                                                            sequence,
+                                                            opaque_replay: None,
+                                                        },
+                                                    }))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    done = true;
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -2579,6 +2723,54 @@ mod tests {
         assert_eq!(calls[0].0, "call_a");
         assert_eq!(calls[0].2, serde_json::json!({"path":"a"}));
         assert_eq!(calls[1].0, "call_b");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn canonical_stream_emits_native_tool_call_deltas_and_complete() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol-actual\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"p\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol-actual\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ath\\\":\\\"a\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol-actual\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol-actual\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream; charset=utf-8")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = canonical_test_provider(server.url());
+        let mut rx = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::Message::user("use tools")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap();
+        let mut deltas = Vec::new();
+        let mut completes = Vec::new();
+        while let Some(item) = rx.recv().await {
+            match item.unwrap() {
+                StreamChunk::ToolCallDelta {
+                    id,
+                    arguments_delta,
+                    ..
+                } => deltas.push((id, arguments_delta)),
+                StreamChunk::ToolCallComplete { id, input, .. } => completes.push((id, input)),
+                _ => {}
+            }
+        }
+        assert!(
+            !deltas.is_empty(),
+            "canonical OpenAI must emit ToolCallDelta fragments: {deltas:?}"
+        );
+        assert_eq!(deltas[0].0, "call_a");
+        assert_eq!(completes.len(), 1, "one ToolCallComplete: {completes:?}");
+        assert_eq!(completes[0].1, serde_json::json!({"path":"a"}));
         mock.assert_async().await;
     }
 
@@ -3699,7 +3891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compatible_nonstream_keeps_historical_malformed_tool_argument_fallback() {
+    async fn compatible_nonstream_malformed_tool_arguments_fail_closed() {
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/v1/chat/completions")
@@ -3716,11 +3908,70 @@ mod tests {
             "compatible".into(),
         )
         .unwrap();
-        let response = provider
+        let error = provider
             .send_message_once(&ProviderRequest::new(vec![crate::Message::user("hello")]))
             .await
+            .expect_err("malformed function arguments must fail closed, not become {{}}");
+        let message = error.to_string();
+        assert!(
+            message.contains("malformed JSON function arguments"),
+            "compatible non-stream must not coerce malformed arguments to {{}}: {message}"
+        );
+        assert!(
+            !message.contains("{}"),
+            "error must not imply empty-object execution: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_stream_malformed_arguments_emit_deltas_without_complete() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(concat!(
+                "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"compatible-model\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"not-json\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n"
+            ))
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_compatible(
+            "key".into(),
+            server.url(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "compatible-model".into(),
+            "compatible".into(),
+        )
+        .unwrap();
+        let mut rx = provider
+            .send_message_stream_once(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
             .unwrap();
-        assert_eq!(response.tool_uses()[0].input, serde_json::json!({}));
+        let mut deltas = 0usize;
+        let mut completes = 0usize;
+        let mut tool_blocks = 0usize;
+        while let Some(item) = rx.recv().await {
+            match item.unwrap() {
+                StreamChunk::ToolCallDelta { .. } => deltas += 1,
+                StreamChunk::ToolCallComplete { .. } => completes += 1,
+                StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { .. }) => tool_blocks += 1,
+                _ => {}
+            }
+        }
+        assert!(
+            deltas > 0,
+            "compatible stream must emit ToolCallDelta so ToolLoop can fail closed from fragments"
+        );
+        assert_eq!(
+            completes, 0,
+            "malformed compatible-stream JSON must not emit ToolCallComplete"
+        );
+        assert_eq!(
+            tool_blocks, 0,
+            "malformed compatible-stream JSON must not emit ContentBlockComplete(ToolUse)"
+        );
     }
 
     #[tokio::test]
