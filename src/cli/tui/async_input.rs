@@ -370,8 +370,8 @@ pub fn spawn_input_task(
                                         Ok(Some("/help".to_string()))
                                     }
                                     (KeyCode::BackTab, _) => {
-                                        // Shift+Tab: Toggle plan mode (send as command)
-                                        Ok(Some("/plan".to_string()))
+                                        // Shift+Tab: cycle Normal → AutoAccept → Planning
+                                        Ok(Some("/cycle-mode".to_string()))
                                     }
                                     (KeyCode::Up, KeyModifiers::NONE) => {
                                         // Check cursor position - only navigate history if at top line

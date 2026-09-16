@@ -3785,15 +3785,7 @@ impl EventLoop {
         }
         if self.mode.read().await.auto_accepts_host_effects() {
             while let Some(pending) = self.queued_remote_brain_approvals.pop_front() {
-                let decision = match &pending.kind {
-                    RemoteBrainApprovalKind::Tool(_) => {
-                        serde_json::json!({"choice": "approve_session"})
-                    }
-                    RemoteBrainApprovalKind::Vm { .. } => {
-                        serde_json::to_value(crate::vm::ApprovalChoice::AllowSession)
-                            .unwrap_or_else(|_| serde_json::json!({"choice": "deny"}))
-                    }
-                };
+                let decision = auto_accept_remote_decision(&pending.kind);
                 let client = pending.client;
                 let request_seq = pending.request_seq;
                 let approval_id = pending.approval_id;
@@ -4765,6 +4757,22 @@ fn confirmation_audit_value(confirmation: &super::events::ConfirmationResult) ->
             "input": input,
         }),
         ConfirmationResult::Deny => serde_json::json!({"choice": "deny"}),
+    }
+}
+
+/// AutoAccept grants once, not for the session, so leaving the mode does not
+/// keep a VM capability grant that would skip later prompts.
+fn auto_accept_vm_choice() -> crate::vm::ApprovalChoice {
+    crate::vm::ApprovalChoice::AllowOnce
+}
+
+/// Remote tool decisions must round-trip `confirmation_from_audit_value`.
+/// `approve_session` is not a recognized choice and becomes Deny.
+fn auto_accept_remote_decision(kind: &RemoteBrainApprovalKind) -> serde_json::Value {
+    match kind {
+        RemoteBrainApprovalKind::Tool(_) => serde_json::json!({"choice": "approve_once"}),
+        RemoteBrainApprovalKind::Vm { .. } => serde_json::to_value(auto_accept_vm_choice())
+            .unwrap_or_else(|_| serde_json::json!({"choice": "deny"})),
     }
 }
 

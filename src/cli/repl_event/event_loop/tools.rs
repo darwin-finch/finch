@@ -391,6 +391,19 @@ impl EventLoop {
                 });
         }
 
+        if self.mode.read().await.auto_accepts_host_effects() {
+            if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+                turn.turn_events
+                    .push(crate::server::RunnerTurnEvent::ApprovalDecided {
+                        approval_id: tool_use.id.clone(),
+                        decision: serde_json::json!({"choice": "approve_once"}),
+                    });
+            }
+            let _ =
+                response_tx.send(crate::cli::repl_event::events::ConfirmationResult::ApproveOnce);
+            return Ok(());
+        }
+
         // Create approval dialog — compact 3-option style matching Claude Code UX
         let mut summary = tool_approval_summary(&tool_use);
         if let Some(audience) = approval_audience {
@@ -430,10 +443,6 @@ impl EventLoop {
         prompt: crate::vm::ApprovalPrompt,
         response_tx: tokio::sync::oneshot::Sender<crate::vm::ApprovalChoice>,
     ) -> Result<()> {
-        if self.mode.read().await.auto_accepts_host_effects() {
-            let _ = response_tx.send(crate::vm::ApprovalChoice::AllowSession);
-            return Ok(());
-        }
         if self.pending_vm_approval.is_some() {
             let _ = response_tx.send(crate::vm::ApprovalChoice::Deny);
             self.output_manager.write_error(
@@ -500,6 +509,23 @@ impl EventLoop {
                         ),
                     });
             }
+        }
+
+        if self.mode.read().await.auto_accepts_host_effects() {
+            let choice = auto_accept_vm_choice();
+            if let Some(query_id) = query_id {
+                if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+                    turn.turn_events
+                        .push(crate::server::RunnerTurnEvent::ApprovalDecided {
+                            approval_id: approval_id.clone(),
+                            decision: serde_json::to_value(&choice).unwrap_or_else(
+                                |_| serde_json::json!({"choice": "serialization_error"}),
+                            ),
+                        });
+                }
+            }
+            let _ = response_tx.send(choice);
+            return Ok(());
         }
 
         let choices = vm_approval_choices(&prompt);
