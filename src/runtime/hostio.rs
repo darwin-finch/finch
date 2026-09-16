@@ -538,10 +538,11 @@ pub(super) fn read_workbook_rows(
 
 /// Render one spreadsheet cell as the text a user or program sees.
 ///
-/// `pub(crate)` so the TUI preview shares it. Two converters meant two answers
-/// for the same cell: the preview mapped cells with a bare `to_string()`, which
-/// is calamine's `Display`, which prints a date as its Excel serial -- the
-/// defect this function was fixed for, still live one module over.
+/// The TUI preview owns a copy in `cli::tui::cell_format`. Two converters meant
+/// two answers for the same cell: the preview mapped cells with a bare
+/// `to_string()`, which is calamine's `Display`, which prints a date as its
+/// Excel serial -- the defect this function was fixed for. Each side pins its
+/// own tests so the preview cannot silently fall back to Display.
 pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
     use calamine::Data;
 

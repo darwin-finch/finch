@@ -43,9 +43,13 @@ mod accordion;
 pub mod activity;
 mod async_input;
 mod autocomplete_widget;
+mod cell_format;
 mod dialog;
 mod dialog_widget;
+mod graph;
 mod input_widget; // kept, used by wizard helpers
+#[cfg(test)]
+mod isolation;
 mod mouse_capture;
 mod scrollback; // kept for future use
 mod shadow_buffer; // kept – good architecture for future diffing
@@ -67,6 +71,7 @@ pub use autocomplete_widget::AutocompleteState;
 use autocomplete_widget::{completion_pane_lines, replace_command_prefix};
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
+pub use graph::{GraphNode, GraphNodeAuthor, GraphNodeKind, GraphNodeStatus, GraphView};
 pub use shadow_buffer::visible_length;
 
 /// Best-effort terminal restoration for an exit path that cannot acquire the
@@ -256,18 +261,52 @@ fn stable_poset_order_and_depth(
     (order, depth)
 }
 
-/// Render a `Poset` as compact Forth source lines for the panel overlay.
+/// Convert Finch's poset into the graph the overlay draws.
+///
+/// This is the injection boundary: the widget takes [`GraphView`], and Finch's
+/// `Poset` is named only here and on [`TuiRenderer::set_poset`].
+#[allow(dead_code)]
+fn graph_view_from_poset(poset: &crate::poset::Poset) -> GraphView {
+    GraphView {
+        nodes: poset.nodes.iter().map(graph_node_from_poset).collect(),
+        edges: poset.edges.clone(),
+        yaw: poset.yaw,
+        pitch: poset.pitch,
+    }
+}
+
+#[allow(dead_code)]
+fn graph_node_from_poset(node: &crate::poset::Node) -> GraphNode {
+    GraphNode {
+        id: node.id,
+        label: node.label.clone(),
+        kind: match node.kind {
+            crate::poset::NodeKind::Task => GraphNodeKind::Task,
+            crate::poset::NodeKind::Constraint => GraphNodeKind::Constraint,
+            crate::poset::NodeKind::Question => GraphNodeKind::Question,
+            crate::poset::NodeKind::Observation => GraphNodeKind::Observation,
+        },
+        status: match node.status {
+            crate::poset::NodeStatus::Pending => GraphNodeStatus::Pending,
+            crate::poset::NodeStatus::Running => GraphNodeStatus::Running,
+            crate::poset::NodeStatus::Done => GraphNodeStatus::Done,
+            crate::poset::NodeStatus::Failed => GraphNodeStatus::Failed,
+        },
+        pos: node.pos,
+        author: match node.author {
+            crate::poset::NodeAuthor::User => GraphNodeAuthor::User,
+            crate::poset::NodeAuthor::Ai => GraphNodeAuthor::Ai,
+        },
+    }
+}
+
+/// Render a graph view as compact Forth source lines for the panel overlay.
 ///
 /// Each node becomes one word definition; predecessors are called first.
 /// `PROGRAM` calls all leaf nodes (nodes with no outgoing edges).
 /// Output is capped at `max_lines` lines.
 #[allow(dead_code)]
-fn poset_to_forth_lines(
-    poset: &crate::poset::Poset,
-    _panel_w: usize,
-    max_lines: usize,
-) -> Vec<String> {
-    use crate::poset::NodeStatus;
+fn poset_to_forth_lines(graph: &GraphView, _panel_w: usize, max_lines: usize) -> Vec<String> {
     const C: SetForegroundColor = SetForegroundColor(Color::DarkCyan);
     const Y: SetForegroundColor = SetForegroundColor(Color::DarkYellow);
     const G: SetForegroundColor = SetForegroundColor(Color::DarkGreen);
@@ -277,12 +316,12 @@ fn poset_to_forth_lines(
 
     let mut lines: Vec<String> = Vec::new();
 
-    // Canonicalize the graph before rendering. `Poset` exposes its storage so
+    // Canonicalize the graph before rendering. The view exposes its storage so
     // callers can restore plans, and restored node/edge order is not a semantic
     // part of the partial order.
     let node_ids: std::collections::BTreeSet<usize> =
-        poset.nodes.iter().map(|node| node.id).collect();
-    let mut edges: Vec<(usize, usize)> = poset
+        graph.nodes.iter().map(|node| node.id).collect();
+    let mut edges: Vec<(usize, usize)> = graph
         .edges
         .iter()
         .copied()
@@ -309,15 +348,15 @@ fn poset_to_forth_lines(
 
     // Render each word in topo order
     for &id in &topo {
-        let Some(node) = poset.nodes.iter().find(|n| n.id == id) else {
+        let Some(node) = graph.nodes.iter().find(|n| n.id == id) else {
             continue;
         };
 
         let status_glyph = match node.status {
-            NodeStatus::Done => format!("{G}✓{RST}"),
-            NodeStatus::Failed => format!("{R}✗{RST}"),
-            NodeStatus::Running => format!("{Y}▶{RST}"),
-            NodeStatus::Pending => format!("{D}·{RST}"),
+            GraphNodeStatus::Done => format!("{G}✓{RST}"),
+            GraphNodeStatus::Failed => format!("{R}✗{RST}"),
+            GraphNodeStatus::Running => format!("{Y}▶{RST}"),
+            GraphNodeStatus::Pending => format!("{D}·{RST}"),
         };
 
         let stack_effect = format!("{D}( -- result ){RST}");
@@ -1474,7 +1513,8 @@ pub struct TuiRenderer {
     // Co-Forth shared stack (set after construction via set_stack)
     stack: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
 
-    // Co-Forth poset VM — 3D rotating graph (set after construction via set_poset)
+    // Co-Forth poset VM — 3D rotating graph (set after construction via set_poset).
+    // Finch Poset stays at this injection; render paths snapshot a GraphView.
     poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
     // True when the poset panel was rendered (non-empty) on the last tick.
     // Used to keep cursor_row_from_top stable when try_lock() fails.
@@ -1738,6 +1778,9 @@ impl TuiRenderer {
     }
 
     /// Attach the Co-Forth poset VM so the live area can render its 3D graph.
+    ///
+    /// Finch's `Poset` is accepted only here. The overlay draws [`GraphView`];
+    /// [`graph_view_from_poset`] is the conversion at this injection boundary.
     pub fn set_poset(&mut self, poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>) {
         self.poset = Some(poset);
     }
@@ -4226,12 +4269,11 @@ impl TuiRenderer {
                             range
                                 .rows()
                                 .map(|row| {
-                                    // Shared with the typed runtime, not
-                                    // `to_string()` -- that is calamine's
-                                    // `Display`, which prints a date as its Excel
-                                    // serial (#281).
+                                    // Tui-owned formatter, not `to_string()` --
+                                    // that is calamine's `Display`, which prints
+                                    // a date as its Excel serial (#281).
                                     row.iter()
-                                        .map(crate::runtime::workbook_cell_to_string)
+                                        .map(cell_format::workbook_cell_to_string)
                                         .collect::<Vec<String>>()
                                 })
                                 .collect(),
@@ -7963,18 +8005,16 @@ mod tests {
 
     // ── poset_to_forth_lines ──────────────────────────────────────────────────
 
-    fn make_node(id: usize, label: &str) -> crate::poset::Node {
-        crate::poset::Node {
-            id,
-            label: label.to_string(),
-            kind: crate::poset::NodeKind::Task,
-            status: crate::poset::NodeStatus::Pending,
-            result: None,
-            pos: [0.0, 0.0, 0.0],
-            author: crate::poset::NodeAuthor::User,
-            tools: Vec::new(),
-            compiled_code: None,
-            compiled_lang: None,
+    fn graph_from_labels(labels: &[&str]) -> GraphView {
+        GraphView {
+            nodes: labels
+                .iter()
+                .enumerate()
+                .map(|(id, label)| GraphNode::new(id, *label))
+                .collect(),
+            edges: Vec::new(),
+            yaw: 0.3,
+            pitch: 0.2,
         }
     }
 
@@ -8045,139 +8085,96 @@ mod tests {
 
     #[test]
     fn test_poset_empty_produces_only_program() {
-        // An empty poset still emits the PROGRAM wrapper word.
-        let poset = crate::poset::Poset::new();
-        let lines = poset_to_forth_lines(&poset, 80, 40);
+        // An empty graph still emits the PROGRAM wrapper word.
+        let graph = GraphView::new();
+        let lines = poset_to_forth_lines(&graph, 80, 40);
         let combined = lines.join("\n");
         assert!(
             combined.contains("PROGRAM"),
-            "empty poset should still emit PROGRAM"
+            "empty graph should still emit PROGRAM: {combined}"
         );
-        // No W-nodes since there are no nodes
         assert!(
             !combined.contains("W0"),
-            "empty poset should have no W nodes"
+            "empty graph should have no W nodes: {combined}"
         );
     }
 
     #[test]
     fn test_poset_single_node_has_word_and_semicolon() {
-        let mut poset = crate::poset::Poset::new();
-        poset.add_node(
-            "do-thing".to_string(),
-            crate::poset::NodeKind::Task,
-            crate::poset::NodeAuthor::User,
-        );
-        let lines = poset_to_forth_lines(&poset, 80, 40);
+        let graph = graph_from_labels(&["do-thing"]);
+        let lines = poset_to_forth_lines(&graph, 80, 40);
         let combined = lines.join("\n");
-        assert!(combined.contains("W0"), "should name node W0");
-        assert!(combined.contains(";"), "should close with semicolon");
-        assert!(combined.contains("do-thing"), "should include label");
+        assert!(combined.contains("W0"), "should name node W0: {combined}");
+        assert!(
+            combined.contains(";"),
+            "should close with semicolon: {combined}"
+        );
+        assert!(
+            combined.contains("do-thing"),
+            "should include label: {combined}"
+        );
     }
 
     #[test]
     fn test_poset_label_truncated_at_30_chars() {
-        let mut poset = crate::poset::Poset::new();
         let long_label = "a".repeat(50);
-        poset.add_node(
-            long_label,
-            crate::poset::NodeKind::Task,
-            crate::poset::NodeAuthor::User,
-        );
-        let lines = poset_to_forth_lines(&poset, 80, 40);
+        let graph = graph_from_labels(&[&long_label]);
+        let lines = poset_to_forth_lines(&graph, 80, 40);
         let combined = lines.join("\n");
-        // The label in the .\" ... " should be truncated to 30 chars + ellipsis
-        assert!(combined.contains('…'), "long label should have ellipsis");
-        // Should NOT contain the full 50-char label
+        assert!(
+            combined.contains('…'),
+            "long label should have ellipsis: {combined}"
+        );
         assert!(
             !combined.contains(&"a".repeat(50)),
-            "full 50-char label should not appear"
+            "full 50-char label should not appear: {combined}"
         );
     }
 
     #[test]
     fn test_poset_max_lines_respected() {
-        let mut poset = crate::poset::Poset::new();
-        for i in 0..20 {
-            poset.add_node(
-                format!("word-{i}"),
-                crate::poset::NodeKind::Task,
-                crate::poset::NodeAuthor::User,
-            );
-        }
+        let labels: Vec<String> = (0..20).map(|i| format!("word-{i}")).collect();
+        let graph = graph_from_labels(&labels.iter().map(String::as_str).collect::<Vec<_>>());
         let max = 10;
-        let lines = poset_to_forth_lines(&poset, 80, max);
+        let lines = poset_to_forth_lines(&graph, 80, max);
         assert!(
             lines.len() <= max,
-            "output must not exceed max_lines (got {})",
+            "output must not exceed max_lines (got {}): {lines:?}",
             lines.len()
         );
     }
 
     #[test]
     fn test_poset_program_word_emitted() {
-        let mut poset = crate::poset::Poset::new();
-        poset.add_node(
-            "step".to_string(),
-            crate::poset::NodeKind::Task,
-            crate::poset::NodeAuthor::User,
-        );
-        let lines = poset_to_forth_lines(&poset, 80, 40);
+        let graph = graph_from_labels(&["step"]);
+        let lines = poset_to_forth_lines(&graph, 80, 40);
         let combined = lines.join("\n");
         assert!(
             combined.contains("PROGRAM"),
-            "PROGRAM word should be emitted"
+            "PROGRAM word should be emitted: {combined}"
         );
     }
 
     #[test]
     fn test_poset_linear_chain_topo_order() {
-        // W0 → W1 → W2: W0 must appear before W1, W1 before W2.
-        let mut poset = crate::poset::Poset::new();
-        poset.add_node(
-            "first".to_string(),
-            crate::poset::NodeKind::Task,
-            crate::poset::NodeAuthor::User,
-        );
-        poset.add_node(
-            "second".to_string(),
-            crate::poset::NodeKind::Task,
-            crate::poset::NodeAuthor::User,
-        );
-        poset.add_node(
-            "third".to_string(),
-            crate::poset::NodeKind::Task,
-            crate::poset::NodeAuthor::User,
-        );
-        poset.add_edge(0, 1);
-        poset.add_edge(1, 2);
-        let lines = poset_to_forth_lines(&poset, 80, 40);
+        let mut graph = graph_from_labels(&["first", "second", "third"]);
+        graph.edges = vec![(0, 1), (1, 2)];
+        let lines = poset_to_forth_lines(&graph, 80, 40);
         let combined = lines.join("\n");
         let pos0 = combined.find("W0").unwrap_or(usize::MAX);
         let pos1 = combined.find("W1").unwrap_or(usize::MAX);
         let pos2 = combined.find("W2").unwrap_or(usize::MAX);
-        assert!(pos0 < pos1, "W0 should appear before W1");
-        assert!(pos1 < pos2, "W1 should appear before W2");
+        assert!(
+            pos0 < pos1 && pos1 < pos2,
+            "W0 should appear before W1 before W2: pos0={pos0} pos1={pos1} pos2={pos2} {combined}"
+        );
     }
 
     #[test]
     fn test_poset_cycle_does_not_panic() {
-        // Cycle (W0 → W1 → W0) must not infinite-loop the topo sort.
-        let mut poset = crate::poset::Poset::new();
-        poset.add_node(
-            "a".to_string(),
-            crate::poset::NodeKind::Task,
-            crate::poset::NodeAuthor::User,
-        );
-        poset.add_node(
-            "b".to_string(),
-            crate::poset::NodeKind::Task,
-            crate::poset::NodeAuthor::User,
-        );
-        poset.add_edge(0, 1);
-        poset.add_edge(1, 0); // cycle
-                              // Must not panic or hang
-        let lines = poset_to_forth_lines(&poset, 80, 40);
+        let mut graph = graph_from_labels(&["a", "b"]);
+        graph.edges = vec![(0, 1), (1, 0)];
+        let lines = poset_to_forth_lines(&graph, 80, 40);
         assert!(
             !lines.is_empty(),
             "cyclic graph should still produce output"
@@ -8186,29 +8183,26 @@ mod tests {
 
     #[test]
     fn test_poset_cyclic_component_precedes_its_downstream_node_stably() {
-        let mut poset = crate::poset::Poset::new();
-        for label in ["downstream", "cycle-a", "cycle-b"] {
-            poset.add_node(
-                label.to_string(),
-                crate::poset::NodeKind::Task,
-                crate::poset::NodeAuthor::User,
-            );
-        }
-        poset.edges = vec![(1, 2), (2, 1), (2, 0)];
+        let mut graph = graph_from_labels(&["downstream", "cycle-a", "cycle-b"]);
+        graph.edges = vec![(1, 2), (2, 1), (2, 0)];
 
-        let expected = poset_to_forth_lines(&poset, 80, 80);
+        let expected = poset_to_forth_lines(&graph, 80, 80);
         assert!(
             rendered_word_position(&expected, 2) < rendered_word_position(&expected, 0),
-            "the cyclic predecessor component must precede its acyclic descendant"
+            "the cyclic predecessor component must precede its acyclic descendant: {expected:?}"
         );
-        assert!(rendered_word_body(&expected, 0).contains("W2"));
+        assert!(
+            rendered_word_body(&expected, 0).contains("W2"),
+            "downstream body should call W2: {}",
+            rendered_word_body(&expected, 0)
+        );
         assert_eq!(
             rendered_program_lines(&expected),
             vec![": PROGRAM", "W1 W2 \\ cycle", "W0 ;"]
         );
 
         for seed in 0..64 {
-            let mut shuffled = poset.clone();
+            let mut shuffled = graph.clone();
             shuffle_with_seed(&mut shuffled.nodes, seed);
             shuffle_with_seed(&mut shuffled.edges, seed ^ 0x5a5a_5a5a_5a5a_5a5a);
             assert_eq!(
@@ -8221,59 +8215,42 @@ mod tests {
 
     #[test]
     fn test_poset_unknown_edges_are_omitted() {
-        let mut baseline = crate::poset::Poset::new();
-        for label in ["root", "child"] {
-            baseline.add_node(
-                label.to_string(),
-                crate::poset::NodeKind::Task,
-                crate::poset::NodeAuthor::User,
-            );
-        }
+        let mut baseline = graph_from_labels(&["root", "child"]);
         baseline.edges = vec![(0, 1)];
         let mut with_unknown_edges = baseline.clone();
         with_unknown_edges.edges.extend([(99, 1), (0, 88)]);
 
         assert_eq!(
             poset_to_forth_lines(&with_unknown_edges, 80, 80),
-            poset_to_forth_lines(&baseline, 80, 80)
+            poset_to_forth_lines(&baseline, 80, 80),
+            "unknown edge endpoints must not change the Forth projection"
         );
     }
 
     #[test]
     fn test_poset_duplicate_edges_do_not_duplicate_calls_or_indegree() {
-        let mut poset = crate::poset::Poset::new();
-        for label in ["left", "right", "join"] {
-            poset.add_node(
-                label.to_string(),
-                crate::poset::NodeKind::Task,
-                crate::poset::NodeAuthor::User,
-            );
-        }
-        poset.edges = vec![(0, 2), (0, 2), (0, 2), (1, 2), (1, 2)];
-        let actual = poset_to_forth_lines(&poset, 80, 80);
+        let mut graph = graph_from_labels(&["left", "right", "join"]);
+        graph.edges = vec![(0, 2), (0, 2), (0, 2), (1, 2), (1, 2)];
+        let actual = poset_to_forth_lines(&graph, 80, 80);
         let body = rendered_word_body(&actual, 2);
-        assert!(body.contains("W0 W1"));
-        assert_eq!(body.matches("W0").count(), 1);
-        assert_eq!(body.matches("W1").count(), 1);
+        assert!(
+            body.contains("W0 W1"),
+            "join body should call each predecessor once: {body}"
+        );
+        assert_eq!(body.matches("W0").count(), 1, "duplicated W0 call: {body}");
+        assert_eq!(body.matches("W1").count(), 1, "duplicated W1 call: {body}");
 
-        poset.edges = vec![(0, 2), (1, 2)];
-        assert_eq!(actual, poset_to_forth_lines(&poset, 80, 80));
+        graph.edges = vec![(0, 2), (1, 2)];
+        assert_eq!(actual, poset_to_forth_lines(&graph, 80, 80));
     }
 
     #[test]
     fn test_poset_program_depth_groups_branching_join_graph() {
-        let mut poset = crate::poset::Poset::new();
-        for label in ["root-a", "root-b", "branch-a", "branch-b", "join"] {
-            poset.add_node(
-                label.to_string(),
-                crate::poset::NodeKind::Task,
-                crate::poset::NodeAuthor::User,
-            );
-        }
-        poset.edges = vec![(0, 2), (1, 2), (0, 3), (1, 3), (2, 4), (3, 4)];
+        let mut graph = graph_from_labels(&["root-a", "root-b", "branch-a", "branch-b", "join"]);
+        graph.edges = vec![(0, 2), (1, 2), (0, 3), (1, 3), (2, 4), (3, 4)];
 
         assert_eq!(
-            rendered_program_lines(&poset_to_forth_lines(&poset, 80, 80)),
+            rendered_program_lines(&poset_to_forth_lines(&graph, 80, 80)),
             vec![
                 ": PROGRAM",
                 "W0 W1 \\ concurrent",
@@ -8285,7 +8262,53 @@ mod tests {
 
     #[test]
     fn test_poset_predecessor_calls_appear_in_body() {
-        // W0 is predecessor of W1; W1's body should call W0.
+        let mut graph = graph_from_labels(&["base", "derived"]);
+        graph.edges = vec![(0, 1)];
+        let lines = poset_to_forth_lines(&graph, 80, 40);
+        let w1_body = rendered_word_body(&lines, 1);
+        assert!(
+            w1_body.contains("W0"),
+            "W1 body should call W0 (its predecessor): {w1_body:?}"
+        );
+    }
+
+    #[test]
+    fn test_poset_rendering_is_stable_across_storage_orders() {
+        let mut graph = graph_from_labels(&["zero", "one", "two", "three", "four", "five"]);
+        graph.edges = vec![(2, 3), (0, 3), (1, 3), (3, 4), (1, 4), (4, 5), (2, 5)];
+
+        let expected = poset_to_forth_lines(&graph, 80, 80);
+        assert!(
+            rendered_word_body(&expected, 3).contains("W0 W1 W2"),
+            "W3 body: {}",
+            rendered_word_body(&expected, 3)
+        );
+        assert!(
+            rendered_word_body(&expected, 4).contains("W1 W3"),
+            "W4 body: {}",
+            rendered_word_body(&expected, 4)
+        );
+        assert!(
+            rendered_word_body(&expected, 5).contains("W2 W4"),
+            "W5 body: {}",
+            rendered_word_body(&expected, 5)
+        );
+
+        for seed in 0..64 {
+            let mut shuffled = graph.clone();
+            shuffle_with_seed(&mut shuffled.nodes, seed);
+            shuffle_with_seed(&mut shuffled.edges, seed ^ 0xa5a5_a5a5_a5a5_a5a5);
+            let actual = poset_to_forth_lines(&shuffled, 80, 80);
+            assert_eq!(
+                actual, expected,
+                "rendering changed for node/edge shuffle seed {seed}"
+            );
+        }
+    }
+
+    /// The injection conversion must preserve the Forth projection the overlay already had.
+    #[test]
+    fn test_graph_view_from_poset_preserves_forth_projection() {
         let mut poset = crate::poset::Poset::new();
         poset.add_node(
             "base".to_string(),
@@ -8298,41 +8321,20 @@ mod tests {
             crate::poset::NodeAuthor::User,
         );
         poset.add_edge(0, 1);
-        let lines = poset_to_forth_lines(&poset, 80, 40);
-        let w1_body = rendered_word_body(&lines, 1);
-        assert!(
-            w1_body.contains("W0"),
-            "W1 body should call W0 (its predecessor): {w1_body:?}"
+        let from_poset = poset_to_forth_lines(&graph_view_from_poset(&poset), 80, 40);
+        let mut view = graph_from_labels(&["base", "derived"]);
+        view.edges = vec![(0, 1)];
+        let from_view = poset_to_forth_lines(&view, 80, 40);
+        assert_eq!(
+            from_poset, from_view,
+            "graph_view_from_poset must not change the Forth projection\n\
+             from_poset={from_poset:?}\nfrom_view={from_view:?}"
         );
-    }
-
-    #[test]
-    fn test_poset_rendering_is_stable_across_storage_orders() {
-        let mut poset = crate::poset::Poset::new();
-        for label in ["zero", "one", "two", "three", "four", "five"] {
-            poset.add_node(
-                label.to_string(),
-                crate::poset::NodeKind::Task,
-                crate::poset::NodeAuthor::User,
-            );
-        }
-        poset.edges = vec![(2, 3), (0, 3), (1, 3), (3, 4), (1, 4), (4, 5), (2, 5)];
-
-        let expected = poset_to_forth_lines(&poset, 80, 80);
-        assert!(rendered_word_body(&expected, 3).contains("W0 W1 W2"));
-        assert!(rendered_word_body(&expected, 4).contains("W1 W3"));
-        assert!(rendered_word_body(&expected, 5).contains("W2 W4"));
-
-        for seed in 0..64 {
-            let mut shuffled = poset.clone();
-            shuffle_with_seed(&mut shuffled.nodes, seed);
-            shuffle_with_seed(&mut shuffled.edges, seed ^ 0xa5a5_a5a5_a5a5_a5a5);
-            let actual = poset_to_forth_lines(&shuffled, 80, 80);
-            assert_eq!(
-                actual, expected,
-                "rendering changed for node/edge shuffle seed {seed}"
-            );
-        }
+        assert!(
+            rendered_word_body(&from_poset, 1).contains("W0"),
+            "converted view lost the predecessor call: {}",
+            rendered_word_body(&from_poset, 1)
+        );
     }
 }
 
