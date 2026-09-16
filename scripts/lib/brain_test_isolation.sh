@@ -73,6 +73,20 @@ brain_isolation_resolve_store() {
 brain_isolation_proof_rejected() {
   if [[ "${FINCH_TEST_PROOF_DIAGNOSTICS:-}" == 1 ]]; then
     printf 'Brain test shell authority rejected: %s\n' "$1" >&2
+    # Opt-in harness diagnostics: binding identities, never credentials.
+    printf 'Brain test shell authority identity: brain_addr=%s daemon_addr=%s socket=%s socket_root=%s supervisor_pid=%s backup_fds=%s,%s,%s' \
+      "${FINCH_TEST_BRAIN_ADDR:-}" \
+      "${FINCH_TEST_DAEMON_ADDR:-}" \
+      "${FINCH_TEST_IPC_SOCKET:-}" \
+      "${FINCH_TEST_SOCKET_ROOT:-}" \
+      "${FINCH_TEST_SUPERVISOR_PID:-}" \
+      "${FINCH_TEST_BRAIN_LISTENER_BACKUP_FD:-}" \
+      "${FINCH_TEST_DAEMON_LISTENER_BACKUP_FD:-}" \
+      "${FINCH_TEST_IPC_LISTENER_BACKUP_FD:-}" >&2
+    if [[ -n "${BRAIN_ISOLATION_ACTIVE_IDENTITY:-}" ]]; then
+      printf ' %s' "$BRAIN_ISOLATION_ACTIVE_IDENTITY" >&2
+    fi
+    printf '\n' >&2
   fi
   return 1
 }
@@ -170,12 +184,18 @@ brain_test_isolation_is_active() {
   local actual_supervisor_digest
   local links proof_uid proof_mode proof_type actual_password_digest ancestor actual_supervisor_executable
   local library_root
-  [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" == 1 ]] || brain_isolation_proof_rejected isolated-marker
-  [[ "${FINCH_BRAIN_TEST_PROOF_FD:-}" == 9 ]] || brain_isolation_proof_rejected proof-target-fd
-  [[ "${FINCH_BRAIN_TEST_PROOF_BACKUP_FD:-}" == 108 ]] || brain_isolation_proof_rejected proof-backup-fd
-  [[ -n "${FINCH_TEST_SUPERVISOR_BIN:-}" ]] || brain_isolation_proof_rejected supervisor-binary
+  local BRAIN_ISOLATION_ACTIVE_IDENTITY=''
+  # Bash disables errexit while this function's result is tested as a
+  # conditional (`if brain_test_isolation_is_active`). `predicate || helper`
+  # therefore cannot stop the function: the helper returns 1 from itself,
+  # later successful checks run, and the function returns 0. Every rejection
+  # must `return` from this function (#516).
+  [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" == 1 ]] || { brain_isolation_proof_rejected isolated-marker; return 1; }
+  [[ "${FINCH_BRAIN_TEST_PROOF_FD:-}" == 9 ]] || { brain_isolation_proof_rejected proof-target-fd; return 1; }
+  [[ "${FINCH_BRAIN_TEST_PROOF_BACKUP_FD:-}" == 108 ]] || { brain_isolation_proof_rejected proof-backup-fd; return 1; }
+  [[ -n "${FINCH_TEST_SUPERVISOR_BIN:-}" ]] || { brain_isolation_proof_rejected supervisor-binary; return 1; }
   if [[ "${FINCH_TEST_PROOF_DIAGNOSTICS:-}" == 1 ]]; then
-    proof="$("$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof)" || brain_isolation_proof_rejected rust-verifier
+    proof="$("$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof)" || { brain_isolation_proof_rejected rust-verifier; return 1; }
   else
     proof="$("$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof 2>/dev/null)" || return 1
   fi
@@ -196,23 +216,24 @@ brain_test_isolation_is_active() {
   supervisor_identity="$(printf '%s\n' "$proof" | sed -n '15p')"
   supervisor_digest="$(printf '%s\n' "$proof" | sed -n '16p')"
   signature="$(printf '%s\n' "$proof" | sed -n '17p')"
-  [[ "$supervisor_digest" =~ ^[0-9a-f]{64}$ ]] || brain_isolation_proof_rejected supervisor-digest-shape
-  [[ "$signature" =~ ^[0-9a-f]{128}$ ]] || brain_isolation_proof_rejected signature-shape
-  [[ "$(printf '%s\n' "$proof" | sed -n '18p')" == '' ]] || brain_isolation_proof_rejected trailing-proof-fields
-  [[ "$token" == "${FINCH_BRAIN_TEST_TOKEN:-}" ]] || brain_isolation_proof_rejected token-binding
-  [[ "$home" == "${HOME:-}" && "$home" == "${FINCH_BRAIN_TEST_HOME:-}" ]] || brain_isolation_proof_rejected home-binding
-  [[ "$root" == "$home/.finch/brains" && "$root" == "${FINCH_BRAIN_TEST_ROOT:-}" ]] || brain_isolation_proof_rejected root-binding
-  [[ "$home_identity" == "$(brain_isolation_file_identity "$home")" ]] || brain_isolation_proof_rejected home-identity
-  [[ "$root_identity" == "$(brain_isolation_file_identity "$root")" ]] || brain_isolation_proof_rejected root-identity
-  [[ "$brain_addr" == "${FINCH_TEST_BRAIN_ADDR:-}" && -n "$brain_addr" ]] || brain_isolation_proof_rejected brain-address
-  [[ "$daemon_addr" == "${FINCH_TEST_DAEMON_ADDR:-}" && -n "$daemon_addr" ]] || brain_isolation_proof_rejected daemon-address
-  actual_password_digest="$(printf '%s' "${FINCH_TEST_BRAIN_PASSWORD:-}" | shasum -a 256 | awk '{print $1}')" || brain_isolation_proof_rejected password-digest-tool
-  [[ "$password_digest" == "$actual_password_digest" ]] || brain_isolation_proof_rejected password-binding
-  [[ "$socket" == "${FINCH_TEST_IPC_SOCKET:-}" ]] || brain_isolation_proof_rejected socket-binding
-  [[ "$socket_root" == "${FINCH_TEST_SOCKET_ROOT:-}" && "$socket" == "$socket_root/daemon.sock" ]] || brain_isolation_proof_rejected socket-root-binding
-  [[ "$socket_root_identity" == "$(brain_isolation_file_identity "$socket_root")" ]] || brain_isolation_proof_rejected socket-root-identity
-  [[ "${FINCH_TEST_BRAIN_LISTENER_FD:-}" == 10 && "${FINCH_TEST_DAEMON_LISTENER_FD:-}" == 11 && "${FINCH_TEST_IPC_LISTENER_FD:-}" == 12 ]] || brain_isolation_proof_rejected listener-target-fds
-  [[ "${FINCH_TEST_BRAIN_LISTENER_BACKUP_FD:-}" == 110 && "${FINCH_TEST_DAEMON_LISTENER_BACKUP_FD:-}" == 111 && "${FINCH_TEST_IPC_LISTENER_BACKUP_FD:-}" == 112 ]] || brain_isolation_proof_rejected listener-backup-fds
+  BRAIN_ISOLATION_ACTIVE_IDENTITY="home_identity=$home_identity root_identity=$root_identity socket_root_identity=$socket_root_identity ipc_listener_identity=$ipc_listener_identity supervisor_digest=$supervisor_digest"
+  [[ "$supervisor_digest" =~ ^[0-9a-f]{64}$ ]] || { brain_isolation_proof_rejected supervisor-digest-shape; return 1; }
+  [[ "$signature" =~ ^[0-9a-f]{128}$ ]] || { brain_isolation_proof_rejected signature-shape; return 1; }
+  [[ "$(printf '%s\n' "$proof" | sed -n '18p')" == '' ]] || { brain_isolation_proof_rejected trailing-proof-fields; return 1; }
+  [[ "$token" == "${FINCH_BRAIN_TEST_TOKEN:-}" ]] || { brain_isolation_proof_rejected token-binding; return 1; }
+  [[ "$home" == "${HOME:-}" && "$home" == "${FINCH_BRAIN_TEST_HOME:-}" ]] || { brain_isolation_proof_rejected home-binding; return 1; }
+  [[ "$root" == "$home/.finch/brains" && "$root" == "${FINCH_BRAIN_TEST_ROOT:-}" ]] || { brain_isolation_proof_rejected root-binding; return 1; }
+  [[ "$home_identity" == "$(brain_isolation_file_identity "$home")" ]] || { brain_isolation_proof_rejected home-identity; return 1; }
+  [[ "$root_identity" == "$(brain_isolation_file_identity "$root")" ]] || { brain_isolation_proof_rejected root-identity; return 1; }
+  [[ "$brain_addr" == "${FINCH_TEST_BRAIN_ADDR:-}" && -n "$brain_addr" ]] || { brain_isolation_proof_rejected brain-address; return 1; }
+  [[ "$daemon_addr" == "${FINCH_TEST_DAEMON_ADDR:-}" && -n "$daemon_addr" ]] || { brain_isolation_proof_rejected daemon-address; return 1; }
+  actual_password_digest="$(printf '%s' "${FINCH_TEST_BRAIN_PASSWORD:-}" | shasum -a 256 | awk '{print $1}')" || { brain_isolation_proof_rejected password-digest-tool; return 1; }
+  [[ "$password_digest" == "$actual_password_digest" ]] || { brain_isolation_proof_rejected password-binding; return 1; }
+  [[ "$socket" == "${FINCH_TEST_IPC_SOCKET:-}" ]] || { brain_isolation_proof_rejected socket-binding; return 1; }
+  [[ "$socket_root" == "${FINCH_TEST_SOCKET_ROOT:-}" && "$socket" == "$socket_root/daemon.sock" ]] || { brain_isolation_proof_rejected socket-root-binding; return 1; }
+  [[ "$socket_root_identity" == "$(brain_isolation_file_identity "$socket_root")" ]] || { brain_isolation_proof_rejected socket-root-identity; return 1; }
+  [[ "${FINCH_TEST_BRAIN_LISTENER_FD:-}" == 10 && "${FINCH_TEST_DAEMON_LISTENER_FD:-}" == 11 && "${FINCH_TEST_IPC_LISTENER_FD:-}" == 12 ]] || { brain_isolation_proof_rejected listener-target-fds; return 1; }
+  [[ "${FINCH_TEST_BRAIN_LISTENER_BACKUP_FD:-}" == 110 && "${FINCH_TEST_DAEMON_LISTENER_BACKUP_FD:-}" == 111 && "${FINCH_TEST_IPC_LISTENER_BACKUP_FD:-}" == 112 ]] || { brain_isolation_proof_rejected listener-backup-fds; return 1; }
   # The trusted Rust verifier above restores and authenticates FD10/FD11/FD12 from
   # the sealed backups. Bash may use a low descriptor while reading a script,
   # so the parent shell independently checks the backups that production will
@@ -249,18 +270,18 @@ brain_test_isolation_is_active() {
       verify_listener(111, $ARGV[1]) &&
       verify_ipc_listener(112, $ARGV[2], $ARGV[3]) ? 0 : 1
     );
-  ' "$brain_addr" "$daemon_addr" "$socket" "$ipc_listener_identity" || brain_isolation_proof_rejected listener-backup-authority
+  ' "$brain_addr" "$daemon_addr" "$socket" "$ipc_listener_identity" || { brain_isolation_proof_rejected listener-backup-authority; return 1; }
   perl -MFcntl=F_GETFL,O_ACCMODE,O_RDONLY -e '
     my $flags = fcntl(STDIN, F_GETFL, 0); exit 1 unless defined $flags;
     exit(($flags & O_ACCMODE) == O_RDONLY ? 0 : 1)
-  ' <&108 || brain_isolation_proof_rejected proof-backup-access
-  [[ "$supervisor_pid" == "${FINCH_TEST_SUPERVISOR_PID:-}" ]] || brain_isolation_proof_rejected supervisor-pid-binding
-  [[ "$supervisor_executable" == "${FINCH_TEST_SUPERVISOR_BIN:-}" ]] || brain_isolation_proof_rejected supervisor-path-binding
+  ' <&108 || { brain_isolation_proof_rejected proof-backup-access; return 1; }
+  [[ "$supervisor_pid" == "${FINCH_TEST_SUPERVISOR_PID:-}" ]] || { brain_isolation_proof_rejected supervisor-pid-binding; return 1; }
+  [[ "$supervisor_executable" == "${FINCH_TEST_SUPERVISOR_BIN:-}" ]] || { brain_isolation_proof_rejected supervisor-path-binding; return 1; }
   ancestor="$$"
   while [[ "$ancestor" -gt 1 && "$ancestor" != "$supervisor_pid" ]]; do
     ancestor="$(/bin/ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d ' ')" || return 1
   done
-  [[ "$ancestor" == "$supervisor_pid" ]] || brain_isolation_proof_rejected supervisor-ancestry
+  [[ "$ancestor" == "$supervisor_pid" ]] || { brain_isolation_proof_rejected supervisor-ancestry; return 1; }
   case "$(uname -s)" in
     Darwin)
       actual_supervisor_executable="$(
@@ -269,16 +290,16 @@ brain_test_isolation_is_active() {
       )" || return 1
       ;;
     Linux) actual_supervisor_executable="$(readlink "/proc/$supervisor_pid/exe" 2>/dev/null)" || return 1 ;;
-    *) brain_isolation_proof_rejected unsupported-platform ;;
+    *) brain_isolation_proof_rejected unsupported-platform; return 1 ;;
   esac
   library_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P)" || return 1
-  [[ "$actual_supervisor_executable" == "$supervisor_executable" ]] || brain_isolation_proof_rejected supervisor-executable-binding
+  [[ "$actual_supervisor_executable" == "$supervisor_executable" ]] || { brain_isolation_proof_rejected supervisor-executable-binding; return 1; }
   # Same rule as `verify_supervisor_image` in src/brain/mod.rs: the image digest
   # is checked always, not only when the inode differs, because an in-place
   # overwrite keeps the inode. A byte-identical relink is accepted; anything
   # else is refused (#259).
   actual_supervisor_digest="$(brain_isolation_supervisor_digest_for_profile "$library_root" "$supervisor_executable")" || return 1
-  [[ "$actual_supervisor_digest" == "$supervisor_digest" ]] || brain_isolation_proof_rejected supervisor-executable-substituted
+  [[ "$actual_supervisor_digest" == "$supervisor_digest" ]] || { brain_isolation_proof_rejected supervisor-executable-substituted; return 1; }
   # fstat the fd itself. Path-based stat differs per platform in ways that
   # do not track isolation: on Linux /dev/fd and /proc/self/fd are magic
   # links whose stat output describes the symlink (st_nlink=1, type
@@ -295,12 +316,12 @@ print(st.st_nlink, st.st_uid, oct(statmod.S_IMODE(st.st_mode))[2:], kind)
 PYEOF
 )" || return 1
   read -r links proof_uid proof_mode proof_type <<<"$fstat_line"
-  [[ "$links" == 0 && "$proof_uid" == "$(id -u)" && "$proof_type" == "regular" ]] || brain_isolation_proof_rejected proof-backup-metadata
+  [[ "$links" == 0 && "$proof_uid" == "$(id -u)" && "$proof_type" == "regular" ]] || { brain_isolation_proof_rejected proof-backup-metadata; return 1; }
   # Sealed read-only: no write bit may be set (Darwin 0400, Linux runner 0500).
-  [[ $(( 8#$proof_mode & 8#222 )) -eq 0 ]] || brain_isolation_proof_rejected proof-backup-writable
-  [[ "$(cd "$home" 2>/dev/null && pwd -P)" == "$home" ]] || brain_isolation_proof_rejected canonical-home
-  [[ "$(brain_isolation_resolve_store "$home" 2>/dev/null)" == "$root" ]] || brain_isolation_proof_rejected canonical-store
-  [[ "${FINCH_BRAIN_TEST_AUTH_FD:-}" == 109 ]] || brain_isolation_proof_rejected auth-fd
+  [[ $(( 8#$proof_mode & 8#222 )) -eq 0 ]] || { brain_isolation_proof_rejected proof-backup-writable; return 1; }
+  [[ "$(cd "$home" 2>/dev/null && pwd -P)" == "$home" ]] || { brain_isolation_proof_rejected canonical-home; return 1; }
+  [[ "$(brain_isolation_resolve_store "$home" 2>/dev/null)" == "$root" ]] || { brain_isolation_proof_rejected canonical-store; return 1; }
+  [[ "${FINCH_BRAIN_TEST_AUTH_FD:-}" == 109 ]] || { brain_isolation_proof_rejected auth-fd; return 1; }
 }
 
 brain_test_isolation_require_finch_profile() {
