@@ -40,16 +40,38 @@ the row into native history twice. Test:
 - `Confirm` — `y`/`n` or Enter/Esc
 - Approval payload is a bounded, scrollable region. `dialog_lines` pins Yes/No/Cancel so a long write never moves the controls off-screen. Write approvals summarise path, size, and create-vs-overwrite; the full preview stays behind body scroll.
 
+**Bounded tool-result controls** (`src/cli/tui/tool_viewport.rs`):
+- Every `ToolOutput` transcript row is a reusable semantic control with a bounded
+  child viewport (`DEFAULT_TOOL_OUTPUT_ROWS`, currently 4): each body line is
+  truncated to the terminal width, so the bound is a hard row bound; one
+  plain-text status row names the visible range, the total, and the
+  scroll/expand affordances (`… lines 1–3 of 40 — ↑/↓ scroll · Enter expand`).
+- Per-row scroll offsets live in `ToolViewportState`, keyed by the append-stable
+  `TranscriptRowId` — interleaved tool updates never reset them. Hit regions are
+  rebuilt from physical-row geometry after every frame and resize, mirroring the
+  accordion; a wheel whose X/Y lands inside a control scrolls that result only
+  and keeps mouse tracking (native scrollback stays reachable for wheels off the
+  control, per #441).
+- Click on the control's cells, or Enter/Space with the row focused via F6,
+  opens a focused expanded surface (title bar, scrolled body, plain-text
+  footer). Up/Down/PageUp/PageDown/Home/End scroll it, Esc/q/Enter close it, and
+  closing restores the captured child scroll offset, disclosure grouping, and
+  focus. Ctrl+C and other unclaimed keys fall through to the input loop.
+- Canonical native scrollback is never bounded: `commit_complete_messages`
+  still writes the fully expanded projection exactly once, so the copyable
+  record stays complete. The bound applies only to viewport projections.
+
 Virtual row helpers:
 - `dialog.submit_virtual_index()` — MultiSelect: `options.len() + (1 if allow_custom)`
 - `dialog.cancel_virtual_index()` — Select: `options.len()`; MultiSelect: `submit + 1`
 
 ## Key files
 
-- `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `commit_complete_messages()`, `erase_live_area()`/`draw_live_area()`
+- `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
 - `src/cli/tui/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`
 - `src/cli/tui/accordion.rs` — retained semantic projection, focus, and hit regions
-- `src/cli/tui/scrollback.rs` — `ScrollbackBuffer` (not yet wired into the main render path)
+- `src/cli/tui/tool_viewport.rs` — bounded tool-result controls: child viewport state, wheel hit regions, expanded surface
+- `src/cli/tui/scrollback.rs` — `ScrollbackBuffer`
 - `src/cli/tui/dialog.rs` — Dialog state machine and approval control pin
 - `src/cli/tui/input_widget.rs` — Input area (tui-textarea)
 - `src/cli/tui/status_widget.rs` — Status bar

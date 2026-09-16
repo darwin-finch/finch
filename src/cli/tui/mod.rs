@@ -35,7 +35,9 @@ use std::time::Duration;
 use tui_textarea::TextArea;
 
 use super::{OutputManager, StatusBar, StatusLineType};
-use crate::cli::messages::{MessageId, MessageRef, MessageStatus, TranscriptRowKind};
+use crate::cli::messages::{
+    MessageId, MessageRef, MessageStatus, TranscriptRow, TranscriptRowId, TranscriptRowKind,
+};
 // Sub-modules
 mod accordion;
 pub mod activity;
@@ -50,10 +52,15 @@ mod shadow_buffer; // kept – good architecture for future diffing
 mod status_widget;
 mod tabbed_dialog;
 mod tabbed_dialog_widget; // kept for wizard helpers
+mod tool_viewport;
 #[cfg(test)]
 mod vt_oracle;
 
 use accordion::{AccordionState, RenderedTranscriptLine};
+use tool_viewport::{
+    is_left_click, wheel_delta, ExpandedToolView, ToolViewportState, DEFAULT_TOOL_OUTPUT_ROWS,
+    PAGE_STEP_LINES,
+};
 
 pub use async_input::{spawn_input_task, InputEvent};
 pub use autocomplete_widget::AutocompleteState;
@@ -1007,6 +1014,9 @@ pub(crate) struct LiveFrameInputs<'a> {
     pub cwd_label: &'a str,
     pub session_label: &'a str,
     pub dialog: Option<&'a Dialog>,
+    /// Lines of the focused expanded tool-result surface (#656), pre-rendered
+    /// by the caller so the planner stays a pure function of its inputs.
+    pub expanded_lines: Option<&'a [String]>,
     /// A render error, like a dialog, owns the viewport and suppresses
     /// completions.
     pub render_error: bool,
@@ -1141,7 +1151,9 @@ pub(crate) fn plan_live_frame(
 ) -> LiveFrame {
     let width = inputs.terminal_width.max(1);
     let height = inputs.terminal_height;
-    let dialog_active = inputs.dialog.is_some();
+    // A dialog or the expanded tool-result surface owns the viewport: a
+    // focused surface's own scrolling must never move the transcript behind it.
+    let dialog_active = inputs.dialog.is_some() || inputs.expanded_lines.is_some();
     let mut frame = LiveFrame::default();
 
     // ── Row budget ────────────────────────────────────────────────────────────
@@ -1245,7 +1257,7 @@ pub(crate) fn plan_live_frame(
         frame.push(format!("{DIM_GRAY}{separator}{RESET}"));
     }
 
-    // ── 3. Dialog or input ───────────────────────────────────────────────────
+    // ── 3. Dialog, expanded tool result, or input ────────────────────────────
     if let Some(dialog) = inputs.dialog {
         let budget = height.saturating_sub(frame.physical_rows(width));
         for line in TuiRenderer::dialog_lines(dialog, width, budget) {
@@ -1253,6 +1265,52 @@ pub(crate) fn plan_live_frame(
         }
         // A dialog has no editable text cursor. Keep the hidden cursor on the
         // final owned row so painting at the viewport bottom cannot scroll it.
+        frame.cursor_visible = false;
+        frame.cursor_row = frame.physical_rows(width).saturating_sub(1);
+        return frame;
+    }
+    if let Some(expanded) = inputs.expanded_lines {
+        // Same budget discipline as a dialog: the surface owns what remains of
+        // the viewport and never pushes rows past it. Title and footer are
+        // preferred; the body window clips from the bottom.
+        let mut remaining = height.saturating_sub(frame.physical_rows(width));
+        match expanded.split_first() {
+            None => return frame,
+            Some((first, rest)) => {
+                let title_rows = shadow_buffer::physical_rows(first, width);
+                if title_rows <= remaining {
+                    frame.push(first.clone());
+                    remaining -= title_rows;
+                }
+                let footer = rest.last();
+                let body = rest
+                    .len()
+                    .checked_sub(1)
+                    .map(|len| &rest[..len])
+                    .unwrap_or(rest);
+                let footer_rows = footer
+                    .map(|line| shadow_buffer::physical_rows(line, width))
+                    .unwrap_or(0);
+                let reserved = if footer_rows <= remaining {
+                    footer_rows
+                } else {
+                    0
+                };
+                for line in body {
+                    let rows = shadow_buffer::physical_rows(line, width);
+                    if rows > remaining.saturating_sub(reserved) {
+                        break;
+                    }
+                    frame.push(line.clone());
+                    remaining -= rows;
+                }
+                if reserved > 0 {
+                    frame.push(footer.expect("footer present when reserved").clone());
+                }
+            }
+        }
+        // The focused surface has no editable text cursor either; park it on
+        // the final owned row like a dialog does.
         frame.cursor_visible = false;
         frame.cursor_row = frame.physical_rows(width).saturating_sub(1);
         return frame;
@@ -1372,6 +1430,12 @@ pub struct TuiRenderer {
     // mutates canonical message content or permanent native scrollback.
     accordion: AccordionState,
 
+    // Bounded child viewports for tool-use output rows (#656): per-row scroll
+    // offsets, the hit regions of the last painted frame, and the focused
+    // expanded surface. Presentation-only, like the accordion state.
+    tool_viewports: ToolViewportState,
+    pub(crate) expanded_tool: Option<ExpandedToolView>,
+
     // Dialog state — tool-approval dialogs shown in the live area.
     pub active_dialog: Option<Dialog>,
     pub active_tabbed_dialog: Option<TabbedDialog>,
@@ -1464,6 +1528,8 @@ impl TuiRenderer {
             cursor_row_from_top: 0,
             printed_ids: HashSet::new(),
             accordion: AccordionState::default(),
+            tool_viewports: ToolViewportState::default(),
+            expanded_tool: None,
             active_dialog: None,
             active_tabbed_dialog: None,
             is_active: false,
@@ -1570,6 +1636,8 @@ impl TuiRenderer {
             cursor_row_from_top: 0,
             printed_ids: HashSet::new(),
             accordion: AccordionState::default(),
+            tool_viewports: ToolViewportState::default(),
+            expanded_tool: None,
 
             active_dialog: None,
             active_tabbed_dialog: None,
@@ -1860,7 +1928,7 @@ impl TuiRenderer {
             &self.command_registry,
         );
 
-        if term_h <= 3 && self.active_dialog.is_none() {
+        if term_h <= 3 && self.active_dialog.is_none() && self.expanded_tool.is_none() {
             completion_pane_lines(&mut self.autocomplete_state, term_width, 0);
             let frame = plan_tiny_live_frame(
                 &input_lines,
@@ -1875,6 +1943,7 @@ impl TuiRenderer {
             self.active_rows = rows;
             self.cursor_row_from_top = frame.cursor_row;
             self.accordion.rebuild_hit_regions(&[], 0, term_width);
+            self.tool_viewports.rebuild_hit_regions(&[], 0, term_width);
             return Ok(());
         }
 
@@ -1900,7 +1969,20 @@ impl TuiRenderer {
             .unwrap_or_else(|| self.session_label.clone());
 
         let live_messages = self.find_live_messages();
-        let live_rendered = self.projected_lines(live_messages);
+        let live_rendered = self.projected_lines(live_messages, term_width);
+
+        // The expanded tool-result surface owns the frame when open. A body
+        // that can no longer be found closes the surface before drawing.
+        let expanded_lines = match self.expanded_surface_frame(term_width, term_h.saturating_sub(1))
+        {
+            Some(lines) => Some(lines),
+            None => {
+                if self.expanded_tool.is_some() {
+                    self.close_expanded_tool();
+                }
+                None
+            }
+        };
 
         let inputs = LiveFrameInputs {
             terminal_width: term_width,
@@ -1912,6 +1994,7 @@ impl TuiRenderer {
             cwd_label: &cwd_label,
             session_label: &session_label,
             dialog: self.active_dialog.as_ref(),
+            expanded_lines: expanded_lines.as_deref(),
             render_error: self.last_render_error.is_some(),
             task_rows: &task_rows,
             tracked_rows: &tracked,
@@ -2188,8 +2271,7 @@ fn rendered_tail_without_pinning(
             if !fragment.is_empty() {
                 selected.push(RenderedTranscriptLine {
                     text: fragment,
-                    row_id: None,
-                    row_expanded: None,
+                    ..RenderedTranscriptLine::default()
                 });
             }
             break;
@@ -2219,8 +2301,7 @@ fn rendered_metadata_for_visible(
             } else {
                 RenderedTranscriptLine {
                     text: text.clone(),
-                    row_id: None,
-                    row_expanded: None,
+                    ..RenderedTranscriptLine::default()
                 }
             }
         })
@@ -2311,6 +2392,38 @@ fn continue_full_viewport_paint(
 }
 
 // ─── flush_output_safe / render ───────────────────────────────────────────────
+
+/// Depth-first search of a transcript row tree by stable identity.
+fn find_transcript_row<'a>(
+    row: &'a TranscriptRow,
+    id: &TranscriptRowId,
+) -> Option<&'a TranscriptRow> {
+    if row.id == *id {
+        return Some(row);
+    }
+    for child in &row.children {
+        if let Some(found) = find_transcript_row(child, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The row whose direct child has the given identity, for surface titles.
+fn find_parent_transcript_row<'a>(
+    row: &'a TranscriptRow,
+    id: &TranscriptRowId,
+) -> Option<&'a TranscriptRow> {
+    for child in &row.children {
+        if child.id == *id {
+            return Some(row);
+        }
+        if let Some(found) = find_parent_transcript_row(child, id) {
+            return Some(found);
+        }
+    }
+    None
+}
 
 impl TuiRenderer {
     /// Called from the event loop on every tick.
@@ -2622,21 +2735,30 @@ impl TuiRenderer {
 // ─── Message helpers ──────────────────────────────────────────────────────────
 
 impl TuiRenderer {
-    fn projected_message_lines(&self, message: &MessageRef) -> Vec<RenderedTranscriptLine> {
-        self.accordion.render_message(message, &self.colors)
+    fn projected_message_lines(
+        &mut self,
+        message: &MessageRef,
+        width: usize,
+    ) -> Vec<RenderedTranscriptLine> {
+        let lines = self.accordion.render_message(message, &self.colors);
+        // Tool results are bounded child viewports (#656): the visible
+        // projection shows a configured number of rows with a scroll offset
+        // the control owns. Canonical scrollback is projected separately
+        // (fully expanded) and is never bounded here.
+        self.tool_viewports
+            .project(lines, width, DEFAULT_TOOL_OUTPUT_ROWS)
     }
 
     fn projected_lines(
-        &self,
+        &mut self,
         messages: impl IntoIterator<Item = MessageRef>,
+        width: usize,
     ) -> Vec<RenderedTranscriptLine> {
         let mut rendered = Vec::new();
         for message in messages {
-            rendered.extend(self.projected_message_lines(&message));
+            rendered.extend(self.projected_message_lines(&message, width));
             rendered.push(RenderedTranscriptLine {
-                text: String::new(),
-                row_id: None,
-                row_expanded: None,
+                ..RenderedTranscriptLine::default()
             });
         }
         rendered
@@ -2652,8 +2774,11 @@ impl TuiRenderer {
         let transcript_budget = height.saturating_sub(live_rows);
         let messages = self.output_manager.get_messages();
         let printed = visible_printed_messages(&messages, &self.printed_ids);
-        let transcript =
-            viewport_tail_rendered_lines(&self.projected_lines(printed), width, transcript_budget);
+        let transcript = viewport_tail_rendered_lines(
+            &self.projected_lines(printed, width),
+            width,
+            transcript_budget,
+        );
         let transcript_rows = transcript
             .iter()
             .map(|line| shadow_buffer::physical_rows(&line.text, width.max(1)))
@@ -2668,12 +2793,12 @@ impl TuiRenderer {
                     .sum::<usize>(),
         );
         combined.extend((0..padding).map(|_| RenderedTranscriptLine {
-            text: String::new(),
-            row_id: None,
-            row_expanded: None,
+            ..RenderedTranscriptLine::default()
         }));
         combined.extend_from_slice(live);
         self.accordion
+            .rebuild_hit_regions(&combined, plan.transcript_top, width);
+        self.tool_viewports
             .rebuild_hit_regions(&combined, plan.transcript_top, width);
     }
 
@@ -2681,7 +2806,45 @@ impl TuiRenderer {
         if self.active_dialog.is_some() || self.active_tabbed_dialog.is_some() {
             return false;
         }
+        if self.expanded_tool.is_some() {
+            return self.handle_expanded_tool_key(key);
+        }
+        if self.handle_tool_viewport_key(key) {
+            return true;
+        }
         if !self.accordion.handle_key(key) {
+            return false;
+        }
+        self.viewport_invalidated = true;
+        self.live_area_dirty = true;
+        true
+    }
+
+    /// Keyboard equivalents for a bounded tool-result control (#656).
+    ///
+    /// When a `ToolOutput` row holds the accordion focus: Up/Down/PageUp/
+    /// PageDown scroll that result's child viewport, Enter/Space open the
+    /// expanded surface. Any other key, or a focused row that is not a tool
+    /// result, is left for the accordion and the input area.
+    fn handle_tool_viewport_key(&mut self, key: KeyEvent) -> bool {
+        let Some(focused) = self.accordion.focused.clone() else {
+            return false;
+        };
+        if self.tool_viewports.kind_of(&focused) != Some(TranscriptRowKind::ToolOutput) {
+            return false;
+        }
+        if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+            self.open_expanded_tool(&focused);
+            return true;
+        }
+        let delta = match key.code {
+            KeyCode::Up => -1,
+            KeyCode::Down => 1,
+            KeyCode::PageUp => -(PAGE_STEP_LINES as isize),
+            KeyCode::PageDown => PAGE_STEP_LINES as isize,
+            _ => return false,
+        };
+        if !self.tool_viewports.scroll_child(&focused, delta) {
             return false;
         }
         self.viewport_invalidated = true;
@@ -2693,6 +2856,19 @@ impl TuiRenderer {
         if self.active_dialog.is_some() || self.active_tabbed_dialog.is_some() {
             return false;
         }
+        // Clicking a bounded tool-result control expands it (#656). The click
+        // must land on the child viewport's own cells; the header keeps the
+        // accordion's toggle-to-collapse behavior.
+        if self.expanded_tool.is_none() && is_left_click(&mouse) {
+            if let Some(region) = self
+                .tool_viewports
+                .region_at(mouse.column, mouse.row)
+                .cloned()
+            {
+                self.open_expanded_tool(&region.row_id);
+                return true;
+            }
+        }
         if !self.accordion.handle_mouse(mouse) {
             return false;
         }
@@ -2701,8 +2877,10 @@ impl TuiRenderer {
         true
     }
 
-    /// Wheel ticks release mouse tracking so native scrollback is reachable;
-    /// other mouse events keep the existing accordion click-to-toggle path.
+    /// Wheel ticks release mouse tracking so native scrollback is reachable —
+    /// unless the wheel is over a bounded tool-result control, which scrolls
+    /// that result in place and keeps tracking held (#656). Other mouse events
+    /// keep the existing accordion click-to-toggle path.
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         let mut stdout = io::stdout();
         self.handle_mouse_to(mouse, &mut stdout)
@@ -2714,6 +2892,25 @@ impl TuiRenderer {
             // off-screen, and the restoring keypress would be dialog input.
             // Leave the wheel for the dialog (ignored today; body scroll later).
             if self.active_dialog.is_none() && self.active_tabbed_dialog.is_none() {
+                if let Some(delta) = wheel_delta(mouse.kind) {
+                    if self.expanded_tool.is_some() {
+                        self.scroll_expanded_tool(delta);
+                        return true;
+                    }
+                    if let Some(region) = self
+                        .tool_viewports
+                        .region_at(mouse.column, mouse.row)
+                        .cloned()
+                    {
+                        // The child viewport owns this wheel: scroll that tool
+                        // result and keep mouse tracking so the next tick keeps
+                        // scrolling it instead of falling to native scrollback.
+                        if self.tool_viewports.scroll_child(&region.row_id, delta) {
+                            self.live_area_dirty = true;
+                        }
+                        return true;
+                    }
+                }
                 self.release_mouse_tracking_to(out);
             }
             return false;
@@ -2740,6 +2937,153 @@ impl TuiRenderer {
         let _ = out.flush();
     }
 
+    // ─── Expanded tool-result surface (#656) ────────────────────────────────
+
+    /// Open the focused expanded surface for one tool result. The surface
+    /// starts at the compact window's scroll position, so reading continues
+    /// where the bounded viewport left off.
+    pub(crate) fn open_expanded_tool(&mut self, row_id: &TranscriptRowId) {
+        if self
+            .expanded_tool
+            .as_ref()
+            .is_some_and(|view| view.row_id == *row_id)
+        {
+            return;
+        }
+        let Some(body) = self.tool_output_body(row_id) else {
+            return;
+        };
+        let title = self.tool_row_title(row_id);
+        let saved_scroll = self.tool_viewports.child_scroll(row_id);
+        self.expanded_tool = Some(ExpandedToolView {
+            row_id: row_id.clone(),
+            title,
+            saved_scroll,
+            scroll: saved_scroll.min(body.len().saturating_sub(1)),
+            body_lines: body.len(),
+        });
+        self.viewport_invalidated = true;
+        self.live_area_dirty = true;
+    }
+
+    /// Close the expanded surface and restore the child scroll offset captured
+    /// at open time. Disclosure grouping and accordion focus were never
+    /// touched, so the surrounding conversation returns exactly as it was.
+    pub(crate) fn close_expanded_tool(&mut self) {
+        let Some(view) = self.expanded_tool.take() else {
+            return;
+        };
+        self.tool_viewports
+            .set_child_scroll(&view.row_id, view.saved_scroll);
+        self.viewport_invalidated = true;
+        self.live_area_dirty = true;
+    }
+
+    fn scroll_expanded_tool(&mut self, delta: isize) {
+        let Some(view) = self.expanded_tool.as_mut() else {
+            return;
+        };
+        let max = view.body_lines.saturating_sub(1);
+        view.scroll = if delta < 0 {
+            view.scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            (view.scroll + delta as usize).min(max)
+        };
+        self.live_area_dirty = true;
+    }
+
+    /// Keys routed to the expanded surface while it is open. Everything it
+    /// does not claim (Ctrl+C, /quit) falls through to the input loop, so the
+    /// surface can never trap the session.
+    fn handle_expanded_tool_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                self.close_expanded_tool();
+                true
+            }
+            KeyCode::Up => {
+                self.scroll_expanded_tool(-1);
+                true
+            }
+            KeyCode::Down => {
+                self.scroll_expanded_tool(1);
+                true
+            }
+            KeyCode::PageUp => {
+                self.scroll_expanded_tool(-(PAGE_STEP_LINES as isize));
+                true
+            }
+            KeyCode::PageDown => {
+                self.scroll_expanded_tool(PAGE_STEP_LINES as isize);
+                true
+            }
+            KeyCode::Home => {
+                if let Some(view) = self.expanded_tool.as_mut() {
+                    view.scroll = 0;
+                }
+                self.live_area_dirty = true;
+                true
+            }
+            KeyCode::End => {
+                if let Some(view) = self.expanded_tool.as_mut() {
+                    view.scroll = view.body_lines.saturating_sub(1);
+                }
+                self.live_area_dirty = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Current body lines of one tool result, looked up from the retained
+    /// messages so appends that arrived after the surface opened stay visible.
+    fn tool_output_body(&self, row_id: &TranscriptRowId) -> Option<Vec<String>> {
+        let messages = self.output_manager.get_messages();
+        for message in &messages {
+            if message.id() != row_id.message_id {
+                continue;
+            }
+            let root = message.transcript_row(&self.colors)?;
+            return find_transcript_row(&root, row_id)
+                .filter(|row| row.kind == TranscriptRowKind::ToolOutput)
+                .map(|row| row.body.clone());
+        }
+        None
+    }
+
+    /// Label of the tool call that owns the result row, for the surface title.
+    fn tool_row_title(&self, row_id: &TranscriptRowId) -> String {
+        let messages = self.output_manager.get_messages();
+        for message in &messages {
+            if message.id() != row_id.message_id {
+                continue;
+            }
+            if let Some(root) = message.transcript_row(&self.colors) {
+                if let Some(parent) = find_parent_transcript_row(&root, row_id) {
+                    return parent.label.clone();
+                }
+                return root.label.clone();
+            }
+        }
+        "Tool output".to_string()
+    }
+
+    /// The expanded surface's lines for the next frame, or `None` when the
+    /// surface's message can no longer be found (the surface closes).
+    fn expanded_surface_frame(&mut self, width: usize, height: usize) -> Option<Vec<String>> {
+        let (row_id, title, scroll) = {
+            let view = self.expanded_tool.as_ref()?;
+            (view.row_id.clone(), view.title.clone(), view.scroll)
+        };
+        let body = self.tool_output_body(&row_id)?;
+        let lines = tool_viewport::expanded_surface_lines(&title, &body, scroll, width, height);
+        if let Some(view) = self.expanded_tool.as_mut() {
+            view.body_lines = body.len();
+            view.scroll = view.scroll.min(body.len().saturating_sub(1));
+        }
+        Some(lines)
+    }
+
     pub fn add_trait_message(&mut self, message: MessageRef) -> MessageId {
         let id = message.id();
         self.output_manager.add_trait_message(message);
@@ -2763,7 +3107,7 @@ impl TuiRenderer {
         Ok(())
     }
 
-    fn live_geometry(&self, width: u16, height: u16) -> Option<(usize, usize)> {
+    fn live_geometry(&mut self, width: u16, height: u16) -> Option<(usize, usize)> {
         if let Some(dialog) = self.active_dialog.as_ref() {
             let terminal_rows = usize::from(height);
             if terminal_rows == 0 {
@@ -2778,6 +3122,33 @@ impl TuiRenderer {
             )
             .ok()?;
             let rows = 1 + dialog_rows;
+            return Some((rows, rows.saturating_sub(1)));
+        }
+        if let Some(view) = self.expanded_tool.as_ref() {
+            let terminal_rows = usize::from(height);
+            if terminal_rows == 0 {
+                return Some((0, 0));
+            }
+            // The surface frame is [separator, surface lines]; mirror the
+            // planner exactly so the transcript budget cannot disagree.
+            let width_us = usize::from(width).max(1);
+            let surface_rows = match self.tool_output_body(&view.row_id) {
+                Some(body) => {
+                    let lines = tool_viewport::expanded_surface_lines(
+                        &view.title,
+                        &body,
+                        view.scroll,
+                        width_us,
+                        terminal_rows.saturating_sub(1),
+                    );
+                    lines
+                        .iter()
+                        .map(|line| shadow_buffer::physical_rows(line, width_us))
+                        .sum::<usize>()
+                }
+                None => 1,
+            };
+            let rows = 1 + surface_rows;
             return Some((rows, rows.saturating_sub(1)));
         }
         let term_width = usize::from(width).max(1);
@@ -2821,7 +3192,7 @@ impl TuiRenderer {
         .sum::<usize>();
         let base_reserved_rows =
             1 + drawn_input_rows + drawn_status_rows + todo_rows + self.tracked_rows.len();
-        let all_live_rendered = self.projected_lines(self.find_live_messages());
+        let all_live_rendered = self.projected_lines(self.find_live_messages(), draw_width);
         let all_live_lines = all_live_rendered
             .iter()
             .map(|line| line.text.clone())
@@ -2919,7 +3290,10 @@ impl TuiRenderer {
 
         let messages = self.output_manager.get_messages();
         let transcript = self
-            .projected_lines(visible_printed_messages(&messages, &self.printed_ids))
+            .projected_lines(
+                visible_printed_messages(&messages, &self.printed_ids),
+                term_width,
+            )
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>();
@@ -4231,6 +4605,589 @@ mod tests {
             disable_mouse_capture_bytes(),
             "INVARIANT: the no-dialog release is DisableMouseCapture (#441). \
              terminal received {bytes:?}"
+        );
+        renderer.is_active = false;
+    }
+
+    // ── Bounded tool-result controls (#656): production event path ───────────
+
+    /// A renderer holding one committed grouped tool turn whose Bash-like
+    /// result produced `lines` lines, with the hit regions rebuilt from the
+    /// real projection exactly as a paint would. Returns the renderer and the
+    /// output row's stable identity.
+    fn committed_tool_result_renderer(
+        lines: usize,
+    ) -> (TuiRenderer, crate::cli::messages::TranscriptRowId) {
+        use crate::cli::messages::WorkUnit;
+
+        let colors = ColorScheme::default();
+        let work = Arc::new(WorkUnit::new("Tools"));
+        let call = work.add_row("bash(build)");
+        work.complete_row_with_body(
+            call,
+            "",
+            (0..lines).map(|n| format!("line {n}")).collect::<Vec<_>>(),
+        );
+        work.set_complete();
+        let output_row = work
+            .transcript_row(&colors)
+            .expect("a tool group projects a transcript row")
+            .children[0]
+            .children[1]
+            .id
+            .clone();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer = TuiRenderer::new_headless(output, Arc::new(StatusBar::new()), colors);
+        renderer.is_active = true;
+        renderer.add_trait_message(work);
+        // The result has been committed to native scrollback and lives in the
+        // visible transcript tail.
+        let message_id = renderer
+            .output_manager
+            .get_messages()
+            .last()
+            .map(|message| message.id())
+            .expect("the tool message was added");
+        renderer.printed_ids.insert(message_id);
+        renderer.rebuild_transcript_hit_regions(&[], 0, 80, 24);
+        (renderer, output_row)
+    }
+
+    /// INVARIANT: a wheel whose X/Y lands on a bounded tool-result control
+    /// scrolls that result in place and never releases mouse tracking to
+    /// native scrollback (#656). The parent scrollback state is untouched:
+    /// no new canonical commit becomes eligible, no printed id changes, and a
+    /// neighbouring message's projection is byte-identical.
+    #[test]
+    fn test_wheel_over_tool_result_scrolls_it_without_touching_parent_scrollback() {
+        let (mut renderer, output_row) = committed_tool_result_renderer(40);
+        let top = renderer
+            .tool_viewports
+            .regions()
+            .iter()
+            .find(|region| region.row_id == output_row)
+            .map(|region| region.top)
+            .expect("the painted tool result registered a hit region");
+        let before_plan = plan_canonical_commit(
+            &renderer.output_manager.get_messages(),
+            &renderer.printed_ids,
+        );
+        let before_printed = renderer.printed_ids.clone();
+
+        let wheel = MouseEvent {
+            kind: event::MouseEventKind::ScrollDown,
+            column: 0,
+            row: top,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut bytes = Vec::new();
+        assert!(
+            renderer.handle_mouse_to(wheel, &mut bytes),
+            "the wheel over the tool result must be dispatched to it, not dropped"
+        );
+        assert_eq!(
+            renderer.tool_viewports.child_scroll(&output_row),
+            1,
+            "INVARIANT: the wheel scrolled the targeted tool result by one line; child \
+             scroll was {:?}, hit region top was {top}",
+            renderer.tool_viewports.child_scroll(&output_row)
+        );
+        assert_eq!(
+            renderer.mouse_tracking,
+            mouse_capture::MouseTracking::Held,
+            "INVARIANT: a wheel over a tool result keeps mouse tracking so the next tick \
+             keeps scrolling the result instead of falling to native scrollback; tracking \
+             was {:?}; terminal received {bytes:?}",
+            renderer.mouse_tracking
+        );
+        assert!(
+            bytes.is_empty(),
+            "INVARIANT: dispatching a wheel to a tool result must not emit \
+             DisableMouseCapture; terminal received {bytes:?}"
+        );
+        let after_plan = plan_canonical_commit(
+            &renderer.output_manager.get_messages(),
+            &renderer.printed_ids,
+        );
+        assert_eq!(
+            before_plan.emit.len(),
+            after_plan.emit.len(),
+            "INVARIANT: scrolling a tool result must not make a canonical commit eligible; \
+             plan before {before:?} vs after {after:?}",
+            before = before_plan.emit.len(),
+            after = after_plan.emit.len()
+        );
+        assert_eq!(
+            before_printed, renderer.printed_ids,
+            "INVARIANT: the set of messages written to native scrollback is unchanged by \
+             a child-viewport wheel"
+        );
+        renderer.is_active = false;
+    }
+
+    /// INVARIANT: the wheel dispatch is exact — two adjacent tool results are
+    /// separately addressable, and a wheel on the first never moves the second.
+    #[test]
+    fn test_wheel_dispatch_reaches_only_the_targeted_tool_result() {
+        use crate::cli::messages::{MessageRef, WorkUnit};
+
+        let (mut renderer, _) = committed_tool_result_renderer(40);
+        let colors = renderer.colors.clone();
+        // A second tool result committed below the first.
+        let second = Arc::new(WorkUnit::new("Tools"));
+        let call = second.add_row("bash(other)");
+        second.complete_row_with_body(
+            call,
+            "",
+            (0..40).map(|n| format!("beta {n}")).collect::<Vec<_>>(),
+        );
+        second.set_complete();
+        let second_output = second
+            .transcript_row(&colors)
+            .expect("a tool group projects a transcript row")
+            .children[0]
+            .children[1]
+            .id
+            .clone();
+        renderer.add_trait_message(second.clone());
+        let second_id = second.id();
+        renderer.printed_ids.insert(second_id);
+        renderer.rebuild_transcript_hit_regions(&[], 0, 80, 24);
+
+        let first_scroll = {
+            let regions = renderer.tool_viewports.regions();
+            let first = regions
+                .iter()
+                .find(|region| region.row_id != second_output)
+                .cloned()
+                .expect("the first tool result registered a region");
+            first.row_id.clone()
+        };
+        let first_region = renderer
+            .tool_viewports
+            .regions()
+            .iter()
+            .find(|region| region.row_id == first_scroll)
+            .cloned()
+            .expect("first region present");
+        let wheel = MouseEvent {
+            kind: event::MouseEventKind::ScrollDown,
+            column: first_region.left,
+            row: first_region.top,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(renderer.handle_mouse_to(wheel, &mut Vec::new()));
+        assert_eq!(
+            renderer.tool_viewports.child_scroll(&first_scroll),
+            1,
+            "the targeted result scrolled"
+        );
+        assert_eq!(
+            renderer.tool_viewports.child_scroll(&second_output),
+            0,
+            "INVARIANT: the neighbouring result did not move; exact X/Y dispatch reaches \
+             only the targeted control"
+        );
+        let second_message: MessageRef = second.clone();
+        let second_projected = renderer.projected_message_lines(&second_message, 80);
+        assert!(
+            second_projected
+                .iter()
+                .any(|line| line.text.contains("beta 0")),
+            "INVARIANT: the untargeted result's window is unchanged (still starts at \
+             beta 0); projection was:\n{}",
+            second_projected
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        renderer.is_active = false;
+    }
+
+    /// A wheel whose row is not on a tool-result control still releases mouse
+    /// tracking for native scrollback — the #441 behavior is preserved for the
+    /// rest of the console.
+    #[test]
+    fn test_wheel_outside_tool_result_still_releases_mouse_tracking() {
+        let (mut renderer, _) = committed_tool_result_renderer(40);
+        let region = renderer
+            .tool_viewports
+            .regions()
+            .first()
+            .cloned()
+            .expect("a painted region exists");
+        let wheel = MouseEvent {
+            kind: event::MouseEventKind::ScrollDown,
+            column: 0,
+            row: region.bottom.saturating_add(5),
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut bytes = Vec::new();
+        assert!(
+            !renderer.handle_mouse_to(wheel, &mut bytes),
+            "a wheel off the control is not claimed by it"
+        );
+        assert_eq!(
+            renderer.mouse_tracking,
+            mouse_capture::MouseTracking::ReleasedForNativeScroll,
+            "INVARIANT: a wheel outside any tool result releases mouse tracking for \
+             native scrollback (#441 preserved); tracking was {:?}; terminal received \
+             {bytes:?}",
+            renderer.mouse_tracking
+        );
+        renderer.is_active = false;
+    }
+
+    /// INVARIANT: clicking a tool result's compact window opens the focused
+    /// expanded surface, and closing it restores the child scroll offset,
+    /// disclosure grouping, and focus exactly as they were; the parent
+    /// scrollback state never changes through the round trip (#656).
+    #[test]
+    fn test_click_expands_tool_result_and_close_restores_child_state() {
+        let (mut renderer, output_row) = committed_tool_result_renderer(40);
+        let region = renderer
+            .tool_viewports
+            .regions()
+            .iter()
+            .find(|region| region.row_id == output_row)
+            .cloned()
+            .expect("the painted tool result registered a region");
+
+        // A user has scrolled the compact window before expanding it.
+        renderer.tool_viewports.scroll_child(&output_row, 2);
+        let disclosure_before = renderer
+            .projected_message_lines(&renderer.output_manager.get_messages()[0].clone(), 80)
+            .iter()
+            .map(|line| (line.text.clone(), line.row_expanded))
+            .collect::<Vec<_>>();
+
+        let click = MouseEvent {
+            kind: event::MouseEventKind::Down(event::MouseButton::Left),
+            column: region.left,
+            row: region.top,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(
+            renderer.handle_mouse_to(click, &mut Vec::new()),
+            "a click on the control's cells must be claimed"
+        );
+        let view = renderer
+            .expanded_tool
+            .as_ref()
+            .expect("the click expanded the tool result");
+        assert_eq!(view.row_id, output_row);
+        assert_eq!(
+            view.saved_scroll, 2,
+            "the surface captured the compact window's scroll offset at open time"
+        );
+        assert!(
+            view.title.contains("bash(build)"),
+            "the surface title names the tool call; title was {:?}",
+            view.title
+        );
+
+        // Scroll the surface away from the compact position, then close.
+        for _ in 0..7 {
+            assert!(renderer.handle_accordion_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        }
+        assert_eq!(
+            renderer.expanded_tool.as_ref().map(|view| view.scroll),
+            Some(9),
+            "the expanded surface scrolled on its own"
+        );
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            "Esc closes the expanded surface"
+        );
+        assert!(renderer.expanded_tool.is_none(), "the surface closed");
+        assert_eq!(
+            renderer.tool_viewports.child_scroll(&output_row),
+            2,
+            "INVARIANT: closing the expanded view restored the child scroll offset that \
+             the compact window had when it opened (2)"
+        );
+        let disclosure_after = renderer
+            .projected_message_lines(&renderer.output_manager.get_messages()[0].clone(), 80)
+            .iter()
+            .map(|line| (line.text.clone(), line.row_expanded))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            disclosure_before, disclosure_after,
+            "INVARIANT: closing the expanded view restores the same grouping; the compact \
+             projection is identical before the expansion and after the close.\n\
+             before:\n{disclosure_before:?}\nafter:\n{disclosure_after:?}"
+        );
+        renderer.is_active = false;
+    }
+
+    /// Keyboard equivalents (#656): F6 focuses the tool result's row, Up/Down
+    /// scroll its compact viewport, Enter opens the expanded surface. On rows
+    /// that are not tool results the keys stay unclaimed.
+    #[test]
+    fn test_keyboard_scroll_and_expand_of_focused_tool_result() {
+        let (mut renderer, output_row) = committed_tool_result_renderer(40);
+        renderer.rebuild_transcript_hit_regions(&[], 0, 80, 24);
+
+        // F6 cycles through the four expandable rows of the grouped turn:
+        // unit root, tool call, Input, Output.
+        for _ in 0..4 {
+            assert!(
+                renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)),
+                "F6 must reach the accordion focus"
+            );
+        }
+        assert_eq!(
+            renderer.accordion.focused.as_ref(),
+            Some(&output_row),
+            "the fourth F6 lands on the tool result row"
+        );
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            "Down scrolls the focused tool result"
+        );
+        assert_eq!(
+            renderer.tool_viewports.child_scroll(&output_row),
+            1,
+            "INVARIANT: the keyboard scroll moved the child viewport one line"
+        );
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            "PageDown scrolls the focused tool result"
+        );
+        assert_eq!(
+            renderer.tool_viewports.child_scroll(&output_row),
+            5,
+            "PageDown moved the window by the page step"
+        );
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            "Enter opens the expanded surface for the focused tool result"
+        );
+        assert!(
+            renderer.expanded_tool.is_some(),
+            "INVARIANT: keyboard activation expands the result into the focused surface"
+        );
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            "Esc closes the expanded surface"
+        );
+        assert_eq!(
+            renderer.tool_viewports.child_scroll(&output_row),
+            5,
+            "INVARIANT: closing restored the compact window's offset (5)"
+        );
+
+        // On a non-tool row the same keys are not claimed: history navigation
+        // keeps working.
+        renderer.accordion.focused = None;
+        assert!(
+            !renderer.handle_accordion_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            "Down without a focused tool result falls through to the input area"
+        );
+        renderer.is_active = false;
+    }
+
+    /// INVARIANT: bounding the viewport projection never bounds the canonical
+    /// commit — permanent scrollback still receives every output line, exactly
+    /// once, so the copyable record stays complete even though the compact
+    /// projection hides lines past the bound.
+    #[test]
+    fn test_canonical_commit_still_writes_full_tool_output_exactly_once() {
+        use crate::cli::messages::MessageRef;
+
+        let (renderer, _output_row) = committed_tool_result_renderer(40);
+        let message: MessageRef = renderer.output_manager.get_messages()[0].clone();
+
+        // The visible projection is bounded: line 39 is not part of it.
+        let mut bounded_renderer = renderer;
+        let bounded = bounded_renderer.projected_message_lines(&message, 80);
+        assert!(
+            !bounded.iter().any(|line| line.text.contains("line 39")),
+            "precondition: the compact projection is bounded and does not show line 39"
+        );
+
+        // The canonical commit writes all 40 lines, each exactly once.
+        let mut printed = HashSet::new();
+        let mut sink = Vec::new();
+        commit_complete_messages(
+            &mut sink,
+            std::slice::from_ref(&message),
+            &mut bounded_renderer.accordion,
+            &ColorScheme::default(),
+            &mut printed,
+            24,
+        )
+        .expect("canonical commit succeeds");
+        let canonical = String::from_utf8_lossy(&sink);
+        let canonical_lines = canonical
+            .lines()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            canonical.matches("line 39").count(),
+            1,
+            "INVARIANT: the canonical commit contains line 39 exactly once; canonical \
+             bytes were:\n{canonical}"
+        );
+        for index in 0..40 {
+            assert_eq!(
+                canonical_lines
+                    .iter()
+                    .filter(|line| **line == format!("line {index}"))
+                    .count(),
+                1,
+                "INVARIANT: canonical scrollback dedup — every output line is written \
+                 exactly once; line {index} appeared {} times",
+                canonical_lines
+                    .iter()
+                    .filter(|line| **line == format!("line {index}"))
+                    .count()
+            );
+        }
+    }
+
+    /// Terminal-boundary check (#648 oracle): the expanded surface painted
+    /// through the production live writer lands as plain text, hides the
+    /// cursor, and reports its scroll position in the footer.
+    #[test]
+    fn test_vt_oracle_expanded_surface_paints_plain_text_and_hides_cursor() {
+        use crate::cli::tui::vt_oracle::VtOracle;
+
+        let body: Vec<String> = (0..40).map(|n| format!("line {n}")).collect();
+        let lines =
+            tool_viewport::expanded_surface_lines("bash(build) — complete", &body, 3, 80, 12);
+        let mut frame = LiveFrame::default();
+        for line in &lines {
+            frame.push(line.clone());
+        }
+        frame.cursor_visible = false;
+        frame.cursor_row = frame.physical_rows(80).saturating_sub(1);
+
+        let mut terminal = VtOracle::new(80, 12);
+        let mut bytes = Vec::new();
+        write_live_frame(&mut bytes, &frame, 80).expect("surface frame paints");
+        terminal.feed(&bytes);
+        assert_vt(
+            terminal.find_row("bash(build)").is_some(),
+            "the title bar names the tool call",
+            &terminal,
+        );
+        assert_vt(
+            terminal.find_row("line 3").is_some(),
+            "the body window starts at the scroll offset",
+            &terminal,
+        );
+        assert_vt(
+            terminal
+                .find_row("lines 4–13 of 40 — ↑/↓ scroll · Esc close")
+                .is_some(),
+            "the footer reports scroll position, total, and the close key",
+            &terminal,
+        );
+        assert_vt(
+            !terminal.cursor().2,
+            "INVARIANT: the focused surface hides the editable cursor, like a dialog",
+            &terminal,
+        );
+    }
+
+    /// The focused surface owns the whole live frame: no draft, no status, and
+    /// the hidden cursor parked on the last owned row.
+    #[test]
+    fn test_expanded_surface_owns_the_live_frame() {
+        let body: Vec<String> = (0..40).map(|n| format!("line {n}")).collect();
+        let surface = tool_viewport::expanded_surface_lines("bash(build)", &body, 0, 80, 10);
+        let input = vec!["draft must stay hidden".to_string()];
+        let mut autocomplete = AutocompleteState::new();
+        let mut inputs = live_inputs(80, 12, &input, "busy");
+        inputs.expanded_lines = Some(&surface);
+        let frame = plan_live_frame(&inputs, &mut autocomplete);
+
+        let painted = frame.lines.join("\n");
+        assert!(
+            !painted.contains("draft must stay hidden"),
+            "INVARIANT: the expanded surface owns the viewport; the draft must not compete \
+             with it. frame:\n{painted}"
+        );
+        assert!(
+            !painted.contains("busy"),
+            "the status line is suppressed while the surface owns the frame; frame:\n{painted}"
+        );
+        assert!(
+            !frame.cursor_visible,
+            "INVARIANT: the surface hides the editable cursor"
+        );
+        assert_eq!(
+            frame.cursor_row,
+            frame.physical_rows(80).saturating_sub(1),
+            "the hidden cursor parks on the final owned row"
+        );
+    }
+
+    /// On a tiny viewport the surface clips instead of overflowing: title and
+    /// footer are preferred, body rows drop out first, and the frame never
+    /// exceeds the terminal height.
+    #[test]
+    fn test_expanded_surface_clips_instead_of_overflowing_on_tiny_viewports() {
+        let body: Vec<String> = (0..40).map(|n| format!("line {n}")).collect();
+        let surface = tool_viewport::expanded_surface_lines("bash(build)", &body, 0, 80, 24);
+        let input = vec![String::new()];
+        let mut autocomplete = AutocompleteState::new();
+        for height in [2usize, 3, 4] {
+            let mut inputs = live_inputs(80, height, &input, "idle");
+            inputs.expanded_lines = Some(&surface);
+            let frame = plan_live_frame(&inputs, &mut autocomplete);
+            assert!(
+                frame.physical_rows(80) <= height,
+                "INVARIANT: the surface frame must fit the {height}-row viewport; it \
+                 measured {} rows. frame:\n{}",
+                frame.physical_rows(80),
+                frame.lines.join("\n")
+            );
+        }
+        // A comfortable viewport still shows the footer state line.
+        let mut inputs = live_inputs(80, 12, &input, "idle");
+        inputs.expanded_lines = Some(&surface);
+        let frame = plan_live_frame(&inputs, &mut autocomplete);
+        assert!(
+            frame.lines.iter().any(|line| line.contains("Esc close")),
+            "the footer survives budget clipping on a usable viewport; frame:\n{}",
+            frame.lines.join("\n")
+        );
+    }
+
+    /// `live_geometry` must agree with the surface frame the planner renders,
+    /// or the full-viewport rebuild budgets the transcript against the wrong
+    /// live height.
+    #[test]
+    fn test_live_geometry_matches_the_expanded_surface_frame() {
+        let (mut renderer, _output_row) = committed_tool_result_renderer(40);
+        let output_row_all = renderer
+            .tool_viewports
+            .regions()
+            .iter()
+            .find(|_| true)
+            .map(|region| region.row_id.clone())
+            .expect("a painted region exists");
+        renderer.open_expanded_tool(&output_row_all);
+        let (width, height) = (80u16, 24u16);
+        let geometry = renderer
+            .live_geometry(width, height)
+            .expect("geometry known with the surface open");
+        let frame_lines = renderer
+            .expanded_surface_frame(80, 23)
+            .expect("surface lines resolvable");
+        let surface_rows = frame_lines
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(line, 80))
+            .sum::<usize>();
+        assert_eq!(
+            geometry,
+            (1 + surface_rows, surface_rows),
+            "INVARIANT: live_geometry matches [separator + surface rows] with the hidden \
+             cursor on the final row; geometry was {geometry:?}, surface measured \
+             {surface_rows} rows"
         );
         renderer.is_active = false;
     }
@@ -5702,6 +6659,7 @@ mod tests {
             cwd_label: "~/repos/finch",
             session_label: "jade-river",
             dialog: None,
+            expanded_lines: None,
             render_error: false,
             task_rows: &[],
             tracked_rows: &[],
