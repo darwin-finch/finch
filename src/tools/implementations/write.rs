@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{IsTerminal, Read as _, Seek as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -599,7 +599,7 @@ impl Tool for WriteTool {
         }
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
+    async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String> {
         let file_path = input["file_path"]
             .as_str()
             .context("Missing file_path parameter")?;
@@ -607,8 +607,9 @@ impl Tool for WriteTool {
             .as_str()
             .context("Missing content parameter")?;
 
-        // Interactive: review a plaintext diff, then perform the write here.
-        if std::io::stdin().is_terminal() {
+        // Interactive: review a plaintext diff, then perform the write here —
+        // unless the REPL already granted this call (write:*, AutoAccept, or Yes).
+        if super::propose::context_should_open_interactive_review(context).await {
             return review_and_apply_write(file_path, content, |artifact| async move {
                 open_review_artifact(&artifact).await
             })
@@ -839,6 +840,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let result = tool.execute(input, &context).await.unwrap();
         let diff = crate::cli::diff::FileDiff::parse(&result).unwrap();

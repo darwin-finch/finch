@@ -226,6 +226,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let input = serde_json::json!({
             "binary_path": "./target/release/finch"
@@ -250,6 +251,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let input = serde_json::json!({
             "reason": "test",
@@ -275,6 +277,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let binary = std::env::current_exe().unwrap();
         let result = tool

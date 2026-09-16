@@ -46,15 +46,20 @@ impl Tool for BashTool {
             .context("Missing command parameter")?;
         let description = input["description"].as_str().unwrap_or("");
 
-        // Propose the command in $EDITOR before running it.
-        let script = match propose_with_decision(description, command).await? {
-            ProposalDecision::Execute { source } => source,
-            ProposalDecision::Chat { context } => {
-                return Ok(format!(
-                    "Tool call not executed. The user asked for a different command instead:\n{context}"
-                ))
+        // Propose the command in $EDITOR before running it — unless the REPL
+        // already granted this call (bash:*, AutoAccept, or Yes).
+        let script = if super::propose::context_should_open_interactive_review(context).await {
+            match propose_with_decision(description, command).await? {
+                ProposalDecision::Execute { source } => source,
+                ProposalDecision::Chat { context } => {
+                    return Ok(format!(
+                        "Tool call not executed. The user asked for a different command instead:\n{context}"
+                    ))
+                }
+                ProposalDecision::Cancel => return Ok("Tool call aborted by user.".to_string()),
             }
-            ProposalDecision::Cancel => return Ok("Tool call aborted by user.".to_string()),
+        } else {
+            command.to_string()
         };
 
         let mut command = Command::new("bash");
@@ -154,6 +159,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         }
     }
 
@@ -220,6 +226,7 @@ mod tests {
             live_output: Some(cb),
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
 
         let result = tool.execute(input, &context).await.unwrap();
@@ -271,6 +278,7 @@ mod tests {
             live_output: Some(cb),
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
 
         tool.execute(input, &context).await.unwrap();

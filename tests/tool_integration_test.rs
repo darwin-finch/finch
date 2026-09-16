@@ -205,6 +205,7 @@ fn editor_boundary_context() -> ToolContext<'static> {
         live_output: None,
         effect_audit: None,
         poset: None,
+        skip_interactive_review: false,
     }
 }
 

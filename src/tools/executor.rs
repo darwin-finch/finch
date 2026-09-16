@@ -504,6 +504,9 @@ impl ToolExecutor {
             live_output,
             effect_audit,
             poset: None,
+            // The coordinator already showed the dialog, applied edit:*, or
+            // AutoAccept. execute() must not open $EDITOR again.
+            skip_interactive_review: true,
         };
 
         match tool.execute(tool_use.input.clone(), &context).await {
@@ -1301,5 +1304,70 @@ mod tests {
 
         assert_eq!(sig.tool_name, "compare_responses");
         assert_eq!(sig.context_key, "compare_responses");
+    }
+
+    #[tokio::test]
+    async fn test_persistent_edit_star_applies_without_editor_review() {
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.register(Box::new(crate::tools::EditTool));
+        let tempdir = tempfile::tempdir().expect("isolated pattern store");
+        let mut executor = ToolExecutor::new(
+            registry,
+            crate::tools::PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct executor for edit:* grant");
+        executor.approve_pattern_persistent(crate::tools::ToolPattern::new(
+            "*".to_string(),
+            "edit".to_string(),
+            "Yes, and don't ask again for: edit:*".to_string(),
+        ));
+
+        let workspace = tempfile::tempdir().expect("edit target");
+        let path = workspace.path().join("file.txt");
+        std::fs::write(&path, "before\n").expect("seed file");
+        let tool_use = ToolUse::new(
+            "edit".to_string(),
+            json!({
+                "file_path": path.to_string_lossy(),
+                "old_string": "before",
+                "new_string": "after",
+            }),
+        );
+        let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
+        assert!(
+            !matches!(
+                executor.is_approved(&signature),
+                ApprovalSource::NotApproved
+            ),
+            "edit:* must match the persistent grant so the REPL dialog is skipped; source={:?}",
+            executor.is_approved(&signature)
+        );
+
+        let result = executor
+            .execute_tool(
+                &tool_use,
+                None,
+                None::<fn() -> anyhow::Result<()>>,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("granted edit must return ToolResult");
+        assert!(
+            !result.is_error,
+            "edit:* always-allow must apply without $EDITOR; content={:?}",
+            result.content
+        );
+        let written = std::fs::read_to_string(&path).expect("read edited file");
+        assert_eq!(
+            written, "after\n",
+            "granted edit must write the replacement; written={written:?}"
+        );
     }
 }

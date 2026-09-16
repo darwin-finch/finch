@@ -93,6 +93,31 @@ pub struct ToolContext<'a> {
 
     /// Co-Forth poset VM — partially-ordered task graph.
     pub poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
+
+    /// True when the REPL (or another caller) already obtained approval.
+    ///
+    /// The TUI dialog includes "Yes, and don't ask again for: edit:*". After
+    /// that grant, `$EDITOR` must not open again — that second review is what
+    /// blocked autonomous iteration. AutoAccept sets this too.
+    pub skip_interactive_review: bool,
+}
+
+impl Default for ToolContext<'_> {
+    fn default() -> Self {
+        Self {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            poset: None,
+            skip_interactive_review: false,
+        }
+    }
 }
 
 pub use finch_providers::{ToolDefinition, ToolInputSchema, ToolUse};
