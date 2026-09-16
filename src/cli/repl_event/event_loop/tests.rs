@@ -1303,7 +1303,6 @@ fn test_issue_652_lifecycle_unbound_events_form_one_structured_activity_unit() {
         .unwrap()
         .block_on(tokio::task::LocalSet::new().run_until(async {
             use crate::cli::messages::TranscriptRowKind;
-
             let (mut event_loop, output) = lifecycle_test_event_loop();
             let agent_id = uuid::Uuid::new_v4();
             let identity = lifecycle_identity(agent_id, uuid::Uuid::new_v4(), None, agent_id, 0);
@@ -1839,6 +1838,152 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     assert!(canonical.contains("read_cache"));
     assert!(canonical.contains("cache hit"));
     assert!(canonical.contains("value=7"));
+}
+
+#[test]
+fn todo_write_transcript_shows_the_task_list_not_the_raw_json() {
+    // Issue #425 (todo_write dumps raw JSON as transcript rows): one todo_write
+    // produced a row whose label was the tool's raw input JSON, and the task
+    // list itself was never shown. The brain event projection must render the
+    // todo payload as the readable list it represents — in the call row and in
+    // the approval row — and never splice the JSON into the transcript.
+    use crate::brain::{
+        AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+    };
+    use crate::cli::messages::{Message, TranscriptRowKind};
+
+    // The payload reported in the issue: a four-task todo_write input.
+    let todos = serde_json::json!({"todos": [
+        {"content": "Identify the harness implementation, website source, and deployment target",
+         "id": "1", "priority": "high", "status": "in_progress"},
+        {"content": "Implement the typed program runner in the harness",
+         "id": "2", "priority": "high", "status": "pending"},
+        {"content": "Build the website source from the harness output",
+         "id": "3", "priority": "medium", "status": "pending"},
+        {"content": "Verify the deployment target accepts the build",
+         "id": "4", "priority": "low", "status": "completed"}
+    ]});
+    let payload = todos.to_string();
+
+    let output =
+        crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
+    output.disable_stdout();
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let run = BrainRun {
+        run_id,
+        kind: BrainRunKind::Speculative,
+        parent_run_id: None,
+        request_seq: 1,
+        initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+        initiated_by: "alice".into(),
+        status: BrainRunStatus::Running,
+        started_ms: 1,
+        updated_ms: 1,
+        detail: None,
+    };
+    let kinds = [
+        BrainEventKind::RunStarted { run },
+        BrainEventKind::ToolCall {
+            request_seq: 1,
+            tool_id: "call_425".into(),
+            name: "todo_write".into(),
+            input: todos.clone(),
+        },
+        BrainEventKind::ApprovalRequested {
+            request_seq: 1,
+            approval_id: "approval_425".into(),
+            approval_kind: "tool".into(),
+            subject: "todo_write".into(),
+            audience: None,
+            detail: serde_json::json!({"input": todos}),
+        },
+        BrainEventKind::ToolResult {
+            request_seq: 1,
+            tool_id: "call_425".into(),
+            output: "Todo list updated: 4 tasks (1 in_progress, 2 pending, 1 completed)".into(),
+            is_error: false,
+        },
+        BrainEventKind::ApprovalDecided {
+            request_seq: 1,
+            approval_id: "approval_425".into(),
+            decision: serde_json::json!({"choice": "approve_pattern_session"}),
+        },
+        BrainEventKind::RunStatusChanged {
+            run_id,
+            status: BrainRunStatus::Completed,
+            detail: None,
+        },
+    ];
+    let mut projections = std::collections::HashMap::new();
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let mut event = brain_event(index as u64 + 1, "daemon", kind);
+        event.run_id = Some(run_id);
+        assert!(
+            super::project_remote_brain_run_event(&output, &mut projections, &event),
+            "every projected run event must be acknowledged: seq={}",
+            index + 1
+        );
+    }
+
+    let unit = projections.get(&run_id).unwrap().unit.clone();
+    let projected = unit
+        .transcript_row(&crate::theme::ColorScheme::default())
+        .unwrap();
+
+    // The todo_write call is one tool row labelled by the task list, not by raw
+    // JSON; its output body carries the list lines durably.
+    let tool = projected
+        .children
+        .iter()
+        .find(|row| row.kind == TranscriptRowKind::ToolCall)
+        .expect("the todo_write call must project as a tool row");
+    let tool_dump = format!("label={:?} children={:?}", tool.label, tool.children);
+    assert!(
+        tool.label.contains("Task list"),
+        "the call row must be labelled by the task list, not the tool's raw JSON: {tool_dump} payload={payload}"
+    );
+    assert!(
+        !tool.label.contains('{'),
+        "raw JSON must never be spliced into a row label: {tool_dump} payload={payload}"
+    );
+    let tool_body: String = tool
+        .children
+        .iter()
+        .flat_map(|child| child.body.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        tool_body.contains("[in progress] Identify the harness implementation, website source, and deployment target")
+            && tool_body.contains("[pending] Implement the typed program runner in the harness")
+            && tool_body.contains("[pending] Build the website source from the harness output")
+            && tool_body.contains("[completed] Verify the deployment target accepts the build"),
+        "the transcript must show the task list with statuses: {tool_body} payload={payload}"
+    );
+
+    // The approval row renders the payload as the list it represents too — the
+    // pretty-printed detail dump must be gone.
+    let approval = projected
+        .children
+        .iter()
+        .find(|row| row.label.starts_with("approval"))
+        .expect("the approval must project as a row");
+    let approval_body = approval.body.join("\n");
+    assert!(
+        approval_body.contains("[in progress] Identify the harness implementation, website source, and deployment target"),
+        "the approval row must render the task list, not the detail JSON: {approval_body} payload={payload}"
+    );
+    assert!(
+        !approval_body.contains('{'),
+        "raw JSON must never be printed as an approval row body: {approval_body} payload={payload}"
+    );
+
+    let canonical = unit.complete_transcript(&crate::theme::ColorScheme::default());
+    let canonical_payload = format!("transcript:\n{canonical}\npayload={payload}");
+    assert!(
+        !canonical.contains('{') && !canonical.contains("\"todos\""),
+        "no raw JSON may survive anywhere in the projected transcript: {canonical_payload}"
+    );
 }
 
 #[test]

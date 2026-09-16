@@ -1035,13 +1035,19 @@ impl EventLoop {
                 let unit = self
                     .remote_brain_tool_unit
                     .get_or_insert_with(|| self.output_manager.start_work_unit("Brain tools"));
-                let input = input.to_string();
-                let input = if input.chars().count() > 80 {
-                    format!("{}…", input.chars().take(79).collect::<String>())
-                } else {
-                    input
-                };
-                let row = unit.add_row(format!("{name} {input}"));
+                // The row is labelled by what the call represents, never by
+                // the raw input JSON (#425).
+                let (label, body_lines) =
+                    crate::cli::repl_event::tool_display::brain_tool_call_row(name, input);
+                let task_list = (!body_lines.is_empty()).then(|| body_lines.clone());
+                let row = unit.add_row(label);
+                for line in body_lines {
+                    unit.append_row_body_line(row, line);
+                }
+                if let Some(task_list) = task_list {
+                    self.remote_brain_task_lists
+                        .insert(tool_id.clone(), task_list);
+                }
                 self.remote_brain_tool_rows.insert(tool_id.clone(), row);
             }
             BrainEventKind::ToolResult {
@@ -1063,6 +1069,9 @@ impl EventLoop {
                 let unit = self
                     .remote_brain_tool_unit
                     .get_or_insert_with(|| self.output_manager.start_work_unit("Brain tools"));
+                // A completed task-list write keeps its rendered list as the
+                // row body (#425).
+                let task_list = self.remote_brain_task_lists.remove(tool_id);
                 let row = self
                     .remote_brain_tool_rows
                     .remove(tool_id)
@@ -1076,7 +1085,8 @@ impl EventLoop {
                     } else {
                         first.to_string()
                     };
-                    let body = output.lines().skip(1).map(str::to_owned).collect();
+                    let body = task_list
+                        .unwrap_or_else(|| output.lines().skip(1).map(str::to_owned).collect());
                     unit.complete_row_with_body(row, summary, body);
                 }
             }
@@ -1113,12 +1123,11 @@ impl EventLoop {
                 let row = unit.add_row(format!(
                     "approval ({approval_kind}) for {audience_summary}: {subject}"
                 ));
-                let body = serde_json::to_string_pretty(detail)
-                    .unwrap_or_else(|_| detail.to_string())
-                    .lines()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                for line in body {
+                // The detail is rendered as the thing it represents — never
+                // pretty-printed JSON in the transcript (#425).
+                for line in
+                    crate::cli::repl_event::tool_display::approval_detail_body(subject, detail)
+                {
                     unit.append_row_body_line(row, line);
                 }
                 self.remote_brain_approval_rows
