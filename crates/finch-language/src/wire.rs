@@ -136,7 +136,7 @@ pub fn render_wire_gbnf() -> String {
     rule(
         &mut out,
         "lisp-form",
-        "lisp-splice | lisp-unquote | lisp-quote | lisp-quasiquote | lisp-list | lisp-string | lisp-math | lisp-brace | lisp-array | lisp-atom",
+        "lisp-splice | lisp-unquote | lisp-quote | lisp-quasiquote | lisp-list | lisp-string | lisp-math | lisp-compact | lisp-brace | lisp-array | lisp-atom",
     );
     rule(
         &mut out,
@@ -190,12 +190,31 @@ pub fn render_wire_gbnf() -> String {
         &mut out,
         "lisp-math",
         &format!(
-            "{} [^{}]* {}",
+            "{} math-ws* math-bit ( math-ws* math-bit )* math-ws* {}",
             gbnf_literal(&lisp.math_delimiter.to_string()),
-            class_escape(lisp.math_delimiter),
             gbnf_literal(&lisp.math_delimiter.to_string())
         ),
     );
+    rule(&mut out, "math-ws", "unicode-ws");
+    rule(
+        &mut out,
+        "math-bit",
+        r#"[+\-*/^()] | math-num | math-ident"#,
+    );
+    rule(&mut out, "math-num", r#"[0-9]+ ( "." [0-9]* )?"#);
+    rule(&mut out, "math-ident", r#"[a-zA-Z_] [a-zA-Z0-9_]*"#);
+    rule(
+        &mut out,
+        "lisp-compact",
+        &compact_prefix_alts(lisp.compact_type_prefixes),
+    );
+    rule(&mut out, "compact-body", "compact-chunk*");
+    rule(
+        &mut out,
+        "compact-chunk",
+        r#"compact-plain | "{" compact-body "}""#,
+    );
+    rule(&mut out, "compact-plain", r#"[^ \t\n\r\x0b\x0c"{}]+"#);
     rule(&mut out, "lisp-brace", "json-object | lisp-record");
     rule(
         &mut out,
@@ -207,7 +226,8 @@ pub fn render_wire_gbnf() -> String {
         ),
     );
     rule(&mut out, "lisp-array", "json-array");
-    rule(&mut out, "lisp-atom", "lisp-atom-piece+");
+    rule(&mut out, "lisp-atom", "lisp-atom-start lisp-atom-piece*");
+    rule(&mut out, "lisp-atom-start", &lisp_atom_start_class());
     rule(&mut out, "lisp-atom-piece", "lisp-plain | lisp-angles");
     rule(&mut out, "lisp-plain", &lisp_plain_class());
     rule(&mut out, "lisp-angles", "\"<\" lisp-angle-body \">\"");
@@ -241,8 +261,26 @@ pub fn render_wire_gbnf() -> String {
         "json-object | json-array | json-string | json-number | \"true\" | \"false\" | \"null\"",
     );
     rule(&mut out, "json-string", r#" "\"" json-str-char* "\"" "#);
-    rule(&mut out, "json-str-char", r#" "\\" . | [^"\\] "#);
-    rule(&mut out, "json-number", r#" "-"? [0-9]+ ( "." [0-9]+ )? "#);
+    rule(
+        &mut out,
+        "json-str-char",
+        r#" json-escape | json-unescaped "#,
+    );
+    rule(
+        &mut out,
+        "json-escape",
+        r#" "\\" ( ["\\/bfnrt] | "u" json-hex json-hex json-hex json-hex ) "#,
+    );
+    rule(&mut out, "json-hex", r#"[0-9a-fA-F]"#);
+    rule(&mut out, "json-unescaped", r#"[^"\\\x00-\x1f]"#);
+    rule(
+        &mut out,
+        "json-number",
+        r#" "-"? json-int json-frac? json-exp? "#,
+    );
+    rule(&mut out, "json-int", r#" "0" | [1-9] [0-9]* "#);
+    rule(&mut out, "json-frac", r#" "." [0-9]+ "#);
+    rule(&mut out, "json-exp", r#" [eE] ( "+" | "-" )? [0-9]+ "#);
 
     rule(&mut out, "ascii-ws", r#"[ \t\n\r\x0b\x0c]"#);
     rule(&mut out, "forth-ws", "ascii-ws");
@@ -344,12 +382,11 @@ pub fn render_wire_gbnf() -> String {
         "forth-raw | forth-string | forth-compact | forth-collection | forth-type | forth-bracket | forth-json | forth-record | forth-body-word",
     );
 
-    let compact_alts: Vec<_> = forth
-        .compact_type_prefixes
-        .iter()
-        .map(|prefix| format!("{} [^\\n\\r\\t \"}}]+ \"}}\"", gbnf_literal(prefix)))
-        .collect();
-    rule(&mut out, "forth-compact", &compact_alts.join(" | "));
+    rule(
+        &mut out,
+        "forth-compact",
+        &compact_prefix_alts(forth.compact_type_prefixes),
+    );
 
     let collection_alts: Vec<_> = forth
         .collection_openers
@@ -475,14 +512,12 @@ fn gbnf_literal(text: &str) -> String {
     out
 }
 
-fn class_escape(ch: char) -> String {
-    match ch {
-        '\\' | ']' | '-' | '^' => format!("\\{ch}"),
-        '\n' => "\\n".to_string(),
-        '\r' => "\\r".to_string(),
-        '\t' => "\\t".to_string(),
-        c => c.to_string(),
-    }
+fn compact_prefix_alts(prefixes: &[&str]) -> String {
+    prefixes
+        .iter()
+        .map(|prefix| format!("{} compact-body \"}}\"", gbnf_literal(prefix)))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn push_class_char(out: &mut String, ch: char) {
@@ -514,7 +549,17 @@ fn unicode_whitespace_class() -> String {
 }
 
 fn lisp_plain_class() -> String {
+    lisp_atom_class(false)
+}
+
+fn lisp_atom_start_class() -> String {
+    lisp_atom_class(true)
+}
+
+fn lisp_atom_class(exclude_math_delimiter: bool) -> String {
     // Complement of whitespace and the reader atom delimiters plus type-arg brackets.
+    // A form starting with `$` is math, not an atom: excluding the delimiter from
+    // atom-start stops `$@@@$` from falling through after lisp-math fails.
     let mut forbidden = String::from("[^");
     for ch in (0..=0x10FFFF)
         .filter_map(char::from_u32)
@@ -524,6 +569,9 @@ fn lisp_plain_class() -> String {
     }
     for ch in "(){}\"';`,<>".chars() {
         push_class_char(&mut forbidden, ch);
+    }
+    if exclude_math_delimiter {
+        push_class_char(&mut forbidden, lisp_lexicon().math_delimiter);
     }
     forbidden.push(']');
     forbidden
@@ -630,6 +678,46 @@ mod tests {
                 source: "(foo { :name \"Ada\" })",
                 accept: true,
                 kind: "lisp",
+            },
+            Fixture {
+                source: "(record{name:string})",
+                accept: true,
+                kind: "lisp-compact",
+            },
+            Fixture {
+                source: "({ :ty record{name:string} })",
+                accept: true,
+                kind: "lisp-compact",
+            },
+            Fixture {
+                source: "(variant{none|some(int)|metadata(record{name:string})})",
+                accept: true,
+                kind: "lisp-compact",
+            },
+            Fixture {
+                source: "(foo $@@@$)",
+                accept: false,
+                kind: "lisp-math",
+            },
+            Fixture {
+                source: "(foo { \"a\": 01 })",
+                accept: false,
+                kind: "json-number",
+            },
+            Fixture {
+                source: "(foo { \"a\": \"\\q\" })",
+                accept: false,
+                kind: "json-string",
+            },
+            Fixture {
+                source: "(foo { \"a\": 1e2 })",
+                accept: true,
+                kind: "json-number",
+            },
+            Fixture {
+                source: "{\"a\": 1e2}",
+                accept: true,
+                kind: "forth-json",
             },
             Fixture {
                 source: "\"Hello\" say",
@@ -823,6 +911,49 @@ mod tests {
                 "generated GBNF must contain Co-Forth string opener {literal}"
             );
         }
+        for prefix in lisp.compact_type_prefixes {
+            let literal = gbnf_literal(prefix);
+            assert!(
+                gbnf.contains(&literal),
+                "generated GBNF must contain CoLisp compact type prefix {literal} so record{{…}}/variant{{…}} stay single atoms"
+            );
+        }
+        for prefix in forth.compact_type_prefixes {
+            let literal = gbnf_literal(prefix);
+            assert!(
+                gbnf.contains(&literal),
+                "generated GBNF must contain Co-Forth compact type prefix {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wire_grammar_known_overapprox() {
+        // Token-valid math that is not a complete expression still matches the
+        // CFG. These holes must not widen: reader rejects, grammar accepts.
+        // Closing a hole means moving the fixture into the iff corpus.
+        let holes = [
+            (
+                "(foo $+$)",
+                "operator-only math is not a parseable expression",
+            ),
+            ("(foo $(1$)", "math with an unclosed parenthesis"),
+        ];
+        let mut failures = Vec::new();
+        for (source, why) in holes {
+            let reader = accepts_wire_source(source).is_ok();
+            let grammar = accepts_published_grammar(source);
+            if reader || !grammar {
+                failures.push(format!(
+                    "known CFG overapprox drifted ({why}): reader_accepts={reader} grammar_accepts={grammar} source={source:?}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "documented GBNF overapprox holes must stay reader-reject/grammar-accept:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
