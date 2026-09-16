@@ -4,8 +4,8 @@ use crate::programs::ExecutionEffect;
 use crate::runtime::ProgramRuntime;
 use crate::scheduler::{AgentScheduler, ProviderResolver};
 use crate::tools::{
-    AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool, AnsibleTool,
-    AskUserQuestionTool, BashTool, CreateMemoryTool, EditTool, EnterPlanModeTool,
+    refined_effect_for_approval, AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool,
+    AnsibleTool, AskUserQuestionTool, BashTool, CreateMemoryTool, EditTool, EnterPlanModeTool,
     GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, HashCompareTool,
     InspectMemoryTool, InspectWordTool, ListRecentTool, PatchTool, PermissionCheck,
     PermissionManager, PermissionRule, PresentPlanTool, ReadTool, RestartTool, SearchMemoryTool,
@@ -242,12 +242,25 @@ fn pre_refactor_effect(tool_name: &str) -> ExecutionEffect {
     }
 }
 
+/// Declared effect the owner catalog must pin. Matches the pre-#466 table
+/// except for the issue #426 re-authorization: canonical `todo_read`,
+/// `todo_write`, `present_plan`, and `ask_user_question` no longer stay
+/// Unclassified just because the legacy arms used stale spellings.
+fn pinned_declared_effect(tool_name: &str) -> ExecutionEffect {
+    match tool_name {
+        "todo_read" => ExecutionEffect::VmRead,
+        "todo_write" | "present_plan" | "ask_user_question" => ExecutionEffect::VmWrite,
+        _ => pre_refactor_effect(tool_name),
+    }
+}
+
 #[test]
 fn test_declared_effects_match_pre_refactor_classification() {
-    // Issue #466 acceptance: enumerate every registered tool and assert its
-    // declared effect matches what legacy_tool_effect computed before the
-    // change. A mismatch here means the refactor silently re-authorized (or
-    // de-authorized) a tool.
+    // Issue #466 acceptance, updated by #426: enumerate every registered tool
+    // and assert its declared effect. A mismatch here means authority drifted
+    // silently. The #426 tools are pinned to the NEW intended classification
+    // (VmRead/VmWrite), not the Unclassified fall-through the canonical names
+    // had under the stale-spelling table.
     let catalog = owner_repl_catalog();
     let mut checked = 0usize;
     for tool in catalog.registry.get_all_tools() {
@@ -262,13 +275,12 @@ fn test_declared_effects_match_pre_refactor_classification() {
         } else {
             assert_eq!(
                 tool.effect(),
-                pre_refactor_effect(name),
-                "'{name}' declared {effect:?} but the pre-refactor table \
-                 classified the canonical name as {expected:?}; re-assert the \
-                 old classification or treat this as a deliberate \
-                 approval-policy change (out of scope for a refactor)",
+                pinned_declared_effect(name),
+                "'{name}' declared {effect:?} but the pinned classification \
+                 is {expected:?}; re-assert the intended classification or \
+                 treat this as a deliberate approval-policy change",
                 effect = tool.effect(),
-                expected = pre_refactor_effect(name),
+                expected = pinned_declared_effect(name),
             );
         }
         checked += 1;
@@ -284,9 +296,10 @@ fn test_declared_effects_match_pre_refactor_classification() {
 fn test_declared_effect_is_independent_of_dispatch_spelling() {
     // The deleted legacy table classified by the raw provider spelling:
     // "TodoWrite" (alias) yielded VmWrite and ran autonomously while the
-    // canonical "todo_write" yielded Unclassified and prompted. Declared
-    // effects travel with the tool, so every dispatch spelling of a tool
-    // must present the same authority.
+    // canonical "todo_write" yielded Unclassified and prompted. Issue #426
+    // re-authorized the canonical name to VmWrite as well. Declared effects
+    // travel with the tool, so every dispatch spelling of a tool must
+    // present the same authority.
     let catalog = owner_repl_catalog();
     assert!(
         !catalog.registry.alias_names().is_empty(),
@@ -308,34 +321,116 @@ fn test_declared_effect_is_independent_of_dispatch_spelling() {
     }
 }
 
+/// The production approval predicate in
+/// `ToolExecutionCoordinator::spawn_tool_execution` and the sync REPL path:
+/// a tool prompts only when the refined effect does not run autonomously
+/// and there is no cached approval. Unclassified never runs autonomously,
+/// so it is AskUser at that boundary.
+fn spawn_site_runs_autonomously(
+    registry: &ToolRegistry,
+    name: &str,
+    input: &serde_json::Value,
+) -> bool {
+    refined_effect_for_approval(registry.declared_effect(name), name, input).runs_autonomously()
+}
+
+#[test]
+fn test_session_local_tools_do_not_hit_unclassified_approval() {
+    // Issue #426: canonical todo_write / todo_read / present_plan /
+    // ask_user_question declared Unclassified after #466 preserved the
+    // stale-spelling fall-through. Unclassified is AskUser at
+    // spawn_tool_execution, so a four-item checklist waited on a host-effect
+    // confirmation the user never expected. present_plan and ask_user_question
+    // already have their own dialogs upstream; a second PermissionManager
+    // AskUser is the reported double prompt.
+    let catalog = owner_repl_catalog();
+    let four_item_list = json!({"todos": [
+        {"content": "Identify the harness implementation, website source, and deployment target",
+         "id": "1", "priority": "high", "status": "in_progress"},
+        {"content": "Implement the typed program runner in the harness",
+         "id": "2", "priority": "high", "status": "pending"},
+        {"content": "Build the website source from the harness output",
+         "id": "3", "priority": "medium", "status": "pending"},
+        {"content": "Verify the deployment target accepts the build",
+         "id": "4", "priority": "low", "status": "completed"}
+    ]});
+    let plan_input = json!({"plan": "1. explore\n2. change files\n3. test"});
+    let question_input = json!({"questions": [{
+        "question": "Which approach?",
+        "header": "Approach",
+        "options": [
+            {"label": "A", "description": "Fast"},
+            {"label": "B", "description": "Simple"}
+        ]
+    }]});
+
+    for (name, expected, input) in [
+        ("todo_write", ExecutionEffect::VmWrite, &four_item_list),
+        ("TodoWrite", ExecutionEffect::VmWrite, &four_item_list),
+        ("todo_read", ExecutionEffect::VmRead, &json!({})),
+        ("TodoRead", ExecutionEffect::VmRead, &json!({})),
+        ("present_plan", ExecutionEffect::VmWrite, &plan_input),
+        ("PresentPlan", ExecutionEffect::VmWrite, &plan_input),
+        (
+            "ask_user_question",
+            ExecutionEffect::VmWrite,
+            &question_input,
+        ),
+        ("AskUserQuestion", ExecutionEffect::VmWrite, &question_input),
+    ] {
+        let declared = catalog.registry.declared_effect(name);
+        let refined = refined_effect_for_approval(declared, name, input);
+        assert_eq!(
+            declared, expected,
+            "invariant: '{name}' must declare {expected:?} so a session-local \
+             checklist or an already-dialogued tool does not demand host-effect \
+             confirmation; declared={declared:?}"
+        );
+        assert_ne!(
+            refined,
+            ExecutionEffect::Unclassified,
+            "invariant: '{name}' must not present Unclassified at the approval \
+             boundary; Unclassified is AskUser in spawn_tool_execution \
+             (declared={declared:?}, refined={refined:?}, input={input})"
+        );
+        assert!(
+            spawn_site_runs_autonomously(&catalog.registry, name, input),
+            "invariant: '{name}' must skip the host-effect confirmation at \
+             spawn_tool_execution; Unclassified would emit ToolApprovalNeeded. \
+             declared={declared:?} refined={refined:?} input={input}"
+        );
+    }
+
+    let write_input = json!({"file_path": "src/lib.rs", "content": "x"});
+    assert!(
+        !spawn_site_runs_autonomously(&catalog.registry, "write", &write_input),
+        "control: workspace write must still demand host-effect confirmation; \
+         got declared={:?} refined={:?}",
+        catalog.registry.declared_effect("write"),
+        refined_effect_for_approval(
+            catalog.registry.declared_effect("write"),
+            "write",
+            &write_input
+        )
+    );
+}
+
 #[test]
 fn test_planning_allowlists_only_admit_justified_tools() {
     // Justifies each planning-table entry against the declared effects. An
     // entry is admissible exactly when one of these holds:
-    //   1. its declared effect is autonomous (reads, VM-local writes),
-    //   2. the tool itself presents a review or question dialog before it
-    //      does anything (present_plan, ask_user_question — the event loop
-    //      intercepts them upstream of the approval gate),
-    //   3. it is bash, whose read-only refinement at the approval sites keeps
+    //   1. its declared effect is autonomous (reads, VM-local writes) —
+    //      todo_read, todo_write, present_plan, and ask_user_question land
+    //      here after the #426 re-authorization,
+    //   2. it is bash, whose read-only refinement at the approval sites keeps
     //      read-only commands autonomous, or
-    //   4. it projects the session-local checklist (todo_read, todo_write) —
-    //      no workspace or host mutation, so planning stays usable; these are
-    //      declared Unclassified only to preserve their owner approval
-    //      behavior (see the declarations in todo_tools.rs), or
-    //   5. it re-enters planning mode (enter_plan_mode) — an idempotent
+    //   3. it re-enters planning mode (enter_plan_mode) — an idempotent
     //      session-local no-op while already planning.
     // A state-changing tool slipping onto a planning table fails here even
     // though its name registers fine. Names are resolved through the registry
     // first, so alias spellings are justified by their canonical tool.
     let catalog = owner_repl_catalog();
-    const JUSTIFIED_EXCEPTIONS: &[&str] = &[
-        "bash",
-        "present_plan",
-        "ask_user_question",
-        "todo_read",
-        "todo_write",
-        "enter_plan_mode",
-    ];
+    const JUSTIFIED_EXCEPTIONS: &[&str] = &["bash", "enter_plan_mode"];
     for (table, names) in [(
         "PLANNING_ALLOWED_TOOLS",
         crate::cli::repl_event::plan_handler::PLANNING_ALLOWED_TOOLS,
@@ -457,7 +552,8 @@ fn test_always_allow_list_does_not_grant_writes() {
     ] {
         assert!(
             !REPL_ALWAYS_ALLOW_TOOLS.contains(&tool),
-            "{tool} has side effects and must not skip the owner approval prompt"
+            "{tool} is a write or host-effect tool and must not be pre-approved \
+             by the always-allow name list; authority is the declared effect"
         );
     }
 }

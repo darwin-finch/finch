@@ -18,11 +18,10 @@ impl Tool for AskUserQuestionTool {
         "ask_user_question"
     }
 
-    /// Has its own question dialog upstream; declared Unclassified to keep
-    /// the approval-boundary behavior the canonical spelling had under
-    /// the legacy table (issue #466).
+    /// Has its own question dialog upstream of the approval gate. VmWrite
+    /// skips a second host-effect confirmation (issue #426).
     fn effect(&self) -> ExecutionEffect {
-        ExecutionEffect::Unclassified
+        ExecutionEffect::VmWrite
     }
 
     fn description(&self) -> &str {

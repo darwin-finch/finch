@@ -15,11 +15,10 @@ impl Tool for PresentPlanTool {
         "present_plan"
     }
 
-    /// Has its own review dialog upstream; declared Unclassified to keep
-    /// the approval-boundary behavior the canonical spelling had under
-    /// the legacy table (issue #466).
+    /// Has its own review dialog upstream of the approval gate. VmWrite
+    /// skips a second host-effect confirmation (issue #426).
     fn effect(&self) -> ExecutionEffect {
-        ExecutionEffect::Unclassified
+        ExecutionEffect::VmWrite
     }
 
     fn description(&self) -> &str {
