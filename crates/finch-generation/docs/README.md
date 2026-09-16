@@ -13,4 +13,5 @@ identity (requested vs resolved vs actual), and injected environmental ports.
 Provider-specific parsers stay in `finch-providers`. Tool execution, Brain,
 TUI, daemon, CLI, and application `Config` stay in Finch.
 
-Unifying the REPL and scheduler tool loops is issue #777 and is not this crate.
+Tool execution is owned by Finch `ToolLoop` (`src/tools/tool_loop.rs`), not this crate.
+Provider tool-binding tables are issue #241.

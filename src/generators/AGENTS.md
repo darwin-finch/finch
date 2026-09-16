@@ -25,13 +25,12 @@ into `cli` or own a `ToolExecutor`. Callers inject everything a generator
 needs.
 
 **Qwen does not execute tools.** It parses local markup and returns
-`tool_uses` / `ToolCall` events. The event loop owns execution (#777 unifies
-REPL and scheduler loops).
+`tool_uses` / `ToolCall` events. The event loop owns execution via
+[`crate::tools::ToolLoop`] (REPL and scheduler).
 
-**Native thinking/tool-call delta emission** from provider adapters stays in
-#777. This facade re-exports `translate_provider_chunk` so
+This facade re-exports `translate_provider_chunk` so
 `ContentBlockComplete(ToolUse)` becomes `ToolCallComplete` at the generation
-layer.
+layer. Native OpenAI/Claude deltas pass through the same ToolLoop.
 
 Add public surface by re-exporting it from `mod.rs`, then regenerate
 `INTERFACE.md` with `python3 scripts/generate_interfaces.py --write`.

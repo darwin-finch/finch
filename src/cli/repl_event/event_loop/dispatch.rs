@@ -710,6 +710,9 @@ impl EventLoop {
                         tracing::debug!("Ignoring cancellation for already-terminal query {}", qid);
                         return Ok(());
                     }
+                    self.tool_coordinator
+                        .terminalize(qid, crate::tools::ToolLoopTerminal::Cancelled)
+                        .await;
                     self.conversation.write().await.abort_staged(qid);
                     self.close_active_tool_rows(qid, "cancelled").await;
                     let named_turn =

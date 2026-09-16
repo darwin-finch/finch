@@ -10,6 +10,8 @@ Everything below is what callers outside this module can reach. Implementation m
 ## Types
 
 ```rust
+/// Why [`ToolLoop::admit_execution`] refused.
+pub enum AdmitError { Terminal, NotReady, AlreadyAdmitted }
 pub struct AgentAwaitTool { … }
 impl AgentAwaitTool {
     pub fn child(scheduler: Arc<AgentScheduler>, caller: AgentIdentity) -> Self;
@@ -143,6 +145,8 @@ pub struct McpConnection { … }
 pub struct McpServerConfig { … }
 /// Untrusted discovery data retained with its server provenance. Re-exported from `tools::mcp`.
 pub struct McpToolDescriptor { … }
+/// Outcome of observing a delta or complete event.
+pub enum ObserveOutcome { Accumulating, Settled, Late }
 pub struct PatchTool;
 /// Type of pattern matching to use
 pub enum PatternType { Wildcard, Regex, Structured }
@@ -198,10 +202,28 @@ impl PersistentPatternStore {
     /// Get total number of patterns and approvals
     pub fn total_count(&self) -> usize;
 }
+/// One observed call after [`ToolLoop::finish_observation`].
+pub enum PreparedCall { Ready, Rejected }
+impl PreparedCall {
+    /// Id used to stage the assistant tool_use and the matching result.
+    pub fn id(&self) -> &str;
+    /// Input used to stage the assistant tool_use.
+    pub fn input(&self) -> &Value;
+    /// Name used to stage the assistant tool_use.
+    pub fn name(&self) -> &str;
+}
 pub struct PresentPlanTool;
 /// Decision encoded in an editor-backed proposal file.
 pub enum ProposalDecision { Execute, Chat, Cancel }
 pub struct ReadTool;
+/// Why a tool call must not execute.
+pub enum RejectReason { DuplicateId, MalformedArguments, UnknownTool, UnsupportedTool, ArgumentMismatch, EmptyId }
+impl RejectReason {
+    /// Speakable typed-result body.
+    pub fn typed_message(&self, id: &str, name: &str) -> String;
+}
+/// Call that must produce a typed error and never execute.
+pub struct RejectedCall { … }
 pub struct RestartTool;
 /// Search memory for relevant past conversations
 pub struct SearchMemoryTool { … }
@@ -273,6 +295,14 @@ impl TodoWriteTool {
     pub fn journaled(todo_list: Arc<RwLock<TodoList>>, journal: crate::tools::todo::TodoJournalWriter) -> Self;
     pub fn new(todo_list: Arc<RwLock<TodoList>>) -> Self;
 }
+/// Names the model was offered this turn, and names the host can execute.
+pub struct ToolCatalog { … }
+impl ToolCatalog {
+    /// Split offered-this-turn from host-executable names.
+    pub fn new(offered: impl IntoIterator<Item = impl Into<String>>, executable: impl IntoIterator<Item = impl Into<String>>) -> Self;
+    /// Catalog where offered names are also executable.
+    pub fn offered(names: impl IntoIterator<Item = impl Into<String>>) -> Self;
+}
 /// Context passed to tools during execution
 pub struct ToolContext<'a> { … }
 /// Tool definition (Claude API-compatible) Re-exported from `finch-providers`.
@@ -325,6 +355,48 @@ impl ToolExecutor {
 }
 /// JSON Schema for tool input parameters Re-exported from `finch-providers`.
 pub struct ToolInputSchema { … }
+/// Single tool-round lifecycle.
+pub struct ToolLoop { … }
+impl ToolLoop {
+    /// Admit execution for a ready id.
+    pub fn admit_execution(&mut self, id: &str) -> Result<ValidatedCall, AdmitError>;
+    /// Append a result at most once.
+    pub fn append_result(&mut self, result: ToolLoopResult) -> Option<ToolLoopResult>;
+    /// Number of ids that started execution.
+    pub fn execution_starts(&self) -> usize;
+    /// Close observation.
+    pub fn finish_observation(&mut self) -> Vec<PreparedCall>;
+    /// Identity recorded for this round.
+    pub fn identity(&self) -> &ToolLoopIdentity;
+    /// True after cancel, timeout, disconnect, failure, or completed drain.
+    pub fn is_terminal(&self) -> bool;
+    /// Start a round pinned to `identity` and the offered/executable catalog.
+    pub fn new(identity: ToolLoopIdentity, catalog: ToolCatalog) -> Self;
+    /// Record a complete tool call (native or translated from a content block).
+    pub fn observe_complete(&mut self, id: String, name: String, input: Value, provenance: EventProvenance) -> ObserveOutcome;
+    /// Record an incremental argument fragment.
+    pub fn observe_delta(&mut self, id: String, name: Option<String>, arguments_delta: String, provenance: EventProvenance) -> ObserveOutcome;
+    /// Number of ids that appended a result.
+    pub fn results_appended(&self) -> usize;
+    /// Terminal reason when the round has ended.
+    pub fn terminal(&self) -> Option<&ToolLoopTerminal>;
+    /// End the round.
+    pub fn terminalize(&mut self, terminal: ToolLoopTerminal) -> bool;
+}
+/// Brain/run/provider/model identity pinned for one tool round.
+pub struct ToolLoopIdentity { … }
+/// Result the loop will append at most once per id.
+pub struct ToolLoopResult { … }
+impl ToolLoopResult {
+    /// Failure or typed reject.
+    pub fn error(id: impl Into<String>, content: impl Into<String>) -> Self;
+    /// Typed result for a rejected call.
+    pub fn from_reject(call: &RejectedCall) -> Self;
+    /// Successful execution output.
+    pub fn success(id: impl Into<String>, content: impl Into<String>) -> Self;
+}
+/// Why the loop will not admit further execution.
+pub enum ToolLoopTerminal { Completed, Cancelled, TimedOut, Disconnected, Failed }
 /// A pattern that can match multiple tool signatures using wildcards or regex
 pub struct ToolPattern { … }
 impl ToolPattern {
@@ -399,6 +471,8 @@ pub struct ToolSignature { … }
 pub struct ToolUse { … }
 /// Transport type for MCP servers Re-exported from `tools::mcp`.
 pub enum TransportType { Stdio, Sse }
+/// Validated call the host may execute at most once.
+pub struct ValidatedCall { … }
 pub struct WebFetchTool { … }
 impl WebFetchTool {
     pub fn new() -> Self;

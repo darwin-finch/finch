@@ -9,8 +9,9 @@
 //! 3. Executes the tool (with a bounded subprocess timeout, but never timing a
 //!    human editor review) and sends the result back as `ReplEvent::ToolResult`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use uuid::Uuid;
 
 use super::events::ConfirmationResult;
@@ -20,7 +21,9 @@ use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::ReplMode;
 use crate::local::LocalGenerator;
 use crate::models::TextTokenizer;
-use crate::tools::{generate_tool_signature, ToolExecutor};
+use crate::tools::{
+    generate_tool_signature, ToolExecutor, ToolLoop, ToolLoopResult, ToolLoopTerminal,
+};
 use crate::tools::{LiveOutput, LiveOutputSink, ToolUse};
 
 use super::events::ReplEvent;
@@ -54,6 +57,10 @@ pub struct ToolExecutionCoordinator {
 
     /// Co-Forth poset — each tool call auto-pushes a trace node here.
     poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
+
+    /// Per-query ToolLoop. The event loop owns the lifecycle; this map is
+    /// how concurrent tool tasks admit-once and drop late results.
+    tool_loops: Arc<Mutex<HashMap<Uuid, Arc<Mutex<ToolLoop>>>>>,
 }
 
 /// One tool's client-side presentation binding. It is intentionally created
@@ -123,6 +130,7 @@ impl ToolExecutionCoordinator {
             repl_mode,
             plan_content,
             poset: None,
+            tool_loops: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -135,6 +143,26 @@ impl ToolExecutionCoordinator {
     /// Get access to the tool executor (for MCP commands and other management)
     pub fn tool_executor(&self) -> &Arc<tokio::sync::Mutex<ToolExecutor>> {
         &self.tool_executor
+    }
+
+    /// Attach the event-loop-owned ToolLoop for this query's tool round.
+    pub async fn attach_loop(&self, query_id: Uuid, tool_loop: Arc<Mutex<ToolLoop>>) {
+        self.tool_loops.lock().await.insert(query_id, tool_loop);
+    }
+
+    /// End the round. Further admits and result appends fail closed.
+    pub async fn terminalize(&self, query_id: Uuid, terminal: ToolLoopTerminal) -> bool {
+        let tool_loop = self.tool_loops.lock().await.get(&query_id).cloned();
+        if let Some(tool_loop) = tool_loop {
+            tool_loop.lock().await.terminalize(terminal)
+        } else {
+            false
+        }
+    }
+
+    /// Drop the round after the query has fully left the tool path.
+    pub async fn forget_loop(&self, query_id: Uuid) {
+        self.tool_loops.lock().await.remove(&query_id);
     }
 
     /// Spawn a task to execute a tool (concurrent, non-blocking)
@@ -166,6 +194,7 @@ impl ToolExecutionCoordinator {
         let plan_content = Arc::clone(&self.plan_content);
         let output_manager = Arc::clone(&self.output_manager);
         let poset = self.poset.clone();
+        let tool_loops = Arc::clone(&self.tool_loops);
 
         // Build a per-tool presentation binding. Ordinary streaming tools append
         // their lines to their row; a typed VM program's portable `say` events
@@ -184,6 +213,17 @@ impl ToolExecutionCoordinator {
 
         tokio::spawn(async move {
             let mut tool_use = tool_use;
+            let tool_loop = tool_loops.lock().await.get(&query_id).cloned();
+            if let Some(tool_loop) = &tool_loop {
+                if tool_loop
+                    .lock()
+                    .await
+                    .admit_execution(&tool_use.id)
+                    .is_err()
+                {
+                    return;
+                }
+            }
             // Generate tool signature for approval checking
             let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
 
@@ -269,25 +309,29 @@ impl ToolExecutionCoordinator {
                                 tool_use.input = new_input;
                             }
                             ConfirmationResult::Deny => {
-                                // Tool denied, send error result
-                                let _ = event_tx.send(ReplEvent::ToolResult {
+                                publish_tool_result(
+                                    &event_tx,
+                                    &tool_loop,
                                     query_id,
                                     round_token,
-                                    tool_id: tool_use.id.clone(),
-                                    result: Err(anyhow::anyhow!("Tool execution denied by user")),
-                                });
+                                    tool_use.id.clone(),
+                                    Err(anyhow::anyhow!("Tool execution denied by user")),
+                                )
+                                .await;
                                 return;
                             }
                         }
                     }
                     Err(_) => {
-                        // Approval channel closed (user cancelled?)
-                        let _ = event_tx.send(ReplEvent::ToolResult {
+                        publish_tool_result(
+                            &event_tx,
+                            &tool_loop,
                             query_id,
                             round_token,
-                            tool_id: tool_use.id.clone(),
-                            result: Err(anyhow::anyhow!("Tool approval cancelled")),
-                        });
+                            tool_use.id.clone(),
+                            Err(anyhow::anyhow!("Tool approval cancelled")),
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -324,32 +368,40 @@ impl ToolExecutionCoordinator {
             // Send result back to event loop
             match result {
                 Ok(Ok(tool_result)) => {
-                    // Tool executed successfully within timeout
                     tracing::info!(
-                        "[tool_exec] Tool {} succeeded, sending result ({} chars)",
+                        "[tool_exec] Tool {} finished, sending result ({} chars, is_error={})",
                         tool_use.name,
-                        tool_result.content.len()
+                        tool_result.content.len(),
+                        tool_result.is_error
                     );
-
-                    let _ = event_tx.send(ReplEvent::ToolResult {
+                    let published = if tool_result.is_error {
+                        Err(anyhow::anyhow!("{}", tool_result.content))
+                    } else {
+                        Ok(tool_result.content)
+                    };
+                    publish_tool_result(
+                        &event_tx,
+                        &tool_loop,
                         query_id,
                         round_token,
-                        tool_id: tool_use.id.clone(),
-                        result: Ok(tool_result.content),
-                    });
+                        tool_use.id.clone(),
+                        published,
+                    )
+                    .await;
                 }
                 Ok(Err(e)) => {
-                    // Tool executed but returned error
                     tracing::warn!("[tool_exec] Tool {} returned error: {}", tool_use.name, e);
-                    let _ = event_tx.send(ReplEvent::ToolResult {
+                    publish_tool_result(
+                        &event_tx,
+                        &tool_loop,
                         query_id,
                         round_token,
-                        tool_id: tool_use.id.clone(),
-                        result: Err(e),
-                    });
+                        tool_use.id.clone(),
+                        Err(e),
+                    )
+                    .await;
                 }
                 Err(_) => {
-                    // Timeout elapsed
                     let seconds = timeout_duration
                         .map(|duration| duration.as_secs())
                         .unwrap_or_default();
@@ -358,18 +410,46 @@ impl ToolExecutionCoordinator {
                         tool_use.name,
                         seconds
                     );
-                    let _ = event_tx.send(ReplEvent::ToolResult {
+                    publish_tool_result(
+                        &event_tx,
+                        &tool_loop,
                         query_id,
                         round_token,
-                        tool_id: tool_use.id.clone(),
-                        result: Err(anyhow::anyhow!(
+                        tool_use.id.clone(),
+                        Err(anyhow::anyhow!(
                             "Tool execution timed out after {} seconds. \
                              Try restarting or check daemon logs for errors.",
                             seconds
                         )),
-                    });
+                    )
+                    .await;
                 }
             }
         });
     }
+}
+
+async fn publish_tool_result(
+    event_tx: &mpsc::UnboundedSender<ReplEvent>,
+    tool_loop: &Option<Arc<Mutex<ToolLoop>>>,
+    query_id: Uuid,
+    round_token: ToolRoundToken,
+    tool_id: String,
+    result: anyhow::Result<String>,
+) {
+    let mapped = match &result {
+        Ok(content) => ToolLoopResult::success(&tool_id, content.clone()),
+        Err(error) => ToolLoopResult::error(&tool_id, error.to_string()),
+    };
+    if let Some(tool_loop) = tool_loop {
+        if tool_loop.lock().await.append_result(mapped).is_none() {
+            return;
+        }
+    }
+    let _ = event_tx.send(ReplEvent::ToolResult {
+        query_id,
+        round_token,
+        tool_id,
+        result,
+    });
 }

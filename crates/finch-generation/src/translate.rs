@@ -2,8 +2,8 @@
 //!
 //! Provider-specific parsers stay in adapters. This module only maps already
 //! normalized provider events, including `ContentBlockComplete(ToolUse)` into
-//! `ToolCallComplete`. Native adapter emission of `ThinkingDelta` /
-//! `ToolCallDelta` remains issue #777.
+//! `ToolCallComplete`. Native OpenAI/Claude `ToolCallDelta` /
+//! `ToolCallComplete` pass through unchanged.
 
 use crate::event::{Allowance, GenerationEvent, ReasoningKind, ToolCall, Usage};
 use crate::identity::GenerationIdentity;
