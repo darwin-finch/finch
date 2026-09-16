@@ -2358,6 +2358,66 @@ fn runner_program_error_keeps_execute_once_effects() {
 }
 
 #[test]
+fn packed_delivery_on_runner_program_result_must_match_the_journal() {
+    let expected_effect = effect_record();
+    let mut message = capnp::message::Builder::new_default();
+    {
+        let mut result =
+            message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
+        result.set_error("program failed after emit");
+        super::super::checkpoint_codec::encode_effect_record(
+            result.reborrow().init_effect_journal(1).get(0),
+            expected_effect.execution_id,
+            &expected_effect.entry,
+        )
+        .unwrap();
+        let frames = super::super::checkpoint_codec::encode_packed_delivery_envelopes(&[
+            expected_effect.clone(),
+        ])
+        .unwrap();
+        result.reborrow().init_delivery(1).set(0, &frames[0]);
+    }
+    let reader = message
+        .get_root_as_reader::<super::finch_ipc_capnp::brain_program_result::Reader>()
+        .unwrap();
+    let error = decode_runner_program_result(Ok(reader)).unwrap_err();
+    assert_eq!(error.effect_journal, vec![expected_effect.clone()]);
+
+    let mut mismatched = expected_effect.clone();
+    mismatched.entry.effect.output = vec![crate::vm::Type::Bytes];
+    let mut message = capnp::message::Builder::new_default();
+    {
+        let mut result =
+            message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
+        result.set_error("program failed after emit");
+        super::super::checkpoint_codec::encode_effect_record(
+            result.reborrow().init_effect_journal(1).get(0),
+            expected_effect.execution_id,
+            &expected_effect.entry,
+        )
+        .unwrap();
+        let frames =
+            super::super::checkpoint_codec::encode_packed_delivery_envelopes(&[mismatched])
+                .unwrap();
+        result.reborrow().init_delivery(1).set(0, &frames[0]);
+    }
+    let reader = message
+        .get_root_as_reader::<super::finch_ipc_capnp::brain_program_result::Reader>()
+        .unwrap();
+    let error = decode_runner_program_result(Ok(reader)).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("packed delivery does not match journal")
+            || error
+                .to_string()
+                .contains("packed delivery does not match journal"),
+        "mismatched output row must fail closed, got {}",
+        error.message
+    );
+}
+
+#[test]
 fn supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path() {
     if std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() != Ok("1") {
         return;

@@ -3268,6 +3268,7 @@ async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint(
         )
         .unwrap();
     let effect_record = acknowledged_emit_effect("frontend completed");
+    let delivered = effect_record.clone();
     tokio::spawn(async move {
         let crate::server::RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
             panic!("expected program request")
@@ -3358,10 +3359,53 @@ async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint(
         .iter()
         .any(|event| matches!(event.kind, BrainEventKind::EffectRecorded { .. })));
 
+    let brain_id = snapshot.brain_id.0;
+    let client = crate::runtime::DeliveryConsumerIdentity::new(brain_id, uuid::Uuid::new_v4());
+    let pending = store.pending_effect_delivery("shared", client).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "runner journal must persist to the delivery log before Result publication; pending={pending:?}"
+    );
+    assert_eq!(pending[0].execution_id, delivered.execution_id);
+    assert_eq!(pending[0].effect.sequence, delivered.entry.effect.sequence);
+    assert_eq!(pending[0].effect.output, delivered.entry.effect.output);
+    assert!(store
+        .acknowledge_effect_delivery(
+            "shared",
+            client,
+            crate::runtime::DeliveryCursor::through(
+                delivered.execution_id,
+                delivered.entry.effect.sequence
+            )
+        )
+        .unwrap());
+    assert!(store
+        .pending_effect_delivery("shared", client)
+        .unwrap()
+        .is_empty());
+
     drop(restored);
     drop(store);
-    let restarted = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
-    let restarted = restarted.snapshot("shared").unwrap();
+    let restarted_store =
+        crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
+    assert!(
+        restarted_store
+            .pending_effect_delivery("shared", client)
+            .unwrap()
+            .is_empty(),
+        "restart must honor the acknowledged cursor"
+    );
+    let other = crate::runtime::DeliveryConsumerIdentity::new(brain_id, uuid::Uuid::new_v4());
+    assert_eq!(
+        restarted_store
+            .pending_effect_delivery("shared", other)
+            .unwrap()
+            .len(),
+        1,
+        "an independent client still sees the unacknowledged suffix after restart"
+    );
+    let restarted = restarted_store.snapshot("shared").unwrap();
     assert!(restarted
         .events
         .iter()

@@ -422,6 +422,10 @@ pub struct BrainStore {
     initializations: Arc<RwLock<HashMap<String, BrainInitialization>>>,
     runtimes: Arc<RwLock<HashMap<String, Arc<crate::runtime::ProgramRuntime>>>>,
     runtime_checkpoints: Arc<RwLock<HashMap<String, crate::vm::TypedRuntimeCheckpoint>>>,
+    /// Brain-bound portable effect delivery logs. Distinct from the typed
+    /// continuation journal and from write-ahead effect audit.
+    delivery_logs:
+        Arc<RwLock<HashMap<String, Arc<std::sync::Mutex<crate::runtime::VmEffectDeliveryLog>>>>>,
     /// One ordered turn lane per Brain. HTTP/WebSocket clients may submit
     /// concurrently, but accepted input, VM commit, and its Result event must
     /// remain an indivisible sequence against the authoritative revision.
@@ -670,6 +674,7 @@ impl BrainStore {
             initializations: Arc::new(RwLock::new(HashMap::new())),
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             runtime_checkpoints: Arc::new(RwLock::new(HashMap::new())),
+            delivery_logs: Arc::new(RwLock::new(HashMap::new())),
             execution_locks: Arc::new(RwLock::new(HashMap::new())),
             run_publication_gates: Arc::new(RwLock::new(HashMap::new())),
             run_connection_authority: Arc::new(RwLock::new(RunConnectionAuthority::default())),
@@ -4615,6 +4620,7 @@ impl BrainStore {
             .get(name)
             .cloned()
         {
+            self.bind_runtime_delivery_log(name, &runtime)?;
             return Ok(runtime);
         }
         let checkpoint = self
@@ -4638,6 +4644,7 @@ impl BrainStore {
             runtime.set_authority_sink(Arc::new(move |state| sink_store.save_state(state)))?;
         }
         let runtime = Arc::new(runtime);
+        self.bind_runtime_delivery_log(name, &runtime)?;
         let mut runtimes = self
             .runtimes
             .write()
@@ -4646,6 +4653,134 @@ impl BrainStore {
             .entry(name.to_string())
             .or_insert_with(|| Arc::clone(&runtime))
             .clone())
+    }
+
+    fn bind_runtime_delivery_log(
+        &self,
+        name: &str,
+        runtime: &crate::runtime::ProgramRuntime,
+    ) -> Result<()> {
+        if runtime.effect_delivery_log().is_some() {
+            return Ok(());
+        }
+        if let Some(log) = self.effect_delivery_log(name)? {
+            runtime.bind_effect_delivery_log(log)?;
+        }
+        Ok(())
+    }
+
+    /// Open or reuse the Brain-bound portable effect delivery log.
+    pub fn effect_delivery_log(
+        &self,
+        name: &str,
+    ) -> Result<Option<Arc<std::sync::Mutex<crate::runtime::VmEffectDeliveryLog>>>> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        if let Some(log) = self
+            .delivery_logs
+            .read()
+            .expect("shared brain delivery-log lock poisoned")
+            .get(name)
+            .cloned()
+        {
+            return Ok(Some(log));
+        }
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+        let brain_id = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .map(|state| state.brain_id.0)
+            .context("Brain was removed concurrently")?;
+        let path = root.join(name).join("runtime").join("effects.jsonl");
+        let log = Arc::new(std::sync::Mutex::new(
+            crate::runtime::VmEffectDeliveryLog::open_bound(path, brain_id)?,
+        ));
+        let mut logs = self
+            .delivery_logs
+            .write()
+            .expect("shared brain delivery-log lock poisoned");
+        Ok(Some(
+            logs.entry(name.to_string())
+                .or_insert_with(|| Arc::clone(&log))
+                .clone(),
+        ))
+    }
+
+    /// Persist envelopes before local Brain handling. Exact replay is
+    /// idempotent; conflicting `(execution_id, sequence)` fails closed.
+    pub fn record_effect_delivery(
+        &self,
+        name: &str,
+        envelopes: &[crate::runtime::VmEffectEnvelope],
+    ) -> Result<()> {
+        let Some(log) = self.effect_delivery_log(name)? else {
+            return Ok(());
+        };
+        let mut log = log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM effect delivery log lock poisoned"))?;
+        for envelope in envelopes {
+            log.append(envelope.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Unacknowledged suffix for one Brain/client identity.
+    pub fn pending_effect_delivery(
+        &self,
+        name: &str,
+        consumer: crate::runtime::DeliveryConsumerIdentity,
+    ) -> Result<Vec<crate::runtime::VmEffectEnvelope>> {
+        let Some(log) = self.effect_delivery_log(name)? else {
+            return Ok(Vec::new());
+        };
+        let log = log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM effect delivery log lock poisoned"))?;
+        if let Some(bound) = log.brain_id() {
+            anyhow::ensure!(
+                bound == consumer.brain_id,
+                "delivery consumer Brain {} does not match log bound to {bound}",
+                consumer.brain_id
+            );
+        }
+        Ok(log.pending_for(&consumer))
+    }
+
+    /// Packed Runtime/Application ABI frames for the unacknowledged suffix.
+    pub fn pending_effect_delivery_frames(
+        &self,
+        name: &str,
+        consumer: crate::runtime::DeliveryConsumerIdentity,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.pending_effect_delivery(name, consumer)?
+            .into_iter()
+            .map(|envelope| {
+                crate::ipc::checkpoint_codec::encode_runtime_application_message_packed(
+                    &crate::runtime::RuntimeApplicationMessage::Envelope { envelope },
+                )
+            })
+            .collect()
+    }
+
+    /// Record that one Brain/client identity durably projected a cursor.
+    pub fn acknowledge_effect_delivery(
+        &self,
+        name: &str,
+        consumer: crate::runtime::DeliveryConsumerIdentity,
+        cursor: crate::runtime::DeliveryCursor,
+    ) -> Result<bool> {
+        let Some(log) = self.effect_delivery_log(name)? else {
+            return Ok(false);
+        };
+        let mut log = log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM effect delivery log lock poisoned"))?;
+        log.acknowledge_identity(consumer, cursor)
     }
 
     /// Return the durable reducible state a newly connected environment

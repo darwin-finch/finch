@@ -1182,6 +1182,28 @@ fn push_named_brain_run_result(
 /// the daemon-issued reserve/begin/finish capability before this result can
 /// arrive. Publishing this caller-provided summary as `EffectRecorded` would
 /// both duplicate that canonical audit and let a runner forge provenance.
+fn delivery_envelopes(
+    records: &[crate::server::RunnerEffectRecord],
+) -> Vec<crate::runtime::VmEffectEnvelope> {
+    records
+        .iter()
+        .map(|record| crate::runtime::VmEffectEnvelope {
+            execution_id: record.execution_id,
+            effect: record.entry.effect.clone(),
+        })
+        .collect()
+}
+
+fn admit_runner_effect_delivery(
+    store: &crate::brain::BrainStore,
+    name: &str,
+    records: &[crate::server::RunnerEffectRecord],
+) -> anyhow::Result<()> {
+    validate_runner_effect_journal(records)?;
+    store.record_effect_delivery(name, &delivery_envelopes(records))?;
+    Ok(())
+}
+
 fn validate_runner_effect_journal(
     records: &[crate::server::RunnerEffectRecord],
 ) -> anyhow::Result<()> {

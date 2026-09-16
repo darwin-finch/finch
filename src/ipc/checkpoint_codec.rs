@@ -2593,6 +2593,94 @@ pub(crate) fn decode_runtime_application_message_packed(
     )
 }
 
+/// Packed envelopes derived from a runner effect journal.
+pub(crate) fn encode_packed_delivery_envelopes(
+    records: &[crate::server::RunnerEffectRecord],
+) -> Result<Vec<Vec<u8>>> {
+    records
+        .iter()
+        .map(|record| {
+            encode_runtime_application_message_packed(&RuntimeApplicationMessage::Envelope {
+                envelope: VmEffectEnvelope {
+                    execution_id: record.execution_id,
+                    effect: record.entry.effect.clone(),
+                },
+            })
+        })
+        .collect()
+}
+
+/// Decode packed delivery frames. An empty list means the peer omitted them
+/// and the journal remains the source of envelopes. Non-empty lists fail
+/// closed unless every frame is ABI v1, an envelope, and an exact match of
+/// the corresponding journal `(execution_id, sequence, output row)`.
+pub(crate) fn decode_packed_delivery_envelopes(
+    frames: capnp::data_list::Reader<'_>,
+    journal: &[crate::server::RunnerEffectRecord],
+) -> Result<Vec<VmEffectEnvelope>> {
+    if frames.len() == 0 {
+        return Ok(journal
+            .iter()
+            .map(|record| VmEffectEnvelope {
+                execution_id: record.execution_id,
+                effect: record.entry.effect.clone(),
+            })
+            .collect());
+    }
+    anyhow::ensure!(
+        frames.len() as usize == journal.len(),
+        "packed delivery length {} does not match effect journal {}",
+        frames.len(),
+        journal.len()
+    );
+    let mut envelopes = Vec::with_capacity(journal.len());
+    for (index, frame) in frames.iter().enumerate() {
+        let encoded = frame.context("packed delivery frame")?;
+        let message = decode_runtime_application_message_packed(encoded)?;
+        let RuntimeApplicationMessage::Envelope { envelope } = message else {
+            bail!("packed delivery frame {index} is not a RuntimeApplicationMessage envelope");
+        };
+        let record = &journal[index];
+        anyhow::ensure!(
+            envelope.execution_id == record.execution_id
+                && envelope.effect.sequence == record.entry.effect.sequence
+                && envelope.effect.output == record.entry.effect.output
+                && envelope.effect == record.entry.effect,
+            "packed delivery does not match journal at {}:{} output row {:?}",
+            envelope.execution_id,
+            envelope.effect.sequence,
+            envelope.effect.output
+        );
+        envelopes.push(envelope);
+    }
+    Ok(envelopes)
+}
+
+pub(crate) fn decode_packed_runtime_application_frames(
+    frames: capnp::data_list::Reader<'_>,
+) -> Result<Vec<RuntimeApplicationMessage>> {
+    frames
+        .iter()
+        .map(|frame| {
+            let encoded = frame.context("packed Runtime/Application ABI frame")?;
+            decode_runtime_application_message_packed(encoded)
+        })
+        .collect()
+}
+
+pub(crate) fn encode_packed_runtime_application_frames(
+    mut encoded: capnp::data_list::Builder<'_>,
+    messages: &[RuntimeApplicationMessage],
+) -> Result<()> {
+    for (index, message) in messages.iter().enumerate() {
+        encoded.set(
+            index as u32,
+            &encode_runtime_application_message_packed(message)?,
+        );
+    }
+    Ok(())
+}
+
 /// Encode one durable typed-runtime checkpoint using the same closed native
 /// schema used by runner registration and result transport.
 pub(crate) fn encode_checkpoint_bytes(value: &TypedRuntimeCheckpoint) -> Result<Vec<u8>> {

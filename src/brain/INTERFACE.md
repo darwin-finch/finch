@@ -118,6 +118,8 @@ impl BrainStore {
     pub fn accept_speculative_run(&self, name: &str, sender: &str, initiating_attachment_id: AttachmentId, text: String) -> Result<(BrainEvent, BrainRun)>;
     /// Persist a projection cursor without appending another numbered Brain event.
     pub fn acknowledge(&self, name: &str, attachment_id: AttachmentId, connection_id: ConnectionId, seq: u64) -> Result<BrainAttachment>;
+    /// Record that one Brain/client identity durably projected a cursor.
+    pub fn acknowledge_effect_delivery(&self, name: &str, consumer: crate::runtime::DeliveryConsumerIdentity, cursor: crate::runtime::DeliveryCursor) -> Result<bool>;
     pub fn acquire_runner_lease(&self, name: &str, subject: &str, environment_generation: u64, lease_id: Option<RunnerLeaseId>, ttl_ms: u64) -> Result<BrainRunnerLease>;
     /// Promote an exact pending REST reservation into the live transport projection.
     pub fn activate_connection(&self, name: &str, attachment_id: AttachmentId, connection_id: ConnectionId) -> Result<BrainAttachment>;
@@ -143,6 +145,8 @@ impl BrainStore {
     pub fn detach(&self, name: &str, attachment_id: AttachmentId, connection_id: ConnectionId) -> Result<()>;
     /// The Brains holding work due at or before `now_ms`, in due order.
     pub fn due_schedule_brains(&self, now_ms: u64) -> Vec<String>;
+    /// Open or reuse the Brain-bound portable effect delivery log.
+    pub fn effect_delivery_log(&self, name: &str) -> Result<Option<Arc<std::sync::Mutex<crate::runtime::VmEffectDeliveryLog>>>>;
     pub fn environment(&self) -> &BrainEnvironment;
     /// Clear an abandoned pending connection without advancing the Brain log or its durable acknowledgement cursor.
     pub fn expire_pending_connection(&self, name: &str, attachment_id: AttachmentId, connection_id: ConnectionId) -> Result<bool>;
@@ -166,6 +170,10 @@ impl BrainStore {
     pub fn next_schedule_due_ms(&self) -> Option<u64>;
     /// Number of disconnect terminalizations currently awaiting durable publication.
     pub fn pending_disconnect_terminalization_retries(&self) -> usize;
+    /// Unacknowledged suffix for one Brain/client identity.
+    pub fn pending_effect_delivery(&self, name: &str, consumer: crate::runtime::DeliveryConsumerIdentity) -> Result<Vec<crate::runtime::VmEffectEnvelope>>;
+    /// Packed Runtime/Application ABI frames for the unacknowledged suffix.
+    pub fn pending_effect_delivery_frames(&self, name: &str, consumer: crate::runtime::DeliveryConsumerIdentity) -> Result<Vec<Vec<u8>>>;
     pub fn pop_program(&self, name: &str, sender: &str) -> Result<Option<BrainEvent>>;
     /// Return the one live typed runtime for a named Brain, restoring its latest reducible checkpoint on first access after daemon restart.
     pub fn program_runtime(&self, name: &str) -> Result<Arc<crate::runtime::ProgramRuntime>>;
@@ -177,6 +185,8 @@ impl BrainStore {
     pub fn push_idempotent(&self, name: &str, sender: &str, kind: BrainEventKind, receipt: BrainMutationReceipt) -> Result<BrainMutationAppend>;
     /// Atomically advance due schedules and append the exact queued ProgramRun for each delivery.
     pub fn queue_due_schedules(&self, name: &str, now_ms: u64) -> Result<Vec<BrainRun>>;
+    /// Persist envelopes before local Brain handling.
+    pub fn record_effect_delivery(&self, name: &str, envelopes: &[crate::runtime::VmEffectEnvelope]) -> Result<()>;
     pub fn release_runner_lease(&self, name: &str, lease_id: RunnerLeaseId) -> Result<()>;
     /// Remove a provisional Brain once its last live participant has left.
     pub fn remove_if_unused(&self, name: &str) -> Result<bool>;

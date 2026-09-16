@@ -335,7 +335,7 @@ pub(super) async fn dispatch_named_brain_program(
                     drop(publication);
                     anyhow::bail!("named Brain run cancelled");
                 }
-                validate_runner_effect_journal(&failure.effect_journal)?;
+                admit_runner_effect_delivery(store, name, &failure.effect_journal)?;
                 push_named_brain_run_result(
                     store,
                     name,
@@ -363,7 +363,7 @@ pub(super) async fn dispatch_named_brain_program(
         drop(publication);
         anyhow::bail!("named Brain run cancelled");
     }
-    validate_runner_effect_journal(&outcome.effect_journal)?;
+    admit_runner_effect_delivery(store, name, &outcome.effect_journal)?;
     store.commit_runner_runtime_for_run(
         name,
         run_id,
@@ -461,7 +461,7 @@ pub(super) async fn dispatch_named_brain_turn(
                     &approval_audience,
                     failure.turn_events.clone(),
                 )?;
-                validate_runner_effect_journal(&failure.effect_journal)?;
+                admit_runner_effect_delivery(store, name, &failure.effect_journal)?;
                 push_named_brain_run_result(
                     store,
                     name,
@@ -499,7 +499,7 @@ pub(super) async fn dispatch_named_brain_turn(
         &approval_audience,
         outcome.turn_events,
     )?;
-    validate_runner_effect_journal(&outcome.effect_journal)?;
+    admit_runner_effect_delivery(store, name, &outcome.effect_journal)?;
     let program = store.push_for_run(
         name,
         "provider",

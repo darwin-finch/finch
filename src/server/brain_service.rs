@@ -107,6 +107,33 @@ impl BrainLifecycleService {
         self.store.snapshot(brain)
     }
 
+    pub fn pending_effect_delivery(
+        &self,
+        brain: &str,
+        client_id: uuid::Uuid,
+    ) -> Result<Vec<crate::runtime::RuntimeApplicationMessage>> {
+        let brain_id = self.store.snapshot(brain)?.brain_id.0;
+        let consumer = crate::runtime::DeliveryConsumerIdentity::new(brain_id, client_id);
+        Ok(self
+            .store
+            .pending_effect_delivery(brain, consumer)?
+            .into_iter()
+            .map(|envelope| crate::runtime::RuntimeApplicationMessage::Envelope { envelope })
+            .collect())
+    }
+
+    pub fn acknowledge_effect_delivery(
+        &self,
+        brain: &str,
+        client_id: uuid::Uuid,
+        cursor: crate::runtime::DeliveryCursor,
+    ) -> Result<bool> {
+        let brain_id = self.store.snapshot(brain)?.brain_id.0;
+        let consumer = crate::runtime::DeliveryConsumerIdentity::new(brain_id, client_id);
+        self.store
+            .acknowledge_effect_delivery(brain, consumer, cursor)
+    }
+
     pub fn initialization(&self, brain: &str) -> Result<crate::brain::BrainInitialization> {
         self.store.initialization(brain)
     }
