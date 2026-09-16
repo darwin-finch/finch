@@ -485,8 +485,11 @@ fn default_green() -> ColorSpec {
     ColorSpec::Named("green".to_string())
 }
 
+/// Muted text/chrome that stays WCAG-AA against the product background `#080808`.
+/// Named `darkgray` is ANSI bright-black; terminals render it as dim grey that
+/// disappears on that background.
 fn default_dark_gray() -> ColorSpec {
-    ColorSpec::Named("darkgray".to_string())
+    ColorSpec::Rgb(180, 180, 180)
 }
 
 fn default_cyan() -> ColorSpec {
@@ -524,22 +527,76 @@ mod tests {
         }
     }
 
-    fn contrast(style: Style) -> f32 {
-        fn linear(component: u8) -> f32 {
-            let value = f32::from(component) / 255.0;
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        }
-        fn relative((red, green, blue): (u8, u8, u8)) -> f32 {
-            0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
-        }
+    /// Product `theme-color` from the shipped site (`#080808`).
+    const PRODUCT_BACKGROUND: (u8, u8, u8) = (8, 8, 8);
 
-        let foreground = relative(rgb(style.fg.expect("band foreground")));
-        let background = relative(rgb(style.bg.expect("band background")));
-        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    fn linear(component: u8) -> f32 {
+        let value = f32::from(component) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn relative((red, green, blue): (u8, u8, u8)) -> f32 {
+        0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    }
+
+    fn contrast_rgb(foreground: (u8, u8, u8), background: (u8, u8, u8)) -> f32 {
+        let fg = relative(foreground);
+        let bg = relative(background);
+        (fg.max(bg) + 0.05) / (fg.min(bg) + 0.05)
+    }
+
+    fn contrast(style: Style) -> f32 {
+        contrast_rgb(
+            rgb(style.fg.expect("band foreground")),
+            rgb(style.bg.expect("band background")),
+        )
+    }
+
+    /// Map a spec to RGB using typical 16-color terminal values, not the
+    /// theoretical 50% grey. ANSI bright-black (`DarkGray`) is commonly
+    /// ~`#666666`, which is what makes the shipped `darkgray` default vanish
+    /// on `#080808`.
+    fn spec_terminal_rgb(spec: &ColorSpec) -> (u8, u8, u8) {
+        match spec.to_color() {
+            Color::Black => (0, 0, 0),
+            Color::Red | Color::LightRed => (255, 0, 0),
+            Color::Green | Color::LightGreen => (0, 255, 0),
+            Color::Yellow | Color::LightYellow => (255, 255, 0),
+            Color::Blue | Color::LightBlue => (0, 0, 255),
+            Color::Magenta | Color::LightMagenta => (255, 0, 255),
+            Color::Cyan | Color::LightCyan => (0, 255, 255),
+            Color::White => (255, 255, 255),
+            Color::Gray => (192, 192, 192),
+            Color::DarkGray => (102, 102, 102),
+            Color::Rgb(red, green, blue) => (red, green, blue),
+            other => panic!("unmapped color {other:?} in default palette contrast check"),
+        }
+    }
+
+    fn default_text_and_border_roles(scheme: &ColorScheme) -> Vec<(&'static str, &ColorSpec)> {
+        vec![
+            ("status.live_stats", &scheme.status.live_stats),
+            ("status.training", &scheme.status.training),
+            ("status.download", &scheme.status.download),
+            ("status.operation", &scheme.status.operation),
+            ("status.border", &scheme.status.border),
+            ("messages.user", &scheme.messages.user),
+            ("messages.assistant", &scheme.messages.assistant),
+            ("messages.system", &scheme.messages.system),
+            ("messages.error", &scheme.messages.error),
+            ("messages.tool", &scheme.messages.tool),
+            ("ui.border", &scheme.ui.border),
+            ("ui.separator", &scheme.ui.separator),
+            ("ui.input", &scheme.ui.input),
+            ("ui.cursor", &scheme.ui.cursor),
+            ("dialog.border", &scheme.dialog.border),
+            ("dialog.title", &scheme.dialog.title),
+            ("dialog.option", &scheme.dialog.option),
+        ]
     }
 
     #[test]
@@ -639,5 +696,30 @@ mod tests {
         );
         assert!(contrast(dark_alice) >= 7.0);
         assert!(contrast(light.message_band_style(MessageBand::Participant(3))) >= 7.0);
+    }
+
+    #[test]
+    fn default_dark_palette_is_readable_on_product_background() {
+        let schemes = [
+            ("ColorScheme::default", ColorScheme::default()),
+            ("ColorTheme::Dark", ColorTheme::Dark.to_scheme()),
+        ];
+        for (label, scheme) in &schemes {
+            for (role, spec) in default_text_and_border_roles(scheme) {
+                assert_ne!(
+                    spec.to_color(),
+                    Color::DarkGray,
+                    "{label} {role} used ANSI DarkGray, which terminals render as dim grey on the product background {:?}",
+                    PRODUCT_BACKGROUND
+                );
+                let rgb = spec_terminal_rgb(spec);
+                let contrast = contrast_rgb(rgb, PRODUCT_BACKGROUND);
+                assert!(
+                    contrast >= 4.5,
+                    "{label} {role} {rgb:?} contrast {contrast:.2} against product background {:?} is below WCAG AA 4.5",
+                    PRODUCT_BACKGROUND
+                );
+            }
+        }
     }
 }
