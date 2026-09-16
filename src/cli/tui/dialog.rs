@@ -2111,6 +2111,7 @@ mod tests {
             cwd_label: "~/repos/finch",
             session_label: "jade-river",
             dialog: Some(dialog),
+            expanded_lines: None,
             render_error: false,
             task_rows: &[],
             tracked_rows: &[],
