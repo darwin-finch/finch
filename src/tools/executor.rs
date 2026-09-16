@@ -3,10 +3,9 @@
 // Executes tools with permission checks and multi-turn support
 
 use crate::cli::ConversationHistory;
+use crate::programs::ExecutionEffect;
 use crate::tools::patterns::{ExactApproval, MatchType, PersistentPatternStore, ToolPattern};
-use crate::tools::permissions::{
-    PermissionCheck, PermissionManager, EXECUTOR_PLANNING_ALLOWED_TOOLS,
-};
+use crate::tools::permissions::{PermissionCheck, PermissionManager};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::types::{ToolResult, ToolUse};
 use anyhow::{Context, Result};
@@ -487,7 +486,6 @@ impl ToolExecutor {
                         crate::cli::repl_event::plan_handler::PLANNING_ALLOWED_TOOLS.join(", ")
                     ),
                 ));
->>>>>>> origin/main
             }
             drop(current_mode);
         }
@@ -928,6 +926,10 @@ mod tests {
     impl Tool for NamedMockTool {
         fn name(&self) -> &str {
             &self.name
+        }
+
+        fn effect(&self) -> ExecutionEffect {
+            ExecutionEffect::Unclassified
         }
 
         fn description(&self) -> &str {

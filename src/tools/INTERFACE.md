@@ -370,11 +370,7 @@ impl ToolRegistry {
     pub fn declared_effect(&self, name: &str) -> ExecutionEffect;
     /// Get all tool definitions (for Claude API)
     pub fn definitions(&self) -> Vec<ToolDefinition>;
-<<<<<<< HEAD
-    /// List every name dispatch accepts: registered tool names plus alias keys.
-=======
     /// Every name accepted at dispatch time: canonical registered names plus the alias spellings mapped by [`Self::register_alias`].
->>>>>>> origin/main
     pub fn dispatch_names(&self) -> Vec<String>;
     /// Get tool by name
     pub fn get(&self, name: &str) -> Option<&dyn Tool>;
@@ -462,8 +458,6 @@ pub fn todo_journal(projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>) -
 ## Constants
 
 ```rust
-/// Registered tool names the [`crate::tools::ToolExecutor`] admits while the session is in `Planning` mode, keyed on the names the `Tool` implementations regist…
-pub const EXECUTOR_PLANNING_ALLOWED_TOOLS: &[&str] = &[ "read", "glob", "grep", "web_fetch", "enter_plan_mode", "EnterPlanMode", "present_plan", "PresentPlan", "ask_user_question", "AskUserQuestion", ];
 /// Registered tool names a peer is hard-denied regardless of configuration.
 pub const PEER_HARD_DENY_TOOLS: &[&str] = &["restart_session", "spawn_task"];
 /// Registered tool names through which a peer proposes file changes.

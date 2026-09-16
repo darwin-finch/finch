@@ -96,29 +96,6 @@ pub(crate) const REPL_ALWAYS_ALLOW_TOOLS: &[&str] = &[
     "cancel_agent",
 ];
 
-/// Tool names the legacy REPL loop's planning gate admits, keyed on the names
-/// the `Tool` implementations register plus the dispatch-only alias keys
-/// `register_repl_tool_aliases` covers (issue #466). Spellings nothing
-/// registers — `ExitPlanMode`, `Bash` — are deliberately absent: no alias maps
-/// to them and dispatch could never execute them.
-///
-/// Every entry must be a name some `Tool` registers or an alias key;
-/// conformance-tested against the owner REPL catalog in
-/// `src/cli/repl/always_allow_tests.rs`.
-pub(crate) const REPL_PLANNING_ALLOWED_TOOLS: &[&str] = &[
-    "read",
-    "glob",
-    "grep",
-    "web_fetch",
-    "bash",
-    "present_plan",
-    "PresentPlan",
-    "ask_user_question",
-    "AskUserQuestion",
-    "enter_plan_mode",
-    "EnterPlanMode",
-];
-
 fn apply_repl_always_allow_tools(permissions: &mut PermissionManager) {
     let allow_config = ToolPermissionConfig {
         enabled: true,

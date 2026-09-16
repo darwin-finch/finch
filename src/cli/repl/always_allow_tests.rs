@@ -1,5 +1,4 @@
 use super::{apply_repl_always_allow_tools, register_repl_tool_aliases, REPL_ALWAYS_ALLOW_TOOLS};
-use crate::cli::repl::REPL_PLANNING_ALLOWED_TOOLS;
 use crate::generators::{Generator, GeneratorCapabilities, GeneratorResponse};
 use crate::programs::ExecutionEffect;
 use crate::runtime::ProgramRuntime;
@@ -156,7 +155,7 @@ fn test_peer_permission_policy_tables_name_only_registered_tools_or_aliases() {
     // loops build their tool lists in build_subagent_tools).
     let catalog = owner_repl_catalog();
     let registry = &catalog.registry;
-    let tables: [(&str, &[&str]); 6] = [
+    let tables = [
         (
             "PEER_SILENT_ALLOW_TOOLS",
             crate::tools::PEER_SILENT_ALLOW_TOOLS,
@@ -167,14 +166,9 @@ fn test_peer_permission_policy_tables_name_only_registered_tools_or_aliases() {
         ),
         ("VM_DISCOVERY_TOOLS", crate::tools::VM_DISCOVERY_TOOLS),
         (
-            "EXECUTOR_PLANNING_ALLOWED_TOOLS",
-            crate::tools::EXECUTOR_PLANNING_ALLOWED_TOOLS,
+            "PLANNING_ALLOWED_TOOLS",
+            crate::cli::repl_event::plan_handler::PLANNING_ALLOWED_TOOLS,
         ),
-        (
-            "PLANNING_MODE_ALLOWED_TOOLS",
-            crate::cli::repl_event::plan_handler::PLANNING_MODE_ALLOWED_TOOLS,
-        ),
-        ("REPL_PLANNING_ALLOWED_TOOLS", REPL_PLANNING_ALLOWED_TOOLS),
     ];
     let mut unregistered: Vec<String> = Vec::new();
     for (table, names) in tables {
@@ -342,17 +336,10 @@ fn test_planning_allowlists_only_admit_justified_tools() {
         "todo_write",
         "enter_plan_mode",
     ];
-    for (table, names) in [
-        (
-            "PLANNING_MODE_ALLOWED_TOOLS",
-            crate::cli::repl_event::plan_handler::PLANNING_MODE_ALLOWED_TOOLS,
-        ),
-        ("REPL_PLANNING_ALLOWED_TOOLS", REPL_PLANNING_ALLOWED_TOOLS),
-        (
-            "EXECUTOR_PLANNING_ALLOWED_TOOLS",
-            crate::tools::EXECUTOR_PLANNING_ALLOWED_TOOLS,
-        ),
-    ] {
+    for (table, names) in [(
+        "PLANNING_ALLOWED_TOOLS",
+        crate::cli::repl_event::plan_handler::PLANNING_ALLOWED_TOOLS,
+    )] {
         for name in names {
             let tool = catalog
                 .registry
@@ -385,14 +372,14 @@ fn test_repl_planning_gate_blocks_spellings_nothing_registers() {
     };
     for tool in ["ExitPlanMode", "Bash"] {
         assert!(
-            !super::Repl::is_tool_allowed_in_mode(tool, &mode),
+            !crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode(tool, &mode),
             "{tool} registers as nothing and must not pass the planning gate"
         );
     }
     for tool in ["bash", "enter_plan_mode", "EnterPlanMode", "read"] {
         assert!(
-            super::Repl::is_tool_allowed_in_mode(tool, &mode),
-            "{tool} must still pass the legacy REPL planning gate"
+            crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode(tool, &mode),
+            "{tool} must still pass the authoritative planning gate"
         );
     }
 }

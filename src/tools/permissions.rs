@@ -77,24 +77,6 @@ pub const PEER_REVIEWED_CHANGESET_TOOLS: &[&str] = &["write", "edit", "patch"];
 /// session is in `Planning` mode, keyed on the names the `Tool`
 /// implementations register plus the dispatch-only alias keys the REPL
 /// registry covers (issue #466). The executor table is narrower than the
-/// event-loop planning tables — it has never admitted `bash` or the todo
-/// tools — and that difference is preserved deliberately; unifying it is an
-/// approval-policy change, not a refactor.
-///
-/// Every entry must be a name some `Tool` registers or an alias key;
-/// conformance-tested in `src/cli/repl/always_allow_tests.rs`.
-pub const EXECUTOR_PLANNING_ALLOWED_TOOLS: &[&str] = &[
-    "read",
-    "glob",
-    "grep",
-    "web_fetch",
-    "enter_plan_mode",
-    "EnterPlanMode",
-    "present_plan",
-    "PresentPlan",
-    "ask_user_question",
-    "AskUserQuestion",
-];
 
 /// Permission decision for a tool execution
 #[derive(Debug, Clone, PartialEq)]
