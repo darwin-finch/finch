@@ -366,8 +366,12 @@ pub struct ToolRegistry { … }
 impl ToolRegistry {
     /// List all alias keys (compatibility spellings accepted at dispatch time but absent from [`Self::definitions`]).
     pub fn alias_names(&self) -> Vec<String>;
+    /// Declared effect for a dispatch name: the registered tool's [`Tool::effect`], alias-resolved.
+    pub fn declared_effect(&self, name: &str) -> ExecutionEffect;
     /// Get all tool definitions (for Claude API)
     pub fn definitions(&self) -> Vec<ToolDefinition>;
+    /// List every name dispatch accepts: registered tool names plus alias keys.
+    pub fn dispatch_names(&self) -> Vec<String>;
     /// Get tool by name
     pub fn get(&self, name: &str) -> Option<&dyn Tool>;
     /// Get all tools (for iteration)
@@ -424,6 +428,7 @@ pub trait LiveOutputSink: Send + Sync {
 /// Tool trait - all tools must implement this
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
+    fn effect(&self) -> ExecutionEffect;
     fn description(&self) -> &str;
     fn input_schema(&self) -> ToolInputSchema;
     fn definition(&self) -> ToolDefinition;
@@ -440,10 +445,10 @@ pub(crate) fn deferred_frontend_restart_from_tool_result(result: &std::result::R
 pub(crate) fn frontend_replacement_args<I>(current: I, brain: &str) -> Vec<OsString> where I: IntoIterator<Item = OsString>, { … }
 /// Generate a context-specific signature for a tool use
 pub fn generate_tool_signature(tool_use: &ToolUse, working_dir: &std::path::Path) -> ToolSignature { … }
-/// Effect declaration for legacy tool adapters.
-pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect { … }
 /// Open a proposal artifact in the user editor and preserve the explicit `execute`/`chat`/`cancel` decision.
 pub async fn propose_artifact_with_decision(language: &str, description: &str, source: &str) -> Result<ProposalDecision> { … }
+/// Effect a tool use presents at the approval boundary.
+pub fn refined_effect_for_approval(declared: ExecutionEffect, tool_name: &str, input: &Value) -> ExecutionEffect { … }
 pub(crate) fn resume_terminal_after_editor() { … }
 pub(crate) fn run_editor(path: &Path) -> Result<std::process::ExitStatus> { … }
 pub(crate) fn suspend_terminal_for_editor() { … }
@@ -453,6 +458,8 @@ pub fn todo_journal(projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>) -
 ## Constants
 
 ```rust
+/// Registered tool names the [`crate::tools::ToolExecutor`] admits while the session is in `Planning` mode, keyed on the names the `Tool` implementations regist…
+pub const EXECUTOR_PLANNING_ALLOWED_TOOLS: &[&str] = &[ "read", "glob", "grep", "web_fetch", "enter_plan_mode", "EnterPlanMode", "present_plan", "PresentPlan", "ask_user_question", "AskUserQuestion", ];
 /// Registered tool names a peer is hard-denied regardless of configuration.
 pub const PEER_HARD_DENY_TOOLS: &[&str] = &["restart_session", "spawn_task"];
 /// Registered tool names through which a peer proposes file changes.

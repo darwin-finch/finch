@@ -1,6 +1,7 @@
 //! Read-only model tools for discovering the persistent program vocabulary.
 
 use crate::memory::MemorySystem;
+use crate::programs::ExecutionEffect;
 use crate::programs::ProgramRef;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
@@ -26,6 +27,10 @@ impl SearchVocabularyTool {
 impl Tool for SearchVocabularyTool {
     fn name(&self) -> &str {
         "search_vocabulary"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmRead
     }
 
     fn description(&self) -> &str {
@@ -98,6 +103,10 @@ impl InspectProgramTool {
 impl Tool for InspectProgramTool {
     fn name(&self) -> &str {
         "inspect_program"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmRead
     }
 
     fn description(&self) -> &str {

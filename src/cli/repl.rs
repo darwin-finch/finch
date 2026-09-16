@@ -95,6 +95,29 @@ pub(crate) const REPL_ALWAYS_ALLOW_TOOLS: &[&str] = &[
     "cancel_agent",
 ];
 
+/// Tool names the legacy REPL loop's planning gate admits, keyed on the names
+/// the `Tool` implementations register plus the dispatch-only alias keys
+/// `register_repl_tool_aliases` covers (issue #466). Spellings nothing
+/// registers — `ExitPlanMode`, `Bash` — are deliberately absent: no alias maps
+/// to them and dispatch could never execute them.
+///
+/// Every entry must be a name some `Tool` registers or an alias key;
+/// conformance-tested against the owner REPL catalog in
+/// `src/cli/repl/always_allow_tests.rs`.
+pub(crate) const REPL_PLANNING_ALLOWED_TOOLS: &[&str] = &[
+    "read",
+    "glob",
+    "grep",
+    "web_fetch",
+    "bash",
+    "present_plan",
+    "PresentPlan",
+    "ask_user_question",
+    "AskUserQuestion",
+    "enter_plan_mode",
+    "EnterPlanMode",
+];
+
 fn apply_repl_always_allow_tools(permissions: &mut PermissionManager) {
     let allow_config = ToolPermissionConfig {
         enabled: true,
@@ -1746,9 +1769,23 @@ impl Repl {
                 let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let signature = generate_tool_signature(tool_use, &working_dir);
 
-                let is_auto_approved =
-                    crate::tools::legacy_tool_effect(&tool_use.name, &tool_use.input)
-                        .runs_autonomously();
+                // Declared authority of the tool (alias-resolved; unknown
+                // names classify as Unclassified and keep requiring
+                // approval). bash declares its worst case; the read-only
+                // refinement is applied here, at the approval site that
+                // consumes the effect.
+                let declared_effect = self
+                    .tool_executor
+                    .lock()
+                    .await
+                    .registry()
+                    .declared_effect(&tool_use.name);
+                let is_auto_approved = crate::tools::refined_effect_for_approval(
+                    declared_effect,
+                    &tool_use.name,
+                    &tool_use.input,
+                )
+                .runs_autonomously();
 
                 // Check if pre-approved in cache
                 let approval_source = self.tool_executor.lock().await.is_approved(&signature);
@@ -2935,22 +2972,7 @@ impl Repl {
             }
             ReplMode::Planning { .. } => {
                 // Inspection tools + plan completion tools allowed
-                matches!(
-                    tool_name,
-                    "read"
-                        | "glob"
-                        | "grep"
-                        | "web_fetch"
-                        | "bash"
-                        | "Bash"
-                        | "present_plan"
-                        | "PresentPlan"
-                        | "ask_user_question"
-                        | "AskUserQuestion"
-                        | "enter_plan_mode"
-                        | "EnterPlanMode"
-                        | "ExitPlanMode"
-                )
+                REPL_PLANNING_ALLOWED_TOOLS.contains(&tool_name)
             }
         }
     }

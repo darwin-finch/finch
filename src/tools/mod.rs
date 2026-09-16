@@ -38,9 +38,9 @@ pub use mcp::{McpClient, McpConnection, McpServerConfig, McpToolDescriptor, Tran
 pub use pattern_matcher::ToolPatternMatcher;
 pub use patterns::{ExactApproval, MatchType, PatternType, PersistentPatternStore, ToolPattern};
 pub use permissions::{
-    legacy_tool_effect, PermissionCheck, PermissionManager, PermissionRule, ToolPermissionConfig,
-    PEER_HARD_DENY_TOOLS, PEER_REVIEWED_CHANGESET_TOOLS, PEER_SILENT_ALLOW_TOOLS,
-    VM_DISCOVERY_TOOLS,
+    refined_effect_for_approval, PermissionCheck, PermissionManager, PermissionRule,
+    ToolPermissionConfig, EXECUTOR_PLANNING_ALLOWED_TOOLS, PEER_HARD_DENY_TOOLS,
+    PEER_REVIEWED_CHANGESET_TOOLS, PEER_SILENT_ALLOW_TOOLS, VM_DISCOVERY_TOOLS,
 };
 pub use registry::{Tool, ToolRegistry};
 pub use todo::{todo_journal, TodoJournalReceiver, TodoJournalTarget, TodoJournalWriter, TodoList};

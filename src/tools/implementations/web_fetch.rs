@@ -1,5 +1,6 @@
 // WebFetch tool - fetches content from URLs
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -33,6 +34,10 @@ impl Default for WebFetchTool {
 impl Tool for WebFetchTool {
     fn name(&self) -> &str {
         "web_fetch"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::ExternalRead
     }
 
     fn description(&self) -> &str {

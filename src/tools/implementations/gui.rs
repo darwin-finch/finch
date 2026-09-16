@@ -3,6 +3,7 @@
 //! The implementation lives in the runtime automation broker so direct tools and VM
 //! programs use the same availability checks and host API path.
 
+use crate::programs::ExecutionEffect;
 use crate::runtime::{AutomationBroker, AutomationRequest};
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
@@ -16,6 +17,10 @@ pub struct GuiClickTool;
 impl Tool for GuiClickTool {
     fn name(&self) -> &str {
         "gui_click"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::ExternalWrite
     }
 
     fn description(&self) -> &str {
@@ -63,6 +68,10 @@ impl Tool for GuiTypeTool {
         "gui_type"
     }
 
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::ExternalWrite
+    }
+
     fn description(&self) -> &str {
         "Type text through Finch's native macOS automation broker. Requires the gui_automation feature and Accessibility consent."
     }
@@ -96,6 +105,10 @@ pub struct GuiInspectTool;
 impl Tool for GuiInspectTool {
     fn name(&self) -> &str {
         "gui_inspect"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceRead
     }
 
     fn description(&self) -> &str {

@@ -1,5 +1,6 @@
 // Grep tool - searches for patterns in files
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -16,6 +17,10 @@ pub struct GrepTool;
 impl Tool for GrepTool {
     fn name(&self) -> &str {
         "grep"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceRead
     }
 
     fn description(&self) -> &str {

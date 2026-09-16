@@ -73,6 +73,29 @@ pub const PEER_SILENT_ALLOW_TOOLS: &[&str] = &[
 /// conformance-tested in `src/cli/repl/always_allow_tests.rs`.
 pub const PEER_REVIEWED_CHANGESET_TOOLS: &[&str] = &["write", "edit", "patch"];
 
+/// Registered tool names the [`crate::tools::ToolExecutor`] admits while the
+/// session is in `Planning` mode, keyed on the names the `Tool`
+/// implementations register plus the dispatch-only alias keys the REPL
+/// registry covers (issue #466). The executor table is narrower than the
+/// event-loop planning tables — it has never admitted `bash` or the todo
+/// tools — and that difference is preserved deliberately; unifying it is an
+/// approval-policy change, not a refactor.
+///
+/// Every entry must be a name some `Tool` registers or an alias key;
+/// conformance-tested in `src/cli/repl/always_allow_tests.rs`.
+pub const EXECUTOR_PLANNING_ALLOWED_TOOLS: &[&str] = &[
+    "read",
+    "glob",
+    "grep",
+    "web_fetch",
+    "enter_plan_mode",
+    "EnterPlanMode",
+    "present_plan",
+    "PresentPlan",
+    "ask_user_question",
+    "AskUserQuestion",
+];
+
 /// Permission decision for a tool execution
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermissionCheck {
@@ -499,50 +522,30 @@ fn is_readonly_bash(command: &str) -> bool {
     readonly_prefixes.iter().any(|p| trimmed.starts_with(p))
 }
 
-/// Effect declaration for legacy tool adapters.
+/// Effect a tool use presents at the approval boundary.
 ///
-/// New VM programs carry this in their language-level signature. This table is
-/// the compatibility boundary while provider-native tools are still exposed.
-pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
-    match tool_name.to_ascii_lowercase().as_str() {
-        // Transitional adapter only: invoking the typed broker is VM-local.
-        // The program's model-supplied coarse effect label is deliberately
-        // ignored; verified capability requirements govern host authority.
-        "submit_program" => ExecutionEffect::VmWrite,
-        "get_vm_state"
-        | "get_language_definition"
-        | "search_vm_vocabulary"
-        | "inspect_vm_word"
-        | "search_word"
-        | "inspect_word"
-        | "search_vocabulary"
-        | "inspect_program"
-        | "search_memory"
-        | "list_recent_memories"
-        | "todoread" => ExecutionEffect::VmRead,
-        "todowrite" | "enterplanmode" | "presentplan" | "askuserquestion" | "create_memory" => {
-            ExecutionEffect::VmWrite
-        }
-        "read" | "glob" | "grep" | "hash_compare" | "excel_read" | "excel_range"
-        | "excel_sheets" | "gui_inspect" => ExecutionEffect::WorkspaceRead,
-        "web_fetch" => ExecutionEffect::ExternalRead,
-        "write" | "edit" | "patch" | "excel_write" | "excel_formula" => {
-            ExecutionEffect::WorkspaceWrite
-        }
-        "bash" => {
-            let command = input.get("command").and_then(Value::as_str).unwrap_or("");
-            if is_readonly_bash(command) {
-                ExecutionEffect::WorkspaceRead
-            } else {
-                ExecutionEffect::ExternalWrite
-            }
-        }
-        "restart_session" => ExecutionEffect::Destructive,
-        "run" | "spawn_task" | "ansible" | "gui_click" | "gui_type" | "excel_activate" => {
-            ExecutionEffect::ExternalWrite
-        }
-        _ => ExecutionEffect::Unclassified,
+/// [`Tool::effect`] is the declared authority and cannot see the invocation
+/// input, so bash declares its worst case (`ExternalWrite`). This refinement
+/// is applied **at the approval call sites that consume the effect**: a
+/// read-only bash command (no shell operators, read-only prefix —
+/// [`is_readonly_bash`]) presents as `WorkspaceRead`, so it stays autonomous
+/// without ever widening the declared effect itself. Every other tool's
+/// effect passes through untouched.
+///
+/// The `"bash"` literal is pinned to the name the real `BashTool` registers
+/// by `test_bash_readonly_refinement_applies_to_the_registered_bash_tool_name`.
+pub fn refined_effect_for_approval(
+    declared: ExecutionEffect,
+    tool_name: &str,
+    input: &Value,
+) -> ExecutionEffect {
+    if tool_name == "bash"
+        && declared == ExecutionEffect::ExternalWrite
+        && is_readonly_bash(input.get("command").and_then(Value::as_str).unwrap_or(""))
+    {
+        return ExecutionEffect::WorkspaceRead;
     }
+    declared
 }
 
 impl Default for PermissionManager {
@@ -554,6 +557,7 @@ impl Default for PermissionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_bash_dangerous_commands_blocked() {
@@ -756,6 +760,43 @@ mod tests {
              and spawn Tool implementations register (declared = {declared:?}, \
              table = {table:?})"
         );
+        // Cross-check the declared effects: a hard-denied tool must never
+        // declare an autonomously-runnable effect, and the declarations must
+        // reproduce exactly what the pre-#466 table computed for these
+        // canonical names (restart_session → Destructive, spawn_task →
+        // ExternalWrite), so the deny table and the effect declarations
+        // cannot drift apart unnoticed.
+        for (name, effect, expected) in [
+            (
+                crate::tools::Tool::name(&crate::tools::implementations::restart::RestartTool),
+                crate::tools::Tool::effect(&crate::tools::implementations::restart::RestartTool),
+                ExecutionEffect::Destructive,
+            ),
+            (
+                crate::tools::Tool::name(&task_tool),
+                crate::tools::Tool::effect(&task_tool),
+                ExecutionEffect::ExternalWrite,
+            ),
+        ] {
+            assert_eq!(
+                effect, expected,
+                "peer hard-deny tool '{name}' must declare {expected:?} — the \
+                 classification the pre-refactor table computed for it"
+            );
+            assert!(
+                matches!(
+                    effect,
+                    ExecutionEffect::Destructive | ExecutionEffect::ExternalWrite
+                ),
+                "peer hard-deny tool '{name}' declares {effect:?}; a hard-denied \
+                 tool must declare Destructive or ExternalWrite so the deny and \
+                 the declaration agree"
+            );
+            assert!(
+                !effect.runs_autonomously(),
+                "peer hard-deny tool '{name}' must not declare an autonomous effect"
+            );
+        }
     }
 
     #[test]
@@ -942,39 +983,128 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_effects_auto_run_reads_but_not_writes() {
+    fn test_declared_effects_auto_run_reads_but_not_writes() {
+        use crate::tools::Tool;
         assert_eq!(
-            legacy_tool_effect("read", &serde_json::json!({"path": "src/lib.rs"})),
+            crate::tools::ReadTool.effect(),
             ExecutionEffect::WorkspaceRead
         );
-        assert!(legacy_tool_effect("read", &serde_json::json!({})).runs_autonomously());
-        assert!(!legacy_tool_effect("write", &serde_json::json!({})).runs_autonomously());
-        assert!(!legacy_tool_effect("unknown", &serde_json::json!({})).runs_autonomously());
+        assert!(crate::tools::ReadTool.effect().runs_autonomously());
+        assert!(!crate::tools::WriteTool.effect().runs_autonomously());
+        assert!(
+            !ExecutionEffect::Unclassified.runs_autonomously(),
+            "Unclassified must never run autonomously"
+        );
     }
 
     #[test]
-    fn test_legacy_tool_effect_does_not_classify_unregistered_stack_words() {
-        for tool in ["push", "pop", "clear"] {
+    fn test_declared_effect_is_unclassified_for_names_nothing_registers() {
+        let registry = crate::tools::ToolRegistry::new();
+        for name in ["push", "pop", "clear", "ExitPlanMode", "Bash"] {
             assert_eq!(
-                legacy_tool_effect(tool, &serde_json::json!({})),
+                registry.declared_effect(name),
                 ExecutionEffect::Unclassified,
-                "{tool} is not a registered tool (`/clear` is a REPL slash command) and must not grant VmWrite"
+                "{name} is not a registered tool (`/clear` is a REPL slash \
+                 command) and must not inherit any granted effect"
+            );
+            assert!(
+                !registry.declared_effect(name).runs_autonomously(),
+                "{name} must not run autonomously"
             );
         }
     }
 
     #[test]
-    fn typed_program_submission_ignores_untrusted_coarse_effect() {
+    fn typed_program_declaration_ignores_untrusted_coarse_effect_input() {
+        use crate::tools::{SubmitProgramTool, Tool};
+        let tool = SubmitProgramTool::new(Arc::new(crate::runtime::ProgramRuntime::new()));
+        assert_eq!(tool.effect(), ExecutionEffect::VmWrite);
+        // The declaration is a property of the tool; a model-supplied coarse
+        // label in the input payload is no longer consulted anywhere.
+        for effect in ["pure", "destructive", "invented"] {
+            let input = serde_json::json!({"effect": effect});
+            assert_eq!(
+                refined_effect_for_approval(tool.effect(), "submit_program", &input),
+                ExecutionEffect::VmWrite,
+                "input payload {effect} must not change the declared effect"
+            );
+        }
+    }
+
+    // ── refined_effect_for_approval (bash read-only refinement) ─────────────
+
+    #[test]
+    fn test_bash_readonly_refinement_applies_to_the_registered_bash_tool_name() {
+        use crate::tools::{BashTool, Tool};
+        // Pin the refinement's literal to the name the real tool registers so
+        // a rename cannot strand the refinement (the #452/#466 drift class).
         assert_eq!(
-            legacy_tool_effect("submit_program", &serde_json::json!({"effect": "pure"})),
-            ExecutionEffect::VmWrite
+            BashTool.name(),
+            "bash",
+            "refined_effect_for_approval refines the name BashTool registers; \
+             if this fails, update the literal there together with this pin"
         );
         assert_eq!(
-            legacy_tool_effect(
-                "submit_program",
-                &serde_json::json!({"effect": "destructive"})
+            refined_effect_for_approval(
+                BashTool.effect(),
+                BashTool.name(),
+                &serde_json::json!({"command": "ls -la"})
             ),
-            ExecutionEffect::VmWrite
+            ExecutionEffect::WorkspaceRead,
+            "read-only bash must refine the declared worst case to WorkspaceRead"
+        );
+        assert_eq!(
+            refined_effect_for_approval(
+                BashTool.effect(),
+                BashTool.name(),
+                &serde_json::json!({"command": "git commit -m x"})
+            ),
+            ExecutionEffect::ExternalWrite,
+            "side-effecting bash keeps the declared worst case"
+        );
+    }
+
+    #[test]
+    fn test_bash_readonly_refinement_still_rejects_shell_operators() {
+        use crate::tools::{BashTool, Tool};
+        // Prefix-bypass invariant: operators disqualify the refinement.
+        for cmd in ["ls; rm file", "cat foo | tee out.txt", "echo hi > file"] {
+            assert_eq!(
+                refined_effect_for_approval(
+                    BashTool.effect(),
+                    BashTool.name(),
+                    &serde_json::json!({"command": cmd})
+                ),
+                ExecutionEffect::ExternalWrite,
+                "'{cmd}' must not refine to WorkspaceRead"
+            );
+        }
+    }
+
+    #[test]
+    fn test_approval_refinement_leaves_other_tools_untouched() {
+        for (name, effect) in [
+            ("read", ExecutionEffect::WorkspaceRead),
+            ("write", ExecutionEffect::WorkspaceWrite),
+            ("restart_session", ExecutionEffect::Destructive),
+            ("anything_else", ExecutionEffect::Unclassified),
+        ] {
+            assert_eq!(
+                refined_effect_for_approval(effect, name, &serde_json::json!({})),
+                effect,
+                "non-bash tools pass through unchanged"
+            );
+        }
+        // A read-only-looking command refines nothing unless the declared
+        // effect is bash's worst case.
+        assert_eq!(
+            refined_effect_for_approval(
+                ExecutionEffect::WorkspaceWrite,
+                "bash",
+                &serde_json::json!({"command": "ls"})
+            ),
+            ExecutionEffect::WorkspaceWrite,
+            "the refinement keys on the declared worst case, not the name alone"
         );
     }
 
@@ -991,20 +1121,49 @@ mod tests {
 
     #[test]
     fn vm_discovery_tools_are_autonomous_vm_reads() {
+        let memory_dir = tempfile::TempDir::new().expect("temp dir for memory catalog");
+        let memory = Arc::new(
+            crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+                db_path: memory_dir.path().join("memory.db"),
+                use_neural_embeddings: false,
+                ..crate::memory::MemoryConfig::default()
+            })
+            .expect("memory system for vm discovery classification"),
+        );
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+
+        let mut registry = crate::tools::ToolRegistry::new();
         for tool in [
-            "get_vm_state",
-            "get_language_definition",
-            "search_vm_vocabulary",
-            "inspect_vm_word",
-            "search_word",
-            "inspect_word",
-            "search_vocabulary",
-            "inspect_program",
+            Box::new(crate::tools::GetVmStateTool::new(Arc::clone(&runtime)))
+                as Box<dyn crate::tools::Tool>,
+            Box::new(crate::tools::GetLanguageDefinitionTool),
+            Box::new(crate::tools::SearchVmVocabularyTool::new(Arc::clone(
+                &runtime,
+            ))),
+            Box::new(crate::tools::InspectVmWordTool::new(Arc::clone(&runtime))),
+            Box::new(crate::tools::SearchWordTool::new(
+                Arc::clone(&runtime),
+                None,
+            )),
+            Box::new(crate::tools::InspectWordTool::new(
+                Arc::clone(&runtime),
+                None,
+            )),
+            Box::new(crate::tools::SearchVocabularyTool::new(Arc::clone(&memory))),
+            Box::new(crate::tools::InspectProgramTool::new(memory)),
         ] {
+            registry.register(tool);
+        }
+
+        for tool in VM_DISCOVERY_TOOLS {
             assert_eq!(
-                legacy_tool_effect(tool, &serde_json::json!({})),
+                registry.declared_effect(tool),
                 ExecutionEffect::VmRead,
                 "{tool} must not open a host-effect approval dialog"
+            );
+            assert!(
+                registry.declared_effect(tool).runs_autonomously(),
+                "{tool} is VM discovery and must run autonomously"
             );
         }
     }

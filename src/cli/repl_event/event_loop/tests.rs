@@ -3492,6 +3492,10 @@ impl crate::tools::Tool for PlanningWriteProbe {
         "write"
     }
 
+    fn effect(&self) -> crate::programs::ExecutionEffect {
+        crate::programs::ExecutionEffect::WorkspaceWrite
+    }
+
     fn description(&self) -> &str {
         "probe: execute must not run in Planning"
     }

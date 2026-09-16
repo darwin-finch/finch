@@ -26,6 +26,44 @@ use crate::tools::ToolUse;
 
 // ── Tool-mode gate ────────────────────────────────────────────────────────────
 
+/// Tool names a provider may call while the session is in `Planning` mode.
+///
+/// Keyed on the names the `Tool` implementations register plus the
+/// dispatch-only alias keys `register_repl_tool_aliases` covers, so a rename
+/// cannot strand an entry and a literal nothing registers cannot hide here
+/// (the issue #466/#465 drift class). Spellings nothing registers —
+/// `ExitPlanMode`, `Bash` — are deliberately absent: no alias maps to them and
+/// dispatch could never execute them, so the gate now refuses them up front.
+///
+/// Every entry must be a name some `Tool` registers or an alias key;
+/// conformance-tested against the owner REPL catalog in
+/// `src/cli/repl/always_allow_tests.rs`.
+pub(crate) const PLANNING_MODE_ALLOWED_TOOLS: &[&str] = &[
+    "read",
+    "glob",
+    "grep",
+    "web_fetch",
+    "bash",
+    "present_plan",
+    "PresentPlan",
+    "ask_user_question",
+    "AskUserQuestion",
+    // Session-local plan visibility is not a workspace or host mutation.
+    // Keep the familiar checklist usable while the model is deliberately
+    // planning.
+    "todo_read",
+    "TodoRead",
+    "todo_write",
+    "TodoWrite",
+    // Re-entering planning while already planning is idempotent
+    // (`EnterPlanModeTool::execute` returns "already in planning mode" and
+    // changes nothing). Both the canonical name and the dispatch-only alias
+    // are accepted; `ToolRegistry::definitions()` shows only the canonical
+    // spelling.
+    "enter_plan_mode",
+    "EnterPlanMode",
+];
+
 /// Returns `true` when `tool_name` may be called in `mode`.
 ///
 /// In `Normal` and `Executing` mode all tools are allowed (subject to the
@@ -42,34 +80,7 @@ pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool 
             // Inspection tools, bash (read-only by convention, confirmed normally),
             // plan completion tools, and plan-mode meta-tools are all allowed.
             // Write/Edit remain blocked to enforce read-only exploration during planning.
-            matches!(
-                tool_name,
-                "read"
-                    | "glob"
-                    | "grep"
-                    | "web_fetch"
-                    | "bash"
-                    | "Bash"
-                    | "present_plan"
-                    | "PresentPlan"
-                    | "ask_user_question"
-                    | "AskUserQuestion"
-                    // Session-local plan visibility is not a workspace or
-                    // host mutation. Keep the familiar checklist usable
-                    // while the model is deliberately planning.
-                    | "todo_read"
-                    | "todo_write"
-                    | "TodoRead"
-                    | "TodoWrite"
-                    // Re-entering planning while already planning is
-                    // idempotent (`EnterPlanModeTool::execute` returns
-                    // "already in planning mode" and changes nothing). The
-                    // canonical name is the only spelling the provider is
-                    // shown: `ToolRegistry::definitions()` omits aliases.
-                    | "enter_plan_mode"
-                    | "EnterPlanMode"
-                    | "ExitPlanMode"
-            )
+            PLANNING_MODE_ALLOWED_TOOLS.contains(&tool_name)
         }
     }
 }
@@ -525,22 +536,36 @@ mod tests {
             is_tool_allowed_in_mode("bash", &mode),
             "bash must be allowed in planning mode (with normal confirmation)"
         );
-        assert!(
-            is_tool_allowed_in_mode("Bash", &mode),
-            "Bash must be allowed in planning mode"
-        );
+    }
+
+    /// Regression (issue #466): spellings nothing registers must not pass the
+    /// planning gate. `ExitPlanMode` and `Bash` were once allow-listed as
+    /// literals while no `Tool` registers them and no alias maps to them, so
+    /// they passed the gate and could only die later at dispatch
+    /// ("Tool '…' not found"). The gate now refuses them up front; the
+    /// canonical `bash` and `enter_plan_mode` stay allowed.
+    #[test]
+    fn test_plan_mode_blocks_spellings_nothing_registers() {
+        let mode = planning_mode();
+        for tool in ["ExitPlanMode", "Bash", "Write", "Edit", "write", "edit"] {
+            assert!(
+                !is_tool_allowed_in_mode(tool, &mode),
+                "{tool} must NOT be allowed in planning mode: it is not a \
+                 registered tool name or alias key (or is a state-changing tool)"
+            );
+        }
     }
 
     #[test]
-    fn test_plan_mode_allows_enter_exit_plan_mode() {
+    fn test_plan_mode_allows_enter_plan_mode() {
         let mode = planning_mode();
         assert!(
             is_tool_allowed_in_mode("EnterPlanMode", &mode),
-            "EnterPlanMode must be allowed in planning mode"
+            "EnterPlanMode (dispatch-only alias) must be allowed in planning mode"
         );
         assert!(
-            is_tool_allowed_in_mode("ExitPlanMode", &mode),
-            "ExitPlanMode must be allowed in planning mode"
+            is_tool_allowed_in_mode("enter_plan_mode", &mode),
+            "enter_plan_mode (canonical) must be allowed in planning mode"
         );
     }
 

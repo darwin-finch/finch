@@ -8,6 +8,7 @@
 // Multiple TaskTool calls in a single model response can be executed in
 // parallel by the executor (see executor.rs).
 
+use crate::programs::ExecutionEffect;
 use crate::providers::{ContentBlock, Message};
 use crate::providers::{LlmProvider, ProviderRequest};
 use crate::tools::implementations::bash::BashTool;
@@ -139,6 +140,10 @@ impl TaskTool {
 impl Tool for TaskTool {
     fn name(&self) -> &str {
         "spawn_task"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::ExternalWrite
     }
 
     fn description(&self) -> &str {

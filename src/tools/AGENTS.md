@@ -27,6 +27,25 @@ hard-deny and allow tables are keyed on registered tool names (`PEER_HARD_DENY_T
 tests in this subtree and in `src/cli/repl/always_allow_tests.rs` fail if a policy table names
 anything no `Tool` registers or alias key covers.
 
+**Effects are declared, not guessed (issue #466).** Every `Tool` implements `fn effect(&self) ->
+ExecutionEffect` with no default, so a new tool cannot exist without stating its authority and a
+rename carries the declaration with it. There is no string-keyed effect table left in this
+subtree: approval call sites read `ToolRegistry::declared_effect(name)` (alias-resolved,
+Unclassified for names nothing registers) instead of classifying by literal. A declaration is the
+tool's **worst case**; input-dependent refinements live at the approval sites that consume the
+effect — `refined_effect_for_approval` applies bash's read-only refinement and pins its literal
+to the name `BashTool` registers. Deleting a tool's `effect()` is a compile error; changing one
+must trip `test_declared_effects_match_pre_refactor_classification` in
+`src/cli/repl/always_allow_tests.rs`, which pins every registered tool's declaration to its
+pre-refactor classification. The planning allowlists (`PLANNING_MODE_ALLOWED_TOOLS` in
+`src/cli/repl_event/plan_handler.rs`, `REPL_PLANNING_ALLOWED_TOOLS` in `src/cli/repl.rs`,
+`EXECUTOR_PLANNING_ALLOWED_TOOLS` in `permissions.rs`) are keyed on registered names or alias
+keys and are conformance-tested in the same file; spellings nothing registers (`ExitPlanMode`,
+`Bash`) are deliberately blocked. Declaring `Unclassified` is a real decision: todo_read,
+todo_write, enter_plan_mode, present_plan, ask_user_question, inspect_memory, and the four agent
+tools preserve their pre-refactor approval behavior that way, and re-authorizing any of them is a
+deliberate approval-policy change with its own review, not a drive-by declaration edit.
+
 **A tool name is not an instruction.** Implementations receive model-supplied names, paths, and
 schemas as data. MCP names are namespaced before they reach the registry; do not invent a second
 permission path around that.

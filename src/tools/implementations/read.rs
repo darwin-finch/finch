@@ -3,6 +3,7 @@
 // Supports optional offset (1-indexed start line) and limit (max lines)
 // so the AI can read large files in focused chunks.
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -16,6 +17,10 @@ pub struct ReadTool;
 impl Tool for ReadTool {
     fn name(&self) -> &str {
         "read"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceRead
     }
 
     fn description(&self) -> &str {

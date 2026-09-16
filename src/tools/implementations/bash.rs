@@ -1,5 +1,6 @@
 // Bash tool - executes shell commands with live output streaming
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -18,6 +19,14 @@ pub struct BashTool;
 impl Tool for BashTool {
     fn name(&self) -> &str {
         "bash"
+    }
+
+    /// Worst case: a shell command can write outside the workspace. The
+    /// read-only refinement (`is_readonly_bash`) is applied at the
+    /// approval call sites that consume this effect, not here — this
+    /// method cannot see the command text.
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::ExternalWrite
     }
 
     fn description(&self) -> &str {

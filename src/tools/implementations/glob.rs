@@ -1,6 +1,7 @@
 // Glob tool - finds files matching glob patterns
 
 use crate::output_error;
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -14,6 +15,10 @@ pub struct GlobTool;
 impl Tool for GlobTool {
     fn name(&self) -> &str {
         "glob"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceRead
     }
 
     fn description(&self) -> &str {

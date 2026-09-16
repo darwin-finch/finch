@@ -4,7 +4,9 @@
 
 use crate::cli::ConversationHistory;
 use crate::tools::patterns::{ExactApproval, MatchType, PersistentPatternStore, ToolPattern};
-use crate::tools::permissions::{PermissionCheck, PermissionManager};
+use crate::tools::permissions::{
+    PermissionCheck, PermissionManager, EXECUTOR_PLANNING_ALLOWED_TOOLS,
+};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::types::{ToolResult, ToolUse};
 use anyhow::{Context, Result};
@@ -468,19 +470,7 @@ impl ToolExecutor {
             let current_mode = mode.read().await;
             if let crate::cli::ReplMode::Planning { .. } = &*current_mode {
                 // In planning mode, only allow read-only tools
-                let allowed_tools = [
-                    "read",
-                    "glob",
-                    "grep",
-                    "web_fetch",
-                    "enter_plan_mode",
-                    "EnterPlanMode",
-                    "present_plan",
-                    "PresentPlan",
-                    "ask_user_question",
-                    "AskUserQuestion",
-                ];
-                if !allowed_tools.contains(&tool_use.name.as_str()) {
+                if !EXECUTOR_PLANNING_ALLOWED_TOOLS.contains(&tool_use.name.as_str()) {
                     drop(current_mode);
                     warn!("Tool '{}' blocked in planning mode", tool_use.name);
                     return Ok(ToolResult::error(
@@ -789,6 +779,10 @@ mod tests {
     impl Tool for MockTool {
         fn name(&self) -> &str {
             "mock"
+        }
+
+        fn effect(&self) -> crate::programs::ExecutionEffect {
+            crate::programs::ExecutionEffect::Unclassified
         }
 
         fn description(&self) -> &str {

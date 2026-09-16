@@ -3,6 +3,7 @@
 // Enables the LLM to display interactive dialogs and collect user input during
 // task execution. Supports single-select, multi-select, and custom text input.
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::Result;
@@ -15,6 +16,13 @@ pub struct AskUserQuestionTool;
 impl Tool for AskUserQuestionTool {
     fn name(&self) -> &str {
         "ask_user_question"
+    }
+
+    /// Has its own question dialog upstream; declared Unclassified to keep
+    /// the approval-boundary behavior the canonical spelling had under
+    /// the legacy table (issue #466).
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Unclassified
     }
 
     fn description(&self) -> &str {

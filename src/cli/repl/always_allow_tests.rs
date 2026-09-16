@@ -1,5 +1,7 @@
 use super::{apply_repl_always_allow_tools, register_repl_tool_aliases, REPL_ALWAYS_ALLOW_TOOLS};
+use crate::cli::repl::REPL_PLANNING_ALLOWED_TOOLS;
 use crate::generators::{Generator, GeneratorCapabilities, GeneratorResponse};
+use crate::programs::ExecutionEffect;
 use crate::runtime::ProgramRuntime;
 use crate::scheduler::{AgentScheduler, ProviderResolver};
 use crate::tools::{
@@ -154,7 +156,7 @@ fn test_peer_permission_policy_tables_name_only_registered_tools_or_aliases() {
     // loops build their tool lists in build_subagent_tools).
     let catalog = owner_repl_catalog();
     let registry = &catalog.registry;
-    let tables: [(&str, &[&str]); 3] = [
+    let tables: [(&str, &[&str]); 6] = [
         (
             "PEER_SILENT_ALLOW_TOOLS",
             crate::tools::PEER_SILENT_ALLOW_TOOLS,
@@ -164,6 +166,15 @@ fn test_peer_permission_policy_tables_name_only_registered_tools_or_aliases() {
             crate::tools::PEER_REVIEWED_CHANGESET_TOOLS,
         ),
         ("VM_DISCOVERY_TOOLS", crate::tools::VM_DISCOVERY_TOOLS),
+        (
+            "EXECUTOR_PLANNING_ALLOWED_TOOLS",
+            crate::tools::EXECUTOR_PLANNING_ALLOWED_TOOLS,
+        ),
+        (
+            "PLANNING_MODE_ALLOWED_TOOLS",
+            crate::cli::repl_event::plan_handler::PLANNING_MODE_ALLOWED_TOOLS,
+        ),
+        ("REPL_PLANNING_ALLOWED_TOOLS", REPL_PLANNING_ALLOWED_TOOLS),
     ];
     let mut unregistered: Vec<String> = Vec::new();
     for (table, names) in tables {
@@ -173,7 +184,8 @@ fn test_peer_permission_policy_tables_name_only_registered_tools_or_aliases() {
             }
         }
     }
-    // Single-name special cases in check_tool_use / check_peer_tool_use.
+    // Single-name special cases in check_tool_use / check_peer_tool_use and
+    // the approval-site bash refinement.
     for name in ["submit_program", "bash"] {
         if !registry.has_tool(name) {
             unregistered.push(format!("peer/owner special case names '{name}'"));
@@ -189,6 +201,200 @@ fn test_peer_permission_policy_tables_name_only_registered_tools_or_aliases() {
         registry.tool_names(),
         registry.alias_names()
     );
+}
+
+/// Pre-#466 classification oracle: what the deleted string-keyed
+/// `legacy_tool_effect` table computed for each **canonical registered name**
+/// before the refactor. The declared `Tool::effect` values must reproduce
+/// these exactly (except bash, below), so the refactor is provably
+/// behaviour-preserving at the approval boundary. The stale spellings the old
+/// table carried ("todowrite", "enterplanmode", …) matched no registered name
+/// and have no arm here — canonical names fell through to Unclassified, which
+/// is what the approval boundary actually observed.
+fn pre_refactor_effect(tool_name: &str) -> ExecutionEffect {
+    match tool_name {
+        "submit_program" => ExecutionEffect::VmWrite,
+        "get_vm_state"
+        | "get_language_definition"
+        | "search_vm_vocabulary"
+        | "inspect_vm_word"
+        | "search_word"
+        | "inspect_word"
+        | "search_vocabulary"
+        | "inspect_program"
+        | "search_memory"
+        | "list_recent_memories"
+        | "todoread" => ExecutionEffect::VmRead,
+        "todowrite" | "enterplanmode" | "presentplan" | "askuserquestion" | "create_memory" => {
+            ExecutionEffect::VmWrite
+        }
+        "read" | "glob" | "grep" | "hash_compare" | "excel_read" | "excel_range"
+        | "excel_sheets" | "gui_inspect" => ExecutionEffect::WorkspaceRead,
+        "web_fetch" => ExecutionEffect::ExternalRead,
+        "write" | "edit" | "patch" | "excel_write" | "excel_formula" => {
+            ExecutionEffect::WorkspaceWrite
+        }
+        // The old table was input-dependent here: read-only commands yielded
+        // WorkspaceRead, everything else ExternalWrite. The declaration is the
+        // worst case; the read-only refinement is now explicit at the approval
+        // sites (refined_effect_for_approval) and pinned in
+        // tools::permissions::tests.
+        "bash" => ExecutionEffect::ExternalWrite,
+        "restart_session" => ExecutionEffect::Destructive,
+        "run" | "spawn_task" | "ansible" | "gui_click" | "gui_type" | "excel_activate" => {
+            ExecutionEffect::ExternalWrite
+        }
+        _ => ExecutionEffect::Unclassified,
+    }
+}
+
+#[test]
+fn test_declared_effects_match_pre_refactor_classification() {
+    // Issue #466 acceptance: enumerate every registered tool and assert its
+    // declared effect matches what legacy_tool_effect computed before the
+    // change. A mismatch here means the refactor silently re-authorized (or
+    // de-authorized) a tool.
+    let catalog = owner_repl_catalog();
+    let mut checked = 0usize;
+    for tool in catalog.registry.get_all_tools() {
+        let name = tool.name();
+        if name == "bash" {
+            assert_eq!(
+                tool.effect(),
+                ExecutionEffect::ExternalWrite,
+                "bash must declare its worst case; the read-only refinement \
+                 lives at the approval sites, not in the declaration"
+            );
+        } else {
+            assert_eq!(
+                tool.effect(),
+                pre_refactor_effect(name),
+                "'{name}' declared {effect:?} but the pre-refactor table \
+                 classified the canonical name as {expected:?}; re-assert the \
+                 old classification or treat this as a deliberate \
+                 approval-policy change (out of scope for a refactor)",
+                effect = tool.effect(),
+                expected = pre_refactor_effect(name),
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 25,
+        "the owner catalog must enumerate the real tool surface; only \
+         {checked} tools were checked"
+    );
+}
+
+#[test]
+fn test_declared_effect_is_independent_of_dispatch_spelling() {
+    // The deleted legacy table classified by the raw provider spelling:
+    // "TodoWrite" (alias) yielded VmWrite and ran autonomously while the
+    // canonical "todo_write" yielded Unclassified and prompted. Declared
+    // effects travel with the tool, so every dispatch spelling of a tool
+    // must present the same authority.
+    let catalog = owner_repl_catalog();
+    assert!(
+        !catalog.registry.alias_names().is_empty(),
+        "the owner catalog must register aliases for this test to mean anything"
+    );
+    for alias in catalog.registry.alias_names() {
+        let canonical = catalog
+            .registry
+            .get(&alias)
+            .unwrap_or_else(|| panic!("alias {alias} must resolve to a registered tool"))
+            .name()
+            .to_string();
+        assert_eq!(
+            catalog.registry.declared_effect(&alias),
+            catalog.registry.declared_effect(&canonical),
+            "alias '{alias}' and canonical '{canonical}' must present the \
+             same declared effect; classification must not depend on spelling"
+        );
+    }
+}
+
+#[test]
+fn test_planning_allowlists_only_admit_justified_tools() {
+    // Justifies each planning-table entry against the declared effects. An
+    // entry is admissible exactly when one of these holds:
+    //   1. its declared effect is autonomous (reads, VM-local writes),
+    //   2. the tool itself presents a review or question dialog before it
+    //      does anything (present_plan, ask_user_question — the event loop
+    //      intercepts them upstream of the approval gate),
+    //   3. it is bash, whose read-only refinement at the approval sites keeps
+    //      read-only commands autonomous, or
+    //   4. it projects the session-local checklist (todo_read, todo_write) —
+    //      no workspace or host mutation, so planning stays usable; these are
+    //      declared Unclassified only to preserve their owner approval
+    //      behavior (see the declarations in todo_tools.rs), or
+    //   5. it re-enters planning mode (enter_plan_mode) — an idempotent
+    //      session-local no-op while already planning.
+    // A state-changing tool slipping onto a planning table fails here even
+    // though its name registers fine. Names are resolved through the registry
+    // first, so alias spellings are justified by their canonical tool.
+    let catalog = owner_repl_catalog();
+    const JUSTIFIED_EXCEPTIONS: &[&str] = &[
+        "bash",
+        "present_plan",
+        "ask_user_question",
+        "todo_read",
+        "todo_write",
+        "enter_plan_mode",
+    ];
+    for (table, names) in [
+        (
+            "PLANNING_MODE_ALLOWED_TOOLS",
+            crate::cli::repl_event::plan_handler::PLANNING_MODE_ALLOWED_TOOLS,
+        ),
+        ("REPL_PLANNING_ALLOWED_TOOLS", REPL_PLANNING_ALLOWED_TOOLS),
+        (
+            "EXECUTOR_PLANNING_ALLOWED_TOOLS",
+            crate::tools::EXECUTOR_PLANNING_ALLOWED_TOOLS,
+        ),
+    ] {
+        for name in names {
+            let tool = catalog
+                .registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{table} names '{name}' which must register"));
+            let effect = tool.effect();
+            let canonical = tool.name();
+            let justified = effect.runs_autonomously() || JUSTIFIED_EXCEPTIONS.contains(&canonical);
+            assert!(
+                justified,
+                "{table} admits '{name}' (canonical '{canonical}', declared \
+                 effect {effect:?}) with no planning-mode justification; \
+                 planning mode must not admit state-changing tools"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_repl_planning_gate_blocks_spellings_nothing_registers() {
+    // Issue #466: the legacy REPL loop's planning gate once allow-listed
+    // "ExitPlanMode" and "Bash" — spellings no Tool registers and no alias
+    // covers, which could only die later at dispatch. The gate now refuses
+    // them up front while canonical and alias spellings stay allowed.
+    use crate::cli::ReplMode;
+    let mode = ReplMode::Planning {
+        task: String::new(),
+        plan_path: std::path::PathBuf::from("/tmp/plan.md"),
+        created_at: chrono::Utc::now(),
+    };
+    for tool in ["ExitPlanMode", "Bash"] {
+        assert!(
+            !super::Repl::is_tool_allowed_in_mode(tool, &mode),
+            "{tool} registers as nothing and must not pass the planning gate"
+        );
+    }
+    for tool in ["bash", "enter_plan_mode", "EnterPlanMode", "read"] {
+        assert!(
+            super::Repl::is_tool_allowed_in_mode(tool, &mode),
+            "{tool} must still pass the legacy REPL planning gate"
+        );
+    }
 }
 
 #[test]

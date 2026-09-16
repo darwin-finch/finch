@@ -2,6 +2,7 @@
 //
 // Returns MD5 hashes of both files and whether they are identical.
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -61,6 +62,10 @@ fn md5_hex(data: &[u8]) -> String {
 impl Tool for HashCompareTool {
     fn name(&self) -> &str {
         "hash_compare"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceRead
     }
 
     fn description(&self) -> &str {

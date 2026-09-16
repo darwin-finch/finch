@@ -4,6 +4,7 @@
 // displayed in the TUI live area.  Both tools capture an
 // Arc<RwLock<TodoList>> directly — no ToolContext fields needed.
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::todo::{TodoItem, TodoList};
 use crate::tools::types::{ToolContext, ToolInputSchema};
@@ -44,6 +45,15 @@ impl TodoWriteTool {
 impl Tool for TodoWriteTool {
     fn name(&self) -> &str {
         "todo_write"
+    }
+
+    /// Session-local checklist write. The legacy table only classified the
+    /// stale spelling "todowrite", which no tool registers; declaring
+    /// VmWrite would silently drop the owner approval prompt the
+    /// canonical name has today, so Unclassified is explicit pending a
+    /// deliberate approval-policy change (issue #466).
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Unclassified
     }
 
     fn description(&self) -> &str {
@@ -151,6 +161,13 @@ impl TodoReadTool {
 impl Tool for TodoReadTool {
     fn name(&self) -> &str {
         "todo_read"
+    }
+
+    /// Session-local checklist read. The legacy table only classified the
+    /// stale spelling "todoread", which no tool registers; Unclassified
+    /// preserves the canonical name's approval behavior (issue #466).
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Unclassified
     }
 
     fn description(&self) -> &str {

@@ -4,6 +4,7 @@
 // (Claude, GPT-4, Grok, etc.) when needed.
 
 use crate::llms::LLM;
+use crate::programs::ExecutionEffect;
 use crate::providers::Message;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
@@ -79,6 +80,13 @@ impl LLMDelegationTool {
 impl Tool for LLMDelegationTool {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Worst case: the query leaves the host for an external LLM service.
+    /// Non-autonomous, so it keeps requiring approval — the same
+    /// approval-boundary behavior its runtime names had implicitly.
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::ExternalWrite
     }
 
     fn description(&self) -> &str {
@@ -177,4 +185,59 @@ pub fn create_llm_tools(registry: &crate::llms::LLMRegistry) -> Vec<Box<dyn Tool
     }
 
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_llm_delegation_declares_worst_case_external_write() {
+        // Issue #466: the delegation tools send the query to an external LLM
+        // service, so they declare the worst case (ExternalWrite) and never
+        // run autonomously — the same approval-boundary behavior their
+        // runtime names had under the deleted legacy table (which classified
+        // them Unclassified). They are constructed dynamically per teacher
+        // and are not part of the static owner catalog, so the catalog-wide
+        // classification conformance does not see them.
+        for name in [
+            "use_claude",
+            "use_gpt4",
+            "use_grok",
+            "use_gemini",
+            "use_deepseek",
+        ] {
+            let tool =
+                LLMDelegationTool::new(name, Arc::new(NullLlm), format!("delegate to {name}"));
+            assert_eq!(
+                crate::tools::Tool::effect(&tool),
+                crate::programs::ExecutionEffect::ExternalWrite,
+                "{name} must declare ExternalWrite (worst case)"
+            );
+            assert!(
+                !crate::tools::Tool::effect(&tool).runs_autonomously(),
+                "{name} must not run autonomously"
+            );
+            assert_eq!(crate::tools::Tool::name(&tool), name);
+        }
+    }
+
+    /// Null LLM — fails on any actual call; only constructions happen here.
+    struct NullLlm;
+
+    #[async_trait::async_trait]
+    impl crate::llms::LLM for NullLlm {
+        fn name(&self) -> &str {
+            "null"
+        }
+        fn provider(&self) -> &str {
+            "null"
+        }
+        fn model(&self) -> &str {
+            "null"
+        }
+        async fn generate(&self, _messages: &[crate::providers::Message]) -> Result<String> {
+            anyhow::bail!("null llm")
+        }
+    }
 }

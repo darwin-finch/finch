@@ -2,6 +2,7 @@
 //
 // Manages available tools and provides uniform execution interface
 
+use crate::programs::ExecutionEffect;
 use crate::tools::types::{ToolContext, ToolDefinition, ToolInputSchema};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,6 +14,23 @@ use std::collections::HashMap;
 pub trait Tool: Send + Sync {
     /// Tool name (e.g., "bash", "read", "glob")
     fn name(&self) -> &str;
+
+    /// Upper bound on what executing this tool can affect.
+    ///
+    /// There is deliberately **no default**: a new tool cannot exist without
+    /// stating its authority, so a classification gap is a compile error
+    /// rather than a policy table silently defaulting to
+    /// [`ExecutionEffect::Unclassified`]. A rename carries the declaration
+    /// with it, so name-drift cannot strand an effect.
+    ///
+    /// The declaration must be the tool's **worst case**. For tools whose
+    /// authority depends on the invocation input (bash decides read-only vs
+    /// side-effecting from the command text), declare the worst case here;
+    /// input-dependent refinements belong at the approval call sites that
+    /// consume the effect (see
+    /// [`crate::tools::refined_effect_for_approval`]), never inside this
+    /// method — it takes no input by design.
+    fn effect(&self) -> ExecutionEffect;
 
     /// Human-readable description of what the tool does
     fn description(&self) -> &str;
@@ -90,6 +108,28 @@ impl ToolRegistry {
         self.aliases.keys().cloned().collect()
     }
 
+    /// List every name dispatch accepts: registered tool names plus alias
+    /// keys. Policy tables and their conformance tests key off this set, so a
+    /// literal that neither a `Tool` registers nor an alias covers cannot
+    /// hide inside one.
+    pub fn dispatch_names(&self) -> Vec<String> {
+        self.tools
+            .keys()
+            .chain(self.aliases.keys())
+            .cloned()
+            .collect()
+    }
+
+    /// Declared effect for a dispatch name: the registered tool's
+    /// [`Tool::effect`], alias-resolved. Names nothing registers classify as
+    /// [`ExecutionEffect::Unclassified`], which never runs autonomously —
+    /// unknown spellings keep requiring approval instead of inheriting one.
+    pub fn declared_effect(&self, name: &str) -> ExecutionEffect {
+        self.get(name)
+            .map(|tool| tool.effect())
+            .unwrap_or(ExecutionEffect::Unclassified)
+    }
+
     /// Get all tool definitions (for Claude API)
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|t| t.definition()).collect()
@@ -130,6 +170,10 @@ mod tests {
     impl Tool for MockTool {
         fn name(&self) -> &str {
             &self.name
+        }
+
+        fn effect(&self) -> ExecutionEffect {
+            ExecutionEffect::Unclassified
         }
 
         fn description(&self) -> &str {
