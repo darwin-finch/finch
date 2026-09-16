@@ -11,12 +11,12 @@ use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::ipc::brain_codec::{
+use crate::ipc::codec::{
     decode_approval_audience, decode_brain_submission, decode_environment,
     encode_approval_audience, encode_attachment, encode_brain_submission_outcome, encode_event,
     encode_run, encode_runner_handoff, encode_runner_lease, encode_schedule, encode_snapshot,
 };
-use crate::ipc::checkpoint_codec::{
+use crate::ipc::codec::{
     decode_checkpoint, decode_packed_delivery_envelopes, encode_checkpoint,
     encode_packed_runtime_application_frames,
 };
@@ -174,9 +174,9 @@ pub(crate) async fn request_test_turn_approval_with_client(
     encoded.set_approval_kind(&approval_kind);
     encoded.set_subject(&subject);
     encode_approval_audience(encoded.reborrow().init_approval_audience(), &audience);
-    crate::ipc::brain_codec::encode_json_value(encoded.reborrow().init_detail(), &detail)?;
+    crate::ipc::codec::encode_json_value(encoded.reborrow().init_detail(), &detail)?;
     let response = call.send().promise.await?;
-    crate::ipc::brain_codec::decode_json_value(response.get()?.get_decision()?)
+    crate::ipc::codec::decode_json_value(response.get()?.get_decision()?)
 }
 
 #[cfg(test)]
@@ -315,7 +315,7 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let status = match params.get_status() {
-            Ok(status) => crate::ipc::brain_codec::run_status_from_capnp(status),
+            Ok(status) => crate::ipc::codec::run_status_from_capnp(status),
             Err(error) => return Promise::err(error.into()),
         };
         let detail = params
@@ -358,7 +358,7 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
         let grant_ceiling = match params
             .get_grant_ceiling()
             .map_err(anyhow::Error::from)
-            .and_then(crate::ipc::checkpoint_codec::decode_effects)
+            .and_then(crate::ipc::codec::decode_effects)
         {
             Ok(effects) => effects,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -475,7 +475,7 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
         let effect = match params
             .get_effect()
             .map_err(anyhow::Error::from)
-            .and_then(crate::ipc::checkpoint_codec::decode_vm_side_effect)
+            .and_then(crate::ipc::codec::decode_vm_side_effect)
         {
             Ok(effect) => effect,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -601,7 +601,7 @@ impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermit
         let outcome = match outcome.which() {
             Ok(Which::Acknowledged(values)) => match values
                 .map_err(anyhow::Error::from)
-                .and_then(|values| crate::ipc::checkpoint_codec::decode_value_list(values, 0))
+                .and_then(|values| crate::ipc::codec::decode_value_list(values, 0))
             {
                 Ok(values) => crate::runtime::EffectAuditTerminalOutcome::Acknowledged {
                     response: crate::runtime::VmResumeResponse::Result { values },
@@ -735,7 +735,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                 }
             };
             let mut response = results.get();
-            super::brain_codec::encode_json_value(response.reborrow().init_decision(), &decision)
+            super::codec::encode_json_value(response.reborrow().init_decision(), &decision)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
             Ok(())
         })
@@ -770,7 +770,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
         let effect = match params
             .get_effect()
             .map_err(anyhow::Error::from)
-            .and_then(crate::ipc::checkpoint_codec::decode_vm_side_effect)
+            .and_then(crate::ipc::codec::decode_vm_side_effect)
         {
             Ok(effect) => effect,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -1325,7 +1325,7 @@ impl brain_service::Server for BrainRpcService {
         let grant_ceiling = match params
             .get_grant_ceiling()
             .map_err(anyhow::Error::from)
-            .and_then(crate::ipc::checkpoint_codec::decode_effects)
+            .and_then(crate::ipc::codec::decode_effects)
         {
             Ok(effects) => effects,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -1637,7 +1637,7 @@ fn write_query_response(
         let mut t = tu_list.reborrow().get(i as u32);
         t.set_id(tu.id.as_str());
         t.set_name(tu.name.as_str());
-        super::brain_codec::encode_json_value(t.reborrow().init_input(), &tu.input)
+        super::codec::encode_json_value(t.reborrow().init_input(), &tu.input)
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
     }
     Ok(())
@@ -1696,7 +1696,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         mut results: finch_daemon::QueryResults,
     ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let p = pry!(params.get());
-        let messages = pry!(super::brain_codec::decode_messages(pry!(p.get_messages()))
+        let messages = pry!(super::codec::decode_messages(pry!(p.get_messages()))
             .map_err(|error| capnp::Error::failed(error.to_string())));
         let tools = pry!(read_tools(pry!(p.get_tools())));
         let server = Arc::clone(&self.server);
@@ -1738,7 +1738,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         _results: finch_daemon::QueryStreamResults,
     ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let p = pry!(params.get());
-        let messages = pry!(super::brain_codec::decode_messages(pry!(p.get_messages()))
+        let messages = pry!(super::codec::decode_messages(pry!(p.get_messages()))
             .map_err(|error| capnp::Error::failed(error.to_string())));
         let tools = pry!(read_tools(pry!(p.get_tools())));
         let receiver = pry!(p.get_receiver());
@@ -1844,7 +1844,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
                                 let mut tool = encoded.init_tool_use();
                                 tool.set_id(&id);
                                 tool.set_name(&name);
-                                super::brain_codec::encode_json_value(
+                                super::codec::encode_json_value(
                                     tool.reborrow().init_input(),
                                     &input,
                                 )
@@ -2175,7 +2175,7 @@ async fn forward_runner_request(
                 });
                 payload.set_has_grant_ceiling(request.grant_ceiling.is_some());
                 if let Some(grant_ceiling) = &request.grant_ceiling {
-                    crate::ipc::checkpoint_codec::encode_effects(
+                    crate::ipc::codec::encode_effects(
                         payload
                             .reborrow()
                             .init_grant_ceiling(grant_ceiling.0.len() as u32),
@@ -2241,7 +2241,7 @@ async fn forward_runner_request(
                     payload.set_run_id(&request.run_id.0.to_string());
                     payload.set_request_seq(request.request_seq);
                     payload.set_prompt(&request.prompt);
-                    let encoded = super::brain_codec::encode_messages(
+                    let encoded = super::codec::encode_messages(
                         payload
                             .reborrow()
                             .init_context(request.context.len() as u32),
@@ -2472,7 +2472,7 @@ fn decode_runner_turn_result(
             while let Some(notice) = rx.recv().await {
                 let mut call = capability.committed_request();
                 call.get()
-                    .set_status(crate::ipc::brain_codec::run_status_to_capnp(notice.status));
+                    .set_status(crate::ipc::codec::run_status_to_capnp(notice.status));
                 call.get().set_detail(&notice.detail);
                 if let Err(error) = call.send().promise.await {
                     tracing::warn!(%error, "could not acknowledge committed Brain turn to runner");
@@ -2500,7 +2500,7 @@ fn decode_runner_turn_result(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string(),
-        continuation_messages: crate::ipc::brain_codec::decode_continuation_messages(
+        continuation_messages: crate::ipc::codec::decode_continuation_messages(
             result
                 .get_continuation_messages()
                 .map_err(|error| error.to_string())?,
@@ -2511,7 +2511,7 @@ fn decode_runner_turn_result(
             .then(|| result.get_invocation_metadata())
             .transpose()
             .map_err(|error| error.to_string())?
-            .map(crate::ipc::brain_codec::decode_invocation_metadata)
+            .map(crate::ipc::codec::decode_invocation_metadata)
             .transpose()
             .map_err(|error| error.to_string())?,
         turn_events,
@@ -2528,7 +2528,7 @@ fn decode_runner_effect_records(
     encoded
         .iter()
         .map(|record| {
-            let (execution_id, entry) = crate::ipc::checkpoint_codec::decode_effect_record(record)
+            let (execution_id, entry) = crate::ipc::codec::decode_effect_record(record)
                 .map_err(|error| error.to_string())?;
             Ok(crate::server::RunnerEffectRecord {
                 execution_id,
@@ -2553,7 +2553,7 @@ fn decode_runner_turn_event(
         finch_ipc_capnp::BrainTurnEventKind::Call => Ok(crate::server::RunnerTurnEvent::Call {
             tool_id,
             name: text(encoded.get_name()),
-            input: super::brain_codec::decode_json_value(
+            input: super::codec::decode_json_value(
                 encoded.get_input().map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?,
@@ -2574,7 +2574,7 @@ fn decode_runner_turn_event(
                         .map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())?,
-                detail: super::brain_codec::decode_json_value(
+                detail: super::codec::decode_json_value(
                     encoded.get_detail().map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())?,
@@ -2583,7 +2583,7 @@ fn decode_runner_turn_event(
         finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided => {
             Ok(crate::server::RunnerTurnEvent::ApprovalDecided {
                 approval_id: text(encoded.get_approval_id()),
-                decision: super::brain_codec::decode_json_value(
+                decision: super::codec::decode_json_value(
                     encoded.get_decision().map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())?,

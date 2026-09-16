@@ -63,7 +63,7 @@ fn decode_task_list(
         .collect::<anyhow::Result<Vec<_>>>()
 }
 
-pub(super) fn encode_json_value(
+pub(crate) fn encode_json_value(
     builder: finch_ipc_capnp::json_value::Builder<'_>,
     value: &serde_json::Value,
 ) -> anyhow::Result<()> {
@@ -109,7 +109,7 @@ fn encode_json_value_at(
     Ok(())
 }
 
-pub(super) fn decode_json_value(
+pub(crate) fn decode_json_value(
     reader: finch_ipc_capnp::json_value::Reader<'_>,
 ) -> anyhow::Result<serde_json::Value> {
     decode_json_value_at(reader, 0)
@@ -152,7 +152,7 @@ fn decode_json_value_at(
     })
 }
 
-pub(super) fn encode_messages(
+pub(crate) fn encode_messages(
     mut builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
     messages: &[crate::providers::Message],
 ) -> anyhow::Result<()> {
@@ -195,7 +195,7 @@ pub(super) fn encode_messages(
     Ok(())
 }
 
-pub(super) fn decode_messages(
+pub(crate) fn decode_messages(
     messages: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
 ) -> anyhow::Result<Vec<crate::providers::Message>> {
     let mut decoded = Vec::with_capacity(messages.len() as usize);
@@ -246,7 +246,7 @@ pub(super) fn decode_messages(
     Ok(decoded)
 }
 
-pub(super) fn encode_invocation_metadata(
+pub(crate) fn encode_invocation_metadata(
     mut builder: finch_ipc_capnp::invocation_metadata::Builder<'_>,
     metadata: &crate::providers::InvocationMetadata,
 ) {
@@ -271,7 +271,7 @@ pub(super) fn encode_invocation_metadata(
     }
 }
 
-pub(super) fn decode_invocation_metadata(
+pub(crate) fn decode_invocation_metadata(
     reader: finch_ipc_capnp::invocation_metadata::Reader<'_>,
 ) -> anyhow::Result<crate::providers::InvocationMetadata> {
     let metadata = crate::providers::InvocationMetadata {
@@ -295,14 +295,14 @@ pub(super) fn decode_invocation_metadata(
     Ok(metadata)
 }
 
-pub(super) fn encode_continuation_messages(
+pub(crate) fn encode_continuation_messages(
     builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
     messages: &[crate::providers::Message],
 ) -> anyhow::Result<()> {
     encode_messages(builder, messages)
 }
 
-pub(super) fn decode_continuation_messages(
+pub(crate) fn decode_continuation_messages(
     messages: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
 ) -> anyhow::Result<Vec<crate::providers::Message>> {
     let decoded = decode_messages(messages)?;
@@ -530,7 +530,7 @@ fn schedule_policy_kind_to_capnp(
     }
 }
 
-pub(super) fn encode_approval_audience(
+pub(crate) fn encode_approval_audience(
     mut builder: brain_approval_audience::Builder<'_>,
     audience: &BrainApprovalAudience,
 ) {
@@ -542,7 +542,7 @@ pub(super) fn encode_approval_audience(
     builder.set_environment_generation(audience.environment_generation);
 }
 
-pub(super) fn decode_approval_audience(
+pub(crate) fn decode_approval_audience(
     reader: brain_approval_audience::Reader<'_>,
 ) -> anyhow::Result<BrainApprovalAudience> {
     Ok(BrainApprovalAudience {
@@ -557,7 +557,7 @@ pub(super) fn decode_approval_audience(
     })
 }
 
-pub(super) fn encode_brain_submission(
+pub(crate) fn encode_brain_submission(
     mut builder: finch_ipc_capnp::brain_submission::Builder<'_>,
     kind: &BrainEventKind,
 ) -> anyhow::Result<()> {
@@ -591,7 +591,7 @@ pub(super) fn encode_brain_submission(
     Ok(())
 }
 
-pub(super) fn decode_brain_submission(
+pub(crate) fn decode_brain_submission(
     reader: finch_ipc_capnp::brain_submission::Reader<'_>,
 ) -> anyhow::Result<BrainEventKind> {
     use finch_ipc_capnp::brain_submission::Which;
@@ -628,7 +628,7 @@ pub(super) fn decode_brain_submission(
     })
 }
 
-pub(super) fn encode_brain_submission_outcome(
+pub(crate) fn encode_brain_submission_outcome(
     mut builder: finch_ipc_capnp::brain_submission_outcome::Builder<'_>,
     accepted: &BrainEvent,
     run: Option<&BrainRun>,
@@ -681,7 +681,7 @@ pub(crate) fn decode_brain_wire_message(bytes: &[u8]) -> anyhow::Result<BrainWir
     decode_brain_wire_reader(root)
 }
 
-pub(super) fn decode_brain_wire_reader(
+pub(crate) fn decode_brain_wire_reader(
     root: finch_ipc_capnp::brain_wire_message::Reader<'_>,
 ) -> anyhow::Result<BrainWireMessage> {
     match root.which()? {
@@ -755,7 +755,7 @@ pub(crate) fn encode_brain_remote_envelope(
                     let mut request = builder.init_create_schedule();
                     request.set_language(language_to_capnp(*language));
                     request.set_source(source);
-                    crate::ipc::checkpoint_codec::encode_effects(
+                    super::checkpoint_codec::encode_effects(
                         request
                             .reborrow()
                             .init_grant_ceiling(grant_ceiling.0.len() as u32),
@@ -902,7 +902,7 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                     BrainRemoteCommandKind::CreateSchedule {
                         language: language_from_capnp(request.get_language()?),
                         source: text(request.get_source()?)?,
-                        grant_ceiling: crate::ipc::checkpoint_codec::decode_effects(
+                        grant_ceiling: super::checkpoint_codec::decode_effects(
                             request.get_grant_ceiling()?,
                         )?,
                         next_due_ms: request.get_next_due_ms(),
@@ -981,7 +981,7 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
     })
 }
 
-pub(super) fn encode_snapshot(
+pub(crate) fn encode_snapshot(
     mut builder: finch_ipc_capnp::brain_snapshot::Builder<'_>,
     snapshot: &BrainSnapshot,
 ) -> anyhow::Result<()> {
@@ -1042,7 +1042,7 @@ pub(super) fn encode_snapshot(
     Ok(())
 }
 
-pub(super) fn decode_snapshot(
+pub(crate) fn decode_snapshot(
     reader: finch_ipc_capnp::brain_snapshot::Reader<'_>,
 ) -> anyhow::Result<BrainSnapshot> {
     let events = reader
@@ -1116,7 +1116,7 @@ pub(super) fn decode_snapshot(
     })
 }
 
-pub(super) fn encode_environment(
+pub(crate) fn encode_environment(
     mut builder: finch_ipc_capnp::brain_environment::Builder<'_>,
     environment: &BrainEnvironment,
 ) {
@@ -1125,7 +1125,7 @@ pub(super) fn encode_environment(
     builder.set_generation(environment.generation);
 }
 
-pub(super) fn decode_environment(
+pub(crate) fn decode_environment(
     reader: finch_ipc_capnp::brain_environment::Reader<'_>,
 ) -> anyhow::Result<BrainEnvironment> {
     Ok(BrainEnvironment {
@@ -1135,7 +1135,7 @@ pub(super) fn decode_environment(
     })
 }
 
-pub(super) fn encode_attachment(
+pub(crate) fn encode_attachment(
     mut builder: finch_ipc_capnp::brain_attachment::Builder<'_>,
     attachment: &BrainAttachment,
 ) {
@@ -1150,7 +1150,7 @@ pub(super) fn encode_attachment(
     }
 }
 
-pub(super) fn decode_attachment(
+pub(crate) fn decode_attachment(
     reader: finch_ipc_capnp::brain_attachment::Reader<'_>,
 ) -> anyhow::Result<BrainAttachment> {
     Ok(BrainAttachment {
@@ -1169,7 +1169,7 @@ pub(super) fn decode_attachment(
     })
 }
 
-pub(super) fn encode_runner_lease(
+pub(crate) fn encode_runner_lease(
     mut builder: finch_ipc_capnp::brain_runner_lease::Builder<'_>,
     lease: &BrainRunnerLease,
 ) {
@@ -1180,7 +1180,7 @@ pub(super) fn encode_runner_lease(
     builder.set_expires_ms(lease.expires_ms);
 }
 
-pub(super) fn decode_runner_lease(
+pub(crate) fn decode_runner_lease(
     reader: finch_ipc_capnp::brain_runner_lease::Reader<'_>,
 ) -> anyhow::Result<BrainRunnerLease> {
     Ok(BrainRunnerLease {
@@ -1192,7 +1192,7 @@ pub(super) fn decode_runner_lease(
     })
 }
 
-pub(super) fn encode_runner_handoff(
+pub(crate) fn encode_runner_handoff(
     mut builder: finch_ipc_capnp::brain_runner_handoff::Builder<'_>,
     handoff: &BrainRunnerHandoff,
 ) {
@@ -1205,7 +1205,7 @@ pub(super) fn encode_runner_handoff(
     builder.set_expires_ms(handoff.expires_ms);
 }
 
-pub(super) fn decode_runner_handoff(
+pub(crate) fn decode_runner_handoff(
     reader: finch_ipc_capnp::brain_runner_handoff::Reader<'_>,
 ) -> anyhow::Result<BrainRunnerHandoff> {
     Ok(BrainRunnerHandoff {
@@ -1240,7 +1240,7 @@ fn decode_program(
     })
 }
 
-pub(super) fn encode_run(mut builder: finch_ipc_capnp::brain_run::Builder<'_>, run: &BrainRun) {
+pub(crate) fn encode_run(mut builder: finch_ipc_capnp::brain_run::Builder<'_>, run: &BrainRun) {
     builder.set_run_id(&run.run_id.0.to_string());
     builder.set_kind(run_kind_to_capnp(run.kind));
     if let Some(parent_run_id) = run.parent_run_id {
@@ -1259,7 +1259,7 @@ pub(super) fn encode_run(mut builder: finch_ipc_capnp::brain_run::Builder<'_>, r
     }
 }
 
-pub(super) fn decode_run(
+pub(crate) fn decode_run(
     reader: finch_ipc_capnp::brain_run::Reader<'_>,
 ) -> anyhow::Result<BrainRun> {
     Ok(BrainRun {
@@ -1294,7 +1294,7 @@ pub(crate) fn encode_schedule(
     builder.set_schedule_id(&schedule.schedule_id.0.to_string());
     builder.set_initiating_attachment_id(&schedule.initiating_attachment_id.0.to_string());
     builder.set_created_by(&schedule.created_by);
-    crate::ipc::checkpoint_codec::encode_effects(
+    super::checkpoint_codec::encode_effects(
         builder
             .reborrow()
             .init_grant_ceiling(schedule.grant_ceiling.0.len() as u32),
@@ -1343,7 +1343,7 @@ pub(crate) fn decode_schedule(
         schedule_id: ScheduleId(parse_uuid(reader.get_schedule_id()?)?),
         initiating_attachment_id: AttachmentId(parse_uuid(reader.get_initiating_attachment_id()?)?),
         created_by: text(reader.get_created_by()?)?,
-        grant_ceiling: crate::ipc::checkpoint_codec::decode_effects(reader.get_grant_ceiling()?)?,
+        grant_ceiling: super::checkpoint_codec::decode_effects(reader.get_grant_ceiling()?)?,
         language: language_from_capnp(reader.get_language()?),
         source: text(reader.get_source()?)?,
         next_due_ms: reader.get_next_due_ms(),
@@ -1373,7 +1373,7 @@ fn encode_schedule_due(
     encode_run(builder.reborrow().init_run(), &due.run);
     builder.set_language(language_to_capnp(due.language));
     builder.set_source(&due.source);
-    crate::ipc::checkpoint_codec::encode_effects(
+    super::checkpoint_codec::encode_effects(
         builder
             .reborrow()
             .init_grant_ceiling(due.grant_ceiling.0.len() as u32),
@@ -1394,7 +1394,7 @@ fn decode_schedule_due(
         run: decode_run(reader.get_run()?)?,
         language: language_from_capnp(reader.get_language()?),
         source: text(reader.get_source()?)?,
-        grant_ceiling: crate::ipc::checkpoint_codec::decode_effects(reader.get_grant_ceiling()?)?,
+        grant_ceiling: super::checkpoint_codec::decode_effects(reader.get_grant_ceiling()?)?,
         due_at_ms: reader.get_due_at_ms(),
         first_missed_at_ms: reader.get_first_missed_at_ms(),
         missed_count: reader.get_missed_count(),
@@ -1404,7 +1404,7 @@ fn decode_schedule_due(
     })
 }
 
-pub(super) fn encode_event(
+pub(crate) fn encode_event(
     mut builder: finch_ipc_capnp::brain_event::Builder<'_>,
     event: &BrainEvent,
 ) -> anyhow::Result<()> {
@@ -1638,11 +1638,11 @@ pub(super) fn encode_event(
             let mut recorded = builder.init_effect_recorded();
             recorded.set_request_seq(*request_seq);
             recorded.set_execution_id(&execution_id.to_string());
-            crate::ipc::checkpoint_codec::encode_vm_side_effect(
+            super::checkpoint_codec::encode_vm_side_effect(
                 recorded.reborrow().init_effect(),
                 effect,
             )?;
-            crate::ipc::checkpoint_codec::encode_effect_journal_state(
+            super::checkpoint_codec::encode_effect_journal_state(
                 recorded.reborrow().init_state(),
                 state,
             )?;
@@ -1661,7 +1661,7 @@ pub(super) fn encode_event(
     Ok(())
 }
 
-pub(super) fn decode_event(
+pub(crate) fn decode_event(
     reader: finch_ipc_capnp::brain_event::Reader<'_>,
 ) -> anyhow::Result<BrainEvent> {
     use finch_ipc_capnp::brain_event::Which;
@@ -1864,12 +1864,8 @@ pub(super) fn decode_event(
             BrainEventKind::EffectRecorded {
                 request_seq: recorded.get_request_seq(),
                 execution_id: parse_uuid(recorded.get_execution_id()?)?,
-                effect: crate::ipc::checkpoint_codec::decode_vm_side_effect(
-                    recorded.get_effect()?,
-                )?,
-                state: crate::ipc::checkpoint_codec::decode_effect_journal_state(
-                    recorded.get_state()?,
-                )?,
+                effect: super::checkpoint_codec::decode_vm_side_effect(recorded.get_effect()?)?,
+                state: super::checkpoint_codec::decode_effect_journal_state(recorded.get_state()?)?,
             }
         }
         Which::EffectAuditTransition(encoded) => {
