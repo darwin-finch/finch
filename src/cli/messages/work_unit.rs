@@ -1962,9 +1962,16 @@ mod tests {
         );
         let plain = format_row_collapsed(&row, &colors(), DiffColorMode::NoColor);
         assert_ne!(dark, light);
-        assert!(dark.contains("38;2;126;231;135"));
-        assert!(light.contains("38;2;0;92;38"));
+        assert!(
+            dark.contains("48;2;20;72;40") && dark.contains("38;2;236;246;238"),
+            "collapsed dark diffs must fill add rows; dark={dark}"
+        );
+        assert!(
+            light.contains("48;2;204;240;214") && light.contains("38;2;12;56;28"),
+            "collapsed light diffs must fill add rows; light={light}"
+        );
         assert!(!plain.contains("38;2;"));
+        assert!(!plain.contains("48;2;"));
     }
 
     #[test]

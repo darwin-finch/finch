@@ -19,6 +19,7 @@ pub(super) enum VtColor {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct VtStyle {
     pub foreground: VtColor,
+    pub background: VtColor,
     pub bold: bool,
     pub reverse: bool,
 }
@@ -202,7 +203,24 @@ impl VtOracle {
                     index += 4;
                 }
                 39 => self.style.foreground = VtColor::Default,
+                40..=47 => self.style.background = VtColor::Indexed((values[index] - 40) as u8),
+                48 if values.get(index + 1) == Some(&5) && values.get(index + 2).is_some() => {
+                    self.style.background = VtColor::Indexed(values[index + 2] as u8);
+                    index += 2;
+                }
+                48 if values.get(index + 1) == Some(&2) && values.get(index + 4).is_some() => {
+                    self.style.background = VtColor::Rgb(
+                        values[index + 2] as u8,
+                        values[index + 3] as u8,
+                        values[index + 4] as u8,
+                    );
+                    index += 4;
+                }
+                49 => self.style.background = VtColor::Default,
                 90..=97 => self.style.foreground = VtColor::Indexed((values[index] - 90 + 8) as u8),
+                100..=107 => {
+                    self.style.background = VtColor::Indexed((values[index] - 100 + 8) as u8)
+                }
                 _ => {}
             }
             index += 1;

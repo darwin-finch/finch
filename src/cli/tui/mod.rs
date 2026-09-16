@@ -6989,6 +6989,7 @@ mod tests {
         let prompt_style = terminal.cell(1, 0).style;
         let colored_prompt = VtStyle {
             foreground: VtColor::Indexed(14),
+            background: VtColor::Default,
             bold: false,
             reverse: false,
         };
@@ -7006,6 +7007,7 @@ mod tests {
         let expected_secondary = if prompt_style == colored_prompt {
             VtStyle {
                 foreground: VtColor::Indexed(8),
+                background: VtColor::Default,
                 bold: false,
                 reverse: false,
             }
@@ -7193,19 +7195,38 @@ mod tests {
         });
         let removed_col = terminal.row(removed_row).find("- before").unwrap();
         let added_col = terminal.row(added_row).find("+ after").unwrap();
+        let removed_style = terminal.cell(removed_row, removed_col).style;
+        let added_style = terminal.cell(added_row, added_col).style;
         assert_vt(
-            terminal.cell(removed_row, removed_col).style.foreground == VtColor::Rgb(255, 123, 114),
-            "the structured removal must use the dark-theme removal color",
+            removed_style.foreground == VtColor::Rgb(255, 236, 236)
+                && removed_style.background == VtColor::Rgb(88, 24, 28),
+            "the structured removal must fill a red background with contrasting ink",
             &terminal,
         );
         assert_vt(
-            terminal.cell(added_row, added_col).style.foreground == VtColor::Rgb(126, 231, 135),
-            "the structured addition must use the dark-theme addition color",
+            added_style.foreground == VtColor::Rgb(236, 246, 238)
+                && added_style.background == VtColor::Rgb(20, 72, 40),
+            "the structured addition must fill a green background with contrasting ink",
+            &terminal,
+        );
+        let keep_row = terminal.find_row("keep").unwrap_or_else(|| {
+            panic!(
+                "context row must remain decision-visible\n{}",
+                terminal.diagnostic()
+            )
+        });
+        let keep_col = terminal.row(keep_row).find("keep").unwrap();
+        let keep_style = terminal.cell(keep_row, keep_col).style;
+        assert_vt(
+            keep_style.background == VtColor::Rgb(44, 48, 54)
+                && keep_style.foreground != VtColor::Rgb(245, 247, 250),
+            "context rows at the top/bottom of the hunk must use a grey fill, not near-white ink on a light default",
             &terminal,
         );
         let selected_style = terminal.cell(yes_row, 4).style;
         let colored_selected = VtStyle {
             foreground: VtColor::Indexed(14),
+            background: VtColor::Default,
             bold: true,
             reverse: false,
         };
