@@ -180,7 +180,7 @@ impl TuiRenderer {
     pub fn resume(&mut self) -> anyhow::Result<()>;
     /// Set the OperationStatus line in the status bar (visible while queries run).
     pub fn set_operation_status(&self, msg: impl Into<String>);
-    /// Attach the Co-Forth poset VM so the live area can render its 3D graph.
+    /// Attach the Co-Forth poset VM.
     pub fn set_poset(&mut self, poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>);
     /// Set session identity without writing to the terminal.
     pub fn set_session_label(&mut self, session_label: impl Into<String>);

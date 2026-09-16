@@ -261,10 +261,11 @@ fn stable_poset_order_and_depth(
     (order, depth)
 }
 
-/// Convert Finch's poset into the graph the overlay draws.
+/// Convert Finch's poset into the graph view the Forth overlay would draw.
 ///
-/// This is the injection boundary: the widget takes [`GraphView`], and Finch's
-/// `Poset` is named only here and on [`TuiRenderer::set_poset`].
+/// Unused in production: [`TuiRenderer::draw_poset_overlay`] paints `corner`,
+/// not this view. Named here so Finch's `Poset` stays next to
+/// [`TuiRenderer::set_poset`] rather than in the widget.
 #[allow(dead_code)]
 fn graph_view_from_poset(poset: &crate::poset::Poset) -> GraphView {
     GraphView {
@@ -1513,8 +1514,8 @@ pub struct TuiRenderer {
     // Co-Forth shared stack (set after construction via set_stack)
     stack: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
 
-    // Co-Forth poset VM — 3D rotating graph (set after construction via set_poset).
-    // Finch Poset stays at this injection; render paths snapshot a GraphView.
+    // Co-Forth poset VM (set after construction via set_poset). Stored only;
+    // draw_poset_overlay paints `corner`, not this graph.
     poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
     // True when the poset panel was rendered (non-empty) on the last tick.
     // Used to keep cursor_row_from_top stable when try_lock() fails.
@@ -1777,10 +1778,11 @@ impl TuiRenderer {
         self.stack = Some(stack);
     }
 
-    /// Attach the Co-Forth poset VM so the live area can render its 3D graph.
+    /// Attach the Co-Forth poset VM. Stored, not drawn: the overlay paints `corner`.
     ///
-    /// Finch's `Poset` is accepted only here. The overlay draws [`GraphView`];
-    /// [`graph_view_from_poset`] is the conversion at this injection boundary.
+    /// Finch's `Poset` is accepted only here and held as the shared mutex the
+    /// event loop already owns. [`graph_view_from_poset`] is unused;
+    /// [`draw_poset_overlay`] does not snapshot a [`GraphView`].
     pub fn set_poset(&mut self, poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>) {
         self.poset = Some(poset);
     }
