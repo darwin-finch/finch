@@ -822,6 +822,124 @@ async fn test_named_brain_runner_attaches_its_scheduler() {
         .await;
 }
 
+/// Production-boundary regression for the loop-detected TUI dump: a blocked
+/// bash result must update the labeled bash row, put the full diagnostic in
+/// the expandable body, and must not spawn a second WorkUnit titled with the
+/// raw provider tool id (`call_tyIrmyNxiUxYGF7QhOT1vslZ`).
+#[tokio::test]
+async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::cli::messages::{Message, TranscriptRowKind};
+
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let query_id = Uuid::new_v4();
+            let tool_id = "call_tyIrmyNxiUxYGF7QhOT1vslZ".to_string();
+            let command = serde_json::json!({"command": "git status --porcelain"});
+            let round_token = event_loop
+                .conversation
+                .write()
+                .await
+                .stage_assistant(
+                    query_id,
+                    crate::providers::Message {
+                        role: "assistant".to_string(),
+                        content: vec![crate::providers::ContentBlock::ToolUse {
+                            id: tool_id.clone(),
+                            name: "bash".to_string(),
+                            input: command.clone(),
+                        }],
+                    },
+                )
+                .expect("stage the tool round handle_tool_result records into");
+
+            let work_unit = output.start_work_unit("Tools");
+            let row_idx = work_unit.add_row(
+                crate::cli::repl_event::tool_display::format_tool_label("bash", &command),
+            );
+            event_loop.active_tool_uses.write().await.insert(
+                tool_id.clone(),
+                (
+                    "bash".to_string(),
+                    command,
+                    Arc::clone(&work_unit),
+                    row_idx,
+                ),
+            );
+
+            let error = anyhow::anyhow!(
+                "loop detected: bash called 3 times with the same arguments\n\
+                 Repeating this exact call is unlikely to produce new information. \
+                 Inspect the previous results or use a different command."
+            );
+            event_loop
+                .handle_tool_result(query_id, round_token, tool_id.clone(), Err(error))
+                .await
+                .expect("loop ToolResult must apply to the registered bash row");
+
+            let labels: Vec<String> = output
+                .get_messages()
+                .iter()
+                .filter_map(|message| {
+                    message
+                        .transcript_row(&crate::theme::ColorScheme::default())
+                        .map(|row| row.label)
+                })
+                .collect();
+            assert_eq!(
+                labels.len(),
+                1,
+                "handle_tool_result must not spawn a fallback WorkUnit titled with the raw tool id; labels={labels:?}"
+            );
+            assert!(
+                labels[0].contains("bash"),
+                "Tools header must keep the bash label; got {}",
+                labels[0]
+            );
+            assert!(
+                !labels[0].contains(&tool_id),
+                "Tools header must not echo the raw provider tool id; got {}",
+                labels[0]
+            );
+            assert!(
+                labels[0].contains("loop detected"),
+                "Tools header must name the loop; got {}",
+                labels[0]
+            );
+
+            let projected = work_unit
+                .transcript_row(&crate::theme::ColorScheme::default())
+                .expect("registered bash row still projects");
+            let call = &projected.children[0];
+            assert!(
+                call.label.contains("bash"),
+                "child must stay a bash row, not {tool_id}; got {}",
+                call.label
+            );
+            assert!(
+                !call.label.contains(&tool_id),
+                "child must not be titled with the raw provider tool id; got {}",
+                call.label
+            );
+            let output_row = call
+                .children
+                .iter()
+                .find(|child| child.kind == TranscriptRowKind::ToolOutput)
+                .unwrap_or_else(|| {
+                    panic!("long loop diagnostic must be expandable output; call={call:?}")
+                });
+            assert!(
+                output_row
+                    .body
+                    .iter()
+                    .any(|line| line.contains("unlikely to produce new information")),
+                "expanding the failed bash row must show the full loop diagnostic; output={output_row:?}"
+            );
+        })
+        .await;
+}
+
 fn lifecycle_identity(
     agent_id: uuid::Uuid,
     task_id: uuid::Uuid,
