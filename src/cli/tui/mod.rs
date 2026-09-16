@@ -3560,7 +3560,7 @@ impl TuiRenderer {
         dialog: &Dialog,
         box_width: usize,
     ) -> Result<usize> {
-        Self::draw_dialog_with_control_start(out, dialog, box_width).map(|(rows, _)| rows)
+        Self::draw_dialog_with_control_start(out, dialog, box_width, None).map(|(rows, _)| rows)
     }
 
     /// Paint a dialog and report the logical line index where the control
@@ -3568,10 +3568,15 @@ impl TuiRenderer {
     ///
     /// That index is structural: options always follow the body, so a markdown
     /// payload that happens to contain `●` cannot shift the pin.
+    ///
+    /// `max_rows` is the live-area budget. Keyboard-hint rows are omitted when
+    /// they would force `pin_dialog_controls` to clip the title on a short
+    /// terminal.
     fn draw_dialog_with_control_start(
         out: &mut impl io::Write,
         dialog: &Dialog,
         box_width: usize,
+        max_rows: Option<usize>,
     ) -> Result<(usize, usize)> {
         // Wrap width inside the 2-space left indent (no right border to reserve for).
         let inner = box_width.saturating_sub(2).max(1);
@@ -3822,9 +3827,16 @@ impl TuiRenderer {
             rows += 1;
 
             let hint = "↑/↓: Navigate | Space: Toggle | Enter: Submit | Esc: Cancel";
-            for line in wrap_text(hint, inner) {
-                print_dialog_line(out, &line, Some(Color::DarkGrey), false)?;
-                rows += 1;
+            let hint_lines = wrap_text(hint, inner);
+            // Bottom rule is one more row after this block.
+            let fits = max_rows
+                .map(|max| rows + hint_lines.len() + 1 <= max)
+                .unwrap_or(true);
+            if fits {
+                for line in hint_lines {
+                    print_dialog_line(out, &line, Some(Color::DarkGrey), false)?;
+                    rows += 1;
+                }
             }
         } else if matches!(&dialog.dialog_type, DialogType::Select { .. }) {
             // Select: [ Cancel ]  (no Submit — Enter on an option submits directly)
@@ -3898,8 +3910,12 @@ impl TuiRenderer {
         }
         let width = width.max(1);
         let mut rendered = Vec::new();
-        let control_start = match Self::draw_dialog_with_control_start(&mut rendered, dialog, width)
-        {
+        let control_start = match Self::draw_dialog_with_control_start(
+            &mut rendered,
+            dialog,
+            width,
+            Some(max_rows),
+        ) {
             Ok((_, start)) => start,
             Err(_) => return Vec::new(),
         };
@@ -7206,7 +7222,7 @@ mod tests {
                     terminal.feed(&bytes);
                 }
                 let rule = "─".repeat(width);
-                let expected = [
+                let mut expected = vec![
                     "──  ~/repos/finch  jade-river ──".to_string(),
                     rule.clone(),
                     format!("  {title}"),
@@ -7214,8 +7230,12 @@ mod tests {
                     "    ☐ Keep".to_string(),
                     rule.clone(),
                     "  [ Submit ]   [ Cancel ]".to_string(),
-                    rule,
                 ];
+                if height > 8 {
+                    expected.push("  ↑/↓: Navigate | Space: Toggle".to_string());
+                    expected.push("  | Enter: Submit | Esc: Cancel".to_string());
+                }
+                expected.push(rule);
                 for (row, expected) in expected.iter().enumerate() {
                     assert_vt(
                         terminal.row(plan.live_top + row) == *expected,
@@ -7224,23 +7244,37 @@ mod tests {
                     );
                 }
                 assert_vt(
-                    active_rows == 8
-                        && frame.cursor_row == 7
+                    active_rows == expected.len()
+                        && frame.cursor_row == expected.len() - 1
                         && terminal.cursor() == (height - 1, 0, false),
-                    "dialog paint must own exactly eight rows and hide its cursor on the final row",
+                    "dialog paint must own every expected row and hide its cursor on the final row",
                     &terminal,
                 );
-                for row in 0..plan.live_top {
-                    let expected = match row {
-                        2 => "retained first",
-                        3 => "retained last",
-                        _ => "",
-                    };
+                if height == 12 {
+                    let first =
+                        (0..plan.live_top).find(|&row| terminal.row(row) == "retained first");
+                    let last = (0..plan.live_top).find(|&row| terminal.row(row) == "retained last");
                     assert_vt(
-                        terminal.row(row) == expected,
-                        "dialog paint and repaint must preserve the retained transcript and top padding",
+                        first.is_some()
+                            && last.is_some()
+                            && first < last
+                            && (0..plan.live_top).all(|row| {
+                                matches!(
+                                    terminal.row(row).as_str(),
+                                    "" | "retained first" | "retained last"
+                                )
+                            }),
+                        "taller dialog may consume padding but must keep retained transcript above live_top",
                         &terminal,
                     );
+                } else {
+                    for row in 0..plan.live_top {
+                        assert_vt(
+                            terminal.row(row).is_empty(),
+                            "short dialog must not paint into the region above live_top",
+                            &terminal,
+                        );
+                    }
                 }
             }
 
