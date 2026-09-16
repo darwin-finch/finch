@@ -454,7 +454,8 @@ pub fn physical_rows(s: &str, terminal_width: usize) -> usize {
 /// Diff paint emits 38;2 / 48;2 so add/remove/context fill the row. The
 /// shadow buffer previously stripped those codes and kept only the band,
 /// which made header and context land as near-white ink on a light band.
-fn overlay_sgr_style(line: &str, mut style: Style) -> Style {
+fn overlay_sgr_style(line: &str, band: Style) -> Style {
+    let mut style = band;
     let bytes = line.as_bytes();
     let mut index = 0;
     while index + 1 < bytes.len() {
@@ -468,7 +469,10 @@ fn overlay_sgr_style(line: &str, mut style: Style) -> Style {
         };
         let params = std::str::from_utf8(&rest[..end]).unwrap_or("");
         if params.is_empty() || params == "0" {
-            style = Style::default();
+            // SGR reset returns to the message band, not the terminal default.
+            // User/tool rows end with `\x1b[0m`; wiping the band made those
+            // tests fail and left unpainted cells on the live viewport.
+            style = band;
         } else {
             let numbers = params
                 .split(';')
@@ -477,7 +481,7 @@ fn overlay_sgr_style(line: &str, mut style: Style) -> Style {
             let mut cursor = 0;
             while cursor < numbers.len() {
                 match numbers[cursor] {
-                    0 => style = Style::default(),
+                    0 => style = band,
                     38 if numbers.get(cursor + 1) == Some(&2) && numbers.len() > cursor + 4 => {
                         style = style.fg(Color::Rgb(
                             numbers[cursor + 2],
