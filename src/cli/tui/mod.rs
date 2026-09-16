@@ -3819,6 +3819,13 @@ impl TuiRenderer {
             execute!(out, Print("   "))?;
             print_dialog_token(out, "[ Cancel ]", cursor == cancel_idx)?;
             execute!(out, Print("\r\n"))?;
+            rows += 1;
+
+            let hint = "↑/↓: Navigate | Space: Toggle | Enter: Submit | Esc: Cancel";
+            for line in wrap_text(hint, inner) {
+                print_dialog_line(out, &line, Some(Color::DarkGrey), false)?;
+                rows += 1;
+            }
         } else if matches!(&dialog.dialog_type, DialogType::Select { .. }) {
             // Select: [ Cancel ]  (no Submit — Enter on an option submits directly)
             let hint = if dialog.custom_mode_active {
@@ -3835,13 +3842,15 @@ impl TuiRenderer {
                 SetAttribute(Attribute::Reset),
                 Print("\r\n"),
             )?;
+            rows += 1;
         } else {
             // Confirm / TextInput: just a keybinding hint
             let help = "↑/↓ Navigate  Enter Select  Esc Cancel";
             print_dialog_line(out, help, Some(Color::DarkGrey), false)?;
+            rows += 1;
         }
         execute!(out, Print(&rule), Print("\r\n"))?;
-        rows += 2; // buttons row + bottom rule
+        rows += 1;
 
         Ok((rows, control_start))
     }
@@ -8513,6 +8522,52 @@ mod draw_dialog_tests {
         );
         let lines = render_lines(&dialog);
         check_widths(&lines, 72);
+    }
+
+    #[test]
+    fn test_live_multiselect_renders_and_honors_complete_keyboard_hint() {
+        let mut dialog = Dialog::multiselect(
+            "Choose all that apply",
+            vec![DialogOption::new("Option A"), DialogOption::new("Option B")],
+        );
+        let mut output = Vec::new();
+        let rendered_rows =
+            TuiRenderer::draw_dialog_inline_static_with_width(&mut output, &dialog, 72).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        let visible = rendered
+            .lines()
+            .map(strip_ansi)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            rendered_rows,
+            rendered.lines().count(),
+            "live multiselect row accounting must include every rendered keyboard-hint row"
+        );
+
+        for expected in [
+            "↑/↓: Navigate",
+            "Space: Toggle",
+            "Enter: Submit",
+            "Esc: Cancel",
+        ] {
+            assert!(
+                visible.contains(expected),
+                "live multiselect omitted the documented keyboard hint {expected:?}:\n{visible}"
+            );
+        }
+
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char(' '))),
+            None,
+            "Space must toggle the focused option without submitting the live multiselect"
+        );
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Enter)),
+            Some(DialogResult::MultiSelected(vec![0])),
+            "Enter must submit the options toggled with the rendered keyboard controls"
+        );
     }
 
     #[test]
