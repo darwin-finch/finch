@@ -111,7 +111,7 @@ fn test_production_explicit_reasoning_efforts_reach_the_request_exactly() {
             )
         });
         let request = ProviderRequest::new(vec![Message::user("hello")]).with_model(DEFAULT_MODEL);
-        let body = responses_lite_request(&request, provider.reasoning_effort)
+        let body = encode_responses_lite(&request, provider.reasoning_effort)
             .expect("validated explicit reasoning must serialize");
 
         assert_eq!(
@@ -1345,7 +1345,7 @@ fn canonical_request_preserves_ordered_reasoning_tools_results_and_lite_shape() 
     .with_model(DEFAULT_MODEL)
     .with_system("developer instructions")
     .with_tools(vec![tool()]);
-    let body = responses_lite_request(&request, ReasoningEffort::High).unwrap();
+    let body = encode_responses_lite(&request, ReasoningEffort::High).unwrap();
     assert_eq!(body["input"][0]["type"], "additional_tools");
     assert_eq!(body["input"][0]["role"], "developer");
     assert_eq!(
@@ -1396,7 +1396,7 @@ fn collaboration_tools_use_reserved_wire_aliases_and_replay_symmetrically() {
     ])
     .with_model(DEFAULT_MODEL)
     .with_tools(vec![named_tool("spawn_agent"), tool()]);
-    let body = responses_lite_request(&request, ReasoningEffort::High)
+    let body = encode_responses_lite(&request, ReasoningEffort::High)
         .expect("advertised collaboration tool should map to a safe wire alias");
     let tools = body["input"][0]["tools"][0]["tools"]
         .as_array()
@@ -1432,7 +1432,7 @@ fn collaboration_tools_use_reserved_wire_aliases_and_replay_symmetrically() {
     let collision = ProviderRequest::new(vec![Message::user("delegate")])
         .with_model(DEFAULT_MODEL)
         .with_tools(vec![named_tool("finch_spawn_agent")]);
-    let error = responses_lite_request(&collision, ReasoningEffort::High)
+    let error = encode_responses_lite(&collision, ReasoningEffort::High)
         .expect_err("a local tool must not claim Finch's reserved collaboration wire alias");
     assert!(
         error.to_string().contains("reserved wire tool name"),
@@ -1465,12 +1465,12 @@ fn responses_lite_prompt_item_ids_are_stable_and_payload_bound() {
         .with_model(DEFAULT_MODEL)
         .with_system("developer instructions")
         .with_tools(vec![tool()]);
-    let first = responses_lite_request(&request, ReasoningEffort::High).unwrap();
-    let retry = responses_lite_request(&request, ReasoningEffort::High).unwrap();
+    let first = encode_responses_lite(&request, ReasoningEffort::High).unwrap();
+    let retry = encode_responses_lite(&request, ReasoningEffort::High).unwrap();
     assert_eq!(first["input"][0]["id"], retry["input"][0]["id"]);
     assert_eq!(first["input"][1]["id"], retry["input"][1]["id"]);
 
-    let changed = responses_lite_request(
+    let changed = encode_responses_lite(
         &request.with_system("different developer instructions"),
         ReasoningEffort::High,
     )
@@ -4665,7 +4665,7 @@ fn tool_argument_reasoning_and_sse_boundaries_are_enforced() {
         }],
     )])
     .with_model(DEFAULT_MODEL);
-    assert!(responses_lite_request(&request, ReasoningEffort::High).is_err());
+    assert!(encode_responses_lite(&request, ReasoningEffort::High).is_err());
     assert!(enforce_sse_remainder_bounds(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]).is_err());
     assert!(sse_data(b"future: attacker-secret").is_err());
 }

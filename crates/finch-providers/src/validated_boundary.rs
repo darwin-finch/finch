@@ -29,12 +29,13 @@ pub struct ValidatedProviderRequest {
 
 impl ValidatedProviderRequest {
     /// Consume this token at the exact provider instance for which it was
-    /// validated and return the effective request.
+    /// validated and return the effective request plus the immutable
+    /// tool-binding table compiled for it.
     #[doc(hidden)]
     pub fn into_request_for(
         self,
         provider: &(impl ProviderBackend + ?Sized),
-    ) -> Result<ProviderRequest> {
+    ) -> Result<(ProviderRequest, Arc<ToolBindingTable>)> {
         if self.target != provider_target(provider)
             || self.target_type != ProviderConcreteType::provider_concrete_type_id(provider)
         {
@@ -42,7 +43,7 @@ impl ValidatedProviderRequest {
                 "Validated provider request was presented to a different provider instance or concrete backend type"
             );
         }
-        Ok(self.request)
+        Ok((self.request, self.tool_bindings))
     }
 
     /// The exact descriptor used to validate this request.

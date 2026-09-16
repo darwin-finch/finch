@@ -330,7 +330,7 @@ mod tests {
             &self,
             request: crate::providers::ValidatedProviderRequest,
         ) -> Result<crate::providers::ProviderResponse> {
-            let request = request.into_request_for(self)?;
+            let (request, _bindings) = request.into_request_for(self)?;
             let model = request.model.clone();
             self.requests.lock().unwrap().push(request);
             Ok(crate::providers::ProviderResponse {

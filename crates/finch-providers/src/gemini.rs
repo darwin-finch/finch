@@ -18,7 +18,7 @@ use super::types::{
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::retry::{with_retry, NonRetriableError};
-use crate::tool_bindings::compile_from_definitions;
+use crate::tool_bindings::ToolBindingTable;
 use crate::ContentBlock;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
@@ -56,7 +56,11 @@ impl GeminiProvider {
     }
 
     /// Convert ProviderRequest to Gemini API format
-    fn to_gemini_request(&self, request: &ProviderRequest) -> Result<GeminiRequest> {
+    fn to_gemini_request(
+        &self,
+        request: &ProviderRequest,
+        bindings: &ToolBindingTable,
+    ) -> Result<GeminiRequest> {
         let model = if request.model.is_empty() {
             self.default_model.clone()
         } else {
@@ -64,68 +68,62 @@ impl GeminiProvider {
         };
 
         // Convert messages to Gemini's contents format
-        let contents: Vec<GeminiContent> = request
-            .messages
-            .iter()
-            .map(|msg| {
-                // Gemini uses "model" instead of "assistant"
-                let role = if msg.role == "assistant" {
-                    "model"
-                } else {
-                    &msg.role
-                };
+        let mut contents = Vec::with_capacity(request.messages.len());
+        for msg in &request.messages {
+            // Gemini uses "model" instead of "assistant"
+            let role = if msg.role == "assistant" {
+                "model"
+            } else {
+                &msg.role
+            };
 
-                // Convert all content blocks to Gemini parts
-                let parts: Vec<GeminiPart> = msg
-                    .content
-                    .iter()
-                    .map(|block| match block {
-                        ContentBlock::Text { text } => GeminiPart::Text { text: text.clone() },
-                        ContentBlock::ToolUse { id: _, name, input } => GeminiPart::FunctionCall {
-                            function_call: GeminiFunctionCall {
-                                name: name.clone(),
-                                args: input.clone(),
-                            },
+            let mut parts = Vec::with_capacity(msg.content.len());
+            for block in &msg.content {
+                parts.push(match block {
+                    ContentBlock::Text { text } => GeminiPart::Text { text: text.clone() },
+                    ContentBlock::ToolUse { id: _, name, input } => GeminiPart::FunctionCall {
+                        function_call: GeminiFunctionCall {
+                            name: bindings
+                                .encode_semantic(name)
+                                .map_err(|error| anyhow::anyhow!("{error}"))?
+                                .wire
+                                .name
+                                .clone(),
+                            args: input.clone(),
                         },
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error,
-                        } => GeminiPart::FunctionResponse {
-                            function_response: GeminiFunctionResponse {
-                                name: tool_use_id.clone(),
-                                response: serde_json::json!({
-                                    "content": content,
-                                    "is_error": is_error.unwrap_or(false),
-                                }),
-                            },
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => GeminiPart::FunctionResponse {
+                        function_response: GeminiFunctionResponse {
+                            name: tool_use_id.clone(),
+                            response: serde_json::json!({
+                                "content": content,
+                                "is_error": is_error.unwrap_or(false),
+                            }),
                         },
-                        ContentBlock::Image { .. } => GeminiPart::Text {
-                            text: "[image content]".to_string(),
-                        },
-                        ContentBlock::OpaqueReasoning { .. } => GeminiPart::Text {
-                            text: String::new(),
-                        },
-                    })
-                    .collect();
+                    },
+                    ContentBlock::Image { .. } => GeminiPart::Text {
+                        text: "[image content]".to_string(),
+                    },
+                    ContentBlock::OpaqueReasoning { .. } => GeminiPart::Text {
+                        text: String::new(),
+                    },
+                });
+            }
 
-                GeminiContent {
-                    role: role.to_string(),
-                    parts,
-                }
-            })
-            .collect();
+            contents.push(GeminiContent {
+                role: role.to_string(),
+                parts,
+            });
+        }
 
         // Convert tools to Gemini's function declarations format
-        let tools = if request.tools.as_ref().is_some_and(|defs| !defs.is_empty()) {
-            let bindings = compile_from_definitions(
-                WireProtocol::GeminiGenerateContent,
-                "gemini",
-                &request.model,
-                request.tools.as_deref().unwrap_or_default(),
-                request.tool_policy(),
-            )
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let tools = if bindings.is_empty() {
+            None
+        } else {
             Some(vec![GeminiTools {
                 function_declarations: bindings
                     .entries()
@@ -137,8 +135,6 @@ impl GeminiProvider {
                     })
                     .collect(),
             }])
-        } else {
-            None
         };
 
         let generation_config = GeminiGenerationConfig {
@@ -156,7 +152,12 @@ impl GeminiProvider {
     }
 
     /// Convert Gemini response to ProviderResponse
-    fn parse_response(&self, response: GeminiResponse, model: String) -> Result<ProviderResponse> {
+    fn parse_response(
+        &self,
+        response: GeminiResponse,
+        model: String,
+        bindings: &ToolBindingTable,
+    ) -> Result<ProviderResponse> {
         let candidate = response
             .candidates
             .into_iter()
@@ -176,9 +177,14 @@ impl GeminiProvider {
                 GeminiPart::FunctionCall { function_call } => {
                     // Generate unique ID since Gemini doesn't provide tool call IDs
                     let unique_id = format!("gemini_{}_{}", function_call.name, Uuid::new_v4());
+                    let name = bindings
+                        .decode_wire_call(&function_call.name, None)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?
+                        .semantic
+                        .clone();
                     content.push(ContentBlock::ToolUse {
                         id: unique_id,
-                        name: function_call.name,
+                        name,
                         input: function_call.args,
                     });
                 }
@@ -201,8 +207,12 @@ impl GeminiProvider {
     }
 
     /// Send a single message request (no retry)
-    async fn send_message_once(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let gemini_request = self.to_gemini_request(request)?;
+    async fn send_message_once(
+        &self,
+        request: &ProviderRequest,
+        bindings: &ToolBindingTable,
+    ) -> Result<ProviderResponse> {
+        let gemini_request = self.to_gemini_request(request, bindings)?;
         let model = gemini_request.model.clone();
 
         let url = format!(
@@ -252,17 +262,18 @@ impl GeminiProvider {
             "received Gemini response"
         );
 
-        self.parse_response(gemini_response, model)
+        self.parse_response(gemini_response, model, bindings)
     }
 
     /// Send a message with streaming response (no retry)
     async fn send_message_stream_once(
         &self,
         request: &ProviderRequest,
+        bindings: &ToolBindingTable,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
         let (tx, rx) = mpsc::channel(100);
 
-        let gemini_request = self.to_gemini_request(request)?;
+        let gemini_request = self.to_gemini_request(request, bindings)?;
         let model = gemini_request.model.clone();
 
         let url = format!(
@@ -296,6 +307,7 @@ impl GeminiProvider {
         }
 
         // Spawn task to parse streaming response
+        let stream_bindings = bindings.clone();
         tokio::spawn(async move {
             tracing::debug!("[STREAM] Gemini streaming task started");
             let mut stream = response.bytes_stream();
@@ -357,9 +369,23 @@ impl GeminiProvider {
                                                         function_call.name,
                                                         Uuid::new_v4()
                                                     );
+                                                    let name = match stream_bindings
+                                                        .decode_wire_call(&function_call.name, None)
+                                                    {
+                                                        Ok(bound) => bound.semantic.clone(),
+                                                        Err(error) => {
+                                                            let _ = tx
+                                                                .send(Err(anyhow::anyhow!(
+                                                                    "{error}"
+                                                                )))
+                                                                .await;
+                                                            done = true;
+                                                            break;
+                                                        }
+                                                    };
                                                     let tool_use = ContentBlock::ToolUse {
                                                         id: unique_id,
-                                                        name: function_call.name,
+                                                        name,
                                                         input: function_call.args,
                                                     };
                                                     // Send complete tool use block
@@ -422,16 +448,16 @@ impl ProviderBackend for GeminiProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        let request = request.into_request_for(self)?;
-        with_retry(|| self.send_message_once(&request)).await
+        let (request, bindings) = request.into_request_for(self)?;
+        with_retry(|| self.send_message_once(&request, &bindings)).await
     }
 
     async fn send_message_stream_validated(
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        let request = request.into_request_for(self)?;
-        with_retry(|| self.send_message_stream_once(&request)).await
+        let (request, bindings) = request.into_request_for(self)?;
+        with_retry(|| self.send_message_stream_once(&request, &bindings)).await
     }
 
     fn name(&self) -> &str {

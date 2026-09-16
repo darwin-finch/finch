@@ -233,7 +233,7 @@ impl ProviderBackend for FallbackChain {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        let request = request.into_request_for(self)?;
+        let (request, _bindings) = request.into_request_for(self)?;
         self.send_message_with_fallback(&request).await
     }
 
@@ -241,7 +241,7 @@ impl ProviderBackend for FallbackChain {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        let request = request.into_request_for(self)?;
+        let (request, _bindings) = request.into_request_for(self)?;
         self.send_message_stream_with_fallback(&request).await
     }
 
@@ -373,7 +373,7 @@ mod tests {
             &self,
             request: ValidatedProviderRequest,
         ) -> Result<ProviderResponse> {
-            let request = request.into_request_for(self)?;
+            let (request, _bindings) = request.into_request_for(self)?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
                 request.model, self.model,
@@ -395,7 +395,7 @@ mod tests {
             &self,
             request: ValidatedProviderRequest,
         ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-            let request = request.into_request_for(self)?;
+            let (request, _bindings) = request.into_request_for(self)?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
                 request.model, self.model,

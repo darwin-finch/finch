@@ -9,9 +9,7 @@ use crate::programs::ExecutionEffect;
 use crate::tools::permissions::PermissionManager;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::types::ToolDefinition;
-use finch_providers::{
-    NativeToolGrant, SemanticTool, ToolAuthority, ToolCompilePolicy, ToolOrigin,
-};
+use finch_providers::{NativeToolGrant, SemanticTool, ToolAuthority, ToolCompilePolicy};
 
 /// Map a declared execution effect onto the provider-neutral authority class.
 pub fn tool_authority_from_effect(effect: ExecutionEffect) -> ToolAuthority {
@@ -93,10 +91,6 @@ pub fn semantic_tools_for_advertisement(
         )
         .with_authority(tool_authority_from_effect(tool.effect()))
         .provider_native(grant.wire_name.clone(), grant.namespace.clone());
-        semantic.origin = ToolOrigin::ProviderNative {
-            wire_name: grant.wire_name.clone(),
-            namespace: grant.namespace.clone(),
-        };
         semantic.available = true;
         semantic.granted = true;
         if tools
@@ -118,7 +112,7 @@ mod tests {
     use crate::tools::{ToolContext, ToolInputSchema};
     use anyhow::Result;
     use async_trait::async_trait;
-    use finch_providers::WireProtocol;
+    use finch_providers::{ToolOrigin, WireProtocol};
     use serde_json::Value;
 
     struct StubSearch;

@@ -459,8 +459,8 @@ pub struct ValidatedProviderRequest { … }
 impl ValidatedProviderRequest {
     /// The exact descriptor used to validate this request.
     pub fn capabilities(&self) -> &ModelCapabilities;
-    /// Consume this token at the exact provider instance for which it was validated and return the effective request.
-    pub fn into_request_for(self, provider: &(impl ProviderBackend + ?Sized)) -> Result<ProviderRequest>;
+    /// Consume this token at the exact provider instance for which it was validated and return the effective request plus the immutable tool-binding table compiled…
+    pub fn into_request_for(self, provider: &(impl ProviderBackend + ?Sized)) -> Result<(ProviderRequest, Arc<ToolBindingTable>)>;
     /// Immutable tool-binding table compiled for this validated request.
     pub fn tool_bindings(&self) -> &Arc<ToolBindingTable>;
 }

@@ -434,6 +434,102 @@ mod capability_contract_tests {
         }
     }
 
+    struct DecodeTableProvider {
+        decoded: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ProviderBackend for DecodeTableProvider {
+        async fn send_message_validated(
+            &self,
+            request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
+            let compiled = std::sync::Arc::clone(request.tool_bindings());
+            let (_request, bindings) = request.into_request_for(self)?;
+            assert!(
+                std::sync::Arc::ptr_eq(&compiled, &bindings),
+                "into_request_for must return the table compiled at validation, not a recompile"
+            );
+            let decoded = bindings
+                .decode_wire_call("finch_spawn_agent", Some("functions"))
+                .expect("validated ChatGPT table must decode the reserved alias")
+                .semantic
+                .clone();
+            self.decoded.lock().unwrap().push(decoded);
+            Ok(ProviderResponse {
+                id: "decode-table".into(),
+                model: "model-a".into(),
+                content: vec![],
+                stop_reason: Some("end_turn".into()),
+                role: "assistant".into(),
+                provider: "decode-table".into(),
+                usage: None,
+                allowance: None,
+            })
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            request: ValidatedProviderRequest,
+        ) -> Result<Receiver<Result<StreamChunk>>> {
+            let _ = request.into_request_for(self)?;
+            anyhow::bail!("decode-table provider does not stream")
+        }
+
+        fn name(&self) -> &str {
+            "decode-table"
+        }
+
+        fn default_model(&self) -> &str {
+            "model-a"
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            ModelCapabilities::static_metadata(
+                self.name(),
+                model,
+                "2026-09-16",
+                "validated binding table contract",
+                CapabilitySupport::Supported,
+                CapabilitySupport::Supported,
+                CapabilitySupport::Unsupported,
+                ReasoningCapability::unsupported("2026-09-16", "validated binding table contract"),
+                Some(1_000),
+                Some(10_000),
+                None,
+            )
+            .with_wire_protocol(
+                WireProtocol::OpenAiChatGptResponsesLite,
+                "2026-09-16",
+                "validated binding table contract",
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn validated_binding_table_is_the_decode_table() {
+        let provider = DecodeTableProvider {
+            decoded: std::sync::Mutex::new(Vec::new()),
+        };
+        provider
+            .send_message(
+                &ProviderRequest::new(vec![])
+                    .with_model("model-a")
+                    .with_tools(vec![ToolDefinition {
+                        name: "spawn_agent".into(),
+                        description: "spawn".into(),
+                        input_schema: ToolInputSchema::simple(vec![]),
+                    }]),
+            )
+            .await
+            .expect("validated request must reach the adapter");
+        assert_eq!(
+            *provider.decoded.lock().unwrap(),
+            vec!["spawn_agent".to_string()],
+            "adapter decode must use the table compiled at validate_provider_request"
+        );
+    }
+
     #[tokio::test]
     async fn reserved_wire_collision_fails_before_provider_effect() {
         let provider = ToolsProvider {

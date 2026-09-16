@@ -163,7 +163,7 @@ mod disabled_training_tests {
             &self,
             request: ValidatedProviderRequest,
         ) -> Result<ProviderResponse> {
-            let request = request.into_request_for(self)?;
+            let (request, _bindings) = request.into_request_for(self)?;
             self.buffered_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::ensure!(
                 request

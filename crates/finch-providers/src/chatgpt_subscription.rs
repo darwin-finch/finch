@@ -26,7 +26,10 @@ use super::{
     ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest, WireProtocol,
 };
 use crate::oauth::{FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthTokenRecord};
-use crate::tool_bindings::{compile_from_definitions, ToolBindingError, ToolBindingTable};
+#[cfg(test)]
+use crate::tool_bindings::compile_from_definitions;
+use crate::tool_bindings::{ToolBindingError, ToolBindingTable};
+#[cfg(test)]
 use crate::ToolDefinition;
 use crate::{
     AudienceBinding, CredentialProvider, EndpointFamily, ProviderCredential, ReasoningEffort,
@@ -573,8 +576,9 @@ impl ChatGptSubscriptionProvider {
         &self,
         request: ProviderRequest,
         cancel: CancellationToken,
+        bindings: &ToolBindingTable,
     ) -> Result<Response> {
-        let body = responses_lite_request(&request, self.reasoning_effort)?;
+        let body = responses_lite_request(&request, self.reasoning_effort, bindings)?;
         let body =
             serde_json::to_vec(&body).context("Failed to encode ChatGPT subscription request")?;
         if body.len() > MAX_REQUEST_BYTES {
@@ -664,18 +668,17 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        let request = request.into_request_for(self)?;
+        let (request, bindings) = request.into_request_for(self)?;
         let expected_model = request.model.clone();
-        let allowed_tools = chatgpt_bindings(&request)?;
         let response = self
-            .start_response(request, CancellationToken::new())
+            .start_response(request, CancellationToken::new(), &bindings)
             .await?;
         let completed = consume_sse(
             response,
             None,
             CancellationToken::new(),
             expected_model,
-            allowed_tools,
+            (*bindings).clone(),
             #[cfg(test)]
             self.stream_producer_observer.clone(),
         )
@@ -708,11 +711,12 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        let request = request.into_request_for(self)?;
+        let (request, bindings) = request.into_request_for(self)?;
         let expected_model = request.model.clone();
-        let allowed_tools = chatgpt_bindings(&request)?;
         let cancel = request.cancellation_token.clone().unwrap_or_default();
-        let response = self.start_response(request, cancel.clone()).await?;
+        let response = self
+            .start_response(request, cancel.clone(), &bindings)
+            .await?;
         let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         // Reserve the channel's dedicated terminal slot before exposing the
         // receiver. Callers retain the historical 32-chunk ordinary buffer,
@@ -724,6 +728,7 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
             .map_err(|_| anyhow::anyhow!("Failed to reserve ChatGPT terminal stream capacity"))?;
         #[cfg(test)]
         let stream_producer_observer = self.stream_producer_observer.clone();
+        let stream_bindings = (*bindings).clone();
         tokio::spawn(async move {
             #[cfg(test)]
             let _finish_guard = StreamProducerFinishGuard(stream_producer_observer.clone());
@@ -732,7 +737,7 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
                 Some(sender),
                 cancel,
                 expected_model,
-                allowed_tools,
+                stream_bindings,
                 #[cfg(test)]
                 stream_producer_observer,
             )
@@ -891,14 +896,23 @@ fn validate_route(url: &Url, path: &str, query: Option<&str>, allow_loopback: bo
     Ok(())
 }
 
-fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) -> Result<Value> {
+#[cfg(test)]
+fn encode_responses_lite(request: &ProviderRequest, effort: ReasoningEffort) -> Result<Value> {
+    let bindings = chatgpt_bindings(request)?;
+    responses_lite_request(request, effort, &bindings)
+}
+
+fn responses_lite_request(
+    request: &ProviderRequest,
+    effort: ReasoningEffort,
+    bindings: &ToolBindingTable,
+) -> Result<Value> {
     validate_model(&request.model)?;
     validate_reasoning(effort)?;
     if request.temperature.is_some() {
         bail!("ChatGPT Responses-Lite does not accept Finch temperature overrides");
     }
-    let allowed_tools = chatgpt_bindings(request)?;
-    let tools = map_tools(&allowed_tools)?;
+    let tools = map_tools(bindings)?;
     let mut input = Vec::new();
     let tools_payload = serde_json::to_vec(&tools)
         .context("Failed to encode ChatGPT subscription tool definitions")?;
@@ -919,13 +933,7 @@ fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) ->
     let mut calls = HashSet::new();
     let mut results = HashSet::new();
     for message in &request.messages {
-        map_message(
-            message,
-            &mut input,
-            &mut calls,
-            &mut results,
-            &allowed_tools,
-        )?;
+        map_message(message, &mut input, &mut calls, &mut results, bindings)?;
     }
     if input.len() == 1 && request.system.as_deref().is_none_or(str::is_empty) {
         bail!("ChatGPT subscription request omitted conversation input");
@@ -958,6 +966,7 @@ fn responses_lite_prefix_id(prefix: &str, visible_payload: &[u8]) -> String {
     format!("{prefix}_{}", Uuid::new_v5(&namespace, visible_payload))
 }
 
+#[cfg(test)]
 fn chatgpt_bindings(request: &ProviderRequest) -> Result<ToolBindingTable> {
     compile_from_definitions(
         WireProtocol::OpenAiChatGptResponsesLite,
@@ -969,6 +978,7 @@ fn chatgpt_bindings(request: &ProviderRequest) -> Result<ToolBindingTable> {
     .map_err(map_chatgpt_compile_error)
 }
 
+#[cfg(test)]
 fn map_chatgpt_compile_error(error: ToolBindingError) -> anyhow::Error {
     match &error {
         ToolBindingError::ReservedNameCollision(_) => {
