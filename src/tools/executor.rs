@@ -466,33 +466,25 @@ impl ToolExecutor {
         // 3. Check plan mode restrictions
         if let Some(ref mode) = repl_mode {
             let current_mode = mode.read().await;
-            if let crate::cli::ReplMode::Planning { .. } = &*current_mode {
-                // In planning mode, only allow read-only tools
-                let allowed_tools = [
-                    "read",
-                    "glob",
-                    "grep",
-                    "web_fetch",
-                    "enter_plan_mode",
-                    "EnterPlanMode",
-                    "present_plan",
-                    "PresentPlan",
-                    "ask_user_question",
-                    "AskUserQuestion",
-                ];
-                if !allowed_tools.contains(&tool_use.name.as_str()) {
-                    drop(current_mode);
-                    warn!("Tool '{}' blocked in planning mode", tool_use.name);
-                    return Ok(ToolResult::error(
-                        tool_use.id.clone(),
-                        format!(
-                            "Tool '{}' is not allowed in planning mode.\n\
-                             Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
-                             Use present_plan to show your plan for approval.",
-                            tool_use.name
-                        ),
-                    ));
-                }
+            // The single authoritative planning gate (see #465): the same
+            // function the dispatch path uses, so a tool that passes dispatch
+            // is not refused here by a divergent copy of the list.
+            if !crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode(
+                &tool_use.name,
+                &current_mode,
+            ) {
+                drop(current_mode);
+                warn!("Tool '{}' blocked in planning mode", tool_use.name);
+                return Ok(ToolResult::error(
+                    tool_use.id.clone(),
+                    format!(
+                        "Tool '{}' is not allowed in planning mode.\n\
+                         Available tools: {}\n\
+                         Use present_plan to show your plan for approval.",
+                        tool_use.name,
+                        crate::cli::repl_event::plan_handler::PLANNING_ALLOWED_TOOLS.join(", ")
+                    ),
+                ));
             }
             drop(current_mode);
         }
@@ -916,6 +908,127 @@ mod tests {
         assert_eq!(result.tool_use_id, tool_use.id);
         assert!(result.is_error);
         assert!(result.content.contains("not allowed"));
+    }
+
+    /// A mock tool registered under an arbitrary spelling, so the
+    /// planning-gate agreement test can exercise every name the gate could
+    /// see without running real tool implementations.
+    struct NamedMockTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for NamedMockTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "A mock tool registered under a specific name"
+        }
+
+        fn input_schema(&self) -> ToolInputSchema {
+            ToolInputSchema::simple(vec![("param", "A test parameter")])
+        }
+
+        async fn execute(&self, _input: Value, _context: &ToolContext<'_>) -> Result<String> {
+            Ok("Mock result".to_string())
+        }
+    }
+
+    /// Regression for #465 (divergent verdicts): the planning dispatch gate
+    /// and the executor's execution-time live check disagreed, so a tool
+    /// could pass one gate and be refused by the next — `bash`, `todo_read`
+    /// and `todo_write` were admitted at dispatch and then rejected at
+    /// execution with a different message from a different layer. For every
+    /// name the gate could see (canonical entries, dispatch aliases, and
+    /// representative blocked tools), both checks must return the same
+    /// verdict, in both directions.
+    #[tokio::test]
+    async fn test_plan_mode_live_check_agrees_with_dispatch_gate() {
+        use crate::cli::repl_event::plan_handler::{
+            is_tool_allowed_in_mode, PLANNING_ALLOWED_TOOLS, PLANNING_ALLOWED_TOOL_ALIASES,
+        };
+        use crate::cli::ReplMode;
+
+        let spellings: Vec<String> = PLANNING_ALLOWED_TOOLS
+            .iter()
+            .map(|name| name.to_string())
+            .chain(
+                PLANNING_ALLOWED_TOOL_ALIASES
+                    .iter()
+                    .map(|(alias, _)| alias.to_string()),
+            )
+            .chain(
+                ["write", "edit", "Write", "Edit"]
+                    .iter()
+                    .map(|name| name.to_string()),
+            )
+            .collect();
+
+        let mut registry = ToolRegistry::new();
+        for spelling in &spellings {
+            registry.register(Box::new(NamedMockTool {
+                name: spelling.clone(),
+            }));
+        }
+        let permissions = PermissionManager::new()
+            .with_default_rule(crate::tools::permissions::PermissionRule::Allow);
+        let executor = ToolExecutor::new(
+            registry,
+            permissions,
+            std::env::temp_dir().join("finch_test_patterns.json"),
+        )
+        .expect("Failed to build agreement-test executor");
+
+        let mode = Arc::new(tokio::sync::RwLock::new(ReplMode::Planning {
+            task: String::new(),
+            plan_path: PathBuf::from("/tmp/plan-agreement-test.md"),
+            created_at: chrono::Utc::now(),
+        }));
+
+        let mut disagreements = Vec::new();
+        for name in &spellings {
+            let gate_allows = {
+                let current_mode = mode.read().await;
+                is_tool_allowed_in_mode(name, &current_mode)
+            };
+            let tool_use = ToolUse::new(name.clone(), json!({}));
+            let (live_allows, detail) = match executor
+                .execute_tool(
+                    &tool_use,
+                    None,
+                    None::<fn() -> Result<()>>,
+                    None,
+                    None,
+                    None,
+                    Some(Arc::clone(&mode)),
+                    None,
+                    None, // live_output
+                    None, // effect_audit
+                )
+                .await
+            {
+                Ok(result) => (
+                    !result.is_error,
+                    format!("result content: {:?}", result.content),
+                ),
+                Err(error) => (false, format!("executor returned Err: {error:#}")),
+            };
+            if gate_allows != live_allows {
+                disagreements.push(format!(
+                    "{name:?}: dispatch gate allows={gate_allows} but executor live check allows={live_allows} ({detail})"
+                ));
+            }
+        }
+
+        assert!(
+            disagreements.is_empty(),
+            "invariant (#465): the planning dispatch gate and the executor's live check \
+             must give the same verdict for the same tool in the same mode — a tool that \
+             passes one gate and fails the next surfaces its refusal late, from a layer \
+             with a different message; disagreements: {disagreements:#?}"
+        );
     }
 
     #[tokio::test]
