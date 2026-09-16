@@ -4,14 +4,21 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use crate::cli::messages::{MessageRef, TranscriptRow, TranscriptRowId};
+use crate::cli::messages::{MessageRef, TranscriptRow, TranscriptRowId, TranscriptRowKind};
 use crate::theme::ColorScheme;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderedTranscriptLine {
     pub text: String,
     pub row_id: Option<TranscriptRowId>,
     pub row_expanded: Option<bool>,
+    /// Kind of the row that produced this line, when the line belongs to an
+    /// interactive row. Set on the row's header line and on its body lines.
+    pub kind: Option<TranscriptRowKind>,
+    /// The tool result whose bounded child viewport this body line belongs to.
+    /// Only `ToolOutput` body lines carry it; the hit-region rebuild uses it to
+    /// give the control ownership of its own cells.
+    pub body_of: Option<TranscriptRowId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,8 +80,7 @@ impl AccordionState {
                 .split('\n')
                 .map(|text| RenderedTranscriptLine {
                     text: text.to_owned(),
-                    row_id: None,
-                    row_expanded: None,
+                    ..RenderedTranscriptLine::default()
                 })
                 .collect();
         };
@@ -134,6 +140,8 @@ impl AccordionState {
             ),
             row_id: expandable.then(|| row.id.clone()),
             row_expanded: expandable.then_some(expanded),
+            kind: Some(row.kind),
+            body_of: None,
         });
         if !expanded {
             return;
@@ -143,6 +151,8 @@ impl AccordionState {
                 text: format!("{}  {}", "  ".repeat(depth), body),
                 row_id: None,
                 row_expanded: None,
+                kind: Some(row.kind),
+                body_of: expandable.then(|| row.id.clone()),
             });
         }
         for child in &row.children {
@@ -447,6 +457,7 @@ mod tests {
             text: "▶ 世界世界 [collapsed]".into(),
             row_id: Some(id.clone()),
             row_expanded: Some(false),
+            ..RenderedTranscriptLine::default()
         }];
         let mut state = AccordionState::default();
         state.rebuild_hit_regions(&lines, 8, 8);

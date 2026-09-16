@@ -67,6 +67,10 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 - **Dialog virtual rows stable after Other-row activation** — `test_multiselect_submit_button_emits_selection`, `test_o_key_moves_cursor_to_other_row` in `src/cli/tui/dialog.rs`
 - **Prose must never be executed as a typed program** — `is_clearly_forth` in `src/main.rs` decides this for `finch query`; a question mark, comma, apostrophe or leading capital disqualifies a line, and the apostrophe test runs before the operator-character test so an emphatic contraction is not claimed by `!` — `prose_about_a_forth_string_opener_is_not_executed_as_forth`, `test_contraction_with_emphasis_is_not_executed_as_forth`, `test_a_forth_line_with_an_operator_still_runs` in `src/main.rs`
 
+### Request assembly
+
+- **Summarised request prefix is byte-stable across turns, with the stable system/context prefix preceding the summary** — past `max_verbatim`, the summary is committed to a range that only moves when the window slides past it (`SummaryCache` in `src/cli/conversation_compactor.rs`), so the head of the message array is reused byte-for-byte instead of regenerated per turn — `test_summarised_request_prefix_is_byte_stable_across_turns` in `src/cli/repl_event/query_processor.rs`
+
 ### Context
 
 - **Load order: `AGENTS.md` → `CLAUDE.md` → `FINCH.md` → `CONTEXT.md` → `README.md`; cwd wins over parent; a file reached by several names (symlink, hardlink) loads once** — `loads_all_names_in_same_directory`, `joins_multiple_sections_with_separator`, `symlinked_agents_md_loads_once_at_the_later_position` in `src/context/claude_md.rs`; `provider_request_carries_symlinked_agents_md_once_and_nested_rules_last` in `src/generators/claude.rs`

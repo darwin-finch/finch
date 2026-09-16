@@ -5463,3 +5463,540 @@ async fn setup_final_validation_preserves_cause_and_compensates_every_owned_gene
         assert!(owned.refresh_token.is_none() && owned.id_token.is_none());
     }
 }
+
+// ── #424: the OAuth device flow runs when the provider is added ──────────
+
+struct ScriptedAddTimeAuthenticator {
+    begin: std::sync::Mutex<
+        std::collections::VecDeque<Result<ChatGptNamedCredentialStart, anyhow::Error>>,
+    >,
+    finish: std::sync::Mutex<
+        std::collections::VecDeque<Result<EnsuredChatGptCredential, anyhow::Error>>,
+    >,
+    begins: std::sync::atomic::AtomicUsize,
+    finishes: std::sync::atomic::AtomicUsize,
+    last_begin_cancel: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+}
+
+impl ScriptedAddTimeAuthenticator {
+    fn new(
+        begin: impl IntoIterator<Item = Result<ChatGptNamedCredentialStart, anyhow::Error>>,
+        finish: impl IntoIterator<Item = Result<EnsuredChatGptCredential, anyhow::Error>>,
+    ) -> Self {
+        Self {
+            begin: std::sync::Mutex::new(begin.into_iter().collect()),
+            finish: std::sync::Mutex::new(finish.into_iter().collect()),
+            begins: std::sync::atomic::AtomicUsize::new(0),
+            finishes: std::sync::atomic::AtomicUsize::new(0),
+            last_begin_cancel: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn begins(&self) -> usize {
+        self.begins.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn finishes(&self) -> usize {
+        self.finishes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator for ScriptedAddTimeAuthenticator {
+    async fn ensure_named_credential(
+        &self,
+        _reference: &str,
+        _presentation: crate::cli::chatgpt_auth::DeviceLoginPresentation,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<EnsuredChatGptCredential> {
+        anyhow::bail!("the add-time dialog must drive the phased ceremony, not the combined one")
+    }
+
+    async fn begin_named_credential(
+        &self,
+        _reference: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ChatGptNamedCredentialStart> {
+        self.begins
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.last_begin_cancel.lock().unwrap() = Some(cancel);
+        match self.begin.lock().unwrap().pop_front() {
+            Some(outcome) => outcome,
+            None => anyhow::bail!("scripted add-time begin missing"),
+        }
+    }
+
+    async fn finish_named_credential(
+        &self,
+        _reference: &str,
+        _pending: &crate::oauth::DeviceAuthorization,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<EnsuredChatGptCredential> {
+        self.finishes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.finish.lock().unwrap().pop_front() {
+            Some(outcome) => outcome,
+            None => anyhow::bail!("scripted add-time finish missing"),
+        }
+    }
+}
+
+fn chatgpt_provider_idx() -> usize {
+    CLOUD_PROVIDERS
+        .iter()
+        .position(|(id, ..)| *id == "chatgpt")
+        .unwrap()
+}
+
+fn add_time_device_authorization(user_code: &str) -> crate::oauth::DeviceAuthorization {
+    crate::oauth::DeviceAuthorization::issued(
+        "device-code-secret".into(),
+        user_code.into(),
+        "https://auth.openai.com/activate".into(),
+        None,
+        Duration::from_secs(600),
+        Duration::from_secs(0),
+    )
+    .unwrap()
+}
+
+fn ensured_for(reference: &str, account: &str) -> EnsuredChatGptCredential {
+    EnsuredChatGptCredential {
+        credential: chatgpt_setup_credential(reference, account),
+        compensation: Some(crate::cli::chatgpt_auth::ChatGptCompensationHandle::issued(
+            reference,
+            "generation-1".into(),
+        )),
+    }
+}
+
+fn device_auth_step(outcome: DeviceAuthOutcome) -> AddProviderStep {
+    AddProviderStep::DeviceAuth {
+        provider_idx: chatgpt_provider_idx(),
+        name: "chatgpt".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        reference: "chatgpt:default".to_string(),
+        editing_idx: None,
+        pending: Arc::new(Mutex::new(None)),
+        outcome,
+        cancel: tokio_util::sync::CancellationToken::new(),
+    }
+}
+
+/// Wait until `probe` yields a value, bounded coarsely so a hung ceremony
+/// fails as hung rather than as a timing mismatch.
+fn wait_for<T>(probe: impl Fn() -> Option<T>, label: &str) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the add-time device ceremony never published {label}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn confirming_a_chatgpt_provider_runs_the_device_exchange_in_the_dialog() {
+    let fake = Arc::new(ScriptedAddTimeAuthenticator::new(
+        [Ok(ChatGptNamedCredentialStart::AuthorizationRequired(
+            add_time_device_authorization("CODE-1234"),
+        ))],
+        [Ok(ensured_for("chatgpt:default", "acct-work"))],
+    ));
+    let mut state = state_with_step(AddProviderStep::SelectAddType {
+        selected: chatgpt_provider_idx(),
+    });
+    state.current_section = WizardSection::Models;
+    state.chatgpt_authenticator = Some(fake.clone());
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureRemote { api_key: None, .. })
+    ));
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(
+        matches!(get_step(&state), Some(AddProviderStep::DeviceAuth { .. })),
+        "confirming a ChatGPT add must open the device dialog instead of adding the row silently; step={:?}",
+        get_step(&state)
+    );
+    assert!(
+        get_tool_models(&state).is_empty(),
+        "no provider row may appear before the exchange completes; got {:?}",
+        get_tool_models(&state)
+    );
+
+    let presented = wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { pending, .. }) => pending.lock().unwrap().clone(),
+            _ => None,
+        },
+        "the one-time code",
+    );
+    assert_eq!(presented.user_code, "CODE-1234");
+    assert_eq!(
+        presented.verification_uri,
+        "https://auth.openai.com/activate"
+    );
+    wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { outcome, .. }) => {
+                outcome.lock().unwrap().is_some().then_some(())
+            }
+            _ => None,
+        },
+        "the terminal outcome",
+    );
+
+    // The dialog reports the authenticated account before returning to the list.
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("Signed in as acct-work") && rendered.contains("authenticated"),
+        "the dialog must show the provider as authenticated before the list; rendered={rendered}"
+    );
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    let primary =
+        get_primary(&state).expect("the models section must survive the add-time ceremony");
+    assert!(
+        matches!(primary, ModelConfig::Remote { provider, .. } if provider == "chatgpt"),
+        "the provider must be added after a successful exchange; got {primary:?}"
+    );
+    assert!(
+        get_step(&state).is_none(),
+        "the device dialog must close on success; step={:?}",
+        get_step(&state)
+    );
+    assert_eq!(
+        state.credentials.len(),
+        1,
+        "the add-time success must bind the named credential in wizard state; got {:?}",
+        state.credentials
+    );
+    assert_eq!(state.credentials[0].name, "chatgpt:default");
+    assert_eq!(state.credentials[0].account.as_deref(), Some("acct-work"));
+    assert_eq!(
+        state.credentials[0].secret_ref,
+        "oauth-store:chatgpt:default"
+    );
+    assert_eq!(fake.begins(), 1);
+    assert_eq!(fake.finishes(), 1);
+}
+
+#[test]
+fn add_time_device_auth_is_skipped_when_a_named_credential_is_already_active() {
+    let fake = Arc::new(ScriptedAddTimeAuthenticator::new(
+        [Ok(ChatGptNamedCredentialStart::Ensured(
+            EnsuredChatGptCredential {
+                credential: chatgpt_setup_credential("chatgpt:default", "acct-existing"),
+                compensation: None,
+            },
+        ))],
+        [],
+    ));
+    let mut state = state_with_step(AddProviderStep::SelectAddType {
+        selected: chatgpt_provider_idx(),
+    });
+    state.current_section = WizardSection::Models;
+    state.chatgpt_authenticator = Some(fake.clone());
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { outcome, .. }) => {
+                outcome.lock().unwrap().is_some().then_some(())
+            }
+            _ => None,
+        },
+        "the reuse outcome",
+    );
+
+    let presented = match get_step(&state) {
+        Some(AddProviderStep::DeviceAuth { pending, .. }) => pending.lock().unwrap().clone(),
+        _ => None,
+    };
+    assert!(
+        presented.is_none(),
+        "an already-authenticated provider must not show a device code; got {presented:?}"
+    );
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("Signed in as acct-existing"),
+        "the dialog must report the reused account; rendered={rendered}"
+    );
+    assert!(
+        !rendered.contains("One-time code"),
+        "the skip path must not render device-code instructions; rendered={rendered}"
+    );
+    assert_eq!(fake.begins(), 1);
+    assert_eq!(fake.finishes(), 0, "reuse must not poll the provider");
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert_eq!(state.credentials.len(), 1);
+    assert_eq!(
+        state.credentials[0].account.as_deref(),
+        Some("acct-existing")
+    );
+    assert!(get_step(&state).is_none());
+}
+
+#[test]
+fn add_time_device_auth_failure_surfaces_the_cause_and_retry_completes() {
+    let fake = Arc::new(ScriptedAddTimeAuthenticator::new(
+        [
+            Ok(ChatGptNamedCredentialStart::AuthorizationRequired(
+                add_time_device_authorization("CODE-1"),
+            )),
+            Ok(ChatGptNamedCredentialStart::AuthorizationRequired(
+                add_time_device_authorization("CODE-2"),
+            )),
+        ],
+        [
+            Err(crate::oauth::OAuthDeviceAuthorizationError::Expired.into()),
+            Ok(ensured_for("chatgpt:default", "acct-work")),
+        ],
+    ));
+    let mut state = state_with_step(AddProviderStep::SelectAddType {
+        selected: chatgpt_provider_idx(),
+    });
+    state.current_section = WizardSection::Models;
+    state.chatgpt_authenticator = Some(fake.clone());
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { outcome, .. }) => {
+                outcome.lock().unwrap().is_some().then_some(())
+            }
+            _ => None,
+        },
+        "the failed outcome",
+    );
+
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("sign-in expired"),
+        "the terminal cause must be surfaced in the dialog; rendered={rendered}"
+    );
+    assert!(
+        rendered.contains("Retry sign-in"),
+        "the failure panel must offer the retry action; rendered={rendered}"
+    );
+    assert!(
+        !rendered.contains("secret-"),
+        "the failure panel must stay secret-free; rendered={rendered}"
+    );
+
+    // Enter retries this one provider with a fresh ceremony.
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    let presented = wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { pending, .. }) => pending.lock().unwrap().clone(),
+            _ => None,
+        },
+        "the retried one-time code",
+    );
+    assert_eq!(presented.user_code, "CODE-2");
+    assert_eq!(
+        fake.begins(),
+        2,
+        "retry must start a fresh device authorization"
+    );
+    wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { outcome, .. }) => {
+                outcome.lock().unwrap().is_some().then_some(())
+            }
+            _ => None,
+        },
+        "the retried outcome",
+    );
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert_eq!(state.credentials.len(), 1);
+    assert_eq!(state.credentials[0].account.as_deref(), Some("acct-work"));
+    assert_eq!(fake.finishes(), 2);
+}
+
+#[test]
+fn add_time_device_auth_failure_stays_visible_back_on_the_provider_form() {
+    let fake = Arc::new(ScriptedAddTimeAuthenticator::new(
+        [Ok(ChatGptNamedCredentialStart::AuthorizationRequired(
+            add_time_device_authorization("CODE-1"),
+        ))],
+        [Err(
+            crate::oauth::OAuthDeviceAuthorizationError::Denied.into()
+        )],
+    ));
+    let mut state = state_with_step(AddProviderStep::SelectAddType {
+        selected: chatgpt_provider_idx(),
+    });
+    state.current_section = WizardSection::Models;
+    state.chatgpt_authenticator = Some(fake.clone());
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { outcome, .. }) => {
+                outcome.lock().unwrap().is_some().then_some(())
+            }
+            _ => None,
+        },
+        "the failed outcome",
+    );
+    handle_models_input(&mut state, key(KeyCode::Esc)).unwrap();
+
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureRemote { .. })
+    ));
+    let error = match state.sections.get(&WizardSection::Models) {
+        Some(SectionState::Models { error, .. }) => error.clone(),
+        other => panic!("expected models section, got {other:?}"),
+    };
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|text| text.contains("sign-in was denied")),
+        "the failure cause must stay visible on the provider form; error={error:?}"
+    );
+    assert!(state.credentials.is_empty());
+}
+
+#[test]
+fn cancelling_the_device_dialog_returns_to_the_provider_form() {
+    let fake = Arc::new(ScriptedAddTimeAuthenticator::new(
+        [Ok(ChatGptNamedCredentialStart::AuthorizationRequired(
+            add_time_device_authorization("CODE-1"),
+        ))],
+        [Err(
+            crate::oauth::OAuthDeviceAuthorizationError::Cancelled.into()
+        )],
+    ));
+    let mut state = state_with_step(AddProviderStep::SelectAddType {
+        selected: chatgpt_provider_idx(),
+    });
+    state.current_section = WizardSection::Models;
+    state.chatgpt_authenticator = Some(fake.clone());
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { pending, .. }) => pending.lock().unwrap().clone(),
+            _ => None,
+        },
+        "the one-time code",
+    );
+
+    handle_models_input(&mut state, key(KeyCode::Esc)).unwrap();
+    let step = get_step(&state);
+    assert!(
+        matches!(
+            step,
+            Some(AddProviderStep::ConfigureRemote {
+                name,
+                model,
+                api_key: None,
+                editing_idx: None,
+                ..
+            }) if name == "chatgpt" && model == "gpt-5.6-sol"
+        ),
+        "Esc must return to the provider form with its fields intact, without abandoning the wizard; step={step:?}"
+    );
+    assert!(
+        fake.last_begin_cancel
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("the ceremony must have been started")
+            .is_cancelled(),
+        "Esc must cancel the in-flight ceremony token"
+    );
+    assert!(get_tool_models(&state).is_empty());
+    assert!(state.credentials.is_empty());
+    assert_eq!(state.current_section, WizardSection::Models);
+    assert_eq!(
+        handle_wizard_key(&mut state, key(KeyCode::Char('n'))).unwrap(),
+        WizardAction::Continue,
+        "the wizard must still be usable after cancelling the device dialog"
+    );
+}
+
+#[test]
+fn editing_an_existing_chatgpt_provider_does_not_start_the_device_ceremony() {
+    let fake = Arc::new(ScriptedAddTimeAuthenticator::new([], []));
+    let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+        provider_idx: chatgpt_provider_idx(),
+        name: "chatgpt".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        api_key: None,
+        focused_field: 1,
+        editing_idx: Some(0),
+    });
+    state.current_section = WizardSection::Models;
+    state.chatgpt_authenticator = Some(fake.clone());
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(
+        get_step(&state).is_none(),
+        "editing keeps the save-time ceremony; got {:?}",
+        get_step(&state)
+    );
+    assert_eq!(
+        fake.begins(),
+        0,
+        "the add-time device ceremony must not run when editing an existing provider"
+    );
+    assert!(matches!(
+        get_primary(&state),
+        Some(ModelConfig::Remote { provider, .. }) if provider == "chatgpt"
+    ));
+}
+
+#[test]
+fn device_auth_dialog_keeps_the_run_loop_polling_instead_of_blocking() {
+    let mut state = state_with_step(device_auth_step(Arc::new(Mutex::new(None))));
+    state.current_section = WizardSection::Models;
+    assert!(
+        is_scanning_state(&state),
+        "the run loop must treat the device dialog as a polling state so terminal input is never blocked; step={:?}",
+        get_step(&state)
+    );
+}
+
+#[test]
+fn add_time_device_dialog_presents_code_and_verification_url_as_text() {
+    let outcome: DeviceAuthOutcome = Arc::new(Mutex::new(None));
+    let mut state = state_with_step(device_auth_step(outcome));
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        if let Some(AddProviderStep::DeviceAuth { pending, .. }) = adding_provider.as_mut() {
+            *pending.lock().unwrap() = Some(DeviceAuthPresentation {
+                verification_uri: "https://auth.openai.com/activate".into(),
+                user_code: "CODE-1234".into(),
+                expires_in: Duration::from_secs(600),
+            });
+        }
+    }
+
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("One-time code: CODE-1234")
+            && rendered.contains("Open: https://auth.openai.com/activate"),
+        "the dialog must present the code and verification URL as speakable text; rendered={rendered}"
+    );
+    assert!(
+        rendered.contains("Esc: Cancel"),
+        "the dialog must advertise its cancellation key; rendered={rendered}"
+    );
+}

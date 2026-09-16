@@ -306,6 +306,9 @@ pub struct EventLoop {
     remote_brain_run_units:
         std::collections::HashMap<crate::brain::RunId, RemoteBrainRunProjection>,
     remote_brain_tool_rows: std::collections::HashMap<String, usize>,
+    /// Rendered task-list lines per remote tool call, so a completed
+    /// todo_write row keeps showing the list it wrote (#425).
+    remote_brain_task_lists: std::collections::HashMap<String, Vec<String>>,
     remote_brain_approval_rows: std::collections::HashMap<String, usize>,
     queued_remote_brain_approvals: std::collections::VecDeque<RemoteBrainApproval>,
     active_remote_brain_approval: Option<RemoteBrainApproval>,
@@ -376,6 +379,21 @@ pub struct EventLoop {
 
     /// Stable UUID for this session — assigned at startup, printed on exit.
     session_uuid: Uuid,
+
+    /// Session-cumulative token burn for this Brain. Accumulated from the
+    /// usage counts generators already report (`ReplEvent::StatsUpdate`),
+    /// restored from disk at startup, and checkpointed after every recorded
+    /// turn so attach/resume keeps the running total. A local observation of
+    /// provider-reported usage only — never a billing statement.
+    session_usage: crate::cli::usage::SessionUsageLedger,
+
+    /// Where the usage ledger checkpoints. `None` disables persistence.
+    session_usage_path: Option<std::path::PathBuf>,
+
+    /// Price data for the clearly-labeled cost estimate. Empty until the
+    /// model catalog or a provider entry carries price fields, so the status
+    /// line stays tokens-only today.
+    session_usage_pricing: crate::cli::usage::ModelPricingTable,
 
     /// Working directory at startup (for terminal title)
     cwd: String,
@@ -536,6 +554,46 @@ fn runner_subject_from(participant: &str, frontend_id: Uuid) -> String {
     let mut base = participant.chars().take(keep).collect::<String>();
     base.push_str(&suffix);
     base
+}
+
+/// Frontend-owned checkpoint location for this Brain's cumulative usage:
+/// `~/.finch/usage/<brain>.usage.json`. The Brain store owns its own
+/// authoritative state; this sidecar is the frontend's session observation.
+fn default_session_usage_path(brain_label: &str) -> Option<std::path::PathBuf> {
+    let safe: String = brain_label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    dirs::home_dir().map(|home| {
+        home.join(".finch")
+            .join("usage")
+            .join(format!("{safe}.usage.json"))
+    })
+}
+
+/// Restore the persisted running total. A damaged checkpoint must never block
+/// startup: log it and begin from zero rather than failing the session.
+fn load_session_usage(
+    path: &Option<std::path::PathBuf>,
+    brain_label: &str,
+) -> crate::cli::usage::SessionUsageLedger {
+    let Some(path) = path else {
+        return Default::default();
+    };
+    match crate::cli::usage::SessionUsageLedger::load(path) {
+        Ok(Some(ledger)) => ledger,
+        Ok(None) => Default::default(),
+        Err(error) => {
+            tracing::warn!("Starting session usage from zero for Brain '{brain_label}': {error:#}");
+            Default::default()
+        }
+    }
 }
 
 fn participant_display_name(subject: &str, local_machine: Option<&str>) -> String {
@@ -969,6 +1027,9 @@ struct RemoteBrainRunProjection {
     result_row: Option<usize>,
     tool_rows: std::collections::HashMap<String, usize>,
     approval_rows: std::collections::HashMap<String, usize>,
+    /// Rendered task-list lines per tool call, so the completed call row keeps
+    /// showing the list it wrote instead of collapsing to a bare summary.
+    task_list_bodies: std::collections::HashMap<String, Vec<String>>,
     locally_rendered_tool_ids: std::collections::HashSet<String>,
     locally_rendered_approval_ids: std::collections::HashSet<String>,
     locally_rendered_program: bool,
@@ -1006,6 +1067,7 @@ fn ensure_remote_brain_run_projection<'a>(
             result_row: None,
             tool_rows: std::collections::HashMap::new(),
             approval_rows: std::collections::HashMap::new(),
+            task_list_bodies: std::collections::HashMap::new(),
             locally_rendered_tool_ids: std::collections::HashSet::new(),
             locally_rendered_approval_ids: std::collections::HashSet::new(),
             locally_rendered_program: false,
@@ -1083,13 +1145,21 @@ fn project_remote_brain_run_event(
                 .tool_rows
                 .entry(tool_id.clone())
                 .or_insert_with(|| {
-                    let input = input.to_string();
-                    let input = if input.chars().count() > 80 {
-                        format!("{}…", input.chars().take(79).collect::<String>())
-                    } else {
-                        input
-                    };
-                    projection.unit.add_row(format!("{name} {input}"))
+                    // The row is labelled by what the call represents, never
+                    // by the raw input JSON (#425).
+                    let (label, body_lines) =
+                        crate::cli::repl_event::tool_display::brain_tool_call_row(name, input);
+                    let task_list = (!body_lines.is_empty()).then(|| body_lines.clone());
+                    let row = projection.unit.add_row(label);
+                    for line in body_lines {
+                        projection.unit.append_row_body_line(row, line);
+                    }
+                    if let Some(task_list) = task_list {
+                        projection
+                            .task_list_bodies
+                            .insert(tool_id.clone(), task_list);
+                    }
+                    row
                 });
         }
         BrainEventKind::ToolResult {
@@ -1105,6 +1175,9 @@ fn project_remote_brain_run_event(
                 .tool_rows
                 .entry(tool_id.clone())
                 .or_insert_with(|| projection.unit.add_row(tool_id));
+            // A completed task-list write keeps its rendered list as the row
+            // body, so the list stays readable in the transcript (#425).
+            let task_list = projection.task_list_bodies.remove(tool_id);
             if *is_error {
                 projection.unit.fail_row(row, output);
             } else {
@@ -1114,11 +1187,9 @@ fn project_remote_brain_run_event(
                 } else {
                     first.to_string()
                 };
-                projection.unit.complete_row_with_body(
-                    row,
-                    summary,
-                    output.lines().skip(1).map(str::to_owned).collect(),
-                );
+                let body = task_list
+                    .unwrap_or_else(|| output.lines().skip(1).map(str::to_owned).collect());
+                projection.unit.complete_row_with_body(row, summary, body);
             }
         }
         BrainEventKind::ApprovalRequested {
@@ -1148,11 +1219,12 @@ fn project_remote_brain_run_event(
                 let row = projection.unit.add_activity_row(format!(
                     "approval ({approval_kind}) for {audience_summary}: {subject}"
                 ));
-                for line in serde_json::to_string_pretty(detail)
-                    .unwrap_or_else(|_| detail.to_string())
-                    .lines()
+                // The detail is rendered as the thing it represents — never
+                // pretty-printed JSON in the transcript (#425).
+                for line in
+                    crate::cli::repl_event::tool_display::approval_detail_body(subject, detail)
                 {
-                    projection.unit.append_row_body_line(row, line.to_owned());
+                    projection.unit.append_row_body_line(row, line);
                 }
                 projection.approval_rows.insert(approval_id.clone(), row);
             }
@@ -1873,7 +1945,12 @@ impl EventLoop {
         let participant_subject = local_participant_subject();
         let runner_subject = runner_subject_from(&participant_subject, Uuid::new_v4());
 
-        Self {
+        // Restore this Brain's running token total so attach/resume keeps the
+        // same cumulative burn instead of starting from zero each session.
+        let session_usage_path = default_session_usage_path(&session_label);
+        let session_usage = load_session_usage(&session_usage_path, &session_label);
+
+        let event_loop = Self {
             event_rx,
             event_tx,
             input_rx,
@@ -1907,6 +1984,7 @@ impl EventLoop {
             remote_brain_tool_unit: None,
             remote_brain_run_units: std::collections::HashMap::new(),
             remote_brain_tool_rows: std::collections::HashMap::new(),
+            remote_brain_task_lists: std::collections::HashMap::new(),
             remote_brain_approval_rows: std::collections::HashMap::new(),
             queued_remote_brain_approvals: std::collections::VecDeque::new(),
             active_remote_brain_approval: None,
@@ -1937,6 +2015,9 @@ impl EventLoop {
             participant_subject,
             runner_subject,
             session_uuid,
+            session_usage,
+            session_usage_path,
+            session_usage_pricing: crate::cli::usage::ModelPricingTable::empty(),
             cwd: String::new(), // populated at the start of run()
             context_lines,
             max_verbatim_messages,
@@ -1970,7 +2051,18 @@ impl EventLoop {
             llm_rx: Some(llm_rx),
             #[cfg(test)]
             effect_audit_test_wrapper: None,
+        };
+
+        // A restored total must be visible from the first render, before any
+        // new provider turn has run.
+        if !event_loop.session_usage.is_empty() {
+            event_loop.status_bar.update_session_usage(
+                &event_loop.session_usage,
+                Some(&event_loop.session_usage_pricing),
+            );
         }
+
+        event_loop
     }
 
     #[cfg(test)]
@@ -2734,6 +2826,7 @@ impl EventLoop {
 
         // Save conversation to ~/.finch/sessions/<uuid>.json and print the UUID.
         // The user can resume with: finch --resume <uuid>
+        self.checkpoint_session_usage();
         if let Some(home) = dirs::home_dir() {
             let sessions_dir = home.join(".finch").join("sessions");
             if std::fs::create_dir_all(&sessions_dir).is_ok() {
@@ -3821,6 +3914,27 @@ impl EventLoop {
             return Ok(());
         };
         history.save(path)
+    }
+
+    /// Durably checkpoint the session-cumulative usage ledger. Best-effort:
+    /// a failed write is logged and never fails the event loop, because the
+    /// next recorded turn or shutdown retries.
+    fn checkpoint_session_usage(&self) {
+        let Some(path) = self.session_usage_path.as_ref() else {
+            return;
+        };
+        if let Err(error) = self.session_usage.save(path) {
+            tracing::warn!(
+                "Failed to persist session usage to {}: {error:#}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_session_usage_for_tests(&mut self, path: Option<std::path::PathBuf>) {
+        self.session_usage = crate::cli::usage::SessionUsageLedger::default();
+        self.session_usage_path = path;
     }
 
     fn report_checkpoint_error(&self, context: &str, error: &anyhow::Error) {

@@ -1,8 +1,9 @@
 //! The ChatGPT credential setup ceremony and its recovery loop.
 //!
 //! Self-contained: every one of the wizard's `crate::oauth` references and every one of its
-//! `crate::cli::chatgpt_auth` references is in this file. Nothing else in the wizard talks to
-//! either.
+//! `crate::cli::chatgpt_auth` references is declared here (the shared `use` in
+//! `setup_wizard.rs` and the add-time spawn below) or flows through the types re-exported
+//! for the dialog. Nothing else in the wizard talks to either directly.
 
 use super::*;
 
@@ -578,4 +579,48 @@ where
         }
     }
     failed
+}
+
+/// Run the add-time ChatGPT device ceremony on a background thread (#424) so
+/// the wizard dialog never blocks on polling: the one-time code is published
+/// to `pending` as soon as the provider issues it, and the terminal outcome to
+/// `outcome`. Reuse or refresh of an existing valid account publishes `Ok`
+/// without ever showing a code; the dialog's `cancel` token stops the flow
+/// when the user dismisses it.
+pub(super) fn spawn_add_time_chatgpt_device_flow(
+    authenticator: std::sync::Arc<dyn crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator>,
+    reference: String,
+    pending: std::sync::Arc<std::sync::Mutex<Option<DeviceAuthPresentation>>>,
+    outcome: DeviceAuthOutcome,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    std::thread::spawn(move || {
+        let result = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async {
+                match authenticator
+                    .begin_named_credential(&reference, cancel.clone())
+                    .await
+                {
+                    Ok(ChatGptNamedCredentialStart::Ensured(ensured)) => Ok(ensured),
+                    Ok(ChatGptNamedCredentialStart::AuthorizationRequired(device)) => {
+                        *pending.lock().unwrap() = Some(DeviceAuthPresentation {
+                            verification_uri: device.verification_uri.clone(),
+                            user_code: device.user_code.clone(),
+                            expires_in: device.expires_in,
+                        });
+                        authenticator
+                            .finish_named_credential(&reference, &device, cancel)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }),
+            Err(error) => Err(anyhow::Error::new(error)
+                .context("ChatGPT device sign-in could not start in setup")),
+        };
+        *outcome.lock().unwrap() = Some(result);
+    });
 }

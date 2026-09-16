@@ -108,16 +108,18 @@ impl ToolRegistry {
         self.aliases.keys().cloned().collect()
     }
 
-    /// List every name dispatch accepts: registered tool names plus alias
-    /// keys. Policy tables and their conformance tests key off this set, so a
-    /// literal that neither a `Tool` registers nor an alias covers cannot
-    /// hide inside one.
+    /// Every name accepted at dispatch time: canonical registered names plus
+    /// the alias spellings mapped by [`Self::register_alias`].
+    ///
+    /// Permission and mode policy tables may only contain names from this
+    /// set; a name absent from it is registered by no tool, so a rule keyed
+    /// on it can never match a real dispatch (see #465, #452).
     pub fn dispatch_names(&self) -> Vec<String> {
-        self.tools
-            .keys()
-            .chain(self.aliases.keys())
-            .cloned()
-            .collect()
+        let mut names: Vec<String> = self.tools.keys().cloned().collect();
+        names.extend(self.aliases.keys().cloned());
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Declared effect for a dispatch name: the registered tool's
@@ -248,9 +250,6 @@ mod tests {
     #[test]
     fn test_registry_alias_names_lists_dispatch_only_spellings() {
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool {
-            name: "todo_read".to_string(),
-        }));
         registry.register_alias("TodoRead", "todo_read");
 
         let aliases = registry.alias_names();
@@ -259,6 +258,35 @@ mod tests {
             vec!["TodoRead".to_string()],
             "alias_names must list alias keys so policy conformance tests can \
              report which dispatch-only spellings exist"
+        );
+    }
+
+    /// `dispatch_names` must list canonical names and alias spellings, once
+    /// each, so policy tables can be checked against the registry (#465).
+    #[test]
+    fn test_dispatch_names_include_canonical_and_alias_spellings() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool {
+            name: "todo_read".to_string(),
+        }));
+        registry.register(Box::new(MockTool {
+            name: "read".to_string(),
+        }));
+        registry.register_alias("TodoRead", "todo_read");
+
+        let names = registry.dispatch_names();
+        assert!(
+            names.contains(&"todo_read".to_string())
+                && names.contains(&"read".to_string())
+                && names.contains(&"TodoRead".to_string()),
+            "invariant: dispatch_names must list canonical names and registered alias \
+             spellings so policy tables can be checked against the registry; got {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| **n == "todo_read").count(),
+            1,
+            "invariant: a name registered both canonically and as an alias target \
+             appears once; got {names:?}"
         );
     }
 

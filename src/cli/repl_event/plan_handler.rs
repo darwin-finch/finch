@@ -3,7 +3,10 @@
 //! This module contains three pure free functions that previously lived inside
 //! `event_loop.rs`:
 //!
-//! * [`is_tool_allowed_in_mode`] — gate-check for tools in Planning vs Normal/Executing mode.
+//! * [`is_tool_allowed_in_mode`] — the single authoritative gate-check for
+//!   tools in Planning vs Normal/Executing mode; `repl.rs`,
+//!   `query_processor.rs`, and the tool executor's live check all call it so
+//!   the permitted set is written exactly once (#465).
 //! * [`handle_present_plan`]    — intercepts `PresentPlan` tool calls and shows the approval dialog.
 //! * [`handle_ask_user_question`] — intercepts `AskUserQuestion` tool calls and shows a question dialog.
 //!
@@ -26,42 +29,50 @@ use crate::tools::ToolUse;
 
 // ── Tool-mode gate ────────────────────────────────────────────────────────────
 
-/// Tool names a provider may call while the session is in `Planning` mode.
+/// Tools permitted in `ReplMode::Planning`, by canonical registered name.
 ///
-/// Keyed on the names the `Tool` implementations register plus the
-/// dispatch-only alias keys `register_repl_tool_aliases` covers, so a rename
-/// cannot strand an entry and a literal nothing registers cannot hide here
-/// (the issue #466/#465 drift class). Spellings nothing registers —
-/// `ExitPlanMode`, `Bash` — are deliberately absent: no alias maps to them and
-/// dispatch could never execute them, so the gate now refuses them up front.
+/// This is the single authoritative planning gate; the dispatch checks in
+/// `repl.rs` and `query_processor.rs` and the executor's live check all read
+/// it, so no second list can drift from it (#465).
 ///
-/// Every entry must be a name some `Tool` registers or an alias key;
-/// conformance-tested against the owner REPL catalog in
-/// `src/cli/repl/always_allow_tests.rs`.
-pub(crate) const PLANNING_MODE_ALLOWED_TOOLS: &[&str] = &[
+/// Every entry must be a name the tool registry actually accepts at dispatch
+/// time — a `Tool::name()` or a registered dispatch alias.
+/// `test_plan_allowlist_entries_are_registered_tool_names` enforces this
+/// against the production tool set; #465 records the `ExitPlanMode` entry
+/// that nothing registered.
+pub(crate) const PLANNING_ALLOWED_TOOLS: &[&str] = &[
     "read",
     "glob",
     "grep",
     "web_fetch",
+    // Read-only by convention and confirmed normally, so the model can run
+    // inspection commands like `which gh` or `cargo check` while planning.
     "bash",
-    "present_plan",
-    "PresentPlan",
-    "ask_user_question",
-    "AskUserQuestion",
-    // Session-local plan visibility is not a workspace or host mutation.
-    // Keep the familiar checklist usable while the model is deliberately
-    // planning.
+    // Session-local plan visibility is not a workspace or host mutation. Keep
+    // the familiar checklist usable while the model is deliberately planning.
     "todo_read",
-    "TodoRead",
     "todo_write",
-    "TodoWrite",
     // Re-entering planning while already planning is idempotent
     // (`EnterPlanModeTool::execute` returns "already in planning mode" and
-    // changes nothing). Both the canonical name and the dispatch-only alias
-    // are accepted; `ToolRegistry::definitions()` shows only the canonical
-    // spelling.
+    // changes nothing). The canonical name is the only spelling the provider
+    // is shown: `ToolRegistry::definitions()` omits aliases.
     "enter_plan_mode",
-    "EnterPlanMode",
+    "present_plan",
+    "ask_user_question",
+];
+
+/// Compatibility spellings the planning gate accepts, mapped to the canonical
+/// entry in [`PLANNING_ALLOWED_TOOLS`]. Aliases are dispatch-only: the
+/// provider is shown canonical names only (`ToolRegistry::definitions`
+/// omits aliases), but legacy spellings still arrive in replayed
+/// conversations.
+pub(crate) const PLANNING_ALLOWED_TOOL_ALIASES: &[(&str, &str)] = &[
+    ("Bash", "bash"),
+    ("TodoRead", "todo_read"),
+    ("TodoWrite", "todo_write"),
+    ("EnterPlanMode", "enter_plan_mode"),
+    ("PresentPlan", "present_plan"),
+    ("AskUserQuestion", "ask_user_question"),
 ];
 
 /// Returns `true` when `tool_name` may be called in `mode`.
@@ -80,7 +91,12 @@ pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool 
             // Inspection tools, bash (read-only by convention, confirmed normally),
             // plan completion tools, and plan-mode meta-tools are all allowed.
             // Write/Edit remain blocked to enforce read-only exploration during planning.
-            PLANNING_MODE_ALLOWED_TOOLS.contains(&tool_name)
+            let canonical = PLANNING_ALLOWED_TOOL_ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == tool_name)
+                .map(|(_, canonical)| *canonical)
+                .unwrap_or(tool_name);
+            PLANNING_ALLOWED_TOOLS.contains(&canonical)
         }
     }
 }
@@ -556,16 +572,23 @@ mod tests {
         }
     }
 
+    /// #465: `ExitPlanMode` was asserted here although no tool registers
+    /// that name — the assertion only checked a literal against the list
+    /// containing it. Plan completion is reached through `present_plan`
+    /// (approval dialog), so no exit spelling exists; re-entering planning
+    /// via the canonical name and its dispatch alias is what this gate must
+    /// allow, and `test_plan_allowlist_entries_are_registered_tool_names`
+    /// pins both spellings to the registry.
     #[test]
-    fn test_plan_mode_allows_enter_plan_mode() {
+    fn test_plan_mode_allows_enter_plan_mode_spellings() {
         let mode = planning_mode();
-        assert!(
-            is_tool_allowed_in_mode("EnterPlanMode", &mode),
-            "EnterPlanMode (dispatch-only alias) must be allowed in planning mode"
-        );
         assert!(
             is_tool_allowed_in_mode("enter_plan_mode", &mode),
             "enter_plan_mode (canonical) must be allowed in planning mode"
+        );
+        assert!(
+            is_tool_allowed_in_mode("EnterPlanMode", &mode),
+            "EnterPlanMode (dispatch alias) must be allowed in planning mode"
         );
     }
 
@@ -608,6 +631,74 @@ mod tests {
              a state-changing tool (#26). Legacy alias \"EnterPlanMode\" allowed = {}.",
             is_tool_allowed_in_mode("EnterPlanMode", &mode),
         );
+    }
+
+    /// Regression for #465 (unregistered name listed): `ExitPlanMode` was an
+    /// entry in the allowlist although no `Tool::name()` or
+    /// `register_alias` produced that string — the list enforced a name no
+    /// provider could ever send, the same defect class as #26
+    /// (`legacy_tool_effect` matching `todowrite`) and #452 (`check_peer_tool_use`
+    /// denying `restart` and `spawn`). Every canonical entry must be a name
+    /// the production tool set registers, and every alias entry must be a
+    /// spelling the REPL dispatch table actually registers.
+    #[test]
+    fn test_plan_allowlist_entries_are_registered_tool_names() {
+        use crate::cli::repl::REPL_TOOL_ALIASES;
+        use crate::tools::{
+            AskUserQuestionTool, BashTool, EnterPlanModeTool, GlobTool, GrepTool, PresentPlanTool,
+            ReadTool, TodoReadTool, TodoWriteTool, ToolRegistry, WebFetchTool,
+        };
+
+        let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReadTool));
+        registry.register(Box::new(GlobTool));
+        registry.register(Box::new(GrepTool));
+        registry.register(Box::new(WebFetchTool::new()));
+        registry.register(Box::new(BashTool));
+        registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
+        registry.register(Box::new(TodoReadTool::new(Arc::clone(&todo_list))));
+        registry.register(Box::new(EnterPlanModeTool));
+        registry.register(Box::new(PresentPlanTool));
+        registry.register(Box::new(AskUserQuestionTool));
+        for (alias, canonical) in REPL_TOOL_ALIASES {
+            if registry.has_tool(canonical) {
+                registry.register_alias(*alias, *canonical);
+            }
+        }
+
+        let unregistered: Vec<&str> = PLANNING_ALLOWED_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| !registry.has_tool(name))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "invariant (#465): every planning-allowlist entry must be a registered tool \
+             name or dispatch alias — an entry registered by nothing can never be sent \
+             by a provider, so the list only mints phantom permissions; unregistered \
+             entries: {unregistered:?}"
+        );
+
+        let unregistered_aliases: Vec<(&str, &str)> = PLANNING_ALLOWED_TOOL_ALIASES
+            .iter()
+            .copied()
+            .filter(|pair| !REPL_TOOL_ALIASES.contains(pair))
+            .collect();
+        assert!(
+            unregistered_aliases.is_empty(),
+            "invariant (#465): every alias the planning gate accepts must be registered \
+             by the REPL dispatch alias table, or the spelling is dead policy that no \
+             dispatch resolves; unregistered alias pairs: {unregistered_aliases:?}"
+        );
+
+        for (alias, _) in PLANNING_ALLOWED_TOOL_ALIASES {
+            assert!(
+                registry.has_tool(alias),
+                "invariant (#465): alias {alias:?} must resolve to a registered tool \
+                 after the REPL dispatch alias table is applied"
+            );
+        }
     }
 
     #[test]

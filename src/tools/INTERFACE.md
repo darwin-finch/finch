@@ -370,7 +370,11 @@ impl ToolRegistry {
     pub fn declared_effect(&self, name: &str) -> ExecutionEffect;
     /// Get all tool definitions (for Claude API)
     pub fn definitions(&self) -> Vec<ToolDefinition>;
+<<<<<<< HEAD
     /// List every name dispatch accepts: registered tool names plus alias keys.
+=======
+    /// Every name accepted at dispatch time: canonical registered names plus the alias spellings mapped by [`Self::register_alias`].
+>>>>>>> origin/main
     pub fn dispatch_names(&self) -> Vec<String>;
     /// Get tool by name
     pub fn get(&self, name: &str) -> Option<&dyn Tool>;

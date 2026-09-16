@@ -38,7 +38,34 @@ pub(super) enum AddProviderStep {
         agents: Vec<DiscoveredService>,
         selected: usize,
     },
+    // Add-time ChatGPT device sign-in (#424): the exchange runs while this
+    // dialog is open, not at save time. The background ceremony publishes the
+    // one-time code to `pending` and its terminal result to `outcome`; the
+    // dialog owns `cancel`. The provider row is only added from the terminal
+    // outcome, so the user learns success or the failure cause here.
+    DeviceAuth {
+        provider_idx: usize,        // index into CLOUD_PROVIDERS
+        name: String,               // stable public name used by /model and API clients
+        model: String,              // resolved model name for the provider row
+        reference: String,          // named credential the ceremony binds
+        editing_idx: Option<usize>, // always None: the ceremony runs for adds only
+        pending: Arc<Mutex<Option<DeviceAuthPresentation>>>,
+        outcome: DeviceAuthOutcome,
+        cancel: tokio_util::sync::CancellationToken,
+    },
 }
+
+/// Secret-free device sign-in details shown by the add-time dialog (#424).
+#[derive(Debug, Clone)]
+pub(super) struct DeviceAuthPresentation {
+    pub(super) verification_uri: String,
+    pub(super) user_code: String,
+    pub(super) expires_in: Duration,
+}
+
+/// Terminal result of the add-time device ceremony, published by the
+/// background flow and read by the dialog's input and render paths.
+pub(super) type DeviceAuthOutcome = Arc<Mutex<Option<anyhow::Result<EnsuredChatGptCredential>>>>;
 
 /// Cloud provider options shown in the add-provider overlay
 pub(super) const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
