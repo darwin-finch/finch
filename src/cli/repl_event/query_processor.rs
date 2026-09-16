@@ -2865,6 +2865,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_streaming_cancel_before_attach_does_not_execute() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CountingTool {
+            name: "read",
+            executions: Arc::clone(&executions),
+        }));
+        let mut harness =
+            StreamingQueryHarness::spawn_with("inspect", registry, offered_read()).await;
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        harness
+            .tool_coordinator
+            .arm_wait_before_attach(Arc::clone(&waiting), Arc::clone(&resume))
+            .await;
+        harness
+            .send(Ok(StreamChunk::ToolCallComplete {
+                id: "call-1".into(),
+                name: "read".into(),
+                input: serde_json::json!({"file_path": "/tmp/a"}),
+                provenance: stream_prov(1),
+            }))
+            .await;
+        harness.close_stream();
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiting.notified())
+            .await
+            .expect("query must park after begin_tool_execution and before attach_loop");
+        harness.query_states.cancel_query(harness.query_id).await;
+        harness
+            .tool_coordinator
+            .terminalize(harness.query_id, crate::tools::ToolLoopTerminal::Cancelled)
+            .await;
+        resume.notify_one();
+        harness.task.await.expect("query task panicked");
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "cancel that wins before attach_loop must not execute the tool"
+        );
+        let mut successes = Vec::new();
+        while let Ok(event) = harness.events.try_recv() {
+            if let ReplEvent::ToolResult {
+                result: Ok(content),
+                ..
+            } = event
+            {
+                successes.push(content);
+            }
+        }
+        assert!(
+            successes.is_empty(),
+            "cancel-before-attach must not append a success: {successes:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn named_brain_stream_error_retains_partial_source_without_executing_it() {
         let mut harness = StreamingQueryHarness::spawn("say nothing yet").await;
         let partial_source = "(say \"must not run\")";

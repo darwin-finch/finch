@@ -58,9 +58,17 @@ pub struct ToolExecutionCoordinator {
     /// Co-Forth poset — each tool call auto-pushes a trace node here.
     poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
 
-    /// Per-query ToolLoop. The event loop owns the lifecycle; this map is
-    /// how concurrent tool tasks admit-once and drop late results.
-    tool_loops: Arc<Mutex<HashMap<Uuid, Arc<Mutex<ToolLoop>>>>>,
+    /// Per-query ToolLoop plus terminals recorded before attach.
+    /// Cancel/timeout/disconnect that wins the map lock first must still
+    /// terminalize the loop that is attached afterwards.
+    tool_loops: Arc<Mutex<ToolLoopTable>>,
+    #[cfg(test)]
+    wait_before_attach: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+}
+
+struct ToolLoopTable {
+    attached: HashMap<Uuid, Arc<Mutex<ToolLoop>>>,
+    pending_terminals: HashMap<Uuid, ToolLoopTerminal>,
 }
 
 /// One tool's client-side presentation binding. It is intentionally created
@@ -130,7 +138,12 @@ impl ToolExecutionCoordinator {
             repl_mode,
             plan_content,
             poset: None,
-            tool_loops: Arc::new(Mutex::new(HashMap::new())),
+            tool_loops: Arc::new(Mutex::new(ToolLoopTable {
+                attached: HashMap::new(),
+                pending_terminals: HashMap::new(),
+            })),
+            #[cfg(test)]
+            wait_before_attach: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -146,23 +159,64 @@ impl ToolExecutionCoordinator {
     }
 
     /// Attach the event-loop-owned ToolLoop for this query's tool round.
+    ///
+    /// A cancel/timeout/disconnect that arrived before this attach is applied
+    /// to the loop before it becomes visible to spawn, so terminal always wins.
     pub async fn attach_loop(&self, query_id: Uuid, tool_loop: Arc<Mutex<ToolLoop>>) {
-        self.tool_loops.lock().await.insert(query_id, tool_loop);
+        #[cfg(test)]
+        {
+            let hook = self.wait_before_attach.lock().await.take();
+            if let Some((waiting, resume)) = hook {
+                waiting.notify_one();
+                resume.notified().await;
+            }
+        }
+        let pending = {
+            let mut table = self.tool_loops.lock().await;
+            let pending = table.pending_terminals.remove(&query_id);
+            table.attached.insert(query_id, Arc::clone(&tool_loop));
+            pending
+        };
+        if let Some(terminal) = pending {
+            tool_loop.lock().await.terminalize(terminal);
+        }
     }
 
     /// End the round. Further admits and result appends fail closed.
+    ///
+    /// When no loop is attached yet, the terminal is recorded so a later
+    /// `attach_loop` cannot revive execution.
     pub async fn terminalize(&self, query_id: Uuid, terminal: ToolLoopTerminal) -> bool {
-        let tool_loop = self.tool_loops.lock().await.get(&query_id).cloned();
-        if let Some(tool_loop) = tool_loop {
-            tool_loop.lock().await.terminalize(terminal)
-        } else {
-            false
-        }
+        let attached = {
+            let mut table = self.tool_loops.lock().await;
+            if let Some(tool_loop) = table.attached.get(&query_id).cloned() {
+                tool_loop
+            } else if table.pending_terminals.contains_key(&query_id) {
+                return false;
+            } else {
+                table.pending_terminals.insert(query_id, terminal);
+                return true;
+            }
+        };
+        let applied = attached.lock().await.terminalize(terminal);
+        applied
     }
 
     /// Drop the round after the query has fully left the tool path.
     pub async fn forget_loop(&self, query_id: Uuid) {
-        self.tool_loops.lock().await.remove(&query_id);
+        let mut table = self.tool_loops.lock().await;
+        table.attached.remove(&query_id);
+        table.pending_terminals.remove(&query_id);
+    }
+
+    /// Park `attach_loop` until the test resumes, so cancel can win the race.
+    #[cfg(test)]
+    pub(crate) async fn arm_wait_before_attach(
+        &self,
+        waiting: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
+    ) {
+        *self.wait_before_attach.lock().await = Some((waiting, resume));
     }
 
     /// Spawn a task to execute a tool (concurrent, non-blocking)
@@ -213,7 +267,13 @@ impl ToolExecutionCoordinator {
 
         tokio::spawn(async move {
             let mut tool_use = tool_use;
-            let tool_loop = tool_loops.lock().await.get(&query_id).cloned();
+            let tool_loop = {
+                let table = tool_loops.lock().await;
+                if table.pending_terminals.contains_key(&query_id) {
+                    return;
+                }
+                table.attached.get(&query_id).cloned()
+            };
             if let Some(tool_loop) = &tool_loop {
                 if tool_loop
                     .lock()

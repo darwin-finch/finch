@@ -1472,8 +1472,16 @@ impl OpenAIProvider {
                             input
                         }
                         TransportRule::CompatibleChatCompletions => {
-                            serde_json::from_str(&tool_call.function.arguments)
-                                .unwrap_or_else(|_| serde_json::json!({}))
+                            if tool_call.function.arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+                                anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
+                            }
+                            let input: serde_json::Value =
+                                serde_json::from_str(&tool_call.function.arguments)
+                                    .context("OpenAI returned malformed JSON function arguments")?;
+                            if !input.is_object() {
+                                anyhow::bail!("OpenAI function arguments were not a JSON object");
+                            }
+                            input
                         }
                     };
                     content.push(ContentBlock::ToolUse {
@@ -3883,7 +3891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compatible_nonstream_keeps_historical_malformed_tool_argument_fallback() {
+    async fn compatible_nonstream_malformed_tool_arguments_fail_closed() {
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/v1/chat/completions")
@@ -3900,11 +3908,70 @@ mod tests {
             "compatible".into(),
         )
         .unwrap();
-        let response = provider
+        let error = provider
             .send_message_once(&ProviderRequest::new(vec![crate::Message::user("hello")]))
             .await
+            .expect_err("malformed function arguments must fail closed, not become {{}}");
+        let message = error.to_string();
+        assert!(
+            message.contains("malformed JSON function arguments"),
+            "compatible non-stream must not coerce malformed arguments to {{}}: {message}"
+        );
+        assert!(
+            !message.contains("{}"),
+            "error must not imply empty-object execution: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_stream_malformed_arguments_emit_deltas_without_complete() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(concat!(
+                "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"compatible-model\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"not-json\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n"
+            ))
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_compatible(
+            "key".into(),
+            server.url(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "compatible-model".into(),
+            "compatible".into(),
+        )
+        .unwrap();
+        let mut rx = provider
+            .send_message_stream_once(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .await
             .unwrap();
-        assert_eq!(response.tool_uses()[0].input, serde_json::json!({}));
+        let mut deltas = 0usize;
+        let mut completes = 0usize;
+        let mut tool_blocks = 0usize;
+        while let Some(item) = rx.recv().await {
+            match item.unwrap() {
+                StreamChunk::ToolCallDelta { .. } => deltas += 1,
+                StreamChunk::ToolCallComplete { .. } => completes += 1,
+                StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { .. }) => tool_blocks += 1,
+                _ => {}
+            }
+        }
+        assert!(
+            deltas > 0,
+            "compatible stream must emit ToolCallDelta so ToolLoop can fail closed from fragments"
+        );
+        assert_eq!(
+            completes, 0,
+            "malformed compatible-stream JSON must not emit ToolCallComplete"
+        );
+        assert_eq!(
+            tool_blocks, 0,
+            "malformed compatible-stream JSON must not emit ContentBlockComplete(ToolUse)"
+        );
     }
 
     #[tokio::test]

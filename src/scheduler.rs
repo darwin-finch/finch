@@ -405,6 +405,10 @@ pub struct AgentScheduler {
     /// for the task write lock used to publish the started attempt.
     #[cfg(test)]
     notify_before_attempt_lock: tokio::sync::Mutex<Option<Arc<Notify>>>,
+    /// Test-only rendezvous after a child tool has executed and before the
+    /// loop appends its result, so cancel can prove late-result ignore.
+    #[cfg(test)]
+    wait_before_tool_result_append: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 #[async_trait::async_trait]
@@ -463,6 +467,8 @@ impl AgentScheduler {
             wait_before_provider_poll: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             notify_before_attempt_lock: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            wait_before_tool_result_append: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -947,8 +953,8 @@ impl AgentScheduler {
                 ToolLoopIdentity {
                     provider: identity.provider_model.clone(),
                     model: identity.provider_model.clone(),
-                    brain: identity.brain_run_id.map(|id| id.to_string()),
-                    run_id: Some(identity.task_id.to_string()),
+                    brain: None,
+                    run_id: identity.brain_run_id.map(|id| id.to_string()),
                 },
                 catalog,
             );
@@ -1015,6 +1021,21 @@ impl AgentScheduler {
                             Err(error) => (format!("Error: {error}"), true),
                         };
                         self.set_active_tool(identity.task_id, None).await;
+                        #[cfg(test)]
+                        {
+                            let hook = self.wait_before_tool_result_append.lock().await.take();
+                            if let Some((waiting, resume)) = hook {
+                                waiting.notify_one();
+                                resume.notified().await;
+                            }
+                        }
+                        if cancellation.is_cancelled() {
+                            tool_loop.terminalize(ToolLoopTerminal::Cancelled);
+                            bail!(
+                                "agent cancelled after consuming {} provider attempts",
+                                usage.usage.started_attempts
+                            );
+                        }
                         let appended = if is_error {
                             ToolLoopResult::error(&validated.id, content)
                         } else {
@@ -4057,6 +4078,220 @@ mod tests {
             provider.calls.load(Ordering::SeqCst),
             2,
             "typed reject must resume the generation turn rather than hang; calls={}",
+            provider.calls.load(Ordering::SeqCst)
+        );
+    }
+
+    struct OneShotToolGenerator {
+        calls: AtomicUsize,
+        first: Vec<ToolUse>,
+        final_text: &'static str,
+    }
+
+    #[async_trait]
+    impl Generator for OneShotToolGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<GeneratorResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                let blocks = self
+                    .first
+                    .iter()
+                    .map(|tool| ContentBlock::ToolUse {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        input: tool.input.clone(),
+                    })
+                    .collect();
+                return Ok(GeneratorResponse {
+                    text: String::new(),
+                    content_blocks: blocks,
+                    tool_uses: self.first.clone(),
+                    metadata: ResponseMetadata {
+                        generator: "oneshot".into(),
+                        model: "oneshot".into(),
+                        confidence: None,
+                        stop_reason: Some("tool_use".into()),
+                        input_tokens: None,
+                        output_tokens: None,
+                        latency_ms: None,
+                        primary_allowance_used_percent: None,
+                        secondary_allowance_used_percent: None,
+                    },
+                });
+            }
+            Ok(GeneratorResponse {
+                text: self.final_text.into(),
+                content_blocks: vec![ContentBlock::text(self.final_text)],
+                tool_uses: Vec::new(),
+                metadata: ResponseMetadata {
+                    generator: "oneshot".into(),
+                    model: "oneshot".into(),
+                    confidence: None,
+                    stop_reason: Some("end_turn".into()),
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(8),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "oneshot"
+        }
+    }
+
+    fn spawn_spec() -> AgentTaskSpec {
+        AgentTaskSpec {
+            task: "inspect".to_string(),
+            role: AgentRole::Explore,
+            background: None,
+            provider: None,
+            model: None,
+            context: Vec::new(),
+            capability_grant_ids: None,
+            budget: AgentBudget::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_unknown_child_tool_fails_closed_without_execution() {
+        let provider = Arc::new(OneShotToolGenerator {
+            calls: AtomicUsize::new(0),
+            first: vec![ToolUse {
+                id: "ghost".into(),
+                name: "ghost_child_tool".into(),
+                input: serde_json::json!({}),
+            }],
+            final_text: "done after unknown",
+        });
+        let scheduler = attached_scheduler(
+            ProviderResolver::new(provider.clone()),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let mut events = scheduler.subscribe();
+        let identity = scheduler
+            .spawn(spawn_spec(), None)
+            .await
+            .expect("child must spawn");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scheduler.wait(identity.task_id),
+        )
+        .await
+        .expect("unknown-tool child must terminalize")
+        .expect("wait must succeed");
+        assert_eq!(result.status, AgentTaskStatus::Completed);
+        assert!(
+            result.final_message.contains("done after unknown"),
+            "typed reject must resume generation; result={result:?}"
+        );
+        let mut started = 0usize;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AgentEvent::ToolStarted { .. }) {
+                started += 1;
+            }
+        }
+        assert_eq!(
+            started, 0,
+            "unknown child tool must never start execution; result={result:?}"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "unknown-tool reject must continue the turn; calls={}",
+            provider.calls.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_late_tool_result_after_cancel_is_dropped() {
+        let provider = Arc::new(OneShotToolGenerator {
+            calls: AtomicUsize::new(0),
+            first: vec![ToolUse {
+                id: "vm".into(),
+                name: "get_vm_state".into(),
+                input: serde_json::json!({}),
+            }],
+            final_text: "must not resume after cancel",
+        });
+        let scheduler = attached_scheduler(
+            ProviderResolver::new(provider.clone()),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let waiting = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *scheduler.wait_before_tool_result_append.lock().await =
+            Some((Arc::clone(&waiting), Arc::clone(&resume)));
+        let mut events = scheduler.subscribe();
+        let identity = scheduler
+            .spawn(spawn_spec(), None)
+            .await
+            .expect("child must spawn");
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+            .await
+            .expect("child must park after executing and before appending the result");
+        scheduler
+            .cancel(identity.task_id)
+            .await
+            .expect("cancel during late-result window must be accepted");
+        resume.notify_one();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scheduler.wait(identity.task_id),
+        )
+        .await
+        .expect("cancelled child must terminalize")
+        .expect("wait must succeed");
+        assert_eq!(
+            result.status,
+            AgentTaskStatus::Cancelled,
+            "late result after cancel must not complete the child; result={result:?}"
+        );
+        assert!(
+            !result
+                .final_message
+                .contains("must not resume after cancel"),
+            "cancelled child must not resume generation with a late tool result; result={result:?}"
+        );
+        let mut completed = 0usize;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AgentEvent::ToolCompleted { .. }) {
+                completed += 1;
+            }
+        }
+        assert_eq!(
+            completed, 0,
+            "late tool result after cancel must not be appended; result={result:?}"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "cancel in the append window must not start another provider turn; calls={}",
             provider.calls.load(Ordering::SeqCst)
         );
     }

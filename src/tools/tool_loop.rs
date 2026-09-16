@@ -54,7 +54,7 @@ impl ToolCatalog {
         if name.is_empty() {
             return Err(RejectReason::UnknownTool);
         }
-        if !self.offered.is_empty() && !self.offered.contains(name) {
+        if !self.offered.contains(name) {
             return Err(RejectReason::UnsupportedTool);
         }
         if !self.executable.is_empty() && !self.executable.contains(name) {
@@ -562,7 +562,7 @@ impl ToolLoop {
 
 fn parse_arguments(raw: &str) -> Result<Value, String> {
     if raw.is_empty() {
-        return Ok(serde_json::json!({}));
+        return Err("arguments were empty".to_string());
     }
     match serde_json::from_str::<Value>(raw) {
         Ok(value) if value.is_object() => Ok(value),
@@ -708,6 +708,53 @@ mod tests {
             Err(AdmitError::NotReady),
             "malformed call must never start execution"
         );
+    }
+
+    #[test]
+    fn test_tool_loop_empty_accumulated_arguments_fail_closed() {
+        let mut tool_loop = loop_open();
+        tool_loop.observe_delta(
+            "call-1".into(),
+            Some("read".into()),
+            String::new(),
+            provenance(1),
+        );
+        let prepared = tool_loop.finish_observation();
+        match &prepared[0] {
+            PreparedCall::Rejected(call) => {
+                assert!(
+                    matches!(call.reason, RejectReason::MalformedArguments { .. }),
+                    "empty fragments must fail closed, not execute as {{}}: {call:?}"
+                );
+            }
+            other => panic!("expected malformed reject for empty args, got {other:?}"),
+        }
+        assert_eq!(
+            tool_loop.admit_execution("call-1"),
+            Err(AdmitError::NotReady)
+        );
+    }
+
+    #[test]
+    fn test_tool_loop_empty_catalog_rejects_every_name() {
+        let mut tool_loop = ToolLoop::new(identity(), ToolCatalog::offered(Vec::<String>::new()));
+        tool_loop.observe_complete(
+            "call-1".into(),
+            "read".into(),
+            serde_json::json!({"file_path": "/tmp/a"}),
+            provenance(1),
+        );
+        let prepared = tool_loop.finish_observation();
+        match &prepared[0] {
+            PreparedCall::Rejected(call) => {
+                assert_eq!(
+                    call.reason,
+                    RejectReason::UnsupportedTool,
+                    "empty offered set means nothing was offered this turn: {call:?}"
+                );
+            }
+            other => panic!("expected unsupported, got {other:?}"),
+        }
     }
 
     #[test]
