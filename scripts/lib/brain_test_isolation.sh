@@ -285,10 +285,14 @@ brain_test_isolation_is_active() {
     proof_mode="$(stat -f '%Lp' /dev/fd/108)" || return 1
     proof_type="$(stat -f '%HT' /dev/fd/108)" || return 1
   else
-    links="$(stat -c '%h' /dev/fd/108)" || return 1
-    proof_uid="$(stat -c '%u' /dev/fd/108)" || return 1
-    proof_mode="$(stat -c '%a' /dev/fd/108)" || return 1
-    proof_type="$(stat -c '%F' /dev/fd/108)" || return 1
+    # Linux: /dev/fd is a symlink to /proc/self/fd, so stat on /dev/fd/108
+    # describes the symlink directory entry ("symbolic link"), not the open
+    # file. /proc/self/fd/N is the canonical magic link and the kernel
+    # resolves it to the target's metadata for stat.
+    links="$(stat -c '%h' /proc/self/fd/108)" || return 1
+    proof_uid="$(stat -c '%u' /proc/self/fd/108)" || return 1
+    proof_mode="$(stat -c '%a' /proc/self/fd/108)" || return 1
+    proof_type="$(stat -c '%F' /proc/self/fd/108)" || return 1
   fi
   [[ "$links" == 0 && "$proof_uid" == "$(id -u)" && "$proof_mode" == 400 ]] || brain_isolation_proof_rejected proof-backup-metadata
   [[ "$proof_type" == 'Regular File' || "$proof_type" == 'regular file' ]] || brain_isolation_proof_rejected proof-backup-type
