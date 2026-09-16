@@ -4760,3 +4760,78 @@ async fn live_chatgpt_subscription_collaboration_tool_is_explicitly_opt_in() -> 
     }
     Ok::<(), anyhow::Error>(())
 }
+
+fn stored_record(account: &str) -> crate::oauth::OAuthTokenRecord {
+    use crate::{AudienceBinding, CredentialKind, CredentialProvider, EndpointFamily};
+    crate::oauth::OAuthTokenRecord {
+        dialect_id: "openai_chatgpt_subscription".into(),
+        protocol_revision: "test".into(),
+        provider: CredentialProvider::ChatgptSubscription,
+        kind: CredentialKind::OauthDevice,
+        issuer: "openai-chatgpt".into(),
+        audience: AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
+        client_id: "client".into(),
+        account: account.into(),
+        tenant: None,
+        project: None,
+        scopes: ["chatgpt.codex.invoke".into()].into(),
+        access_token: "access".into(),
+        refresh_token: Some("refresh".into()),
+        id_token: Some("id".into()),
+        expires_at: Utc::now() + chrono::Duration::hours(1),
+        generation: "generation".into(),
+        revoked: false,
+        mutation_pending: false,
+    }
+}
+
+#[test]
+fn interrupted_refresh_is_not_reported_as_an_account_change() {
+    let mut record = stored_record("account-1");
+    record.mutation_pending = true;
+    let error = super::diagnose_stored_chatgpt_record(&record, "account-1", "chatgpt:default")
+        .expect_err("interrupted refresh must fail closed");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("interrupted token refresh"),
+        "query path must name the crash marker, got {text}"
+    );
+    assert!(
+        text.contains("finch auth recover chatgpt --credential chatgpt:default"),
+        "query path must name the recover command, got {text}"
+    );
+    assert!(
+        !text.contains("changed accounts"),
+        "interrupted refresh must not be described as an account change, got {text}"
+    );
+}
+
+#[test]
+fn revoked_and_account_mismatch_are_named_separately() {
+    let mut revoked = stored_record("account-1");
+    revoked.revoked = true;
+    let revoked_text = format!(
+        "{:#}",
+        super::diagnose_stored_chatgpt_record(&revoked, "account-1", "chatgpt:default")
+            .expect_err("revoked credential must fail closed")
+    );
+    assert!(
+        revoked_text.contains("was revoked"),
+        "revoked credential must say revoked, got {revoked_text}"
+    );
+
+    let mismatch = stored_record("other-account");
+    let mismatch_text = format!(
+        "{:#}",
+        super::diagnose_stored_chatgpt_record(&mismatch, "account-1", "chatgpt:default")
+            .expect_err("account mismatch must fail closed")
+    );
+    assert!(
+        mismatch_text.contains("different account than config"),
+        "account mismatch must not reuse the mutation-pending copy, got {mismatch_text}"
+    );
+    assert!(
+        !mismatch_text.contains("interrupted token refresh"),
+        "account mismatch must not look like a crash marker, got {mismatch_text}"
+    );
+}
