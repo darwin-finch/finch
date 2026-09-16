@@ -19,6 +19,7 @@ use super::types::{
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::retry::{with_retry, NonRetriableError};
+use crate::tool_bindings::{compile_from_definitions, ToolBindingTable};
 use crate::ReasoningEffort;
 use crate::{ContentBlock, ImageSource};
 
@@ -31,6 +32,38 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+
+fn openai_bindings(
+    provider: &str,
+    request: &ProviderRequest,
+    model: &str,
+) -> Result<ToolBindingTable> {
+    compile_from_definitions(
+        WireProtocol::OpenAiChatCompletions,
+        provider,
+        model,
+        request.tools.as_deref().unwrap_or_default(),
+        request.tool_policy(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn decode_openai_tool_name(
+    provider: &str,
+    request: &ProviderRequest,
+    wire_name: &str,
+) -> Result<String> {
+    let model = if request.model.is_empty() {
+        String::new()
+    } else {
+        request.model.clone()
+    };
+    let bindings = openai_bindings(provider, request, &model)?;
+    if bindings.is_empty() {
+        return Ok(wire_name.to_string());
+    }
+    Ok(bindings.decode_wire_call(wire_name, None)?.semantic.clone())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransportRule {
@@ -1149,6 +1182,7 @@ impl OpenAIProvider {
         } else {
             request.model.clone()
         };
+        let bindings = openai_bindings(&self.provider_name, request, &model)?;
         let rule = self.transport_rule(&model);
 
         let mut messages: Vec<OpenAIMessage> = Vec::new();
@@ -1214,11 +1248,19 @@ impl OpenAIProvider {
                             ContentBlock::ToolUse { id, name, input } => {
                                 let arguments = serde_json::to_string(input)
                                     .unwrap_or_else(|_| "{}".to_string());
+                                let wire_name = if bindings.is_empty() {
+                                    name.clone()
+                                } else {
+                                    bindings
+                                        .encode_semantic(name)
+                                        .map(|bound| bound.wire.name.clone())
+                                        .unwrap_or_else(|_| name.clone())
+                                };
                                 Some(OpenAIRequestToolCall {
                                     id: id.clone(),
                                     tool_type: "function".to_string(),
                                     function: OpenAIRequestFunction {
-                                        name: name.clone(),
+                                        name: wire_name,
                                         arguments,
                                     },
                                 })
@@ -1361,34 +1403,24 @@ impl OpenAIProvider {
         }
 
         // Convert tools to OpenAI format if present
-        let tools = request.tools.as_ref().map(|tool_defs| {
-            tool_defs
-                .iter()
-                .map(|tool| {
-                    // Convert ToolInputSchema to Value
-                    let parameters = match serde_json::to_value(&tool.input_schema) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to convert tool schema for '{}': {}",
-                                tool.name,
-                                e
-                            );
-                            serde_json::json!({})
-                        }
-                    };
-
-                    OpenAITool {
+        let tools = if bindings.is_empty() {
+            None
+        } else {
+            Some(
+                bindings
+                    .entries()
+                    .iter()
+                    .map(|bound| OpenAITool {
                         tool_type: "function".to_string(),
                         function: OpenAIFunction {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters,
+                            name: bound.wire.name.clone(),
+                            description: bound.description.clone(),
+                            parameters: bound.wire_schema.clone(),
                         },
-                    }
-                })
-                .collect()
-        });
+                    })
+                    .collect(),
+            )
+        };
 
         let openai_request = OpenAIRequest {
             model,
@@ -1417,6 +1449,7 @@ impl OpenAIProvider {
         &self,
         response: OpenAIResponse,
         rule: TransportRule,
+        request: &ProviderRequest,
     ) -> Result<ProviderResponse> {
         if rule == TransportRule::CanonicalGpt56ChatCompletions {
             if response.object.as_deref() != Some("chat.completion") {
@@ -1484,9 +1517,14 @@ impl OpenAIProvider {
                             input
                         }
                     };
+                    let name = decode_openai_tool_name(
+                        &self.provider_name,
+                        request,
+                        &tool_call.function.name,
+                    )?;
                     content.push(ContentBlock::ToolUse {
                         id: tool_call.id,
-                        name: tool_call.function.name,
+                        name,
                         input,
                     });
                 } else if rule == TransportRule::CanonicalGpt56ChatCompletions {
@@ -1592,7 +1630,7 @@ impl OpenAIProvider {
             "received OpenAI-compatible response"
         );
 
-        self.parse_response(openai_response, rule)
+        self.parse_response(openai_response, rule, request)
     }
 
     /// Send a message with streaming response (no retry)
@@ -3878,7 +3916,11 @@ mod tests {
             },
         ] {
             let error = provider
-                .parse_response(response, TransportRule::CanonicalGpt56ChatCompletions)
+                .parse_response(
+                    response,
+                    TransportRule::CanonicalGpt56ChatCompletions,
+                    &ProviderRequest::new(vec![]),
+                )
                 .unwrap_err()
                 .to_string();
             assert!(error.len() < 256);

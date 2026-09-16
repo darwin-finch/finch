@@ -30,6 +30,7 @@ mod ports;
 mod reasoning;
 mod retry;
 mod teacher_session;
+mod tool_bindings;
 mod tool_contract;
 mod types;
 mod validated_boundary;
@@ -78,12 +79,18 @@ pub use retry::{with_retry, NonRetriableError};
 pub use teacher_session::{
     ConversationState, OptimizationStats, TeacherContextConfig, TeacherSession,
 };
+pub use tool_bindings::{
+    compile_from_definitions, compile_tool_bindings, BoundTool, ResultEncoding, SemanticTool,
+    ToolBindingError, ToolBindingTable, ToolOrigin, WireToolIdentity, WireToolKind,
+    MAX_ADVERTISED_TOOLS,
+};
 pub use tool_contract::{ToolDefinition, ToolInputSchema, ToolUse};
 pub use types::{
     CapabilityProvenance, CapabilitySupport, ContextWindowCapability, EventProvenance,
-    InvocationMetadata, ModelCapabilities, ModelFeature, OutputTokenLimitCapability,
-    ProviderAllowance, ProviderRequest, ProviderResponse, ProviderUsage, ReasoningCapability,
-    StreamChunk, WireProtocol, WireProtocolCapability,
+    InvocationMetadata, ModelCapabilities, ModelFeature, NativeToolGrant,
+    OutputTokenLimitCapability, ProviderAllowance, ProviderRequest, ProviderResponse,
+    ProviderUsage, ReasoningCapability, StreamChunk, ToolAuthority, ToolCompilePolicy,
+    WireProtocol, WireProtocolCapability,
 };
 pub use validated_boundary::ValidatedProviderRequest;
 pub use wire_types::{ContentBlock, ImageSource, Message};
@@ -376,6 +383,80 @@ mod capability_contract_tests {
             .to_string()
             .contains("supports at most 10000 output tokens, but 10001 were requested"));
         assert_eq!(output_provider.effects.load(Ordering::SeqCst), 0);
+    }
+
+    struct ToolsProvider {
+        effects: AtomicUsize,
+        protocol: WireProtocol,
+    }
+
+    #[async_trait]
+    impl ProviderBackend for ToolsProvider {
+        async fn send_message_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
+            self.effects.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("raw provider effect must not run")
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<Receiver<Result<StreamChunk>>> {
+            self.effects.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("raw provider effect must not run")
+        }
+
+        fn name(&self) -> &str {
+            "tools-contract"
+        }
+
+        fn default_model(&self) -> &str {
+            "model-a"
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            ModelCapabilities::static_metadata(
+                self.name(),
+                model,
+                "2026-09-16",
+                "tool binding contract",
+                CapabilitySupport::Supported,
+                CapabilitySupport::Supported,
+                CapabilitySupport::Unsupported,
+                ReasoningCapability::unsupported("2026-09-16", "tool binding contract"),
+                Some(1_000),
+                Some(10_000),
+                None,
+            )
+            .with_wire_protocol(self.protocol, "2026-09-16", "tool binding contract")
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_wire_collision_fails_before_provider_effect() {
+        let provider = ToolsProvider {
+            effects: AtomicUsize::new(0),
+            protocol: WireProtocol::OpenAiChatGptResponsesLite,
+        };
+        let error = provider
+            .send_message(
+                &ProviderRequest::new(vec![])
+                    .with_model("model-a")
+                    .with_tools(vec![ToolDefinition {
+                        name: "finch_spawn_agent".into(),
+                        description: "collision".into(),
+                        input_schema: ToolInputSchema::simple(vec![]),
+                    }]),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("reserved wire tool name"),
+            "reserved alias must fail at the validated boundary: {error}"
+        );
+        assert_eq!(provider.effects.load(Ordering::SeqCst), 0);
     }
 }
 

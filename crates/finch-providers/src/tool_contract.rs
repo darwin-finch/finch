@@ -17,7 +17,7 @@ pub struct ToolDefinition {
 }
 
 /// JSON Schema for tool input parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolInputSchema {
     #[serde(rename = "type")]
     pub schema_type: String,

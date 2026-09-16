@@ -18,6 +18,7 @@ use super::types::{
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::retry::{with_retry, NonRetriableError};
+use crate::tool_bindings::compile_from_definitions;
 use crate::ContentBlock;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
@@ -55,7 +56,7 @@ impl GeminiProvider {
     }
 
     /// Convert ProviderRequest to Gemini API format
-    fn to_gemini_request(&self, request: &ProviderRequest) -> GeminiRequest {
+    fn to_gemini_request(&self, request: &ProviderRequest) -> Result<GeminiRequest> {
         let model = if request.model.is_empty() {
             self.default_model.clone()
         } else {
@@ -116,33 +117,29 @@ impl GeminiProvider {
             .collect();
 
         // Convert tools to Gemini's function declarations format
-        let tools = request.tools.as_ref().map(|tool_defs| {
-            vec![GeminiTools {
-                function_declarations: tool_defs
+        let tools = if request.tools.as_ref().is_some_and(|defs| !defs.is_empty()) {
+            let bindings = compile_from_definitions(
+                WireProtocol::GeminiGenerateContent,
+                "gemini",
+                &request.model,
+                request.tools.as_deref().unwrap_or_default(),
+                request.tool_policy(),
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Some(vec![GeminiTools {
+                function_declarations: bindings
+                    .entries()
                     .iter()
-                    .map(|tool| {
-                        // Convert ToolInputSchema to parameters
-                        let parameters = match serde_json::to_value(&tool.input_schema) {
-                            Ok(value) => value,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to convert tool schema for '{}': {}",
-                                    tool.name,
-                                    e
-                                );
-                                serde_json::json!({})
-                            }
-                        };
-
-                        GeminiFunctionDeclaration {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters,
-                        }
+                    .map(|bound| GeminiFunctionDeclaration {
+                        name: bound.wire.name.clone(),
+                        description: bound.description.clone(),
+                        parameters: bound.wire_schema.clone(),
                     })
                     .collect(),
-            }]
-        });
+            }])
+        } else {
+            None
+        };
 
         let generation_config = GeminiGenerationConfig {
             temperature: request.temperature,
@@ -150,12 +147,12 @@ impl GeminiProvider {
             ..Default::default()
         };
 
-        GeminiRequest {
+        Ok(GeminiRequest {
             model,
             contents,
             tools,
             generation_config: Some(generation_config),
-        }
+        })
     }
 
     /// Convert Gemini response to ProviderResponse
@@ -205,7 +202,7 @@ impl GeminiProvider {
 
     /// Send a single message request (no retry)
     async fn send_message_once(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let gemini_request = self.to_gemini_request(request);
+        let gemini_request = self.to_gemini_request(request)?;
         let model = gemini_request.model.clone();
 
         let url = format!(
@@ -265,7 +262,7 @@ impl GeminiProvider {
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
         let (tx, rx) = mpsc::channel(100);
 
-        let gemini_request = self.to_gemini_request(request);
+        let gemini_request = self.to_gemini_request(request)?;
         let model = gemini_request.model.clone();
 
         let url = format!(

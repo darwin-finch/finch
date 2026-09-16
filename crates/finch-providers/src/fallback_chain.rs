@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use super::{
     resolve_effective_request, validate_provider_request, CapabilityProvenance, CapabilitySupport,
     LlmProvider, ModelCapabilities, ModelFeature, ProviderBackend, ProviderRequest,
-    ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest,
+    ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest, WireProtocol,
 };
 
 /// A chain of providers to try in order
@@ -428,6 +428,11 @@ mod tests {
                 Some(10_000),
                 None,
             )
+            .with_wire_protocol(
+                WireProtocol::OpenAiChatCompletions,
+                "2026-08-26",
+                "test fixture",
+            )
         }
     }
 
@@ -540,6 +545,11 @@ mod tests {
                 Some(10_000),
                 None,
             )
+            .with_wire_protocol(
+                super::WireProtocol::OpenAiChatCompletions,
+                "2026-08-26",
+                "test fixture",
+            )
         }
     }
 
@@ -560,6 +570,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let result = chain.send_message_with_fallback(&request).await;
@@ -584,6 +595,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let result = chain.send_message_with_fallback(&request).await;
@@ -608,6 +620,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let result = chain.send_message_with_fallback(&request).await;
@@ -631,6 +644,7 @@ mod tests {
             stream: true,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let result = chain.send_message_stream_with_fallback(&request).await;

@@ -7,6 +7,7 @@ use crate::ReasoningEffort;
 use crate::ToolDefinition;
 use crate::{ContentBlock, Message};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Whether a provider/model capability is known to be usable.
 ///
@@ -179,7 +180,7 @@ impl OutputTokenLimitCapability {
 }
 
 /// Request/response protocol used by the provider adapter for this model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireProtocol {
     AnthropicMessages,
@@ -408,6 +409,81 @@ impl ModelCapabilities {
     }
 }
 
+/// Authority class carried with a semantic tool. Mirrors Finch
+/// `ExecutionEffect` without taking a dependency on the application crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAuthority {
+    Pure,
+    VmRead,
+    VmWrite,
+    WorkspaceRead,
+    ExternalRead,
+    WorkspaceWrite,
+    ExternalWrite,
+    Destructive,
+    Unclassified,
+}
+
+impl ToolAuthority {
+    /// Snake-case name used in diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pure => "pure",
+            Self::VmRead => "vm_read",
+            Self::VmWrite => "vm_write",
+            Self::WorkspaceRead => "workspace_read",
+            Self::ExternalRead => "external_read",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::ExternalWrite => "external_write",
+            Self::Destructive => "destructive",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+/// Grant allowing a provider-native tool to be advertised.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct NativeToolGrant {
+    /// Protocol that owns the native tool.
+    pub protocol: WireProtocol,
+    /// Semantic Finch identity that handles the native tool.
+    pub semantic_identity: String,
+    /// Native wire name.
+    pub wire_name: String,
+    /// Native namespace.
+    pub namespace: Option<String>,
+}
+
+/// Optional extras Finch attaches so compilation can record authority and
+/// native-tool grants. Missing entries default to unclassified semantic tools.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ToolCompilePolicy {
+    /// Declared authority keyed by semantic identity.
+    pub authority: BTreeMap<String, ToolAuthority>,
+    /// Native tools Finch may advertise for this request.
+    pub native_grants: BTreeSet<NativeToolGrant>,
+}
+
+impl ToolCompilePolicy {
+    /// Empty policy: unclassified authority, no native grants.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record authority for one semantic identity.
+    pub fn with_authority(mut self, identity: impl Into<String>, authority: ToolAuthority) -> Self {
+        self.authority.insert(identity.into(), authority);
+        self
+    }
+
+    /// Allow one provider-native tool to be advertised.
+    pub fn with_native_grant(mut self, grant: NativeToolGrant) -> Self {
+        self.native_grants.insert(grant);
+        self
+    }
+}
+
 /// Unified request format for all LLM providers
 ///
 /// This wraps the existing Message format and adds provider-agnostic options.
@@ -443,6 +519,10 @@ pub struct ProviderRequest {
     /// Caller-owned cancellation propagated to network transports.
     #[serde(skip)]
     pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
+
+    /// Authority and native-tool grants used when compiling bindings.
+    #[serde(skip)]
+    pub tool_policy: ToolCompilePolicy,
 }
 
 impl ProviderRequest {
@@ -457,6 +537,7 @@ impl ProviderRequest {
             temperature: None,
             stream: false,
             cancellation_token: None,
+            tool_policy: ToolCompilePolicy::default(),
         }
     }
 
@@ -482,6 +563,17 @@ impl ProviderRequest {
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.tools = Some(tools);
         self
+    }
+
+    /// Attach Finch authority metadata and native-tool grants for compilation.
+    pub fn with_tool_policy(mut self, policy: ToolCompilePolicy) -> Self {
+        self.tool_policy = policy;
+        self
+    }
+
+    /// Policy used when compiling this request's tool bindings.
+    pub fn tool_policy(&self) -> &ToolCompilePolicy {
+        &self.tool_policy
     }
 
     /// Enable streaming
@@ -1138,6 +1230,7 @@ mod tests {
             temperature: None,
             stream: false,
             cancellation_token: None,
+            tool_policy: Default::default(),
         };
         let original_len = req.messages.len();
         let dropped = req.truncate_to_context_limit(10_000); // tight limit
@@ -1170,6 +1263,7 @@ mod tests {
             temperature: None,
             stream: false,
             cancellation_token: None,
+            tool_policy: Default::default(),
         };
         // Limit of 20k tokens; ~13k system + ~4k response reserve = ~3k for messages
         // Each message ~1.3k tokens so only a couple fit → should drop several

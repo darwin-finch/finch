@@ -838,6 +838,30 @@ mod tests {
             }
             other => panic!("expected unsupported bash, got {other:?}"),
         }
+        let mut leaked_alias = ToolLoop::new(identity(), ToolCatalog::offered(["spawn_agent"]));
+        leaked_alias.observe_complete(
+            "call-alias".into(),
+            "finch_spawn_agent".into(),
+            serde_json::json!({"task": "x"}),
+            provenance(1),
+        );
+        let prepared = leaked_alias.finish_observation();
+        match &prepared[0] {
+            PreparedCall::Rejected(call) => {
+                assert_eq!(
+                    call.reason,
+                    RejectReason::UnsupportedTool,
+                    "a provider wire alias must not execute: {call:?}"
+                );
+            }
+            other => panic!("leaked ChatGPT wire alias must not execute: {other:?}"),
+        }
+        assert_eq!(
+            leaked_alias.execution_starts(),
+            0,
+            "unknown wire names must cause no tool effect"
+        );
+
         let mut unknown_only = ToolLoop::new(identity(), ToolCatalog::new(["ghost"], ["read"]));
         unknown_only.observe_complete(
             "call-ghost".into(),

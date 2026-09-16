@@ -155,6 +155,8 @@ pub enum PermissionCheck { Allow, AskUser, Deny }
 /// Permission manager - checks if tool execution is allowed
 pub struct PermissionManager { … }
 impl PermissionManager {
+    /// Whether policy allows advertising this tool to a provider.
+    pub fn allows_advertising(&self, tool_name: &str) -> bool;
     /// Check if tool execution is permitted
     pub fn check_tool_use(&self, tool_name: &str, input: &Value) -> PermissionCheck;
     /// Create a permission manager for an AI peer (asymmetric rules).
@@ -503,6 +505,8 @@ pub trait Tool: Send + Sync {
 ## Functions
 
 ```rust
+/// Compile policy for the registered tools.
+pub fn compile_policy_from_registry(registry: &ToolRegistry, permissions: &PermissionManager) -> ToolCompilePolicy { … }
 /// Helper to create all LLM delegation tools from registry
 pub fn create_llm_tools(registry: &crate::llms::LLMRegistry) -> Vec<Box<dyn Tool>> { … }
 pub(crate) fn deferred_frontend_restart_from_tool_result(result: &std::result::Result<String, anyhow::Error>) -> Option<DeferredFrontendRestart> { … }
@@ -516,8 +520,12 @@ pub async fn propose_artifact_with_decision(language: &str, description: &str, s
 pub fn refined_effect_for_approval(declared: ExecutionEffect, tool_name: &str, input: &Value) -> ExecutionEffect { … }
 pub(crate) fn resume_terminal_after_editor() { … }
 pub(crate) fn run_editor(path: &Path) -> Result<std::process::ExitStatus> { … }
+/// Semantic tools Finch may advertise this turn.
+pub fn semantic_tools_for_advertisement(definitions: &[ToolDefinition], registry: &ToolRegistry, permissions: &PermissionManager, native_candidates: &[NativeToolGrant]) -> Vec<SemanticTool> { … }
 pub(crate) fn suspend_terminal_for_editor() { … }
 pub fn todo_journal(projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>) -> (TodoJournalWriter, TodoJournalTarget, TodoJournalReceiver) { … }
+/// Map a declared execution effect onto the provider-neutral authority class.
+pub fn tool_authority_from_effect(effect: ExecutionEffect) -> ToolAuthority { … }
 ```
 
 ## Constants

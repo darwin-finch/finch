@@ -747,6 +747,7 @@ impl<'a> ConversationCompactor<'a> {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let response = self

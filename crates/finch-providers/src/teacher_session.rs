@@ -510,6 +510,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         session.send_message(&request1).await.unwrap();
@@ -552,6 +553,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         session.send_message(&request2).await.unwrap();
@@ -581,6 +583,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         session.send_message(&request).await.unwrap();
@@ -651,6 +654,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let truncated = session.truncate_context(&request);
@@ -719,6 +723,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let truncated = session.truncate_context(&request);
@@ -880,6 +885,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let optimized = session.optimize_context(&request);

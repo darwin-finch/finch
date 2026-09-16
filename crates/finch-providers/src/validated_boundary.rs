@@ -1,6 +1,9 @@
 // Non-overridable dispatch boundary: tokens that prove a request was validated.
 
 use super::*;
+use std::sync::Arc;
+
+use crate::tool_bindings::{compile_from_definitions, ToolBindingTable};
 
 /// A request whose effective provider/model identity and optional
 /// capabilities were checked by Finch's non-overridable dispatch boundary.
@@ -19,6 +22,7 @@ use super::*;
 pub struct ValidatedProviderRequest {
     request: ProviderRequest,
     capabilities: ModelCapabilities,
+    tool_bindings: Arc<ToolBindingTable>,
     target: usize,
     target_type: TypeId,
 }
@@ -45,6 +49,11 @@ impl ValidatedProviderRequest {
     pub fn capabilities(&self) -> &ModelCapabilities {
         &self.capabilities
     }
+
+    /// Immutable tool-binding table compiled for this validated request.
+    pub fn tool_bindings(&self) -> &Arc<ToolBindingTable> {
+        &self.tool_bindings
+    }
 }
 
 pub(crate) fn validate_provider_request(
@@ -58,12 +67,45 @@ pub(crate) fn validate_provider_request(
         streaming,
         provider.requested_reasoning_effort(&effective),
     )?;
+    let tool_bindings = compile_validated_bindings(provider.name(), &effective, &capabilities)?;
     Ok(ValidatedProviderRequest {
         request: effective,
         capabilities,
+        tool_bindings,
         target: provider_target(provider),
         target_type: ProviderConcreteType::provider_concrete_type_id(provider),
     })
+}
+
+fn compile_validated_bindings(
+    provider: &str,
+    request: &ProviderRequest,
+    capabilities: &ModelCapabilities,
+) -> Result<Arc<ToolBindingTable>> {
+    let definitions = request.tools.as_deref().unwrap_or_default();
+    if definitions.is_empty() {
+        let protocol = capabilities
+            .wire_protocol
+            .protocol
+            .unwrap_or(WireProtocol::AnthropicMessages);
+        return Ok(Arc::new(ToolBindingTable::empty(
+            protocol,
+            provider,
+            &request.model,
+        )));
+    }
+    let protocol = capabilities
+        .wire_protocol
+        .protocol
+        .ok_or_else(|| anyhow::anyhow!("cannot compile tool bindings: wire protocol is unknown"))?;
+    let table = compile_from_definitions(
+        protocol,
+        provider,
+        &request.model,
+        definitions,
+        request.tool_policy(),
+    )?;
+    Ok(Arc::new(table))
 }
 
 fn provider_target(provider: &(impl ProviderBackend + ?Sized)) -> usize {

@@ -56,6 +56,8 @@ pub struct ModelCatalog { … }
 pub struct ModelCatalogProfile { … }
 /// A single yes/no/unknown model feature with its evidence. Re-exported from `finch-providers`.
 pub struct ModelFeature { … }
+/// Grant allowing a provider-native tool to be advertised. Re-exported from `finch-providers`.
+pub struct NativeToolGrant { … }
 /// OpenAI API provider  Supports both OpenAI and Grok APIs (they use the same format). Re-exported from `finch-providers`.
 pub struct OpenAIProvider { … }
 /// Strict OpenAI-specific dialect; reusable OAuth state remains in `oauth`. Re-exported from `finch-providers`.
@@ -98,12 +100,24 @@ pub struct ProviderResponse { … }
 pub struct ProviderUsage { … }
 /// Exact reasoning-effort values accepted by one provider/model adapter. Re-exported from `finch-providers`.
 pub struct ReasoningCapability { … }
+/// One semantic tool offered for compilation. Re-exported from `finch-providers`.
+pub struct SemanticTool { … }
 /// Streaming chunk (text delta, reasoning, tool call, or complete block). Re-exported from `finch-providers`.
 pub enum StreamChunk { TextDelta, ThinkingDelta, ToolCallDelta, ToolCallComplete, ContentBlockComplete, ResponseMetadata, Usage, Allowance }
 /// Configuration for teacher context management Re-exported from `finch-providers`.
 pub struct TeacherContextConfig { … }
 /// Teacher session with context tracking  Tracks what context has been sent to the teacher provider to enable: - Metrics on new vs repeated context - Optional t… Re-exported from `finch-providers`.
 pub struct TeacherSession { … }
+/// Authority class carried with a semantic tool. Re-exported from `finch-providers`.
+pub enum ToolAuthority { Pure, VmRead, VmWrite, WorkspaceRead, ExternalRead, WorkspaceWrite, ExternalWrite, Destructive, Unclassified }
+/// Why compilation or decode failed. Re-exported from `finch-providers`.
+pub enum ToolBindingError { DuplicateLocalIdentity, DuplicateWireIdentity, ReservedNameCollision, CaseCollision, TruncationCollision, NameTooLong, InvalidIdentifier, LossySchemaConversion, UnsupportedSchemaFeature, UnknownWireCall, UnknownNamespace, UnknownSemanticIdentity, NativeToolWithoutHandler, NativeToolWithoutGrant, UnknownWireProtocol, TooManyTools }
+/// Immutable bijective map from semantic identities to wire identities for one validated request. Re-exported from `finch-providers`.
+pub struct ToolBindingTable { … }
+/// Optional extras Finch attaches so compilation can record authority and native-tool grants. Re-exported from `finch-providers`.
+pub struct ToolCompilePolicy { … }
+/// Where a tool identity comes from. Re-exported from `finch-providers`.
+pub enum ToolOrigin { Semantic, ProviderNative }
 /// A request whose effective provider/model identity and optional capabilities were checked by Finch's non-overridable dispatch boundary. Re-exported from `finch-providers`.
 pub struct ValidatedProviderRequest { … }
 /// Signature-verified provider claims. Re-exported from `finch-providers`.
@@ -144,6 +158,10 @@ pub trait ProviderConcreteType: Any {
 ```rust
 /// Finch-local capability attached to a verified ChatGPT account credential. Re-exported from `finch-providers`.
 pub fn chatgpt_required_scopes() -> BTreeSet<String> { … }
+/// Compile `ToolDefinition`s plus an optional Finch policy into a table. Re-exported from `finch-providers`.
+pub fn compile_from_definitions(protocol: WireProtocol, provider: &str, model: &str, definitions: &[ToolDefinition], policy: &ToolCompilePolicy) -> Result<ToolBindingTable, ToolBindingError> { … }
+/// Compile semantic tools into an immutable bijective binding table. Re-exported from `finch-providers`.
+pub fn compile_tool_bindings(protocol: WireProtocol, provider: impl Into<String>, model: impl Into<String>, tools: &[SemanticTool]) -> Result<ToolBindingTable, ToolBindingError> { … }
 /// Create a fallback chain with all teachers in priority order.
 pub fn create_provider(teachers: &[TeacherEntry]) -> Result<Box<dyn LlmProvider>> { … }
 /// Create the active provider or fallback chain from unified or legacy configuration.

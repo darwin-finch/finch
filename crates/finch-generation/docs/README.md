@@ -14,4 +14,5 @@ Provider-specific parsers stay in `finch-providers`. Tool execution, Brain,
 TUI, daemon, CLI, and application `Config` stay in Finch.
 
 Tool execution is owned by Finch `ToolLoop` (`src/tools/tool_loop.rs`), not this crate.
-Provider tool-binding tables are issue #241.
+Provider tool-binding tables live in `finch-providers` (issue #241). This crate
+keeps semantic Finch tool identities on `GenerationRequest` and `ToolCall`.

@@ -57,8 +57,10 @@ application code. Finch-owned adapters (Claude, Qwen, daemon-local) stay in
 **Named remainders (not this extraction):**
 - IPC projection of native `ThinkingDelta`/`ToolCallDelta` (schema still
   carries tool calls as `ContentBlockComplete`).
-- Request construction still uses ad-hoc Claude-shaped `ToolDefinition`
-  schemas; bijective provider tool-binding tables are #241.
+- Request construction still uses Claude-shaped `ToolDefinition` schemas as
+  semantic identities. `finch-providers` compiles those into per-request
+  bijective wire-binding tables (issue #241) at the validated dispatch
+  boundary; this crate must keep storing semantic names, not provider aliases.
 - Local model architecture rewrite (ONNX/Candle/Qwen internals) is out of scope.
 - `generate_interfaces.py` matches `fn`, not `async fn` (hygiene Issue 6).
   `GenerationBackend::generate` and `Sleeper::sleep` are therefore absent from

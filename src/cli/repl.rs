@@ -1337,6 +1337,7 @@ impl Repl {
             stream: false,
             cancellation_token: None,
             system,
+            tool_policy: Default::default(),
         };
 
         // Send with Level 3 optimization (smart strategies)
@@ -1386,6 +1387,7 @@ impl Repl {
             stream: true,
             cancellation_token: None,
             system,
+            tool_policy: Default::default(),
         };
 
         // Send with streaming (Level 1 tracking only, no truncation for streaming)

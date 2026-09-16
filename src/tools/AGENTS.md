@@ -4,8 +4,9 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 
 **Owns** `src/tools/` except `mcp`: the executor, registry, permission policy, persistent
 approval patterns, session task list, the event-loop-owned [`ToolLoop`](tool_loop.rs)
-protocol, and the local tool implementations. Connecting to
-external Model Context Protocol servers is the nested [`mcp`](mcp/AGENTS.md) capsule.
+protocol, the semantic advertisement catalog (`semantic.rs`, issue #241), and the
+local tool implementations. Connecting to external Model Context Protocol servers
+is the nested [`mcp`](mcp/AGENTS.md) capsule.
 
 **ToolLoop is the single execution lifecycle.** REPL and scheduler drive it.
 Generators and provider adapters never import or invoke `ToolExecutor`.
