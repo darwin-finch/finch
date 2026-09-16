@@ -16,6 +16,18 @@ impl AudienceBinding {
     pub fn custom(endpoint: &str) -> Result<Self>;
     pub fn standard(family: EndpointFamily) -> Self;
 }
+/// One compiled row of a binding table.
+pub struct BoundTool { … }
+impl BoundTool {
+    /// Anthropic Messages tool definition using the compiled wire name.
+    pub fn anthropic_tool(&self) -> ToolDefinition;
+    /// ChatGPT Responses-Lite function tool inside the `functions` namespace.
+    pub fn chatgpt_function(&self) -> Value;
+    /// Gemini `functionDeclarations` entry.
+    pub fn gemini_declaration(&self) -> Value;
+    /// OpenAI chat-completions `tools[]` function entry.
+    pub fn openai_tool(&self) -> Value;
+}
 /// Where Finch obtained a capability claim.
 pub enum CapabilityProvenance { RuntimeDiscovery, StaticMetadata, Configuration, Unknown }
 /// Whether a provider/model capability is known to be usable.
@@ -199,6 +211,8 @@ impl ModelFeature {
     /// Construct an unknown feature with no provenance.
     pub fn unknown() -> Self;
 }
+/// Grant allowing a provider-native tool to be advertised.
+pub struct NativeToolGrant { … }
 /// A marker error type that tells `with_retry` not to retry the request.
 pub struct NonRetriableError(pub String);
 /// OpenAI API provider  Supports both OpenAI and Grok APIs (they use the same format).
@@ -263,6 +277,8 @@ impl ProviderRequest {
     pub fn new(messages: Vec<Message>) -> Self;
     /// Remove orphaned tool_use blocks from the end of the conversation.
     pub fn sanitize_messages(&mut self);
+    /// Policy used when compiling this request's tool bindings.
+    pub fn tool_policy(&self) -> &ToolCompilePolicy;
     /// Truncate conversation history to fit within a provider's context window.
     pub fn truncate_to_context_limit(&mut self, token_limit: usize) -> usize;
     pub fn with_cancellation_token(mut self, cancellation_token: tokio_util::sync::CancellationToken) -> Self;
@@ -276,6 +292,8 @@ impl ProviderRequest {
     pub fn with_system(mut self, system: impl Into<String>) -> Self;
     /// Set temperature
     pub fn with_temperature(mut self, temperature: f32) -> Self;
+    /// Attach Finch authority metadata and native-tool grants for compilation.
+    pub fn with_tool_policy(mut self, policy: ToolCompilePolicy) -> Self;
     /// Add tools to the request
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self;
 }
@@ -318,6 +336,18 @@ impl ResolvedSecret {
     /// Expose secret bytes to a trusted resolver/transport boundary.
     pub fn expose(&self) -> &str;
     pub fn new(secret: impl Into<String>) -> Result<Self>;
+}
+/// How a tool result is written back on this protocol.
+pub enum ResultEncoding { AnthropicToolResult, OpenAiToolMessage, ChatGptFunctionCallOutput, GeminiFunctionResponse }
+/// One semantic tool offered for compilation.
+pub struct SemanticTool { … }
+impl SemanticTool {
+    /// Finch-owned semantic tool with unclassified authority.
+    pub fn finch(identity: impl Into<String>, description: impl Into<String>, schema: ToolInputSchema) -> Self;
+    /// Mark this as a provider-native tool that still needs handler+grant.
+    pub fn provider_native(mut self, wire_name: impl Into<String>, namespace: Option<String>) -> Self;
+    /// Attach declared authority.
+    pub fn with_authority(mut self, authority: ToolAuthority) -> Self;
 }
 /// Streaming chunk (text delta, reasoning, tool call, or complete block).
 pub enum StreamChunk { TextDelta, ThinkingDelta, ToolCallDelta, ToolCallComplete, ContentBlockComplete, ResponseMetadata, Usage, Allowance }
@@ -365,6 +395,46 @@ impl TeacherSession {
 }
 /// Tokio sleeper.
 pub struct TokioSleeper;
+/// Authority class carried with a semantic tool.
+pub enum ToolAuthority { Pure, VmRead, VmWrite, WorkspaceRead, ExternalRead, WorkspaceWrite, ExternalWrite, Destructive, Unclassified }
+impl ToolAuthority {
+    /// Snake-case name used in diagnostics.
+    pub fn as_str(self) -> &'static str;
+}
+/// Why compilation or decode failed.
+pub enum ToolBindingError { DuplicateLocalIdentity, DuplicateWireIdentity, ReservedNameCollision, CaseCollision, TruncationCollision, NameTooLong, InvalidIdentifier, LossySchemaConversion, UnsupportedSchemaFeature, UnknownWireCall, UnknownNamespace, UnknownSemanticIdentity, NativeToolWithoutHandler, NativeToolWithoutGrant, UnknownWireProtocol, TooManyTools }
+/// Immutable bijective map from semantic identities to wire identities for one validated request.
+pub struct ToolBindingTable { … }
+impl ToolBindingTable {
+    /// Decode a provider wire call into the semantic binding for this table.
+    pub fn decode_wire_call(&self, name: &str, namespace: Option<&str>) -> Result<&BoundTool, ToolBindingError>;
+    /// Empty table for a request that advertised no tools.
+    pub fn empty(protocol: WireProtocol, provider: impl Into<String>, model: impl Into<String>) -> Self;
+    /// Look up the binding for a semantic Finch identity.
+    pub fn encode_semantic(&self, identity: &str) -> Result<&BoundTool, ToolBindingError>;
+    /// Compiled rows in advertisement order.
+    pub fn entries(&self) -> &[BoundTool];
+    /// True when no tools were advertised.
+    pub fn is_empty(&self) -> bool;
+    /// Number of advertised tools.
+    pub fn len(&self) -> usize;
+    /// Model identity recorded at compile time.
+    pub fn model(&self) -> &str;
+    /// Wire protocol this table was compiled for.
+    pub fn protocol(&self) -> WireProtocol;
+    /// Provider identity recorded at compile time.
+    pub fn provider(&self) -> &str;
+}
+/// Optional extras Finch attaches so compilation can record authority and native-tool grants.
+pub struct ToolCompilePolicy { … }
+impl ToolCompilePolicy {
+    /// Empty policy: unclassified authority, no native grants.
+    pub fn new() -> Self;
+    /// Record authority for one semantic identity.
+    pub fn with_authority(mut self, identity: impl Into<String>, authority: ToolAuthority) -> Self;
+    /// Allow one provider-native tool to be advertised.
+    pub fn with_native_grant(mut self, grant: NativeToolGrant) -> Self;
+}
 /// Tool definition (Claude API-compatible)
 pub struct ToolDefinition { … }
 /// JSON Schema for tool input parameters
@@ -373,6 +443,8 @@ impl ToolInputSchema {
     /// Create a simple schema with required string parameters
     pub fn simple(params: Vec<(&str, &str)>) -> Self;
 }
+/// Where a tool identity comes from.
+pub enum ToolOrigin { Semantic, ProviderNative }
 /// Tool use request after adapter-level validation.
 pub struct ToolUse { … }
 impl ToolUse {
@@ -387,8 +459,10 @@ pub struct ValidatedProviderRequest { … }
 impl ValidatedProviderRequest {
     /// The exact descriptor used to validate this request.
     pub fn capabilities(&self) -> &ModelCapabilities;
-    /// Consume this token at the exact provider instance for which it was validated and return the effective request.
-    pub fn into_request_for(self, provider: &(impl ProviderBackend + ?Sized)) -> Result<ProviderRequest>;
+    /// Consume this token at the exact provider instance for which it was validated and return the effective request plus the immutable tool-binding table compiled…
+    pub fn into_request_for(self, provider: &(impl ProviderBackend + ?Sized)) -> Result<(ProviderRequest, Arc<ToolBindingTable>)>;
+    /// Immutable tool-binding table compiled for this validated request.
+    pub fn tool_bindings(&self) -> &Arc<ToolBindingTable>;
 }
 /// Signature-verified provider claims.
 pub struct VerifiedOpenAiClaims { … }
@@ -396,6 +470,10 @@ pub struct VerifiedOpenAiClaims { … }
 pub enum WireProtocol { AnthropicMessages, OpenAiChatCompletions, OpenAiChatGptResponsesLite, GeminiGenerateContent }
 /// Known wire protocol and the evidence for that binding.
 pub struct WireProtocolCapability { … }
+/// Collision-free identity on one provider wire.
+pub struct WireToolIdentity { … }
+/// Wire-level kind advertised to the provider.
+pub enum WireToolKind { Function, ProviderNative }
 ```
 
 ## Traits
@@ -453,6 +531,10 @@ pub trait Sleeper: Send + Sync { … }
 ```rust
 /// Finch-local capability attached to a verified ChatGPT account credential.
 pub fn chatgpt_required_scopes() -> BTreeSet<String> { … }
+/// Compile `ToolDefinition`s plus an optional Finch policy into a table.
+pub fn compile_from_definitions(protocol: WireProtocol, provider: &str, model: &str, definitions: &[ToolDefinition], policy: &ToolCompilePolicy) -> Result<ToolBindingTable, ToolBindingError> { … }
+/// Compile semantic tools into an immutable bijective binding table.
+pub fn compile_tool_bindings(protocol: WireProtocol, provider: impl Into<String>, model: impl Into<String>, tools: &[SemanticTool]) -> Result<ToolBindingTable, ToolBindingError> { … }
 /// Names of profiles that depend on a credential, for revoke/delete UX.
 pub fn credential_dependencies<'a>(credential_name: &str, profiles: impl IntoIterator<Item = (String, Option<&'a CredentialBinding>)>) -> Vec<String> { … }
 /// Validate all credential metadata and return a stable name index.
@@ -492,6 +574,8 @@ pub const CHATGPT_OAUTH_PROTOCOL_REVISION: &str = "openai-codex-public-client@94
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5";
 /// Default completion budget used by Anthropic request envelopes.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8000;
+/// Upper bound on advertised tools for every current wire protocol.
+pub const MAX_ADVERTISED_TOOLS: usize = 256;
 pub const OPENAI_PUBLIC_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const REQUIRED_TOKEN_ISSUER: &str = "https://auth.openai.com";
 /// Date on which Finch's bundled, deliberately incomplete model fallback was reviewed.

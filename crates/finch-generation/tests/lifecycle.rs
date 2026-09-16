@@ -631,7 +631,7 @@ impl ProviderBackend for RecordingProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> anyhow::Result<ProviderResponse> {
-        let request = request.into_request_for(self)?;
+        let (request, _bindings) = request.into_request_for(self)?;
         anyhow::bail!(
             "non-stream path unused in this test; model={}",
             request.model
@@ -642,7 +642,7 @@ impl ProviderBackend for RecordingProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>> {
-        let request = request.into_request_for(self)?;
+        let (request, _bindings) = request.into_request_for(self)?;
         self.seen_models
             .lock()
             .expect("seen_models lock")

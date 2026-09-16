@@ -26,6 +26,10 @@ use super::{
     ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest, WireProtocol,
 };
 use crate::oauth::{FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthTokenRecord};
+#[cfg(test)]
+use crate::tool_bindings::compile_from_definitions;
+use crate::tool_bindings::{ToolBindingError, ToolBindingTable};
+#[cfg(test)]
 use crate::ToolDefinition;
 use crate::{
     AudienceBinding, CredentialProvider, EndpointFamily, ProviderCredential, ReasoningEffort,
@@ -572,8 +576,9 @@ impl ChatGptSubscriptionProvider {
         &self,
         request: ProviderRequest,
         cancel: CancellationToken,
+        bindings: &ToolBindingTable,
     ) -> Result<Response> {
-        let body = responses_lite_request(&request, self.reasoning_effort)?;
+        let body = responses_lite_request(&request, self.reasoning_effort, bindings)?;
         let body =
             serde_json::to_vec(&body).context("Failed to encode ChatGPT subscription request")?;
         if body.len() > MAX_REQUEST_BYTES {
@@ -663,18 +668,17 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        let request = request.into_request_for(self)?;
+        let (request, bindings) = request.into_request_for(self)?;
         let expected_model = request.model.clone();
-        let allowed_tools = advertised_tool_names(&request);
         let response = self
-            .start_response(request, CancellationToken::new())
+            .start_response(request, CancellationToken::new(), &bindings)
             .await?;
         let completed = consume_sse(
             response,
             None,
             CancellationToken::new(),
             expected_model,
-            allowed_tools,
+            (*bindings).clone(),
             #[cfg(test)]
             self.stream_producer_observer.clone(),
         )
@@ -707,11 +711,12 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        let request = request.into_request_for(self)?;
+        let (request, bindings) = request.into_request_for(self)?;
         let expected_model = request.model.clone();
-        let allowed_tools = advertised_tool_names(&request);
         let cancel = request.cancellation_token.clone().unwrap_or_default();
-        let response = self.start_response(request, cancel.clone()).await?;
+        let response = self
+            .start_response(request, cancel.clone(), &bindings)
+            .await?;
         let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         // Reserve the channel's dedicated terminal slot before exposing the
         // receiver. Callers retain the historical 32-chunk ordinary buffer,
@@ -723,6 +728,7 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
             .map_err(|_| anyhow::anyhow!("Failed to reserve ChatGPT terminal stream capacity"))?;
         #[cfg(test)]
         let stream_producer_observer = self.stream_producer_observer.clone();
+        let stream_bindings = (*bindings).clone();
         tokio::spawn(async move {
             #[cfg(test)]
             let _finish_guard = StreamProducerFinishGuard(stream_producer_observer.clone());
@@ -731,7 +737,7 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
                 Some(sender),
                 cancel,
                 expected_model,
-                allowed_tools,
+                stream_bindings,
                 #[cfg(test)]
                 stream_producer_observer,
             )
@@ -890,14 +896,23 @@ fn validate_route(url: &Url, path: &str, query: Option<&str>, allow_loopback: bo
     Ok(())
 }
 
-fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) -> Result<Value> {
+#[cfg(test)]
+fn encode_responses_lite(request: &ProviderRequest, effort: ReasoningEffort) -> Result<Value> {
+    let bindings = chatgpt_bindings(request)?;
+    responses_lite_request(request, effort, &bindings)
+}
+
+fn responses_lite_request(
+    request: &ProviderRequest,
+    effort: ReasoningEffort,
+    bindings: &ToolBindingTable,
+) -> Result<Value> {
     validate_model(&request.model)?;
     validate_reasoning(effort)?;
     if request.temperature.is_some() {
         bail!("ChatGPT Responses-Lite does not accept Finch temperature overrides");
     }
-    let tools = map_tools(request.tools.as_deref().unwrap_or_default())?;
-    let allowed_tools = advertised_tool_names(request);
+    let tools = map_tools(bindings)?;
     let mut input = Vec::new();
     let tools_payload = serde_json::to_vec(&tools)
         .context("Failed to encode ChatGPT subscription tool definitions")?;
@@ -918,13 +933,7 @@ fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) ->
     let mut calls = HashSet::new();
     let mut results = HashSet::new();
     for message in &request.messages {
-        map_message(
-            message,
-            &mut input,
-            &mut calls,
-            &mut results,
-            &allowed_tools,
-        )?;
+        map_message(message, &mut input, &mut calls, &mut results, bindings)?;
     }
     if input.len() == 1 && request.system.as_deref().is_none_or(str::is_empty) {
         bail!("ChatGPT subscription request omitted conversation input");
@@ -957,43 +966,49 @@ fn responses_lite_prefix_id(prefix: &str, visible_payload: &[u8]) -> String {
     format!("{prefix}_{}", Uuid::new_v5(&namespace, visible_payload))
 }
 
-fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
-    if tools.len() > 256 {
-        bail!("ChatGPT subscription request advertised too many tools");
-    }
-    let mut names = BTreeSet::new();
-    let mut wire_names = BTreeSet::new();
-    let mut functions = Vec::with_capacity(tools.len());
-    for tool in tools {
-        validate_identifier(&tool.name, 128, "tool name")?;
-        if is_chatgpt_agent_wire_alias(&tool.name) {
-            bail!("ChatGPT subscription request used a reserved wire tool name");
+#[cfg(test)]
+fn chatgpt_bindings(request: &ProviderRequest) -> Result<ToolBindingTable> {
+    compile_from_definitions(
+        WireProtocol::OpenAiChatGptResponsesLite,
+        "chatgpt_subscription",
+        &request.model,
+        request.tools.as_deref().unwrap_or_default(),
+        request.tool_policy(),
+    )
+    .map_err(map_chatgpt_compile_error)
+}
+
+#[cfg(test)]
+fn map_chatgpt_compile_error(error: ToolBindingError) -> anyhow::Error {
+    match &error {
+        ToolBindingError::ReservedNameCollision(_) => {
+            anyhow::anyhow!("ChatGPT subscription request used a reserved wire tool name")
         }
+        ToolBindingError::DuplicateLocalIdentity(_) => {
+            anyhow::anyhow!("ChatGPT subscription request repeated a tool name")
+        }
+        ToolBindingError::DuplicateWireIdentity { .. } => {
+            anyhow::anyhow!("ChatGPT subscription request repeated a wire tool name")
+        }
+        ToolBindingError::TooManyTools(_) => {
+            anyhow::anyhow!("ChatGPT subscription request advertised too many tools")
+        }
+        ToolBindingError::InvalidIdentifier(_) | ToolBindingError::NameTooLong(_, _) => {
+            anyhow::anyhow!("ChatGPT subscription tool name was invalid")
+        }
+        other => anyhow::Error::msg(other.to_string()),
+    }
+}
+
+fn map_tools(bindings: &ToolBindingTable) -> Result<Vec<Value>> {
+    let mut functions = Vec::with_capacity(bindings.len());
+    for tool in bindings.entries() {
         validate_bounded_text(
             &tool.description,
             MAX_TOOL_ARGUMENT_BYTES,
             "tool description",
         )?;
-        if !names.insert(tool.name.clone()) {
-            bail!("ChatGPT subscription request repeated a tool name");
-        }
-        let wire_name = chatgpt_wire_tool_name(&tool.name);
-        validate_identifier(wire_name, 128, "ChatGPT wire tool name")?;
-        if !wire_names.insert(wire_name.to_string()) {
-            bail!("ChatGPT subscription request repeated a wire tool name");
-        }
-        functions.push(json!({
-            "type":"function",
-            "name":wire_name,
-            "description":tool.description,
-            "strict":false,
-            "parameters": {
-                "type":tool.input_schema.schema_type,
-                "properties":tool.input_schema.properties,
-                "required":tool.input_schema.required,
-                "additionalProperties":false
-            }
-        }));
+        functions.push(tool.chatgpt_function());
     }
     Ok(if functions.is_empty() {
         Vec::new()
@@ -1002,54 +1017,54 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
     })
 }
 
-fn chatgpt_wire_tool_name(name: &str) -> &str {
-    match name {
-        "spawn_agent" => "finch_spawn_agent",
-        "await_agent" => "finch_await_agent",
-        "poll_agent" => "finch_poll_agent",
-        "cancel_agent" => "finch_cancel_agent",
-        _ => name,
-    }
+#[cfg(test)]
+pub(super) fn test_tool_bindings(names: &[&str]) -> ToolBindingTable {
+    let definitions = names
+        .iter()
+        .map(|name| ToolDefinition {
+            name: (*name).to_string(),
+            description: (*name).to_string(),
+            input_schema: crate::ToolInputSchema::simple(vec![]),
+        })
+        .collect::<Vec<_>>();
+    compile_from_definitions(
+        WireProtocol::OpenAiChatGptResponsesLite,
+        "chatgpt_subscription",
+        DEFAULT_MODEL,
+        &definitions,
+        &Default::default(),
+    )
+    .expect("test tool bindings")
 }
 
-fn is_chatgpt_agent_wire_alias(name: &str) -> bool {
-    matches!(
-        name,
-        "finch_spawn_agent" | "finch_await_agent" | "finch_poll_agent" | "finch_cancel_agent"
+#[cfg(test)]
+pub(super) fn empty_tool_bindings() -> ToolBindingTable {
+    ToolBindingTable::empty(
+        WireProtocol::OpenAiChatGptResponsesLite,
+        "chatgpt_subscription",
+        DEFAULT_MODEL,
     )
 }
 
-fn chatgpt_local_tool_name(name: &str) -> Option<&str> {
-    match name {
-        "finch_spawn_agent" => Some("spawn_agent"),
-        "finch_await_agent" => Some("await_agent"),
-        "finch_poll_agent" => Some("poll_agent"),
-        "finch_cancel_agent" => Some("cancel_agent"),
-        // ChatGPT owns these unprefixed names in its native collaboration
-        // namespace. Finch advertises application-owned aliases instead.
-        "spawn_agent" | "await_agent" | "poll_agent" | "cancel_agent" => None,
-        _ => Some(name),
+fn decode_chatgpt_function<'a>(
+    bindings: &'a ToolBindingTable,
+    wire_name: &str,
+    namespace: Option<&str>,
+) -> Result<&'a crate::tool_bindings::BoundTool> {
+    match bindings.decode_wire_call(wire_name, namespace) {
+        Ok(bound) => Ok(bound),
+        Err(ToolBindingError::ReservedNameCollision(_)) => {
+            bail!("ChatGPT requested a reserved native function name")
+        }
+        Err(ToolBindingError::UnknownNamespace { .. }) => {
+            bail!("ChatGPT function call namespace was invalid")
+        }
+        Err(ToolBindingError::UnknownWireCall { .. })
+        | Err(ToolBindingError::UnknownSemanticIdentity(_)) => {
+            bail!("ChatGPT requested a function Finch did not advertise")
+        }
+        Err(error) => Err(anyhow::Error::msg(error.to_string())),
     }
-}
-
-fn chatgpt_wire_namespace_is_valid(name: &str, namespace: Option<&str>) -> bool {
-    match namespace {
-        // Responses-Lite may omit the namespace on a returned custom function
-        // call. Omission denotes the request's advertised `functions` group.
-        None | Some("functions") => true,
-        Some("collaboration") => is_chatgpt_agent_wire_alias(name),
-        Some(_) => false,
-    }
-}
-
-fn advertised_tool_names(request: &ProviderRequest) -> HashSet<String> {
-    request
-        .tools
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|tool| tool.name.clone())
-        .collect()
 }
 
 fn map_message(
@@ -1057,7 +1072,7 @@ fn map_message(
     input: &mut Vec<Value>,
     calls: &mut HashSet<String>,
     results: &mut HashSet<String>,
-    allowed_tools: &HashSet<String>,
+    allowed_tools: &ToolBindingTable,
 ) -> Result<()> {
     if !matches!(message.role.as_str(), "user" | "assistant") {
         bail!("ChatGPT subscription history contained an unsupported role");
@@ -1112,9 +1127,9 @@ fn map_message(
                 }
                 validate_identifier(id, 256, "tool call identifier")?;
                 validate_identifier(name, 128, "tool name")?;
-                if !allowed_tools.contains(name) {
-                    bail!("ChatGPT subscription history used an unadvertised tool");
-                }
+                let bound = allowed_tools.encode_semantic(name).map_err(|_| {
+                    anyhow::anyhow!("ChatGPT subscription history used an unadvertised tool")
+                })?;
                 if !calls.insert(id.clone()) {
                     bail!("ChatGPT subscription history repeated a tool call identifier");
                 }
@@ -1122,8 +1137,9 @@ fn map_message(
                     .context("Failed to serialize ChatGPT function arguments")?;
                 validate_bounded_text(&arguments, MAX_TOOL_ARGUMENT_BYTES, "tool arguments")?;
                 input.push(json!({
-                    "type":"function_call","call_id":id,"name":chatgpt_wire_tool_name(name),
-                    "namespace":"functions","arguments":arguments
+                    "type":"function_call","call_id":id,"name":bound.wire.name,
+                    "namespace":bound.wire.namespace.as_deref().unwrap_or("functions"),
+                    "arguments":arguments
                 }));
             }
             ContentBlock::ToolResult {
@@ -1277,7 +1293,7 @@ async fn consume_sse(
     sender: Option<mpsc::Sender<Result<StreamChunk>>>,
     cancel: CancellationToken,
     expected_model: String,
-    allowed_tools: HashSet<String>,
+    allowed_tools: ToolBindingTable,
     #[cfg(test)] stream_producer_observer: Option<StreamProducerObserver>,
 ) -> Result<CompletedResponse> {
     let header_allowance = parse_allowance_headers(response.headers())?;
@@ -1454,7 +1470,7 @@ fn parse_event(
     event: Value,
     expected_model: &str,
     header_model: Option<&str>,
-    allowed_tools: &HashSet<String>,
+    allowed_tools: &ToolBindingTable,
     accumulator: &mut StreamAccumulator,
 ) -> Result<Option<CompletedResponse>> {
     let object = event
@@ -1793,7 +1809,7 @@ fn parse_completed(
     response: &Map<String, Value>,
     expected_model: &str,
     header_model: Option<&str>,
-    allowed_tools: &HashSet<String>,
+    allowed_tools: &ToolBindingTable,
     accumulator: &mut StreamAccumulator,
 ) -> Result<CompletedResponse> {
     exact_keys(
@@ -1986,7 +2002,7 @@ fn parse_completed(
 
 fn validate_output_snapshot<'a>(
     items: impl Iterator<Item = &'a Value>,
-    allowed_tools: &HashSet<String>,
+    allowed_tools: &ToolBindingTable,
 ) -> Result<()> {
     let mut blocks = Vec::new();
     let mut call_ids = HashSet::new();
@@ -2042,7 +2058,7 @@ fn parse_output_item(
     item: &Value,
     blocks: &mut Vec<ContentBlock>,
     call_ids: &mut HashSet<String>,
-    allowed_tools: &HashSet<String>,
+    allowed_tools: &ToolBindingTable,
 ) -> Result<()> {
     let object = item
         .as_object()
@@ -2168,14 +2184,8 @@ fn parse_output_item(
                         .context("ChatGPT function call namespace was invalid")
                 })
                 .transpose()?;
-            if !chatgpt_wire_namespace_is_valid(&wire_name, namespace) {
-                bail!("ChatGPT function call namespace was invalid");
-            }
-            let name = chatgpt_local_tool_name(&wire_name)
-                .context("ChatGPT requested a reserved native function name")?;
-            if !allowed_tools.contains(name) {
-                bail!("ChatGPT requested a function Finch did not advertise");
-            }
+            let bound = decode_chatgpt_function(allowed_tools, &wire_name, namespace)?;
+            let name = bound.semantic.as_str();
             let arguments = object
                 .get("arguments")
                 .and_then(Value::as_str)

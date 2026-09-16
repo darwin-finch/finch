@@ -10,6 +10,7 @@ mod pattern_matcher;
 mod patterns;
 mod permissions;
 mod registry;
+mod semantic;
 mod todo;
 mod tool_loop;
 mod types;
@@ -44,6 +45,9 @@ pub use permissions::{
     PEER_SILENT_ALLOW_TOOLS, VM_DISCOVERY_TOOLS,
 };
 pub use registry::{Tool, ToolRegistry};
+pub use semantic::{
+    compile_policy_from_registry, semantic_tools_for_advertisement, tool_authority_from_effect,
+};
 pub use todo::{todo_journal, TodoJournalReceiver, TodoJournalTarget, TodoJournalWriter, TodoList};
 pub use tool_loop::{
     AdmitError, ObserveOutcome, PreparedCall, RejectReason, RejectedCall, ToolCatalog, ToolLoop,

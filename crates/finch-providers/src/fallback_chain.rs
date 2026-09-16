@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use super::{
     resolve_effective_request, validate_provider_request, CapabilityProvenance, CapabilitySupport,
     LlmProvider, ModelCapabilities, ModelFeature, ProviderBackend, ProviderRequest,
-    ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest,
+    ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest, WireProtocol,
 };
 
 /// A chain of providers to try in order
@@ -233,7 +233,7 @@ impl ProviderBackend for FallbackChain {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        let request = request.into_request_for(self)?;
+        let (request, _bindings) = request.into_request_for(self)?;
         self.send_message_with_fallback(&request).await
     }
 
@@ -241,7 +241,7 @@ impl ProviderBackend for FallbackChain {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        let request = request.into_request_for(self)?;
+        let (request, _bindings) = request.into_request_for(self)?;
         self.send_message_stream_with_fallback(&request).await
     }
 
@@ -373,7 +373,7 @@ mod tests {
             &self,
             request: ValidatedProviderRequest,
         ) -> Result<ProviderResponse> {
-            let request = request.into_request_for(self)?;
+            let (request, _bindings) = request.into_request_for(self)?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
                 request.model, self.model,
@@ -395,7 +395,7 @@ mod tests {
             &self,
             request: ValidatedProviderRequest,
         ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-            let request = request.into_request_for(self)?;
+            let (request, _bindings) = request.into_request_for(self)?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
                 request.model, self.model,
@@ -427,6 +427,11 @@ mod tests {
                 Some(1_000),
                 Some(10_000),
                 None,
+            )
+            .with_wire_protocol(
+                WireProtocol::OpenAiChatCompletions,
+                "2026-08-26",
+                "test fixture",
             )
         }
     }
@@ -540,6 +545,11 @@ mod tests {
                 Some(10_000),
                 None,
             )
+            .with_wire_protocol(
+                super::WireProtocol::OpenAiChatCompletions,
+                "2026-08-26",
+                "test fixture",
+            )
         }
     }
 
@@ -560,6 +570,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let result = chain.send_message_with_fallback(&request).await;
@@ -584,6 +595,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let result = chain.send_message_with_fallback(&request).await;
@@ -608,6 +620,7 @@ mod tests {
             stream: false,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let result = chain.send_message_with_fallback(&request).await;
@@ -631,6 +644,7 @@ mod tests {
             stream: true,
             cancellation_token: None,
             system: None,
+            tool_policy: Default::default(),
         };
 
         let result = chain.send_message_stream_with_fallback(&request).await;

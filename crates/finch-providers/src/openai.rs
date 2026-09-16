@@ -9,6 +9,7 @@ use base64::Engine;
 use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -19,6 +20,9 @@ use super::types::{
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::retry::{with_retry, NonRetriableError};
+#[cfg(test)]
+use crate::tool_bindings::compile_from_definitions;
+use crate::tool_bindings::ToolBindingTable;
 use crate::ReasoningEffort;
 use crate::{ContentBlock, ImageSource};
 
@@ -31,6 +35,39 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+
+#[cfg(test)]
+fn openai_bindings(
+    provider: &str,
+    request: &ProviderRequest,
+    model: &str,
+) -> Result<ToolBindingTable> {
+    compile_from_definitions(
+        WireProtocol::OpenAiChatCompletions,
+        provider,
+        model,
+        request.tools.as_deref().unwrap_or_default(),
+        request.tool_policy(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn decode_openai_tool_name(bindings: &ToolBindingTable, wire_name: &str) -> Result<String> {
+    Ok(bindings
+        .decode_wire_call(wire_name, None)
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .semantic
+        .clone())
+}
+
+fn encode_openai_tool_name(bindings: &ToolBindingTable, semantic: &str) -> Result<String> {
+    Ok(bindings
+        .encode_semantic(semantic)
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .wire
+        .name
+        .clone())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransportRule {
@@ -404,7 +441,6 @@ fn validate_canonical_actual_model(model: &str) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("OpenAI response actual model was invalid"))
 }
 
-#[derive(Default)]
 struct CanonicalStreamState {
     provider: String,
     response_id: Option<String>,
@@ -416,6 +452,7 @@ struct CanonicalStreamState {
     tool_calls: Vec<(String, String, String)>,
     tool_delta_emitted: Vec<bool>,
     sequence: u64,
+    bindings: Arc<ToolBindingTable>,
 }
 
 fn reject_unknown_keys(
@@ -646,7 +683,7 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
                 let name = if call_name.is_empty() {
                     None
                 } else {
-                    Some(call_name)
+                    Some(decode_openai_tool_name(&state.bindings, &call_name)?)
                 };
                 state.sequence += 1;
                 let sequence = state.sequence;
@@ -696,7 +733,7 @@ async fn publish_canonical_completion(
     state: &CanonicalStreamState,
     tx: &mpsc::Sender<Result<StreamChunk>>,
 ) -> Result<()> {
-    let tool_blocks = finalize_tool_calls(&state.tool_calls, true)?;
+    let tool_blocks = finalize_tool_calls(&state.tool_calls, true, &state.bindings)?;
     if !state.accumulated_text.is_empty() {
         tx.send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
             text: state.accumulated_text.clone(),
@@ -742,6 +779,7 @@ fn sse_line_prefix_exceeds_limit(buffer: &[u8]) -> bool {
 fn spawn_canonical_stream_parser(
     response: reqwest::Response,
     provider: String,
+    bindings: Arc<ToolBindingTable>,
 ) -> mpsc::Receiver<Result<StreamChunk>> {
     let (tx, rx) = mpsc::channel(100);
     tokio::spawn(async move {
@@ -750,7 +788,16 @@ fn spawn_canonical_stream_parser(
         let mut total = 0usize;
         let mut state = CanonicalStreamState {
             provider,
-            ..CanonicalStreamState::default()
+            response_id: None,
+            model: None,
+            terminal_reason: None,
+            usage_seen: false,
+            done: false,
+            accumulated_text: String::new(),
+            tool_calls: Vec::new(),
+            tool_delta_emitted: Vec::new(),
+            sequence: 0,
+            bindings,
         };
         loop {
             let next = tokio::select! {
@@ -939,6 +986,7 @@ fn accumulate_tool_call_delta(
 fn finalize_tool_calls(
     acc: &[(String, String, String)],
     strict: bool,
+    bindings: &ToolBindingTable,
 ) -> Result<Vec<ContentBlock>> {
     let mut blocks = Vec::new();
     for (id, name, args_str) in acc
@@ -961,9 +1009,10 @@ fn finalize_tool_calls(
             }
             Ok(_) | Err(_) => continue,
         };
+        let name = decode_openai_tool_name(bindings, name)?;
         blocks.push(ContentBlock::ToolUse {
             id: id.clone(),
-            name: name.clone(),
+            name,
             input,
         });
     }
@@ -1143,7 +1192,11 @@ impl OpenAIProvider {
     }
 
     /// Convert a Finch request according to the explicitly selected wire rule.
-    fn to_openai_request(&self, request: &ProviderRequest) -> Result<OpenAIRequest> {
+    fn to_openai_request(
+        &self,
+        request: &ProviderRequest,
+        bindings: &ToolBindingTable,
+    ) -> Result<OpenAIRequest> {
         let model = if request.model.is_empty() {
             self.default_model.clone()
         } else {
@@ -1207,25 +1260,21 @@ impl OpenAIProvider {
                         .collect::<Vec<_>>()
                         .join("");
 
-                    let tool_calls: Vec<OpenAIRequestToolCall> = msg
-                        .content
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::ToolUse { id, name, input } => {
-                                let arguments = serde_json::to_string(input)
-                                    .unwrap_or_else(|_| "{}".to_string());
-                                Some(OpenAIRequestToolCall {
-                                    id: id.clone(),
-                                    tool_type: "function".to_string(),
-                                    function: OpenAIRequestFunction {
-                                        name: name.clone(),
-                                        arguments,
-                                    },
-                                })
-                            }
-                            _ => None,
-                        })
-                        .collect();
+                    let mut tool_calls = Vec::new();
+                    for block in &msg.content {
+                        if let ContentBlock::ToolUse { id, name, input } = block {
+                            let arguments =
+                                serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                            tool_calls.push(OpenAIRequestToolCall {
+                                id: id.clone(),
+                                tool_type: "function".to_string(),
+                                function: OpenAIRequestFunction {
+                                    name: encode_openai_tool_name(bindings, name)?,
+                                    arguments,
+                                },
+                            });
+                        }
+                    }
                     if rule == TransportRule::CanonicalGpt56ChatCompletions {
                         for call in &tool_calls {
                             if call.id.is_empty() || call.function.name.is_empty() {
@@ -1361,34 +1410,24 @@ impl OpenAIProvider {
         }
 
         // Convert tools to OpenAI format if present
-        let tools = request.tools.as_ref().map(|tool_defs| {
-            tool_defs
-                .iter()
-                .map(|tool| {
-                    // Convert ToolInputSchema to Value
-                    let parameters = match serde_json::to_value(&tool.input_schema) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to convert tool schema for '{}': {}",
-                                tool.name,
-                                e
-                            );
-                            serde_json::json!({})
-                        }
-                    };
-
-                    OpenAITool {
+        let tools = if bindings.is_empty() {
+            None
+        } else {
+            Some(
+                bindings
+                    .entries()
+                    .iter()
+                    .map(|bound| OpenAITool {
                         tool_type: "function".to_string(),
                         function: OpenAIFunction {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters,
+                            name: bound.wire.name.clone(),
+                            description: bound.description.clone(),
+                            parameters: bound.wire_schema.clone(),
                         },
-                    }
-                })
-                .collect()
-        });
+                    })
+                    .collect(),
+            )
+        };
 
         let openai_request = OpenAIRequest {
             model,
@@ -1417,6 +1456,7 @@ impl OpenAIProvider {
         &self,
         response: OpenAIResponse,
         rule: TransportRule,
+        bindings: &ToolBindingTable,
     ) -> Result<ProviderResponse> {
         if rule == TransportRule::CanonicalGpt56ChatCompletions {
             if response.object.as_deref() != Some("chat.completion") {
@@ -1484,9 +1524,10 @@ impl OpenAIProvider {
                             input
                         }
                     };
+                    let name = decode_openai_tool_name(bindings, &tool_call.function.name)?;
                     content.push(ContentBlock::ToolUse {
                         id: tool_call.id,
-                        name: tool_call.function.name,
+                        name,
                         input,
                     });
                 } else if rule == TransportRule::CanonicalGpt56ChatCompletions {
@@ -1533,8 +1574,12 @@ impl OpenAIProvider {
     }
 
     /// Send a single message request (no retry)
-    async fn send_message_once(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let openai_request = self.to_openai_request(request)?;
+    async fn send_message_once(
+        &self,
+        request: &ProviderRequest,
+        bindings: &ToolBindingTable,
+    ) -> Result<ProviderResponse> {
+        let openai_request = self.to_openai_request(request, bindings)?;
         let rule = self.transport_rule(&openai_request.model);
         let url = &self.endpoints.chat_url;
 
@@ -1592,17 +1637,18 @@ impl OpenAIProvider {
             "received OpenAI-compatible response"
         );
 
-        self.parse_response(openai_response, rule)
+        self.parse_response(openai_response, rule, bindings)
     }
 
     /// Send a message with streaming response (no retry)
     async fn send_message_stream_once(
         &self,
         request: &ProviderRequest,
+        bindings: &ToolBindingTable,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
         let (tx, rx) = mpsc::channel(100);
 
-        let mut openai_request = self.to_openai_request(request)?;
+        let mut openai_request = self.to_openai_request(request, bindings)?;
         openai_request.stream = true;
         let rule = self.transport_rule(&openai_request.model);
         if rule == TransportRule::CanonicalGpt56ChatCompletions {
@@ -1648,11 +1694,13 @@ impl OpenAIProvider {
             return Ok(spawn_canonical_stream_parser(
                 response,
                 self.provider_name.clone(),
+                Arc::new(bindings.clone()),
             ));
         }
 
         // Compatible providers retain the permissive historical parser.
         let provider_name = self.provider_name.clone();
+        let stream_bindings = bindings.clone();
         tokio::spawn(async move {
             tracing::debug!("[STREAM] OpenAI streaming task started");
             let mut stream = response.bytes_stream();
@@ -1705,7 +1753,11 @@ impl OpenAIProvider {
                                     }
 
                                     // Convert accumulated tool call deltas to ToolUse blocks
-                                    let blocks = match finalize_tool_calls(&tool_call_acc, false) {
+                                    let blocks = match finalize_tool_calls(
+                                        &tool_call_acc,
+                                        false,
+                                        &stream_bindings,
+                                    ) {
                                         Ok(blocks) => blocks,
                                         Err(error) => {
                                             let _ = tx.send(Err(error)).await;
@@ -1800,17 +1852,28 @@ impl OpenAIProvider {
                                                 if id.is_empty() {
                                                     continue;
                                                 }
+                                                let name = if name.is_empty() {
+                                                    None
+                                                } else {
+                                                    match decode_openai_tool_name(
+                                                        &stream_bindings,
+                                                        &name,
+                                                    ) {
+                                                        Ok(name) => Some(name),
+                                                        Err(error) => {
+                                                            let _ = tx.send(Err(error)).await;
+                                                            done = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                };
                                                 let first = !tool_delta_emitted[idx];
                                                 tool_delta_emitted[idx] = true;
                                                 sequence += 1;
                                                 if tx
                                                     .send(Ok(StreamChunk::ToolCallDelta {
                                                         id,
-                                                        name: if name.is_empty() {
-                                                            None
-                                                        } else {
-                                                            Some(name)
-                                                        },
+                                                        name,
                                                         arguments_delta: if first {
                                                             accumulated
                                                         } else {
@@ -1858,16 +1921,16 @@ impl ProviderBackend for OpenAIProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        let request = request.into_request_for(self)?;
-        with_retry(|| self.send_message_once(&request)).await
+        let (request, bindings) = request.into_request_for(self)?;
+        with_retry(|| self.send_message_once(&request, &bindings)).await
     }
 
     async fn send_message_stream_validated(
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        let request = request.into_request_for(self)?;
-        with_retry(|| self.send_message_stream_once(&request)).await
+        let (request, bindings) = request.into_request_for(self)?;
+        with_retry(|| self.send_message_stream_once(&request, &bindings)).await
     }
 
     fn name(&self) -> &str {
@@ -2006,6 +2069,36 @@ impl ProviderBackend for OpenAIProvider {
 
     fn requested_reasoning_effort(&self, _request: &ProviderRequest) -> Option<ReasoningEffort> {
         self.reasoning_effort
+    }
+}
+
+#[cfg(test)]
+impl OpenAIProvider {
+    fn test_bindings(&self, request: &ProviderRequest) -> Result<ToolBindingTable> {
+        let model = if request.model.is_empty() {
+            self.default_model.as_str()
+        } else {
+            request.model.as_str()
+        };
+        openai_bindings(&self.provider_name, request, model)
+    }
+
+    fn encode_request(&self, request: &ProviderRequest) -> Result<OpenAIRequest> {
+        let bindings = self.test_bindings(request)?;
+        self.to_openai_request(request, &bindings)
+    }
+
+    async fn dispatch_once(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+        let bindings = self.test_bindings(request)?;
+        self.send_message_once(request, &bindings).await
+    }
+
+    async fn dispatch_stream(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+        let bindings = self.test_bindings(request)?;
+        self.send_message_stream_once(request, &bindings).await
     }
 }
 
@@ -2222,6 +2315,40 @@ mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_tool_bindings(names: &[&str]) -> ToolBindingTable {
+        compile_from_definitions(
+            WireProtocol::OpenAiChatCompletions,
+            "openai",
+            "gpt-4",
+            &names
+                .iter()
+                .map(|name| crate::ToolDefinition {
+                    name: (*name).to_string(),
+                    description: (*name).to_string(),
+                    input_schema: crate::ToolInputSchema::simple(vec![]),
+                })
+                .collect::<Vec<_>>(),
+            &Default::default(),
+        )
+        .expect("test tool bindings")
+    }
+
+    fn test_stream_state() -> CanonicalStreamState {
+        CanonicalStreamState {
+            provider: "openai".into(),
+            response_id: None,
+            model: None,
+            terminal_reason: None,
+            usage_seen: false,
+            done: false,
+            accumulated_text: String::new(),
+            tool_calls: Vec::new(),
+            tool_delta_emitted: Vec::new(),
+            sequence: 0,
+            bindings: Arc::new(test_tool_bindings(&["read", "bash", "glob", "grep"])),
+        }
+    }
 
     const VALID_PNG_BASE64: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -2446,7 +2573,7 @@ mod tests {
             .await;
         let provider = canonical_test_provider(server.url());
         let mut rx = provider
-            .send_message_stream_once(
+            .dispatch_stream(
                 &ProviderRequest::new(vec![crate::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
@@ -2545,7 +2672,7 @@ mod tests {
             description: "read file".into(),
             input_schema: ToolInputSchema::simple(vec![("path", "path")]),
         }]);
-        let response = provider.send_message_once(&request).await.unwrap();
+        let response = provider.dispatch_once(&request).await.unwrap();
         assert_eq!(response.model, "gpt-5.6-sol-2026-08-01");
         mock.assert_async().await;
     }
@@ -2642,11 +2769,11 @@ mod tests {
         let request =
             ProviderRequest::new(vec![crate::Message::user("hello")]).with_model("gpt-5.6-sol");
         let response = canonical_test_provider(nonstream_server.url())
-            .send_message_once(&request)
+            .dispatch_once(&request)
             .await
             .unwrap();
         let mut receiver = canonical_test_provider(stream_server.url())
-            .send_message_stream_once(&request)
+            .dispatch_stream(&request)
             .await
             .unwrap();
         let mut chunks = Vec::new();
@@ -2697,9 +2824,14 @@ mod tests {
             .await;
         let provider = canonical_test_provider(server.url());
         let mut rx = provider
-            .send_message_stream_once(
+            .dispatch_stream(
                 &ProviderRequest::new(vec![crate::Message::user("use tools")])
-                    .with_model("gpt-5.6-sol"),
+                    .with_model("gpt-5.6-sol")
+                    .with_tools(vec![crate::ToolDefinition {
+                        name: "read".into(),
+                        description: "read".into(),
+                        input_schema: crate::ToolInputSchema::simple(vec![]),
+                    }]),
             )
             .await
             .unwrap();
@@ -2745,9 +2877,14 @@ mod tests {
             .await;
         let provider = canonical_test_provider(server.url());
         let mut rx = provider
-            .send_message_stream_once(
+            .dispatch_stream(
                 &ProviderRequest::new(vec![crate::Message::user("use tools")])
-                    .with_model("gpt-5.6-sol"),
+                    .with_model("gpt-5.6-sol")
+                    .with_tools(vec![crate::ToolDefinition {
+                        name: "read".into(),
+                        description: "read".into(),
+                        input_schema: crate::ToolInputSchema::simple(vec![]),
+                    }]),
             )
             .await
             .unwrap();
@@ -2784,7 +2921,7 @@ mod tests {
             .create_async().await;
         let provider = canonical_test_provider(server.url());
         let mut rx = provider
-            .send_message_stream_once(
+            .dispatch_stream(
                 &ProviderRequest::new(vec![crate::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
@@ -2807,7 +2944,7 @@ mod tests {
         let (url, closed) = stalling_http_server(true).await;
         let provider = canonical_test_provider(url);
         let rx = provider
-            .send_message_stream_once(
+            .dispatch_stream(
                 &ProviderRequest::new(vec![crate::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
@@ -2837,7 +2974,7 @@ mod tests {
             .expect("HTTP/2 provider client must build");
 
         let response = provider
-            .send_message_once(
+            .dispatch_once(
                 &ProviderRequest::new(vec![crate::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
@@ -2867,7 +3004,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            provider.send_message_once(
+            provider.dispatch_once(
                 &ProviderRequest::new(vec![crate::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             ),
@@ -2902,7 +3039,7 @@ mod tests {
             .build()
             .unwrap();
         let error = provider
-            .send_message_once(
+            .dispatch_once(
                 &ProviderRequest::new(vec![crate::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
@@ -2964,7 +3101,7 @@ mod tests {
             .build()
             .unwrap();
         let mut rx = provider
-            .send_message_stream_once(
+            .dispatch_stream(
                 &ProviderRequest::new(vec![crate::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
@@ -3003,7 +3140,7 @@ mod tests {
                 .await;
             let provider = canonical_test_provider(server.url());
             let mut rx = provider
-                .send_message_stream_once(
+                .dispatch_stream(
                     &ProviderRequest::new(vec![crate::Message::user("hello")])
                         .with_model("gpt-5.6-sol"),
                 )
@@ -3122,7 +3259,7 @@ mod tests {
                 .create_async()
                 .await;
             let error = canonical_test_provider(server.url())
-                .send_message_once(
+                .dispatch_once(
                     &ProviderRequest::new(vec![crate::Message::user("hello")])
                         .with_model("gpt-5.6-sol"),
                 )
@@ -3183,7 +3320,7 @@ mod tests {
 
     #[test]
     fn canonical_stream_rejects_unknown_malformed_duplicate_and_mismatched_events() {
-        let mut state = CanonicalStreamState::default();
+        let mut state = test_stream_state();
         assert!(canonical_stream_data(&mut state, "not-json")
             .unwrap_err()
             .to_string()
@@ -3195,7 +3332,7 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("unknown event"));
-        let mut state = CanonicalStreamState::default();
+        let mut state = test_stream_state();
         assert!(canonical_stream_data(
             &mut state,
             r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"mystery":"payload"},"finish_reason":null}]}"#
@@ -3203,7 +3340,7 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("unknown delta field"));
-        let mut state = CanonicalStreamState::default();
+        let mut state = test_stream_state();
         assert!(canonical_stream_data(
             &mut state,
             r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"role":"tool"},"finish_reason":null}]}"#
@@ -3211,7 +3348,7 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("unknown delta role"));
-        let mut state = CanonicalStreamState::default();
+        let mut state = test_stream_state();
         assert!(canonical_stream_data(
             &mut state,
             r#"{"id":"x","object":"chat.completion.chunk","model":"","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#
@@ -3219,7 +3356,7 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("omitted the actual model"));
-        let mut state = CanonicalStreamState::default();
+        let mut state = test_stream_state();
         canonical_stream_data(
             &mut state,
             r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol-a","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
@@ -3232,14 +3369,14 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("changed actual model"));
-        let mut state = CanonicalStreamState::default();
+        let mut state = test_stream_state();
         canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#).unwrap();
         assert!(canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#).unwrap_err().to_string().contains("duplicate terminal"));
-        let mut state = CanonicalStreamState::default();
+        let mut state = test_stream_state();
         canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}"#).unwrap();
         assert!(canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","function":{"arguments":""}}]},"finish_reason":null}]}"#).unwrap_err().to_string().contains("changed a function-call ID"));
 
-        let mut state = CanonicalStreamState::default();
+        let mut state = test_stream_state();
         assert!(canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_same","type":"function","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"call_same","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}"#).unwrap_err().to_string().contains("reused a function-call ID"));
     }
 
@@ -3272,7 +3409,7 @@ mod tests {
             )],
         )])
         .with_model("gpt-5.6-sol");
-        provider.to_openai_request(&progressive_request).unwrap();
+        provider.encode_request(&progressive_request).unwrap();
         assert!(validate_jpeg(&progressive[..progressive.len() - 2]).is_err());
         let bad_base64 = ProviderRequest::new(vec![crate::Message::with_content(
             "user",
@@ -3280,7 +3417,7 @@ mod tests {
         )])
         .with_model("gpt-5.6-sol");
         assert!(provider
-            .to_openai_request(&bad_base64)
+            .encode_request(&bad_base64)
             .unwrap_err()
             .to_string()
             .contains("invalid base64"));
@@ -3290,7 +3427,7 @@ mod tests {
         )])
         .with_model("gpt-5.6-sol");
         assert!(provider
-            .to_openai_request(&bad_mime)
+            .encode_request(&bad_mime)
             .unwrap_err()
             .to_string()
             .contains("unsupported"));
@@ -3300,7 +3437,7 @@ mod tests {
                 vec![ContentBlock::image(media_type, data)],
             )])
             .with_model("gpt-5.6-sol");
-            assert!(provider.to_openai_request(&truncated).is_err());
+            assert!(provider.encode_request(&truncated).is_err());
         }
         for corrupt in [corrupted_png(true), corrupted_png(false)] {
             let request = ProviderRequest::new(vec![crate::Message::with_content(
@@ -3309,7 +3446,7 @@ mod tests {
             )])
             .with_model("gpt-5.6-sol");
             assert!(provider
-                .to_openai_request(&request)
+                .encode_request(&request)
                 .unwrap_err()
                 .to_string()
                 .contains("integrity validation"));
@@ -3342,7 +3479,7 @@ mod tests {
         )])
         .with_model("gpt-5.6-sol");
         assert!(provider
-            .to_openai_request(&mismatch)
+            .encode_request(&mismatch)
             .unwrap_err()
             .to_string()
             .contains("unknown function call ID"));
@@ -3359,7 +3496,7 @@ mod tests {
                 ProviderRequest::new(vec![crate::Message::with_content("assistant", vec![block])])
                     .with_model("gpt-5.6-sol");
             assert!(provider
-                .to_openai_request(&request)
+                .encode_request(&request)
                 .unwrap_err()
                 .to_string()
                 .contains("assistant message contained an unsupported content block"));
@@ -3375,7 +3512,7 @@ mod tests {
         )])
         .with_model("gpt-5.6-sol");
         assert!(provider
-            .to_openai_request(&user_tool_call)
+            .encode_request(&user_tool_call)
             .unwrap_err()
             .to_string()
             .contains("user message contained an unsupported content block"));
@@ -3390,7 +3527,7 @@ mod tests {
         )])
         .with_model("gpt-5.6-sol");
         assert!(provider
-            .to_openai_request(&scalar_arguments)
+            .encode_request(&scalar_arguments)
             .unwrap_err()
             .to_string()
             .contains("not a JSON object"));
@@ -3401,6 +3538,11 @@ mod tests {
             serde_json::to_string(&exact_input).unwrap().len(),
             MAX_TOOL_ARGUMENT_BYTES
         );
+        let read_tool = crate::ToolDefinition {
+            name: "read".into(),
+            description: "read".into(),
+            input_schema: crate::ToolInputSchema::simple(vec![]),
+        };
         let matched = |input| {
             ProviderRequest::new(vec![
                 crate::Message::with_content(
@@ -3421,11 +3563,12 @@ mod tests {
                 ),
             ])
             .with_model("gpt-5.6-sol")
+            .with_tools(vec![read_tool.clone()])
         };
-        provider.to_openai_request(&matched(exact_input)).unwrap();
+        provider.encode_request(&matched(exact_input)).unwrap();
         let over_input = serde_json::json!({"data": "x".repeat(exact_string_bytes + 1)});
         assert!(provider
-            .to_openai_request(&matched(over_input))
+            .encode_request(&matched(over_input))
             .unwrap_err()
             .to_string()
             .contains("1 MiB limit"));
@@ -3440,7 +3583,7 @@ mod tests {
         )
         .unwrap();
         let compatible_request = compatible
-            .to_openai_request(
+            .encode_request(
                 &ProviderRequest::new(vec![crate::Message::with_content(
                     "assistant",
                     vec![ContentBlock::ToolUse {
@@ -3449,7 +3592,12 @@ mod tests {
                         input: serde_json::json!("scalar"),
                     }],
                 )])
-                .with_model("compatible-model"),
+                .with_model("compatible-model")
+                .with_tools(vec![crate::ToolDefinition {
+                    name: "read".into(),
+                    description: "read".into(),
+                    input_schema: crate::ToolInputSchema::simple(vec![]),
+                }]),
             )
             .unwrap();
         let wire = serde_json::to_value(compatible_request).unwrap();
@@ -3529,7 +3677,12 @@ mod tests {
                 ),
                 crate::Message::with_content("user", blocks),
             ])
-            .with_model("gpt-5.6-sol");
+            .with_model("gpt-5.6-sol")
+            .with_tools(vec![crate::ToolDefinition {
+                name: "read".into(),
+                description: "read".into(),
+                input_schema: crate::ToolInputSchema::simple(vec![]),
+            }]);
             assert_eq!(
                 provider
                     .send_message(&request)
@@ -3551,7 +3704,7 @@ mod tests {
     async fn canonical_request_and_response_payload_limits_hold_at_http_boundary() {
         let provider = canonical_test_provider("http://127.0.0.1:1".into());
         let empty = ProviderRequest::new(vec![crate::Message::user("")]).with_model("gpt-5.6-sol");
-        let empty_size = serde_json::to_vec(&provider.to_openai_request(&empty).unwrap())
+        let empty_size = serde_json::to_vec(&provider.encode_request(&empty).unwrap())
             .unwrap()
             .len();
         let exact = ProviderRequest::new(vec![crate::Message::user(
@@ -3559,13 +3712,13 @@ mod tests {
         )])
         .with_model("gpt-5.6-sol");
         assert_eq!(
-            serde_json::to_vec(&provider.to_openai_request(&exact).unwrap())
+            serde_json::to_vec(&provider.encode_request(&exact).unwrap())
                 .unwrap()
                 .len(),
             MAX_REQUEST_BYTES
         );
         assert!(provider
-            .send_message_stream_once(&exact)
+            .dispatch_stream(&exact)
             .await
             .unwrap_err()
             .to_string()
@@ -3580,7 +3733,7 @@ mod tests {
             .await;
         let provider = canonical_test_provider(server.url());
         let error = provider
-            .send_message_once(
+            .dispatch_once(
                 &ProviderRequest::new(vec![crate::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
@@ -3643,8 +3796,13 @@ mod tests {
                 )],
             ),
         ])
-        .with_model("gpt-5.6-sol");
-        let error = provider.send_message_once(&request).await.unwrap_err();
+        .with_model("gpt-5.6-sol")
+        .with_tools(vec![crate::ToolDefinition {
+            name: "inspect".into(),
+            description: "inspect".into(),
+            input_schema: crate::ToolInputSchema::simple(vec![]),
+        }]);
+        let error = provider.dispatch_once(&request).await.unwrap_err();
         let error = error.to_string();
         assert!(error.contains("response body redacted"));
         assert!(!error.contains(upstream_secret));
@@ -3716,9 +3874,14 @@ mod tests {
                 .await;
             let provider = canonical_test_provider(server.url());
             let error = provider
-                .send_message_once(
+                .dispatch_once(
                     &ProviderRequest::new(vec![crate::Message::user("hello")])
-                        .with_model("gpt-5.6-sol"),
+                        .with_model("gpt-5.6-sol")
+                        .with_tools(vec![crate::ToolDefinition {
+                            name: "read".into(),
+                            description: "read".into(),
+                            input_schema: crate::ToolInputSchema::simple(vec![]),
+                        }]),
                 )
                 .await
                 .unwrap_err();
@@ -3762,7 +3925,7 @@ mod tests {
             .await;
         let provider = canonical_test_provider(server.url());
         let error = provider
-            .send_message_once(
+            .dispatch_once(
                 &ProviderRequest::new(vec![crate::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
@@ -3795,7 +3958,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
         let provider = canonical_test_provider(server.url());
         let error = provider
-            .send_message_once(
+            .dispatch_once(
                 &ProviderRequest::new(vec![crate::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
             )
@@ -3838,10 +4001,7 @@ mod tests {
         )])
         .with_model("gpt-5.6-sol");
         for request in [invalid_role, invalid_mime, duplicate_ids, unknown_result] {
-            let error = provider
-                .to_openai_request(&request)
-                .unwrap_err()
-                .to_string();
+            let error = provider.encode_request(&request).unwrap_err().to_string();
             assert!(error.len() < 256);
             assert!(!error.contains("REQUEST_PRIVATE_VALUE"));
         }
@@ -3878,7 +4038,11 @@ mod tests {
             },
         ] {
             let error = provider
-                .parse_response(response, TransportRule::CanonicalGpt56ChatCompletions)
+                .parse_response(
+                    response,
+                    TransportRule::CanonicalGpt56ChatCompletions,
+                    &test_tool_bindings(&[]),
+                )
                 .unwrap_err()
                 .to_string();
             assert!(error.len() < 256);
@@ -3909,7 +4073,7 @@ mod tests {
         )
         .unwrap();
         let error = provider
-            .send_message_once(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .dispatch_once(&ProviderRequest::new(vec![crate::Message::user("hello")]))
             .await
             .expect_err("malformed function arguments must fail closed, not become {{}}");
         let message = error.to_string();
@@ -3946,7 +4110,15 @@ mod tests {
         )
         .unwrap();
         let mut rx = provider
-            .send_message_stream_once(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .dispatch_stream(
+                &ProviderRequest::new(vec![crate::Message::user("hello")]).with_tools(vec![
+                    crate::ToolDefinition {
+                        name: "read".into(),
+                        description: "read".into(),
+                        input_schema: crate::ToolInputSchema::simple(vec![]),
+                    },
+                ]),
+            )
             .await
             .unwrap();
         let mut deltas = 0usize;
@@ -3997,7 +4169,7 @@ mod tests {
         )
         .unwrap();
         let mut rx = provider
-            .send_message_stream_once(&ProviderRequest::new(vec![crate::Message::user("hello")]))
+            .dispatch_stream(&ProviderRequest::new(vec![crate::Message::user("hello")]))
             .await
             .unwrap();
         let mut text = String::new();
@@ -4076,7 +4248,7 @@ mod tests {
         use crate::ProviderRequest;
         let req =
             ProviderRequest::new(vec![Message::user("hello")]).with_system("You are helpful.");
-        let openai_req = provider.to_openai_request(&req).unwrap();
+        let openai_req = provider.encode_request(&req).unwrap();
         // System message should be first
         assert!(
             matches!(&openai_req.messages[0], OpenAIMessage::Regular { role, .. } if role == "system")
@@ -4094,7 +4266,7 @@ mod tests {
         use crate::Message;
         use crate::ProviderRequest;
         let req = ProviderRequest::new(vec![Message::user("hello")]);
-        let openai_req = provider.to_openai_request(&req).unwrap();
+        let openai_req = provider.encode_request(&req).unwrap();
         // No system message — first message is user
         assert!(
             matches!(&openai_req.messages[0], OpenAIMessage::Regular { role, .. } if role == "user")
@@ -4116,8 +4288,13 @@ mod tests {
                     input: serde_json::json!({"command": "ls"}),
                 }],
             ),
-        ]);
-        let openai_req = provider.to_openai_request(&req).unwrap();
+        ])
+        .with_tools(vec![crate::ToolDefinition {
+            name: "bash".into(),
+            description: "bash".into(),
+            input_schema: crate::ToolInputSchema::simple(vec![]),
+        }]);
+        let openai_req = provider.encode_request(&req).unwrap();
         // Assistant message should have tool_calls
         let assistant_msg = openai_req
             .messages
@@ -4130,6 +4307,26 @@ mod tests {
             assert_eq!(calls[0].id, "call_1");
             assert_eq!(calls[0].function.name, "bash");
         }
+    }
+
+    #[test]
+    fn openai_history_encode_fails_closed_on_unadvertised_name() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::ProviderRequest;
+        use crate::{ContentBlock, Message};
+        let req = ProviderRequest::new(vec![Message::with_content(
+            "assistant",
+            vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "finch_spawn_agent".to_string(),
+                input: serde_json::json!({}),
+            }],
+        )]);
+        let error = provider.encode_request(&req).unwrap_err().to_string();
+        assert!(
+            error.contains("not in this request's binding table"),
+            "unadvertised history identity must fail closed, got {error}"
+        );
     }
 
     #[test]
@@ -4155,8 +4352,13 @@ mod tests {
                     is_error: None,
                 }],
             ),
-        ]);
-        let openai_req = provider.to_openai_request(&req).unwrap();
+        ])
+        .with_tools(vec![crate::ToolDefinition {
+            name: "bash".into(),
+            description: "bash".into(),
+            input_schema: crate::ToolInputSchema::simple(vec![]),
+        }]);
+        let openai_req = provider.encode_request(&req).unwrap();
         // There should be a "tool" role message
         let tool_msg = openai_req
             .messages
@@ -4187,7 +4389,7 @@ mod tests {
                 is_error: None,
             }],
         )]);
-        let openai_req = provider.to_openai_request(&req).unwrap();
+        let openai_req = provider.encode_request(&req).unwrap();
         if let Some(OpenAIMessage::Tool { content, .. }) = openai_req
             .messages
             .iter()
@@ -4211,7 +4413,7 @@ mod tests {
                 text: "   ".to_string(),
             }],
         )]);
-        let openai_req = provider.to_openai_request(&req).unwrap();
+        let openai_req = provider.encode_request(&req).unwrap();
         assert!(openai_req.messages.is_empty());
     }
 
@@ -4221,7 +4423,7 @@ mod tests {
         use crate::ProviderRequest;
         // Request with empty model — should fall back to provider default
         let req = ProviderRequest::new(vec![]);
-        let openai_req = provider.to_openai_request(&req).unwrap();
+        let openai_req = provider.encode_request(&req).unwrap();
         assert!(!openai_req.model.is_empty());
     }
 
@@ -4232,7 +4434,7 @@ mod tests {
             .with_model("gpt-5.6-sol")
             .with_reasoning_effort(ReasoningEffort::High);
         let request = ProviderRequest::new(vec![crate::Message::user("reason carefully")]);
-        let openai_request = provider.to_openai_request(&request).unwrap();
+        let openai_request = provider.encode_request(&request).unwrap();
 
         assert_eq!(openai_request.model, "gpt-5.6-sol");
         assert_eq!(openai_request.reasoning_effort, Some("high"));
@@ -4521,7 +4723,12 @@ mod tests {
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
         )];
-        let blocks = finalize_tool_calls(&acc, true).unwrap();
+        let blocks = finalize_tool_calls(
+            &acc,
+            true,
+            &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+        )
+        .unwrap();
         assert_eq!(blocks.len(), 1);
         if let crate::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
             assert_eq!(id, "call_1");
@@ -4539,7 +4746,12 @@ mod tests {
             "glob".to_string(),
             "NOT_VALID_JSON".to_string(),
         )];
-        let error = finalize_tool_calls(&acc, true).unwrap_err();
+        let error = finalize_tool_calls(
+            &acc,
+            true,
+            &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("malformed JSON function arguments"));
@@ -4548,7 +4760,12 @@ mod tests {
     #[test]
     fn test_finalize_tool_calls_empty_acc() {
         let acc: Vec<(String, String, String)> = Vec::new();
-        let blocks = finalize_tool_calls(&acc, true).unwrap();
+        let blocks = finalize_tool_calls(
+            &acc,
+            true,
+            &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+        )
+        .unwrap();
         assert!(blocks.is_empty());
     }
 
@@ -4590,7 +4807,12 @@ mod tests {
         accumulate_tool_call_delta(&mut acc, &delta2);
 
         // Finalize
-        let blocks = finalize_tool_calls(&acc, true).unwrap();
+        let blocks = finalize_tool_calls(
+            &acc,
+            true,
+            &test_tool_bindings(&["bash", "glob", "grep", "read"]),
+        )
+        .unwrap();
         assert_eq!(blocks.len(), 1);
         if let crate::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
             assert_eq!(id, "call_xyz");

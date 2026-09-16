@@ -482,12 +482,19 @@ mod tests {
         }
 
         fn capabilities(&self, model: &str) -> crate::providers::ModelCapabilities {
-            use crate::providers::{CapabilitySupport, ModelCapabilities, ModelFeature};
+            use crate::providers::{
+                CapabilitySupport, ModelCapabilities, ModelFeature, WireProtocol,
+            };
 
             let mut capabilities = ModelCapabilities::unknown(self.name(), model);
             if model == self.default_model() {
                 capabilities.tools = ModelFeature::static_metadata(
                     CapabilitySupport::Supported,
+                    "2026-08-27",
+                    "spawn test fixture",
+                );
+                capabilities = capabilities.with_wire_protocol(
+                    WireProtocol::AnthropicMessages,
                     "2026-08-27",
                     "spawn test fixture",
                 );

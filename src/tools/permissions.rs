@@ -199,6 +199,23 @@ impl PermissionManager {
         self.configs.insert(tool_name, config);
     }
 
+    /// Whether policy allows advertising this tool to a provider.
+    ///
+    /// Input-dependent constitutional checks run at execution, not
+    /// advertisement. Disabled tools and explicit Deny rules are not
+    /// advertised. Peer hard-deny tools are never advertised to a peer.
+    pub fn allows_advertising(&self, tool_name: &str) -> bool {
+        if self.role == ExecutorRole::Peer && PEER_HARD_DENY_TOOLS.contains(&tool_name) {
+            return false;
+        }
+        if let Some(config) = self.configs.get(tool_name) {
+            if !config.enabled || config.rule == PermissionRule::Deny {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Check if tool execution is permitted
     pub fn check_tool_use(&self, tool_name: &str, input: &Value) -> PermissionCheck {
         // Peer role: asymmetric rules take precedence over per-tool config

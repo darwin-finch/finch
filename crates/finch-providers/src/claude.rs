@@ -16,9 +16,35 @@ use super::types::{
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::anthropic::StreamEvent;
 use crate::retry::{with_retry, NonRetriableError};
+use crate::tool_bindings::ToolBindingTable;
 use crate::ContentBlock;
 use crate::MessageRequest;
 use crate::DEFAULT_CLAUDE_MODEL;
+
+fn decode_claude_tool_name(bindings: &ToolBindingTable, name: &str) -> Result<String> {
+    Ok(bindings
+        .decode_wire_call(name, None)
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .semantic
+        .clone())
+}
+
+fn decode_claude_content(
+    content: Vec<ContentBlock>,
+    bindings: &ToolBindingTable,
+) -> Result<Vec<ContentBlock>> {
+    content
+        .into_iter()
+        .map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => Ok(ContentBlock::ToolUse {
+                id,
+                name: decode_claude_tool_name(bindings, &name)?,
+                input,
+            }),
+            other => Ok(other),
+        })
+        .collect()
+}
 
 const CLAUDE_API_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -104,7 +130,11 @@ impl ClaudeProvider {
     }
 
     /// Convert ProviderRequest to Claude's MessageRequest format
-    fn to_message_request(&self, request: &ProviderRequest) -> MessageRequest {
+    fn to_message_request(
+        &self,
+        request: &ProviderRequest,
+        bindings: &ToolBindingTable,
+    ) -> MessageRequest {
         let model = if request.model.is_empty() {
             self.default_model.clone()
         } else {
@@ -116,13 +146,27 @@ impl ClaudeProvider {
             max_tokens: request.max_tokens,
             messages: request.messages.clone(),
             system: request.system.clone(),
-            tools: request.tools.clone(),
+            tools: if bindings.is_empty() {
+                None
+            } else {
+                Some(
+                    bindings
+                        .entries()
+                        .iter()
+                        .map(|bound| bound.anthropic_tool())
+                        .collect(),
+                )
+            },
         }
     }
 
     /// Send a single message request (no retry)
-    async fn send_message_once(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let msg_request = self.to_message_request(request);
+    async fn send_message_once(
+        &self,
+        request: &ProviderRequest,
+        bindings: &ToolBindingTable,
+    ) -> Result<ProviderResponse> {
+        let msg_request = self.to_message_request(request, bindings);
 
         tracing::debug!(
             model = %msg_request.model,
@@ -166,11 +210,10 @@ impl ClaudeProvider {
             "received Claude response"
         );
 
-        // Convert to ProviderResponse
         Ok(ProviderResponse {
             id: message_response.id,
             model: message_response.model,
-            content: message_response.content,
+            content: decode_claude_content(message_response.content, bindings)?,
             stop_reason: message_response.stop_reason,
             role: message_response.role,
             provider: "claude".to_string(),
@@ -183,10 +226,11 @@ impl ClaudeProvider {
     async fn send_message_stream_once(
         &self,
         request: &ProviderRequest,
+        bindings: &ToolBindingTable,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
         let (tx, rx) = mpsc::channel(100);
 
-        let msg_request = self.to_message_request(request);
+        let msg_request = self.to_message_request(request, bindings);
 
         // Convert to JSON and add stream: true
         let mut request_json = serde_json::to_value(&msg_request)?;
@@ -216,6 +260,7 @@ impl ClaudeProvider {
         }
 
         let model = request.model.clone();
+        let stream_bindings = bindings.clone();
         // Spawn task to parse SSE stream with block tracking
         tokio::spawn(async move {
             tracing::debug!("[STREAM] Streaming task started");
@@ -352,11 +397,33 @@ impl ClaudeProvider {
                                                                 builder.accumulated.push_str(&json);
                                                                 if let Some(id) = builder.id.clone()
                                                                 {
+                                                                    let name = match builder
+                                                                        .name
+                                                                        .as_deref()
+                                                                    {
+                                                                        Some(wire_name) => {
+                                                                            match decode_claude_tool_name(
+                                                                                &stream_bindings,
+                                                                                wire_name,
+                                                                            ) {
+                                                                                Ok(name) => {
+                                                                                    Some(name)
+                                                                                }
+                                                                                Err(error) => {
+                                                                                    let _ = tx
+                                                                                        .send(Err(error))
+                                                                                        .await;
+                                                                                    return;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        None => None,
+                                                                    };
                                                                     sequence += 1;
                                                                     if tx
                                                                         .send(Ok(StreamChunk::ToolCallDelta {
                                                                             id,
-                                                                            name: builder.name.clone(),
+                                                                            name,
                                                                             arguments_delta: json,
                                                                             provenance: EventProvenance {
                                                                                 provider: "claude".to_string(),
@@ -403,10 +470,16 @@ impl ClaudeProvider {
                                                         };
                                                         let id =
                                                             builder.id.clone().unwrap_or_default();
-                                                        let name = builder
-                                                            .name
-                                                            .clone()
-                                                            .unwrap_or_default();
+                                                        let name = match decode_claude_tool_name(
+                                                            &stream_bindings,
+                                                            builder.name.as_deref().unwrap_or(""),
+                                                        ) {
+                                                            Ok(name) => name,
+                                                            Err(error) => {
+                                                                let _ = tx.send(Err(error)).await;
+                                                                return;
+                                                            }
+                                                        };
                                                         sequence += 1;
                                                         let _ = tx
                                                             .send(Ok(
@@ -510,16 +583,16 @@ impl ProviderBackend for ClaudeProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        let request = request.into_request_for(self)?;
-        with_retry(|| self.send_message_once(&request)).await
+        let (request, bindings) = request.into_request_for(self)?;
+        with_retry(|| self.send_message_once(&request, &bindings)).await
     }
 
     async fn send_message_stream_validated(
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        let request = request.into_request_for(self)?;
-        with_retry(|| self.send_message_stream_once(&request)).await
+        let (request, bindings) = request.into_request_for(self)?;
+        with_retry(|| self.send_message_stream_once(&request, &bindings)).await
     }
 
     fn name(&self) -> &str {
@@ -563,6 +636,26 @@ impl ProviderBackend for ClaudeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_bindings::compile_from_definitions;
+    use crate::ToolDefinition;
+
+    fn claude_test_bindings(names: &[&str]) -> ToolBindingTable {
+        compile_from_definitions(
+            WireProtocol::AnthropicMessages,
+            "claude",
+            "test",
+            &names
+                .iter()
+                .map(|name| ToolDefinition {
+                    name: (*name).to_string(),
+                    description: (*name).to_string(),
+                    input_schema: crate::ToolInputSchema::simple(vec![]),
+                })
+                .collect::<Vec<_>>(),
+            &Default::default(),
+        )
+        .expect("test tool bindings")
+    }
 
     #[tokio::test]
     async fn raw_sse_eof_after_tool_block_is_an_error_not_a_completion() {
@@ -587,7 +680,10 @@ mod tests {
         )
         .unwrap();
         let mut stream = provider
-            .send_message_stream_once(&ProviderRequest::new(vec![crate::Message::user("inspect")]))
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::Message::user("inspect")]),
+                &claude_test_bindings(&["Read"]),
+            )
             .await
             .unwrap();
         let mut tool_blocks = 0;
@@ -639,7 +735,10 @@ mod tests {
         )
         .unwrap();
         let mut stream = provider
-            .send_message_stream_once(&ProviderRequest::new(vec![crate::Message::user("inspect")]))
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::Message::user("inspect")]),
+                &claude_test_bindings(&["read"]),
+            )
             .await
             .unwrap();
         let mut tool_blocks = Vec::new();
@@ -676,33 +775,39 @@ mod tests {
         use crate::{ContentBlock, Message};
 
         let provider = ClaudeProvider::new("test-key".to_string()).unwrap();
-        let staged =
-            provider.to_message_request(&ProviderRequest::new(vec![Message::user("inspect")]));
+        let staged = provider.to_message_request(
+            &ProviderRequest::new(vec![Message::user("inspect")]),
+            &ToolBindingTable::empty(WireProtocol::AnthropicMessages, "claude", "test"),
+        );
         assert_eq!(staged.messages.len(), 1);
         assert!(staged.messages.iter().all(|message| message
             .content
             .iter()
             .all(|block| !matches!(block, ContentBlock::ToolUse { .. }))));
 
-        let committed = provider.to_message_request(&ProviderRequest::new(vec![
-            Message::user("inspect"),
-            Message::with_content(
-                "assistant",
-                vec![ContentBlock::ToolUse {
-                    id: "call-A".to_string(),
-                    name: "Read".to_string(),
-                    input: serde_json::json!({"path": "A"}),
-                }],
-            ),
-            Message::with_content(
-                "user",
-                vec![ContentBlock::ToolResult {
-                    tool_use_id: "call-A".to_string(),
-                    content: "value".to_string(),
-                    is_error: Some(false),
-                }],
-            ),
-        ]));
+        let empty = ToolBindingTable::empty(WireProtocol::AnthropicMessages, "claude", "test");
+        let committed = provider.to_message_request(
+            &ProviderRequest::new(vec![
+                Message::user("inspect"),
+                Message::with_content(
+                    "assistant",
+                    vec![ContentBlock::ToolUse {
+                        id: "call-A".to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({"path": "A"}),
+                    }],
+                ),
+                Message::with_content(
+                    "user",
+                    vec![ContentBlock::ToolResult {
+                        tool_use_id: "call-A".to_string(),
+                        content: "value".to_string(),
+                        is_error: Some(false),
+                    }],
+                ),
+            ]),
+            &empty,
+        );
         assert_eq!(committed.messages.len(), 3);
         assert!(matches!(
             committed.messages[1].content[0],

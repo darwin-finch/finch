@@ -19,7 +19,7 @@ impl ProviderBackend for EchoProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        let request = request.into_request_for(self)?;
+        let (request, _bindings) = request.into_request_for(self)?;
         let text = request
             .messages
             .last()
@@ -41,7 +41,7 @@ impl ProviderBackend for EchoProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<Receiver<Result<StreamChunk>>> {
-        let _request = request.into_request_for(self)?;
+        let (_request, _bindings) = request.into_request_for(self)?;
         anyhow::bail!("echo adapter does not stream")
     }
 

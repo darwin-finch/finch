@@ -108,6 +108,85 @@ fn openai_and_claude_emit_native_tool_call_events() {
 }
 
 #[test]
+fn live_adapters_do_not_recompile_tool_bindings() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let adapters = [
+        "claude.rs",
+        "openai.rs",
+        "gemini.rs",
+        "chatgpt_subscription.rs",
+    ];
+    let forbidden = [
+        "chatgpt_bindings(",
+        "openai_bindings(",
+        "compile_from_definitions(",
+    ];
+    let mut hits = Vec::new();
+    for adapter in adapters {
+        let path = root.join(adapter);
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let production = strip_cfg_test_items(&source);
+        assert!(
+            production.contains("into_request_for"),
+            "{adapter} live path must consume ValidatedProviderRequest::into_request_for"
+        );
+        for (line_number, line) in production.lines().enumerate() {
+            if forbidden.iter().any(|token| line.contains(token)) {
+                hits.push(format!(
+                    "{}:{}: {}",
+                    path.display(),
+                    line_number + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "live adapters must decode through the validated table, not recompile: {hits:?}"
+    );
+}
+
+fn strip_cfg_test_items(source: &str) -> String {
+    let mut out = String::new();
+    let mut skip = false;
+    let mut skip_depth = 0;
+    let mut depth = 0;
+    let mut pending_skip = false;
+    let mut entered_skip_body = false;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !skip && trimmed == "#[cfg(test)]" {
+            pending_skip = true;
+            continue;
+        }
+        if pending_skip {
+            pending_skip = false;
+            skip = true;
+            skip_depth = depth;
+            entered_skip_body = false;
+        }
+        let opens = line.chars().filter(|ch| *ch == '{').count();
+        let closes = line.chars().filter(|ch| *ch == '}').count();
+        depth = depth + opens as i32 - closes as i32;
+        if skip {
+            if depth > skip_depth {
+                entered_skip_body = true;
+            }
+            if entered_skip_body && depth <= skip_depth {
+                skip = false;
+                entered_skip_body = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
 fn public_contract_exports_provider_and_oauth_facades() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<finch_providers::ProviderRequest>();

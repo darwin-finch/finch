@@ -31,7 +31,13 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
   Generation-layer translation of `ContentBlockComplete(ToolUse)` into
   `ToolCallComplete` lives in `finch-generation`. Dual encoding of the same
   id+input is one call at the ToolLoop. Do not flatten per-adapter parsers
-  into a lowest-common-denominator decoder. Do not add #241 wire-name tables.
+  into a lowest-common-denominator decoder.
+- Per-request tool wire names come from `compile_tool_bindings` (issue #241).
+  Semantic Finch identities persist in history; adapters decode through the
+  immutable table compiled at `validate_provider_request` and returned by
+  `into_request_for`. Generic OpenAI-compatible clients do not use
+  ChatGPT/Codex reserved namespaces. Provider-native tools are advertised
+  only with a Finch handler and grant.
 - OAuth cancellation, expiry, and denial are terminal; interrupted refresh
   recovers only as tombstones.
 - Secrets never appear in `Debug`, logs, or error text.

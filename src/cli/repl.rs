@@ -163,7 +163,7 @@ mod disabled_training_tests {
             &self,
             request: ValidatedProviderRequest,
         ) -> Result<ProviderResponse> {
-            let request = request.into_request_for(self)?;
+            let (request, _bindings) = request.into_request_for(self)?;
             self.buffered_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::ensure!(
                 request
@@ -1337,6 +1337,7 @@ impl Repl {
             stream: false,
             cancellation_token: None,
             system,
+            tool_policy: Default::default(),
         };
 
         // Send with Level 3 optimization (smart strategies)
@@ -1386,6 +1387,7 @@ impl Repl {
             stream: true,
             cancellation_token: None,
             system,
+            tool_policy: Default::default(),
         };
 
         // Send with streaming (Level 1 tracking only, no truncation for streaming)

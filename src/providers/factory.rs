@@ -71,7 +71,7 @@ impl ProviderBackend for CredentialBoundProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        let request = request.into_request_for(self)?;
+        let (request, _bindings) = request.into_request_for(self)?;
         self.validate_lifecycle()?;
         self.inner.send_message(&request).await
     }
@@ -80,7 +80,7 @@ impl ProviderBackend for CredentialBoundProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<Receiver<Result<StreamChunk>>> {
-        let request = request.into_request_for(self)?;
+        let (request, _bindings) = request.into_request_for(self)?;
         self.validate_lifecycle()?;
         self.inner.send_message_stream(&request).await
     }
