@@ -9,6 +9,9 @@ use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
 use crate::cli::conversation::ConversationHistory;
+use crate::cli::conversation_compactor::{
+    inject_summary_prefix, ConversationCompactor, SummaryPlan,
+};
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
@@ -1025,6 +1028,7 @@ pub(crate) async fn process_query_with_tools(
     enable_summarization: bool,
     auto_compact_enabled: bool,
     summary_gen: Arc<dyn Generator>,
+    summary_cache: crate::cli::conversation_compactor::SharedSummaryCache,
     tool_call_history: Arc<
         RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
     >,
@@ -1071,19 +1075,23 @@ pub(crate) async fn process_query_with_tools(
     let messages = {
         let all_msgs = conversation.read().await.get_messages();
         // When summarization is enabled and messages have been dropped by the
-        // sliding window, summarise them and inject as a prefix so the LLM
-        // retains awareness of earlier turns.
+        // sliding window, inject the committed summary of those messages as a
+        // prefix so the LLM retains awareness of earlier turns. The summary
+        // is keyed on a committed range, so its bytes stay stable across
+        // turns and the request prefix can be cached.
         let mut msgs = if enable_summarization && max_verbatim > 0 && all_msgs.len() > max_verbatim
         {
-            let drop_end = all_msgs.len() - max_verbatim;
-            // Clone the dropped slice so we can pass all_msgs by value to apply_sliding_window.
-            let dropped: Vec<_> = all_msgs[..drop_end].to_vec();
-            let window = apply_sliding_window(all_msgs, max_verbatim);
-            let compactor =
-                crate::cli::conversation_compactor::ConversationCompactor::new(summary_gen);
-            compactor
-                .compact_with_system(&dropped, window, Some(persona_system_prompt.clone()))
-                .await
+            let compactor = crate::cli::conversation_compactor::ConversationCompactor::new(
+                summary_gen,
+                summary_cache,
+            );
+            assemble_window_with_summary(
+                &compactor,
+                all_msgs,
+                max_verbatim,
+                Some(persona_system_prompt.clone()),
+            )
+            .await
         } else {
             apply_sliding_window(all_msgs, max_verbatim)
         };
@@ -1847,6 +1855,53 @@ fn fallback_vm_manifest() -> crate::programs::VmManifest {
     }
 }
 
+/// Assemble this turn's message array when summarisation is active.
+///
+/// The committed-range decision runs before the sliding window consumes
+/// `history`: a still-valid committed summary is reused byte-for-byte, and a
+/// fresh summary is produced and committed only when the window has slid past
+/// the previously committed range. The summary prefix pair is injected ahead
+/// of the window; the caller injects the persona/VM system message before it,
+/// so the assembled request keeps the stable `[system, summary, window]`
+/// order that prompt caching needs.
+///
+/// Callers must invoke this only when summarisation is active: `max_verbatim
+/// > 0` and `history.len() > max_verbatim`.
+pub(crate) async fn assemble_window_with_summary(
+    compactor: &ConversationCompactor,
+    history: Vec<crate::providers::Message>,
+    max_verbatim: usize,
+    summarizer_system: Option<String>,
+) -> Vec<crate::providers::Message> {
+    let summary = match compactor.plan_summary(&history, max_verbatim) {
+        SummaryPlan::Reuse(text) => Some(text),
+        SummaryPlan::Summarize { input_end } => {
+            let input_end = input_end.min(history.len());
+            match compactor
+                .summarize(&history[..input_end], summarizer_system)
+                .await
+            {
+                Ok(text) => {
+                    let boundary = ConversationCompactor::boundary_fingerprint(&history, input_end);
+                    compactor.commit_summary(input_end, boundary, text.clone());
+                    Some(text)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Conversation summarisation failed, keeping window as-is: {error}"
+                    );
+                    None
+                }
+            }
+        }
+    };
+    let window = apply_sliding_window(history, max_verbatim);
+    match summary {
+        Some(text) => inject_summary_prefix(text, window),
+        None => window,
+    }
+}
+
 /// Apply a sliding window to the message list, keeping only the last `max` messages
 /// verbatim. If `max` is 0 or the list is shorter than `max`, returns all messages.
 ///
@@ -2197,6 +2252,9 @@ mod tests {
                 false,
                 false,
                 selected,
+                Arc::new(std::sync::Mutex::new(
+                    crate::cli::conversation_compactor::SummaryCache::new(),
+                )),
                 Arc::new(RwLock::new(HashMap::new())),
                 None,
                 "test persona".to_string(),
@@ -3566,5 +3624,535 @@ mod tests {
                  dispatch_tool_uses path; got Ok({text:?})"
             ),
         }
+    }
+
+    // ── Summarised request assembly (committed-range summary reuse) ────────
+
+    /// Main-turn generator that records every assembled provider request and
+    /// answers with a valid pure Forth wire program so the turn completes
+    /// without entering the wire-repair path.
+    struct RecordingTurnGenerator {
+        requests: std::sync::Mutex<Vec<Vec<crate::providers::Message>>>,
+    }
+
+    impl Default for RecordingTurnGenerator {
+        fn default() -> Self {
+            Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RecordingTurnGenerator {
+        fn requests(&self) -> Vec<Vec<crate::providers::Message>> {
+            self.requests
+                .lock()
+                .expect("recording generator request lock poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for RecordingTurnGenerator {
+        async fn generate(
+            &self,
+            messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            self.requests
+                .lock()
+                .expect("recording generator request lock poisoned")
+                .push(messages);
+            Ok(crate::generators::GeneratorResponse {
+                text: "(say \"ack\")".to_string(),
+                content_blocks: vec![ContentBlock::Text {
+                    text: "(say \"ack\")".to_string(),
+                }],
+                tool_uses: vec![],
+                metadata: crate::generators::ResponseMetadata {
+                    generator: "recorder".to_string(),
+                    model: "recorder".to_string(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPS: std::sync::OnceLock<GeneratorCapabilities> = std::sync::OnceLock::new();
+            CAPS.get_or_init(|| GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: None,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "request-recorder"
+        }
+    }
+
+    /// Summary generator that returns a distinct, numbered text per call and
+    /// records how many times it was consulted.
+    struct CountingSummaryGenerator {
+        calls: AtomicUsize,
+    }
+
+    impl Default for CountingSummaryGenerator {
+        fn default() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CountingSummaryGenerator {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for CountingSummaryGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = format!("summary generation {n}");
+            Ok(crate::generators::GeneratorResponse {
+                text: text.clone(),
+                content_blocks: vec![ContentBlock::Text { text }],
+                tool_uses: vec![],
+                metadata: crate::generators::ResponseMetadata {
+                    generator: "counting".to_string(),
+                    model: "counting".to_string(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::providers::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPS: std::sync::OnceLock<GeneratorCapabilities> = std::sync::OnceLock::new();
+            CAPS.get_or_init(|| GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: false,
+                supports_conversation: true,
+                max_context_messages: None,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "counting-summary-generator"
+        }
+    }
+
+    /// Run one summarisation-active turn through the real
+    /// `process_query_with_tools` against a preloaded conversation.
+    struct SummarizedTurnHarness {
+        task: tokio::task::JoinHandle<()>,
+        events: mpsc::UnboundedReceiver<ReplEvent>,
+        _tempdir: tempfile::TempDir,
+    }
+
+    async fn spawn_summarized_turn(
+        conversation: Arc<RwLock<ConversationHistory>>,
+        query: &str,
+        main_gen: Arc<dyn Generator>,
+        summary_gen: Arc<dyn Generator>,
+        summary_cache: crate::cli::conversation_compactor::SharedSummaryCache,
+    ) -> SummarizedTurnHarness {
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        conversation
+            .write()
+            .await
+            .add_user_message(query.to_string());
+
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+
+        let tempdir = tempfile::tempdir().expect("create isolated tool-pattern directory");
+        let executor = ToolExecutor::new(
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct inert tool executor");
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::clone(&conversation),
+            Arc::new(tokio::sync::RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
+            Arc::new(tokio::sync::RwLock::new(ReplMode::Normal)),
+            Arc::new(tokio::sync::RwLock::new(None)),
+        );
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let task = tokio::spawn(process_query_with_tools(
+            query_id,
+            query.to_string(),
+            event_tx,
+            Arc::clone(&main_gen),
+            Arc::clone(&main_gen),
+            Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+            Arc::new(tokio::sync::RwLock::new(GeneratorState::NotAvailable)),
+            Arc::new(Vec::new()),
+            conversation,
+            Arc::clone(&query_states),
+            tool_coordinator,
+            Arc::clone(&runtime),
+            tui_renderer,
+            Arc::new(tokio::sync::RwLock::new(ReplMode::Normal)),
+            Arc::clone(&output),
+            status,
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            None,
+            "test-session".to_string(),
+            "/test/workspace".to_string(),
+            4,
+            20,
+            0,
+            false,
+            true,
+            false,
+            summary_gen,
+            summary_cache,
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            None,
+            "test persona".to_string(),
+        ));
+        SummarizedTurnHarness {
+            task,
+            events,
+            _tempdir: tempdir,
+        }
+    }
+
+    fn seed_exchanges(conversation: &mut ConversationHistory, exchanges: usize) {
+        for i in 0..exchanges * 2 {
+            let message = if i % 2 == 0 {
+                crate::providers::Message::user(format!("seed question {i}"))
+            } else {
+                crate::providers::Message::assistant(format!("seed answer {i}"))
+            };
+            conversation.add_message(message);
+        }
+    }
+
+    /// Role plus a text preview for every message in an assembled request.
+    fn request_shape(request: &[crate::providers::Message]) -> Vec<(String, String)> {
+        request
+            .iter()
+            .map(|message| {
+                (
+                    message.role.clone(),
+                    message.text_content().chars().take(48).collect::<String>(),
+                )
+            })
+            .collect()
+    }
+
+    fn summary_text_of(message: &crate::providers::Message) -> String {
+        assert_eq!(
+            message.role, "user",
+            "summary prefix must be a user message: {message:?}"
+        );
+        match message.content.first() {
+            Some(ContentBlock::Text { text }) => text.clone(),
+            other => panic!("summary prefix must carry a text block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_summarised_request_prefix_is_byte_stable_across_turns() {
+        let recorder = Arc::new(RecordingTurnGenerator::default());
+        let summary_gen = Arc::new(CountingSummaryGenerator::default());
+        let summary_cache = Arc::new(std::sync::Mutex::new(
+            crate::cli::conversation_compactor::SummaryCache::new(),
+        ));
+
+        // 21 exchanges = 42 seed messages, so turn 1 (43 with the query)
+        // crosses max_verbatim = 20 and summarisation activates.
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        seed_exchanges(&mut *conversation.write().await, 21);
+
+        let turn1 = spawn_summarized_turn(
+            Arc::clone(&conversation),
+            "first question",
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&summary_gen) as Arc<dyn Generator>,
+            Arc::clone(&summary_cache),
+        )
+        .await;
+        turn1.task.await.expect("turn 1 query task panicked");
+        drop(turn1.events);
+
+        let turn2 = spawn_summarized_turn(
+            Arc::clone(&conversation),
+            "second question",
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&summary_gen) as Arc<dyn Generator>,
+            Arc::clone(&summary_cache),
+        )
+        .await;
+        turn2.task.await.expect("turn 2 query task panicked");
+        drop(turn2.events);
+
+        let requests = recorder.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "each turn must issue exactly one provider request; got {}: {:?}",
+            requests.len(),
+            requests
+                .iter()
+                .map(|r| request_shape(r))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            summary_gen.calls(),
+            1,
+            "invariant: the committed summary must be reused on turn 2 instead of \
+             re-summarising; summariser was called {} times",
+            summary_gen.calls()
+        );
+
+        for (turn, request) in requests.iter().enumerate() {
+            let shape = request_shape(request);
+            assert!(
+                request.len() >= 4,
+                "turn {}: assembled request must carry system prefix, summary pair, \
+                 and window; shape {shape:?}",
+                turn + 1
+            );
+            assert_eq!(
+                request[0].role,
+                "system",
+                "invariant: the stable system prefix must precede the summary; \
+                 turn {}, shape {shape:?}",
+                turn + 1
+            );
+            assert!(
+                summary_text_of(&request[1]).contains("[Summary of earlier context:"),
+                "turn {}: messages[1] must be the summary prefix; shape {shape:?}",
+                turn + 1
+            );
+            assert_eq!(
+                request[2].role,
+                "assistant",
+                "turn {}: messages[2] must be the summary acknowledgement; shape {shape:?}",
+                turn + 1
+            );
+            assert_eq!(
+                request[2].text_content(),
+                "Understood.",
+                "turn {}: summary acknowledgement must follow the summary; shape {shape:?}",
+                turn + 1
+            );
+            assert_eq!(
+                request[3].role,
+                "user",
+                "turn {}: the verbatim window must follow the summary pair; shape {shape:?}",
+                turn + 1
+            );
+        }
+
+        assert_eq!(
+            summary_text_of(&requests[0][1]),
+            summary_text_of(&requests[1][1]),
+            "invariant: the summary at the head of the message array must be \
+             byte-stable across turns so the request prefix can be cached; \
+             turn 1 = {:?}, turn 2 = {:?}",
+            summary_text_of(&requests[0][1]),
+            summary_text_of(&requests[1][1])
+        );
+        assert_eq!(
+            requests[0][0].text_content(),
+            requests[1][0].text_content(),
+            "invariant: the system prefix must be byte-stable across turns; \
+             turn 1 = {:?}, turn 2 = {:?}",
+            requests[0][0].text_content(),
+            requests[1][0].text_content()
+        );
+        let last_user = requests[1]
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .expect("turn 2 request must contain a user message");
+        assert!(
+            last_user.text_content().contains("second question"),
+            "turn 2 request must carry the newest query; shape {:?}",
+            request_shape(&requests[1])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_below_verbatim_threshold_carries_no_summary() {
+        let recorder = Arc::new(RecordingTurnGenerator::default());
+        let summary_gen = Arc::new(CountingSummaryGenerator::default());
+        let summary_cache = Arc::new(std::sync::Mutex::new(
+            crate::cli::conversation_compactor::SummaryCache::new(),
+        ));
+
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        seed_exchanges(&mut *conversation.write().await, 2);
+
+        let harness = spawn_summarized_turn(
+            Arc::clone(&conversation),
+            "short question",
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&summary_gen) as Arc<dyn Generator>,
+            Arc::clone(&summary_cache),
+        )
+        .await;
+        harness.task.await.expect("query task panicked");
+        drop(harness.events);
+
+        assert_eq!(
+            summary_gen.calls(),
+            0,
+            "below the verbatim threshold the summariser must never run; calls {}",
+            summary_gen.calls()
+        );
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 1, "one turn, one provider request");
+        let shape = request_shape(&requests[0]);
+        assert!(
+            requests[0]
+                .iter()
+                .all(|m| !m.text_content().contains("[Summary of earlier context:")),
+            "short conversations must not carry a summary prefix; shape {shape:?}"
+        );
+        assert_eq!(
+            requests[0][0].role, "system",
+            "system prefix must still precede the conversation; shape {shape:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_assemble_window_with_summary_reuses_committed_bytes_across_calls() {
+        let summary_gen = Arc::new(CountingSummaryGenerator::default());
+        let summary_cache = Arc::new(std::sync::Mutex::new(
+            crate::cli::conversation_compactor::SummaryCache::new(),
+        ));
+        let compactor = crate::cli::conversation_compactor::ConversationCompactor::new(
+            Arc::clone(&summary_gen) as Arc<dyn Generator>,
+            Arc::clone(&summary_cache),
+        );
+
+        let history = (0..42)
+            .map(|i| {
+                if i % 2 == 0 {
+                    crate::providers::Message::user(format!("seed question {i}"))
+                } else {
+                    crate::providers::Message::assistant(format!("seed answer {i}"))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let first = assemble_window_with_summary(
+            &compactor,
+            history.clone(),
+            20,
+            Some("test persona".to_string()),
+        )
+        .await;
+        assert_eq!(
+            summary_gen.calls(),
+            1,
+            "first assembly must summarise once; calls {}",
+            summary_gen.calls()
+        );
+        assert_eq!(
+            first[0].role,
+            "user",
+            "summary prefix must lead the assembled messages: {:?}",
+            request_shape(&first)
+        );
+        assert!(
+            summary_text_of(&first[0]).contains("[Summary of earlier context:"),
+            "summary prefix must be present: {:?}",
+            summary_text_of(&first[0])
+        );
+        assert_eq!(
+            first[1].text_content(),
+            "Understood.",
+            "assistant acknowledgement must follow the summary: {:?}",
+            request_shape(&first)
+        );
+        assert_eq!(
+            first[2].role,
+            "user",
+            "the verbatim window must follow the summary pair: {:?}",
+            request_shape(&first)
+        );
+
+        // One exchange later, the window slides but stays inside the
+        // committed range: same bytes, no summariser call.
+        let mut grown = history;
+        grown.push(crate::providers::Message::user("next question".to_string()));
+        grown.push(crate::providers::Message::assistant(
+            "next answer".to_string(),
+        ));
+        let second =
+            assemble_window_with_summary(&compactor, grown, 20, Some("test persona".to_string()))
+                .await;
+        assert_eq!(
+            summary_gen.calls(),
+            1,
+            "reuse must not re-summarise; calls {}",
+            summary_gen.calls()
+        );
+        assert_eq!(
+            summary_text_of(&first[0]),
+            summary_text_of(&second[0]),
+            "invariant: committed summary bytes must be identical across turns; \
+             first = {:?}, second = {:?}",
+            summary_text_of(&first[0]),
+            summary_text_of(&second[0])
+        );
     }
 }
