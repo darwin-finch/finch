@@ -454,6 +454,104 @@ pub(crate) fn compact_tool_summary(content: &str) -> String {
     }
 }
 
+// ── Session task-list rendering ──────────────────────────────────────────────
+
+/// Longest task content shown per list line before truncation.
+const MAX_TODO_CONTENT_LEN: usize = 120;
+
+/// Cap on task-list lines rendered into a transcript row body.
+const MAX_TODO_LIST_LINES: usize = 40;
+
+/// Whether a tool or approval subject is the session task-list write, in any
+/// casing providers have used (`todo_write`, `TodoWrite`).
+fn is_todo_write(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    normalized == "todowrite"
+}
+
+/// Human wording for a task status, from the wire value
+/// (`"in_progress"` → `"in progress"`).
+fn todo_status_word(status: Option<&str>) -> String {
+    match status.unwrap_or("pending") {
+        "in_progress" => "in progress".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Render a `todo_write` input as the readable task list it represents.
+///
+/// Returns the row summary (a count header) and one line per task, so a
+/// transcript row shows the list rather than the tool's raw JSON (#425).
+/// `None` when the input is not a well-formed todo payload.
+pub(crate) fn todo_write_display(input: &Value) -> Option<(String, Vec<String>)> {
+    let todos = input.get("todos")?.as_array()?;
+    let count = |status: &str| {
+        todos
+            .iter()
+            .filter(|task| task["status"].as_str() == Some(status))
+            .count()
+    };
+    let (in_progress, pending, completed) =
+        (count("in_progress"), count("pending"), count("completed"));
+    let noun = if todos.len() == 1 { "task" } else { "tasks" };
+    let summary = format!(
+        "Task list — {} {noun}: {} in progress, {} pending, {} completed",
+        todos.len(),
+        in_progress,
+        pending,
+        completed
+    );
+    let mut lines: Vec<String> = todos
+        .iter()
+        .map(|task| {
+            let content = task["content"].as_str().unwrap_or("(untitled)");
+            format!(
+                "[{}] {}",
+                todo_status_word(task["status"].as_str()),
+                crate::cli::diff::sanitize_terminal(&truncate(content, MAX_TODO_CONTENT_LEN))
+            )
+        })
+        .collect();
+    if lines.len() > MAX_TODO_LIST_LINES {
+        let overflow = lines.len() - MAX_TODO_LIST_LINES;
+        lines.truncate(MAX_TODO_LIST_LINES);
+        lines.push(format!("… +{overflow} more tasks"));
+    }
+    Some((summary, lines))
+}
+
+/// Label and body for a transcript row rendering a Brain-projected tool call.
+///
+/// The task-list write names itself by what it wrote, with the list as the
+/// row body; every other tool keeps its readable `Tool(param)` label. Tool
+/// input is never spliced into the label as raw JSON (#425).
+pub(crate) fn brain_tool_call_row(name: &str, input: &Value) -> (String, Vec<String>) {
+    if is_todo_write(name) {
+        if let Some(display) = todo_write_display(input) {
+            return display;
+        }
+    }
+    (format_tool_label(name, input), Vec::new())
+}
+
+/// Body lines for a transcript approval row: the approval detail rendered as
+/// the thing it represents. A task-list approval shows the list; any other
+/// detail stays out of the transcript (it is inspectable in the approval
+/// dialog) rather than printing as raw JSON (#425).
+pub(crate) fn approval_detail_body(subject: &str, detail: &Value) -> Vec<String> {
+    if is_todo_write(subject) {
+        let input = detail.get("input").unwrap_or(detail);
+        if let Some((_, lines)) = todo_write_display(input) {
+            return lines;
+        }
+    }
+    Vec::new()
+}
+
 // ── Time / token formatting ──────────────────────────────────────────────────
 
 /// Format elapsed seconds as "Xs" or "Xm Ys".
@@ -477,6 +575,135 @@ pub fn format_token_count(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── session task-list rendering (#425) ──────────────────────────────────
+
+    fn issue_425_payload() -> serde_json::Value {
+        serde_json::json!({"todos": [
+            {"content": "Identify the harness implementation, website source, and deployment target",
+             "id": "1", "priority": "high", "status": "in_progress"},
+            {"content": "Implement the typed program runner in the harness",
+             "id": "2", "priority": "high", "status": "pending"},
+            {"content": "Verify the deployment target accepts the build",
+             "id": "3", "priority": "low", "status": "completed"}
+        ]})
+    }
+
+    #[test]
+    fn test_todo_write_display_renders_the_issue_425_payload_as_a_task_list() {
+        let input = issue_425_payload();
+        let (summary, lines) =
+            todo_write_display(&input).expect("a well-formed todo payload must render");
+        assert!(
+            summary.contains("Task list — 3 tasks: 1 in progress, 1 pending, 1 completed"),
+            "the header must count every status: summary={summary:?} lines={lines:?}"
+        );
+        assert_eq!(
+            lines[0],
+            "[in progress] Identify the harness implementation, website source, and deployment target",
+            "each task is one bracketed-status line: lines={lines:?}"
+        );
+        assert!(
+            lines[1].contains("[pending] Implement the typed program runner in the harness"),
+            "lines={lines:?}"
+        );
+        assert!(
+            lines[2].contains("[completed] Verify the deployment target accepts the build"),
+            "lines={lines:?}"
+        );
+        let rendered = format!("{summary}\n{}", lines.join("\n"));
+        assert!(
+            !rendered.contains('{') && !rendered.contains("\"todos\""),
+            "the rendered list must not contain raw JSON: {rendered} payload={}",
+            input
+        );
+    }
+
+    #[test]
+    fn test_brain_tool_call_row_names_the_task_list_instead_of_raw_json() {
+        let (label, body) = brain_tool_call_row("todo_write", &issue_425_payload());
+        assert!(
+            label.contains("Task list") && !label.contains('{'),
+            "label must name the list, not the JSON: {label:?} body={body:?}"
+        );
+        assert!(
+            !body.is_empty(),
+            "the list lines are the row body: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_brain_tool_call_row_accepts_provider_casing() {
+        let (label, _) = brain_tool_call_row("TodoWrite", &issue_425_payload());
+        assert!(
+            label.contains("Task list"),
+            "TodoWrite is the same session task-list write: {label:?}"
+        );
+    }
+
+    #[test]
+    fn test_brain_tool_call_row_keeps_readable_label_for_other_tools() {
+        let (label, body) =
+            brain_tool_call_row("bash", &serde_json::json!({"command": "git status"}));
+        assert!(
+            label.contains("bash") && label.contains("git status"),
+            "other tools keep their readable label: {label:?}"
+        );
+        assert!(
+            body.is_empty(),
+            "no spliced JSON body for other tools: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_brain_tool_call_row_falls_back_when_todo_payload_is_malformed() {
+        let (label, body) = brain_tool_call_row("todo_write", &serde_json::json!({"todos": 3}));
+        assert!(
+            !label.contains('{'),
+            "a malformed payload must not splice JSON either: {label:?}"
+        );
+        assert!(body.is_empty(), "no list can be rendered: {body:?}");
+    }
+
+    #[test]
+    fn test_approval_detail_body_renders_the_list_not_the_detail_json() {
+        let detail = serde_json::json!({"input": issue_425_payload()});
+        let body = approval_detail_body("todo_write", &detail);
+        assert!(
+            body.iter().any(|line| line.contains("[in progress] Identify the harness implementation, website source, and deployment target")),
+            "the approval row body must be the task list: {body:?}"
+        );
+        assert!(
+            !body.iter().any(|line| line.contains('{')),
+            "the approval row body must not contain raw JSON: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_approval_detail_body_stays_out_of_transcript_for_other_tools() {
+        let body = approval_detail_body("bash", &serde_json::json!({"input": {"command": "true"}}));
+        assert!(
+            body.is_empty(),
+            "non-list approval details must not print as JSON rows: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_todo_write_display_caps_a_very_long_task_content() {
+        let input = serde_json::json!({"todos": [{
+            "content": "x".repeat(MAX_TODO_CONTENT_LEN + 50),
+            "id": "1", "priority": "low", "status": "pending"
+        }]});
+        let (summary, lines) = todo_write_display(&input).unwrap();
+        assert!(
+            summary.contains("1 task: 0 in progress, 1 pending, 0 completed"),
+            "singular noun and zero counts: {summary:?}"
+        );
+        assert!(
+            lines[0].chars().count() <= MAX_TODO_CONTENT_LEN + "[pending] ".len() + 1,
+            "content must be truncated: {lines:?}"
+        );
+    }
 
     // ── format_tool_label ────────────────────────────────────────────────────
 

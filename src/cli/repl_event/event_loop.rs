@@ -306,6 +306,9 @@ pub struct EventLoop {
     remote_brain_run_units:
         std::collections::HashMap<crate::brain::RunId, RemoteBrainRunProjection>,
     remote_brain_tool_rows: std::collections::HashMap<String, usize>,
+    /// Rendered task-list lines per remote tool call, so a completed
+    /// todo_write row keeps showing the list it wrote (#425).
+    remote_brain_task_lists: std::collections::HashMap<String, Vec<String>>,
     remote_brain_approval_rows: std::collections::HashMap<String, usize>,
     queued_remote_brain_approvals: std::collections::VecDeque<RemoteBrainApproval>,
     active_remote_brain_approval: Option<RemoteBrainApproval>,
@@ -969,6 +972,9 @@ struct RemoteBrainRunProjection {
     result_row: Option<usize>,
     tool_rows: std::collections::HashMap<String, usize>,
     approval_rows: std::collections::HashMap<String, usize>,
+    /// Rendered task-list lines per tool call, so the completed call row keeps
+    /// showing the list it wrote instead of collapsing to a bare summary.
+    task_list_bodies: std::collections::HashMap<String, Vec<String>>,
     locally_rendered_tool_ids: std::collections::HashSet<String>,
     locally_rendered_approval_ids: std::collections::HashSet<String>,
     locally_rendered_program: bool,
@@ -1006,6 +1012,7 @@ fn ensure_remote_brain_run_projection<'a>(
             result_row: None,
             tool_rows: std::collections::HashMap::new(),
             approval_rows: std::collections::HashMap::new(),
+            task_list_bodies: std::collections::HashMap::new(),
             locally_rendered_tool_ids: std::collections::HashSet::new(),
             locally_rendered_approval_ids: std::collections::HashSet::new(),
             locally_rendered_program: false,
@@ -1083,13 +1090,21 @@ fn project_remote_brain_run_event(
                 .tool_rows
                 .entry(tool_id.clone())
                 .or_insert_with(|| {
-                    let input = input.to_string();
-                    let input = if input.chars().count() > 80 {
-                        format!("{}…", input.chars().take(79).collect::<String>())
-                    } else {
-                        input
-                    };
-                    projection.unit.add_row(format!("{name} {input}"))
+                    // The row is labelled by what the call represents, never
+                    // by the raw input JSON (#425).
+                    let (label, body_lines) =
+                        crate::cli::repl_event::tool_display::brain_tool_call_row(name, input);
+                    let task_list = (!body_lines.is_empty()).then(|| body_lines.clone());
+                    let row = projection.unit.add_row(label);
+                    for line in body_lines {
+                        projection.unit.append_row_body_line(row, line);
+                    }
+                    if let Some(task_list) = task_list {
+                        projection
+                            .task_list_bodies
+                            .insert(tool_id.clone(), task_list);
+                    }
+                    row
                 });
         }
         BrainEventKind::ToolResult {
@@ -1105,6 +1120,9 @@ fn project_remote_brain_run_event(
                 .tool_rows
                 .entry(tool_id.clone())
                 .or_insert_with(|| projection.unit.add_row(tool_id));
+            // A completed task-list write keeps its rendered list as the row
+            // body, so the list stays readable in the transcript (#425).
+            let task_list = projection.task_list_bodies.remove(tool_id);
             if *is_error {
                 projection.unit.fail_row(row, output);
             } else {
@@ -1114,11 +1132,9 @@ fn project_remote_brain_run_event(
                 } else {
                     first.to_string()
                 };
-                projection.unit.complete_row_with_body(
-                    row,
-                    summary,
-                    output.lines().skip(1).map(str::to_owned).collect(),
-                );
+                let body = task_list
+                    .unwrap_or_else(|| output.lines().skip(1).map(str::to_owned).collect());
+                projection.unit.complete_row_with_body(row, summary, body);
             }
         }
         BrainEventKind::ApprovalRequested {
@@ -1148,11 +1164,12 @@ fn project_remote_brain_run_event(
                 let row = projection.unit.add_activity_row(format!(
                     "approval ({approval_kind}) for {audience_summary}: {subject}"
                 ));
-                for line in serde_json::to_string_pretty(detail)
-                    .unwrap_or_else(|_| detail.to_string())
-                    .lines()
+                // The detail is rendered as the thing it represents — never
+                // pretty-printed JSON in the transcript (#425).
+                for line in
+                    crate::cli::repl_event::tool_display::approval_detail_body(subject, detail)
                 {
-                    projection.unit.append_row_body_line(row, line.to_owned());
+                    projection.unit.append_row_body_line(row, line);
                 }
                 projection.approval_rows.insert(approval_id.clone(), row);
             }
@@ -1907,6 +1924,7 @@ impl EventLoop {
             remote_brain_tool_unit: None,
             remote_brain_run_units: std::collections::HashMap::new(),
             remote_brain_tool_rows: std::collections::HashMap::new(),
+            remote_brain_task_lists: std::collections::HashMap::new(),
             remote_brain_approval_rows: std::collections::HashMap::new(),
             queued_remote_brain_approvals: std::collections::VecDeque::new(),
             active_remote_brain_approval: None,
