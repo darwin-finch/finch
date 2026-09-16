@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Print the GitHub issue poset from native blocked-by edges.
+"""Print a dependency-aware GitHub issue work plan from blocked-by edges.
 
-Ready work is open issues with zero open blockers. Serial chains are the
-blocked-by DAG. File-overlap mutexes are scheduling advice, not GitHub edges;
-see the grooming issue that introduced this script.
+The output is topological: every issue appears after its open blockers. Issues
+in one wave have no dependency ordering and are candidates for parallel workers.
+File-overlap mutexes are scheduling advice, not GitHub edges. This script only
+reads GitHub; it never claims, assigns, comments, or creates worktrees.
 
 Usage:
   python3 .agents/skills/finch-backlog/scripts/ticket_poset.py
   python3 .agents/skills/finch-backlog/scripts/ticket_poset.py --milestone 'v0.7.31'
+  python3 .agents/skills/finch-backlog/scripts/ticket_poset.py --workers 4 --format json
 """
 
 from __future__ import annotations
@@ -67,7 +69,11 @@ def load_open_issues() -> list[dict]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--milestone", help="Restrict output to this milestone title")
+    parser.add_argument("--workers", type=int, default=1, help="Maximum workers shown per wave")
+    parser.add_argument("--format", choices=("text", "json"), default="text")
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be positive")
 
     issues = load_open_issues()
     if args.milestone:
@@ -87,27 +93,56 @@ def main() -> int:
         ]
         blocked_by[issue["number"]] = sorted(open_blockers)
 
-    ready = sorted(
-        number for number, blockers in blocked_by.items() if not blockers
-    )
-    blocked = sorted(
-        number for number, blockers in blocked_by.items() if blockers
-    )
+    # Kahn's algorithm gives dependency waves rather than merely a ready/
+    # blocked split. A dependent ticket cannot enter a wave until every open
+    # blocker has entered an earlier wave.
+    remaining = {number: set(blockers) for number, blockers in blocked_by.items()}
+    waves: list[list[int]] = []
+    while remaining:
+        wave = sorted(number for number, blockers in remaining.items() if not blockers)
+        if not wave:
+            print("ticket_poset: dependency cycle detected", file=sys.stderr)
+            return 1
+        waves.append(wave)
+        for number in wave:
+            del remaining[number]
+        for blockers in remaining.values():
+            blockers.difference_update(wave)
+
+    plan = {
+        "open_in_scope": len(issues),
+        "workers": args.workers,
+        "scheduling": "replenish_on_completion",
+        "waves": [
+            {
+                "wave": index,
+                "parallel": numbers,
+            }
+            for index, numbers in enumerate(waves)
+        ],
+    }
+    if args.format == "json":
+        print(json.dumps(plan, indent=2))
+        return 0
+
+    ready = waves[0] if waves else []
+    blocked = [number for wave in waves[1:] for number in wave]
 
     print(f"open_in_scope {len(issues)}")
     print(f"ready {len(ready)}")
     print(f"blocked {len(blocked)}")
+    print(f"waves {len(waves)}")
     print()
-    print("## Ready (no open blockers)")
-    for number in ready:
-        title = by_number[number]["title"]
-        print(f"- #{number} {title}")
+    print("## Dependency waves (parallel candidates)")
+    for wave_index, numbers in enumerate(waves):
+        print(f"### Wave {wave_index} (dispatch up to {args.workers}; refill on completion)")
+        print("- " + ", ".join(f"#{number} {by_number[number]['title']}" for number in numbers))
 
     print()
-    print("## Blocked")
+    print("## Dependency edges")
     for number in blocked:
         blockers = ", ".join(f"#{b}" for b in blocked_by[number])
-        print(f"- #{number} blocked by {blockers} — {by_number[number]['title']}")
+        print(f"- #{number} after {blockers} — {by_number[number]['title']}")
 
     print()
     print("## Mermaid")
