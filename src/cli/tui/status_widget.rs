@@ -179,7 +179,12 @@ mod tests {
         let colors = ColorScheme::default();
         let widget = StatusWidget::new(&status_bar, &colors);
         let style = widget.get_line_style(&StatusLineType::TrainingStats);
-        assert_eq!(style.fg, Some(Color::DarkGray));
+        assert_eq!(style.fg, Some(colors.status.training.to_color()));
+        assert_ne!(
+            style.fg,
+            Some(Color::DarkGray),
+            "default training text must not use ANSI DarkGray on the product dark background"
+        );
     }
 
     #[test]

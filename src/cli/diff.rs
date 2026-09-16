@@ -509,17 +509,8 @@ impl FileDiff {
                     DiffLineKind::NoNewline => (None, None, '\\', Tone::Meta),
                 };
                 out.push('\n');
-                let a = a.map(|v| v.to_string()).unwrap_or_default();
-                let b = b.map(|v| v.to_string()).unwrap_or_default();
                 out.push_str(&paint(
-                    format!(
-                        "{:>width$} {:>width$} {} {}",
-                        a,
-                        b,
-                        m,
-                        sanitize_terminal(&line.text),
-                        width = width
-                    ),
+                    format_gutter_line(a, b, m, &sanitize_terminal(&line.text), width),
                     colors,
                     mode,
                     t,
@@ -1058,6 +1049,22 @@ enum Tone {
     Context,
     Meta,
 }
+
+/// One right-aligned number, then the marker. Context uses the new-file
+/// number; add uses new; remove uses old. Two side-by-side numbers duplicated
+/// the same logical line and put 13 in a different column on `-` vs `+`.
+fn format_gutter_line(
+    old: Option<usize>,
+    new: Option<usize>,
+    marker: char,
+    text: &str,
+    width: usize,
+) -> String {
+    match new.or(old) {
+        Some(number) => format!("{number:>width$} {marker} {text}"),
+        None => format!("{:width$} {marker} {text}", ""),
+    }
+}
 fn paint(text: String, colors: &ColorScheme, mode: DiffColorMode, tone: Tone) -> String {
     if mode == DiffColorMode::NoColor {
         return text;
@@ -1087,7 +1094,96 @@ mod tests {
     #[test]
     fn no_color_snapshot() {
         let d = FileDiff::parse(SAMPLE).unwrap();
-        assert_eq!(d.render(&ColorScheme::default(),DiffColorMode::NoColor),"src/old.rs → src/new.rs  +2 -1  renamed\n@@ -2,2 +2,3 @@ fn x\n2 2   keep\n3   - old\n  3 + new\n  4 + more")
+        assert_eq!(d.render(&ColorScheme::default(),DiffColorMode::NoColor),"src/old.rs → src/new.rs  +2 -1  renamed\n@@ -2,2 +2,3 @@ fn x\n2   keep\n3 - old\n3 + new\n4 + more")
+    }
+
+    fn hunk_body(rendered: &str) -> Vec<&str> {
+        rendered
+            .lines()
+            .skip_while(|line| !line.starts_with("@@"))
+            .skip(1)
+            .collect()
+    }
+
+    fn first_number_column(line: &str) -> usize {
+        line.find(|c: char| c.is_ascii_digit())
+            .unwrap_or_else(|| panic!("gutter line must carry a line number, got {line:?}"))
+    }
+
+    #[test]
+    fn test_diff_gutter_does_not_duplicate_line_numbers() {
+        let d = FileDiff::parse(SAMPLE).unwrap();
+        let rendered = d.render(&ColorScheme::default(), DiffColorMode::NoColor);
+        let body = hunk_body(&rendered);
+        assert!(!body.is_empty(), "expected hunk body lines in {rendered}");
+
+        let keep = body
+            .iter()
+            .find(|line| line.contains("keep"))
+            .unwrap_or_else(|| panic!("context line missing from {rendered}"));
+        assert_eq!(
+            keep.matches('2').count(),
+            1,
+            "context gutter must show the line number once, not duplicated side-by-side; line={keep:?} rendered={rendered}"
+        );
+
+        let removed = body
+            .iter()
+            .find(|line| line.contains("old"))
+            .unwrap_or_else(|| panic!("remove line missing from {rendered}"));
+        let added = body
+            .iter()
+            .find(|line| line.contains("new"))
+            .unwrap_or_else(|| panic!("add line missing from {rendered}"));
+        assert_eq!(
+            first_number_column(removed),
+            first_number_column(added),
+            "the same logical number must occupy the same gutter column on every row type; removed={removed:?} added={added:?} rendered={rendered}"
+        );
+
+        let old: String = (1..=16).map(|i| format!("line {i}\n")).collect();
+        let new: String = (1..=16)
+            .map(|i| {
+                if i == 13 || i == 14 {
+                    format!("changed {i}\n")
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        let two_digit = FileDiff::from_texts("index.html", &old, &new)
+            .render(&ColorScheme::default(), DiffColorMode::NoColor);
+        assert!(
+            !two_digit.contains("15 15"),
+            "context rows must not duplicate the line number; rendered={two_digit}"
+        );
+        let two_body = hunk_body(&two_digit);
+        let two_removed = two_body
+            .iter()
+            .find(|line| line.contains("line 13") && line.contains('-'))
+            .unwrap_or_else(|| panic!("remove of line 13 missing from {two_digit}"));
+        let two_added = two_body
+            .iter()
+            .find(|line| line.contains("changed 13"))
+            .unwrap_or_else(|| panic!("add of line 13 missing from {two_digit}"));
+        assert_eq!(
+            first_number_column(two_removed),
+            first_number_column(two_added),
+            "two-digit gutters must put 13 in the same column on remove and add; removed={two_removed:?} added={two_added:?} rendered={two_digit}"
+        );
+        let context_15 = two_body
+            .iter()
+            .find(|line| line.contains("line 15"))
+            .unwrap_or_else(|| panic!("context line 15 missing from {two_digit}"));
+        let gutter = context_15
+            .split_once("line 15")
+            .map(|(prefix, _)| prefix)
+            .unwrap_or_else(|| panic!("context line 15 missing payload in {context_15:?}"));
+        assert_eq!(
+            gutter.matches("15").count(),
+            1,
+            "context gutter must not print 15 twice; gutter={gutter:?} line={context_15:?} rendered={two_digit}"
+        );
     }
     #[test]
     fn light_dark() {
