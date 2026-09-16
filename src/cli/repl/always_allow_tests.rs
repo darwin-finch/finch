@@ -360,22 +360,29 @@ fn test_planning_allowlists_only_admit_justified_tools() {
 
 #[test]
 fn test_repl_planning_gate_blocks_spellings_nothing_registers() {
-    // Issue #466: the legacy REPL loop's planning gate once allow-listed
-    // "ExitPlanMode" and "Bash" — spellings no Tool registers and no alias
-    // covers, which could only die later at dispatch. The gate now refuses
-    // them up front while canonical and alias spellings stay allowed.
+    // Issue #466: planning gates once allow-listed spellings no Tool
+    // registered. "ExitPlanMode" is refused up front. "Bash" is NOT in that
+    // class any more: #765 registered it as a dispatch alias of `bash`
+    // because legacy compacted history carries it, so the alias-resolving
+    // gate admits it — asserted in test_plan_mode_allows_enter_plan_mode_
+    // spellings' siblings, not here.
     use crate::cli::ReplMode;
     let mode = ReplMode::Planning {
         task: String::new(),
         plan_path: std::path::PathBuf::from("/tmp/plan.md"),
         created_at: chrono::Utc::now(),
     };
-    for tool in ["ExitPlanMode", "Bash"] {
+    for tool in ["ExitPlanMode"] {
         assert!(
             !crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode(tool, &mode),
             "{tool} registers as nothing and must not pass the planning gate"
         );
     }
+    assert!(
+        crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode("Bash", &mode),
+        "Bash is a registered dispatch alias of bash (#765 legacy replay) and \
+         must pass the alias-resolving gate"
+    );
     for tool in ["bash", "enter_plan_mode", "EnterPlanMode", "read"] {
         assert!(
             crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode(tool, &mode),
