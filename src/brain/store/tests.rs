@@ -7462,3 +7462,231 @@ fn test_replay_mutation_is_stable_across_store_restart() {
         "restart replay must resolve the same mutation without appending; after={after_restart:?}"
     );
 }
+
+fn delivery_envelope(
+    execution_id: uuid::Uuid,
+    sequence: u64,
+    text: &str,
+) -> crate::runtime::VmEffectEnvelope {
+    crate::runtime::VmEffectEnvelope {
+        execution_id,
+        effect: crate::vm::VmSideEffect {
+            protocol_version: 1,
+            sequence,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            output: Vec::new(),
+            event: crate::vm::HostSideEffect::Emit { text: text.into() },
+            origin: crate::vm::SourceOrigin::generated("brain-delivery-test"),
+        },
+    }
+}
+
+fn output_handle_envelope(
+    execution_id: uuid::Uuid,
+    sequence: u64,
+    handle: &str,
+    generation: u64,
+) -> crate::runtime::VmEffectEnvelope {
+    crate::runtime::VmEffectEnvelope {
+        execution_id,
+        effect: crate::vm::VmSideEffect {
+            protocol_version: 1,
+            sequence,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            output: Vec::new(),
+            event: crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Status,
+                target: Some(crate::vm::TypedValue::Resource {
+                    kind: "output-handle".into(),
+                    handle: handle.into(),
+                    generation,
+                }),
+                text: Some(handle.into()),
+                progress: None,
+            },
+            origin: crate::vm::SourceOrigin::generated("brain-delivery-handle"),
+        },
+    }
+}
+
+#[test]
+fn brain_delivery_log_replays_unacked_suffix_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    store.snapshot("shared").unwrap();
+    let brain_id = store.snapshot("shared").unwrap().brain_id.0;
+    let client = crate::runtime::DeliveryConsumerIdentity::new(brain_id, uuid::Uuid::new_v4());
+    let execution_id = uuid::Uuid::new_v4();
+    let first = delivery_envelope(execution_id, 0, "one");
+    let second = delivery_envelope(execution_id, 1, "two");
+    store
+        .record_effect_delivery("shared", &[first.clone(), second.clone()])
+        .unwrap();
+    assert_eq!(
+        store.pending_effect_delivery("shared", client).unwrap(),
+        vec![first.clone(), second.clone()]
+    );
+    assert!(store
+        .acknowledge_effect_delivery(
+            "shared",
+            client,
+            crate::runtime::DeliveryCursor::through(execution_id, 0)
+        )
+        .unwrap());
+    assert_eq!(
+        store.pending_effect_delivery("shared", client).unwrap(),
+        vec![second.clone()],
+        "ack through sequence 0 must leave only the unacknowledged suffix"
+    );
+
+    drop(store);
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    assert_eq!(
+        restarted.pending_effect_delivery("shared", client).unwrap(),
+        vec![second.clone()],
+        "restart must replay the unacknowledged suffix"
+    );
+    let other = crate::runtime::DeliveryConsumerIdentity::new(brain_id, uuid::Uuid::new_v4());
+    assert_eq!(
+        restarted
+            .pending_effect_delivery("shared", other)
+            .unwrap()
+            .len(),
+        2,
+        "a different client keeps an independent cursor"
+    );
+    assert!(restarted
+        .acknowledge_effect_delivery(
+            "shared",
+            client,
+            crate::runtime::DeliveryCursor::through(execution_id, 1)
+        )
+        .unwrap());
+    assert!(restarted
+        .pending_effect_delivery("shared", client)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn brain_delivery_log_indexes_concurrent_output_handles() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    store.snapshot("shared").unwrap();
+    let brain_id = store.snapshot("shared").unwrap().brain_id.0;
+    let client = crate::runtime::DeliveryConsumerIdentity::new(brain_id, uuid::Uuid::new_v4());
+    let execution_id = uuid::Uuid::new_v4();
+    let download = output_handle_envelope(execution_id, 0, "download", 4);
+    let log_handle = output_handle_envelope(execution_id, 1, "log", 1);
+    store
+        .record_effect_delivery("shared", &[download.clone(), log_handle.clone()])
+        .unwrap();
+    let log = store.effect_delivery_log("shared").unwrap().unwrap();
+    let handles = log.lock().unwrap().output_handles(execution_id);
+    assert_eq!(
+        handles.len(),
+        2,
+        "concurrent output handles must be independently addressable; handles={handles:?}"
+    );
+    let download_ref = crate::runtime::OutputHandleRef::new(execution_id, "download", 4);
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .pending_for_handle(&client, &download_ref),
+        vec![download]
+    );
+    let stale = crate::runtime::OutputHandleRef::new(execution_id, "download", 3);
+    assert!(
+        log.lock()
+            .unwrap()
+            .pending_for_handle(&client, &stale)
+            .is_empty(),
+        "a smaller generation must not match the live handle"
+    );
+}
+
+#[tokio::test]
+async fn program_runtime_from_brain_store_binds_the_delivery_log() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    store.snapshot("shared").unwrap();
+    let runtime = store.program_runtime("shared").unwrap();
+    assert!(
+        runtime.effect_delivery_log().is_some(),
+        "BrainStore::program_runtime must bind the production delivery log"
+    );
+    let outcome = runtime
+        .submit_typed_only(crate::runtime::ProgramSubmission {
+            language: crate::programs::ProgramLanguage::Lisp,
+            source_id: Some("brain-delivery".into()),
+            source: "(let ((handle (output-open \"download\"))) (output-complete handle))".into(),
+            intent: "bind production delivery log".into(),
+            effect: crate::programs::ExecutionEffect::VmRead,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: Some(runtime.revision()),
+            budget: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
+    let brain_id = store.snapshot("shared").unwrap().brain_id.0;
+    let client = crate::runtime::DeliveryConsumerIdentity::new(brain_id, uuid::Uuid::new_v4());
+    let pending = store.pending_effect_delivery("shared", client).unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|envelope| envelope.execution_id == outcome.execution_id),
+        "effects observed by the bound runtime must land in the Brain delivery log; pending={pending:?}"
+    );
+}
+
+#[test]
+fn archive_evicts_delivery_log_so_a_reused_name_does_not_leak() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("brains");
+    let store = BrainStore::with_root("box.local", Some(root.clone()));
+    store.snapshot("shared").unwrap();
+    let execution_id = uuid::Uuid::new_v4();
+    let first = delivery_envelope(execution_id, 0, "archived");
+    store
+        .record_effect_delivery("shared", &[first.clone()])
+        .unwrap();
+    let archived = store.archive("shared").unwrap().unwrap();
+    let archived_log = archived.join("runtime").join("effects.jsonl");
+    let archived_bytes = std::fs::read(&archived_log).unwrap();
+    assert!(
+        !archived_bytes.is_empty(),
+        "archived Brain must retain its delivery log"
+    );
+
+    store.snapshot("shared").unwrap();
+    let new_id = store.snapshot("shared").unwrap().brain_id.0;
+    let client = crate::runtime::DeliveryConsumerIdentity::new(new_id, uuid::Uuid::new_v4());
+    assert!(
+        store
+            .pending_effect_delivery("shared", client)
+            .unwrap()
+            .is_empty(),
+        "a reused name must open a new delivery log, not the archived Brain's"
+    );
+    let replacement = delivery_envelope(uuid::Uuid::new_v4(), 0, "replacement");
+    store
+        .record_effect_delivery("shared", &[replacement.clone()])
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&archived_log).unwrap(),
+        archived_bytes,
+        "recording on the reused name must not append into the archived effects.jsonl"
+    );
+    assert_eq!(
+        store.pending_effect_delivery("shared", client).unwrap(),
+        vec![replacement]
+    );
+}

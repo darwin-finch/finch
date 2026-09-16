@@ -16,7 +16,10 @@ use crate::ipc::brain_codec::{
     decode_run, decode_runner_handoff, decode_runner_lease, decode_schedule, decode_snapshot,
     encode_approval_audience, encode_brain_submission, encode_environment,
 };
-use crate::ipc::checkpoint_codec::{decode_checkpoint, encode_checkpoint};
+use crate::ipc::checkpoint_codec::{
+    decode_checkpoint, decode_packed_runtime_application_frames, encode_checkpoint,
+    encode_packed_delivery_envelopes,
+};
 use crate::ipc::schema::finch_ipc_capnp::{
     self, brain_runner, brain_runner_control, brain_service, brain_wire_receiver, finch_daemon,
     stream_receiver,
@@ -29,6 +32,9 @@ pub struct BrainRunnerBootstrap {
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
     pub subagent_control: mpsc::UnboundedSender<crate::scheduler::AgentBrainControlRequest>,
+    /// Packed Runtime/Application ABI envelopes the previous runner did not
+    /// acknowledge. Not projected into the TUI (#57).
+    pub pending_delivery: Vec<crate::runtime::RuntimeApplicationMessage>,
 }
 
 pub struct BrainSubmissionResult {
@@ -371,6 +377,41 @@ impl IpcClient {
         }
         let reply = request.send().promise.await?;
         decode_schedule(reply.get()?.get_schedule()?)
+    }
+
+    pub async fn brain_pending_effect_delivery(
+        &self,
+        brain: &str,
+        client_id: uuid::Uuid,
+    ) -> Result<Vec<crate::runtime::RuntimeApplicationMessage>> {
+        let service = self.brain_service().await?;
+        let mut request = service.pending_effect_delivery_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_client_id(&client_id.to_string());
+        }
+        let reply = request.send().promise.await?;
+        decode_packed_runtime_application_frames(reply.get()?.get_frames()?)
+            .context("daemon returned invalid packed effect delivery")
+    }
+
+    pub async fn brain_acknowledge_effect_delivery(
+        &self,
+        brain: &str,
+        client_id: uuid::Uuid,
+        cursor: crate::runtime::DeliveryCursor,
+    ) -> Result<bool> {
+        let service = self.brain_service().await?;
+        let mut request = service.acknowledge_effect_delivery_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_client_id(&client_id.to_string());
+            params.set_execution_id(&cursor.execution_id.to_string());
+            params.set_through_sequence(cursor.through_sequence);
+        }
+        Ok(request.send().promise.await?.get()?.get_applied())
     }
 
     pub async fn brain_attach(
@@ -731,6 +772,10 @@ impl IpcClient {
             checkpoint: decode_checkpoint(response.get_checkpoint()?)
                 .context("daemon returned an invalid named-Brain checkpoint")?,
             subagent_control,
+            pending_delivery: decode_packed_runtime_application_frames(
+                response.get_pending_delivery()?,
+            )
+            .context("daemon returned invalid packed effect delivery")?,
         })
     }
 }
@@ -1145,6 +1190,10 @@ impl brain_runner::Server for BrainRunnerImpl {
                     .init_effect_journal(effect_journal.len() as u32),
                 effect_journal,
             )?;
+            encode_runner_delivery(
+                result.reborrow().init_delivery(effect_journal.len() as u32),
+                effect_journal,
+            )?;
             match response {
                 Ok(response) => {
                     result.set_output(&response.output);
@@ -1265,6 +1314,10 @@ impl brain_runner::Server for BrainRunnerImpl {
                 result
                     .reborrow()
                     .init_effect_journal(effect_journal.len() as u32),
+                effect_journal,
+            )?;
+            encode_runner_delivery(
+                result.reborrow().init_delivery(effect_journal.len() as u32),
                 effect_journal,
             )?;
             match response {
@@ -1459,6 +1512,18 @@ fn encode_runner_effect_records(
             &record.entry,
         )
         .map_err(|error| capnp::Error::failed(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn encode_runner_delivery(
+    mut encoded: capnp::data_list::Builder<'_>,
+    records: &[crate::server::RunnerEffectRecord],
+) -> capnp::Result<()> {
+    let frames = encode_packed_delivery_envelopes(records)
+        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+    for (index, frame) in frames.iter().enumerate() {
+        encoded.set(index as u32, frame);
     }
     Ok(())
 }
@@ -1938,7 +2003,7 @@ mod tests {
 
     #[test]
     fn mixed_ipc_generations_reject_before_query_or_stream_use() {
-        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 8);
+        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 9);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1947,13 +2012,13 @@ mod tests {
         runtime.block_on(local.run_until(async {
             let old_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 7,
+                protocol_version: 8,
                 query_calls: std::rc::Rc::clone(&old_daemon_calls),
             });
             let client = IpcClient::from_test_client(daemon);
             let error = client.ping().await.unwrap_err().to_string();
-            assert!(error.contains("protocol 7"));
-            assert!(error.contains("requires 8"));
+            assert!(error.contains("protocol 8"));
+            assert!(error.contains("requires 9"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(old_daemon_calls.get(), 0);
 

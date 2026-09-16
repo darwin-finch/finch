@@ -932,6 +932,10 @@ struct BrainProgramResult {
   checkpoint      @2 :TypedRuntimeCheckpoint;
   error           @3 :Text;
   effectJournal   @4 :List(BrainEffectRecord);
+  # Packed RuntimeApplicationMessage envelopes for the same journal. Decode
+  # fail-closes unless abiVersion is 1 and each frame matches the journal
+  # (executionId, sequence, output row). Empty means reconstruct from journal.
+  delivery        @5 :List(Data);
 }
 
 struct BrainTurnRequest {
@@ -974,6 +978,8 @@ struct BrainTurnResult {
   continuationMessages @10 :List(Message);
   hasInvocationMetadata @11 :Bool;
   invocationMetadata @12 :InvocationMetadata;
+  # Packed RuntimeApplicationMessage envelopes; same contract as BrainProgramResult.delivery.
+  delivery        @13 :List(Data);
 }
 
 # Optional reverse capability returned by the runner with a completed turn.
@@ -1624,6 +1630,14 @@ interface BrainService {
                               attachmentId :Text,
                               connectionId :Text,
                               nextDueMs :UInt64) -> (schedule :BrainSchedule);
+
+  # Packed Runtime/Application ABI envelopes the consumer has not acknowledged.
+  pendingEffectDelivery @18 (brain :Text, clientId :Text) -> (frames :List(Data));
+
+  acknowledgeEffectDelivery @19 (brain :Text,
+                                 clientId :Text,
+                                 executionId :Text,
+                                 throughSequence :UInt64) -> (applied :Bool);
 }
 
 # ---------------------------------------------------------------------------
@@ -1679,7 +1693,7 @@ interface FinchDaemon {
   # hydrate before accepting work. Host authority is deliberately absent.
   registerBrainRunner @4 (brain :Text, leaseId :Text, runner :BrainRunner)
       -> (runtimeRevision :UInt64, checkpoint :TypedRuntimeCheckpoint,
-          control :BrainRunnerControl);
+          control :BrainRunnerControl, pendingDelivery :List(Data));
 
   # Return the canonical named-Brain lifecycle capability. Keeping this as a
   # capability allows later protocol evolution without adding every Brain

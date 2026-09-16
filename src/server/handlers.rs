@@ -1177,6 +1177,28 @@ fn push_named_brain_run_result(
     )
 }
 
+fn delivery_envelopes(
+    records: &[crate::server::RunnerEffectRecord],
+) -> Vec<crate::runtime::VmEffectEnvelope> {
+    records
+        .iter()
+        .map(|record| crate::runtime::VmEffectEnvelope {
+            execution_id: record.execution_id,
+            effect: record.entry.effect.clone(),
+        })
+        .collect()
+}
+
+fn admit_runner_effect_delivery(
+    store: &crate::brain::BrainStore,
+    name: &str,
+    records: &[crate::server::RunnerEffectRecord],
+) -> anyhow::Result<()> {
+    validate_runner_effect_journal(records)?;
+    store.record_effect_delivery(name, &delivery_envelopes(records))?;
+    Ok(())
+}
+
 /// Validate the runner's diagnostic VM journal without treating it as durable
 /// audit authority. Physical host effects are recorded synchronously through
 /// the daemon-issued reserve/begin/finish capability before this result can

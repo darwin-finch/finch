@@ -16,7 +16,10 @@ use crate::ipc::brain_codec::{
     encode_approval_audience, encode_attachment, encode_brain_submission_outcome, encode_event,
     encode_run, encode_runner_handoff, encode_runner_lease, encode_schedule, encode_snapshot,
 };
-use crate::ipc::checkpoint_codec::{decode_checkpoint, encode_checkpoint};
+use crate::ipc::checkpoint_codec::{
+    decode_checkpoint, decode_packed_delivery_envelopes, encode_checkpoint,
+    encode_packed_runtime_application_frames,
+};
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_service, finch_daemon};
 use crate::server::AgentServer;
 
@@ -1449,6 +1452,68 @@ impl brain_service::Server for BrainRpcService {
         }
     }
 
+    fn pending_effect_delivery(
+        self: capnp::capability::Rc<Self>,
+        params: brain_service::PendingEffectDeliveryParams,
+        mut results: brain_service::PendingEffectDeliveryResults,
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let client_id = match pry!(params.get_client_id()).to_str() {
+            Ok(value) => match uuid::Uuid::parse_str(value) {
+                Ok(id) => id,
+                Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+            },
+            Err(error) => return Promise::err(error.into()),
+        };
+        match self.lifecycle.pending_effect_delivery(&brain, client_id) {
+            Ok(messages) => {
+                if let Err(error) = encode_packed_runtime_application_frames(
+                    results.get().init_frames(messages.len() as u32),
+                    &messages,
+                ) {
+                    return Promise::err(capnp::Error::failed(error.to_string()));
+                }
+                Promise::ok(())
+            }
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+
+    fn acknowledge_effect_delivery(
+        self: capnp::capability::Rc<Self>,
+        params: brain_service::AcknowledgeEffectDeliveryParams,
+        mut results: brain_service::AcknowledgeEffectDeliveryResults,
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let client_id = match pry!(params.get_client_id()).to_str() {
+            Ok(value) => match uuid::Uuid::parse_str(value) {
+                Ok(id) => id,
+                Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+            },
+            Err(error) => return Promise::err(error.into()),
+        };
+        let execution_id = match pry!(params.get_execution_id()).to_str() {
+            Ok(value) => match uuid::Uuid::parse_str(value) {
+                Ok(id) => id,
+                Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+            },
+            Err(error) => return Promise::err(error.into()),
+        };
+        match self.lifecycle.acknowledge_effect_delivery(
+            &brain,
+            client_id,
+            crate::runtime::DeliveryCursor::through(execution_id, params.get_through_sequence()),
+        ) {
+            Ok(applied) => {
+                results.get().set_applied(applied);
+                Promise::ok(())
+            }
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+
     fn claim_runner_identity(
         self: capnp::capability::Rc<Self>,
         params: brain_service::ClaimRunnerIdentityParams,
@@ -1972,6 +2037,23 @@ impl finch_daemon::Server for FinchDaemonImpl {
                 lease_id,
             });
         response.set_control(control);
+        let consumer =
+            crate::runtime::DeliveryConsumerIdentity::new(snapshot.brain_id.0, lease_id.0);
+        match self
+            .server
+            .brain_store()
+            .pending_effect_delivery_frames(&brain, consumer)
+        {
+            Ok(frames) => {
+                let mut pending = response
+                    .reborrow()
+                    .init_pending_delivery(frames.len() as u32);
+                for (index, frame) in frames.iter().enumerate() {
+                    pending.set(index as u32, frame);
+                }
+            }
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        }
         Promise::ok(())
     }
 
@@ -2316,6 +2398,11 @@ fn decode_runner_program_result(
             .get_effect_journal()
             .map_err(|error| error.to_string())?,
     )?;
+    decode_packed_delivery_envelopes(
+        result.get_delivery().map_err(|error| error.to_string())?,
+        &effect_journal,
+    )
+    .map_err(|error| error.to_string())?;
     let error = result
         .get_error()
         .ok()
@@ -2363,6 +2450,11 @@ fn decode_runner_turn_result(
             .get_effect_journal()
             .map_err(|error| error.to_string())?,
     )?;
+    decode_packed_delivery_envelopes(
+        result.get_delivery().map_err(|error| error.to_string())?,
+        &effect_journal,
+    )
+    .map_err(|error| error.to_string())?;
     if !error.is_empty() {
         return Err(crate::server::RunnerTurnError {
             message: error.to_string(),

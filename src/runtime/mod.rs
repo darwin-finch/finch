@@ -446,6 +446,9 @@ pub struct ProgramRuntime {
     /// the UI. Approval and resumption use this exact verified program state.
     pending_typed: Mutex<HashMap<uuid::Uuid, PendingTypedExecution>>,
     revision_history: Mutex<Vec<VmRevisionSnapshot>>,
+    /// Optional Brain-owned delivery log. When bound, every ProgramRun
+    /// observation sink persists before projecting to the caller.
+    delivery_log: Arc<RwLock<Option<Arc<Mutex<VmEffectDeliveryLog>>>>>,
 }
 
 /// Host-owned socket metadata. Finch source sees only the opaque resource
@@ -751,6 +754,41 @@ impl ProgramRuntime {
                 checkpoint: Some(checkpoint),
                 checkpoint_diagnostic: None,
             }]),
+            delivery_log: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Install the application-owned effect delivery log. Subsequent
+    /// ProgramRun observation sinks persist each envelope before projecting
+    /// to the caller. Exact replay is not re-projected; conflict panics so a
+    /// persist failure cannot leave a suspended run unobserved.
+    pub fn bind_effect_delivery_log(&self, log: Arc<Mutex<VmEffectDeliveryLog>>) -> Result<()> {
+        *self
+            .delivery_log
+            .write()
+            .map_err(|_| anyhow::anyhow!("VM effect delivery log lock poisoned"))? = Some(log);
+        Ok(())
+    }
+
+    /// The bound delivery log, if this runtime is a production Brain instance.
+    pub fn effect_delivery_log(&self) -> Option<Arc<Mutex<VmEffectDeliveryLog>>> {
+        self.delivery_log
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn compose_typed_effect_sink(
+        &self,
+        downstream: Option<TypedEffectSink>,
+    ) -> Option<TypedEffectSink> {
+        let log = match self.delivery_log.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => panic!("VM effect delivery log lock poisoned"),
+        };
+        match log {
+            Some(log) => Some(bind_delivery_log(log, downstream)),
+            None => downstream,
         }
     }
 
@@ -3038,6 +3076,7 @@ impl ProgramRuntime {
         grant_ceiling: Option<EffectSet>,
         effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
+        let effect_sink = self.compose_typed_effect_sink(effect_sink);
         // This is a per-session state transaction, not a process-wide
         // interpreter lock. Independent runtimes and child model loops remain
         // concurrent while revision checks and mutations of this VM are atomic.

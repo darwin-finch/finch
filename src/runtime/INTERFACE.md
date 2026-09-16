@@ -197,6 +197,8 @@ impl ProgramRuntime {
     pub fn attach_memory(&self, memory: Arc<crate::memory::MemorySystem>);
     pub fn authority_state(&self) -> Result<ProgramRuntimeAuthorityState>;
     pub fn automation(&self) -> Arc<AutomationBroker>;
+    /// Install the application-owned effect delivery log.
+    pub fn bind_effect_delivery_log(&self, log: Arc<Mutex<VmEffectDeliveryLog>>) -> Result<()>;
     /// Install the host-owned root behind `root<host-machine>`.
     pub fn bind_host_machine_root(&self, root: impl Into<PathBuf>) -> Result<()>;
     /// Install an application-selected project root.
@@ -225,6 +227,8 @@ impl ProgramRuntime {
     pub fn compiler_context(&self) -> Result<ProgramCompilerContext>;
     /// Record a deliberate denial for the exact awaited portable effect and discard its uncommitted continuation.
     pub fn deny_typed_execution_for_effect(&self, execution_id: uuid::Uuid, effect_sequence: u64, reason: impl Into<String>) -> Result<ExecutionOutcome>;
+    /// The bound delivery log, if this runtime is a production Brain instance.
+    pub fn effect_delivery_log(&self) -> Option<Arc<Mutex<VmEffectDeliveryLog>>>;
     /// Restore a retained reducible revision window.
     pub fn from_archive(archive: ProgramRuntimeArchive) -> Result<Self>;
     /// Restore reducible VM state and host authority as two independently validated records.

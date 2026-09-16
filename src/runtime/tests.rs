@@ -8082,6 +8082,105 @@ async fn bound_log_all_awaited_output_open_registers_the_resumed_handle() {
     );
 }
 
+#[tokio::test]
+async fn program_runtime_bound_log_is_the_production_observation_sink() {
+    let directory = tempfile::tempdir().unwrap();
+    let brain = uuid::Uuid::new_v4();
+    let client = DeliveryConsumerIdentity::new(brain, uuid::Uuid::new_v4());
+    let log = Arc::new(Mutex::new(
+        VmEffectDeliveryLog::open_bound(directory.path().join("effects.jsonl"), brain).unwrap(),
+    ));
+    let (live, receiver) = typed_effect_channel();
+    let runtime = ProgramRuntime::new();
+    runtime.bind_effect_delivery_log(Arc::clone(&log)).unwrap();
+    grant_workspace_file_read(&runtime);
+    let pending = runtime
+        .submit_with_deferred_host_effects(
+            submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"does-not-need-to-exist.txt\"))",
+                ExecutionEffect::WorkspaceRead,
+            ),
+            live,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.status, ExecutionStatus::Suspended);
+    let envelope = receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("production bound log must project after persist");
+    assert_eq!(
+        log.lock().unwrap().get(envelope.handle()).cloned().as_ref(),
+        Some(&envelope),
+        "ProgramRuntime must persist before the live observer"
+    );
+    assert_eq!(envelope.effect.output, vec![Type::Bytes]);
+    {
+        let mut log = log.lock().unwrap();
+        assert!(log
+            .acknowledge_identity(
+                client,
+                DeliveryCursor::through(envelope.execution_id, envelope.effect.sequence)
+            )
+            .unwrap());
+        assert!(log.pending_for(&client).is_empty());
+    }
+    let stale = runtime
+        .resume_vm_effect(VmResume {
+            execution_id: envelope.execution_id,
+            sequence: envelope.effect.sequence + 1,
+            response: VmResumeResponse::Result {
+                values: vec![TypedValue::Bytes(b"stale".to_vec())],
+            },
+        })
+        .await;
+    assert!(
+        stale
+            .unwrap_err()
+            .to_string()
+            .contains("stale typed effect resume"),
+        "a mismatched sequence must not consume the continuation"
+    );
+    let completed = runtime
+        .resume_vm_effect(VmResume {
+            execution_id: envelope.execution_id,
+            sequence: envelope.effect.sequence,
+            response: VmResumeResponse::Result {
+                values: vec![TypedValue::Bytes(b"embedder bytes".to_vec())],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+}
+
+#[tokio::test]
+async fn program_runtime_bound_log_persists_when_caller_omits_a_sink() {
+    let directory = tempfile::tempdir().unwrap();
+    let brain = uuid::Uuid::new_v4();
+    let log = Arc::new(Mutex::new(
+        VmEffectDeliveryLog::open_bound(directory.path().join("effects.jsonl"), brain).unwrap(),
+    ));
+    let runtime = ProgramRuntime::new();
+    runtime.bind_effect_delivery_log(Arc::clone(&log)).unwrap();
+    let outcome = runtime
+        .submit_typed_only(submission(
+            ProgramLanguage::Lisp,
+            "(let ((handle (output-open \"download\"))) (output-complete handle))",
+            ExecutionEffect::VmRead,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, ExecutionStatus::Completed);
+    let pending = log.lock().unwrap().pending("observer");
+    assert!(
+        pending
+            .iter()
+            .any(|envelope| envelope.execution_id == outcome.execution_id),
+        "bound production log must persist even without a caller sink; pending={pending:?}"
+    );
+}
+
 #[test]
 fn runtime_facade_keeps_child_modules_private() {
     let facade = include_str!("mod.rs");

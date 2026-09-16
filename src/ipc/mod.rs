@@ -31,4 +31,6 @@ pub use transport::DAEMON_SOCK_PATH;
 /// Increment this whenever a change requires both processes to come from the
 /// same build generation. Older daemons leave the added ping field at zero,
 /// so new frontends fail before acquiring Brain identities or callbacks.
-pub const IPC_PROTOCOL_VERSION: u32 = 8;
+/// Generation 9 requires packed `RuntimeApplicationMessage` envelopes on
+/// runner-result delivery and exposes `pendingDelivery` / cursor ack.
+pub const IPC_PROTOCOL_VERSION: u32 = 9;
