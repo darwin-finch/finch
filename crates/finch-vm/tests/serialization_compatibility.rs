@@ -1,5 +1,6 @@
 use finch_vm::{
-    CapabilityGrant, Module, TypedRuntimeCheckpoint, TypedValue, VerifiedModule, VmSideEffect,
+    CapabilityGrant, Module, TypedRuntimeCheckpoint, TypedValue, VerifiedModule, VmDiagnostic,
+    VmSideEffect,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -25,6 +26,11 @@ fn test_pre_extraction_serialization_goldens_remain_byte_identical() {
         5,
         "typed VM wire/checkpoint version must remain frozen at 5"
     );
+    assert_eq!(
+        finch_vm::RUNTIME_APPLICATION_ABI_VERSION,
+        1,
+        "Runtime/Application ABI version must remain frozen at 1"
+    );
     assert_golden_round_trip::<Module>("Module", include_bytes!("fixtures/module.json"));
     assert_golden_round_trip::<VerifiedModule>(
         "VerifiedModule",
@@ -41,6 +47,14 @@ fn test_pre_extraction_serialization_goldens_remain_byte_identical() {
     assert_golden_round_trip::<VmSideEffect>(
         "VmSideEffect/UiOperation",
         include_bytes!("fixtures/vm_side_effect.json"),
+    );
+    assert_golden_round_trip::<VmSideEffect>(
+        "VmSideEffect/request output row",
+        include_bytes!("fixtures/vm_side_effect_request.json"),
+    );
+    assert_golden_round_trip::<VmDiagnostic>(
+        "VmDiagnostic",
+        include_bytes!("fixtures/vm_diagnostic.json"),
     );
     assert_golden_round_trip::<TypedRuntimeCheckpoint>(
         "TypedRuntimeCheckpoint",

@@ -25,8 +25,9 @@ material for this crate. Cross-frontend planned semantics remain in the shared
 `serde_json`, `thiserror`, and `uuid`. It never depends on `finch-vm` or the root `finch` crate.
 
 **Invariants:** `VM_TYPE_SYSTEM_VERSION` remains the version of serialized IR and typed runtime
-checkpoints. Moving a contract here must not change its serde representation, authority semantics,
-or vocabulary entry.
+checkpoints. Structured `VmDiagnostic` records are part of the frozen Runtime/Application ABI
+and must keep their serde representation. Moving a contract here must not change its serde
+representation, authority semantics, or vocabulary entry.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test -p finch-vm-core --lib`. Also run the
 `finch-vm` serialization compatibility and frontend equivalence integration tests for boundary

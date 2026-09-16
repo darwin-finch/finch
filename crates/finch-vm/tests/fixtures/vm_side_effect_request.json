@@ -1,0 +1,1 @@
+{"protocol_version":5,"sequence":0,"requirement":{"capability":"file_read","selector":{"kind":"file","selector":{"root":{"kind":"workspace"},"pattern":"./**"}}},"event":{"Request":{"arguments":[{"type":"string","value":"Cargo.toml"}]}},"output":[{"kind":"bytes"}],"origin":{"language":"finch_ir","span":null,"word":"file-read","expansion":null}}

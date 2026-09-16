@@ -1,6 +1,9 @@
 //! Durable application-side delivery log for portable VM effects.
 
-use crate::runtime::VmEffectEnvelope;
+use crate::runtime::{
+    DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, TypedEffectSink, VmEffectEnvelope,
+    VmEffectHandle,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 /// Maximum serialized intent admitted for one host effect. Admission occurs
@@ -759,6 +763,9 @@ enum EffectLogRecord {
         execution_id: Uuid,
         through_sequence: u64,
     },
+    Bound {
+        brain_id: Uuid,
+    },
 }
 
 /// Append-only effect delivery state owned by an embedding application. VM
@@ -767,8 +774,10 @@ enum EffectLogRecord {
 pub struct VmEffectDeliveryLog {
     path: PathBuf,
     writer: File,
+    brain_id: Option<Uuid>,
     effects: BTreeMap<(Uuid, u64), VmEffectEnvelope>,
     acknowledgements: HashMap<(String, Uuid), u64>,
+    output_handles: BTreeMap<(Uuid, String), OutputHandleRef>,
 }
 
 impl VmEffectDeliveryLog {
@@ -781,6 +790,8 @@ impl VmEffectDeliveryLog {
         }
         let mut effects = BTreeMap::new();
         let mut acknowledgements = HashMap::new();
+        let mut brain_id = None;
+        let mut output_handles = BTreeMap::new();
         if path.exists() {
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("read VM effect log '{}'", path.display()))?;
@@ -812,7 +823,13 @@ impl VmEffectDeliveryLog {
                         index + 1
                     )
                 })?;
-                apply_record(&mut effects, &mut acknowledgements, record)?;
+                apply_record(
+                    &mut effects,
+                    &mut acknowledgements,
+                    &mut brain_id,
+                    &mut output_handles,
+                    record,
+                )?;
                 committed_len += terminated.len();
             }
             if committed_len != bytes.len() {
@@ -835,9 +852,32 @@ impl VmEffectDeliveryLog {
         Ok(Self {
             path,
             writer,
+            brain_id,
             effects,
             acknowledgements,
+            output_handles,
         })
+    }
+
+    /// Open a delivery log bound to one Brain identity. A log already bound
+    /// to a different Brain fails closed.
+    pub fn open_bound(path: impl Into<PathBuf>, brain_id: Uuid) -> Result<Self> {
+        let mut log = Self::open(path)?;
+        if let Some(existing) = log.brain_id {
+            anyhow::ensure!(
+                existing == brain_id,
+                "VM effect delivery log is bound to Brain {existing}, not {brain_id}"
+            );
+            return Ok(log);
+        }
+        log.persist(&EffectLogRecord::Bound { brain_id })?;
+        log.brain_id = Some(brain_id);
+        Ok(log)
+    }
+
+    /// Optional Brain identity this log is bound to.
+    pub fn brain_id(&self) -> Option<Uuid> {
+        self.brain_id
     }
 
     /// Persist one event before projecting it. Exact replay is idempotent;
@@ -858,6 +898,7 @@ impl VmEffectDeliveryLog {
         self.persist(&EffectLogRecord::Effect {
             envelope: envelope.clone(),
         })?;
+        note_output_handle(&mut self.output_handles, &envelope);
         self.effects.insert(key, envelope);
         Ok(true)
     }
@@ -906,6 +947,78 @@ impl VmEffectDeliveryLog {
             .collect()
     }
 
+    /// Record that one Brain/client identity durably projected a cursor.
+    pub fn acknowledge_identity(
+        &mut self,
+        consumer: DeliveryConsumerIdentity,
+        cursor: DeliveryCursor,
+    ) -> Result<bool> {
+        if let Some(bound) = self.brain_id {
+            anyhow::ensure!(
+                bound == consumer.brain_id,
+                "delivery consumer Brain {} does not match bound Brain {bound}",
+                consumer.brain_id
+            );
+        }
+        self.acknowledge(
+            consumer.wire_key(),
+            cursor.execution_id,
+            cursor.through_sequence,
+        )
+    }
+
+    /// Unacknowledged suffix for one Brain/client identity.
+    pub fn pending_for(&self, consumer: &DeliveryConsumerIdentity) -> Vec<VmEffectEnvelope> {
+        self.pending(&consumer.wire_key())
+    }
+
+    /// Current cursor for a string consumer on one ProgramRun, if any.
+    pub fn cursor(&self, consumer: &str, execution_id: Uuid) -> Option<DeliveryCursor> {
+        self.acknowledgements
+            .get(&(consumer.to_string(), execution_id))
+            .copied()
+            .map(|through_sequence| DeliveryCursor {
+                execution_id,
+                through_sequence,
+            })
+    }
+
+    /// Current cursor for a Brain/client identity on one ProgramRun, if any.
+    pub fn cursor_for(
+        &self,
+        consumer: &DeliveryConsumerIdentity,
+        execution_id: Uuid,
+    ) -> Option<DeliveryCursor> {
+        self.cursor(&consumer.wire_key(), execution_id)
+    }
+
+    /// Look up one persisted envelope by its effect handle.
+    pub fn get(&self, handle: VmEffectHandle) -> Option<&VmEffectEnvelope> {
+        self.effects.get(&(handle.execution_id, handle.sequence))
+    }
+
+    /// Concurrent output handles observed for one ProgramRun.
+    pub fn output_handles(&self, execution_id: Uuid) -> Vec<OutputHandleRef> {
+        self.output_handles
+            .values()
+            .filter(|handle| handle.execution_id == execution_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Unacknowledged events that target one concurrent output handle at its
+    /// exact generation. A stale generation is a different handle.
+    pub fn pending_for_handle(
+        &self,
+        consumer: &DeliveryConsumerIdentity,
+        handle: &OutputHandleRef,
+    ) -> Vec<VmEffectEnvelope> {
+        self.pending_for(consumer)
+            .into_iter()
+            .filter(|envelope| envelope.output_handle().as_ref() == Some(handle))
+            .collect()
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -922,6 +1035,8 @@ impl VmEffectDeliveryLog {
 fn apply_record(
     effects: &mut BTreeMap<(Uuid, u64), VmEffectEnvelope>,
     acknowledgements: &mut HashMap<(String, Uuid), u64>,
+    brain_id: &mut Option<Uuid>,
+    output_handles: &mut BTreeMap<(Uuid, String), OutputHandleRef>,
     record: EffectLogRecord,
 ) -> Result<()> {
     match record {
@@ -936,6 +1051,7 @@ fn apply_record(
                     );
                 }
             } else {
+                note_output_handle(output_handles, &envelope);
                 effects.insert(key, envelope);
             }
         }
@@ -956,17 +1072,75 @@ fn apply_record(
                 .and_modify(|current| *current = (*current).max(through_sequence))
                 .or_insert(through_sequence);
         }
+        EffectLogRecord::Bound { brain_id: recorded } => {
+            if let Some(existing) = *brain_id {
+                anyhow::ensure!(
+                    existing == recorded,
+                    "VM effect delivery log is bound to Brain {existing}, not {recorded}"
+                );
+            } else {
+                *brain_id = Some(recorded);
+            }
+        }
     }
     Ok(())
+}
+
+fn note_output_handle(
+    handles: &mut BTreeMap<(Uuid, String), OutputHandleRef>,
+    envelope: &VmEffectEnvelope,
+) {
+    let Some(handle) = envelope.output_handle() else {
+        return;
+    };
+    let key = (handle.execution_id, handle.handle.clone());
+    if handles
+        .get(&key)
+        .is_some_and(|existing| handle.generation < existing.generation)
+    {
+        return;
+    }
+    handles.insert(key, handle);
+}
+
+/// Persist each new envelope before projecting it to a live observer.
+///
+/// Exact replay (`append` returning `Ok(false)`) is already durable and is
+/// not re-projected. Conflicting content, persist failure, or a poisoned lock
+/// is a protocol violation: this sink panics so `observe_awaited_effect`
+/// cannot return success and leave the VM suspended with no observer.
+pub fn bind_delivery_log(
+    log: Arc<Mutex<VmEffectDeliveryLog>>,
+    downstream: Option<TypedEffectSink>,
+) -> TypedEffectSink {
+    Arc::new(move |envelope| {
+        let result = match log.lock() {
+            Ok(mut log) => log.append(envelope.clone()),
+            Err(_) => panic!("VM effect delivery log lock poisoned"),
+        };
+        match result {
+            Ok(true) => {
+                if let Some(sink) = &downstream {
+                    sink(envelope);
+                }
+            }
+            Ok(false) => {}
+            Err(error) => panic!("VM effect delivery log protocol violation: {error:#}"),
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{
+        DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, TypedEffectSink,
+    };
     use crate::vm::{
         CapabilityKind, CapabilityRequirement, HostSideEffect, ResourceSelector, SourceOrigin,
         VmSideEffect,
     };
+    use std::sync::{Arc, Mutex};
 
     fn effect(execution_id: Uuid, sequence: u64, text: &str) -> VmEffectEnvelope {
         VmEffectEnvelope {
@@ -1320,5 +1494,209 @@ mod tests {
         std::fs::write(&path, b"not-json\n{}\n").unwrap();
         let error = VmEffectDeliveryLog::open(&path).err().unwrap();
         assert!(error.to_string().contains("line 1"));
+    }
+
+    fn ui_effect(
+        execution_id: Uuid,
+        sequence: u64,
+        handle: &str,
+        generation: u64,
+        text: &str,
+    ) -> VmEffectEnvelope {
+        VmEffectEnvelope {
+            execution_id,
+            effect: VmSideEffect {
+                protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                sequence,
+                requirement: CapabilityRequirement {
+                    capability: CapabilityKind::SessionEmit,
+                    selector: ResourceSelector::None,
+                },
+                output: Vec::new(),
+                event: HostSideEffect::Ui {
+                    operation: crate::vm::UiOperation::Status,
+                    target: Some(crate::vm::TypedValue::Resource {
+                        kind: "output-handle".into(),
+                        handle: handle.into(),
+                        generation,
+                    }),
+                    text: Some(text.into()),
+                    progress: None,
+                },
+                origin: SourceOrigin::generated("output-status"),
+            },
+        }
+    }
+
+    #[test]
+    fn bound_log_replays_per_brain_client_cursor_and_rejects_foreign_brain() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("effects.jsonl");
+        let brain = Uuid::new_v4();
+        let client_a = DeliveryConsumerIdentity::new(brain, Uuid::new_v4());
+        let client_b = DeliveryConsumerIdentity::new(brain, Uuid::new_v4());
+        let execution_id = Uuid::new_v4();
+        {
+            let mut log = VmEffectDeliveryLog::open_bound(&path, brain).unwrap();
+            assert_eq!(log.brain_id(), Some(brain));
+            assert!(log.append(effect(execution_id, 0, "one")).unwrap());
+            assert!(log.append(effect(execution_id, 1, "two")).unwrap());
+            assert!(log
+                .acknowledge_identity(client_a, DeliveryCursor::through(execution_id, 0))
+                .unwrap());
+        }
+
+        let log = VmEffectDeliveryLog::open_bound(&path, brain).unwrap();
+        assert_eq!(
+            log.cursor_for(&client_a, execution_id),
+            Some(DeliveryCursor::through(execution_id, 0))
+        );
+        assert_eq!(log.pending_for(&client_a).len(), 1);
+        assert_eq!(log.pending_for(&client_b).len(), 2);
+        let foreign = DeliveryConsumerIdentity::new(Uuid::new_v4(), client_a.client_id);
+        let error = VmEffectDeliveryLog::open_bound(&path, Uuid::new_v4())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("bound to Brain"));
+        let mut rebound = VmEffectDeliveryLog::open_bound(&path, brain).unwrap();
+        let denied = rebound
+            .acknowledge_identity(foreign, DeliveryCursor::through(execution_id, 1))
+            .err()
+            .unwrap();
+        assert!(denied.to_string().contains("does not match bound Brain"));
+    }
+
+    #[test]
+    fn concurrent_output_handles_replay_independently_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("effects.jsonl");
+        let brain = Uuid::new_v4();
+        let client = DeliveryConsumerIdentity::new(brain, Uuid::new_v4());
+        let execution_id = Uuid::new_v4();
+        let download = ui_effect(execution_id, 0, "download", 1, "starting");
+        let log_view = ui_effect(execution_id, 1, "log", 3, "line");
+        {
+            let mut log = VmEffectDeliveryLog::open_bound(&path, brain).unwrap();
+            log.append(download.clone()).unwrap();
+            log.append(log_view.clone()).unwrap();
+            assert_eq!(log.output_handles(execution_id).len(), 2);
+            log.acknowledge_identity(client, DeliveryCursor::through(execution_id, 0))
+                .unwrap();
+        }
+
+        let log = VmEffectDeliveryLog::open_bound(&path, brain).unwrap();
+        let handles = log.output_handles(execution_id);
+        let download_ref = handles
+            .iter()
+            .find(|handle| handle.handle == "download")
+            .cloned()
+            .unwrap();
+        let log_ref = handles
+            .iter()
+            .find(|handle| handle.handle == "log")
+            .cloned()
+            .unwrap();
+        assert!(log.pending_for_handle(&client, &download_ref).is_empty());
+        assert_eq!(
+            log.pending_for_handle(&client, &log_ref),
+            vec![log_view.clone()]
+        );
+        assert_eq!(
+            log.get(log_view.handle()).unwrap().output_handle(),
+            Some(log_ref)
+        );
+    }
+
+    #[test]
+    fn bind_delivery_log_persists_before_observer_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("effects.jsonl");
+        let log = Arc::new(Mutex::new(VmEffectDeliveryLog::open(path).unwrap()));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let execution_id = Uuid::new_v4();
+        let envelope = effect(execution_id, 0, "one");
+        let downstream: TypedEffectSink = {
+            let log = Arc::clone(&log);
+            let observed = Arc::clone(&observed);
+            Arc::new(move |projected| {
+                let log = log.lock().unwrap();
+                assert_eq!(
+                    log.get(projected.handle()).cloned().as_ref(),
+                    Some(&projected),
+                    "observer delivery must follow durable append"
+                );
+                observed.lock().unwrap().push(projected);
+            })
+        };
+        let sink = bind_delivery_log(Arc::clone(&log), Some(downstream));
+        sink(envelope.clone());
+        sink(envelope.clone());
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[envelope.clone()],
+            "exact replay must stay durable without a second live projection"
+        );
+        assert_eq!(
+            log.lock().unwrap().get(envelope.handle()).cloned(),
+            Some(envelope.clone())
+        );
+        let stale = effect(execution_id, 0, "changed");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink(stale)));
+        assert!(
+            panicked.is_err(),
+            "conflicting content is a protocol violation and must not be swallowed"
+        );
+        assert_eq!(observed.lock().unwrap().as_slice(), &[envelope]);
+    }
+
+    #[test]
+    fn stale_output_handle_generation_does_not_replace_or_match_live_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let brain = Uuid::new_v4();
+        let client = DeliveryConsumerIdentity::new(brain, Uuid::new_v4());
+        let execution_id = Uuid::new_v4();
+        let mut log =
+            VmEffectDeliveryLog::open_bound(directory.path().join("effects.jsonl"), brain).unwrap();
+        let live = ui_effect(execution_id, 0, "download", 4, "live");
+        let stale = ui_effect(execution_id, 1, "download", 3, "stale");
+        log.append(live.clone()).unwrap();
+        log.append(stale.clone()).unwrap();
+        let handles = log.output_handles(execution_id);
+        assert_eq!(
+            handles,
+            vec![OutputHandleRef::new(execution_id, "download", 4)],
+            "a smaller generation must not replace the live output handle"
+        );
+        assert_eq!(
+            log.pending_for_handle(&client, &handles[0]),
+            vec![live],
+            "pending_for_handle must not return a stale generation for the live handle"
+        );
+        assert_eq!(
+            log.pending_for_handle(&client, &OutputHandleRef::new(execution_id, "download", 3)),
+            vec![stale]
+        );
+    }
+
+    #[test]
+    fn late_completion_after_disconnect_is_idempotent_and_rejects_stale_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("effects.jsonl");
+        let execution_id = Uuid::new_v4();
+        let first = effect(execution_id, 0, "one");
+        {
+            let mut log = VmEffectDeliveryLog::open(&path).unwrap();
+            log.append(first.clone()).unwrap();
+            log.acknowledge("client", execution_id, 0).unwrap();
+        }
+        let mut log = VmEffectDeliveryLog::open(&path).unwrap();
+        assert!(!log.append(first.clone()).unwrap());
+        let late = effect(execution_id, 1, "two");
+        assert!(log.append(late.clone()).unwrap());
+        assert_eq!(log.pending("client"), vec![late.clone()]);
+        let stale = effect(execution_id, 1, "changed");
+        let error = log.append(stale).err().unwrap();
+        assert!(error.to_string().contains("conflicting"));
+        assert_eq!(log.pending("client"), vec![late]);
     }
 }

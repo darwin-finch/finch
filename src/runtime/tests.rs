@@ -7611,6 +7611,478 @@ mod agent_capability {
 }
 
 #[test]
+fn runtime_application_abi_json_records_are_byte_stable() {
+    assert_eq!(crate::vm::RUNTIME_APPLICATION_ABI_VERSION, 1);
+    let execution_id = uuid::Uuid::nil();
+    let run = ProgramRun::new(execution_id);
+    assert_eq!(
+        serde_json::to_string(&run).unwrap(),
+        r#"{"abi_version":1,"execution_id":"00000000-0000-0000-0000-000000000000"}"#
+    );
+    let resume = VmResume {
+        execution_id,
+        sequence: 0,
+        response: VmResumeResponse::Cancelled {
+            reason: Some("timeout".into()),
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&resume).unwrap(),
+        r#"{"execution_id":"00000000-0000-0000-0000-000000000000","sequence":0,"response":{"kind":"cancelled","reason":"timeout"}}"#
+    );
+    let handle = OutputHandleRef::new(execution_id, "download", 4);
+    assert_eq!(
+        serde_json::to_string(&handle).unwrap(),
+        r#"{"execution_id":"00000000-0000-0000-0000-000000000000","handle":"download","generation":4}"#
+    );
+}
+
+#[tokio::test]
+async fn delivery_log_observes_awaited_effect_before_local_resume_and_rejects_stale_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let brain = uuid::Uuid::new_v4();
+    let client = DeliveryConsumerIdentity::new(brain, uuid::Uuid::new_v4());
+    let log = Arc::new(Mutex::new(
+        VmEffectDeliveryLog::open_bound(directory.path().join("effects.jsonl"), brain).unwrap(),
+    ));
+    let (live, receiver) = typed_effect_channel();
+    let sink = bind_delivery_log(Arc::clone(&log), Some(live));
+    let runtime = ProgramRuntime::new();
+    runtime
+        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./**").unwrap(),
+        ))
+        .unwrap();
+
+    let pending = runtime
+        .submit_with_deferred_host_effects(
+            submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"does-not-need-to-exist.txt\"))",
+                ExecutionEffect::WorkspaceRead,
+            ),
+            sink,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.status, ExecutionStatus::Suspended);
+    assert_eq!(pending.program_run().execution_id, pending.execution_id);
+
+    let envelope = receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("observer must receive the awaited effect");
+    assert_eq!(envelope.effect.output, vec![Type::Bytes]);
+    {
+        let mut log = log.lock().unwrap();
+        assert_eq!(
+            log.get(envelope.handle()).cloned().as_ref(),
+            Some(&envelope),
+            "durable delivery must precede observer projection"
+        );
+        assert!(log
+            .acknowledge_identity(
+                client,
+                DeliveryCursor::through(envelope.execution_id, envelope.effect.sequence)
+            )
+            .unwrap());
+        assert!(log.pending_for(&client).is_empty());
+    }
+
+    let stale = runtime
+        .resume_vm_effect(VmResume {
+            execution_id: envelope.execution_id,
+            sequence: envelope.effect.sequence + 1,
+            response: VmResumeResponse::Result {
+                values: vec![TypedValue::Bytes(b"stale".to_vec())],
+            },
+        })
+        .await;
+    assert!(
+        stale
+            .unwrap_err()
+            .to_string()
+            .contains("stale typed effect resume"),
+        "a mismatched sequence must not consume the continuation"
+    );
+    assert!(runtime
+        .pending_typed_execution(pending.execution_id)
+        .unwrap()
+        .is_some());
+
+    let completed = runtime
+        .resume_vm_effect(VmResume {
+            execution_id: envelope.execution_id,
+            sequence: envelope.effect.sequence,
+            response: VmResumeResponse::Result {
+                values: vec![TypedValue::Bytes(b"embedder bytes".to_vec())],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    assert_eq!(
+        completed.values,
+        vec![crate::programs::ProgramValue::Bytes(
+            b"embedder bytes".to_vec()
+        )]
+    );
+    assert!(runtime
+        .pending_typed_execution(pending.execution_id)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn delivery_bound_concurrent_output_handles_survive_disconnect() {
+    let directory = tempfile::tempdir().unwrap();
+    let brain = uuid::Uuid::new_v4();
+    let client = DeliveryConsumerIdentity::new(brain, uuid::Uuid::new_v4());
+    let path = directory.path().join("effects.jsonl");
+    let log = Arc::new(Mutex::new(
+        VmEffectDeliveryLog::open_bound(&path, brain).unwrap(),
+    ));
+    let (live, receiver) = typed_effect_channel();
+    let sink = bind_delivery_log(Arc::clone(&log), Some(live));
+    let runtime = ProgramRuntime::new();
+    let outcome = runtime
+        .submit_with_typed_effect_sink(
+            submission(
+                ProgramLanguage::Lisp,
+                "(let ((download (output-open \"download\")) (log (output-open \"log\")))
+                       (begin (output-status download \"starting\")
+                              (output-status log \"line\")
+                              (output-complete download)
+                              (output-complete log)))",
+                ExecutionEffect::VmRead,
+            ),
+            sink,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, ExecutionStatus::Completed);
+    let events = receiver.try_iter().collect::<Vec<_>>();
+    let sequences: Vec<_> = events
+        .iter()
+        .map(|envelope| envelope.effect.sequence)
+        .collect();
+    assert_eq!(
+        sequences,
+        (0..events.len() as u64).collect::<Vec<_>>(),
+        "delivery sequences must be contiguous before ack; events={events:?}"
+    );
+    let created: Vec<(String, String)> = events
+        .iter()
+        .filter_map(|envelope| match &envelope.effect.event {
+            crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Create,
+                text: Some(title),
+                target: Some(TypedValue::Resource { handle, .. }),
+                ..
+            } => Some((title.clone(), handle.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        created.len(),
+        2,
+        "one Create per output handle; events={events:?}"
+    );
+    let download = created
+        .iter()
+        .find(|(title, _)| title == "download")
+        .map(|(_, handle)| handle.clone())
+        .expect("download handle");
+    let log_handle = created
+        .iter()
+        .find(|(title, _)| title == "log")
+        .map(|(_, handle)| handle.clone())
+        .expect("log handle");
+    let pairs: Vec<_> = events
+        .iter()
+        .map(|envelope| match &envelope.effect.event {
+            crate::vm::HostSideEffect::Ui {
+                operation,
+                target: Some(TypedValue::Resource { handle, .. }),
+                ..
+            } => (handle.clone(), *operation),
+            other => panic!("expected UI output-handle event, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            (download.clone(), crate::vm::UiOperation::Create),
+            (log_handle.clone(), crate::vm::UiOperation::Create),
+            (download.clone(), crate::vm::UiOperation::Status),
+            (log_handle.clone(), crate::vm::UiOperation::Status),
+            (download, crate::vm::UiOperation::Complete),
+            (log_handle, crate::vm::UiOperation::Complete),
+        ]
+    );
+    drop(log);
+
+    let mut reopened = VmEffectDeliveryLog::open_bound(&path, brain).unwrap();
+    let handles = reopened.output_handles(outcome.execution_id);
+    assert_eq!(
+        handles.len(),
+        2,
+        "concurrent output handles must survive restart; handles={handles:?}"
+    );
+    let pending = reopened.pending_for(&client);
+    assert_eq!(pending.len(), events.len());
+    assert!(reopened
+        .acknowledge_identity(
+            client,
+            DeliveryCursor::through(outcome.execution_id, events.last().unwrap().effect.sequence),
+        )
+        .unwrap());
+    assert!(reopened.pending_for(&client).is_empty());
+}
+
+fn grant_workspace_file_read(runtime: &ProgramRuntime) {
+    runtime
+        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./**").unwrap(),
+        ))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn delivery_conflict_fails_observation_instead_of_suspending_unobserved() {
+    let directory = tempfile::tempdir().unwrap();
+    let brain = uuid::Uuid::new_v4();
+    let path = directory.path().join("effects.jsonl");
+    let log = Arc::new(Mutex::new(
+        VmEffectDeliveryLog::open_bound(&path, brain).unwrap(),
+    ));
+    let (live, receiver) = typed_effect_channel();
+    let bound = bind_delivery_log(Arc::clone(&log), Some(live));
+    let sink: TypedEffectSink = {
+        let log = Arc::clone(&log);
+        Arc::new(move |envelope| {
+            let mut conflict = envelope.clone();
+            conflict.effect.event = crate::vm::HostSideEffect::Request {
+                arguments: vec![TypedValue::String("forged".into())],
+            };
+            log.lock()
+                .unwrap()
+                .append(conflict)
+                .expect("planted conflict must persist");
+            bound(envelope);
+        })
+    };
+    let runtime = ProgramRuntime::new();
+    grant_workspace_file_read(&runtime);
+    let error = runtime
+        .submit_with_deferred_host_effects(
+            submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"does-not-need-to-exist.txt\"))",
+                ExecutionEffect::WorkspaceRead,
+            ),
+            sink,
+        )
+        .await
+        .expect_err("conflict must fail the host observation path");
+    assert!(
+        error.to_string().contains("conflicting")
+            || error.to_string().contains("protocol violation")
+            || error.to_string().contains("panicked"),
+        "conflict must surface from observation, got {error:#}"
+    );
+    assert!(
+        receiver.try_recv().is_err(),
+        "the live observer must not receive a conflicting dispatch"
+    );
+    let planted = log.lock().unwrap().pending("observer");
+    assert_eq!(planted.len(), 1, "only the planted conflict row is durable");
+    assert!(
+        runtime
+            .pending_typed_execution(planted[0].execution_id)
+            .unwrap()
+            .is_none(),
+        "a persist/conflict failure must not leave a suspended run"
+    );
+}
+
+#[tokio::test]
+async fn bound_log_cancel_after_persist_marks_the_journalled_effect() {
+    let directory = tempfile::tempdir().unwrap();
+    let brain = uuid::Uuid::new_v4();
+    let log = Arc::new(Mutex::new(
+        VmEffectDeliveryLog::open_bound(directory.path().join("effects.jsonl"), brain).unwrap(),
+    ));
+    let (live, receiver) = typed_effect_channel();
+    let sink = bind_delivery_log(Arc::clone(&log), Some(live));
+    let runtime = ProgramRuntime::new();
+    grant_workspace_file_read(&runtime);
+    let pending = runtime
+        .submit_with_deferred_host_effects(
+            submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"does-not-need-to-exist.txt\"))",
+                ExecutionEffect::WorkspaceRead,
+            ),
+            sink,
+        )
+        .await
+        .unwrap();
+    let envelope = receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("observer must receive the awaited effect before cancel");
+    assert_eq!(
+        log.lock().unwrap().get(envelope.handle()).cloned().as_ref(),
+        Some(&envelope)
+    );
+    let cancelled = runtime
+        .resume_vm_effect(VmResume {
+            execution_id: envelope.execution_id,
+            sequence: envelope.effect.sequence,
+            response: VmResumeResponse::Cancelled {
+                reason: Some("timeout".into()),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+    assert!(matches!(
+        cancelled.effect_journal.last(),
+        Some(crate::vm::EffectJournalEntry {
+            state: crate::vm::EffectJournalState::Cancelled,
+            ..
+        })
+    ));
+    assert!(runtime
+        .pending_typed_execution(pending.execution_id)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn late_vm_resume_after_observer_disconnect_replays_from_reopened_log() {
+    let directory = tempfile::tempdir().unwrap();
+    let brain = uuid::Uuid::new_v4();
+    let path = directory.path().join("effects.jsonl");
+    let log = Arc::new(Mutex::new(
+        VmEffectDeliveryLog::open_bound(&path, brain).unwrap(),
+    ));
+    let (live, receiver) = typed_effect_channel();
+    let sink = bind_delivery_log(Arc::clone(&log), Some(live));
+    let runtime = ProgramRuntime::new();
+    grant_workspace_file_read(&runtime);
+    let pending = runtime
+        .submit_with_deferred_host_effects(
+            submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"does-not-need-to-exist.txt\"))",
+                ExecutionEffect::WorkspaceRead,
+            ),
+            sink,
+        )
+        .await
+        .unwrap();
+    let envelope = receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("observer must receive the awaited effect");
+    drop(receiver);
+    drop(log);
+    let reopened = VmEffectDeliveryLog::open_bound(&path, brain).unwrap();
+    assert_eq!(
+        reopened.get(envelope.handle()).cloned().as_ref(),
+        Some(&envelope),
+        "reopening the log must replay the persisted envelope after observer drop"
+    );
+    let completed = runtime
+        .resume_vm_effect(VmResume {
+            execution_id: envelope.execution_id,
+            sequence: envelope.effect.sequence,
+            response: VmResumeResponse::Result {
+                values: vec![TypedValue::Bytes(b"late resume".to_vec())],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    assert_eq!(
+        completed.values,
+        vec![crate::programs::ProgramValue::Bytes(
+            b"late resume".to_vec()
+        )]
+    );
+    assert!(runtime
+        .pending_typed_execution(pending.execution_id)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn bound_log_all_awaited_output_open_registers_the_resumed_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    let brain = uuid::Uuid::new_v4();
+    let log = Arc::new(Mutex::new(
+        VmEffectDeliveryLog::open_bound(directory.path().join("effects.jsonl"), brain).unwrap(),
+    ));
+    let (live, receiver) = typed_effect_channel();
+    let sink = bind_delivery_log(Arc::clone(&log), Some(live));
+    let runtime = ProgramRuntime::new();
+    let pending = runtime
+        .submit_with_deferred_host_effects(
+            submission(
+                ProgramLanguage::Lisp,
+                "(let ((handle (output-open \"download\"))) \
+                       (begin (output-status handle \"starting\") \
+                              (output-complete handle)))",
+                ExecutionEffect::VmRead,
+            ),
+            sink,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.status, ExecutionStatus::Suspended);
+    let open = receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("portable output-open request");
+    assert_eq!(
+        log.lock().unwrap().get(open.handle()).cloned().as_ref(),
+        Some(&open)
+    );
+    let completed = runtime
+        .resume_vm_effect(VmResume {
+            execution_id: open.execution_id,
+            sequence: open.effect.sequence,
+            response: VmResumeResponse::Result {
+                values: vec![TypedValue::Resource {
+                    kind: "output-handle".into(),
+                    handle: "portable-download".into(),
+                    generation: 7,
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    let updates = receiver.try_iter().collect::<Vec<_>>();
+    assert_eq!(
+        updates
+            .iter()
+            .map(|envelope| envelope.effect.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    let handles = log.lock().unwrap().output_handles(open.execution_id);
+    assert_eq!(
+        handles,
+        vec![OutputHandleRef::new(
+            open.execution_id,
+            "portable-download",
+            7
+        )]
+    );
+}
+
+#[test]
 fn runtime_facade_keeps_child_modules_private() {
     let facade = include_str!("mod.rs");
     let published = facade
@@ -7628,6 +8100,7 @@ fn runtime_facade_keeps_child_modules_private() {
 #[test]
 fn runtime_callers_use_facade_not_child_modules() {
     let children = [
+        "abi",
         "agent_vm",
         "agents",
         "archive_store",
@@ -7662,6 +8135,11 @@ fn runtime_facade_reexports_caller_types() {
     let _ = std::any::type_name::<AutomationBroker>();
     let _ = std::any::type_name::<AgentTaskSpec>();
     let _ = std::any::type_name::<RunnerEffectAuditControl>();
+    let _ = std::any::type_name::<ProgramRun>();
+    let _ = std::any::type_name::<DeliveryConsumerIdentity>();
+    let _ = std::any::type_name::<DeliveryCursor>();
+    let _ = std::any::type_name::<OutputHandleRef>();
+    let _ = std::any::type_name::<RuntimeApplicationMessage>();
     let _ = MAX_ACTIVE_EFFECT_AUDITS_PER_RUN;
     let _ = permission_context_key();
 }

@@ -30,6 +30,8 @@ making production VM code select a frontend. The pure CPU fiber scheduler remain
 
 **Effects** go through the capability broker, never around it
 ([capability boundaries](../../CLAUDE.md#key-principles)).
+`RUNTIME_APPLICATION_ABI_VERSION` versions the portable effect/resume/delivery
+boundary independently of `VM_TYPE_SYSTEM_VERSION` (IR/checkpoints).
 
 **Focused tests:** `./scripts/test_brains.sh cargo test -p finch-vm --lib` and
 `./scripts/test_brains.sh cargo test -p finch-colisp --lib`,

@@ -3,21 +3,24 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/runtime/` (typed program execution, capability/authority binding, host-effect
-audit, automation broker, archive/authority persistence, and the child-agent vocabulary), plus
+audit, automation broker, archive/authority persistence, the child-agent vocabulary, and the
+frozen Runtime/Application ABI: `ProgramRun`, diagnostics, `VmSideEffect` envelopes,
+`VmResume`, output-handle refs, and `VmEffectDeliveryLog` Brain/client identity ports), plus
 the adjacent `poset` tree and composition adapter [`src/program_registry.rs`](../program_registry.rs)
 listed on the DESIGN.md runtime row. Those adjacent trees are not this facade; this capsule is
-`src/runtime/` only.
+`src/runtime/` only. Live attached-console streaming is issue #57 and is not this module.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
 modules are private, so the `pub use` list in `src/runtime/mod.rs` is the whole public surface.
-Callers outside this directory use `crate::runtime::Item`; they must not name `agent_vm`,
-`agents`, `archive_store`, `automation`, `context`, `effect_audit`, `effect_log`, `outcome`,
-`host`, `hostio`, or `mcp`.
+Callers outside this directory use `crate::runtime::Item`; they must not name `abi`,
+`agent_vm`, `agents`, `archive_store`, `automation`, `context`, `effect_audit`, `effect_log`,
+`outcome`, `host`, `hostio`, or `mcp`.
 
 **Dependencies:** `vm` (capability types and the typed machine), `programs` (language, values,
 execution effect), `tools` (MCP client binding), and `memory` (optional MemTree binding).
 Production code under `src/runtime/**` must not name `crate::brain`. Brain → runtime is the
-intended direction (runtime layer 2, brain layer 4). Do not extract `finch-runtime` until
+intended direction (runtime layer 2, brain layer 4). Delivery identity is an embedder-neutral
+port (`DeliveryConsumerIdentity`); Brain implements it. Do not extract `finch-runtime` until
 remaining edges are measured and that reverse edge stays gone.
 
 **Scheduling, capabilities, and effect audit are not this commit.** Configuration and host
