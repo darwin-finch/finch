@@ -149,66 +149,7 @@ impl QwenGenerator {
             let gen = self.local_generator.read().await;
             gen.model_name().to_string()
         };
-
-        if !ToolCallParser::has_tool_calls(&output) {
-            let text = ToolCallParser::extract_text(&output);
-            return Ok(GeneratorResponse {
-                text: text.clone(),
-                content_blocks: vec![ContentBlock::Text { text: text.clone() }],
-                tool_uses: vec![],
-                metadata: ResponseMetadata {
-                    generator: "local".to_string(),
-                    model: model_display_name,
-                    confidence: Some(0.8),
-                    stop_reason: Some("end_turn".to_string()),
-                    input_tokens: None,
-                    output_tokens: Some(text.split_whitespace().count() as u32),
-                    latency_ms: None,
-                    primary_allowance_used_percent: None,
-                    secondary_allowance_used_percent: None,
-                },
-            });
-        }
-
-        let parsed = ToolCallParser::parse(&output)
-            .context("Failed to parse tool calls from local model output")?;
-        let mut content_blocks = Vec::new();
-        let text = ToolCallParser::extract_text(&output);
-        if !text.is_empty() {
-            content_blocks.push(ContentBlock::Text { text: text.clone() });
-        }
-        let tool_uses: Vec<ToolUse> = parsed
-            .into_iter()
-            .map(|call| {
-                content_blocks.push(ContentBlock::ToolUse {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    input: call.input.clone(),
-                });
-                ToolUse {
-                    id: call.id,
-                    name: call.name,
-                    input: call.input,
-                }
-            })
-            .collect();
-
-        Ok(GeneratorResponse {
-            text,
-            content_blocks,
-            tool_uses,
-            metadata: ResponseMetadata {
-                generator: "local".to_string(),
-                model: model_display_name,
-                confidence: Some(0.8),
-                stop_reason: Some("tool_use".to_string()),
-                input_tokens: None,
-                output_tokens: Some(output.split_whitespace().count() as u32),
-                latency_ms: None,
-                primary_allowance_used_percent: None,
-                secondary_allowance_used_percent: None,
-            },
-        })
+        proposal_from_output(&output, &model_display_name)
     }
 
     /// Format prompt with tool definitions in system message
@@ -302,5 +243,103 @@ impl QwenGenerator {
         })
         .await
         .context("Failed to spawn blocking task")?
+    }
+}
+
+/// Parse local model output into a generator response without executing tools.
+fn proposal_from_output(output: &str, model: &str) -> Result<GeneratorResponse> {
+    if !ToolCallParser::has_tool_calls(output) {
+        let text = ToolCallParser::extract_text(output);
+        return Ok(GeneratorResponse {
+            text: text.clone(),
+            content_blocks: vec![ContentBlock::Text { text: text.clone() }],
+            tool_uses: vec![],
+            metadata: ResponseMetadata {
+                generator: "local".to_string(),
+                model: model.to_string(),
+                confidence: Some(0.8),
+                stop_reason: Some("end_turn".to_string()),
+                input_tokens: None,
+                output_tokens: Some(text.split_whitespace().count() as u32),
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        });
+    }
+
+    let parsed = ToolCallParser::parse(output)
+        .context("Failed to parse tool calls from local model output")?;
+    let mut content_blocks = Vec::new();
+    let text = ToolCallParser::extract_text(output);
+    if !text.is_empty() {
+        content_blocks.push(ContentBlock::Text { text: text.clone() });
+    }
+    let tool_uses: Vec<ToolUse> = parsed
+        .into_iter()
+        .map(|call| {
+            content_blocks.push(ContentBlock::ToolUse {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
+            });
+            ToolUse {
+                id: call.id,
+                name: call.name,
+                input: call.input,
+            }
+        })
+        .collect();
+
+    Ok(GeneratorResponse {
+        text,
+        content_blocks,
+        tool_uses,
+        metadata: ResponseMetadata {
+            generator: "local".to_string(),
+            model: model.to_string(),
+            confidence: Some(0.8),
+            stop_reason: Some("tool_use".to_string()),
+            input_tokens: None,
+            output_tokens: Some(output.split_whitespace().count() as u32),
+            latency_ms: None,
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_local_tool_markup_becomes_tool_uses_without_executing() {
+        let output = r#"I'll read that file.
+
+<tool_use>
+  <name>read</name>
+  <parameters>{"file_path": "/tmp/a.rs"}</parameters>
+</tool_use>
+"#;
+        let response = proposal_from_output(output, "Qwen2.5").expect("parse local tool markup");
+        assert_eq!(
+            response.metadata.stop_reason.as_deref(),
+            Some("tool_use"),
+            "tool markup must stop as tool_use, not end_turn: {response:?}"
+        );
+        assert_eq!(
+            response.tool_uses.len(),
+            1,
+            "expected one proposed tool call: {response:?}"
+        );
+        assert_eq!(response.tool_uses[0].name, "read");
+        assert_eq!(response.tool_uses[0].input["file_path"], "/tmp/a.rs");
+        assert_eq!(response.text.trim(), "I'll read that file.");
+        assert!(
+            !response.tool_uses[0].id.is_empty(),
+            "proposed tool call must carry an id for the event loop: {:?}",
+            response.tool_uses[0]
+        );
     }
 }

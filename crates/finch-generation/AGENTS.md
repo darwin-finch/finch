@@ -57,3 +57,14 @@ application code. Finch-owned adapters (Claude, Qwen, daemon-local) stay in
 - Unify REPL and scheduler tool loops behind one event-loop owner (#777).
 - Native adapter emission of thinking/tool-call deltas and IPC/UI projection (#777).
 - Local model architecture rewrite (ONNX/Candle/Qwen internals) is out of scope.
+- `generate_interfaces.py` matches `fn`, not `async fn` (hygiene Issue 6).
+  `GenerationBackend::generate` and `Sleeper::sleep` are therefore absent from
+  `INTERFACE.md`. Read the trait in `src/backend.rs` / `src/ports.rs` for those
+  methods until the generator is fixed.
+- `GenerationPorts` progress/loader/cache/telemetry/scheduler are construction
+  scaffolding. The supervisor uses clock, sleeper, and hardware metadata.
+  Backends do not receive ports on `generate`; stitch them at construction.
+  `GenerationEvent::Loading` is for backends to emit; the supervisor reports
+  load state via `Readiness`.
+- Thread ports into `GenerationBackend::generate` and cancel-on-switch resource
+  accounting beyond the generation-id fence (#776 follow-up / #777).

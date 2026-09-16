@@ -1735,7 +1735,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "finch-providers",
- "futures",
  "serde",
  "serde_json",
  "tokio",

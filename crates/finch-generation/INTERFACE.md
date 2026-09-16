@@ -81,6 +81,8 @@ impl GenerationId {
 /// Requested versus resolved versus actual backend for one generation.
 pub struct GenerationIdentity { … }
 impl GenerationIdentity {
+    /// Identity for one dispatch.
+    pub fn for_dispatch(requested: BackendRef, backend: BackendRef) -> Self;
     /// Pin requested = resolved = actual at the start of an attempt.
     pub fn pinned(backend: BackendRef) -> Self;
     /// Record a serving-model correction without changing requested/resolved.
@@ -155,7 +157,9 @@ impl Message {
 /// Generation backend over a provider transport.
 pub struct ProviderGenerationBackend { … }
 impl ProviderGenerationBackend {
-    /// Wrap a provider using its default model.
+    /// Wrap a provider pinned to `model`, or the provider default when `None`.
+    pub fn for_model(provider: Arc<dyn LlmProvider>, model: Option<&str>) -> Result<Self>;
+    /// Wrap a provider using its default model as the catalog identity.
     pub fn new(provider: Arc<dyn LlmProvider>) -> Result<Self>;
 }
 /// Whether a backend can accept a generate call.

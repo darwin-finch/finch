@@ -12,12 +12,14 @@ use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, Receiver};
+use tokio_util::sync::CancellationToken;
 
 /// Drives one generation attempt and drops events from superseded attempts.
 #[derive(Clone)]
 pub struct GenerationSupervisor {
     ports: GenerationPorts,
     current: Arc<Mutex<Option<GenerationId>>>,
+    in_flight: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 impl GenerationSupervisor {
@@ -26,6 +28,7 @@ impl GenerationSupervisor {
         Self {
             ports,
             current: Arc::new(Mutex::new(None)),
+            in_flight: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -62,12 +65,19 @@ impl GenerationSupervisor {
         request: GenerationRequest,
         route: Option<RouteDecision>,
     ) -> Result<Receiver<Result<GenerationEvent>>> {
+        {
+            let mut in_flight = self.in_flight.lock().expect("in_flight lock");
+            if let Some(previous) = in_flight.take() {
+                previous.cancel();
+            }
+            *in_flight = Some(request.cancellation.clone());
+        }
         let (tx, rx) = mpsc::channel(64);
         let ports = self.ports.clone();
         let current = Arc::clone(&self.current);
         tokio::spawn(async move {
-            let mut identity = GenerationIdentity::pinned(backend.identity());
-            identity.requested = request.requested.clone();
+            let identity =
+                GenerationIdentity::for_dispatch(request.requested.clone(), backend.identity());
             let started_ms = ports.clock.now_ms();
 
             if !emit(
@@ -298,16 +308,12 @@ async fn emit_terminal(
     id: GenerationId,
     outcome: TerminalOutcome,
 ) -> bool {
-    emit(tx, current, id, Ok(GenerationEvent::Terminal(outcome))).await
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::event::ToolResult;
-
-    #[test]
-    fn test_tool_result_is_available_for_event_loop_feedback() {
-        let result = ToolResult::success("id", "ok");
-        assert!(!result.is_error);
+    let sent = emit(tx, current, id, Ok(GenerationEvent::Terminal(outcome))).await;
+    if sent {
+        let mut guard = current.lock().expect("current lock");
+        if *guard == Some(id) {
+            *guard = None;
+        }
     }
+    sent
 }

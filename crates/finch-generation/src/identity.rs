@@ -71,6 +71,29 @@ impl GenerationIdentity {
         }
     }
 
+    /// Identity for one dispatch.
+    ///
+    /// Requested is caller intent. When this backend is the requested
+    /// provider, resolved/actual follow the requested model (what is sent
+    /// on the wire), not the backend's default. Explicit fallback to a
+    /// different provider keeps the selected backend's identity.
+    pub fn for_dispatch(requested: BackendRef, backend: BackendRef) -> Self {
+        let resolved = if requested.provider == backend.provider {
+            BackendRef {
+                provider: backend.provider,
+                model: requested.model.clone(),
+                kind: backend.kind,
+            }
+        } else {
+            backend
+        };
+        Self {
+            requested,
+            resolved: resolved.clone(),
+            actual: resolved,
+        }
+    }
+
     /// Record a serving-model correction without changing requested/resolved.
     pub fn with_actual_model(mut self, model: impl Into<String>) -> Result<Self> {
         let model = model.into();
@@ -154,5 +177,32 @@ mod tests {
         assert_eq!(identity.requested, requested);
         assert_eq!(identity.resolved.model, "claude-sonnet-4");
         assert_eq!(identity.actual.model, "claude-sonnet-4-served");
+    }
+
+    #[test]
+    fn test_for_dispatch_follows_requested_model_not_backend_default() {
+        let requested = BackendRef::new("claude", "requested-model", BackendKind::Cloud).unwrap();
+        let backend = BackendRef::new("claude", "default-model", BackendKind::Cloud).unwrap();
+        let identity = GenerationIdentity::for_dispatch(requested.clone(), backend);
+        assert_eq!(identity.requested.model, "requested-model");
+        assert_eq!(
+            identity.resolved.model, "requested-model",
+            "same-provider dispatch must resolve the requested model, not the default: {identity:?}"
+        );
+        assert_eq!(identity.actual.model, "requested-model");
+        assert_ne!(identity.resolved.model, "default-model");
+    }
+
+    #[test]
+    fn test_for_dispatch_keeps_fallback_backend_identity() {
+        let requested = BackendRef::new("local", "missing", BackendKind::Local).unwrap();
+        let backend = BackendRef::new("claude", "teacher", BackendKind::Cloud).unwrap();
+        let identity = GenerationIdentity::for_dispatch(requested.clone(), backend.clone());
+        assert_eq!(identity.requested, requested);
+        assert_eq!(
+            identity.resolved, backend,
+            "fallback to another provider must keep that backend's identity: {identity:?}"
+        );
+        assert_eq!(identity.actual, backend);
     }
 }

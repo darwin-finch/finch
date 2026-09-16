@@ -3,10 +3,14 @@
 use finch_generation::{
     select_backend, translate_provider_chunk, Allowance, BackendKind, BackendRef,
     ControllableSleeper, FrozenMonotonicClock, GenerationBackend, GenerationEvent, GenerationPorts,
-    GenerationRequest, GenerationStrategy, GenerationSupervisor, LoadPhase, ReadinessReport,
-    ResourceBudget, ResourceMetadata, ScriptedBackend, ScriptedStep, TerminalOutcome, ToolCall,
+    GenerationRequest, GenerationStrategy, GenerationSupervisor, LoadPhase,
+    ProviderGenerationBackend, ReadinessReport, ResourceBudget, ResourceMetadata, ScriptedBackend,
+    ScriptedStep, TerminalOutcome, ToolCall,
 };
-use finch_providers::{ContentBlock, EventProvenance, StreamChunk};
+use finch_providers::{
+    CapabilitySupport, ContentBlock, EventProvenance, ModelCapabilities, ProviderBackend,
+    ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest,
+};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +45,27 @@ async fn collect(
     while let Some(item) = rx.recv().await {
         events.push(item.expect("generation stream error"));
     }
+    events
+}
+
+async fn drain_until_started(
+    rx: &mut tokio::sync::mpsc::Receiver<anyhow::Result<GenerationEvent>>,
+) -> Vec<GenerationEvent> {
+    let mut events = Vec::new();
+    while let Some(item) = rx.recv().await {
+        let event = item.expect("generation stream error before Started");
+        let started = matches!(event, GenerationEvent::Started { .. });
+        events.push(event);
+        if started {
+            break;
+        }
+    }
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, GenerationEvent::Started { .. })),
+        "supervisor never emitted Started; events={events:?}"
+    );
     events
 }
 
@@ -167,10 +192,11 @@ async fn test_cancellation_beats_late_completion() {
         GenerationStrategy::CausalAutoregressive,
     )
     .with_cancellation(cancel.clone());
-    let rx = supervisor.run(backend, request, None).await.unwrap();
+    let mut rx = supervisor.run(backend, request, None).await.unwrap();
+    let mut events = drain_until_started(&mut rx).await;
     cancel.cancel();
-    let events = collect(rx).await;
     hold.notify_one();
+    events.extend(collect(rx).await);
     match terminals(&events).as_slice() {
         [TerminalOutcome::Cancelled { identity }] => {
             assert_eq!(identity.actual.provider, "cloud");
@@ -183,7 +209,7 @@ async fn test_cancellation_beats_late_completion() {
             event,
             GenerationEvent::TextDelta { text, .. } if text == "late"
         )),
-        "cancelled attempt must drop late text; events={events:?}"
+        "cancelled attempt must drop late text after it is offered; events={events:?}"
     );
 }
 
@@ -213,16 +239,24 @@ async fn test_timeout_uses_injected_sleeper_not_wall_clock() {
         max_output_tokens: Some(16),
         timeout: Some(Duration::from_secs(30)),
     });
-    let rx = supervisor.run(backend, request, None).await.unwrap();
+    let mut rx = supervisor.run(backend, request, None).await.unwrap();
+    let mut events = drain_until_started(&mut rx).await;
     sleeper.release();
-    let events = collect(rx).await;
     hold.notify_one();
+    events.extend(collect(rx).await);
     match terminals(&events).as_slice() {
         [TerminalOutcome::TimedOut { identity }] => {
             assert_eq!(identity.actual.model, "slow");
         }
         other => panic!("expected TimedOut, got {other:?} from {events:?}"),
     }
+    assert!(
+        events.iter().all(|event| !matches!(
+            event,
+            GenerationEvent::TextDelta { text, .. } if text == "too late"
+        )),
+        "timed-out attempt must drop late text after it is offered; events={events:?}"
+    );
 }
 
 #[tokio::test]
@@ -584,4 +618,172 @@ fn test_allowance_is_not_billing() {
         secondary_used_percent: None,
     };
     assert_eq!(allowance.primary_used_percent, Some(12.0));
+}
+
+struct RecordingProvider {
+    default_model: &'static str,
+    seen_models: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl ProviderBackend for RecordingProvider {
+    async fn send_message_validated(
+        &self,
+        request: ValidatedProviderRequest,
+    ) -> anyhow::Result<ProviderResponse> {
+        let request = request.into_request_for(self)?;
+        anyhow::bail!(
+            "non-stream path unused in this test; model={}",
+            request.model
+        )
+    }
+
+    async fn send_message_stream_validated(
+        &self,
+        request: ValidatedProviderRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>> {
+        let request = request.into_request_for(self)?;
+        self.seen_models
+            .lock()
+            .expect("seen_models lock")
+            .push(request.model.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let model = request.model;
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(StreamChunk::TextDelta("ok".into()))).await;
+            let _ = tx
+                .send(Ok(StreamChunk::ResponseMetadata {
+                    model: format!("{model}-served"),
+                }))
+                .await;
+        });
+        Ok(rx)
+    }
+
+    fn name(&self) -> &str {
+        "cloud"
+    }
+
+    fn default_model(&self) -> &str {
+        self.default_model
+    }
+
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        ModelCapabilities::static_metadata(
+            self.name(),
+            model,
+            "2026-09-16",
+            "generation identity fixture",
+            CapabilitySupport::Supported,
+            CapabilitySupport::Unsupported,
+            CapabilitySupport::Unsupported,
+            ReasoningCapability::unsupported("2026-09-16", "generation identity fixture"),
+            Some(8_000),
+            Some(16_000),
+            None,
+        )
+    }
+}
+
+#[tokio::test]
+async fn test_requested_model_is_not_reported_as_provider_default() {
+    let provider = Arc::new(RecordingProvider {
+        default_model: "default-model",
+        seen_models: std::sync::Mutex::new(Vec::new()),
+    });
+    let backend = Arc::new(
+        ProviderGenerationBackend::new(provider.clone()).expect("wrap recording provider"),
+    );
+    assert_eq!(
+        backend.identity().model,
+        "default-model",
+        "catalog identity may name the default; dispatch must not: {:?}",
+        backend.identity()
+    );
+
+    let requested = BackendRef::new("cloud", "requested-model", BackendKind::Cloud).unwrap();
+    let supervisor = GenerationSupervisor::new(GenerationPorts::test());
+    let events = collect(
+        supervisor
+            .run(
+                backend,
+                GenerationRequest::new(
+                    vec![finch_providers::Message::user("hi")],
+                    requested.clone(),
+                    GenerationStrategy::CausalAutoregressive,
+                ),
+                None,
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let seen = provider
+        .seen_models
+        .lock()
+        .expect("seen_models lock")
+        .clone();
+    assert_eq!(
+        seen,
+        vec!["requested-model".to_string()],
+        "wire dispatch must send the requested model, not the default; events={events:?}"
+    );
+
+    let named_default = events
+        .iter()
+        .filter(|event| event_names_model(event, "default-model"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        named_default.is_empty(),
+        "requested run must not be attributed to default-model; leaked={named_default:?} events={events:?}"
+    );
+
+    match terminals(&events).as_slice() {
+        [TerminalOutcome::Completed { metadata, .. }] => {
+            assert_eq!(metadata.identity.requested, requested);
+            assert_eq!(
+                metadata.identity.resolved.model, "requested-model",
+                "resolved must follow the request, not default-model: {metadata:?}"
+            );
+            assert_eq!(
+                metadata.identity.actual.model, "requested-model-served",
+                "actual must follow provider-reported serving model: {metadata:?}"
+            );
+            assert_ne!(metadata.identity.resolved.model, "default-model");
+            assert_ne!(metadata.identity.actual.model, "default-model");
+        }
+        other => {
+            panic!("expected Completed with requested identity, got {other:?} from {events:?}")
+        }
+    }
+}
+
+fn event_names_model(event: &GenerationEvent, model: &str) -> bool {
+    match event {
+        GenerationEvent::Started { identity, .. }
+        | GenerationEvent::Identity(identity)
+        | GenerationEvent::Terminal(TerminalOutcome::Completed {
+            metadata: finch_generation::GenerationMetadata { identity, .. },
+            ..
+        })
+        | GenerationEvent::Terminal(TerminalOutcome::Cancelled { identity })
+        | GenerationEvent::Terminal(TerminalOutcome::TimedOut { identity })
+        | GenerationEvent::Terminal(TerminalOutcome::Disconnected { identity, .. })
+        | GenerationEvent::Terminal(TerminalOutcome::Failed { identity, .. }) => {
+            identity.requested.model == model
+                || identity.resolved.model == model
+                || identity.actual.model == model
+        }
+        GenerationEvent::TextDelta { provenance, .. }
+        | GenerationEvent::ThinkingDelta { provenance, .. }
+        | GenerationEvent::ToolCallDelta { provenance, .. } => provenance.model == model,
+        GenerationEvent::ToolCallComplete(call) => call.provenance.model == model,
+        GenerationEvent::Readiness(_)
+        | GenerationEvent::Loading { .. }
+        | GenerationEvent::Usage(_)
+        | GenerationEvent::Allowance(_)
+        | GenerationEvent::Route(_) => false,
+    }
 }
