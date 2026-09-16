@@ -279,10 +279,17 @@ fn test_foreign_auth_store_monitor_reaps_on_unwind() {
     }));
 
     assert!(unwind.is_err(), "monitor cleanup probe did not unwind");
+    // Reaping is proven by parentage, not by signal: after the monitor's Drop
+    // killed and waited the child, `waitpid` on that pid from this process
+    // must answer ECHILD. A bare `kill(pid, None)` expecting ESRCH races PID
+    // recycling on loaded CI runners — a recycled pid belongs to an unrelated
+    // live process, so the probe can succeed even though the check means
+    // nothing, or fail while cleanup actually worked. ECHILD cannot be fooled
+    // by recycling: only "this pid is no longer our child" answers it.
     assert!(
         matches!(
-            nix::sys::signal::kill(monitor_pid, None),
-            Err(nix::errno::Errno::ESRCH)
+            nix::sys::wait::waitpid(monitor_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
         ),
         "foreign credential-store monitor survived or remained unreaped after unwind: pid={monitor_pid}"
     );

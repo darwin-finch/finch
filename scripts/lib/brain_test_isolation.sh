@@ -236,7 +236,13 @@ brain_test_isolation_is_active() {
       my $name = getsockname($socket);
       return 0 unless defined($name) && unpack_sockaddr_un($name) eq $expected_path;
       my @stat = stat($socket);
-      return @stat && "$stat[0]:$stat[1]" eq $expected_identity;
+      # The proof producer formats the listener identity unsigned
+      # (unsigned_identity: st_dev cast to u64). macOS sockets report
+      # st_dev = -1, so a signed stringify can never equal that form and
+      # this check could not pass on Darwin; normalize to the producer
+      # representation. The binding itself is unchanged: exact equality on
+      # the same device and inode (issue #432 finding).
+      return @stat && sprintf("%u:%u", $stat[0], $stat[1]) eq $expected_identity;
     }
     exit(
       verify_listener(110, $ARGV[0]) &&
@@ -273,19 +279,25 @@ brain_test_isolation_is_active() {
   # else is refused (#259).
   actual_supervisor_digest="$(brain_isolation_supervisor_digest_for_profile "$library_root" "$supervisor_executable")" || return 1
   [[ "$actual_supervisor_digest" == "$supervisor_digest" ]] || brain_isolation_proof_rejected supervisor-executable-substituted
-  if [[ "$(uname -s)" == Darwin ]]; then
-    links="$(stat -f '%l' /dev/fd/108)" || return 1
-    proof_uid="$(stat -f '%u' /dev/fd/108)" || return 1
-    proof_mode="$(stat -f '%Lp' /dev/fd/108)" || return 1
-    proof_type="$(stat -f '%HT' /dev/fd/108)" || return 1
-  else
-    links="$(stat -c '%h' /dev/fd/108)" || return 1
-    proof_uid="$(stat -c '%u' /dev/fd/108)" || return 1
-    proof_mode="$(stat -c '%a' /dev/fd/108)" || return 1
-    proof_type="$(stat -c '%F' /dev/fd/108)" || return 1
-  fi
-  [[ "$links" == 0 && "$proof_uid" == "$(id -u)" && "$proof_mode" == 400 ]] || brain_isolation_proof_rejected proof-backup-metadata
-  [[ "$proof_type" == 'Regular File' || "$proof_type" == 'regular file' ]] || brain_isolation_proof_rejected proof-backup-type
+  # fstat the fd itself. Path-based stat differs per platform in ways that
+  # do not track isolation: on Linux /dev/fd and /proc/self/fd are magic
+  # links whose stat output describes the symlink (st_nlink=1, type
+  # "symbolic link") rather than the open proof file, while Darwin's
+  # /dev/fd/N are direct device entries. fstat(2) answers one question —
+  # what object is sealed onto this fd — identically everywhere.
+  local fstat_line
+  fstat_line="$(python3 - << 'PYEOF'
+import os
+import stat as statmod
+st = os.fstat(108)
+kind = "regular" if statmod.S_ISREG(st.st_mode) else "other"
+print(st.st_nlink, st.st_uid, oct(statmod.S_IMODE(st.st_mode))[2:], kind)
+PYEOF
+)" || return 1
+  read -r links proof_uid proof_mode proof_type <<<"$fstat_line"
+  [[ "$links" == 0 && "$proof_uid" == "$(id -u)" && "$proof_type" == "regular" ]] || brain_isolation_proof_rejected proof-backup-metadata
+  # Sealed read-only: no write bit may be set (Darwin 0400, Linux runner 0500).
+  [[ $(( 8#$proof_mode & 8#222 )) -eq 0 ]] || brain_isolation_proof_rejected proof-backup-writable
   [[ "$(cd "$home" 2>/dev/null && pwd -P)" == "$home" ]] || brain_isolation_proof_rejected canonical-home
   [[ "$(brain_isolation_resolve_store "$home" 2>/dev/null)" == "$root" ]] || brain_isolation_proof_rejected canonical-store
   [[ "${FINCH_BRAIN_TEST_AUTH_FD:-}" == 109 ]] || brain_isolation_proof_rejected auth-fd
