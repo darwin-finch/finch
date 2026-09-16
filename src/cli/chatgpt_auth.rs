@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{CredentialProvider, ProviderCredential};
 use crate::oauth::{
-    FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthDialect, OAuthTokenRecord,
+    DeviceAuthorization, FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthDialect,
+    OAuthTokenRecord,
 };
 use crate::providers::OpenAiChatGptOAuthDialect;
 use chrono::Utc;
@@ -54,6 +55,7 @@ pub enum ChatGptAuthState {
 }
 
 /// Opaque exact-generation authority for compensating one setup issuance.
+#[derive(Clone)]
 pub struct ChatGptCompensationHandle {
     reference: String,
     generation: String,
@@ -87,9 +89,22 @@ impl ChatGptCompensationHandle {
 }
 
 /// Metadata plus exact rollback authority from one ensure operation.
+#[derive(Debug, Clone)]
 pub struct EnsuredChatGptCredential {
     pub credential: ProviderCredential,
     pub compensation: Option<ChatGptCompensationHandle>,
+}
+
+/// First phase of the named-credential ceremony: either the local account
+/// already satisfied the request without user interaction (reused or
+/// refreshed), or a device authorization must be shown to the user and
+/// completed with `finish_named_credential`.
+#[derive(Debug, Clone)]
+pub enum ChatGptNamedCredentialStart {
+    /// A validated named credential satisfied the request; no dialog is needed.
+    Ensured(EnsuredChatGptCredential),
+    /// Present the pending device authorization's one-time code, then commit.
+    AuthorizationRequired(DeviceAuthorization),
 }
 
 /// Render one stable, secret-free status line for scripts and interactive use.
@@ -159,6 +174,31 @@ pub trait ChatGptCredentialAuthenticator: Send + Sync {
         presentation: DeviceLoginPresentation,
         cancel: CancellationToken,
     ) -> Result<EnsuredChatGptCredential>;
+
+    /// Begin the named-credential ceremony: reuse or refresh a valid local
+    /// account when one exists, or start a device authorization whose one-time
+    /// code the caller presents (interactive setup dialogs, #424).
+    ///
+    /// The default returns an error so scripted fakes that only exercise the
+    /// combined ceremony fail loudly instead of silently skipping a phase.
+    async fn begin_named_credential(
+        &self,
+        _reference: &str,
+        _cancel: CancellationToken,
+    ) -> Result<ChatGptNamedCredentialStart> {
+        bail!("this authenticator does not script the phased named-credential ceremony")
+    }
+
+    /// Complete a began ceremony: poll to one terminal outcome, persist the
+    /// validated account, and return its compensation authority.
+    async fn finish_named_credential(
+        &self,
+        _reference: &str,
+        _pending: &DeviceAuthorization,
+        _cancel: CancellationToken,
+    ) -> Result<EnsuredChatGptCredential> {
+        bail!("this authenticator does not script the phased named-credential ceremony")
+    }
 }
 
 /// Production Finch-native ChatGPT authentication service.
@@ -226,38 +266,55 @@ impl ChatGptAuthService {
         presentation: DeviceLoginPresentation,
         cancel: CancellationToken,
     ) -> Result<EnsuredChatGptCredential> {
-        let client = self.client()?;
-        match self.store.load(reference)? {
-            Some(record) => {
-                client.validate_existing_binding(&record)?;
-                if record.mutation_pending {
-                    bail!(
-                        "ChatGPT credential has an interrupted mutation; run `finch auth recover chatgpt --credential {reference}` before signing in again"
-                    );
-                }
-                if record.revoked {
-                    return login_device_with_commit(&client, reference, presentation, cancel)
-                        .await;
-                }
-                if record.expires_at > Utc::now() {
-                    client.validate_active_reuse(&record)?;
-                    return Ok(EnsuredChatGptCredential {
-                        credential: record.provider_credential(reference),
-                        compensation: None,
-                    });
-                }
-                if record.refresh_token.is_some() {
-                    return Ok(EnsuredChatGptCredential {
-                        credential: client.refresh(reference, cancel).await?,
-                        compensation: None,
-                    });
-                }
-                bail!(
-                    "ChatGPT credential is expired and unrefreshable; log it out before explicit re-authentication"
-                )
+        match self
+            .begin_named_credential(reference, cancel.clone())
+            .await?
+        {
+            ChatGptNamedCredentialStart::Ensured(ensured) => Ok(ensured),
+            ChatGptNamedCredentialStart::AuthorizationRequired(pending) => {
+                present_device_authorization(
+                    &pending.verification_uri,
+                    &pending.user_code,
+                    pending.expires_in,
+                    presentation,
+                )?;
+                let countdown_cancel = cancel.child_token();
+                let countdown = tokio::spawn(countdown_status(
+                    pending.expires_in,
+                    countdown_cancel.clone(),
+                ));
+                let result = self
+                    .finish_named_credential(reference, &pending, cancel)
+                    .await;
+                countdown_cancel.cancel();
+                let _ = countdown.await;
+                result
             }
-            None => login_device_with_commit(&client, reference, presentation, cancel).await,
         }
+    }
+
+    /// Begin the named-credential ceremony without presenting anything: reuse
+    /// or refresh a valid local account when one exists, or start a device
+    /// authorization for the caller to present (#424).
+    pub async fn begin_named_credential(
+        &self,
+        reference: &str,
+        cancel: CancellationToken,
+    ) -> Result<ChatGptNamedCredentialStart> {
+        let client = self.client()?;
+        begin_named_credential_with(&client, self.store.as_ref(), reference, cancel).await
+    }
+
+    /// Complete a began ceremony: poll to one terminal outcome, persist the
+    /// validated account, and return its compensation authority (#424).
+    pub async fn finish_named_credential(
+        &self,
+        reference: &str,
+        pending: &DeviceAuthorization,
+        cancel: CancellationToken,
+    ) -> Result<EnsuredChatGptCredential> {
+        let client = self.client()?;
+        finish_device_login_with(&client, reference, pending, cancel).await
     }
 
     /// Revoke remotely and persist a local tombstone. No alternate account or
@@ -296,6 +353,23 @@ impl ChatGptCredentialAuthenticator for ChatGptAuthService {
     ) -> Result<EnsuredChatGptCredential> {
         ChatGptAuthService::ensure_named_credential(self, reference, presentation, cancel).await
     }
+
+    async fn begin_named_credential(
+        &self,
+        reference: &str,
+        cancel: CancellationToken,
+    ) -> Result<ChatGptNamedCredentialStart> {
+        ChatGptAuthService::begin_named_credential(self, reference, cancel).await
+    }
+
+    async fn finish_named_credential(
+        &self,
+        reference: &str,
+        pending: &DeviceAuthorization,
+        cancel: CancellationToken,
+    ) -> Result<EnsuredChatGptCredential> {
+        ChatGptAuthService::finish_named_credential(self, reference, pending, cancel).await
+    }
 }
 
 async fn login_device_with_commit<D, S>(
@@ -308,12 +382,7 @@ where
     D: OAuthDialect + 'static,
     S: OAuthCredentialStore + 'static,
 {
-    crate::oauth::validate_reference(reference)?;
-    client.preflight_reauthentication(reference)?;
-    let pending = client
-        .begin_device_authorization_cancellable(cancel.clone())
-        .await
-        .context("ChatGPT device login could not start")?;
+    let pending = begin_device_login_with(client, reference, cancel.clone()).await?;
     present_device_authorization(
         &pending.verification_uri,
         &pending.user_code,
@@ -325,13 +394,47 @@ where
         pending.expires_in,
         countdown_cancel.clone(),
     ));
-    let result = client
-        .finish_device_authorization_commit(reference, &pending, cancel)
-        .await
-        .context("ChatGPT device login did not complete");
+    let result = finish_device_login_with(client, reference, &pending, cancel).await;
     countdown_cancel.cancel();
     let _ = countdown.await;
-    let commit = result?;
+    result
+}
+
+/// Validate the reference, reject any conflicting local record, and request
+/// the device one-time code. Shared by the terminal and phased ceremonies.
+async fn begin_device_login_with<D, S>(
+    client: &OAuthClient<D, S>,
+    reference: &str,
+    cancel: CancellationToken,
+) -> Result<DeviceAuthorization>
+where
+    D: OAuthDialect + 'static,
+    S: OAuthCredentialStore + 'static,
+{
+    crate::oauth::validate_reference(reference)?;
+    client.preflight_reauthentication(reference)?;
+    client
+        .begin_device_authorization_cancellable(cancel)
+        .await
+        .context("ChatGPT device login could not start")
+}
+
+/// Poll to one terminal outcome, persist the validated account, and project
+/// its compensation authority. Shared by the terminal and phased ceremonies.
+async fn finish_device_login_with<D, S>(
+    client: &OAuthClient<D, S>,
+    reference: &str,
+    pending: &DeviceAuthorization,
+    cancel: CancellationToken,
+) -> Result<EnsuredChatGptCredential>
+where
+    D: OAuthDialect + 'static,
+    S: OAuthCredentialStore + 'static,
+{
+    let commit = client
+        .finish_device_authorization_commit(reference, pending, cancel)
+        .await
+        .context("ChatGPT device login did not complete")?;
     Ok(EnsuredChatGptCredential {
         credential: commit.credential,
         compensation: Some(ChatGptCompensationHandle::issued(
@@ -339,6 +442,53 @@ where
             commit.generation,
         )),
     })
+}
+
+/// Phased named-credential begin over an explicit client and store. Tests
+/// inject the same OAuth production boundary with deterministic fixtures.
+async fn begin_named_credential_with<D, S>(
+    client: &OAuthClient<D, S>,
+    store: &S,
+    reference: &str,
+    cancel: CancellationToken,
+) -> Result<ChatGptNamedCredentialStart>
+where
+    D: OAuthDialect + 'static,
+    S: OAuthCredentialStore + 'static,
+{
+    if let Some(record) = store.load(reference)? {
+        client.validate_existing_binding(&record)?;
+        if record.mutation_pending {
+            bail!(
+                "ChatGPT credential has an interrupted mutation; run `finch auth recover chatgpt --credential {reference}` before signing in again"
+            );
+        }
+        if !record.revoked {
+            if record.expires_at > Utc::now() {
+                client.validate_active_reuse(&record)?;
+                return Ok(ChatGptNamedCredentialStart::Ensured(
+                    EnsuredChatGptCredential {
+                        credential: record.provider_credential(reference),
+                        compensation: None,
+                    },
+                ));
+            }
+            if record.refresh_token.is_some() {
+                return Ok(ChatGptNamedCredentialStart::Ensured(
+                    EnsuredChatGptCredential {
+                        credential: client.refresh(reference, cancel).await?,
+                        compensation: None,
+                    },
+                ));
+            }
+            bail!(
+                "ChatGPT credential is expired and unrefreshable; log it out before explicit re-authentication"
+            );
+        }
+    }
+    Ok(ChatGptNamedCredentialStart::AuthorizationRequired(
+        begin_device_login_with(client, reference, cancel).await?,
+    ))
 }
 
 /// Shared device ceremony used by setup and scriptable login. Tests inject the
@@ -721,6 +871,322 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(30), listener.accept())
                 .await
                 .is_err()
+        );
+    }
+
+    fn aligned_active_record(
+        descriptor: &crate::oauth::OAuthDialectDescriptor,
+    ) -> OAuthTokenRecord {
+        let mut aligned = record();
+        aligned.dialect_id = descriptor.dialect_id.clone();
+        aligned.protocol_revision = descriptor.protocol_revision.clone();
+        aligned.provider = descriptor.provider;
+        aligned.kind = descriptor.credential_kind;
+        aligned.issuer = descriptor.issuer.clone();
+        aligned.audience = descriptor.audience.clone();
+        aligned.client_id = descriptor.client_id.clone();
+        aligned.scopes = descriptor.scopes.clone();
+        aligned
+    }
+
+    struct PhasedVerifier;
+
+    #[async_trait]
+    impl OpenAiTokenVerifier for PhasedVerifier {
+        fn preflight(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn verify(
+            &self,
+            _id_token: Option<&str>,
+            _access_token: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<VerifiedOpenAiClaims> {
+            Ok(VerifiedOpenAiClaims {
+                issuer: crate::providers::REQUIRED_TOKEN_ISSUER.into(),
+                audiences: BTreeSet::from([crate::providers::OPENAI_PUBLIC_CLIENT_ID.into()]),
+                authorized_party: None,
+                subject: "subject-phased".into(),
+                account_id: Some("acct-phased".into()),
+                chatgpt_plan_type: Some("plus".into()),
+                account_is_fedramp: false,
+                nonce: None,
+                expires_at: Utc::now() + TimeDelta::hours(1),
+                not_before: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct PhasedFlowState {
+        starts: Mutex<Vec<String>>,
+        polls: std::sync::atomic::AtomicUsize,
+        exchanges: std::sync::atomic::AtomicUsize,
+    }
+
+    async fn phased_flow_handler(
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<PhasedFlowState>>,
+        request: axum::extract::Request,
+    ) -> axum::http::Response<axum::body::Body> {
+        use base64::Engine;
+        use sha2::Digest;
+        let path = request.uri().path().to_string();
+        let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        let (status, response) = match path.as_str() {
+            "/api/accounts/deviceauth/usercode" => {
+                state
+                    .starts
+                    .lock()
+                    .unwrap()
+                    .push(json["client_id"].as_str().unwrap_or("").to_string());
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({
+                        "device_auth_id": "device-1",
+                        "user_code": "CODE-1234",
+                        "interval": "0"
+                    }),
+                )
+            }
+            "/api/accounts/deviceauth/token" => {
+                state
+                    .polls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let verifier = "phased-pkce-verifier";
+                let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(sha2::Sha256::digest(verifier.as_bytes()));
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({
+                        "authorization_code": "phased-authorization-code",
+                        "code_verifier": verifier,
+                        "code_challenge": challenge
+                    }),
+                )
+            }
+            "/oauth/token" => {
+                state
+                    .exchanges
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({
+                        "access_token": "phased-access-secret",
+                        "refresh_token": "phased-refresh-secret",
+                        "id_token": "phased-id-secret",
+                        "expires_in": 3600
+                    }),
+                )
+            }
+            _ => (
+                axum::http::StatusCode::NOT_FOUND,
+                serde_json::json!({"error": "unexpected-path"}),
+            ),
+        };
+        axum::http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(response.to_string()))
+            .unwrap()
+    }
+
+    struct PhasedFlowServer {
+        origin: String,
+        state: std::sync::Arc<PhasedFlowState>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl PhasedFlowServer {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let state = std::sync::Arc::new(PhasedFlowState::default());
+            let app = axum::Router::new()
+                .fallback(axum::routing::post(phased_flow_handler))
+                .with_state(state.clone());
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self {
+                origin,
+                state,
+                task,
+            }
+        }
+    }
+
+    impl Drop for PhasedFlowServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_named_credential_reuses_active_record_without_device_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let dialect = Arc::new(
+            OpenAiChatGptOAuthDialect::for_test(&origin, Arc::new(UnreachableVerifier)).unwrap(),
+        );
+        let aligned = aligned_active_record(dialect.descriptor());
+        let generation = aligned.generation.clone();
+        let store = Arc::new(MemoryStore(Mutex::new(Some(aligned))));
+        let client = OAuthClient::new(dialect, store.clone()).unwrap();
+        let start = begin_named_credential_with(
+            &client,
+            store.as_ref(),
+            "chatgpt:work",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("an active named credential must begin as ensured without any dialog");
+        let ChatGptNamedCredentialStart::Ensured(ensured) = start else {
+            panic!("expected the reuse path, got a device authorization requirement");
+        };
+        assert_eq!(
+            ensured.credential.account.as_deref(),
+            Some("acct-redacted"),
+            "reuse must project the stored account; got {:?}",
+            ensured.credential
+        );
+        assert!(
+            ensured.compensation.is_none(),
+            "reuse must not hand out rollback authority for an untouched record"
+        );
+        let persisted = store.0.lock().unwrap();
+        let persisted = persisted.as_ref().unwrap();
+        assert_eq!(
+            persisted.generation, generation,
+            "reuse must not rewrite the record"
+        );
+        assert!(!persisted.mutation_pending && !persisted.revoked);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "the reuse path must not open a device-authorization request"
+        );
+    }
+
+    #[tokio::test]
+    async fn phased_named_credential_presents_code_then_persists_one_account_with_compensation() {
+        let server = PhasedFlowServer::start().await;
+        let dialect = Arc::new(
+            OpenAiChatGptOAuthDialect::for_test(&server.origin, Arc::new(PhasedVerifier)).unwrap(),
+        );
+        let store = Arc::new(MemoryStore(Mutex::new(None)));
+        let client = OAuthClient::new(dialect, store.clone()).unwrap();
+
+        let start = begin_named_credential_with(
+            &client,
+            store.as_ref(),
+            "chatgpt:work",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("begin over an empty store must start a device authorization");
+        let ChatGptNamedCredentialStart::AuthorizationRequired(pending) = start else {
+            panic!("an absent record must require device authorization");
+        };
+        assert_eq!(pending.user_code, "CODE-1234", "the dialog shows this code");
+        assert!(
+            !pending.verification_uri.is_empty(),
+            "the dialog must present a verification URL"
+        );
+        assert!(
+            !pending.verification_uri.contains("CODE-1234"),
+            "the verification URL must not embed the one-time code"
+        );
+        assert_eq!(server.state.starts.lock().unwrap().len(), 1);
+
+        let ensured = finish_device_login_with(&client, "chatgpt:work", &pending, {
+            CancellationToken::new()
+        })
+        .await
+        .expect("the scripted provider approves the first poll");
+        assert_eq!(
+            ensured.credential.account.as_deref(),
+            Some("acct-phased"),
+            "the persisted account must come from the signed claims; got {:?}",
+            ensured.credential
+        );
+        assert_eq!(ensured.credential.name, "chatgpt:work");
+        let compensation = ensured
+            .compensation
+            .expect("a fresh issuance must return rollback authority");
+        assert_eq!(compensation.reference(), "chatgpt:work");
+
+        let persisted = store.0.lock().unwrap();
+        let persisted = persisted
+            .as_ref()
+            .expect("exactly one record must be persisted");
+        assert_eq!(persisted.account, "acct-phased");
+        assert_eq!(persisted.access_token, "phased-access-secret");
+        assert!(persisted.refresh_token.is_some());
+        assert!(!persisted.revoked && !persisted.mutation_pending);
+        assert_eq!(
+            server.state.polls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the phased ceremony must poll to exactly one terminal outcome"
+        );
+        assert_eq!(
+            server
+                .state
+                .exchanges
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unscripted_named_credential_phases_return_errors_without_panicking() {
+        struct UnscriptedAuthenticator;
+
+        #[async_trait]
+        impl ChatGptCredentialAuthenticator for UnscriptedAuthenticator {
+            async fn ensure_named_credential(
+                &self,
+                _reference: &str,
+                _presentation: DeviceLoginPresentation,
+                _cancel: CancellationToken,
+            ) -> Result<EnsuredChatGptCredential> {
+                bail!("ensure is not scripted")
+            }
+        }
+
+        let authenticator = UnscriptedAuthenticator;
+        let begin = authenticator
+            .begin_named_credential("chatgpt:work", CancellationToken::new())
+            .await
+            .expect_err("an unscripted phase must fail, not default to a real flow");
+        assert!(
+            begin
+                .to_string()
+                .contains("phased named-credential ceremony"),
+            "the stub error must name the missing scripting; got {begin}"
+        );
+        let pending = DeviceAuthorization::issued(
+            "device-secret".into(),
+            "CODE-0000".into(),
+            "https://auth.example/activate".into(),
+            None,
+            Duration::from_secs(600),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let finish = authenticator
+            .finish_named_credential("chatgpt:work", &pending, CancellationToken::new())
+            .await
+            .expect_err("an unscripted phase must fail, not default to a real flow");
+        assert!(
+            finish
+                .to_string()
+                .contains("phased named-credential ceremony"),
+            "the stub error must name the missing scripting; got {finish}"
         );
     }
 }

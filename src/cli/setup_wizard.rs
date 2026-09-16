@@ -13,7 +13,7 @@
 //! | [`input`] | key handling, one function per wizard section |
 //! | [`render`] | drawing, one function per wizard section and overlay |
 //! | [`apply`] | from wizard state to a saved `crate::config::Config` |
-//! | [`chatgpt_recovery`] | the ChatGPT credential ceremony and its recovery loop |
+//! | [`chatgpt_recovery`] | the ChatGPT credential ceremony, its recovery loop, and the add-time device dialog flow (#424) |
 
 mod apply;
 mod catalog;
@@ -26,6 +26,9 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+use crate::cli::chatgpt_auth::{
+    ChatGptCredentialAuthenticator, ChatGptNamedCredentialStart, EnsuredChatGptCredential,
+};
 use crate::config::{CoreMlConfig, ExecutionTarget, ProviderEntry, TeacherEntry};
 use crate::models::{get_repository, InferenceProvider, ModelFamily, ModelSize};
 use crate::providers::ProviderEndpoints;
