@@ -2563,7 +2563,9 @@ fn decode_runtime_application_message(
 
 /// Compact packed Cap'n Proto frame for the Runtime/Application ABI. Local
 /// IPC and WebSocket clients share this encoding; live console streaming is
-/// issue #57 and is not implemented here.
+/// issue #57 and is not implemented here. Version 1 is not a production freeze:
+/// bump `RUNTIME_APPLICATION_ABI_VERSION` and fail closed rather than forking
+/// a parallel frame format.
 pub(crate) fn encode_runtime_application_message_packed(
     value: &RuntimeApplicationMessage,
 ) -> Result<Vec<u8>> {

@@ -32,10 +32,15 @@ pub use finch_vm_core::{
 /// Version of the portable Runtime/Application effect, resume, and delivery ABI.
 ///
 /// Independent of [`VM_TYPE_SYSTEM_VERSION`], which versions serialized IR and
-/// typed-runtime checkpoints. Bump this when `ProgramRun`, diagnostics,
-/// `VmSideEffect`, `VmResume`, output rows, or effect handles change on the
-/// wire. Existing JSON goldens for those records must stay byte-identical
-/// across a version that claims compatibility.
+/// typed-runtime checkpoints. **Version 1 is a development seam, not a
+/// production compatibility promise.** Types may change when justified; bump
+/// this constant and fail closed on mismatch. Do not persist a parallel copy
+/// of these records, or bind an external client, as if the layout were frozen.
+///
+/// Bump when `ProgramRun`, diagnostics, `VmSideEffect`, `VmResume`, output
+/// rows, or effect handles change on the wire. Existing JSON goldens for those
+/// records must stay byte-identical only across a version that *claims*
+/// compatibility.
 pub const RUNTIME_APPLICATION_ABI_VERSION: u32 = 1;
 pub use interpreter::instantiate_requirement;
 pub use interpreter::{

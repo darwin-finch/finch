@@ -1,8 +1,15 @@
-//! Frozen portable Runtime/Application ABI types.
+//! Versioned portable Runtime/Application ABI types.
 //!
-//! These records are embedder-neutral. Brain supplies identity through the
-//! ports below; this module never names `crate::brain`. Live attached-console
-//! streaming is issue #57 and is not implemented here.
+//! These records are an internal seam (#90), not a production compatibility
+//! promise. `RUNTIME_APPLICATION_ABI_VERSION` is 1 while the boundary is still
+//! settling. Fields and encodings may change when justified: bump the version
+//! and fail closed on mismatch. Do not grow a second durable journal, external
+//! client schema, or cache keyed on these types as if they were frozen — that
+//! is how extra data connections form around this bottleneck.
+//!
+//! Embedder-neutral: Brain supplies identity through the ports below; this
+//! module never names `crate::brain`. Live attached-console streaming is
+//! issue #57 and is not implemented here.
 
 use crate::runtime::{VmEffectEnvelope, VmEffectHandle, VmResume};
 use crate::vm::{HostSideEffect, TypedValue, VmDiagnostic, VmSideEffect};
@@ -13,7 +20,7 @@ fn abi_version() -> u32 {
     crate::vm::RUNTIME_APPLICATION_ABI_VERSION
 }
 
-/// Frozen identity of one verified ProgramRun.
+/// Versioned identity of one verified ProgramRun (not a frozen public wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProgramRun {
     /// Runtime/Application ABI version carried with this run identity.
@@ -128,6 +135,8 @@ impl OutputHandleRef {
 
 /// One versioned Runtime/Application ABI record. Cap'n Proto packed frames
 /// carry this same closed set for local IPC and later WebSocket reuse.
+/// Not a production freeze: bump `RUNTIME_APPLICATION_ABI_VERSION` instead of
+/// adding a parallel encoding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum RuntimeApplicationMessage {

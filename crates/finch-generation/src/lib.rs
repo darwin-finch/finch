@@ -4,6 +4,10 @@
 //! transports live in `finch-providers`. Finch application types (Brain, TUI,
 //! daemon, CLI, `Config`, `ToolExecutor`) stay outside. Child modules are
 //! private; the `pub use` list is the public surface.
+//!
+//! These types are a development seam, not a production wire. Change them when
+//! justified; do not persist a parallel copy or bind an external client as if
+//! `GenerationEvent` / `ToolCall` were frozen.
 
 mod backend;
 mod event;

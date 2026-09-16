@@ -815,8 +815,11 @@ struct VmSideEffect {
 
 # Portable Runtime/Application ABI (#90). Embedder-neutral records for
 # verified execution, diagnostics, effects, resumes, output handles, and
-# delivery cursors. Local IPC and compact packed WebSocket frames share this
-# schema. Live attached-console streaming is #57 and is not defined here.
+# delivery cursors. Version 1 is a development seam, not a production
+# compatibility promise: fields may change when justified (bump abiVersion
+# and fail closed). Do not grow a second durable encoding or external client
+# schema on these structs. Local IPC and compact packed WebSocket frames share
+# this schema. Live attached-console streaming is #57 and is not defined here.
 struct ProgramRun {
   abiVersion @0 :UInt32;
   executionId @1 :Text;
