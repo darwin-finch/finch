@@ -8,7 +8,7 @@ use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::todo::{TodoItem, TodoList};
 use crate::tools::types::{ToolContext, ToolInputSchema};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
@@ -125,7 +125,17 @@ impl Tool for TodoWriteTool {
         // Persist first: the shared list is a projection and must not claim a
         // successful update when its owning Brain rejected the mutation.
         let persisted = if let Some(journal) = &self.journal {
-            journal.replace(items.clone()).await?
+            match journal.replace(items.clone()).await {
+                Ok(persisted) => persisted,
+                Err(error) if error.to_string().contains("Disconnected") => {
+                    // The home watch already dropped; do not fail the tool for
+                    // a dead journal clone. Persist locally until reconnect.
+                    false
+                }
+                Err(error) => {
+                    return Err(error.context("could not persist todo_write to the Brain journal"));
+                }
+            }
         } else {
             false
         };

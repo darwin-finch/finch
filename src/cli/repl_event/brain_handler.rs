@@ -41,9 +41,7 @@ fn verify_frontend_environment(
     Ok(())
 }
 
-fn participant_attachment_label(
-    attachment: &crate::brain::BrainAttachment,
-) -> String {
+fn participant_attachment_label(attachment: &crate::brain::BrainAttachment) -> String {
     let id = attachment.attachment_id.0.to_string();
     format!("{} [{}]", attachment.subject, &id[..8])
 }
@@ -120,9 +118,7 @@ fn initialization_schedule_message(
     }
 }
 
-fn verify_local_frontend_environment(
-    expected: &crate::brain::BrainEnvironment,
-) -> Result<()> {
+fn verify_local_frontend_environment(expected: &crate::brain::BrainEnvironment) -> Result<()> {
     let machine = hostname::get()
         .ok()
         .and_then(|value| value.into_string().ok())
@@ -155,9 +151,7 @@ impl EventLoop {
     /// Register the frontend's home namespace and maintain its expiring
     /// environment-runner lease. A failed renewal immediately removes the
     /// runner claim from the status bar; retry never reuses an expired ID.
-    async fn register_home_brain(
-        &self,
-    ) -> Result<Option<HomeRunnerRegistration>> {
+    async fn register_home_brain(&self) -> Result<Option<HomeRunnerRegistration>> {
         let Some(ipc) = self.ipc_client.as_ref().cloned() else {
             return Ok(None);
         };
@@ -440,8 +434,23 @@ impl EventLoop {
 
     /// Restore only the durable event attachment. Runner callback health is
     /// supervised separately, even when both capabilities lost one socket.
-    async fn reconnect_home_brain(&mut self) -> Result<()> {
+    fn unbind_home_brain_watch(&mut self) {
         self.home_brain = None;
+        // `todo_write` journals through a clone of this client. If the watch
+        // dies and we leave that clone bound, the next todo_write RPCs a dead
+        // peer (`Disconnected: Peer disconnected`) while bash still works.
+        if self.active_remote_brain.is_none() {
+            self.todo_journal_target.set(None);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn todo_journal_is_bound_for_test(&self) -> bool {
+        self.todo_journal_target.is_bound()
+    }
+
+    async fn reconnect_home_brain(&mut self) -> Result<()> {
+        self.unbind_home_brain_watch();
         if self.attach_home_brain().await.is_ok() {
             self.last_home_watch_error = None;
             self.update_remote_brain_status(self.home_runner_lease_active);
@@ -513,11 +522,8 @@ impl EventLoop {
             "runner reconnect environment changed for {}",
             target.brain
         );
-        let durable_lease_id = reconnect_runner_lease_id(
-            target.lease_id,
-            &snapshot,
-            &self.runner_subject,
-        )?;
+        let durable_lease_id =
+            reconnect_runner_lease_id(target.lease_id, &snapshot, &self.runner_subject)?;
         let lease = ipc
             .brain_acquire_runner(
                 &target.brain,
@@ -544,10 +550,7 @@ impl EventLoop {
         };
         if let Err(error) = self
             .program_runtime
-            .hydrate_reducible_state_if_newer(
-                bootstrap.checkpoint,
-                bootstrap.runtime_revision,
-            )
+            .hydrate_reducible_state_if_newer(bootstrap.checkpoint, bootstrap.runtime_revision)
             .await
         {
             let _ = ipc
@@ -623,6 +626,8 @@ impl EventLoop {
                 tracing::warn!("home Brain detach timed out during shutdown");
             }
         }
+        self.todo_journal_target
+            .set(self.active_remote_brain.clone());
     }
 
     /// Handle `/brains` — list the daemon's authoritative named Brains.
@@ -723,7 +728,11 @@ impl EventLoop {
                     .unwrap_or_default();
                 lines.push(format!(
                     "  {}  {:?} · {:?} · event {}{}",
-                    &run_id[..8], run.status, run.kind, run.request_seq, parent
+                    &run_id[..8],
+                    run.status,
+                    run.kind,
+                    run.request_seq,
+                    parent
                 ));
             }
         }
@@ -759,7 +768,10 @@ impl EventLoop {
 
     async fn handle_brain_run_cancel(&mut self, prefix: String) -> Result<()> {
         let prefix = prefix.trim().to_ascii_lowercase();
-        anyhow::ensure!(prefix.len() >= 4, "run id prefix must contain at least 4 characters");
+        anyhow::ensure!(
+            prefix.len() >= 4,
+            "run id prefix must contain at least 4 characters"
+        );
         let client = self
             .selected_brain()
             .cloned()
@@ -778,10 +790,8 @@ impl EventLoop {
         };
         let run = client.cancel_run(run_id).await?;
         let run_id = run.run_id.0.to_string();
-        self.output_manager.write_info(format!(
-            "run {} is {:?}",
-            &run_id[..8], run.status
-        ));
+        self.output_manager
+            .write_info(format!("run {} is {:?}", &run_id[..8], run.status));
         self.render_tui().await
     }
 
@@ -814,18 +824,22 @@ impl EventLoop {
             None
         } else {
             let snapshot = client.snapshot().await?;
-            snapshot.events.iter().rev().find_map(|event| match &event.kind {
-                crate::brain::BrainEventKind::ScheduleDue { due }
-                    if due.schedule_id == schedule.schedule_id =>
-                {
-                    snapshot
-                        .runs
-                        .iter()
-                        .find(|run| run.run_id == due.run.run_id)
-                        .map(|run| run.status)
-                }
-                _ => None,
-            })
+            snapshot
+                .events
+                .iter()
+                .rev()
+                .find_map(|event| match &event.kind {
+                    crate::brain::BrainEventKind::ScheduleDue { due }
+                        if due.schedule_id == schedule.schedule_id =>
+                    {
+                        snapshot
+                            .runs
+                            .iter()
+                            .find(|run| run.run_id == due.run.run_id)
+                            .map(|run| run.status)
+                    }
+                    _ => None,
+                })
         };
         self.output_manager
             .write_info(initialization_schedule_message(&schedule, status));
@@ -905,7 +919,10 @@ impl EventLoop {
             .map(|attachment| attachment.subject.as_str())
             .or_else(|| runner.map(|lease| lease.subject.as_str()))
             .unwrap_or(subject.as_str());
-        let mut lines = vec![format!("{canonical_subject} in {}:", client.target.display_name())];
+        let mut lines = vec![format!(
+            "{canonical_subject} in {}:",
+            client.target.display_name()
+        )];
         for attachment in attachments {
             lines.push(format!(
                 "  {} · {} · {} · acknowledged event {}",
@@ -1108,10 +1125,7 @@ impl EventLoop {
         };
         if let Err(error) = self
             .program_runtime
-            .hydrate_reducible_state_if_newer(
-                bootstrap.checkpoint,
-                bootstrap.runtime_revision,
-            )
+            .hydrate_reducible_state_if_newer(bootstrap.checkpoint, bootstrap.runtime_revision)
             .await
         {
             let _ = ipc.brain_release_runner(&brain, lease.lease_id).await;
@@ -1354,12 +1368,8 @@ mod brain_handler_tests {
 
         snapshot.runner_lease.as_mut().unwrap().expires_ms = 0;
         assert_eq!(
-            reconnect_runner_lease_id(
-                Some(observed_id),
-                &snapshot,
-                "runner/frontend-stable"
-            )
-            .unwrap(),
+            reconnect_runner_lease_id(Some(observed_id), &snapshot, "runner/frontend-stable")
+                .unwrap(),
             None
         );
 
@@ -1371,13 +1381,10 @@ mod brain_handler_tests {
             expires_ms: u64::MAX,
         };
         let snapshot = test_runner_snapshot(Some(foreign), Vec::new());
-        let error = reconnect_runner_lease_id(
-            Some(observed_id),
-            &snapshot,
-            "runner/frontend-stable",
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            reconnect_runner_lease_id(Some(observed_id), &snapshot, "runner/frontend-stable")
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("another subject"));
     }
 
@@ -1415,9 +1422,7 @@ mod brain_handler_tests {
             expires_ms: 20,
         };
         let events = vec![
-            test_runner_event(crate::brain::BrainEventKind::RunnerHandoffRequested {
-                handoff,
-            }),
+            test_runner_event(crate::brain::BrainEventKind::RunnerHandoffRequested { handoff }),
             test_runner_event(crate::brain::BrainEventKind::RunnerHandoffCompleted {
                 handoff_id,
                 lease: target_lease.clone(),
@@ -1456,9 +1461,7 @@ mod brain_handler_tests {
         }
     }
 
-    fn test_runner_event(
-        kind: crate::brain::BrainEventKind,
-    ) -> crate::brain::BrainEvent {
+    fn test_runner_event(kind: crate::brain::BrainEventKind) -> crate::brain::BrainEvent {
         crate::brain::BrainEvent {
             schema_version: 1,
             brain_id: crate::brain::BrainId(uuid::Uuid::new_v4()),
