@@ -28,21 +28,6 @@ use crate::tools::{LiveOutput, LiveOutputSink, ToolUse};
 
 use super::events::ReplEvent;
 
-/// True when the REPL must show an AskUser dialog before this tool runs.
-///
-/// `AutoAccept` skips the dialog; `PermissionManager` Deny still applies inside
-/// `ToolExecutor::execute_tool`. Effect auto-approval (read/pure) and stored
-/// session/persistent signatures also skip it in every mode.
-pub(crate) fn tool_requires_repl_approval_dialog(
-    mode: &ReplMode,
-    is_effect_auto_approved: bool,
-    approval_source: crate::tools::ApprovalSource,
-) -> bool {
-    !is_effect_auto_approved
-        && !mode.auto_accepts_host_effects()
-        && matches!(approval_source, crate::tools::ApprovalSource::NotApproved)
-}
-
 /// Coordinates concurrent tool execution for the event loop
 #[derive(Clone)]
 pub struct ToolExecutionCoordinator {
@@ -321,11 +306,12 @@ impl ToolExecutionCoordinator {
             )
             .runs_autonomously();
 
-            let needs_approval = tool_requires_repl_approval_dialog(
-                &*repl_mode.read().await,
-                is_auto_approved,
-                approval_source,
-            );
+            // AutoAccept does not skip here. Named-Brain turns must still
+            // emit ToolApprovalNeeded so the event-loop presenter can record
+            // ApprovalRequested and round-trip the daemon. The dialog waiver
+            // lives in `handle_tool_approval_request` after that route.
+            let needs_approval = !is_auto_approved
+                && matches!(approval_source, crate::tools::ApprovalSource::NotApproved);
 
             if needs_approval {
                 // Request approval from user (non-blocking for other queries)
@@ -539,8 +525,7 @@ mod tests {
     use crate::providers::{ContentBlock, Message};
     use crate::theme::ColorScheme;
     use crate::tools::{
-        ApprovalSource, PermissionManager, Tool, ToolExecutor, ToolInputSchema, ToolRegistry,
-        ToolUse,
+        PermissionManager, Tool, ToolExecutor, ToolInputSchema, ToolRegistry, ToolUse,
     };
 
     struct AutoAcceptWriteProbe;
@@ -570,35 +555,6 @@ mod tests {
         ) -> anyhow::Result<String> {
             Ok("auto-accepted-write".to_string())
         }
-    }
-
-    #[test]
-    fn test_auto_accept_skips_repl_approval_dialog_for_unclassified_host_effects() {
-        assert!(
-            !tool_requires_repl_approval_dialog(
-                &ReplMode::AutoAccept,
-                false,
-                ApprovalSource::NotApproved
-            ),
-            "AutoAccept must skip the REPL AskUser dialog for host-effect tools \
-             and unclassified programs; PermissionManager Deny still applies later"
-        );
-        assert!(
-            tool_requires_repl_approval_dialog(
-                &ReplMode::Normal,
-                false,
-                ApprovalSource::NotApproved
-            ),
-            "Normal must still show the REPL AskUser dialog for host-effect tools"
-        );
-        assert!(
-            !tool_requires_repl_approval_dialog(
-                &ReplMode::Normal,
-                true,
-                ApprovalSource::NotApproved
-            ),
-            "read/pure tools skip the dialog in every mode"
-        );
     }
 
     fn coordinator_with_write_probe(
@@ -667,25 +623,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auto_accept_executes_write_without_tool_approval_event() {
+    async fn test_auto_accept_still_emits_tool_approval_needed_for_named_brain_route() {
         let (coordinator, mut events, _tempdir) =
             coordinator_with_write_probe(ReplMode::AutoAccept);
         let event = spawn_write_probe(&coordinator, &mut events).await;
         match event {
-            ReplEvent::ToolResult { result, .. } => {
-                let output = result.expect("auto-accepted write must execute");
+            ReplEvent::ToolApprovalNeeded { tool_use, .. } => {
                 assert_eq!(
-                    output, "auto-accepted-write",
-                    "AutoAccept must skip ToolApprovalNeeded and run the write probe; output={output:?}"
+                    tool_use.name, "write",
+                    "AutoAccept must still emit ToolApprovalNeeded so the event-loop \
+                     presenter can record named-Brain ApprovalRequested; tool={:?}",
+                    tool_use.name
                 );
             }
-            ReplEvent::ToolApprovalNeeded { .. } => {
-                panic!(
-                    "AutoAccept must not emit ToolApprovalNeeded for write; \
-                     that is the dialog that blocked dogfood programs and edits"
-                );
-            }
-            other => panic!("unexpected event while auto-accepting write: {other:?}"),
+            other => panic!("AutoAccept must not skip ToolApprovalNeeded at spawn; got {other:?}"),
         }
     }
 
