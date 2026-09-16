@@ -405,9 +405,11 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 created="$scratch/created-home"
 phase=sealed-proof-and-endpoints
-FINCH_TEST_BRAIN_ADDR=127.0.0.1:11436 FINCH_TEST_DAEMON_ADDR=127.0.0.1:11435 \
-FINCH_TEST_BRAIN_PASSWORD=ambient-password FINCH_CREATED_HOME="$created" \
-FINCH_PROOF_HELPER="$repo_root/scripts/lib/brain_test_isolation.sh" run_isolated bash -ec '
+if ! FINCH_TEST_BRAIN_ADDR=127.0.0.1:11436 FINCH_TEST_DAEMON_ADDR=127.0.0.1:11435 \
+  FINCH_TEST_BRAIN_PASSWORD=ambient-password FINCH_CREATED_HOME="$created" \
+  FINCH_PROOF_HELPER="$repo_root/scripts/lib/brain_test_isolation.sh" \
+  run_isolated bash -exc '
+  exec 2>"'"$scratch"'/sealed-proof-child-stderr"
   source "$FINCH_PROOF_HELPER"
   brain_test_isolation_is_active
   test "$FINCH_BRAIN_TEST_ROOT" = "$HOME/.finch/brains"
@@ -423,7 +425,11 @@ FINCH_PROOF_HELPER="$repo_root/scripts/lib/brain_test_isolation.sh" run_isolated
   if sh -c ": >/dev/fd/108"; then exit 1; fi
   printf "%s\n" "$HOME" >"$FINCH_CREATED_HOME"
   printf test >"$FINCH_BRAIN_TEST_ROOT/test-created"
-'
+'; then
+  echo '--- sealed-proof-and-endpoints child stderr (trace + failure) ---' >&2
+  cat "$scratch/sealed-proof-child-stderr" >&2
+  exit 1
+fi
 isolated_home="$(cat "$created")"
 test ! -e "$isolated_home"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
