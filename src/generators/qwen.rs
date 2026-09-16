@@ -6,47 +6,32 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::local::LocalGenerator;
-use crate::models::TextTokenizer;
 use crate::models::{ToolCallParser, ToolPromptFormatter};
 use crate::providers::{ContentBlock, Message};
-use crate::tools::ToolExecutor;
-use crate::tools::ToolUse as ToolsToolUse;
-use crate::tools::{ToolDefinition, ToolResult}; // Import with alias to avoid confusion
+use crate::tools::ToolDefinition;
 
 use super::{
-    Generator,
-    GeneratorCapabilities,
-    GeneratorResponse,
-    ResponseMetadata,
-    StreamChunk,
-    ToolUse as GenToolUse, // Use the generator's ToolUse type
+    Generator, GeneratorCapabilities, GeneratorResponse, ResponseMetadata, StreamChunk, ToolUse,
 };
 
-/// Qwen local generator implementation
+/// Qwen local generator implementation.
+///
+/// Parses local tool markup and returns semantic [`ToolUse`] values. It does
+/// not own or invoke a tool executor; the event loop executes tools.
 pub struct QwenGenerator {
     local_generator: Arc<RwLock<LocalGenerator>>,
-    tokenizer: Arc<TextTokenizer>,
-    tool_executor: Option<Arc<tokio::sync::Mutex<ToolExecutor>>>,
     capabilities: GeneratorCapabilities,
 }
 
 impl QwenGenerator {
-    pub fn new(
-        local_generator: Arc<RwLock<LocalGenerator>>,
-        tokenizer: Arc<TextTokenizer>,
-        tool_executor: Option<Arc<tokio::sync::Mutex<ToolExecutor>>>,
-    ) -> Self {
-        let supports_tools = tool_executor.is_some();
-
+    pub fn new(local_generator: Arc<RwLock<LocalGenerator>>) -> Self {
         Self {
             local_generator,
-            tokenizer,
-            tool_executor,
             capabilities: GeneratorCapabilities {
-                supports_streaming: false,             // Qwen blocks (for now)
-                supports_tools,                        // Enable if executor provided
-                supports_conversation: supports_tools, // Enable multi-turn if tools enabled
-                max_context_messages: Some(5),         // Limit context to prevent token overflow
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(5),
             },
         }
     }
@@ -59,13 +44,9 @@ impl Generator for QwenGenerator {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<GeneratorResponse> {
-        // If tools provided and executor available, use multi-turn tool loop
-        if let Some(tools) = tools {
-            if self.tool_executor.is_some() {
-                return self.generate_with_tools(messages, tools).await;
-            }
+        if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
+            return self.generate_proposing_tools(messages, tools).await;
         }
-        // Simple single-turn generation (no tools)
         self.generate_single_turn(messages).await
     }
 
@@ -156,115 +137,19 @@ impl QwenGenerator {
         })
     }
 
-    /// Generate with tool support (multi-turn loop)
-    async fn generate_with_tools(
+    /// Generate one turn and return parsed tool calls without executing them.
+    async fn generate_proposing_tools(
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
     ) -> Result<GeneratorResponse> {
-        let max_turns = 5; // Prevent infinite loops
-        let mut conversation_history = messages;
-        let mut all_tool_uses: Vec<GenToolUse> = Vec::new(); // Use generator's ToolUse type
-
-        for turn in 0..max_turns {
-            tracing::debug!("Tool execution turn {}/{}", turn + 1, max_turns);
-
-            // 1. Format prompt with tools in system message
-            let prompt = self.format_prompt_with_tools(&conversation_history, &tools)?;
-
-            // 2. Generate response
-            let output = self.generate_text(&prompt).await?;
-
-            tracing::debug!(
-                "Generated output ({} chars): {}",
-                output.len(),
-                &output[..output.len().min(100)]
-            );
-
-            // 3. Check for tool calls
-            if !ToolCallParser::has_tool_calls(&output) {
-                // No tools → final answer
-                let text = ToolCallParser::extract_text(&output);
-                tracing::info!("No tool calls found, returning final answer");
-
-                let model_display_name = {
-                    let gen = self.local_generator.read().await;
-                    gen.model_name().to_string()
-                };
-                return Ok(GeneratorResponse {
-                    text: text.clone(),
-                    content_blocks: vec![ContentBlock::Text { text: text.clone() }],
-                    tool_uses: all_tool_uses,
-                    metadata: ResponseMetadata {
-                        generator: "local".to_string(),
-                        model: model_display_name,
-                        confidence: Some(0.8),
-                        stop_reason: Some("end_turn".to_string()),
-                        input_tokens: None,
-                        output_tokens: Some(text.split_whitespace().count() as u32),
-                        latency_ms: None,
-                        primary_allowance_used_percent: None,
-                        secondary_allowance_used_percent: None,
-                    },
-                });
-            }
-
-            // 4. Parse tool calls (returns tools::types::ToolUse)
-            let tool_calls: Vec<ToolsToolUse> =
-                ToolCallParser::parse(&output).context("Failed to parse tool calls from output")?;
-
-            tracing::info!("Parsed {} tool call(s)", tool_calls.len());
-
-            // Convert tools::types::ToolUse to generators::ToolUse
-            for tc in &tool_calls {
-                all_tool_uses.push(GenToolUse {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    input: tc.input.clone(),
-                });
-            }
-
-            // 5. Execute tools
-            let tool_results = self.execute_tools(&all_tool_uses).await?;
-
-            // 6. Add assistant message with tool_use blocks
-            let assistant_content: Vec<ContentBlock> = all_tool_uses
-                .iter()
-                .map(|tu| ContentBlock::ToolUse {
-                    id: tu.id.clone(),
-                    name: tu.name.clone(),
-                    input: tu.input.clone(),
-                })
-                .collect();
-
-            conversation_history.push(Message {
-                role: "assistant".to_string(),
-                content: assistant_content,
-            });
-
-            // 7. Add user message with tool_result blocks
-            let result_content: Vec<ContentBlock> = tool_results
-                .iter()
-                .map(|tr| ContentBlock::ToolResult {
-                    tool_use_id: tr.tool_use_id.clone(),
-                    content: tr.content.clone(),
-                    is_error: Some(tr.is_error),
-                })
-                .collect();
-
-            conversation_history.push(Message {
-                role: "user".to_string(),
-                content: result_content,
-            });
-
-            // Loop: continue with updated conversation
-        }
-
-        // Max turns exceeded
-        Err(anyhow::anyhow!(
-            "Maximum tool use turns ({}) exceeded",
-            max_turns
-        ))
+        let prompt = self.format_prompt_with_tools(&messages, &tools)?;
+        let output = self.generate_text(&prompt).await?;
+        let model_display_name = {
+            let gen = self.local_generator.read().await;
+            gen.model_name().to_string()
+        };
+        proposal_from_output(&output, &model_display_name)
     }
 
     /// Format prompt with tool definitions in system message
@@ -344,56 +229,6 @@ impl QwenGenerator {
         Ok(prompt)
     }
 
-    /// Execute a list of tool calls
-    async fn execute_tools(&self, tool_calls: &[GenToolUse]) -> Result<Vec<ToolResult>> {
-        let tool_executor = self
-            .tool_executor
-            .as_ref()
-            .context("Tool executor not available")?;
-
-        let mut results = Vec::new();
-
-        let executor = tool_executor.lock().await;
-
-        for gen_tool_use in tool_calls {
-            tracing::info!(
-                "Executing tool: {} ({})",
-                gen_tool_use.name,
-                gen_tool_use.id
-            );
-
-            // Convert generator ToolUse to executor ToolUse
-            let tool_use = ToolsToolUse {
-                id: gen_tool_use.id.clone(),
-                name: gen_tool_use.name.clone(),
-                input: gen_tool_use.input.clone(),
-            };
-
-            // Execute tool (note: ToolExecutor has execute_tool method)
-            let result = executor
-                .execute_tool(
-                    &tool_use,
-                    None,                                    // conversation
-                    None::<fn() -> Result<()>>,              // save_models_fn
-                    None,                                    // batch_trainer
-                    Some(Arc::clone(&self.local_generator)), // local_generator (for query_local tool)
-                    Some(Arc::clone(&self.tokenizer)),       // tokenizer
-                    None,                                    // repl_mode
-                    None,                                    // plan_content
-                    None,                                    // live_output
-                    None,                                    // effect_audit
-                )
-                .await
-                .unwrap_or_else(|e| {
-                    ToolResult::error(tool_use.id.clone(), format!("Tool execution failed: {}", e))
-                });
-
-            results.push(result);
-        }
-
-        Ok(results)
-    }
-
     /// Low-level text generation (synchronous, blocking)
     async fn generate_text(&self, prompt: &str) -> Result<String> {
         let local_generator = Arc::clone(&self.local_generator);
@@ -408,5 +243,103 @@ impl QwenGenerator {
         })
         .await
         .context("Failed to spawn blocking task")?
+    }
+}
+
+/// Parse local model output into a generator response without executing tools.
+fn proposal_from_output(output: &str, model: &str) -> Result<GeneratorResponse> {
+    if !ToolCallParser::has_tool_calls(output) {
+        let text = ToolCallParser::extract_text(output);
+        return Ok(GeneratorResponse {
+            text: text.clone(),
+            content_blocks: vec![ContentBlock::Text { text: text.clone() }],
+            tool_uses: vec![],
+            metadata: ResponseMetadata {
+                generator: "local".to_string(),
+                model: model.to_string(),
+                confidence: Some(0.8),
+                stop_reason: Some("end_turn".to_string()),
+                input_tokens: None,
+                output_tokens: Some(text.split_whitespace().count() as u32),
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        });
+    }
+
+    let parsed = ToolCallParser::parse(output)
+        .context("Failed to parse tool calls from local model output")?;
+    let mut content_blocks = Vec::new();
+    let text = ToolCallParser::extract_text(output);
+    if !text.is_empty() {
+        content_blocks.push(ContentBlock::Text { text: text.clone() });
+    }
+    let tool_uses: Vec<ToolUse> = parsed
+        .into_iter()
+        .map(|call| {
+            content_blocks.push(ContentBlock::ToolUse {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
+            });
+            ToolUse {
+                id: call.id,
+                name: call.name,
+                input: call.input,
+            }
+        })
+        .collect();
+
+    Ok(GeneratorResponse {
+        text,
+        content_blocks,
+        tool_uses,
+        metadata: ResponseMetadata {
+            generator: "local".to_string(),
+            model: model.to_string(),
+            confidence: Some(0.8),
+            stop_reason: Some("tool_use".to_string()),
+            input_tokens: None,
+            output_tokens: Some(output.split_whitespace().count() as u32),
+            latency_ms: None,
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_local_tool_markup_becomes_tool_uses_without_executing() {
+        let output = r#"I'll read that file.
+
+<tool_use>
+  <name>read</name>
+  <parameters>{"file_path": "/tmp/a.rs"}</parameters>
+</tool_use>
+"#;
+        let response = proposal_from_output(output, "Qwen2.5").expect("parse local tool markup");
+        assert_eq!(
+            response.metadata.stop_reason.as_deref(),
+            Some("tool_use"),
+            "tool markup must stop as tool_use, not end_turn: {response:?}"
+        );
+        assert_eq!(
+            response.tool_uses.len(),
+            1,
+            "expected one proposed tool call: {response:?}"
+        );
+        assert_eq!(response.tool_uses[0].name, "read");
+        assert_eq!(response.tool_uses[0].input["file_path"], "/tmp/a.rs");
+        assert_eq!(response.text.trim(), "I'll read that file.");
+        assert!(
+            !response.tool_uses[0].id.is_empty(),
+            "proposed tool call must carry an id for the event loop: {:?}",
+            response.tool_uses[0]
+        );
     }
 }

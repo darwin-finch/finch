@@ -90,8 +90,9 @@ fn adapter_streaming_does_not_construct_thinking_or_toolcall_events() {
     }
     assert!(
         hits.is_empty(),
-        "adapters must keep TextDelta + ContentBlockComplete in this extraction; \
-         ThinkingDelta/ToolCall* emission is #776/#777: {hits:?}"
+        "adapters must keep TextDelta + ContentBlockComplete; native \
+         ThinkingDelta/ToolCall* emission is #777 (finch-generation translates \
+         ContentBlockComplete(ToolUse)): {hits:?}"
     );
 }
 
