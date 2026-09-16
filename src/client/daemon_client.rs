@@ -634,6 +634,19 @@ impl DaemonClient {
             anyhow::bail!("Daemon health check failed: {}", response.status());
         }
 
+        let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+        let generation = crate::ipc::protocol_generation_from_health_json(&body);
+        anyhow::ensure!(
+            generation == crate::ipc::IPC_PROTOCOL_VERSION,
+            "{}",
+            crate::ipc::leftover_daemon_message(
+                crate::ipc::IPC_PROTOCOL_VERSION,
+                generation,
+                Some(crate::ipc::uptime_seconds_from_health_json(&body))
+                    .filter(|seconds| *seconds > 0),
+            )
+        );
+
         Ok(())
     }
 

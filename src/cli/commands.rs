@@ -87,6 +87,9 @@ pub enum Command {
     BrainHandoffAccept(Option<String>), // /brain handoff accept [handoff-id]
     BrainHandoffCancel(Option<String>), // /brain handoff cancel [handoff-id]
     BrainPassword(Option<String>), // /brain password [new-password]
+    BrainRunnerStatus,      // /brain runner status
+    BrainRunnerClaim,       // /brain runner claim
+    BrainRunnerRelease,     // /brain runner release
     // Execution graph
     Graph, // /graph — show causal trace of last query
     // Reviewable execution-plan operations
@@ -218,6 +221,9 @@ impl Command {
             "/brain handoff cancel" => return Some(Command::BrainHandoffCancel(None)),
             "/brain handoff identity" => return Some(Command::BrainHandoffIdentity),
             "/brain password" => return Some(Command::BrainPassword(None)),
+            "/brain runner" | "/brain runner status" => return Some(Command::BrainRunnerStatus),
+            "/brain runner claim" => return Some(Command::BrainRunnerClaim),
+            "/brain runner release" => return Some(Command::BrainRunnerRelease),
             "/graph" => return Some(Command::Graph),
             // Co-Forth VM
             "/stack" | "/stack list" | "/stack show" => return Some(Command::StackShow),
@@ -648,7 +654,10 @@ pub fn handle_command(
         | Command::BrainHandoffIdentity
         | Command::BrainHandoffAccept(_)
         | Command::BrainHandoffCancel(_)
-        | Command::BrainPassword(_) => Ok(CommandOutput::Status(
+        | Command::BrainPassword(_)
+        | Command::BrainRunnerStatus
+        | Command::BrainRunnerClaim
+        | Command::BrainRunnerRelease => Ok(CommandOutput::Status(
             "Brain commands should be handled in REPL.".to_string(),
         )),
         // Graph command is handled directly in REPL
@@ -837,6 +846,9 @@ pub fn format_help() -> String {
          {cyan}  /brain handoff cancel [id]{reset} Cancel a pending transfer\n\
          {cyan}  /brain archive <name>{reset} Remove an inactive Brain but preserve its log\n\
          {cyan}  /brain password [new]{reset} Show or rotate the local brain credential\n\
+         {cyan}  /brain runner status{reset} Explain runner owner, lease, queued runs, and recovery\n\
+         {cyan}  /brain runner claim{reset}  Run this Brain here when no live lease exists\n\
+         {cyan}  /brain runner release{reset} Release this frontend's runner lease\n\
          {reset}\n\
          {gray}  A Brain is one durable session; agents and scheduled work are runs within it.{reset}\n\n\
          {yellow_bold}📚 Learn More:{reset}\n\
@@ -1315,6 +1327,24 @@ mod tests {
             Command::parse("/brain handoff cancel"),
             Some(Command::BrainHandoffCancel(None))
         ));
+        assert!(matches!(
+            Command::parse("/brain runner"),
+            Some(Command::BrainRunnerStatus)
+        ));
+        assert!(matches!(
+            Command::parse("/brain runner status"),
+            Some(Command::BrainRunnerStatus)
+        ));
+        assert!(matches!(
+            Command::parse("/brain runner claim"),
+            Some(Command::BrainRunnerClaim)
+        ));
+        assert!(matches!(
+            Command::parse("/brain runner release"),
+            Some(Command::BrainRunnerRelease)
+        ));
+        assert!(format_help().contains("/brain runner status"));
+        assert!(format_help().contains("/brain runner claim"));
         assert!(format_help().contains("/brain list"));
         assert!(format_help().contains("/brain attach <name>"));
         assert!(format_help().contains("/brain join <name@machine[:port]> <invite>"));

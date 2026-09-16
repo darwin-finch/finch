@@ -419,6 +419,24 @@ impl CommandRegistry {
                     category: CommandCategory::Brain,
                 },
                 CommandSpec {
+                    name: "/brain runner status",
+                    params: None,
+                    description: "Explain runner owner, lease, queued runs, and next recovery action",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain runner claim",
+                    params: None,
+                    description: "Run this Brain here when no live lease exists",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain runner release",
+                    params: None,
+                    description: "Release this frontend's environment-runner lease",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
                     name: "/brain password",
                     params: Some("[new]"),
                     description: "Show or rotate the local Brain credential",

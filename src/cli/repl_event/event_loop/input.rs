@@ -623,6 +623,23 @@ Rules:\n\
                     Command::BrainPassword(password) => {
                         self.handle_brain_password(password).await?;
                     }
+                    Command::BrainRunnerStatus => {
+                        self.handle_brain_runner_status().await?;
+                    }
+                    Command::BrainRunnerClaim => {
+                        if let Err(error) = self.handle_brain_runner_claim().await {
+                            self.output_manager
+                                .write_info(format!("brain runner claim: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
+                    Command::BrainRunnerRelease => {
+                        if let Err(error) = self.handle_brain_runner_release().await {
+                            self.output_manager
+                                .write_info(format!("brain runner release: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
                     Command::Accept(prefix) => {
                         self.handle_accept(prefix).await?;
                     }

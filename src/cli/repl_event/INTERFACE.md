@@ -131,6 +131,7 @@ pub mod parts;
 pub mod plan_handler;
 pub mod query_processor;
 pub mod query_state;
+pub(crate) mod runner_recovery;
 pub mod tool_display;
 pub mod tool_execution;
 ```

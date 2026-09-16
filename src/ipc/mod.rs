@@ -40,6 +40,122 @@ pub use transport::DAEMON_SOCK_PATH;
 /// runner-result delivery and exposes `pendingDelivery` / cursor ack.
 pub const IPC_PROTOCOL_VERSION: u32 = 9;
 
+/// Short package identity advertised on `/health` and IPC ping.
+pub fn package_identity() -> &'static str {
+    concat!("finch ", env!("CARGO_PKG_VERSION"))
+}
+
+/// Protocol generation advertised by a running daemon's `/health` document.
+///
+/// Older daemons omit the field. Missing or unreadable values stay at 0 so a
+/// newer frontend fails closed instead of treating HTTP 200 as compatibility.
+pub fn protocol_generation_from_health_json(value: &serde_json::Value) -> u32 {
+    value
+        .get("protocol_generation")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32
+}
+
+/// Uptime from a `/health` document, or 0 when the field is absent.
+pub fn uptime_seconds_from_health_json(value: &serde_json::Value) -> u64 {
+    value
+        .get("uptime_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// One human leftover-daemon error naming both generations and the kick command.
+pub fn leftover_daemon_message(
+    frontend_generation: u32,
+    daemon_generation: u32,
+    uptime_seconds: Option<u64>,
+) -> String {
+    let uptime = uptime_seconds
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| format!(" (up for {})", format_uptime(seconds)))
+        .unwrap_or_default();
+    format!(
+        "This Finch speaks protocol {frontend_generation}; the running daemon speaks {daemon_generation}{uptime}. Stop it with: finch daemon-stop"
+    )
+}
+
+fn format_uptime(seconds: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if seconds >= DAY {
+        let days = seconds / DAY;
+        let hours = (seconds % DAY) / HOUR;
+        if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d {hours}h")
+        }
+    } else if seconds >= HOUR {
+        let hours = seconds / HOUR;
+        let minutes = (seconds % HOUR) / MINUTE;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        }
+    } else if seconds >= MINUTE {
+        format!("{}m", seconds / MINUTE)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod health_advertisement_tests {
+    use super::*;
+
+    #[test]
+    fn omitted_health_protocol_generation_fails_closed_at_zero() {
+        let body = serde_json::json!({
+            "status": "healthy",
+            "uptime_seconds": 7200,
+            "named_brains": 1
+        });
+        assert_eq!(
+            protocol_generation_from_health_json(&body),
+            0,
+            "older daemons omit protocol_generation; HTTP 200 must not be treated as compatibility. body={body}"
+        );
+        assert_eq!(uptime_seconds_from_health_json(&body), 7200);
+        let message = leftover_daemon_message(IPC_PROTOCOL_VERSION, 0, Some(7200));
+        assert!(
+            message.contains(&format!("protocol {IPC_PROTOCOL_VERSION}")),
+            "leftover error must name this Finch generation; message={message}"
+        );
+        assert!(
+            message.contains("speaks 0"),
+            "leftover error must name the running daemon generation; message={message}"
+        );
+        assert!(
+            message.contains("up for 2h"),
+            "leftover error must include uptime; message={message}"
+        );
+        assert!(
+            message.contains("finch daemon-stop"),
+            "leftover error must name the exact kick command; message={message}"
+        );
+    }
+
+    #[test]
+    fn advertised_health_protocol_generation_is_read_verbatim() {
+        let body = serde_json::json!({
+            "protocol_generation": IPC_PROTOCOL_VERSION,
+            "uptime_seconds": 12,
+            "package_identity": package_identity(),
+        });
+        assert_eq!(
+            protocol_generation_from_health_json(&body),
+            IPC_PROTOCOL_VERSION
+        );
+    }
+}
+
 #[cfg(test)]
 mod codec_boundary_tests {
     use super::{

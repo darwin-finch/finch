@@ -2646,12 +2646,19 @@ pub struct StatusResponse {
 }
 
 /// Health check response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthStatus {
     pub status: String,
     pub uptime_seconds: u64,
     pub named_brains: usize,
     pub pending_brain_terminalizations: usize,
+    /// Cap'n Proto compatibility generation. Older daemons omit this field;
+    /// clients treat a missing value as 0 and refuse reuse.
+    #[serde(default)]
+    pub protocol_generation: u32,
+    /// Short package/build identity, e.g. `finch 0.7.30`.
+    #[serde(default)]
+    pub package_identity: String,
 }
 
 /// Application error wrapper for proper HTTP error responses

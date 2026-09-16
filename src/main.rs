@@ -1158,6 +1158,7 @@ async fn main() -> Result<()> {
     // Try to connect to daemon BEFORE creating Repl
     // This allows Repl to suppress local model logs if daemon is available
     use finch::client::{DaemonClient, DaemonConfig};
+    let mut leftover_daemon_error = None;
     let daemon_client = if use_daemon && config.client.use_daemon {
         // The health probe behind this connect is what gates every launch:
         // GET /health, under a 500 ms client timeout whose expiry costs an
@@ -1175,9 +1176,20 @@ async fn main() -> Result<()> {
                 phase.detail(finch::startup::PhaseDetail::category("connected"));
                 Some(Arc::new(client))
             }
-            Err(_e) => {
-                phase.detail(finch::startup::PhaseDetail::category("unavailable"));
-                tracing::debug!("Failed to connect to daemon: {}", _e);
+            Err(error) => {
+                let message = error.to_string();
+                let leftover = message.contains("finch daemon-stop");
+                phase.detail(finch::startup::PhaseDetail::category(if leftover {
+                    "incompatible"
+                } else {
+                    "unavailable"
+                }));
+                if leftover {
+                    tracing::warn!("leftover daemon refused at health probe: {error}");
+                    leftover_daemon_error = Some(message);
+                } else {
+                    tracing::debug!("Failed to connect to daemon: {error}");
+                }
                 None
             }
         }
@@ -1256,12 +1268,27 @@ async fn main() -> Result<()> {
                 let mut phase = finch::startup::phase(finch::startup::PHASE_IPC_CONNECT);
                 match finch::ipc::IpcClient::connect().await {
                     Ok(ipc) => {
-                        phase.detail(finch::startup::PhaseDetail::category("connected"));
-                        repl.set_ipc_client(ipc)
+                        if let Some(error) = leftover_daemon_error.take() {
+                            phase.detail(finch::startup::PhaseDetail::category("incompatible"));
+                            drop(ipc);
+                            repl.set_daemon_ipc_error(error);
+                        } else {
+                            phase.detail(finch::startup::PhaseDetail::category("connected"));
+                            repl.set_ipc_client(ipc);
+                        }
                     }
                     Err(error) => {
-                        phase.detail(finch::startup::PhaseDetail::category("unavailable"));
-                        repl.set_daemon_ipc_error(error.to_string())
+                        let message = leftover_daemon_error
+                            .take()
+                            .unwrap_or_else(|| error.to_string());
+                        phase.detail(finch::startup::PhaseDetail::category(
+                            if message.contains("finch daemon-stop") {
+                                "incompatible"
+                            } else {
+                                "unavailable"
+                            },
+                        ));
+                        repl.set_daemon_ipc_error(message);
                     }
                 }
             }
@@ -1448,6 +1475,10 @@ async fn run_daemon_status() -> Result<()> {
         status: String,
         uptime_seconds: u64,
         named_brains: usize,
+        #[serde(default)]
+        protocol_generation: u32,
+        #[serde(default)]
+        package_identity: String,
     }
 
     let health: HealthStatus = response
@@ -1463,6 +1494,15 @@ async fn run_daemon_status() -> Result<()> {
     println!("  PID:             {}", pid);
     println!("  Uptime:          {}s", health.uptime_seconds);
     println!("  Named Brains:    {}", health.named_brains);
+    println!(
+        "  Protocol:        {} ({})",
+        health.protocol_generation,
+        if health.package_identity.is_empty() {
+            "unknown build"
+        } else {
+            health.package_identity.as_str()
+        }
+    );
     println!("  Bind Address:    {}", finch::config::DEFAULT_DAEMON_ADDR);
     println!();
 

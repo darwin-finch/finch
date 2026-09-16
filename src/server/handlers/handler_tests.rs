@@ -5544,6 +5544,18 @@ async fn test_health_probe_counts_brains_without_hydrating_the_store() {
         Some(BRAINS as u64),
         "/health must still report the whole Brain population; body was {body}"
     );
+    assert_eq!(
+        body.get("protocol_generation")
+            .and_then(serde_json::Value::as_u64),
+        Some(crate::ipc::IPC_PROTOCOL_VERSION as u64),
+        "/health must advertise protocol generation so reuse is not HTTP-200-only; body was {body}"
+    );
+    assert_eq!(
+        body.get("package_identity")
+            .and_then(serde_json::Value::as_str),
+        Some(crate::ipc::package_identity()),
+        "/health must advertise a short package identity; body was {body}"
+    );
 
     let resident = server.brain_store().resident_brain_count();
     assert_eq!(

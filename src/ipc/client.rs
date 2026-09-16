@@ -795,7 +795,8 @@ fn ensure_compatible_protocol(protocol_version: u32) -> Result<()> {
 fn ensure_protocol_generation(protocol_version: u32, required_version: u32) -> Result<()> {
     anyhow::ensure!(
         protocol_version == required_version,
-        "the running Finch daemon uses IPC protocol {protocol_version}, but this frontend requires {required_version}; restart the daemon with the rebuilt Finch binary",
+        "{}",
+        crate::ipc::leftover_daemon_message(required_version, protocol_version, None),
     );
     Ok(())
 }
@@ -1989,8 +1990,18 @@ mod tests {
         ensure_compatible_protocol(crate::ipc::IPC_PROTOCOL_VERSION).unwrap();
 
         let error = ensure_compatible_protocol(0).unwrap_err().to_string();
-        assert!(error.contains("restart the daemon"));
-        assert!(error.contains("protocol 0"));
+        assert!(
+            error.contains("finch daemon-stop"),
+            "protocol mismatch must name the kick command; error={error}"
+        );
+        assert!(
+            error.contains("speaks 0"),
+            "protocol mismatch must name the running daemon generation; error={error}"
+        );
+        assert!(
+            error.contains(&format!("protocol {}", crate::ipc::IPC_PROTOCOL_VERSION)),
+            "protocol mismatch must name this Finch generation; error={error}"
+        );
     }
 
     #[test]
@@ -2009,9 +2020,18 @@ mod tests {
             });
             let client = IpcClient::from_test_client(daemon);
             let error = client.ping().await.unwrap_err().to_string();
-            assert!(error.contains("protocol 8"));
-            assert!(error.contains("requires 9"));
-            assert!(error.contains("restart the daemon"));
+            assert!(
+                error.contains("speaks 8"),
+                "ping must name the leftover daemon generation; error={error}"
+            );
+            assert!(
+                error.contains("protocol 9"),
+                "ping must name this Finch generation; error={error}"
+            );
+            assert!(
+                error.contains("finch daemon-stop"),
+                "ping must name the kick command; error={error}"
+            );
             assert_eq!(old_daemon_calls.get(), 0);
 
             let new_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -2025,9 +2045,18 @@ mod tests {
             let error = ensure_protocol_generation(protocol_version, 7)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("protocol 8"));
-            assert!(error.contains("requires 7"));
-            assert!(error.contains("restart the daemon"));
+            assert!(
+                error.contains("speaks 8"),
+                "generation check must name the daemon protocol; error={error}"
+            );
+            assert!(
+                error.contains("protocol 7"),
+                "generation check must name the required protocol; error={error}"
+            );
+            assert!(
+                error.contains("finch daemon-stop"),
+                "generation check must name the kick command; error={error}"
+            );
             assert_eq!(new_daemon_calls.get(), 0);
         }));
     }

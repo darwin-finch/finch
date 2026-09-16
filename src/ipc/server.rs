@@ -1093,7 +1093,18 @@ impl brain_service::Server for BrainRpcService {
             params.get_ttl_ms(),
         ) {
             Ok(lease) => lease,
-            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+            Err(error) => {
+                tracing::warn!(
+                    brain = %brain,
+                    subject = %subject,
+                    machine = %environment.machine,
+                    workspace = %environment.workspace.display(),
+                    expected_protocol = crate::ipc::IPC_PROTOCOL_VERSION,
+                    error = %error,
+                    "rejected runner handshake"
+                );
+                return Promise::err(capnp::Error::failed(error.to_string()));
+            }
         };
         encode_runner_lease(results.get().init_lease(), &lease);
         Promise::ok(())
@@ -1528,7 +1539,15 @@ impl brain_service::Server for BrainRpcService {
             .claim_connection_identity(self.connection_id, &subject)
         {
             Ok(()) => Promise::ok(()),
-            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+            Err(error) => {
+                tracing::warn!(
+                    subject = %subject,
+                    expected_protocol = crate::ipc::IPC_PROTOCOL_VERSION,
+                    error = %error,
+                    "rejected runner identity claim"
+                );
+                Promise::err(capnp::Error::failed(error.to_string()))
+            }
         }
     }
 }
