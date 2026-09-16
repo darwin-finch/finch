@@ -311,8 +311,8 @@ if [[ "$shell_wrong_digest_status" -eq 0 ]]; then
   echo "shell supervisor-profile validation accepted bytes under a false digest name" >&2
   exit 1
 fi
-if [[ "$(cat "$shell_wrong_digest_diagnostic")" != \
-  'Brain test shell authority rejected: supervisor-content-path-binding' ]]; then
+if ! grep -Fxq 'Brain test shell authority rejected: supervisor-content-path-binding' \
+  "$shell_wrong_digest_diagnostic"; then
   echo "shell supervisor-profile validation rejected the false digest name for an unrelated reason" >&2
   sed 's/^/shell diagnostic: /' "$shell_wrong_digest_diagnostic" >&2
   exit 1
@@ -930,6 +930,101 @@ if [[ -n "$(find "$temp_parent" -mindepth 1 -print -quit)" ]]; then
   find "$temp_parent" -mindepth 1 -maxdepth 2 -print >&2
   exit 1
 fi
+
+# Force a post-Rust-verifier predicate failure and call the maintained
+# launcher path. `if brain_test_isolation_is_active` disables errexit, so a
+# rejected `listener-backup-authority` used to be overwritten by a later
+# successful check and the launcher accepted isolation with status 0 (#516).
+phase=post-verifier-listener-backup-rejection-fails-closed
+listener_reject_dir="$scratch/listener-reject"
+mkdir -p "$listener_reject_dir/bin" "$listener_reject_dir/fake-root/scripts"
+real_perl="$(command -v perl)"
+{
+  printf '%s\n' '#!/bin/bash' 'for arg in "$@"; do' '  case "$arg" in' \
+    '    *verify_listener*) exit 1 ;;' '  esac' 'done'
+  printf 'exec %q "$@"\n' "$real_perl"
+} >"$listener_reject_dir/bin/perl"
+chmod +x "$listener_reject_dir/bin/perl"
+: >"$listener_reject_dir/fake-root/scripts/dummy_launcher.sh"
+printf '%s\n' '#!/bin/bash' 'printf re-executed >"$FINCH_REEXEC_MARKER"' 'exit 42' \
+  >"$listener_reject_dir/fake-root/scripts/test_brains.sh"
+chmod +x "$listener_reject_dir/fake-root/scripts/test_brains.sh"
+listener_reject_probe="$scratch/listener-reject-probe"
+listener_reject_log="$scratch/listener-reject-log"
+listener_reject_identities="$scratch/listener-reject-identities"
+listener_reexec_marker="$scratch/listener-reject-reexec"
+listener_reject_status=0
+FINCH_TEST_PROOF_DIAGNOSTICS=1 \
+FINCH_TEST_LAUNCHER_PROBE_FILE="$listener_reject_probe" \
+FINCH_TEST_LAUNCHER_PROBE_ONLY=1 \
+FINCH_PROOF_HELPER="$repo_root/scripts/lib/brain_test_isolation.sh" \
+FINCH_DUMMY_LAUNCHER="$listener_reject_dir/fake-root/scripts/dummy_launcher.sh" \
+FINCH_HOSTILE_PERL_BIN="$listener_reject_dir/bin" \
+FINCH_IDENTITY_FILE="$listener_reject_identities" \
+FINCH_REEXEC_MARKER="$listener_reexec_marker" \
+  run_isolated bash -ec '
+    source "$FINCH_PROOF_HELPER"
+    {
+      printf "brain_addr=%s\n" "$FINCH_TEST_BRAIN_ADDR"
+      printf "daemon_addr=%s\n" "$FINCH_TEST_DAEMON_ADDR"
+      printf "socket=%s\n" "$FINCH_TEST_IPC_SOCKET"
+      printf "socket_root=%s\n" "$FINCH_TEST_SOCKET_ROOT"
+      printf "supervisor_pid=%s\n" "$FINCH_TEST_SUPERVISOR_PID"
+      printf "backup_fds=%s,%s,%s\n" \
+        "$FINCH_TEST_BRAIN_LISTENER_BACKUP_FD" \
+        "$FINCH_TEST_DAEMON_LISTENER_BACKUP_FD" \
+        "$FINCH_TEST_IPC_LISTENER_BACKUP_FD"
+      printf "home_identity=%s\n" "$(brain_isolation_file_identity "$HOME")"
+      printf "root_identity=%s\n" "$(brain_isolation_file_identity "$FINCH_BRAIN_TEST_ROOT")"
+      printf "socket_root_identity=%s\n" "$(brain_isolation_file_identity "$FINCH_TEST_SOCKET_ROOT")"
+      proof="$("$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof)"
+      printf "ipc_listener_identity=%s\n" "$(printf "%s\n" "$proof" | sed -n "12p")"
+      printf "isolated_home=%s\n" "$HOME"
+    } >"$FINCH_IDENTITY_FILE"
+    PATH="$FINCH_HOSTILE_PERL_BIN:$PATH"
+    export PATH
+    brain_test_isolation_reexec_launcher "$FINCH_DUMMY_LAUNCHER"
+  ' 2>"$listener_reject_log" || listener_reject_status=$?
+listener_reject_diag() {
+  echo "$1" >&2
+  echo "rejected-predicate-status=$listener_reject_status" >&2
+  if [[ -s "$listener_reject_identities" ]]; then
+    sed 's/^/proof\/listener identity: /' "$listener_reject_identities" >&2
+  else
+    echo 'proof/listener identity: <missing identity file>' >&2
+  fi
+  if [[ -s "$listener_reject_log" ]]; then
+    sed 's/^/launcher diagnostic: /' "$listener_reject_log" >&2
+  else
+    echo 'launcher diagnostic: <empty>' >&2
+  fi
+  if [[ -e "$listener_reject_probe" ]]; then
+    echo "accepted-isolation-home=$(cat "$listener_reject_probe")" >&2
+  fi
+  if [[ -e "$listener_reexec_marker" ]]; then
+    echo "reexec-marker=$(cat "$listener_reexec_marker")" >&2
+  fi
+}
+if [[ -e "$listener_reject_probe" ]]; then
+  listener_reject_diag "maintained launcher accepted isolation after listener-backup-authority rejected the inherited proof"
+  exit 1
+fi
+if [[ "$listener_reject_status" -ne 42 || "$(cat "$listener_reexec_marker" 2>/dev/null || true)" != re-executed ]]; then
+  listener_reject_diag "maintained launcher did not re-execute after listener-backup-authority rejection; expected stub status 42"
+  exit 1
+fi
+if ! grep -Fq 'Brain test shell authority rejected: listener-backup-authority' "$listener_reject_log"; then
+  listener_reject_diag "maintained launcher did not report the rejected listener-backup-authority predicate"
+  exit 1
+fi
+while IFS='=' read -r identity_key identity_value; do
+  [[ "$identity_key" != isolated_home ]] || continue
+  if [[ -z "$identity_value" ]] || ! grep -Fq "$identity_value" "$listener_reject_log"; then
+    listener_reject_diag "maintained launcher omitted proof/listener identity $identity_key=${identity_value:-<empty>} from the rejection diagnostic"
+    exit 1
+  fi
+done <"$listener_reject_identities"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 launchers=(demo_boot.sh smoke_vm_wire_provider.sh stress_test.sh test_persistence.sh test_server.sh test_tool_passthrough.sh test_tui_debug.sh)
 phase=launcher-probe-closure
