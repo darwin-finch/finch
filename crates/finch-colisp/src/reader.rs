@@ -11,6 +11,7 @@
 use anyhow::{bail, Result};
 use std::ops::Range;
 
+use super::lexicon::{lisp_atom_delimiter, lisp_lexicon};
 use super::types::Val;
 
 /// A reader value paired with the exact byte range that produced it.
@@ -319,8 +320,10 @@ fn tokenize(src: &str) -> Result<Vec<SpannedTok>> {
             continue;
         }
 
+        let lex = lisp_lexicon();
+
         // Line comment
-        if c == ';' {
+        if c == lex.line_comment {
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
@@ -328,14 +331,14 @@ fn tokenize(src: &str) -> Result<Vec<SpannedTok>> {
         }
 
         // Block comment #| … |#
-        if c == '#' && i + 1 < chars.len() && chars[i + 1] == '|' {
-            i += 2;
+        if starts_at(&chars, i, lex.block_comment_open) {
+            i += lex.block_comment_open.chars().count();
             loop {
-                if i + 1 >= chars.len() {
+                if i >= chars.len() {
                     bail!("unterminated block comment");
                 }
-                if chars[i] == '|' && chars[i + 1] == '#' {
-                    i += 2;
+                if starts_at(&chars, i, lex.block_comment_close) {
+                    i += lex.block_comment_close.chars().count();
                     break;
                 }
                 i += 1;
@@ -358,10 +361,10 @@ fn tokenize(src: &str) -> Result<Vec<SpannedTok>> {
         }
 
         let kind = match c {
-            '$' => {
+            ch if ch == lex.math_delimiter => {
                 i += 1;
                 let start = i;
-                while i < chars.len() && chars[i] != '$' {
+                while i < chars.len() && chars[i] != lex.math_delimiter {
                     i += 1;
                 }
                 if i >= chars.len() {
@@ -371,7 +374,7 @@ fn tokenize(src: &str) -> Result<Vec<SpannedTok>> {
                 i += 1; // consume closing '$'
                 Tok::MathVal(parse_math(math_src)?)
             }
-            '[' => {
+            ch if ch == lex.json_array_open => {
                 // JSON array literal — bracket-balanced span, parsed with serde_json.
                 let start = i;
                 let mut depth = 0usize;
@@ -412,7 +415,7 @@ fn tokenize(src: &str) -> Result<Vec<SpannedTok>> {
                     .map_err(|e| anyhow::anyhow!("JSON array literal: {e}"))?;
                 Tok::JsonVal(json_value_to_syntax(jv))
             }
-            '{' => {
+            ch if ch == lex.record_open => {
                 if brace_starts_typed_record(&chars, i) {
                     i += 1;
                     tokens.push(SpannedTok {
@@ -461,40 +464,40 @@ fn tokenize(src: &str) -> Result<Vec<SpannedTok>> {
                     .map_err(|e| anyhow::anyhow!("JSON literal: {e}"))?;
                 Tok::JsonVal(json_value_to_syntax(jv))
             }
-            ']' => {
+            ch if ch == lex.json_array_close => {
                 i += 1;
                 Tok::RBracket
             }
-            '}' => {
+            ch if ch == lex.record_close => {
                 i += 1;
                 Tok::RBrace
             }
-            '(' => {
+            ch if ch == lex.list_open => {
                 i += 1;
                 Tok::LParen
             }
-            ')' => {
+            ch if ch == lex.list_close => {
                 i += 1;
                 Tok::RParen
             }
-            '\'' => {
+            ch if ch == lex.quote => {
                 i += 1;
                 Tok::Quote
             }
-            '`' => {
+            ch if ch == lex.quasiquote => {
                 i += 1;
                 Tok::BackQuote
             }
-            ',' => {
-                if i + 1 < chars.len() && chars[i + 1] == '@' {
-                    i += 2;
+            ch if ch == lex.unquote => {
+                if starts_at(&chars, i, lex.unquote_splice) {
+                    i += lex.unquote_splice.chars().count();
                     Tok::CommaAt
                 } else {
                     i += 1;
                     Tok::Comma
                 }
             }
-            '"' => {
+            ch if ch == lex.string_delimiter => {
                 i += 1;
                 let mut s = String::new();
                 loop {
@@ -521,7 +524,7 @@ fn tokenize(src: &str) -> Result<Vec<SpannedTok>> {
                             }
                             i += 1;
                         }
-                        '"' => {
+                        ch if ch == lex.string_delimiter => {
                             i += 1;
                             break;
                         }
@@ -549,17 +552,7 @@ fn tokenize(src: &str) -> Result<Vec<SpannedTok>> {
                         i += 1;
                         continue;
                     }
-                    if ch.is_whitespace()
-                        || ch == '('
-                        || ch == ')'
-                        || ch == '{'
-                        || ch == '}'
-                        || ch == '"'
-                        || ch == ';'
-                        || ch == '\''
-                        || ch == '`'
-                        || (ch == ',' && angle_depth == 0)
-                    {
+                    if lisp_atom_delimiter(ch, angle_depth) {
                         break;
                     }
                     i += 1;
@@ -582,11 +575,22 @@ fn tokenize(src: &str) -> Result<Vec<SpannedTok>> {
     Ok(tokens)
 }
 
+fn starts_at(chars: &[char], start: usize, needle: &str) -> bool {
+    let mut index = start;
+    for expected in needle.chars() {
+        if chars.get(index) != Some(&expected) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 fn compact_braced_type_end(chars: &[char], start: usize) -> Option<usize> {
-    let has_type_prefix = ["record{", "variant{"].iter().any(|prefix| {
-        let prefix: Vec<char> = prefix.chars().collect();
-        chars.get(start..start + prefix.len()) == Some(prefix.as_slice())
-    });
+    let has_type_prefix = lisp_lexicon()
+        .compact_type_prefixes
+        .iter()
+        .any(|prefix| starts_at(chars, start, prefix));
     if !has_type_prefix {
         return None;
     }
@@ -941,6 +945,16 @@ mod tests {
                 "both projections must share grammar errors: source={source:?}, plain={plain:?}, spanned={spanned:?}"
             );
         }
+    }
+
+    #[test]
+    fn line_comment_uses_the_published_lexicon_marker() {
+        let src = format!("({} hidden\n)", lisp_lexicon().line_comment);
+        assert_eq!(
+            parse_str(&src).expect("lexicon line comments must be skipped by the tokenizer"),
+            vec![Val::Nil],
+            "the tokenizer must treat lisp_lexicon().line_comment as a comment, not an atom: {src:?}"
+        );
     }
 
     #[test]

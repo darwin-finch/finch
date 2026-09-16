@@ -103,11 +103,17 @@ impl Val {
     pub fn repr(&self) -> String;
     pub fn type_name(&self) -> &'static str;
 }
+/// Why a compact-wire submission was rejected before compilation.
+pub struct WireReject { … }
 ```
 
 ## Functions
 
 ```rust
+/// True when the published GBNF accepts `source` as a complete submission.
+pub fn accepts_published_grammar(source: &str) -> bool { … }
+/// Production-reader oracle for a complete compact-wire `ProgramSubmission`.
+pub fn accepts_wire_source(source: &str) -> Result<ProgramLanguage, WireReject> { … }
 /// Seal a complete function map and independently verify it. Re-exported from `finch-vm-core`.
 pub fn certify_module(name: impl Into<String>, entry: impl Into<String>, functions: BTreeMap<String, Function>, vocabulary: &Vocabulary) -> Result<ModuleVerified, Vec<VmDiagnostic>> { … }
 /// Compile source in `language` through the shared compiler pipeline.
@@ -128,6 +134,8 @@ pub fn parse_math(src: &str) -> Result<Val> { … }
 pub fn parse_str(src: &str) -> Result<Vec<Val>> { … }
 /// Parse all top-level expressions while retaining their source structure. Re-exported from `finch-colisp`.
 pub fn parse_str_spanned(src: &str) -> Result<Vec<SpannedVal>> { … }
+/// Render the canonical compact-wire GBNF from production reader lexicons.
+pub fn render_wire_gbnf() -> String { … }
 ```
 
 ## Constants
@@ -135,4 +143,8 @@ pub fn parse_str_spanned(src: &str) -> Result<Vec<SpannedVal>> { … }
 ```rust
 /// Version of the frontend-facing semantic-construction protocol. Re-exported from `finch-vm-core`.
 pub const SEMANTIC_CONSTRUCTION_VERSION: u32 = 1;
+/// Path of the committed grammar artifact, relative to the repository root.
+pub const WIRE_GRAMMAR_ARTIFACT: &str = "vocabulary/language/wire.gbnf";
+/// Version of the published compact-wire GBNF.
+pub const WIRE_GRAMMAR_VERSION: u32 = 1;
 ```

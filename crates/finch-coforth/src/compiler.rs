@@ -1,3 +1,4 @@
+use crate::lexicon::{forth_lexicon, forth_word_terminator};
 use finch_vm_core::{
     apply_signature_types, certify_module, instantiate_signature_types, nearest_names,
     parse_type_name, BasicBlock, ControlEffect, DiagnosticPhase, EffectSet, Function, Instruction,
@@ -3587,10 +3588,93 @@ fn control_error(code: &str, message: impl Into<String>, origin: SourceOrigin) -
     VmDiagnostic::error(code, DiagnosticPhase::TypeInference, message, Some(origin))
 }
 
+/// Syntactic completeness of Co-Forth source: tokenization, typed-definition
+/// structure, and collection/quotation delimiter balance. Unknown words are
+/// accepted; types, vocabulary, and host effects remain verifier concerns.
+pub fn read_forth_source(source_id: &str, source: &str) -> Result<(), Vec<VmDiagnostic>> {
+    let tokens = tokenize(source_id, source)?;
+    ensure_collection_delimiters_balanced(source_id, source, &tokens)?;
+    let _ = parse_forth_module(source_id, source)?;
+    Ok(())
+}
+
+fn ensure_collection_delimiters_balanced(
+    source_id: &str,
+    source: &str,
+    tokens: &[Token<'_>],
+) -> Result<(), Vec<VmDiagnostic>> {
+    let lex = forth_lexicon();
+    let mut stack: Vec<(&str, usize, usize)> = Vec::new();
+    for token in tokens {
+        let TokenValue::Word(word) = token.value else {
+            continue;
+        };
+        if word.len() == 1 && word.as_bytes()[0] == lex.list_open as u8 {
+            stack.push(("[", token.start, token.end));
+            continue;
+        }
+        if word.len() == 1 && word.as_bytes()[0] == lex.record_open as u8 {
+            stack.push(("{", token.start, token.end));
+            continue;
+        }
+        if let Some(opener) = lex
+            .collection_openers
+            .iter()
+            .copied()
+            .find(|open| *open == word)
+        {
+            stack.push((opener, token.start, token.end));
+            continue;
+        }
+        let expected = if word.len() == 1 && word.as_bytes()[0] == lex.list_close as u8 {
+            Some("[")
+        } else if word.len() == 1 && word.as_bytes()[0] == lex.record_close as u8 {
+            Some("{")
+        } else {
+            lex.collection_openers
+                .iter()
+                .copied()
+                .zip(lex.collection_closers.iter().copied())
+                .find_map(|(open, close)| (close == word).then_some(open))
+        };
+        if let Some(expected) = expected {
+            match stack.pop() {
+                Some((open, _, _)) if open == expected => {}
+                Some((open, start, end)) => {
+                    return Err(vec![VmDiagnostic::error(
+                        "E-READ-008",
+                        DiagnosticPhase::Reader,
+                        format!("Co-Forth closer '{word}' does not match opener '{open}'"),
+                        Some(origin(source_id, source, start, end)),
+                    )]);
+                }
+                None => {
+                    return Err(vec![VmDiagnostic::error(
+                        "E-READ-008",
+                        DiagnosticPhase::Reader,
+                        format!("unmatched Co-Forth closer '{word}'"),
+                        Some(origin(source_id, source, token.start, token.end)),
+                    )]);
+                }
+            }
+        }
+    }
+    if let Some((open, start, end)) = stack.last() {
+        return Err(vec![VmDiagnostic::error(
+            "E-READ-008",
+            DiagnosticPhase::Reader,
+            format!("unterminated Co-Forth '{open}'"),
+            Some(origin(source_id, source, *start, *end)),
+        )]);
+    }
+    Ok(())
+}
+
 fn tokenize<'source>(
     source_id: &str,
     source: &'source str,
 ) -> Result<Vec<Token<'source>>, Vec<VmDiagnostic>> {
+    let lex = forth_lexicon();
     let bytes = source.as_bytes();
     let mut cursor = 0;
     let mut tokens = Vec::new();
@@ -3604,11 +3688,11 @@ fn tokenize<'source>(
         // Commas are optional collection separators.  They are ignored by
         // Co-Forth's ordinary stack syntax as well, so `[1, 2]` and
         // `[ 1 2 ]` share the same typed lowering.
-        if bytes[cursor] == b',' {
+        if bytes[cursor] == lex.comma_separator as u8 {
             cursor += 1;
             continue;
         }
-        if bytes[cursor] == b'\\' {
+        if bytes[cursor] == lex.line_comment as u8 {
             while cursor < bytes.len() && bytes[cursor] != b'\n' {
                 cursor += 1;
             }
@@ -3617,10 +3701,10 @@ fn tokenize<'source>(
         let start = cursor;
         // Preserve the conventional quotation token before treating `[` as a
         // typed-list delimiter.
-        if source[start..].starts_with("[']") {
-            cursor += 3;
+        if source[start..].starts_with(lex.quote_word) {
+            cursor += lex.quote_word.len();
             tokens.push(Token {
-                value: TokenValue::Word("[']"),
+                value: TokenValue::Word(lex.quote_word),
                 start,
                 end: cursor,
             });
@@ -3655,8 +3739,11 @@ fn tokenize<'source>(
         // These existing multi-character forms take precedence over generic
         // brace punctuation. `map{`, `list{`, and `record{` retain their
         // literal spellings; purity is written explicitly as `! pure`.
-        if let Some(word) = ["map{", "}map", "list{", "}list", "record{", "}record"]
-            .into_iter()
+        if let Some(word) = lex
+            .collection_openers
+            .iter()
+            .chain(lex.collection_closers.iter())
+            .copied()
             .find(|word| source[start..].starts_with(word))
         {
             cursor += word.len();
@@ -3703,7 +3790,12 @@ fn tokenize<'source>(
         }
         // Split collection/record delimiters even when pasted without
         // whitespace: `[1,2]` and `{name: \"Ada\"}` are valid source.
-        if matches!(bytes[start], b'[' | b']' | b'{' | b'}') {
+        if matches!(bytes[start], b'[' | b']' | b'{' | b'}')
+            && (bytes[start] == lex.list_open as u8
+                || bytes[start] == lex.list_close as u8
+                || bytes[start] == lex.record_open as u8
+                || bytes[start] == lex.record_close as u8)
+        {
             cursor += 1;
             tokens.push(Token {
                 value: TokenValue::Word(&source[start..cursor]),
@@ -3717,106 +3809,55 @@ fn tokenize<'source>(
         // The contents are verbatim (including newlines and ordinary quotes)
         // until the next `"""`; use it for model/user prose that would make
         // ordinary escaping needlessly fragile.
-        if source[start..].starts_with("s\"\"\"") || source[start..].starts_with("\"\"\"") {
-            cursor += if source[start..].starts_with("s\"\"\"") {
-                4
-            } else {
-                3
-            };
-            let (value, end) = read_raw_string(
-                source_id,
-                source,
-                cursor,
-                start,
-                "E-READ-004",
-                "unterminated Co-Forth raw string literal",
-            )?;
-            tokens.push(Token {
-                value: TokenValue::String(value),
-                start,
-                end,
-            });
-            cursor = end;
-            continue;
-        }
-        // Standard Forth output literal. In typed Co-Forth it is syntax sugar
-        // for `s\"...\" say`, so it remains familiar to Forth authors while
-        // preserving the same typed SessionEmit side effect as `say`.
-        if source[start..].starts_with(".\"") {
-            cursor += 2;
-            if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            let (value, end) = read_string(
-                source_id,
-                source,
-                cursor,
-                start,
-                "E-READ-005",
-                "unterminated Co-Forth output string literal",
-            )?;
-            tokens.push(Token {
-                value: TokenValue::String(value),
-                start,
-                end,
-            });
-            // Attribute the implicit effect to the source literal, rather
-            // than inventing an unlocatable synthetic `say` token.
-            tokens.push(Token {
-                value: TokenValue::Word("say"),
-                start,
-                end,
-            });
-            cursor = end;
-            continue;
-        }
-        if source[start..].starts_with("s\"") {
-            cursor += 2;
-            if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            let (value, end) = read_string(
-                source_id,
-                source,
-                cursor,
-                start,
-                "E-READ-001",
-                "unterminated Co-Forth string literal",
-            )?;
-            tokens.push(Token {
-                value: TokenValue::String(value),
-                start,
-                end,
-            });
-            cursor = end;
-            continue;
-        }
-        // Finch also accepts a bare quoted string as the concise typed-string
-        // spelling. `s"..."` remains the familiar Forth spelling (the `s`
-        // means "string", not "say"), while `"..."` is unambiguously a
-        // constant and avoids making models learn an unnecessary prefix.
-        if source[start..].starts_with('"') {
-            cursor += 1;
-            let (value, end) = read_string(
-                source_id,
-                source,
-                cursor,
-                start,
-                "E-READ-001",
-                "unterminated Co-Forth string literal",
-            )?;
-            tokens.push(Token {
-                value: TokenValue::String(value),
-                start,
-                end,
-            });
-            cursor = end;
-            continue;
-        }
-        while cursor < bytes.len()
-            && !bytes[cursor].is_ascii_whitespace()
-            && !matches!(bytes[cursor], b',' | b'[' | b']' | b'}')
+        if let Some(opener) = lex
+            .string_openers
+            .iter()
+            .find(|opener| source[start..].starts_with(opener.spelling))
         {
+            cursor += opener.spelling.len();
+            if opener.skip_one_ascii_ws
+                && cursor < bytes.len()
+                && bytes[cursor].is_ascii_whitespace()
+            {
+                cursor += 1;
+            }
+            let (value, end) = if opener.raw {
+                read_raw_string(
+                    source_id,
+                    source,
+                    cursor,
+                    start,
+                    opener.unterminated_code,
+                    opener.unterminated_message,
+                )?
+            } else {
+                read_string(
+                    source_id,
+                    source,
+                    cursor,
+                    start,
+                    opener.unterminated_code,
+                    opener.unterminated_message,
+                )?
+            };
+            tokens.push(Token {
+                value: TokenValue::String(value),
+                start,
+                end,
+            });
+            if opener.implicit_say {
+                // Attribute the implicit effect to the source literal, rather
+                // than inventing an unlocatable synthetic `say` token.
+                tokens.push(Token {
+                    value: TokenValue::Word("say"),
+                    start,
+                    end,
+                });
+            }
+            cursor = end;
+            continue;
+        }
+        while cursor < bytes.len() && !forth_word_terminator(bytes[cursor]) {
             cursor += 1;
         }
         // Keep the conventional Forth line-break word available without
@@ -3852,7 +3893,11 @@ fn looks_like_json_object(source: &str, start: usize) -> bool {
 
 fn compact_braced_type_end(source: &str, start: usize) -> Option<usize> {
     let remainder = source.get(start..)?;
-    if !remainder.starts_with("record{") && !remainder.starts_with("variant{") {
+    if !forth_lexicon()
+        .compact_type_prefixes
+        .iter()
+        .any(|prefix| remainder.starts_with(prefix))
+    {
         return None;
     }
     let mut depth = 0usize;
@@ -3876,24 +3921,10 @@ fn compact_braced_type_end(source: &str, start: usize) -> Option<usize> {
 
 fn parameterized_type_end(source: &str, start: usize) -> Option<usize> {
     let remainder = source.get(start..)?;
-    let known_prefix = [
-        "empty-list<",
-        "empty-map<",
-        "list<",
-        "map<",
-        "option<",
-        "result<",
-        "fn<",
-        "task<",
-        "fiber<",
-        "stream<",
-        "resource<",
-        "capability<",
-        "variant<",
-        "variant-get<",
-    ]
-    .into_iter()
-    .any(|prefix| remainder.starts_with(prefix));
+    let known_prefix = forth_lexicon()
+        .parameterized_type_prefixes
+        .iter()
+        .any(|prefix| remainder.starts_with(prefix));
     if !known_prefix {
         return None;
     }
@@ -4024,9 +4055,12 @@ fn read_raw_string(
     message: &str,
 ) -> Result<(String, usize), Vec<VmDiagnostic>> {
     let remainder = &source[cursor..];
-    if let Some(close) = remainder.find("\"\"\"") {
+    if let Some(close) = remainder.find(forth_lexicon().raw_string_close) {
         let end = cursor + close;
-        return Ok((source[cursor..end].to_string(), end + 3));
+        return Ok((
+            source[cursor..end].to_string(),
+            end + forth_lexicon().raw_string_close.len(),
+        ));
     }
     Err(vec![VmDiagnostic::error(
         code,
@@ -4389,6 +4423,36 @@ mod tests {
         let unclosed =
             compile_forth("input.forth", "[ 1", Vec::new(), &core_vocabulary()).unwrap_err();
         assert!(unclosed.iter().any(|error| error.code == "E-LIST-004"));
+    }
+
+    #[test]
+    fn read_forth_source_rejects_unclosed_lists_and_definitions() {
+        let unclosed_list = read_forth_source("wire.forth", "[ 1 2")
+            .expect_err("an unclosed list is not a complete Co-Forth wire response");
+        assert_eq!(
+            unclosed_list[0].code, "E-READ-008",
+            "collection completeness must fail at the reader boundary, not later as a type error: {unclosed_list:?}"
+        );
+        let unclosed_def =
+            read_forth_source("wire.forth", ": square ( S int -- S int ! pure ) dup *")
+                .expect_err("an unclosed definition is not a complete Co-Forth wire response");
+        assert!(
+            unclosed_def
+                .iter()
+                .any(|error| error.message.contains("unterminated word definition")),
+            "typed definition completeness must use the production parser: {unclosed_def:?}"
+        );
+        read_forth_source("wire.forth", "\"don't\" say")
+            .expect("a contraction inside a string is complete Co-Forth syntax");
+        read_forth_source("wire.forth", "s\"\"\"raw \"quotes\" and don't\"\"\" say")
+            .expect("raw strings are complete Co-Forth syntax");
+    }
+
+    #[test]
+    fn line_comment_uses_the_published_lexicon_marker() {
+        let src = format!("1 {} ignored\n2 +", forth_lexicon().line_comment);
+        read_forth_source("wire.forth", &src)
+            .expect("the tokenizer must treat forth_lexicon().line_comment as a comment");
     }
 
     #[test]

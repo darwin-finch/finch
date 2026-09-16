@@ -2,7 +2,8 @@
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `crates/finch-colisp/src/`: the CoLisp reader, source values, and translation from
+**Owns** `crates/finch-colisp/src/`: the CoLisp reader, source values, the reader
+lexicon used by the published compact-wire grammar, and translation from
 span-preserving CoLisp syntax into Finch's shared semantic-construction protocol. It owns no
 interpreter, runtime, fiber scheduler, capability broker, or checkpoint codec. It does not infer
 types or effects privately or mint `ModuleVerified` certificates.
