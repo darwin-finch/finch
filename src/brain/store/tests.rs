@@ -7210,15 +7210,28 @@ fn test_concurrent_archive_and_remove_if_unused_do_not_resurrect() {
     });
     barrier.wait();
     let archived = archive.join().unwrap();
-    let removed = remove.join().unwrap();
+    let _removed = remove.join().unwrap();
+    let archive_absent_or_moved = match &archived {
+        Ok(_) => true,
+        Err(error) => error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        }),
+    };
     assert!(
-        archived.is_ok() && removed.is_ok(),
-        "archive/remove must not panic or poison; archive={archived:?} remove={removed:?}"
+        archive_absent_or_moved,
+        "archive may move the log or lose the race to delete (not-found); it must not fail any other way; archive={archived:?}"
     );
     let names = store.list_names_unhydrated();
     assert!(
         !names.iter().any(|name| name == "shared"),
         "the active namespace must not contain the Brain after concurrent archive/delete; names={names:?}"
+    );
+    assert!(
+        !temp.path().join("shared").exists(),
+        "the live Brain directory must not remain after concurrent archive/delete; listing={}",
+        directory_listing(temp.path())
     );
     let resurrected = BrainStore::with_root("box.local", Some(temp.path().into()));
     assert!(
@@ -7285,6 +7298,119 @@ fn test_late_completion_after_cancel_leaves_run_cancelled() {
         inspected.status,
         BrainRunStatus::Cancelled,
         "exact-once terminal state must remain Cancelled after a late completion; run={inspected:?}"
+    );
+}
+
+/// A cancelled run stays cancelled across restart; a late Completed must not
+/// append a second terminal event.
+#[test]
+fn test_late_completion_after_cancel_survives_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let attachment = store
+        .attach("shared", "alice", AttachmentRole::Driver, None)
+        .unwrap();
+    let prompt = store
+        .push(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "persist".into(),
+            },
+        )
+        .unwrap();
+    let run = store
+        .start_run(
+            "shared",
+            "alice",
+            BrainRunKind::Interactive,
+            prompt.seq,
+            attachment.attachment_id,
+            BrainRunStatus::QueuedForEnvironment,
+        )
+        .unwrap();
+    store
+        .transition_run("shared", "alice", run.run_id, BrainRunStatus::Running, None)
+        .unwrap();
+    store
+        .transition_run(
+            "shared",
+            "alice",
+            run.run_id,
+            BrainRunStatus::Cancelled,
+            Some("user cancel".into()),
+        )
+        .unwrap();
+    let late = store.transition_run(
+        "shared",
+        "alice",
+        run.run_id,
+        BrainRunStatus::Completed,
+        None,
+    );
+    assert!(
+        late.is_err(),
+        "late completion must be rejected before restart; late={late:?}"
+    );
+    let terminal_events = |snapshot: &BrainSnapshot, run_id: RunId| {
+        snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    BrainEventKind::RunStatusChanged {
+                        run_id: event_run,
+                        status,
+                        ..
+                    } if *event_run == run_id && status.is_terminal()
+                )
+            })
+            .count()
+    };
+    let before = store.snapshot("shared").unwrap();
+    assert_eq!(
+        terminal_events(&before, run.run_id),
+        1,
+        "cancel must publish exactly one terminal status event; events={:?}",
+        before.events
+    );
+    drop(store);
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let restored = restarted.inspect_run("shared", run.run_id).unwrap();
+    assert_eq!(
+        restored.status,
+        BrainRunStatus::Cancelled,
+        "restart replay must keep the cancelled terminal status; run={restored:?}"
+    );
+    let late_again = restarted.transition_run(
+        "shared",
+        "alice",
+        run.run_id,
+        BrainRunStatus::Completed,
+        None,
+    );
+    assert!(
+        late_again.is_err(),
+        "late completion after restart must still be rejected; late={late_again:?}"
+    );
+    let after = restarted.snapshot("shared").unwrap();
+    assert_eq!(
+        after
+            .runs
+            .iter()
+            .find(|candidate| candidate.run_id == run.run_id)
+            .map(|candidate| candidate.status),
+        Some(BrainRunStatus::Cancelled),
+        "a late completion after restart must not revive the run; snapshot runs={:?}",
+        after.runs
+    );
+    assert_eq!(
+        terminal_events(&after, run.run_id),
+        1,
+        "restart plus late completion must not append a second terminal event; events={:?}",
+        after.events
     );
 }
 

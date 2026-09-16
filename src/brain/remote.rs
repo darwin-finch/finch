@@ -2812,7 +2812,7 @@ mod tests {
 
     #[tokio::test]
     async fn invitation_pinned_wss_handles_fragmented_binary_ping_pong_and_close() {
-        use crate::brain::store::{BrainEvent, ConnectionId};
+        use crate::brain::{BrainEvent, ConnectionId};
         use crate::ipc::brain_codec::BrainRemoteEnvelope;
         use tokio_tungstenite::tungstenite::{
             handshake::server::{Request, Response},
@@ -2822,7 +2822,7 @@ mod tests {
 
         let secret = [47; 32];
         let authority = super::super::credential::BrainCredentialAuthority::ephemeral(secret);
-        let store = crate::brain::store::BrainStore::with_root("fixture.local", None);
+        let store = crate::brain::BrainStore::with_root("fixture.local", None);
         let initial_snapshot = store.snapshot("shared").unwrap();
         let brain_id = initial_snapshot.brain_id;
         let (invitation, invitation_claims) = authority
@@ -3021,7 +3021,7 @@ mod tests {
 
     #[tokio::test]
     async fn invitation_pinned_wss_never_redirects_bearer_to_another_authority() {
-        use crate::brain::store::ConnectionId;
+        use crate::brain::ConnectionId;
         use axum::{response::Redirect, routing::get, Router};
 
         let attacker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3730,7 +3730,7 @@ mod tests {
             .bind_attachment(
                 &bound_parent,
                 AttachmentId(uuid::Uuid::new_v4()),
-                super::super::store::ConnectionId(uuid::Uuid::new_v4()),
+                crate::brain::ConnectionId(uuid::Uuid::new_v4()),
                 now,
             )
             .unwrap();
@@ -4046,7 +4046,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_binary_session_correlates_mutations_while_streaming_events() {
-        use crate::brain::store::{BrainEvent, ConnectionId};
+        use crate::brain::{BrainEvent, ConnectionId};
         use crate::ipc::brain_codec::{
             BrainRemoteCommandKind, BrainRemoteEnvelope, BrainRemoteReply,
         };
@@ -4167,8 +4167,8 @@ mod tests {
             assert_eq!(target_subject, "runner-b@box.local");
             assert_eq!(environment_generation, 1);
             assert_eq!(ttl_ms, 30_000);
-            let handoff = crate::brain::store::BrainRunnerHandoff {
-                handoff_id: crate::brain::store::RunnerHandoffId(uuid::Uuid::new_v4()),
+            let handoff = crate::brain::BrainRunnerHandoff {
+                handoff_id: crate::brain::RunnerHandoffId(uuid::Uuid::new_v4()),
                 from_lease_id: expected_lease_id,
                 requested_by: "alice@laptop.local".into(),
                 target_subject,
@@ -4287,7 +4287,7 @@ mod tests {
             .unwrap();
         client.acknowledge(1).await.unwrap();
         assert_eq!(client.attachment().unwrap().acknowledged_seq, 1);
-        let lease_id = crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4());
+        let lease_id = crate::brain::RunnerLeaseId(uuid::Uuid::new_v4());
         let handoff_kind = BrainRemoteCommandKind::RequestRunnerHandoff {
             target_subject: "runner-b@box.local".into(),
             expected_lease_id: lease_id,
@@ -4335,7 +4335,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_mutation_retry_preserves_idempotency_key_across_reconnect() {
-        use crate::brain::store::{BrainEvent, ConnectionId};
+        use crate::brain::{BrainEvent, ConnectionId};
         use crate::ipc::brain_codec::{BrainRemoteEnvelope, BrainRemoteReply};
         use tokio_tungstenite::tungstenite::Message;
 
@@ -4484,7 +4484,7 @@ mod tests {
 
     #[tokio::test]
     async fn production_server_deduplicates_lost_replies_across_daemon_restarts() {
-        use crate::brain::store::{
+        use crate::brain::{
             BrainEventKind, BrainRunKind, BrainScheduleDeliveryPolicy, ProgramLanguage,
         };
 
@@ -4496,10 +4496,10 @@ mod tests {
             RemoteBrainTarget,
             tokio::task::JoinHandle<()>,
             mpsc::UnboundedReceiver<crate::server::RunnerRequest>,
-            super::super::store::BrainRunnerLease,
+            crate::brain::BrainRunnerLease,
             crate::server::BrainLifecycleService,
         ) {
-            let store = crate::brain::store::BrainStore::with_test_environment_generation(
+            let store = crate::brain::BrainStore::with_test_environment_generation(
                 "box.local",
                 Some(root.to_path_buf()),
                 environment_generation,
@@ -4690,7 +4690,7 @@ mod tests {
         );
         assert_eq!(
             completed_run.status,
-            super::super::store::BrainRunStatus::Completed
+            crate::brain::BrainRunStatus::Completed
         );
         let snapshot = client.snapshot().await.unwrap();
         assert_eq!(
@@ -4850,7 +4850,7 @@ mod tests {
             .is_err());
         assert!(client
             .cancel_runner_handoff_with_handle(
-                super::super::store::RunnerHandoffId(uuid::Uuid::new_v4()),
+                crate::brain::RunnerHandoffId(uuid::Uuid::new_v4()),
                 &cancel_handle,
             )
             .await
@@ -4980,7 +4980,7 @@ mod tests {
                 BrainRunKind::Interactive,
                 cancel_request.seq,
                 current_attachment.attachment_id,
-                super::super::store::BrainRunStatus::Running,
+                crate::brain::BrainRunStatus::Running,
                 None,
             )
             .unwrap();
@@ -5017,7 +5017,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status,
-            super::super::store::BrainRunStatus::Cancelled
+            crate::brain::BrainRunStatus::Cancelled
         );
 
         let initialization_handle = client
@@ -5226,7 +5226,7 @@ mod tests {
             )
             .unwrap();
         let approval_id = "remote-replay-approval";
-        let approval_audience = crate::brain::store::BrainApprovalAudience {
+        let approval_audience = crate::brain::BrainApprovalAudience {
             brain_id: client.snapshot().await.unwrap().brain_id,
             brain: "shared".into(),
             attachment_id: current_attachment.attachment_id,
@@ -5334,7 +5334,7 @@ mod tests {
             ws: WebSocketUpgrade,
         ) -> Response {
             let attachment_id = AttachmentId(connection.attachment_id);
-            let connection_id = crate::brain::store::ConnectionId(connection.connection_id);
+            let connection_id = crate::brain::ConnectionId(connection.connection_id);
             let claims = match crate::server::handlers::authorize_pending_remote_attachment(
                 &fixture.lifecycle,
                 &fixture.credentials,
@@ -5400,7 +5400,7 @@ mod tests {
             .into_response()
         }
 
-        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let store = crate::brain::BrainStore::with_root("box.local", None);
         let lifecycle = crate::server::BrainLifecycleService::new(
             store,
             crate::server::BrainRunnerBroker::default(),
@@ -5617,7 +5617,7 @@ mod tests {
     #[test]
     #[ignore = "requires explicitly owned IPC and HTTP endpoints"]
     fn live_local_and_remote_transports_produce_equivalent_lifecycle() {
-        use crate::brain::store::{BrainRunKind, BrainRunStatus};
+        use crate::brain::{BrainRunKind, BrainRunStatus};
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         fn lifecycle(snapshot: &BrainSnapshot) -> Vec<&'static str> {
@@ -5871,7 +5871,7 @@ mod tests {
             let submission = tokio::task::spawn_local(async move {
                 submitting_client
                     .push(BrainEventKind::Program {
-                        language: crate::brain::store::ProgramLanguage::Lisp,
+                        language: crate::brain::ProgramLanguage::Lisp,
                         source: "(say \"handoff-live\")".into(),
                     })
                     .await

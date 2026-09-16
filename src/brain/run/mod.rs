@@ -3,7 +3,7 @@
 //! Durable run records live in the journal. This facade owns the transition
 //! table, lease/handoff types, and disconnect-terminalization intent files.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

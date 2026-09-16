@@ -5,10 +5,9 @@
 //! events and can reconstruct identical state without sharing a filesystem.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
@@ -41,8 +40,8 @@ pub use super::run::{
 };
 pub(crate) use super::schedule::DEFAULT_INITIALIZATION_SOURCE;
 use super::schedule::{
-    self, legacy_schedule_attachment_id, queued_schedule_run, schedule_due_window,
-    sorted_schedule_dues, sorted_schedules, ScheduleIndex,
+    legacy_schedule_attachment_id, queued_schedule_run, schedule_due_window, sorted_schedule_dues,
+    sorted_schedules, ScheduleIndex,
 };
 pub use super::schedule::{
     BrainInitialization, BrainSchedule, BrainScheduleDeliveryPolicy, BrainScheduleDue,
@@ -244,39 +243,8 @@ impl BrainState {
                     self.runner_handoff = None;
                 }
             }
-            BrainEventKind::ClientAttached {
-                attachment_id,
-                connection_id,
-                subject,
-                role,
-            } => {
-                let acknowledged_seq = self
-                    .attachments
-                    .get(attachment_id)
-                    .map(|attachment| attachment.acknowledged_seq)
-                    .unwrap_or(0);
-                self.attachments.insert(
-                    *attachment_id,
-                    BrainAttachment {
-                        attachment_id: *attachment_id,
-                        subject: subject.clone(),
-                        role: *role,
-                        acknowledged_seq,
-                        connected: true,
-                        connection_id: Some(*connection_id),
-                    },
-                );
-            }
-            BrainEventKind::ClientDetached {
-                attachment_id,
-                connection_id,
-            } => {
-                if let Some(attachment) = self.attachments.get_mut(attachment_id) {
-                    if attachment.connection_id == Some(*connection_id) {
-                        attachment.connected = false;
-                        attachment.connection_id = None;
-                    }
-                }
+            BrainEventKind::ClientAttached { .. } | BrainEventKind::ClientDetached { .. } => {
+                attachment::apply_event(&mut self.attachments, &event);
             }
             BrainEventKind::RunStarted { run } => {
                 self.runs.insert(run.run_id, run.clone());
@@ -4348,19 +4316,7 @@ impl BrainStore {
         self.ensure_loaded(name)?;
         let brains = self.brains.read().expect("shared brain lock poisoned");
         let state = brains.get(name).context("Brain was removed concurrently")?;
-        let Some(event) = state.events.iter().find(|event| {
-            event.mutation.as_ref().is_some_and(|recorded| {
-                recorded.attachment_id == receipt.attachment_id
-                    && recorded.mutation_id == receipt.mutation_id
-            })
-        }) else {
-            return Ok(None);
-        };
-        anyhow::ensure!(
-            event.mutation.as_ref() == Some(receipt),
-            "Brain mutation idempotency key was reused with a different command or precondition"
-        );
-        Ok(Some(event.clone()))
+        Ok(journal::replay_mutation(&state.events, receipt)?.cloned())
     }
 
     fn push_idempotent_locked(
@@ -4371,20 +4327,7 @@ impl BrainStore {
         kind: BrainEventKind,
         receipt: BrainMutationReceipt,
     ) -> Result<BrainMutationAppend> {
-        if let Some(existing) = state.events.iter().find(|event| {
-            event.mutation.as_ref().is_some_and(|recorded| {
-                recorded.attachment_id == receipt.attachment_id
-                    && recorded.mutation_id == receipt.mutation_id
-            })
-        }) {
-            let recorded = existing
-                .mutation
-                .as_ref()
-                .expect("matched mutation receipt");
-            anyhow::ensure!(
-                recorded == &receipt,
-                "Brain mutation idempotency key was reused with a different command or precondition"
-            );
+        if let Some(existing) = journal::replay_mutation(&state.events, &receipt)? {
             return Ok(BrainMutationAppend {
                 event: existing.clone(),
                 replayed: true,

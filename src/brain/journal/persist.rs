@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::{BrainEvent, BrainEventKind, BrainJournalRecord};
-use crate::brain::attachment::{AttachmentId, BrainAttachment};
+use crate::brain::attachment::{self, AttachmentId, BrainAttachment};
 use crate::brain::run::{BrainRun, BrainRunnerLease, RunId};
 
 /// Append-only event log rooted at a Brain store directory.
@@ -272,6 +272,7 @@ pub fn scan_readonly(path: &Path) -> JournalProjection {
             },
         };
         for event in parsed {
+            attachment::apply_event(&mut projection.attachments, &event);
             apply_scan_event(&mut projection, event);
         }
     }
@@ -286,40 +287,7 @@ fn apply_scan_event(projection: &mut JournalProjection, event: BrainEvent) {
         BrainEventKind::Prompt { .. } => {
             projection.turns += 1;
         }
-        BrainEventKind::ClientAttached {
-            attachment_id,
-            connection_id,
-            subject,
-            role,
-        } => {
-            let acknowledged_seq = projection
-                .attachments
-                .get(&attachment_id)
-                .map(|attachment| attachment.acknowledged_seq)
-                .unwrap_or(0);
-            projection.attachments.insert(
-                attachment_id,
-                BrainAttachment {
-                    attachment_id,
-                    subject,
-                    role,
-                    acknowledged_seq,
-                    connected: true,
-                    connection_id: Some(connection_id),
-                },
-            );
-        }
-        BrainEventKind::ClientDetached {
-            attachment_id,
-            connection_id,
-        } => {
-            if let Some(attachment) = projection.attachments.get_mut(&attachment_id) {
-                if attachment.connection_id == Some(connection_id) {
-                    attachment.connected = false;
-                    attachment.connection_id = None;
-                }
-            }
-        }
+        BrainEventKind::ClientAttached { .. } | BrainEventKind::ClientDetached { .. } => {}
         BrainEventKind::RunStarted { run } => {
             projection.runs.insert(run.run_id, run);
         }
