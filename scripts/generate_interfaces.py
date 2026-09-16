@@ -119,6 +119,34 @@ def with_methods(kind: str, defined: str, name: str, text: str, sources: dict[st
     return f"{text}\nimpl {name} {{\n{body}\n}}"
 
 
+def cfgs_above(source: str, start: int) -> list[str]:
+    """`cfg` conditions stacked directly above an item, outermost first."""
+    lines = source[:start].splitlines()
+    cfgs: list[str] = []
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("///"):
+            if cfgs:
+                break
+            continue
+        match = re.fullmatch(r"#\[cfg\((.*)\)\]", stripped)
+        if match:
+            cfgs.append(match.group(1).strip())
+            continue
+        if stripped.startswith("#["):
+            continue
+        break
+    cfgs.reverse()
+    return cfgs
+
+
+def with_cfg(signature: str, cfgs: list[str]) -> str:
+    """Prefix a signature with its `#[cfg(...)]` gates so readers see the condition."""
+    if not cfgs:
+        return signature
+    return "\n".join([*(f"#[cfg({cfg})]" for cfg in cfgs), signature])
+
+
 def scan_items(source: str) -> list[tuple[str, str, str, str]]:
     """(kind, name, signature, doc) for every `pub` item defined in one file."""
     items: list[tuple[str, str, str, str]] = []
@@ -130,7 +158,7 @@ def scan_items(source: str) -> list[tuple[str, str, str, str]]:
     for match in pattern.finditer(source):
         if match.group("indent"):  # nested in an impl or another item
             continue
-        signature = signature_at(source, match.start())
+        signature = with_cfg(signature_at(source, match.start()), cfgs_above(source, match.start()))
         doc = doc_above(source, match.start())
         items.append((match.group("kind"), match.group("name"), signature, doc))
     return items
@@ -143,16 +171,32 @@ def without_comments(source: str) -> str:
 
 
 def blank_attributes(source: str) -> str:
-    """Blank `#[...]` spans, matching nested brackets, keeping offsets."""
+    """Blank `#[...]` spans, matching nested brackets, keeping offsets.
+
+    Brackets inside string literals do not affect depth, so
+    `#[serde(rename = "]")]` blanks only through its real closing `]`.
+    """
     out = list(source)
     index = 0
     while index < len(source):
         if source.startswith("#[", index) or source.startswith("#![", index):
             depth, end = 0, index + 1
+            quote: str | None = None
             while end < len(source):
-                if source[end] == "[":
+                char = source[end]
+                if quote is not None:
+                    if char == "\\" and end + 1 < len(source):
+                        end += 2
+                        continue
+                    if char == quote:
+                        quote = None
+                    end += 1
+                    continue
+                if char in "\"'":
+                    quote = char
+                elif char == "[":
                     depth += 1
-                elif source[end] == "]":
+                elif char == "]":
                     depth -= 1
                     if depth == 0:
                         end += 1
@@ -214,7 +258,11 @@ def trait_methods(source: str, brace: int) -> str:
         index += 1
     body = source[brace + 1:end]
     methods = []
-    for match in re.finditer(r"^[ \t]*fn\s+[A-Za-z_][A-Za-z0-9_]*", body, re.M):
+    for match in re.finditer(
+        r"^[ \t]*(?:async\s+|unsafe\s+|const\s+)*fn\s+[A-Za-z_][A-Za-z0-9_]*",
+        body,
+        re.M,
+    ):
         method = signature_at(body, match.start()).removesuffix(" { … }").rstrip(";")
         methods.append(f"    {method};")
     return "\n".join(methods)
@@ -343,21 +391,17 @@ def subsystem_sources(root: Path, files: list[str], record: dict) -> dict[str, s
     }
 
 
-def resolve_definition(
+def hint_matches(
     module: str,
     defined: str,
     candidates: list[tuple[str, str, str, str]],
-    problems: list[str],
     package_aliases: dict[str, str] | None = None,
     package_reexports: dict[tuple[str, str], str] | None = None,
-) -> tuple[str, str, str, str] | None:
-    """Pick the definition the `use` path names; ambiguity is an error, not a guess."""
-    if len(candidates) == 1:
-        return candidates[0]
+) -> list[tuple[str, str, str, str]]:
+    """Candidates the `use` path's module/package hint uniquely points at."""
+    if not candidates:
+        return []
     hint = module.rstrip(":").rsplit("::", 1)[-1]
-    # A facade may name a workspace dependency directly (`finch_vm_core::Type`)
-    # or through a root facade alias (`finch_vm as vm`). Normalize either form
-    # to its package directory before resolving duplicate public type names.
     package = (package_aliases or {}).get(hint, hint)
     package = (package_reexports or {}).get((package, defined), package)
     if package:
@@ -366,14 +410,42 @@ def resolve_definition(
             if candidate[3].startswith("crates/")
             and candidate[3].split("/", 2)[1].replace("-", "_") == package
         ]
-        if len(packaged) == 1:
-            return packaged[0]
-    matched = [
+        if packaged:
+            return packaged
+    if not hint:
+        return []
+    return [
         candidate for candidate in candidates
-        if hint and (f"/{hint}/" in candidate[3] or candidate[3].endswith(f"/{hint}.rs"))
+        if f"/{hint}/" in candidate[3] or candidate[3].endswith(f"/{hint}.rs")
     ]
+
+
+def resolve_definition(
+    module: str,
+    defined: str,
+    candidates: list[tuple[str, str, str, str]],
+    problems: list[str],
+    package_aliases: dict[str, str] | None = None,
+    package_reexports: dict[tuple[str, str], str] | None = None,
+) -> tuple[str, str, str, str] | None:
+    """Pick the definition the `use` path names; ambiguity is an error, not a guess.
+
+    The module hint is consulted before any single-candidate shortcut so a
+    `pub use other::Name` cannot silently bind a same-named local definition.
+    """
+    if not candidates:
+        return None
+    matched = hint_matches(module, defined, candidates, package_aliases, package_reexports)
     if len(matched) == 1:
         return matched[0]
+    if len(matched) > 1:
+        problems.append(
+            f"`{defined}` is defined in more than one place and `use {module}` does not "
+            f"disambiguate: " + ", ".join(sorted(candidate[3] for candidate in matched))
+        )
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
     problems.append(
         f"`{defined}` is defined in more than one place and `use {module}` does not disambiguate: "
         + ", ".join(sorted(candidate[3] for candidate in candidates))
@@ -496,7 +568,17 @@ def interface_text(
     rendered: list[tuple[str, str, str]] = []
     missing: list[str] = []
     for module, defined, name in exported_names(facade_source, problems):
-        candidates = definitions.get(defined) or elsewhere.get(defined)
+        local = definitions.get(defined) or []
+        full = elsewhere.get(defined) or []
+        # Honor an unambiguous use-path hint across the whole tree first so a
+        # same-named local definition cannot beat `pub use other::Name`. When the
+        # hint is absent or collides (two crates both have `ports.rs`), fall back
+        # to this subsystem's own definitions.
+        hinted = hint_matches(module, defined, full, package_aliases, package_reexports)
+        if len(hinted) == 1:
+            candidates = hinted
+        else:
+            candidates = local or full
         if not candidates:
             missing.append(defined)
             continue

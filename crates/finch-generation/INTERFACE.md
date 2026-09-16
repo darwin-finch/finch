@@ -268,6 +268,7 @@ pub trait GenerationBackend: Send + Sync {
     fn capabilities(&self) -> GenerationCapabilities;
     fn strategy(&self) -> GenerationStrategy;
     fn readiness(&self) -> ReadinessReport;
+    async fn generate(&self, request: GenerationRequest) -> Result<Receiver<Result<GenerationEvent>>>;
 }
 /// Secret-free telemetry.
 pub trait GenerationTelemetry: Send + Sync {
@@ -290,7 +291,9 @@ pub trait ProgressSink: Send + Sync {
     fn report(&self, phase: LoadPhase, elapsed_ms: u64);
 }
 /// Sleeper used for timeouts.
-pub trait Sleeper: Send + Sync { … }
+pub trait Sleeper: Send + Sync {
+    async fn sleep(&self, duration: Duration);
+}
 ```
 
 ## Functions

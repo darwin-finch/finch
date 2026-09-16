@@ -397,6 +397,94 @@ class InterfaceGeneratorTests(unittest.TestCase):
         (self.fixture.root / "src/vm/INTERFACE.md").unlink()
         self.assert_stale("src/vm/INTERFACE.md is stale")
 
+    def test_cfg_gated_items_are_marked_with_their_condition(self) -> None:
+        # A #[cfg(test)] export must not look like production surface.
+        self.fixture.edit(
+            "src/vm/mod.rs",
+            "pub const VERSION: u32 = 5;",
+            "pub const VERSION: u32 = 5;\n\n/// Test-only hook.\n#[cfg(test)]\npub fn probe() -> u32 {\n    1\n}\n\n#[cfg(feature = \"extra\")]\npub struct Extra;",
+        )
+        result = self.fixture.run("--write")
+        self.assertEqual(0, result.returncode, result.stderr)
+        text = self.fixture.interface()
+        self.assertIn("#[cfg(test)]\npub fn probe() -> u32 { … }", text, text)
+        self.assertIn("#[cfg(feature = \"extra\")]\npub struct Extra;", text, text)
+
+    def test_async_trait_methods_reach_the_interface(self) -> None:
+        # `async fn` in a trait is part of the contract; skipping it left Generator hollow.
+        self.fixture.edit(
+            "src/vm/interpreter.rs",
+            "pub trait Handler {\n    /// Handle one effect.\n    fn handle(&mut self, phase: Phase) -> bool;\n    fn finish(&self) -> String {\n        String::new()\n    }\n}",
+            "pub trait Handler {\n    /// Handle one effect.\n    async fn handle(&mut self, phase: Phase) -> bool;\n    fn finish(&self) -> String {\n        String::new()\n    }\n}",
+        )
+        result = self.fixture.run("--write")
+        self.assertEqual(0, result.returncode, result.stderr)
+        text = self.fixture.interface()
+        self.assertIn("async fn handle(&mut self, phase: Phase) -> bool;", text, text)
+        self.assertIn("fn finish(&self) -> String;", text, text)
+
+    def test_duplicate_name_resolves_by_use_module_not_sorted_first(self) -> None:
+        # Two same-named defs: sorted-first would pick alpha; the use path names beta.
+        self.fixture.write(
+            "src/vm/alpha.rs",
+            "/// From alpha, sorted first.\npub struct Twin;\n",
+        )
+        self.fixture.write(
+            "src/vm/beta.rs",
+            "/// From beta, named by the use path.\npub struct Twin;\n",
+        )
+        self.fixture.edit(
+            "src/vm/mod.rs",
+            "mod ir;\nmod interpreter;",
+            "mod alpha;\nmod beta;\nmod ir;\nmod interpreter;",
+        )
+        self.fixture.edit(
+            "src/vm/mod.rs",
+            "pub use interpreter::{inspect, run, Handler};",
+            "pub use beta::Twin;\npub use interpreter::{inspect, run, Handler};",
+        )
+        result = self.fixture.run("--write")
+        self.assertEqual(0, result.returncode, result.stderr)
+        text = self.fixture.interface()
+        self.assertIn("From beta, named by the use path.", text, text)
+        self.assertNotIn("From alpha, sorted first.", text, text)
+
+    def test_attribute_bracket_inside_string_keeps_enum_variants(self) -> None:
+        # `]` inside a rename string must not truncate attribute blanking.
+        self.fixture.edit(
+            "src/vm/ir.rs",
+            "pub enum Phase {\n    /// Parsing, with commas, in prose.\n    #[serde(rename = \"parse, really\")]\n    Parse,\n    Verify(Detail),\n}",
+            "pub enum Phase {\n    /// Parsing, with commas, in prose.\n    #[serde(rename = \"]\")]\n    Close,\n    Open,\n    Verify(Detail),\n}",
+        )
+        result = self.fixture.run("--write")
+        self.assertEqual(0, result.returncode, result.stderr)
+        text = self.fixture.interface()
+        self.assertIn("pub enum Phase { Close, Open, Verify }", text, text)
+        self.assertNotIn("pub enum Phase { … }", text, text)
+
+    def test_cross_subsystem_reexport_wins_over_local_same_name(self) -> None:
+        # A local same-named type must not beat `pub use crate::app::Shared`.
+        self.fixture.write(
+            "src/vm/local_shared.rs",
+            "/// Local twin that must not win.\npub struct Shared;\n",
+        )
+        self.fixture.edit(
+            "src/vm/mod.rs",
+            "mod ir;\nmod interpreter;",
+            "mod ir;\nmod interpreter;\nmod local_shared;",
+        )
+        self.fixture.edit(
+            "src/vm/mod.rs",
+            "pub use interpreter::{inspect, run, Handler};",
+            "pub use crate::app::Shared;\npub use interpreter::{inspect, run, Handler};",
+        )
+        result = self.fixture.run("--write")
+        self.assertEqual(0, result.returncode, result.stderr)
+        text = self.fixture.interface()
+        self.assertIn("A type another subsystem re-exports.", text, text)
+        self.assertIn("Re-exported from `app`", text, text)
+        self.assertNotIn("Local twin that must not win.", text, text)
+
     def test_real_tree_interfaces_match_their_facades(self) -> None:
         result = subprocess.run([sys.executable, str(GENERATOR)], capture_output=True, text=True, check=False)
         self.assertEqual(0, result.returncode, f"repository interfaces drifted:\n{result.stderr}")

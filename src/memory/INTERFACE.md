@@ -14,6 +14,7 @@ Everything below is what callers outside this module can reach. Implementation m
 pub struct BrainConversationProvenance { … }
 /// Summary of conversation topics derived from MemTree centroid queries.
 pub struct ConversationSummaryLines { … }
+#[cfg(test)]
 pub(crate) struct HydrationBatchPauseRegistration { … }
 /// Progress of the background MemTree hydration.
 pub enum HydrationStatus { Ready, Loading, Degraded, Failed }
@@ -157,6 +158,7 @@ pub fn average_embeddings(embeddings: &[&Vec<f32>]) -> Vec<f32> { … }
 /// Compute cosine similarity between two embedding vectors
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 { … }
 /// Hold the production loader after `after_loaded` nodes so a test can observe a genuinely `Loading` index.
+#[cfg(test)]
 pub(crate) fn register_hydration_batch_pause(path: PathBuf, after_loaded: usize) -> (HydrationBatchPauseRegistration, watch::Receiver<bool>, watch::Sender<bool>) { … }
 ```
 

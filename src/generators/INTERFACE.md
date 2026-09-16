@@ -96,9 +96,13 @@ pub trait GenerationBackend: Send + Sync {
     fn capabilities(&self) -> GenerationCapabilities;
     fn strategy(&self) -> GenerationStrategy;
     fn readiness(&self) -> ReadinessReport;
+    async fn generate(&self, request: GenerationRequest) -> Result<Receiver<Result<GenerationEvent>>>;
 }
 /// Unified generator interface for Claude, Qwen, and future generators
 pub trait Generator: Send + Sync {
+    async fn generate(&self, messages: Vec<Message>, tools: Option<Vec<ToolDefinition>>) -> Result<GeneratorResponse>;
+    async fn generate_stream(&self, messages: Vec<Message>, tools: Option<Vec<ToolDefinition>>) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>>;
+    async fn generate_stream_cancellable(&self, messages: Vec<Message>, tools: Option<Vec<ToolDefinition>>, _cancellation_token: tokio_util::sync::CancellationToken) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>>;
     fn capabilities(&self) -> &GeneratorCapabilities;
     fn name(&self) -> &str;
     fn model_name(&self) -> &str;

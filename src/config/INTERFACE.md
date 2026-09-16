@@ -215,6 +215,7 @@ pub fn forget_notice_suppression() { … }
 /// Load configuration from Shammah config file or environment
 pub fn load_config() -> Result<Config> { … }
 pub(crate) fn load_config_from_path(config_path: &std::path::Path) -> Result<Config> { … }
+#[cfg(test)]
 pub(crate) fn load_config_from_path_with_paths(config_path: &std::path::Path, metrics_dir: std::path::PathBuf, constitution_path: Option<std::path::PathBuf>) -> Result<Config> { … }
 /// Load the persisted configuration without substituting environment or empty state when an existing file is invalid.
 pub fn load_persisted_config() -> Result<Option<Config>> { … }

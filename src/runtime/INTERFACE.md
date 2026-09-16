@@ -379,7 +379,13 @@ pub struct VmVocabularyEntry { … }
 
 ```rust
 /// Somewhere a typed program's child agents can be run.
-pub trait AgentSpawning: Send + Sync { … }
+pub trait AgentSpawning: Send + Sync {
+    async fn spawn(&self, spec: AgentTaskSpec, parent: Option<&AgentIdentity>) -> Result<AgentIdentity>;
+    async fn authorize(&self, task_id: Uuid, parent: Option<&AgentIdentity>) -> Result<()>;
+    async fn poll(&self, task_id: Uuid) -> Result<AgentTaskSnapshot>;
+    async fn wait(&self, task_id: Uuid) -> Result<AgentTaskResult>;
+    async fn cancel(&self, task_id: Uuid) -> Result<()>;
+}
 ```
 
 ## Functions

@@ -240,6 +240,7 @@ impl IsolatedTestProof {
     pub fn duplicate_ipc_listener(&self) -> anyhow::Result<std::os::unix::net::UnixListener>;
 }
 /// Observable pathname version for accidental-race detection, not a non-repeating identity.
+#[cfg(all(test, unix))]
 pub(crate) struct IsolatedTestSocketIdentity { … }
 /// Re-exported from `brain::schedule`.
 pub enum ProgramLanguage { Forth, Lisp }
@@ -333,11 +334,13 @@ pub struct ScheduleId(pub uuid::Uuid);
 ## Functions
 
 ```rust
+#[cfg(all(test, unix))]
 pub(crate) fn authenticate_isolated_test_peer(stream: &tokio::net::UnixStream) -> anyhow::Result<()> { … }
 pub fn authenticated_isolated_test_proof_text() -> anyhow::Result<Vec<u8>> { … }
 /// Baseline authority granted when the bootstrap administrator selects only a participant role.
 pub fn default_participant_scopes(role: AttachmentRole) -> BTreeSet<BrainCredentialScope> { … }
 /// What is actually on disk under `path`, for assertion diagnostics.
+#[cfg(test)]
 pub(crate) fn directory_listing_for_tests(path: &std::path::Path) -> String { … }
 /// Generate a cute, practically unique Brain name: "quiet-hill-a13f09", etc.
 pub fn generate() -> String { … }
@@ -346,9 +349,12 @@ pub fn isolated_test_proof_if_present() -> anyhow::Result<Option<IsolatedTestPro
 /// Maximum scopes this participant credential endpoint may mint for a role.
 pub fn permitted_participant_scopes(role: AttachmentRole) -> BTreeSet<BrainCredentialScope> { … }
 /// A Brain with one recurring schedule, created through the real API so the index is populated the way production populates it.
+#[cfg(test)]
 pub(crate) fn seed_scheduled_brain_for_tests(store: &BrainStore, name: &str, next_due_ms: u64) -> (AttachmentId, ScheduleId) { … }
+#[cfg(all(test, unix))]
 pub(crate) fn supervised_test_subprocess_command() -> std::process::Command { … }
 pub(crate) fn unix_millis() -> u64 { … }
+#[cfg(all(test, unix))]
 pub(crate) fn validate_isolated_test_socket(proof: &IsolatedTestProof, path: &std::path::Path) -> anyhow::Result<IsolatedTestSocketIdentity> { … }
 ```
 
