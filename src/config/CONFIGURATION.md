@@ -90,7 +90,7 @@ actionable `finch setup` migration error.
 
 ## Key files
 
-- `src/config/mod.rs` — Config loading, validation, migration
-- `src/config/credential.rs` — named credential schema and binding validator
+- `src/config/mod.rs` — Config loading, validation, migration; re-exports credential types from `finch-providers`
+- `crates/finch-providers/src/credentials.rs` — named credential schema and binding validator
 - `src/config/provider.rs` — `ProviderEntry` tagged enum
 - `src/config/settings.rs` — `TeacherEntry` (legacy), `LicenseConfig`, `LicenseType`

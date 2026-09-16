@@ -1252,11 +1252,10 @@ pub(crate) async fn process_query_with_tools(
                             }
                         }
                         Ok(StreamChunk::ThinkingDelta { .. })
-                        | Ok(StreamChunk::ToolCallDelta { .. }) => {}
-                        Ok(StreamChunk::ToolCallComplete {
-                            id, name, input, ..
-                        }) => {
-                            blocks.push(ContentBlock::ToolUse { id, name, input });
+                        | Ok(StreamChunk::ToolCallDelta { .. })
+                        | Ok(StreamChunk::ToolCallComplete { .. }) => {
+                            // Adapters do not emit these yet. Dual encoding
+                            // (here vs ContentBlockComplete) is owned by #776/#777.
                         }
                         Ok(StreamChunk::ContentBlockComplete(block)) => {
                             tracing::debug!(

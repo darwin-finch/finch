@@ -1758,9 +1758,8 @@ impl finch_daemon::Server for FinchDaemonImpl {
                     Ok(StreamChunk::ThinkingDelta { .. })
                     | Ok(StreamChunk::ToolCallDelta { .. })
                     | Ok(StreamChunk::ToolCallComplete { .. }) => {
-                        // Provider-native reasoning/tool deltas are crate events.
-                        // Cap'n Proto IPC (#775 follow-up / not this schema) keeps
-                        // the existing complete-block encoding.
+                        // Adapters do not emit these yet. IPC projection is #776/#777;
+                        // this schema is unchanged.
                         continue;
                     }
                     Ok(StreamChunk::ContentBlockComplete(block)) => {

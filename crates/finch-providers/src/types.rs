@@ -891,10 +891,13 @@ pub enum StreamChunk {
     TextDelta(String),
     /// Provider-native thinking/reasoning text. Labels must distinguish
     /// summaries, raw text, and encrypted/opaque material.
+    ///
+    /// Unused by current adapters; emission and IPC projection are #776/#777.
     ThinkingDelta {
         text: String,
         provenance: EventProvenance,
     },
+    /// Unused by current adapters; emission and IPC projection are #776/#777.
     ToolCallDelta {
         id: String,
         name: Option<String>,
@@ -902,6 +905,7 @@ pub enum StreamChunk {
         provenance: EventProvenance,
     },
     /// Adapter-validated tool call. Wire data remains in provenance.opaque_replay.
+    /// Unused by current adapters; emission and IPC projection are #776/#777.
     ToolCallComplete {
         id: String,
         name: String,

@@ -47,9 +47,12 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
     ),
     "issue-201-chatgpt-auth.yml": (
         "Cargo.toml", "src/lib.rs", "src/oauth/**", "src/config/**",
+        "crates/finch-providers/Cargo.toml",
         "crates/finch-providers/src/chatgpt_oauth.rs",
-        "crates/finch-providers/src/openai_jwks.rs",
+        "crates/finch-providers/src/credentials.rs",
         "crates/finch-providers/src/model_catalog.rs",
+        "crates/finch-providers/src/oauth/**",
+        "crates/finch-providers/src/openai_jwks.rs",
         "src/providers/mod.rs", "src/cli/chatgpt_auth.rs",
         "src/cli/setup_wizard.rs", "src/main.rs", "docs/OAUTH.md",
         ".github/issue-105-windows-probe/**", ".github/issue-201-windows-probe/**",

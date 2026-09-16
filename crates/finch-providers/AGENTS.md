@@ -26,6 +26,11 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
 - `ValidatedProviderRequest` is unforgeable; backends consume `into_request_for`.
 - Tool calls become semantic `ToolUse` only after adapter validation.
 - Opaque reasoning/replay material is not display content.
+- Adapters emit `TextDelta` and `ContentBlockComplete` (plus usage/allowance/metadata).
+  `StreamChunk::{ThinkingDelta, ToolCallDelta, ToolCallComplete}` are crate-contract
+  placeholders. Adapter emission and IPC projection of those events belong to
+  #776 (generation types) and #777 (provider-specific reasoning/tool streaming).
+  Do not flatten per-adapter parsers into a lowest-common-denominator decoder.
 - OAuth cancellation, expiry, and denial are terminal; interrupted refresh
   recovers only as tombstones.
 - Secrets never appear in `Debug`, logs, or error text.
@@ -45,3 +50,9 @@ adapters.
 **Agent-context audit:** a worker can understand, implement against, and test this
 crate from this capsule plus `INTERFACE.md` without opening Finch application
 code. Config-taking factory mapping remains in Finch `src/providers`.
+
+**Named remainders (not this extraction):**
+- Thread streaming HTTP through adapter constructors (Issue 3 / #776).
+- Feature-gate optional deps (`reqwest`/`png`/`ring`) so `--no-default-features` drops them (Issue 4 / #775).
+- Stop baking `~/.finch` into crate constructors; Finch should pass cache/store roots (Issue 5 / #775).
+- `generate_interfaces.py` omits `async fn` trait methods (Issue 6 / hygiene).

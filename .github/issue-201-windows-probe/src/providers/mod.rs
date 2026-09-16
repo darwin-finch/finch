@@ -1,5 +1,7 @@
-#[path = "../../../../src/providers/chatgpt_oauth.rs"]
-pub mod chatgpt_oauth;
+//! Compatibility names for the former Finch `providers` path includes.
+//!
+//! ChatGPT OAuth and OpenAI JWKS now live in `finch-providers`.
 
-#[path = "../../../../src/providers/openai_jwks.rs"]
-pub mod openai_jwks;
+pub use finch_providers::{
+    OpenAiChatGptOAuthDialect, OpenAiJwksVerifier, OpenAiTokenVerifier,
+};
