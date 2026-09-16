@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::providers::{ContentBlock, Message};
@@ -164,6 +163,13 @@ pub struct ResponseMetadata {
     pub secondary_allowance_used_percent: Option<f32>,
 }
 
+pub use finch_generation::{
+    translate_provider_chunk, Allowance, BackendKind, BackendRef, GenerationBackend,
+    GenerationEvent, GenerationId, GenerationIdentity, GenerationPorts, GenerationRequest,
+    GenerationStrategy, GenerationSupervisor, LoadPhase, ProviderGenerationBackend, Readiness,
+    ReadinessReport, ReasoningKind, ResourceBudget, RouteDecision, ScriptedBackend,
+    TerminalOutcome, ToolCall, ToolResult as GenerationToolResult,
+};
 pub use finch_providers::StreamChunk;
 
 pub use finch_providers::ToolUse;
@@ -425,6 +431,20 @@ mod tests {
         let _ = std::any::type_name::<ClaudeGenerator>();
         let _ = std::any::type_name::<DaemonLocalGenerator>();
         let _ = CODING_SYSTEM_PROMPT;
+        let _ = std::any::type_name::<GenerationEvent>();
+        let _ = std::any::type_name::<ToolCall>();
+        let _ = std::any::type_name::<GenerationToolResult>();
+    }
+
+    #[test]
+    fn qwen_generator_source_does_not_own_tool_executor() {
+        let source = include_str!("qwen.rs");
+        for forbidden in ["ToolExecutor", "execute_tool", "execute_tools"] {
+            assert!(
+                !source.contains(forbidden),
+                "QwenGenerator must emit tool calls without owning execution; found {forbidden}"
+            );
+        }
     }
 
     fn collect_generators_child_imports(

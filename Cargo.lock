@@ -1645,6 +1645,7 @@ dependencies = [
  "dashmap",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "finch-generation",
  "finch-language",
  "finch-providers",
  "finch-vm",
@@ -1725,6 +1726,22 @@ dependencies = [
  "finch-vm-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "finch-generation"
+version = "0.7.30"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "finch-providers",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

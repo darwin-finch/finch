@@ -2280,11 +2280,7 @@ impl Repl {
                     .unwrap_or_else(|| "local".to_string());
                 Arc::new(DaemonLocalGenerator::new(client, profile_name))
             } else {
-                Arc::new(QwenGenerator::new(
-                    Arc::clone(&self.local_generator),
-                    Arc::clone(&self.tokenizer),
-                    Some(Arc::clone(&self.tool_executor)),
-                ))
+                Arc::new(QwenGenerator::new(Arc::clone(&self.local_generator)))
             };
         drop(generator_select_phase);
 
