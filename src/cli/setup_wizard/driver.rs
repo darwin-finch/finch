@@ -5,20 +5,25 @@
 
 use super::*;
 
-/// Returns true if the Models section is currently in the Scanning sub-step
+/// Returns true if the Models section is in a sub-step that polls background
+/// work (network scan, catalog refresh, or the add-time ChatGPT device
+/// ceremony #424), so the run loop uses a short poll timeout and keeps
+/// redrawing instead of blocking on keyboard input.
 pub(super) fn is_scanning_state(state: &WizardState) -> bool {
     if let Some(SectionState::Models {
         adding_provider, ..
     }) = state.sections.get(&WizardSection::Models)
     {
-        matches!(adding_provider, Some(AddProviderStep::Scanning { .. }))
-            || matches!(
-                state.sections.get(&WizardSection::Models),
-                Some(SectionState::Models {
-                    catalog_refresh: Some(_),
-                    ..
-                })
-            )
+        matches!(
+            adding_provider,
+            Some(AddProviderStep::Scanning { .. }) | Some(AddProviderStep::DeviceAuth { .. })
+        ) || matches!(
+            state.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_refresh: Some(_),
+                ..
+            })
+        )
     } else {
         false
     }
@@ -257,6 +262,24 @@ pub(super) fn run_tabbed_wizard(
     existing_config: Option<&crate::config::Config>,
 ) -> Result<SetupResult> {
     let mut state = WizardState::new(existing_config);
+    // #424: the add-provider dialog runs the ChatGPT device exchange itself,
+    // so the live wizard carries the production credential authority. Without
+    // one (no home directory), the dialog falls back to the save-time ceremony.
+    state.chatgpt_authenticator = match crate::cli::chatgpt_auth::ChatGptAuthService::production() {
+        Ok(service) => {
+            Some(Arc::new(service)
+                as Arc<
+                    dyn crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator,
+                >)
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "ChatGPT device sign-in is unavailable in setup; the exchange will run when setup is saved"
+            );
+            None
+        }
+    };
 
     loop {
         terminal.draw(|f| {

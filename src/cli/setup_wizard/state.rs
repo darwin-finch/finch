@@ -160,6 +160,10 @@ pub(super) struct WizardState {
     /// Named credential metadata is preserved unchanged by the compact model
     /// editor; it contains no secret material.
     pub(super) credentials: Vec<crate::config::ProviderCredential>,
+    /// Add-time ChatGPT credential authority (#424). Attached only by the live
+    /// wizard loop; hermetic constructors leave it absent so tests and degraded
+    /// environments never touch a real credential store.
+    pub(super) chatgpt_authenticator: Option<std::sync::Arc<dyn ChatGptCredentialAuthenticator>>,
 }
 
 impl WizardState {
@@ -406,6 +410,7 @@ impl WizardState {
             credentials: existing_config
                 .map(|config| config.credentials().to_vec())
                 .unwrap_or_default(),
+            chatgpt_authenticator: None,
         }
     }
 

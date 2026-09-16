@@ -4,6 +4,9 @@
 //! Review. Deliberately holds no drawing code and almost no dependencies: the whole file
 //! reaches outside `cli` only for `crate::models` and `crate::config`.
 
+use super::chatgpt_recovery::{
+    chatgpt_setup_failure_cause, chatgpt_setup_failure_summary, spawn_add_time_chatgpt_device_flow,
+};
 use super::*;
 
 /// Handle input for Themes section
@@ -41,6 +44,91 @@ pub(super) fn handle_themes_input(
     Ok(false)
 }
 
+/// The named credential a confirmed ChatGPT provider binds to: the persisted
+/// reference when one exists, otherwise the wizard default for fresh adds.
+fn chatgpt_persisted_reference(persisted: Option<&ProviderEntry>) -> String {
+    persisted
+        .and_then(|entry| match entry {
+            ProviderEntry::Credentialed {
+                provider: crate::config::CredentialProvider::ChatgptSubscription,
+                credential,
+                ..
+            } => Some(credential.credential_ref.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "chatgpt:default".to_string())
+}
+
+/// The persisted profile an edited remote row carries, when it still belongs
+/// to the provider being confirmed.
+fn resolved_persisted_entry(
+    primary_model: &ModelConfig,
+    tool_models: &[ModelConfig],
+    editing_idx: Option<usize>,
+    provider_id: &str,
+) -> Option<ProviderEntry> {
+    editing_idx
+        .and_then(|index| {
+            if index == 0 {
+                match primary_model {
+                    ModelConfig::Remote { persisted, .. } => persisted.as_ref(),
+                    ModelConfig::Local { .. } => None,
+                }
+            } else {
+                tool_models.get(index - 1).and_then(|model| match model {
+                    ModelConfig::Remote { persisted, .. } => persisted.as_ref(),
+                    ModelConfig::Local { .. } => None,
+                })
+            }
+        })
+        .filter(|entry| registered_editor_id(entry) == Some(provider_id))
+        .cloned()
+}
+
+/// Build the edited remote model from a confirmed dialog and insert it into
+/// the provider list: the edited slot, the primary slot when it is the
+/// unconfigured placeholder, or a new tool row.
+fn commit_remote_provider(
+    primary_model: &mut ModelConfig,
+    tool_models: &mut Vec<ModelConfig>,
+    selected_idx: &mut usize,
+    provider_id: &str,
+    name: &str,
+    model: &str,
+    api_key: Option<String>,
+    editing_idx: Option<usize>,
+    persisted: Option<ProviderEntry>,
+) {
+    let edited = ModelConfig::Remote {
+        provider: provider_id.to_string(),
+        name: if name.trim().is_empty() {
+            provider_id.to_string()
+        } else {
+            name.trim().to_string()
+        },
+        api_key: api_key.unwrap_or_default(),
+        model: model.to_string(),
+        enabled: true,
+        persisted,
+    };
+    if let Some(index) = editing_idx {
+        if index == 0 {
+            *primary_model = edited;
+        } else if let Some(slot) = tool_models.get_mut(index - 1) {
+            let enabled = slot.enabled();
+            *slot = edited;
+            slot.set_enabled(enabled);
+        }
+        *selected_idx = index;
+    } else if tool_models.is_empty() && is_unconfigured_placeholder(primary_model) {
+        *primary_model = edited;
+        *selected_idx = 0;
+    } else {
+        tool_models.push(edited);
+        *selected_idx = tool_models.len();
+    }
+}
+
 /// Handle input for Models section (unified Backend + Teachers)
 pub(super) fn handle_models_input(
     state: &mut WizardState,
@@ -48,6 +136,11 @@ pub(super) fn handle_models_input(
 ) -> Result<bool> {
     let catalog_cache_dir = state.catalog_cache_dir.clone();
     let credentials = state.credentials.clone();
+    let chatgpt_authenticator = state.chatgpt_authenticator.clone();
+    // Credential published by a completed add-time device ceremony (#424),
+    // recorded into wizard state once the section borrow ends.
+    let mut record_named_credential: Option<crate::config::ProviderCredential> = None;
+    let mut overlay_handled = false;
     if let Some(SectionState::Models {
         primary_model,
         tool_models,
@@ -125,7 +218,35 @@ pub(super) fn handle_models_input(
 
             match key.code {
                 KeyCode::Esc => {
-                    *adding_provider = None;
+                    if let Some(AddProviderStep::DeviceAuth {
+                        provider_idx,
+                        name,
+                        model,
+                        editing_idx,
+                        outcome,
+                        cancel,
+                        ..
+                    }) = adding_provider.as_ref()
+                    {
+                        // Dismissing the dialog cancels the ceremony and
+                        // returns to the provider form without abandoning the
+                        // wizard; a terminal failure's cause stays visible.
+                        cancel.cancel();
+                        if let Some(Err(failure)) = outcome.lock().unwrap().as_ref() {
+                            let cause = chatgpt_setup_failure_cause(failure);
+                            *error = Some(chatgpt_setup_failure_summary(cause));
+                        }
+                        *adding_provider = Some(AddProviderStep::ConfigureRemote {
+                            provider_idx: *provider_idx,
+                            name: name.clone(),
+                            model: model.clone(),
+                            api_key: None,
+                            focused_field: 1,
+                            editing_idx: *editing_idx,
+                        });
+                    } else {
+                        *adding_provider = None;
+                    }
                     *catalog_generation = catalog_generation.wrapping_add(1);
                     *catalog_refresh = None;
                 }
@@ -668,59 +789,161 @@ pub(super) fn handle_models_input(
                                     editing_idx,
                                 })
                             } else {
-                                let persisted = editing_idx
-                                    .and_then(|index| {
-                                        if index == 0 {
-                                            match &*primary_model {
-                                                ModelConfig::Remote { persisted, .. } => {
-                                                    persisted.clone()
-                                                }
-                                                ModelConfig::Local { .. } => None,
-                                            }
-                                        } else {
-                                            tool_models.get(index - 1).and_then(|model| match model
-                                            {
-                                                ModelConfig::Remote { persisted, .. } => {
-                                                    persisted.clone()
-                                                }
-                                                ModelConfig::Local { .. } => None,
-                                            })
-                                        }
-                                    })
-                                    .filter(|entry| {
-                                        registered_editor_id(entry) == Some(provider_id)
-                                    });
-                                let edited = ModelConfig::Remote {
-                                    provider: provider_id.to_string(),
-                                    name: if name.trim().is_empty() {
-                                        provider_id.to_string()
-                                    } else {
-                                        name.trim().to_string()
-                                    },
-                                    api_key: api_key.unwrap_or_default(),
-                                    model: resolved_model,
-                                    enabled: true,
-                                    persisted,
-                                };
-                                if let Some(index) = editing_idx {
-                                    if index == 0 {
-                                        *primary_model = edited;
-                                    } else if let Some(slot) = tool_models.get_mut(index - 1) {
-                                        let enabled = slot.enabled();
-                                        *slot = edited;
-                                        slot.set_enabled(enabled);
-                                    }
-                                    *selected_idx = index;
-                                } else if tool_models.is_empty()
-                                    && is_unconfigured_placeholder(primary_model)
+                                let persisted = resolved_persisted_entry(
+                                    primary_model,
+                                    tool_models,
+                                    editing_idx,
+                                    provider_id,
+                                );
+                                if provider_id.eq_ignore_ascii_case("chatgpt")
+                                    && editing_idx.is_none()
                                 {
-                                    *primary_model = edited;
-                                    *selected_idx = 0;
+                                    // #424: run the device exchange here, in
+                                    // the dialog, so the user learns the
+                                    // outcome while adding the provider and
+                                    // can add several OAuth providers in one
+                                    // sitting. Editing an existing profile
+                                    // keeps its credential untouched; the
+                                    // save-time ceremony still validates it.
+                                    if let Some(authenticator) = chatgpt_authenticator.as_ref() {
+                                        let reference =
+                                            chatgpt_persisted_reference(persisted.as_ref());
+                                        let pending = Arc::new(Mutex::new(None));
+                                        let outcome: DeviceAuthOutcome = Arc::new(Mutex::new(None));
+                                        let cancel = tokio_util::sync::CancellationToken::new();
+                                        spawn_add_time_chatgpt_device_flow(
+                                            authenticator.clone(),
+                                            reference.clone(),
+                                            pending.clone(),
+                                            outcome.clone(),
+                                            cancel.clone(),
+                                        );
+                                        Some(AddProviderStep::DeviceAuth {
+                                            provider_idx,
+                                            name,
+                                            model: resolved_model,
+                                            reference,
+                                            editing_idx,
+                                            pending,
+                                            outcome,
+                                            cancel,
+                                        })
+                                    } else {
+                                        // No credential authority (no home
+                                        // directory): keep the save-time
+                                        // ceremony as the fallback.
+                                        commit_remote_provider(
+                                            primary_model,
+                                            tool_models,
+                                            selected_idx,
+                                            provider_id,
+                                            &name,
+                                            &resolved_model,
+                                            api_key,
+                                            editing_idx,
+                                            persisted,
+                                        );
+                                        None
+                                    }
                                 } else {
-                                    tool_models.push(edited);
-                                    *selected_idx = tool_models.len();
+                                    commit_remote_provider(
+                                        primary_model,
+                                        tool_models,
+                                        selected_idx,
+                                        provider_id,
+                                        &name,
+                                        &resolved_model,
+                                        api_key,
+                                        editing_idx,
+                                        persisted,
+                                    );
+                                    None
                                 }
-                                None
+                            }
+                        }
+                        // ── add-time ChatGPT device ceremony (#424) ──────────────────
+                        Some(AddProviderStep::DeviceAuth {
+                            provider_idx,
+                            name,
+                            model,
+                            reference,
+                            editing_idx,
+                            pending,
+                            outcome,
+                            cancel,
+                        }) => {
+                            let terminal = outcome.lock().unwrap().take();
+                            match terminal {
+                                // Terminal success: bind the account credential and
+                                // add the provider before returning to the list.
+                                Some(Ok(ensured)) => {
+                                    let (provider_id, _, default_model, _) = CLOUD_PROVIDERS
+                                        [provider_idx.min(CLOUD_PROVIDERS.len() - 1)];
+                                    let resolved_model = if model.is_empty() {
+                                        default_model.to_string()
+                                    } else {
+                                        model
+                                    };
+                                    let persisted = resolved_persisted_entry(
+                                        primary_model,
+                                        tool_models,
+                                        editing_idx,
+                                        provider_id,
+                                    );
+                                    record_named_credential = Some(ensured.credential);
+                                    commit_remote_provider(
+                                        primary_model,
+                                        tool_models,
+                                        selected_idx,
+                                        provider_id,
+                                        &name,
+                                        &resolved_model,
+                                        None,
+                                        editing_idx,
+                                        persisted,
+                                    );
+                                    None
+                                }
+                                // Terminal failure: surface the cause and restart
+                                // the ceremony for this one provider on Enter.
+                                Some(Err(failure)) => {
+                                    let cause = chatgpt_setup_failure_cause(&failure);
+                                    *error = Some(chatgpt_setup_failure_summary(cause));
+                                    let retry_pending = Arc::new(Mutex::new(None));
+                                    let retry_outcome: DeviceAuthOutcome =
+                                        Arc::new(Mutex::new(None));
+                                    let retry_cancel = tokio_util::sync::CancellationToken::new();
+                                    if let Some(authenticator) = chatgpt_authenticator.as_ref() {
+                                        spawn_add_time_chatgpt_device_flow(
+                                            authenticator.clone(),
+                                            reference.clone(),
+                                            retry_pending.clone(),
+                                            retry_outcome.clone(),
+                                            retry_cancel.clone(),
+                                        );
+                                    }
+                                    Some(AddProviderStep::DeviceAuth {
+                                        provider_idx,
+                                        name,
+                                        model,
+                                        reference,
+                                        editing_idx,
+                                        pending: retry_pending,
+                                        outcome: retry_outcome,
+                                        cancel: retry_cancel,
+                                    })
+                                }
+                                // Still running: ignore Enter.
+                                None => Some(AddProviderStep::DeviceAuth {
+                                    provider_idx,
+                                    name,
+                                    model,
+                                    reference,
+                                    editing_idx,
+                                    pending,
+                                    outcome,
+                                    cancel,
+                                }),
                             }
                         }
                         // ── single-screen local dialog — confirm ─────────────────────
@@ -779,6 +1002,20 @@ pub(super) fn handle_models_input(
                     *adding_provider = next_step;
                 }
                 _ => {}
+            }
+            overlay_handled = true;
+        }
+
+        if overlay_handled {
+            // Record the credential bound by a completed add-time device
+            // ceremony (#424) now that the section borrow has ended. It
+            // replaces any record of the same named credential, matching
+            // `save_named_credential`.
+            if let Some(credential) = record_named_credential.take() {
+                state
+                    .credentials
+                    .retain(|existing| existing.name != credential.name);
+                state.credentials.push(credential);
             }
             return Ok(false);
         }

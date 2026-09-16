@@ -3,6 +3,7 @@
 //! The wizard's largest region and its least coupled: it references no subsystem outside
 //! `cli` except `crate::theme`.
 
+use super::chatgpt_recovery::{chatgpt_setup_failure_cause, chatgpt_setup_failure_summary};
 use super::*;
 
 /// Render the tabbed wizard UI
@@ -663,6 +664,91 @@ pub(super) fn render_models_section(
     }
 }
 
+/// Render the add-time ChatGPT device sign-in dialog (#424). Every state is
+/// plain, speakable text: starting, the one-time code with its verification
+/// URL, the authenticated account, or the terminal failure cause with its
+/// recovery keys.
+pub(super) fn render_device_auth_overlay(
+    f: &mut Frame,
+    area: Rect,
+    provider_name: &str,
+    pending: &std::sync::Arc<std::sync::Mutex<Option<DeviceAuthPresentation>>>,
+    outcome: &DeviceAuthOutcome,
+) {
+    let title = Line::from(Span::styled(
+        format!("ChatGPT device sign-in for {provider_name}"),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let lines: Vec<Line> = match outcome.lock().unwrap().as_ref() {
+        Some(Ok(ensured)) => {
+            let account = ensured
+                .credential
+                .account
+                .as_deref()
+                .unwrap_or("the authorized account");
+            vec![
+                title,
+                Line::from(""),
+                Line::from(format!("Signed in as {account}.")),
+                Line::from(format!(
+                    "{provider_name} is authenticated. Press Enter to return to the provider list."
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter: Continue",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ]
+        }
+        Some(Err(failure)) => {
+            let cause = chatgpt_setup_failure_cause(failure);
+            vec![
+                title,
+                Line::from(""),
+                Line::from(chatgpt_setup_failure_summary(cause)),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter: Retry sign-in | Esc: Back to provider details",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ]
+        }
+        None => match pending.lock().unwrap().as_ref() {
+            Some(presentation) => vec![
+                title,
+                Line::from(""),
+                Line::from(format!("Open: {}", presentation.verification_uri)),
+                Line::from(format!("One-time code: {}", presentation.user_code)),
+                Line::from(""),
+                Line::from("Approve the code in your browser; this dialog finishes automatically."),
+                Line::from(format!(
+                    "The code expires in {} minutes.",
+                    presentation.expires_in.as_secs().div_ceil(60)
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Esc: Cancel",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ],
+            None => vec![
+                title,
+                Line::from(""),
+                Line::from("Starting the device sign-in…"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Esc: Cancel",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ],
+        },
+    };
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
 /// Render the add-provider overlay (centered box)
 pub(super) fn render_add_provider_overlay(
     f: &mut Frame,
@@ -683,14 +769,19 @@ pub(super) fn render_add_provider_overlay(
 
     // The wizard already knows which operation it is performing; say so rather
     // than telling someone editing a working provider that they are adding one
-    // (#418). Only the remote form is ever reopened for an existing provider.
-    let editing_existing_provider = matches!(
-        step,
+    // (#418). Only the remote and device-auth dialogs are ever reopened for an
+    // existing provider.
+    let editing_existing_provider = match step {
         AddProviderStep::ConfigureRemote {
             editing_idx: Some(_),
             ..
         }
-    );
+        | AddProviderStep::DeviceAuth {
+            editing_idx: Some(_),
+            ..
+        } => true,
+        _ => false,
+    };
 
     // Clear the overlay area with a filled block
     let background = Block::default()
@@ -889,6 +980,13 @@ pub(super) fn render_add_provider_overlay(
             );
             f.render_widget(list, inner);
         }
+        // ── add-time ChatGPT device ceremony (#424) ──────────────────────────────────
+        AddProviderStep::DeviceAuth {
+            name,
+            pending,
+            outcome,
+            ..
+        } => render_device_auth_overlay(f, inner, name, pending, outcome),
     }
 }
 
