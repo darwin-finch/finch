@@ -83,8 +83,8 @@ pub(crate) const PLANNING_ALLOWED_TOOL_ALIASES: &[(&str, &str)] = &[
 /// destructive tools are blocked to enforce read-only exploration.
 pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool {
     match mode {
-        ReplMode::Normal | ReplMode::Executing { .. } => {
-            // All tools allowed (subject to normal confirmation)
+        ReplMode::Normal | ReplMode::AutoAccept | ReplMode::Executing { .. } => {
+            // All tools allowed (subject to normal confirmation, or auto-accept)
             true
         }
         ReplMode::Planning { .. } => {
