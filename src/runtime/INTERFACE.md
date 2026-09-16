@@ -140,7 +140,7 @@ impl OutputHandleRef {
 /// UI-safe metadata for a daemon-owned typed continuation.
 pub struct PendingTypedExecutionInfo { … }
 pub enum PendingTypedReason { Yielded, AwaitingHostEffect, AuthorizationRequired }
-/// Frozen identity of one verified ProgramRun.
+/// Versioned identity of one verified ProgramRun (not a frozen public wire).
 pub struct ProgramRun { … }
 impl ProgramRun {
     /// Named handle for one journaled effect on this run.

@@ -7,7 +7,9 @@ boundary, provider-neutral `GenerationRequest` / `GenerationEvent` /
 `ToolCall` / `ToolResult` types, readiness and load phases, generation
 strategies over shared predictive state, identity/provenance, usage/latency
 terminal outcomes, injected environmental ports, generation-layer translation
-from `finch-providers::StreamChunk`, and scripted test backends.
+from `finch-providers::StreamChunk`, and scripted test backends. Those types
+are a development seam, not a production wire: change them when justified;
+do not persist a parallel copy or bind an external client as if they were frozen.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`.
 Child modules are private; the `pub use` list is the whole public surface.
