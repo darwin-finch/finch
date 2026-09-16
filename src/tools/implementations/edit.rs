@@ -13,6 +13,7 @@
 // itself; the edit is then applied here, in Rust, from the tool's own
 // parameters. Nothing on this path is handed to a shell.
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -602,6 +603,10 @@ pub struct EditTool;
 impl Tool for EditTool {
     fn name(&self) -> &str {
         "edit"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceWrite
     }
 
     fn description(&self) -> &str {

@@ -12,6 +12,7 @@
 //
 // Returns a colored summary of applied hunks.
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -32,6 +33,10 @@ pub struct PatchTool;
 impl Tool for PatchTool {
     fn name(&self) -> &str {
         "patch"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceWrite
     }
 
     fn description(&self) -> &str {

@@ -4,6 +4,7 @@
 //   Created src/foo.rs (42 lines)
 //   Updated src/bar.rs (Added 10 lines, removed 3 lines)
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -568,6 +569,10 @@ pub struct WriteTool;
 impl Tool for WriteTool {
     fn name(&self) -> &str {
         "write"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceWrite
     }
 
     fn description(&self) -> &str {

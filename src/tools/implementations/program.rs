@@ -21,6 +21,10 @@ impl Tool for GetLanguageDefinitionTool {
         "get_language_definition"
     }
 
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmRead
+    }
+
     fn description(&self) -> &str {
         "Return Finch's exact shared VM, typed Lisp, typed Co-Forth, or machine-readable program-envelope definition. Use this before writing unfamiliar VM programs."
     }
@@ -307,6 +311,10 @@ impl Tool for SearchVmVocabularyTool {
         "search_vm_vocabulary"
     }
 
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmRead
+    }
+
     fn description(&self) -> &str {
         "Compatibility search for Finch's built-in typed VM words and matching Lisp/Co-Forth source syntax. Prefer search_word for canonical cross-scope discovery; search_vocabulary only searches persisted user/project definitions."
     }
@@ -417,6 +425,10 @@ impl Tool for InspectVmWordTool {
         "inspect_vm_word"
     }
 
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmRead
+    }
+
     fn description(&self) -> &str {
         "Compatibility inspection for one built-in typed Finch VM word or verified Lisp/Co-Forth source form. Runtime words return signature/capability contracts; syntax forms return their language grammar role. Prefer inspect_word for canonical core, syntax, or persisted-definition inspection; inspect_program remains the legacy persisted-definition alias."
     }
@@ -485,6 +497,10 @@ impl SearchWordTool {
 impl Tool for SearchWordTool {
     fn name(&self) -> &str {
         "search_word"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmRead
     }
 
     fn description(&self) -> &str {
@@ -615,6 +631,10 @@ impl InspectWordTool {
 impl Tool for InspectWordTool {
     fn name(&self) -> &str {
         "inspect_word"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmRead
     }
 
     fn description(&self) -> &str {
@@ -749,6 +769,13 @@ impl Tool for SubmitProgramTool {
         "submit_program"
     }
 
+    /// Entering the typed broker is VM-local. The verifier derives the
+    /// concrete host authority from the program, so a model-supplied
+    /// coarse effect label is never consulted here.
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmWrite
+    }
+
     fn description(&self) -> &str {
         "Execute Forth or Lisp inside the active Brain only when this same inference must inspect the structured result before composing its final response. Do not use it merely to deliver a final reply: raw response text is already executed as Finch Lisp/Co-Forth. Never invoke a nested finch CLI through bash. Returns typed values, portable output events, diagnostics, and VM revisions; capabilities remain verified by the runtime."
     }
@@ -876,6 +903,10 @@ impl GetVmStateTool {
 impl Tool for GetVmStateTool {
     fn name(&self) -> &str {
         "get_vm_state"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmRead
     }
 
     fn description(&self) -> &str {

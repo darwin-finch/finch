@@ -552,9 +552,32 @@ mod tests {
             is_tool_allowed_in_mode("bash", &mode),
             "bash must be allowed in planning mode (with normal confirmation)"
         );
+    }
+
+    /// Regression (issue #466): spellings nothing registers must not pass the
+    /// planning gate. `ExitPlanMode` and `Bash` were once allow-listed as
+    /// literals while no `Tool` registers them and no alias maps to them, so
+    /// they passed the gate and could only die later at dispatch
+    /// ("Tool '…' not found"). The gate now refuses them up front; the
+    /// canonical `bash` and `enter_plan_mode` stay allowed.
+    #[test]
+    fn test_plan_mode_blocks_spellings_nothing_registers() {
+        let mode = planning_mode();
+        for tool in ["ExitPlanMode", "Write", "Edit", "write", "edit"] {
+            assert!(
+                !is_tool_allowed_in_mode(tool, &mode),
+                "{tool} must NOT be allowed in planning mode: it is not a \
+                 registered tool name or alias key (or is a state-changing tool)"
+            );
+        }
+        // "Bash" is deliberately absent from this refusal list: #765
+        // registered it as a dispatch alias of `bash` (legacy compacted
+        // history carries the spelling), so the alias-resolving gate admits
+        // it while `write`/`edit` stay blocked.
         assert!(
             is_tool_allowed_in_mode("Bash", &mode),
-            "Bash must be allowed in planning mode"
+            "Bash is a registered dispatch alias of bash (#765) and must pass \
+             the alias-resolving planning gate"
         );
     }
 

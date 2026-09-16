@@ -7,6 +7,7 @@
 // - list_recent: Show recent conversation history
 
 use crate::memory::MemorySystem;
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::Result;
@@ -29,6 +30,10 @@ impl SearchMemoryTool {
 impl Tool for SearchMemoryTool {
     fn name(&self) -> &str {
         "search_memory"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmRead
     }
 
     fn description(&self) -> &str {
@@ -164,6 +169,13 @@ impl Tool for InspectMemoryTool {
         "inspect_memory"
     }
 
+    /// Reads Finch's own memory store, but the legacy table had no arm for
+    /// the canonical name; Unclassified preserves that approval behavior
+    /// until a deliberate re-authorization (issue #466).
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Unclassified
+    }
+
     fn description(&self) -> &str {
         "Inspect the full, untruncated canonical source of one result returned by search_memory. Pass the exact memory_id from that result."
     }
@@ -232,6 +244,10 @@ impl CreateMemoryTool {
 impl Tool for CreateMemoryTool {
     fn name(&self) -> &str {
         "create_memory"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmWrite
     }
 
     fn description(&self) -> &str {
@@ -305,6 +321,10 @@ impl ListRecentTool {
 impl Tool for ListRecentTool {
     fn name(&self) -> &str {
         "list_recent_memories"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::VmRead
     }
 
     fn description(&self) -> &str {

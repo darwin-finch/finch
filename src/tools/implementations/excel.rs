@@ -12,6 +12,7 @@
 //   ExcelSheetsTool — list sheet names in the workbook    excel-sheets
 //   ExcelActivateTool— bring Excel to front, open file   excel-activate
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -101,6 +102,10 @@ impl Tool for ExcelReadTool {
         "excel_read"
     }
 
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceRead
+    }
+
     fn description(&self) -> &str {
         "Read the displayed value of one Excel cell by address (e.g. \"B3\"). \
          Returns the text as Excel would show it. \
@@ -163,6 +168,10 @@ pub struct ExcelWriteTool;
 impl Tool for ExcelWriteTool {
     fn name(&self) -> &str {
         "excel_write"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceWrite
     }
 
     fn description(&self) -> &str {
@@ -229,6 +238,10 @@ pub struct ExcelRangeTool;
 impl Tool for ExcelRangeTool {
     fn name(&self) -> &str {
         "excel_range"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceRead
     }
 
     fn description(&self) -> &str {
@@ -311,6 +324,10 @@ impl Tool for ExcelFormulaTool {
         "excel_formula"
     }
 
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceWrite
+    }
+
     fn description(&self) -> &str {
         "Get the formula stored in one Excel cell (e.g. \"=SUM(A1:A10)\"). \
          Returns the raw formula string, or the literal value if no formula. \
@@ -372,6 +389,10 @@ impl Tool for ExcelSheetsTool {
         "excel_sheets"
     }
 
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::WorkspaceRead
+    }
+
     fn description(&self) -> &str {
         "List all sheet names in the active Excel workbook, one per line. \
          Designed for blind users: no screen coordinates required."
@@ -414,6 +435,10 @@ pub struct ExcelActivateTool;
 impl Tool for ExcelActivateTool {
     fn name(&self) -> &str {
         "excel_activate"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::ExternalWrite
     }
 
     fn description(&self) -> &str {

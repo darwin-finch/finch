@@ -2,6 +2,7 @@
 //
 // Execute and check. No ceremony.
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -15,6 +16,10 @@ pub struct AnsibleTool;
 impl Tool for AnsibleTool {
     fn name(&self) -> &str {
         "ansible"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::ExternalWrite
     }
 
     fn description(&self) -> &str {

@@ -1,5 +1,6 @@
 // EnterPlanMode - Tool for Claude to signal entering read-only planning mode
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::Result;
@@ -12,6 +13,15 @@ pub struct EnterPlanModeTool;
 impl Tool for EnterPlanModeTool {
     fn name(&self) -> &str {
         "enter_plan_mode"
+    }
+
+    /// Session-local mode flip, but declared Unclassified on purpose: the
+    /// canonical name previously classified as Unclassified at the
+    /// approval boundary and still prompts there. Re-authorizing is a
+    /// deliberate approval-policy change, not part of expressing the
+    /// existing authority (issue #466).
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Unclassified
     }
 
     fn description(&self) -> &str {

@@ -1,5 +1,6 @@
 // Restart tool - prepares a frontend replacement after its Brain turn commits.
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
@@ -108,6 +109,10 @@ fn hash_file(path: &std::path::Path) -> Result<String> {
 impl Tool for RestartTool {
     fn name(&self) -> &str {
         "restart_session"
+    }
+
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Destructive
     }
 
     fn description(&self) -> &str {

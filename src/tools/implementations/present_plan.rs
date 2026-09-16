@@ -1,5 +1,6 @@
 // PresentPlan - Tool for Claude to present implementation plan for approval
 
+use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{bail, Result};
@@ -12,6 +13,13 @@ pub struct PresentPlanTool;
 impl Tool for PresentPlanTool {
     fn name(&self) -> &str {
         "present_plan"
+    }
+
+    /// Has its own review dialog upstream; declared Unclassified to keep
+    /// the approval-boundary behavior the canonical spelling had under
+    /// the legacy table (issue #466).
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Unclassified
     }
 
     fn description(&self) -> &str {

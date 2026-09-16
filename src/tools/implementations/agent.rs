@@ -1,5 +1,6 @@
 //! Structured provider tools for bounded child-agent fork/join.
 
+use crate::programs::ExecutionEffect;
 use crate::scheduler::{
     AgentBudget, AgentContextReference, AgentIdentity, AgentRole, AgentScheduler, AgentTaskSpec,
 };
@@ -36,6 +37,13 @@ impl AgentSpawnTool {
 impl Tool for AgentSpawnTool {
     fn name(&self) -> &str {
         "spawn_agent"
+    }
+
+    /// Scheduler-local and peer-allowlisted by name; Unclassified keeps the
+    /// owner approval behavior the legacy table gave the canonical
+    /// name (issue #466).
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Unclassified
     }
 
     fn description(&self) -> &str {
@@ -158,6 +166,13 @@ impl Tool for AgentAwaitTool {
         "await_agent"
     }
 
+    /// Scheduler-local and peer-allowlisted by name; Unclassified keeps the
+    /// owner approval behavior the legacy table gave the canonical
+    /// name (issue #466).
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Unclassified
+    }
+
     fn description(&self) -> &str {
         "Join a child-agent task and return its structured terminal result."
     }
@@ -202,6 +217,13 @@ impl Tool for AgentPollTool {
         "poll_agent"
     }
 
+    /// Scheduler-local and peer-allowlisted by name; Unclassified keeps the
+    /// owner approval behavior the legacy table gave the canonical
+    /// name (issue #466).
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Unclassified
+    }
+
     fn description(&self) -> &str {
         "Read a child-agent task's current structured state without blocking."
     }
@@ -244,6 +266,13 @@ impl AgentCancelTool {
 impl Tool for AgentCancelTool {
     fn name(&self) -> &str {
         "cancel_agent"
+    }
+
+    /// Scheduler-local and peer-allowlisted by name; Unclassified keeps the
+    /// owner approval behavior the legacy table gave the canonical
+    /// name (issue #466).
+    fn effect(&self) -> ExecutionEffect {
+        ExecutionEffect::Unclassified
     }
 
     fn description(&self) -> &str {

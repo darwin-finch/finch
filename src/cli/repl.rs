@@ -1756,9 +1756,23 @@ impl Repl {
                 let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let signature = generate_tool_signature(tool_use, &working_dir);
 
-                let is_auto_approved =
-                    crate::tools::legacy_tool_effect(&tool_use.name, &tool_use.input)
-                        .runs_autonomously();
+                // Declared authority of the tool (alias-resolved; unknown
+                // names classify as Unclassified and keep requiring
+                // approval). bash declares its worst case; the read-only
+                // refinement is applied here, at the approval site that
+                // consumes the effect.
+                let declared_effect = self
+                    .tool_executor
+                    .lock()
+                    .await
+                    .registry()
+                    .declared_effect(&tool_use.name);
+                let is_auto_approved = crate::tools::refined_effect_for_approval(
+                    declared_effect,
+                    &tool_use.name,
+                    &tool_use.input,
+                )
+                .runs_autonomously();
 
                 // Check if pre-approved in cache
                 let approval_source = self.tool_executor.lock().await.is_approved(&signature);
@@ -2936,6 +2950,7 @@ impl Repl {
     }
 
     /// Extract directory from a context string
+
     fn get_dir_from_context(context: &str) -> String {
         // For "reading /path/to/file.txt", return "/path/to"
         if let Some(last_slash) = context.rfind('/') {
