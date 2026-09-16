@@ -313,7 +313,7 @@ impl RunnerHostEffectPermit {
 /// One versioned Runtime/Application ABI record.
 pub enum RuntimeApplicationMessage { ProgramRun, Diagnostic, Envelope, Resume, EffectHandle, OutputHandle, CursorAck }
 impl RuntimeApplicationMessage {
-    /// ABI version carried by this record family.
+    /// ABI version to stamp on a packed frame.
     pub fn abi_version(&self) -> u32;
 }
 /// Host-specific projection of one portable typed VM event.
@@ -345,7 +345,7 @@ impl VmEffectDeliveryLog {
     pub fn pending(&self, consumer: &str) -> Vec<VmEffectEnvelope>;
     /// Unacknowledged suffix for one Brain/client identity.
     pub fn pending_for(&self, consumer: &DeliveryConsumerIdentity) -> Vec<VmEffectEnvelope>;
-    /// Unacknowledged events that target one concurrent output handle.
+    /// Unacknowledged events that target one concurrent output handle at its exact generation.
     pub fn pending_for_handle(&self, consumer: &DeliveryConsumerIdentity, handle: &OutputHandleRef) -> Vec<VmEffectEnvelope>;
 }
 /// A portable VM event attached to its owning ProgramRun.
@@ -381,7 +381,7 @@ pub trait AgentSpawning: Send + Sync { … }
 ## Functions
 
 ```rust
-/// Persist each envelope before projecting it to a live observer.
+/// Persist each new envelope before projecting it to a live observer.
 pub fn bind_delivery_log(log: Arc<Mutex<VmEffectDeliveryLog>>, downstream: Option<TypedEffectSink>) -> TypedEffectSink { … }
 pub fn parse_task_id(value: &str) -> Result<Uuid> { … }
 /// Conservative key for scoping prior permission observations.

@@ -1006,7 +1006,8 @@ impl VmEffectDeliveryLog {
             .collect()
     }
 
-    /// Unacknowledged events that target one concurrent output handle.
+    /// Unacknowledged events that target one concurrent output handle at its
+    /// exact generation. A stale generation is a different handle.
     pub fn pending_for_handle(
         &self,
         consumer: &DeliveryConsumerIdentity,
@@ -1014,11 +1015,7 @@ impl VmEffectDeliveryLog {
     ) -> Vec<VmEffectEnvelope> {
         self.pending_for(consumer)
             .into_iter()
-            .filter(|envelope| {
-                envelope.output_handle().is_some_and(|found| {
-                    found.execution_id == handle.execution_id && found.handle == handle.handle
-                })
-            })
+            .filter(|envelope| envelope.output_handle().as_ref() == Some(handle))
             .collect()
     }
 
@@ -1093,26 +1090,42 @@ fn note_output_handle(
     handles: &mut BTreeMap<(Uuid, String), OutputHandleRef>,
     envelope: &VmEffectEnvelope,
 ) {
-    if let Some(handle) = envelope.output_handle() {
-        handles.insert((handle.execution_id, handle.handle.clone()), handle);
+    let Some(handle) = envelope.output_handle() else {
+        return;
+    };
+    let key = (handle.execution_id, handle.handle.clone());
+    if handles
+        .get(&key)
+        .is_some_and(|existing| handle.generation < existing.generation)
+    {
+        return;
     }
+    handles.insert(key, handle);
 }
 
-/// Persist each envelope before projecting it to a live observer. Persistence
-/// failure suppresses projection so a reconnect cannot miss a delivered row.
+/// Persist each new envelope before projecting it to a live observer.
+///
+/// Exact replay (`append` returning `Ok(false)`) is already durable and is
+/// not re-projected. Conflicting content, persist failure, or a poisoned lock
+/// is a protocol violation: this sink panics so `observe_awaited_effect`
+/// cannot return success and leave the VM suspended with no observer.
 pub fn bind_delivery_log(
     log: Arc<Mutex<VmEffectDeliveryLog>>,
     downstream: Option<TypedEffectSink>,
 ) -> TypedEffectSink {
     Arc::new(move |envelope| {
-        let persisted = match log.lock() {
-            Ok(mut log) => log.append(envelope.clone()).is_ok(),
-            Err(_) => false,
+        let result = match log.lock() {
+            Ok(mut log) => log.append(envelope.clone()),
+            Err(_) => panic!("VM effect delivery log lock poisoned"),
         };
-        if persisted {
-            if let Some(sink) = &downstream {
-                sink(envelope);
+        match result {
+            Ok(true) => {
+                if let Some(sink) = &downstream {
+                    sink(envelope);
+                }
             }
+            Ok(false) => {}
+            Err(error) => panic!("VM effect delivery log protocol violation: {error:#}"),
         }
     })
 }
@@ -1120,7 +1133,9 @@ pub fn bind_delivery_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{DeliveryConsumerIdentity, DeliveryCursor, TypedEffectSink};
+    use crate::runtime::{
+        DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, TypedEffectSink,
+    };
     use crate::vm::{
         CapabilityKind, CapabilityRequirement, HostSideEffect, ResourceSelector, SourceOrigin,
         VmSideEffect,
@@ -1615,10 +1630,51 @@ mod tests {
         };
         let sink = bind_delivery_log(Arc::clone(&log), Some(downstream));
         sink(envelope.clone());
-        assert_eq!(observed.lock().unwrap().as_slice(), &[envelope.clone()]);
+        sink(envelope.clone());
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[envelope.clone()],
+            "exact replay must stay durable without a second live projection"
+        );
         assert_eq!(
             log.lock().unwrap().get(envelope.handle()).cloned(),
-            Some(envelope)
+            Some(envelope.clone())
+        );
+        let stale = effect(execution_id, 0, "changed");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink(stale)));
+        assert!(
+            panicked.is_err(),
+            "conflicting content is a protocol violation and must not be swallowed"
+        );
+        assert_eq!(observed.lock().unwrap().as_slice(), &[envelope]);
+    }
+
+    #[test]
+    fn stale_output_handle_generation_does_not_replace_or_match_live_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let brain = Uuid::new_v4();
+        let client = DeliveryConsumerIdentity::new(brain, Uuid::new_v4());
+        let execution_id = Uuid::new_v4();
+        let mut log =
+            VmEffectDeliveryLog::open_bound(directory.path().join("effects.jsonl"), brain).unwrap();
+        let live = ui_effect(execution_id, 0, "download", 4, "live");
+        let stale = ui_effect(execution_id, 1, "download", 3, "stale");
+        log.append(live.clone()).unwrap();
+        log.append(stale.clone()).unwrap();
+        let handles = log.output_handles(execution_id);
+        assert_eq!(
+            handles,
+            vec![OutputHandleRef::new(execution_id, "download", 4)],
+            "a smaller generation must not replace the live output handle"
+        );
+        assert_eq!(
+            log.pending_for_handle(&client, &handles[0]),
+            vec![live],
+            "pending_for_handle must not return a stale generation for the live handle"
+        );
+        assert_eq!(
+            log.pending_for_handle(&client, &OutputHandleRef::new(execution_id, "download", 3)),
+            vec![stale]
         );
     }
 

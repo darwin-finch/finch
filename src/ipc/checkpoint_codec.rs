@@ -2518,7 +2518,13 @@ fn decode_runtime_application_message(
     reader: wire::runtime_application_message::Reader<'_>,
 ) -> Result<RuntimeApplicationMessage> {
     use wire::runtime_application_message::Which;
-    Ok(match reader.which()? {
+    let abi_version = reader.get_abi_version();
+    anyhow::ensure!(
+        abi_version == crate::vm::RUNTIME_APPLICATION_ABI_VERSION,
+        "unsupported Runtime/Application ABI version {abi_version}; expected {}",
+        crate::vm::RUNTIME_APPLICATION_ABI_VERSION
+    );
+    let message = match reader.which()? {
         Which::ProgramRun(run) => RuntimeApplicationMessage::ProgramRun {
             run: decode_program_run(run?)?,
         },
@@ -2544,7 +2550,15 @@ fn decode_runtime_application_message(
                 cursor: decode_delivery_cursor(ack.get_cursor()?)?,
             }
         }
-    })
+    };
+    if let RuntimeApplicationMessage::ProgramRun { run } = &message {
+        anyhow::ensure!(
+            run.abi_version == abi_version,
+            "ProgramRun ABI version {} does not match frame version {abi_version}",
+            run.abi_version
+        );
+    }
+    Ok(message)
 }
 
 /// Compact packed Cap'n Proto frame for the Runtime/Application ABI. Local
@@ -3256,6 +3270,72 @@ mod tests {
                 "packed ABI frames must reject trailing bytes"
             );
         }
+        Ok(())
+    }
+
+    fn packed_with_outer_abi_version(
+        value: &RuntimeApplicationMessage,
+        outer: u32,
+    ) -> Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut root = message.init_root::<wire::runtime_application_message::Builder<'_>>();
+            encode_runtime_application_message(root.reborrow(), value)?;
+            root.set_abi_version(outer);
+        }
+        let mut packed = Vec::new();
+        capnp::serialize_packed::write_message(&mut packed, &message)?;
+        Ok(packed)
+    }
+
+    fn sample_envelope_message() -> RuntimeApplicationMessage {
+        RuntimeApplicationMessage::Envelope {
+            envelope: VmEffectEnvelope {
+                execution_id: uuid::Uuid::nil(),
+                effect: VmSideEffect {
+                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    sequence: 0,
+                    requirement: sample_requirement(),
+                    event: HostSideEffect::Request {
+                        arguments: vec![TypedValue::String("Cargo.toml".into())],
+                    },
+                    output: vec![Type::Bytes],
+                    origin: SourceOrigin::generated("file-read"),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn packed_runtime_application_abi_rejects_unknown_and_mismatched_versions() -> Result<()> {
+        let expected = crate::vm::RUNTIME_APPLICATION_ABI_VERSION;
+        for version in [0_u32, 2] {
+            let packed = packed_with_outer_abi_version(&sample_envelope_message(), version)?;
+            let error = decode_runtime_application_message_packed(&packed)
+                .expect_err("unknown ABI versions must fail closed")
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "unsupported Runtime/Application ABI version {version}"
+                )) && error.contains(&format!("expected {expected}")),
+                "unknown version {version} must name the supported ABI, got {error}"
+            );
+        }
+
+        let mut run = ProgramRun::new(uuid::Uuid::nil());
+        run.abi_version = 2;
+        let mismatched = packed_with_outer_abi_version(
+            &RuntimeApplicationMessage::ProgramRun { run },
+            expected,
+        )?;
+        let error = decode_runtime_application_message_packed(&mismatched)
+            .expect_err("inner/outer ABI mismatch must fail closed")
+            .to_string();
+        assert!(
+            error.contains("ProgramRun ABI version 2")
+                && error.contains(&format!("frame version {expected}")),
+            "mismatched ProgramRun version must fail closed, got {error}"
+        );
         Ok(())
     }
 }

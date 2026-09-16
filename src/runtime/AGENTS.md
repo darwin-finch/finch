@@ -12,9 +12,9 @@ listed on the DESIGN.md runtime row. Those adjacent trees are not this facade; t
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
 modules are private, so the `pub use` list in `src/runtime/mod.rs` is the whole public surface.
-Callers outside this directory use `crate::runtime::Item`; they must not name `agent_vm`,
-`agents`, `archive_store`, `automation`, `context`, `effect_audit`, `effect_log`, `outcome`,
-`host`, `hostio`, or `mcp`.
+Callers outside this directory use `crate::runtime::Item`; they must not name `abi`,
+`agent_vm`, `agents`, `archive_store`, `automation`, `context`, `effect_audit`, `effect_log`,
+`outcome`, `host`, `hostio`, or `mcp`.
 
 **Dependencies:** `vm` (capability types and the typed machine), `programs` (language, values,
 execution effect), `tools` (MCP client binding), and `memory` (optional MemTree binding).

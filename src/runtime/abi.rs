@@ -156,7 +156,9 @@ pub enum RuntimeApplicationMessage {
 }
 
 impl RuntimeApplicationMessage {
-    /// ABI version carried by this record family.
+    /// ABI version to stamp on a packed frame. Non-`ProgramRun` records use
+    /// the process constant; packed decode fail-closes unless the frame
+    /// version equals [`crate::vm::RUNTIME_APPLICATION_ABI_VERSION`].
     pub fn abi_version(&self) -> u32 {
         match self {
             Self::ProgramRun { run } => run.abi_version,
