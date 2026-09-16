@@ -149,6 +149,43 @@ async fn test_boundary_01_real_event_loop_dispatch_keeps_usage_refreshes_out_of_
         .await;
 }
 
+#[tokio::test]
+async fn home_watch_failure_clears_todo_journal_target() {
+    tokio::task::LocalSet::new()
+        .run_until(home_watch_failure_clears_todo_journal_target_scenario())
+        .await;
+}
+
+async fn home_watch_failure_clears_todo_journal_target_scenario() {
+    use std::sync::Arc;
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let tempdir = tempfile::tempdir().expect("create isolated tool state");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        tempdir.path().join("patterns.json"),
+    )
+    .expect("construct inert tool executor");
+    let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+    let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+        generator,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        Arc::clone(&runtime),
+    );
+    event_loop
+        .handle_event(super::ReplEvent::HomeBrainWatchFailed {
+            epoch: 0,
+            error: Some("Disconnected: Peer disconnected.".into()),
+        })
+        .await
+        .expect("watch failure dispatch must succeed");
+    assert!(
+        !event_loop.todo_journal_is_bound_for_test(),
+        "todo_write must not keep a clone of the disconnected home Brain client"
+    );
+}
+
 async fn boundary_01_dispatch_scenario() {
     use std::sync::Arc;
 

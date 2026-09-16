@@ -862,7 +862,7 @@ impl EventLoop {
                 if epoch != self.home_watch_epoch {
                     return Ok(());
                 }
-                self.home_brain = None;
+                self.unbind_home_brain_watch();
                 let detail = error.unwrap_or_else(|| "connection closed".into());
                 if self.last_home_watch_error.as_deref() != Some(&detail) {
                     self.output_manager.write_info(format!(

@@ -48,6 +48,12 @@ impl TodoJournalTarget {
     pub fn set(&self, selected: Option<crate::brain::AttachedBrainClient>) {
         *self.selected.borrow_mut() = selected;
     }
+
+    /// True when a Brain client will receive the next `todo_write`.
+    #[cfg(test)]
+    pub fn is_bound(&self) -> bool {
+        self.selected.borrow().is_some()
+    }
 }
 
 pub struct TodoJournalReceiver {
