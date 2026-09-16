@@ -4308,6 +4308,434 @@ mod tests {
         );
     }
 
+    /// Production-boundary regression for #426: `dispatch_tool_uses` is the
+    /// gate the provider-emitted name actually hits. Unclassified was AskUser
+    /// at `spawn_tool_execution`, so a four-item `todo_write` waited on
+    /// `ToolApprovalNeeded`. `present_plan` / `ask_user_question` already
+    /// present their own dialogs; a second `ToolApprovalNeeded` is the
+    /// double prompt. `write` still emits `ToolApprovalNeeded` so this test
+    /// is on the live approval path, not a helper-only classification.
+    #[tokio::test]
+    async fn test_dispatch_session_local_tools_do_not_emit_tool_approval_needed() {
+        use crate::tools::{
+            AskUserQuestionTool, PresentPlanTool, TodoList, TodoWriteTool, ToolExecutor,
+            ToolRegistry, WriteTool,
+        };
+
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+        let mode = Arc::new(RwLock::new(ReplMode::Normal));
+
+        let todo_list = Arc::new(RwLock::new(TodoList::default()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
+        registry.register(Box::new(PresentPlanTool));
+        registry.register(Box::new(AskUserQuestionTool));
+        registry.register(Box::new(WriteTool));
+        let tempdir = tempfile::tempdir().expect("isolated tool-pattern store for #426 dispatch");
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct executor for session-local dispatch");
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::clone(&conversation),
+            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
+            Arc::clone(&mode),
+            Arc::new(RwLock::new(None)),
+        );
+
+        let four_item_list = serde_json::json!({"todos": [
+            {"content": "Identify the harness implementation, website source, and deployment target",
+             "id": "1", "priority": "high", "status": "in_progress"},
+            {"content": "Implement the typed program runner in the harness",
+             "id": "2", "priority": "high", "status": "pending"},
+            {"content": "Build the website source from the harness output",
+             "id": "3", "priority": "medium", "status": "pending"},
+            {"content": "Verify the deployment target accepts the build",
+             "id": "4", "priority": "low", "status": "completed"}
+        ]});
+        let question_input = serde_json::json!({"questions": [{
+            "question": "Which approach?",
+            "header": "Approach",
+            "options": [
+                {"label": "A", "description": "Fast"},
+                {"label": "B", "description": "Simple"}
+            ]
+        }]});
+
+        let todo_id = "toolu_todo_write_four_item".to_string();
+        let write_id = "toolu_write_still_asks".to_string();
+        let plan_id = "toolu_present_plan_intercept".to_string();
+        let question_id = "toolu_ask_user_question_dialog".to_string();
+        let todo_use = crate::tools::ToolUse {
+            id: todo_id.clone(),
+            name: "todo_write".to_string(),
+            input: four_item_list.clone(),
+        };
+        let write_use = crate::tools::ToolUse {
+            id: write_id.clone(),
+            name: "write".to_string(),
+            input: serde_json::json!({"file_path": "src/lib.rs", "content": "must still prompt"}),
+        };
+        let plan_use = crate::tools::ToolUse {
+            id: plan_id.clone(),
+            name: "present_plan".to_string(),
+            input: serde_json::json!({"plan": "1. explore\n2. change files\n3. test"}),
+        };
+        let question_use = crate::tools::ToolUse {
+            id: question_id.clone(),
+            name: "ask_user_question".to_string(),
+            input: question_input,
+        };
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                crate::providers::Message {
+                    role: "assistant".to_string(),
+                    content: vec![
+                        ContentBlock::ToolUse {
+                            id: todo_id.clone(),
+                            name: "todo_write".to_string(),
+                            input: todo_use.input.clone(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: write_id.clone(),
+                            name: "write".to_string(),
+                            input: write_use.input.clone(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: plan_id.clone(),
+                            name: "present_plan".to_string(),
+                            input: plan_use.input.clone(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: question_id.clone(),
+                            name: "ask_user_question".to_string(),
+                            input: question_use.input.clone(),
+                        },
+                    ],
+                },
+            )
+            .expect("stage the provider tool round that dispatch_tool_uses consumes");
+
+        let work_unit = output.start_work_unit("session-local dispatch");
+        let active_tool_uses: ActiveToolUsesMap = Arc::new(RwLock::new(HashMap::new()));
+        let tool_call_history = Arc::new(RwLock::new(HashMap::new()));
+
+        // ask_user_question intercepts inline and waits on ShowDialog, so the
+        // collector must run concurrently with dispatch_tool_uses.
+        let dispatch = {
+            let work_unit = Arc::clone(&work_unit);
+            let mode = Arc::clone(&mode);
+            let tool_call_history = Arc::clone(&tool_call_history);
+            let event_tx = event_tx.clone();
+            let active_tool_uses = Arc::clone(&active_tool_uses);
+            let tui_renderer = Arc::clone(&tui_renderer);
+            let output = Arc::clone(&output);
+            let query_states = Arc::clone(&query_states);
+            let tool_coordinator = tool_coordinator.clone();
+            let status = Arc::clone(&status);
+            tokio::spawn(async move {
+                dispatch_tool_uses(
+                    vec![todo_use, write_use, plan_use, question_use],
+                    query_id,
+                    round_token,
+                    &work_unit,
+                    &mode,
+                    &tool_call_history,
+                    &event_tx,
+                    &active_tool_uses,
+                    &tui_renderer,
+                    &output,
+                    &query_states,
+                    &tool_coordinator,
+                    &None,
+                    crate::memory_status::Recall::none(),
+                    "test-session",
+                    "/test/workspace",
+                    &status,
+                    4,
+                )
+                .await;
+            })
+        };
+
+        let mut todo_result = None;
+        let mut write_asked = false;
+        let mut plan_result = None;
+        let mut question_dialog = false;
+        let mut question_result = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while todo_result.is_none()
+            || !write_asked
+            || plan_result.is_none()
+            || !question_dialog
+            || question_result.is_none()
+        {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, events.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "dispatch_tool_uses never produced the #426 events; \
+                         todo={todo_result:?} write_asked={write_asked} \
+                         plan={plan_result:?} question_dialog={question_dialog} \
+                         question={question_result:?}"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "event channel closed before the #426 events; \
+                         todo={todo_result:?} write_asked={write_asked} \
+                         plan={plan_result:?} question_dialog={question_dialog} \
+                         question={question_result:?}"
+                    )
+                });
+            match event {
+                ReplEvent::ToolApprovalNeeded {
+                    tool_use,
+                    response_tx,
+                    ..
+                } => {
+                    assert_eq!(
+                        tool_use.name, "write",
+                        "invariant: only write may emit ToolApprovalNeeded at \
+                         dispatch_tool_uses; Unclassified on todo_write / \
+                         present_plan / ask_user_question was the #426 defect. \
+                         tool={:?}",
+                        tool_use.name
+                    );
+                    write_asked = true;
+                    let _ = response_tx.send(crate::cli::repl_event::ConfirmationResult::Deny);
+                }
+                ReplEvent::ShowDialog { response_tx, .. } => {
+                    question_dialog = true;
+                    let _ = response_tx.send(crate::cli::tui::DialogResult::Cancelled);
+                }
+                ReplEvent::ToolResult {
+                    tool_id, result, ..
+                } => {
+                    let rendered = match result {
+                        Ok(text) => Ok(text),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    if tool_id == todo_id {
+                        todo_result = Some(rendered);
+                    } else if tool_id == plan_id {
+                        plan_result = Some(rendered);
+                    } else if tool_id == question_id {
+                        question_result = Some(rendered);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        dispatch
+            .await
+            .expect("dispatch_tool_uses task must finish after dialogs are answered");
+
+        let todo_result = todo_result.expect("todo_write ToolResult");
+        match &todo_result {
+            Ok(text) => {
+                assert!(
+                    text.contains("4 task"),
+                    "invariant: four-item todo_write must run at dispatch_tool_uses \
+                     without ToolApprovalNeeded (#426). got Ok({text:?})"
+                );
+            }
+            Err(error) => panic!(
+                "invariant: four-item todo_write must not be refused or wait on \
+                 approval at dispatch_tool_uses (#426). got Err({error:?})"
+            ),
+        }
+
+        assert!(
+            write_asked,
+            "control: write must still emit ToolApprovalNeeded on the same \
+             dispatch_tool_uses path, proving this test hit the live approval \
+             boundary rather than a helper-only classification"
+        );
+
+        let plan_result = plan_result.expect("present_plan intercept ToolResult");
+        match &plan_result {
+            Ok(text) => {
+                assert!(
+                    text.to_lowercase().contains("not in planning")
+                        || text.to_lowercase().contains("plan"),
+                    "invariant: present_plan must take the intercept path \
+                     (own dialog or intercept ToolResult), not ToolApprovalNeeded. \
+                     got Ok({text:?})"
+                );
+            }
+            Err(error) => panic!(
+                "invariant: present_plan must not fall through to \
+                 spawn_tool_execution approval; got Err({error:?})"
+            ),
+        }
+
+        assert!(
+            question_dialog,
+            "invariant: ask_user_question must yield ShowDialog (its own \
+             dialog), not ToolApprovalNeeded"
+        );
+        let question_result = question_result.expect("ask_user_question intercept ToolResult");
+        assert!(
+            question_result.is_ok(),
+            "invariant: ask_user_question intercept must complete without a \
+             host-effect approval; got {question_result:?}"
+        );
+
+        // Planning-mode present_plan is the path that actually sends ShowDialog.
+        // A fresh query is required: the first round already has a staged
+        // assistant message, and stage_assistant refuses a second stage.
+        let plan_query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+        let plan_path = tempdir.path().join("plan.md");
+        *mode.write().await = ReplMode::Planning {
+            task: "Manual exploration".to_string(),
+            plan_path: plan_path.clone(),
+            created_at: chrono::Utc::now(),
+        };
+        let plan_show_id = "toolu_present_plan_show_dialog".to_string();
+        let plan_show_use = crate::tools::ToolUse {
+            id: plan_show_id.clone(),
+            name: "present_plan".to_string(),
+            input: serde_json::json!({"plan": "1. explore\n2. change files\n3. test"}),
+        };
+        let plan_round = conversation
+            .write()
+            .await
+            .stage_assistant(
+                plan_query_id,
+                crate::providers::Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: plan_show_id.clone(),
+                        name: "present_plan".to_string(),
+                        input: plan_show_use.input.clone(),
+                    }],
+                },
+            )
+            .expect("stage the planning-mode present_plan round");
+        let plan_work = output.start_work_unit("present_plan ShowDialog");
+        let plan_dispatch = {
+            let plan_work = Arc::clone(&plan_work);
+            let mode = Arc::clone(&mode);
+            let tool_call_history = Arc::clone(&tool_call_history);
+            let event_tx = event_tx.clone();
+            let active_tool_uses = Arc::clone(&active_tool_uses);
+            let tui_renderer = Arc::clone(&tui_renderer);
+            let output = Arc::clone(&output);
+            let query_states = Arc::clone(&query_states);
+            let tool_coordinator = tool_coordinator.clone();
+            let status = Arc::clone(&status);
+            tokio::spawn(async move {
+                dispatch_tool_uses(
+                    vec![plan_show_use],
+                    plan_query_id,
+                    plan_round,
+                    &plan_work,
+                    &mode,
+                    &tool_call_history,
+                    &event_tx,
+                    &active_tool_uses,
+                    &tui_renderer,
+                    &output,
+                    &query_states,
+                    &tool_coordinator,
+                    &None,
+                    crate::memory_status::Recall::none(),
+                    "test-session",
+                    "/test/workspace",
+                    &status,
+                    4,
+                )
+                .await;
+            })
+        };
+
+        let mut plan_show_dialog = false;
+        let mut plan_show_result = None;
+        let plan_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !plan_show_dialog || plan_show_result.is_none() {
+            let remaining = plan_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, events.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "planning-mode present_plan never produced ShowDialog; \
+                         dialog={plan_show_dialog} result={plan_show_result:?}"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "event channel closed before present_plan ShowDialog; \
+                         dialog={plan_show_dialog} result={plan_show_result:?}"
+                    )
+                });
+            match event {
+                ReplEvent::ToolApprovalNeeded { tool_use, .. } => {
+                    panic!(
+                        "invariant: present_plan in Planning must not emit \
+                         ToolApprovalNeeded; its own review dialog is ShowDialog. \
+                         tool={:?}",
+                        tool_use.name
+                    );
+                }
+                ReplEvent::ShowDialog { response_tx, .. } => {
+                    plan_show_dialog = true;
+                    let _ = response_tx.send(crate::cli::tui::DialogResult::Cancelled);
+                }
+                ReplEvent::ToolResult {
+                    tool_id, result, ..
+                } if tool_id == plan_show_id => {
+                    plan_show_result = Some(match result {
+                        Ok(text) => Ok(text),
+                        Err(error) => Err(error.to_string()),
+                    });
+                }
+                _ => {}
+            }
+        }
+        plan_dispatch
+            .await
+            .expect("planning-mode present_plan dispatch must finish after ShowDialog");
+        assert!(
+            plan_show_dialog,
+            "invariant: present_plan in Planning must yield ShowDialog, not \
+             ToolApprovalNeeded"
+        );
+        assert!(
+            plan_show_result
+                .expect("present_plan ShowDialog ToolResult")
+                .is_ok(),
+            "invariant: present_plan intercept must complete from its own dialog"
+        );
+    }
+
     // ── Summarised request assembly (committed-range summary reuse) ────────
 
     /// Main-turn generator that records every assembled provider request and
