@@ -1,44 +1,26 @@
-# providers capsule: provider graph, wire transports, and the model catalog
+# providers capsule: Finch Config mapping onto finch-providers
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `src/providers/`: the provider graph and factory, per-dialect wire transports
-(Claude, OpenAI, Gemini, ChatGPT OAuth and subscription), OpenAI JWKS verification, the
-model catalog with its static fallback and cache, teacher session management, the
-fallback chain, and the non-overridable validated dispatch boundary. The Claude HTTP
-client lives in `src/claude` (its own subtree); credential persistence is the `oauth`
-capsule; which provider a conversation uses is the caller's decision, not this subtree's.
+**Owns** this Finch compatibility facade: Config-taking factory and catalog mapping
+(`factory.rs`, `catalog.rs`) and re-exports of `finch-providers`. Transports, OAuth
+dialects, wire types, dispatch, and adapter tests live in
+[`crates/finch-providers/AGENTS.md`](../../crates/finch-providers/AGENTS.md).
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its
-signature. Child modules are private (`alignment`, `chatgpt_oauth`,
-`chatgpt_subscription`, `claude`, `endpoints`, `factory`, `fallback_chain`, `gemini`,
-`model_catalog`, `openai`, `openai_jwks`, `teacher_session`, `types`), so the `pub use`
-list in `src/providers/mod.rs` is the whole public surface. Callers outside this
-directory use `crate::providers::Item`; they must not name `providers::<child>::`.
+**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item. Callers
+outside this directory use `crate::providers::Item`.
 
-**Dependencies:** `config` (provider
-entry and teacher types), `oauth` (dialect-facing credential types), `tools`,
-`models`, `generators` (streaming chunks). `crate::cli::ConversationHistory` appears
-only inside `claude.rs` tests.
+**Dependencies:** `finch-providers` (transports and contracts), `config` (application
+`Config` / `ProviderEntry` / `TeacherEntry`). Do not add Brain, TUI, daemon, or tool
+execution here.
 
-**Owns the universal wire types.** `wire_types` defines `Message`, `ContentBlock`,
-and `ImageSource` — the provider-neutral conversation vocabulary every caller
-uses (`crate::providers::Message`). The Claude HTTP client in `src/claude`
-consumes these types like any other transport and keeps only its own
-`MessageRequest`/`MessageResponse` envelopes; it must not re-export the trio
-under claude paths. `wire_type_boundary_tests` in `mod.rs` fails if a caller
-reaches the trio through a claude path.
+**Owns the compatibility path** `crate::providers::Message` for the universal wire
+types. The Claude HTTP client in `src/claude` must not re-export that trio.
 
-**Invariants:**
+**Invariants:** dialects, `ValidatedProviderRequest`, and adapter parsing belong to
+the crate. This facade only maps application configuration onto crate constructors.
 
-- Dialects own every provider fact — URL, client ID, scope, token issuer, endpoint
-  behavior. Shared code and callers know none of them.
-- `ValidatedProviderRequest` is minted only inside `validated_boundary`; its fields and
-  constructor are private, so even a provider backend elsewhere in the crate cannot
-  fabricate a dispatch token.
-- Contract tests in `mod.rs` pin reasoning-control and output-token limits; wire changes
-  must keep them green.
-
-**Focused tests:** `./scripts/test_brains.sh cargo test --lib -- providers::`; also
-`cargo test --test gemini_streaming_test --test provider_token_binding_test` when wire
-behavior changes. Run the full suite when changing a re-exported `pub` item.
+**Focused tests:** `./scripts/test_brains.sh cargo test --lib -- providers::`; crate
+tests via `./scripts/test_brains.sh cargo test -p finch-providers --lib`; also
+`cargo test --test gemini_streaming_test --test provider_token_binding_test` when
+wire behavior changes.

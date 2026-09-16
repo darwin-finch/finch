@@ -126,14 +126,14 @@ pub enum CredentialLifecycle {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct LifecycleRevocation(Arc<AtomicBool>);
+pub struct LifecycleRevocation(Arc<AtomicBool>);
 
 impl LifecycleRevocation {
-    pub(crate) fn revoke(&self) {
+    pub fn revoke(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
 
-    pub(crate) fn is_revoked(&self) -> bool {
+    pub fn is_revoked(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
 }
@@ -186,7 +186,7 @@ pub struct ProviderCredential {
     /// In-process invalidation authority shared by configuration clones and
     /// already-constructed providers. It is runtime state, never persisted.
     #[serde(skip)]
-    pub(crate) revocation: LifecycleRevocation,
+    pub revocation: LifecycleRevocation,
 }
 
 /// Profile-side authentication contract. Central provider descriptors supply
@@ -219,7 +219,10 @@ impl ResolvedSecret {
         Ok(Self(secret))
     }
 
-    pub(crate) fn expose(&self) -> &str {
+    /// Expose secret bytes to a trusted resolver/transport boundary.
+    ///
+    /// Never log, display, or persist the returned value.
+    pub fn expose(&self) -> &str {
         &self.0
     }
 }

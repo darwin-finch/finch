@@ -294,8 +294,8 @@ impl ProviderBackend for FallbackChain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::ContentBlock;
-    use crate::tools::{ToolDefinition, ToolInputSchema};
+    use crate::ContentBlock;
+    use crate::{ToolDefinition, ToolInputSchema};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Mock provider for testing
@@ -355,8 +355,8 @@ mod tests {
         fn requested_reasoning_effort(
             &self,
             _: &ProviderRequest,
-        ) -> Option<crate::config::ReasoningEffort> {
-            Some(crate::config::ReasoningEffort::High)
+        ) -> Option<crate::ReasoningEffort> {
+            Some(crate::ReasoningEffort::High)
         }
     }
 

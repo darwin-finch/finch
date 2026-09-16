@@ -356,7 +356,7 @@ mod secure_directory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AudienceBinding, CredentialKind, CredentialProvider, EndpointFamily};
+    use crate::{AudienceBinding, CredentialKind, CredentialProvider, EndpointFamily};
     use chrono::{TimeDelta, Utc};
     use std::collections::BTreeSet;
 

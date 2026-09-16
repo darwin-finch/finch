@@ -1755,6 +1755,13 @@ impl finch_daemon::Server for FinchDaemonImpl {
                             .set_secondary_used_percent(secondary_used_percent.unwrap_or_default());
                         r.send().promise.await?;
                     }
+                    Ok(StreamChunk::ThinkingDelta { .. })
+                    | Ok(StreamChunk::ToolCallDelta { .. })
+                    | Ok(StreamChunk::ToolCallComplete { .. }) => {
+                        // Adapters do not emit these yet. IPC projection is #776/#777;
+                        // this schema is unchanged.
+                        continue;
+                    }
                     Ok(StreamChunk::ContentBlockComplete(block)) => {
                         let mut r = receiver.on_chunk_request();
                         let mut encoded = r.get().init_chunk().init_content_block_complete();

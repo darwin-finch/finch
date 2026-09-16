@@ -1,6 +1,6 @@
 use super::*;
-use crate::config::EndpointFamily;
-use crate::providers::{
+use crate::EndpointFamily;
+use crate::{
     ChatGptDeviceEndpointError, OpenAiChatGptOAuthDialect, OpenAiTokenVerifier,
     VerifiedOpenAiClaims,
 };
@@ -1794,7 +1794,7 @@ async fn saved_oauth_tokens_project_through_174_binding_and_resolve_only_exact_a
         .await
         .unwrap();
     let credential = record.provider_credential("chatgpt:work");
-    let binding = crate::config::CredentialBinding {
+    let binding = crate::CredentialBinding {
         credential_ref: "chatgpt:work".into(),
         audience: Some(AudienceBinding::standard(
             EndpointFamily::ChatgptSubscription,
@@ -1804,7 +1804,7 @@ async fn saved_oauth_tokens_project_through_174_binding_and_resolve_only_exact_a
         account: Some("account-one".into()),
         required_scopes: dialect.descriptor.scopes.clone(),
     };
-    crate::config::validate_binding(
+    crate::validate_binding(
         CredentialProvider::ChatgptSubscription,
         None,
         &binding,

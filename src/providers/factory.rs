@@ -6,10 +6,6 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use super::chatgpt_subscription::ChatGptSubscriptionProvider;
-use super::claude::ClaudeProvider;
-use super::gemini::GeminiProvider;
-use super::openai::OpenAIProvider;
 use super::{
     LlmProvider, ProviderBackend, ProviderRequest, ProviderResponse, StreamChunk,
     ValidatedProviderRequest,
@@ -17,6 +13,9 @@ use super::{
 use crate::config::{
     Config, CredentialProvider, CredentialResolver, EnvironmentCredentialResolver, ProviderEntry,
     ResolvedCredential, TeacherEntry,
+};
+use finch_providers::{
+    ChatGptSubscriptionProvider, ClaudeProvider, GeminiProvider, OpenAIProvider,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;

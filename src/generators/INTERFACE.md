@@ -39,14 +39,10 @@ impl QwenGenerator {
     pub fn new(local_generator: Arc<RwLock<LocalGenerator>>, tokenizer: Arc<TextTokenizer>, tool_executor: Option<Arc<tokio::sync::Mutex<ToolExecutor>>>) -> Self;
 }
 pub struct ResponseMetadata { … }
-/// Streaming chunk (text delta or complete block)
-pub enum StreamChunk { TextDelta, ContentBlockComplete, ResponseMetadata, Usage, Allowance }
-/// Tool use request from generator
+/// Streaming chunk (text delta, reasoning, tool call, or complete block). Re-exported from `finch-providers`.
+pub enum StreamChunk { TextDelta, ThinkingDelta, ToolCallDelta, ToolCallComplete, ContentBlockComplete, ResponseMetadata, Usage, Allowance }
+/// Tool use request after adapter-level validation. Re-exported from `finch-providers`.
 pub struct ToolUse { … }
-impl ToolUse {
-    /// Convert to ContentBlock for conversation history
-    pub fn to_content_block(&self) -> ContentBlock;
-}
 ```
 
 ## Traits

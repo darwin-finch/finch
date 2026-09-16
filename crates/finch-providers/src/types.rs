@@ -3,9 +3,9 @@
 // These types abstract over provider-specific formats (Claude, OpenAI, Gemini, etc.)
 // allowing the rest of the codebase to work with a unified interface.
 
-use crate::config::ReasoningEffort;
-use crate::providers::{ContentBlock, Message};
-use crate::tools::ToolDefinition;
+use crate::ReasoningEffort;
+use crate::ToolDefinition;
+use crate::{ContentBlock, Message};
 use serde::{Deserialize, Serialize};
 
 /// Whether a provider/model capability is known to be usable.
@@ -512,7 +512,7 @@ impl ProviderRequest {
     /// such histories with a 400 error. This method trims those orphaned tail
     /// messages so the fallback provider sees a clean conversation.
     pub fn sanitize_messages(&mut self) {
-        use crate::providers::ContentBlock;
+        use crate::ContentBlock;
 
         loop {
             // Find the last assistant message index
@@ -689,7 +689,7 @@ impl ProviderRequest {
         // tool_use (in the preceding assistant message) was just dropped.
         // All providers reject tool_result without a matching tool_use, so
         // strip any such orphaned pairs from the front of the window.
-        use crate::providers::ContentBlock;
+        use crate::ContentBlock;
         loop {
             if self.messages.len() <= 1 {
                 break;
@@ -848,11 +848,11 @@ impl ProviderResponse {
     }
 
     /// Extract tool uses from response
-    pub fn tool_uses(&self) -> Vec<crate::tools::ToolUse> {
+    pub fn tool_uses(&self) -> Vec<crate::ToolUse> {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input } => Some(crate::tools::ToolUse {
+                ContentBlock::ToolUse { id, name, input } => Some(crate::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
@@ -871,15 +871,65 @@ impl ProviderResponse {
     }
 }
 
-/// Stream chunk types for streaming responses
+/// Provider/model/event provenance retained with a stream event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventProvenance {
+    pub provider: String,
+    pub model: String,
+    pub event: String,
+    pub sequence: u64,
+    /// Opaque replay material. Never treat as display content.
+    pub opaque_replay: Option<String>,
+}
+
+/// Streaming chunk (text delta, reasoning, tool call, or complete block).
 ///
-/// Re-export from generators module for convenience
-pub use crate::generators::StreamChunk;
+/// Adapters translate native formats into this stream. Tool calls become
+/// semantic [`crate::ToolUse`] only after adapter validation.
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    TextDelta(String),
+    /// Provider-native thinking/reasoning text. Labels must distinguish
+    /// summaries, raw text, and encrypted/opaque material.
+    ///
+    /// Unused by current adapters; emission and IPC projection are #776/#777.
+    ThinkingDelta {
+        text: String,
+        provenance: EventProvenance,
+    },
+    /// Unused by current adapters; emission and IPC projection are #776/#777.
+    ToolCallDelta {
+        id: String,
+        name: Option<String>,
+        arguments_delta: String,
+        provenance: EventProvenance,
+    },
+    /// Adapter-validated tool call. Wire data remains in provenance.opaque_replay.
+    /// Unused by current adapters; emission and IPC projection are #776/#777.
+    ToolCallComplete {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        provenance: EventProvenance,
+    },
+    ContentBlockComplete(ContentBlock),
+    ResponseMetadata {
+        model: String,
+    },
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+    Allowance {
+        primary_used_percent: Option<f32>,
+        secondary_used_percent: Option<f32>,
+    },
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::Message;
+    use crate::Message;
 
     fn user_msg(text: &str) -> Message {
         Message::user(text)
@@ -1027,7 +1077,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_large_image_replaced_with_placeholder() {
-        use crate::providers::ContentBlock;
+        use crate::ContentBlock;
         // Create a base64 string larger than 4 MB limit
         let large_data = "A".repeat(5_000_000);
         let mut req = ProviderRequest::new(vec![Message::with_content(
@@ -1046,7 +1096,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_small_image_kept() {
-        use crate::providers::ContentBlock;
+        use crate::ContentBlock;
         let small_data = "iVBORw0KGgo="; // tiny valid base64
         let mut req = ProviderRequest::new(vec![Message::with_content(
             "user",
@@ -1225,7 +1275,7 @@ mod tests {
 
     #[test]
     fn test_provider_request_with_tools() {
-        use crate::tools::{ToolDefinition, ToolInputSchema};
+        use crate::{ToolDefinition, ToolInputSchema};
         let tool = ToolDefinition {
             name: "bash".to_string(),
             description: "Run commands".to_string(),
@@ -1307,7 +1357,7 @@ mod tests {
         let tool = ToolDefinition {
             name: "lookup".into(),
             description: "lookup".into(),
-            input_schema: crate::tools::ToolInputSchema::simple(vec![]),
+            input_schema: crate::ToolInputSchema::simple(vec![]),
         };
         let cases = [
             (

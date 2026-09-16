@@ -1,15 +1,15 @@
 // Claude API request/response envelopes.
 //
 // The universal conversation types (`Message`, `ContentBlock`, `ImageSource`)
-// live in `crate::providers::wire_types` and are reached through the providers
+// live in `crate::wire_types` and are reached through the providers
 // facade; this file only defines the Claude-API-specific request and response
 // envelopes that wrap them on the wire.
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{DEFAULT_CLAUDE_MODEL, DEFAULT_MAX_TOKENS};
-use crate::providers::{ContentBlock, Message};
-use crate::tools::ToolDefinition;
+use crate::ToolDefinition;
+use crate::{ContentBlock, Message};
+use crate::{DEFAULT_CLAUDE_MODEL, DEFAULT_MAX_OUTPUT_TOKENS};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageRequest {
@@ -26,7 +26,7 @@ impl MessageRequest {
     pub fn new(user_query: &str) -> Self {
         Self {
             model: DEFAULT_CLAUDE_MODEL.to_string(),
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             messages: vec![Message::user(user_query)],
             system: None,
             tools: None,
@@ -37,7 +37,7 @@ impl MessageRequest {
     pub fn with_context(messages: Vec<Message>) -> Self {
         Self {
             model: DEFAULT_CLAUDE_MODEL.to_string(),
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             messages,
             system: None,
             tools: None,
@@ -98,11 +98,11 @@ impl MessageResponse {
     }
 
     /// Extract tool uses from response
-    pub fn tool_uses(&self) -> Vec<crate::tools::ToolUse> {
+    pub fn tool_uses(&self) -> Vec<crate::ToolUse> {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input } => Some(crate::tools::ToolUse {
+                ContentBlock::ToolUse { id, name, input } => Some(crate::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
@@ -124,8 +124,8 @@ impl MessageResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::ContentBlock as WireContentBlock;
-    use crate::providers::Message as WireMessage;
+    use crate::ContentBlock as WireContentBlock;
+    use crate::Message as WireMessage;
 
     // --- MessageRequest ---
 
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn test_message_request_with_tools() {
-        use crate::tools::ToolInputSchema;
+        use crate::ToolInputSchema;
         let tool = ToolDefinition {
             name: "read".to_string(),
             description: "Read a file".to_string(),

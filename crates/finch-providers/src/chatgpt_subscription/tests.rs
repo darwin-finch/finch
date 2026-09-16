@@ -1,6 +1,6 @@
 use super::*;
-use crate::providers::LlmProvider;
-use crate::tools::ToolInputSchema;
+use crate::LlmProvider;
+use crate::ToolInputSchema;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4674,34 +4674,22 @@ fn live_chatgpt_subscription_provider() -> Result<ChatGptSubscriptionProvider> {
     if std::env::var("FINCH_LIVE_CHATGPT_ACCEPTANCE").as_deref() != Ok("1") {
         bail!("Set FINCH_LIVE_CHATGPT_ACCEPTANCE=1 after security review");
     }
-    let config_path = std::env::var_os("FINCH_LIVE_CHATGPT_CONFIG")
-        .context("Set FINCH_LIVE_CHATGPT_CONFIG to Finch's config.toml")?;
-    let config = crate::config::load_config_from_path(std::path::Path::new(&config_path))?;
-    crate::providers::factory::preflight_provider_config(&config)?;
-    let (binding, configured_model, configured_reasoning) = config
-        .providers
-        .iter()
-        .find_map(|entry| match entry {
-            crate::config::ProviderEntry::Credentialed {
-                provider: CredentialProvider::ChatgptSubscription,
-                credential,
-                model,
-                reasoning_effort,
-                ..
-            } => Some((credential, model.as_deref(), *reasoning_effort)),
-            _ => None,
-        })
-        .context("No Finch ChatGPT subscription profile is configured")?;
-    let credential = config
-        .credentials
-        .iter()
-        .find(|credential| credential.name == binding.credential_ref)
-        .context("Finch ChatGPT subscription profile references a missing credential")?;
+    let credential_name = std::env::var("FINCH_LIVE_CHATGPT_CREDENTIAL")
+        .context("Set FINCH_LIVE_CHATGPT_CREDENTIAL to the named OAuth credential")?;
+    let oauth_root_preview = std::env::var_os("FINCH_LIVE_CHATGPT_OAUTH_ROOT")
+        .context("Set FINCH_LIVE_CHATGPT_OAUTH_ROOT to Finch's oauth directory")?;
+    let store = crate::oauth::FileOAuthCredentialStore::new(oauth_root_preview.into());
+    let record = store
+        .load_existing(&credential_name)?
+        .context("named ChatGPT credential is missing from the oauth store")?;
+    let credential = record.provider_credential(&credential_name);
+    let configured_model = std::env::var("FINCH_LIVE_CHATGPT_MODEL").ok();
+    let configured_reasoning = None;
     let oauth_root = std::env::var_os("FINCH_LIVE_CHATGPT_OAUTH_ROOT")
         .context("Set FINCH_LIVE_CHATGPT_OAUTH_ROOT to Finch's oauth directory")?;
     ChatGptSubscriptionProvider::production_in_oauth_root(
-        credential,
-        configured_model,
+        &credential,
+        configured_model.as_deref(),
         configured_reasoning,
         oauth_root,
     )

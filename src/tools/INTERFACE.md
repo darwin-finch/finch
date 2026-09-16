@@ -275,7 +275,7 @@ impl TodoWriteTool {
 }
 /// Context passed to tools during execution
 pub struct ToolContext<'a> { … }
-/// Tool definition (Claude API-compatible)
+/// Tool definition (Claude API-compatible) Re-exported from `finch-providers`.
 pub struct ToolDefinition { … }
 /// Tool executor - manages tool execution lifecycle
 pub struct ToolExecutor { … }
@@ -323,12 +323,8 @@ impl ToolExecutor {
     /// Save patterns to disk if modified
     pub fn save_patterns(&mut self) -> Result<()>;
 }
-/// JSON Schema for tool input parameters
+/// JSON Schema for tool input parameters Re-exported from `finch-providers`.
 pub struct ToolInputSchema { … }
-impl ToolInputSchema {
-    /// Create a simple schema with required string parameters
-    pub fn simple(params: Vec<(&str, &str)>) -> Self;
-}
 /// A pattern that can match multiple tool signatures using wildcards or regex
 pub struct ToolPattern { … }
 impl ToolPattern {
@@ -399,13 +395,8 @@ impl ToolResult {
 }
 /// Signature for a tool execution, used for caching approval decisions
 pub struct ToolSignature { … }
-/// Tool use request (from generator or Claude API)
+/// Tool use request after adapter-level validation. Re-exported from `finch-providers`.
 pub struct ToolUse { … }
-impl ToolUse {
-    /// Generate unique tool use ID
-    pub fn generate_id() -> String;
-    pub fn new(name: String, input: Value) -> Self;
-}
 /// Transport type for MCP servers Re-exported from `tools::mcp`.
 pub enum TransportType { Stdio, Sse }
 pub struct WebFetchTool { … }

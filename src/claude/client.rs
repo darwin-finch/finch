@@ -6,7 +6,7 @@
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use super::types::{MessageRequest, MessageResponse};
+use super::{MessageRequest, MessageResponse};
 use crate::generators::StreamChunk;
 use crate::providers::{ClaudeProvider, LlmProvider, ProviderRequest};
 

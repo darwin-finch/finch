@@ -2131,6 +2131,9 @@ impl Repl {
                     // attach provider metadata to.
                 }
                 Ok(crate::generators::StreamChunk::Allowance { .. }) => {}
+                Ok(crate::generators::StreamChunk::ThinkingDelta { .. })
+                | Ok(crate::generators::StreamChunk::ToolCallDelta { .. })
+                | Ok(crate::generators::StreamChunk::ToolCallComplete { .. }) => {}
                 Err(e) => {
                     return Err(e);
                 }

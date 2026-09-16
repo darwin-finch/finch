@@ -10,12 +10,12 @@ pub struct StreamEvent {
     #[serde(default)]
     pub index: Option<usize>,
     pub delta: Option<StreamDelta>,
-    pub content_block: Option<ContentBlock>,
+    pub content_block: Option<SseContentBlock>,
 }
 
 /// Content block metadata from content_block_start events
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ContentBlock {
+pub struct SseContentBlock {
     #[serde(rename = "type")]
     pub block_type: String,
     #[serde(default)]

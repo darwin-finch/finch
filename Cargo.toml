@@ -17,6 +17,7 @@ members = [
     "crates/finch-coforth",
     "crates/finch-colisp",
     "crates/finch-language",
+    "crates/finch-providers",
     "crates/finch-vm",
     "crates/finch-vm-core",
 ]
@@ -25,6 +26,7 @@ default-members = [
     "crates/finch-coforth",
     "crates/finch-colisp",
     "crates/finch-language",
+    "crates/finch-providers",
     "crates/finch-vm",
     "crates/finch-vm-core",
 ]
@@ -32,6 +34,7 @@ resolver = "2"
 
 [dependencies]
 finch-language = { path = "crates/finch-language" }
+finch-providers = { path = "crates/finch-providers" }
 finch-vm = { path = "crates/finch-vm" }
 
 # CLI

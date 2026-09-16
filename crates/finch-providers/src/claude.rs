@@ -14,11 +14,11 @@ use super::types::{
     WireProtocol,
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
-use crate::claude::retry::{with_retry, NonRetriableError};
-use crate::claude::streaming::StreamEvent;
-use crate::claude::MessageRequest;
-use crate::config::DEFAULT_CLAUDE_MODEL;
-use crate::providers::ContentBlock;
+use crate::anthropic::StreamEvent;
+use crate::retry::{with_retry, NonRetriableError};
+use crate::ContentBlock;
+use crate::MessageRequest;
+use crate::DEFAULT_CLAUDE_MODEL;
 
 const CLAUDE_API_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -153,7 +153,7 @@ impl ClaudeProvider {
             anyhow::bail!("{}", msg);
         }
 
-        let message_response: crate::claude::MessageResponse = response
+        let message_response: crate::MessageResponse = response
             .json()
             .await
             .context("Failed to parse Claude API response")?;
@@ -533,9 +533,7 @@ mod tests {
         )
         .unwrap();
         let mut stream = provider
-            .send_message_stream_once(&ProviderRequest::new(vec![
-                crate::providers::Message::user("inspect"),
-            ]))
+            .send_message_stream_once(&ProviderRequest::new(vec![crate::Message::user("inspect")]))
             .await
             .unwrap();
         let mut tool_blocks = 0;
@@ -563,39 +561,36 @@ mod tests {
 
     #[test]
     fn provider_request_boundary_observes_only_complete_tool_pairs() {
-        use crate::cli::ConversationHistory;
-        use crate::providers::{ContentBlock, Message};
+        use crate::{ContentBlock, Message};
 
         let provider = ClaudeProvider::new("test-key".to_string()).unwrap();
-        let query_id = uuid::Uuid::new_v4();
-        let mut history = ConversationHistory::new();
-        history.add_user_message("inspect".to_string());
-        let token = history
-            .stage_assistant(
-                query_id,
-                Message {
-                    role: "assistant".to_string(),
-                    content: vec![ContentBlock::ToolUse {
-                        id: "call-A".to_string(),
-                        name: "Read".to_string(),
-                        input: serde_json::json!({"path": "A"}),
-                    }],
-                },
-            )
-            .unwrap();
-
-        let staged = provider.to_message_request(&ProviderRequest::new(history.get_messages()));
+        let staged =
+            provider.to_message_request(&ProviderRequest::new(vec![Message::user("inspect")]));
         assert_eq!(staged.messages.len(), 1);
         assert!(staged.messages.iter().all(|message| message
             .content
             .iter()
             .all(|block| !matches!(block, ContentBlock::ToolUse { .. }))));
 
-        history
-            .record_tool_result(query_id, token, "call-A", &Ok("value".to_string()))
-            .unwrap();
-        history.commit_tool_round(query_id, token).unwrap();
-        let committed = provider.to_message_request(&ProviderRequest::new(history.get_messages()));
+        let committed = provider.to_message_request(&ProviderRequest::new(vec![
+            Message::user("inspect"),
+            Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
+                    id: "call-A".to_string(),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({"path": "A"}),
+                }],
+            ),
+            Message::with_content(
+                "user",
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-A".to_string(),
+                    content: "value".to_string(),
+                    is_error: Some(false),
+                }],
+            ),
+        ]));
         assert_eq!(committed.messages.len(), 3);
         assert!(matches!(
             committed.messages[1].content[0],
@@ -628,9 +623,7 @@ mod tests {
         .with_model(DEFAULT_CLAUDE_MODEL);
 
         provider
-            .send_message(&ProviderRequest::new(vec![
-                crate::providers::Message::user("hello"),
-            ]))
+            .send_message(&ProviderRequest::new(vec![crate::Message::user("hello")]))
             .await
             .unwrap();
         mock.assert_async().await;

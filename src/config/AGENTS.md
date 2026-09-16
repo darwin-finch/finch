@@ -11,8 +11,9 @@ modules are private, so the `pub use` list in `src/config/mod.rs` is the whole p
 `scripts/check_subsystems.py` rejects a `pub mod` there. `src/context` and `src/license` have their
 own module documents and no separate facade yet.
 
-**Dependencies:** `config` should depend on nothing — everything depends on it. Three unwanted
-edges remain, to `memory`, `models`, and `tools::mcp` (`McpServerConfig`). Add no new ones.
+**Dependencies:** `config` should depend on nothing except the extracted provider
+credential/reasoning types from `finch-providers`. Three unwanted edges remain, to
+`memory`, `models`, and `tools::mcp` (`McpServerConfig`). Add no new ones.
 
 **Credentials are secrets.** Resolvers return values that must never reach logs, prompts, metrics,
 or error text; see the redaction rules in the root instructions before touching
