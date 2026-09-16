@@ -1,5 +1,29 @@
 use super::*;
 
+/// Split a tool error into a collapsed-row summary and expandable body.
+///
+/// The first line is the summary (truncated to 60 characters). Remaining
+/// lines, plus the untruncated first line when it did not fit, go in the body
+/// so expanding the row is not an empty copy of the header.
+fn tool_error_display(err: &str) -> (String, Vec<String>) {
+    let mut lines: Vec<String> = err.lines().map(str::to_owned).collect();
+    if lines.is_empty() {
+        return (err.to_string(), Vec::new());
+    }
+    let first = lines.remove(0);
+    let short = if first.chars().count() > 60 {
+        format!("{}…", first.chars().take(57).collect::<String>())
+    } else {
+        first.clone()
+    };
+    let mut body = Vec::new();
+    if short != first {
+        body.push(first);
+    }
+    body.extend(lines);
+    (short, body)
+}
+
 impl EventLoop {
     /// Handle a tool result
     pub(super) async fn handle_tool_result(
@@ -118,14 +142,8 @@ impl EventLoop {
                 work_unit.complete_row_with_body(row_idx, summary, body);
             }
             Err(e) => {
-                // Truncate very long error messages for the row display
-                let err_str = e.to_string();
-                let short_err = if err_str.len() > 60 {
-                    format!("{}…", err_str.chars().take(57).collect::<String>())
-                } else {
-                    err_str
-                };
-                work_unit.fail_row(row_idx, short_err);
+                let (short_err, body) = tool_error_display(&e.to_string());
+                work_unit.fail_row_with_body(row_idx, short_err, body);
             }
         }
         self.flush_genuinely_unbound_agent_lifecycle().await;

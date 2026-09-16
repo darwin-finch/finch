@@ -905,13 +905,14 @@ async fn test_named_brain_runner_attaches_its_scheduler() {
 }
 
 /// Production-boundary regression for the loop-detected TUI dump: a blocked
-/// bash result must update the labeled bash row and must not spawn a second
-/// WorkUnit titled with the raw provider tool id (`call_tyIrmyNxiUxYGF7QhOT1vslZ`).
+/// bash result must update the labeled bash row, put the full diagnostic in
+/// the expandable body, and must not spawn a second WorkUnit titled with the
+/// raw provider tool id (`call_tyIrmyNxiUxYGF7QhOT1vslZ`).
 #[tokio::test]
 async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            use crate::cli::messages::Message;
+            use crate::cli::messages::{Message, TranscriptRowKind};
 
             let (mut event_loop, output) = lifecycle_test_event_loop();
             output.disable_stdout();
@@ -954,8 +955,9 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
             );
 
             let error = anyhow::anyhow!(
-                "LOOP DETECTED: You have called bash with the same arguments 1 time(s) and received the same result each time.\n\
-                 Repeating this call will not produce different output."
+                "loop detected: bash called 3 times with the same arguments\n\
+                 Repeating this exact call is unlikely to produce new information. \
+                 Inspect the previous results or use a different command."
             );
             event_loop
                 .handle_tool_result(query_id, round_token, tool_id.clone(), Err(error))
@@ -987,9 +989,8 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
                 labels[0]
             );
             assert!(
-                labels[0].to_ascii_lowercase().contains("loop detected")
-                    || labels[0].contains("failed"),
-                "Tools header must name the loop failure; got {}",
+                labels[0].contains("loop detected"),
+                "Tools header must name the loop; got {}",
                 labels[0]
             );
 
@@ -1011,6 +1012,20 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
                 call.label.contains("failed"),
                 "labeled bash row must be Error; got {}",
                 call.label
+            );
+            let output_row = call
+                .children
+                .iter()
+                .find(|child| child.kind == TranscriptRowKind::ToolOutput)
+                .unwrap_or_else(|| {
+                    panic!("long loop diagnostic must be expandable output; call={call:?}")
+                });
+            assert!(
+                output_row
+                    .body
+                    .iter()
+                    .any(|line| line.contains("unlikely to produce new information")),
+                "expanding the failed bash row must show the full loop diagnostic; output={output_row:?}"
             );
         })
         .await;
