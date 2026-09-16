@@ -10,6 +10,7 @@
 // The throb animation is TIME-DRIVEN — no external counter required.
 
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -192,6 +193,11 @@ struct WorkUnitInner {
     progress: Option<(u64, Option<u64>)>,
     /// Child-agent lifecycle rows, optionally owned by one spawn tool row.
     agent_activity: Vec<AgentActivityRow>,
+    /// User disclosure overrides keyed by transcript `path`.
+    ///
+    /// This is presentation state on the widget. Completing a row must not
+    /// lose an expand/collapse choice stored in a renderer-global map.
+    disclosure: HashMap<Vec<u32>, bool>,
 }
 
 // ============================================================================
@@ -249,6 +255,7 @@ impl WorkUnit {
                 transient_status: None,
                 progress: None,
                 agent_activity: Vec::new(),
+                disclosure: HashMap::new(),
             })),
         }
     }
@@ -348,6 +355,15 @@ impl WorkUnit {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .transient_status = status;
+    }
+
+    /// Persist accordion disclosure on this unit's semantic row `path`.
+    pub fn set_disclosure(&self, path: &[u32], expanded: bool) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .disclosure
+            .insert(path.to_vec(), expanded);
     }
 
     /// Update an explicit output handle's progress independently from its
@@ -904,9 +920,11 @@ impl Message for WorkUnit {
             .map(|(index, row)| {
                 let mut projected = match row.presentation {
                     WorkRowPresentation::Activity => {
-                        transcript_activity_row(self.id, index, row, colors)
+                        transcript_activity_row(&inner, self.id, index, row, colors)
                     }
-                    WorkRowPresentation::Tool => transcript_tool_row(self.id, index, row, colors),
+                    WorkRowPresentation::Tool => {
+                        transcript_tool_row(&inner, self.id, index, row, colors)
+                    }
                 };
                 projected.children.extend(agent_activity_transcript_roots(
                     self.id,
@@ -938,7 +956,10 @@ impl Message for WorkUnit {
                 true,
             ),
             WorkUnitPresentation::Activity { title } => {
-                let actionable = inner.rows.iter().any(tool_row_requires_default_expansion);
+                let actionable = inner
+                    .rows
+                    .iter()
+                    .any(activity_row_requires_default_expansion);
                 (
                     TranscriptRowKind::Activity,
                     compact_activity_group_label(title, &inner.rows),
@@ -971,8 +992,13 @@ impl Message for WorkUnit {
             label,
             body,
             children,
-            default_expanded,
+            default_expanded: resolve_disclosure(&inner, &[0], default_expanded),
         })
+    }
+
+    fn set_disclosure(&self, path: &[u32], expanded: bool) -> bool {
+        WorkUnit::set_disclosure(self, path, expanded);
+        true
     }
 
     fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
@@ -1264,7 +1290,12 @@ fn program_output_lines(inner: &WorkUnitInner) -> Vec<String> {
     body
 }
 
+fn resolve_disclosure(inner: &WorkUnitInner, path: &[u32], default: bool) -> bool {
+    inner.disclosure.get(path).copied().unwrap_or(default)
+}
+
 fn transcript_tool_row(
+    inner: &WorkUnitInner,
     message_id: MessageId,
     index: usize,
     row: &WorkRow,
@@ -1276,16 +1307,17 @@ fn transcript_tool_row(
         WorkRowStatus::Complete(summary) => summary.clone(),
         WorkRowStatus::Error(error) => format!("failed: {error}"),
     };
+    let input_path = vec![1, index as u32, 0];
     let input = TranscriptRow {
         id: TranscriptRowId {
             message_id,
-            path: vec![1, index as u32, 0],
+            path: input_path.clone(),
         },
         kind: TranscriptRowKind::Input,
         label: "Input".to_string(),
         body: vec![row.label.clone()],
         children: Vec::new(),
-        default_expanded: false,
+        default_expanded: resolve_disclosure(inner, &input_path, false),
     };
     let output_body = if let Some(diffs) = &row.diffs {
         let mut body = row.body_lines.clone();
@@ -1301,32 +1333,37 @@ fn transcript_tool_row(
     let actionable = tool_row_requires_default_expansion(row);
     let mut children = vec![input];
     if !output_body.is_empty() {
+        let output_path = vec![1, index as u32, 1];
+        let output_default = matches!(row.status, WorkRowStatus::Running) || actionable;
         children.push(TranscriptRow {
             id: TranscriptRowId {
                 message_id,
-                path: vec![1, index as u32, 1],
+                path: output_path.clone(),
             },
             kind: TranscriptRowKind::ToolOutput,
             label: format!("Output ({})", output_body.len()),
             body: output_body,
             children: Vec::new(),
-            default_expanded: matches!(row.status, WorkRowStatus::Running) || actionable,
+            default_expanded: resolve_disclosure(inner, &output_path, output_default),
         });
     }
+    let call_path = vec![1, index as u32];
+    let call_default = matches!(row.status, WorkRowStatus::Running) || actionable;
     TranscriptRow {
         id: TranscriptRowId {
             message_id,
-            path: vec![1, index as u32],
+            path: call_path.clone(),
         },
         kind: TranscriptRowKind::ToolCall,
         label: format!("{} — {summary}", row.label),
         body: Vec::new(),
         children,
-        default_expanded: matches!(row.status, WorkRowStatus::Running) || actionable,
+        default_expanded: resolve_disclosure(inner, &call_path, call_default),
     }
 }
 
 fn transcript_activity_row(
+    inner: &WorkUnitInner,
     message_id: MessageId,
     index: usize,
     row: &WorkRow,
@@ -1349,16 +1386,30 @@ fn transcript_activity_row(
     } else {
         row.body_lines.clone()
     };
+    let path = vec![1, index as u32];
     TranscriptRow {
         id: TranscriptRowId {
             message_id,
-            path: vec![1, index as u32],
+            path: path.clone(),
         },
         kind: TranscriptRowKind::Activity,
         label: format!("{} — {summary}", row.label),
         body,
         children: Vec::new(),
-        default_expanded: tool_row_requires_default_expansion(row),
+        default_expanded: resolve_disclosure(
+            inner,
+            &path,
+            activity_row_requires_default_expansion(row),
+        ),
+    }
+}
+
+fn activity_row_requires_default_expansion(row: &WorkRow) -> bool {
+    match &row.status {
+        WorkRowStatus::Running => true,
+        WorkRowStatus::Error(_) | WorkRowStatus::Complete(_) => {
+            !row.body_lines.is_empty() || row.diffs.as_ref().is_some_and(|diffs| !diffs.is_empty())
+        }
     }
 }
 
@@ -1998,6 +2049,59 @@ mod tests {
                 Some(tool)
             );
         }
+    }
+
+    #[test]
+    fn brain_run_result_with_body_stays_expanded_after_complete() {
+        let unit = WorkUnit::new("Brain");
+        unit.set_activity_presentation("Interactive run");
+        let status = unit.add_activity_row("status");
+        unit.complete_row(status, "completed");
+        let result = unit.add_activity_row("result");
+        unit.complete_row_with_body(
+            result,
+            "completed",
+            vec!["Test received successfully.".into()],
+        );
+        unit.set_complete();
+        let projected = unit.transcript_row(&colors()).unwrap();
+        assert_eq!(projected.children.len(), 2);
+        assert!(
+            !projected.children[0].default_expanded,
+            "a status-only row may stay collapsed; got {:?}",
+            projected.children[0]
+        );
+        assert!(
+            projected.children[1].default_expanded,
+            "program/result body must stay visible after complete, not auto-collapse; row={:?}",
+            projected.children[1]
+        );
+        assert!(projected.children[1]
+            .body
+            .iter()
+            .any(|line| line.contains("Test received successfully.")));
+    }
+
+    #[test]
+    fn disclosure_override_lives_on_the_work_unit_not_a_global_map() {
+        let unit = WorkUnit::new("Brain");
+        unit.set_activity_presentation("Interactive run");
+        let result = unit.add_activity_row("result");
+        unit.complete_row_with_body(result, "completed", vec!["visible".into()]);
+        unit.set_complete();
+        let path = unit.transcript_row(&colors()).unwrap().children[0]
+            .id
+            .path
+            .clone();
+        unit.set_disclosure(&path, false);
+        let projected = unit.transcript_row(&colors()).unwrap();
+        assert!(
+            !projected.children[0].default_expanded,
+            "collapsing the result must stick on the widget after re-projection"
+        );
+        unit.set_disclosure(&path, true);
+        let opened = unit.transcript_row(&colors()).unwrap();
+        assert!(opened.children[0].default_expanded);
     }
 
     #[test]

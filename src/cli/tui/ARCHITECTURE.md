@@ -23,6 +23,10 @@ the row into native history twice. Test:
 
 **Retained transcript accordions** (`accordion.rs`):
 - WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).
+- Expand/collapse is stored on the WorkUnit (`set_disclosure`). AccordionState
+  owns focus and hit regions only; it must not be the source of truth for
+  whether a result is open. Completing a run must not collapse a result that
+  still has body text.
 - Native scrollback always receives the fully expanded semantic projection;
   disclosure state only changes later reconstructed/live viewport projections.
 - `F6`/`Shift+F6` moves semantic focus, Left/Right collapses or expands,

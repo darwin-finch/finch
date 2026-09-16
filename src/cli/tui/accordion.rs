@@ -37,6 +37,8 @@ pub struct AccordionState {
     pub hit_regions: Vec<TranscriptHitRegion>,
     visible_order: Vec<TranscriptRowId>,
     visible_expanded: HashMap<TranscriptRowId, bool>,
+    /// Row whose disclosure was last changed by key or click.
+    last_toggled: Option<TranscriptRowId>,
 }
 
 impl AccordionState {
@@ -220,17 +222,20 @@ impl AccordionState {
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let current = self.resolved_expanded(&focused);
                 self.expanded.insert(focused.clone(), !current);
-                self.visible_expanded.insert(focused, !current);
+                self.visible_expanded.insert(focused.clone(), !current);
+                self.last_toggled = Some(focused);
                 true
             }
             KeyCode::Left => {
                 self.expanded.insert(focused.clone(), false);
-                self.visible_expanded.insert(focused, false);
+                self.visible_expanded.insert(focused.clone(), false);
+                self.last_toggled = Some(focused);
                 true
             }
             KeyCode::Right => {
                 self.expanded.insert(focused.clone(), true);
-                self.visible_expanded.insert(focused, true);
+                self.visible_expanded.insert(focused.clone(), true);
+                self.last_toggled = Some(focused);
                 true
             }
             KeyCode::Esc => {
@@ -260,8 +265,15 @@ impl AccordionState {
         self.focused = None;
         let current = self.resolved_expanded(&row_id);
         self.expanded.insert(row_id.clone(), !current);
-        self.visible_expanded.insert(row_id, !current);
+        self.visible_expanded.insert(row_id.clone(), !current);
+        self.last_toggled = Some(row_id);
         true
+    }
+
+    pub(crate) fn take_last_toggled(&mut self) -> Option<(TranscriptRowId, bool)> {
+        let row_id = self.last_toggled.take()?;
+        let expanded = self.resolved_expanded(&row_id);
+        Some((row_id, expanded))
     }
 }
 

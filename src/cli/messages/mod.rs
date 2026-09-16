@@ -120,6 +120,16 @@ pub trait Message: Send + Sync {
         None
     }
 
+    /// Persist presentation-only disclosure on this widget.
+    ///
+    /// Accordion focus and hit regions stay in the renderer; the row's open
+    /// or closed choice belongs here so completing a run cannot collapse a
+    /// result by flipping a global cache. Returns whether this message owns
+    /// `path`.
+    fn set_disclosure(&self, _path: &[u32], _expanded: bool) -> bool {
+        false
+    }
+
     /// Get the background style for this message type (for TUI rendering)
     /// Returns None for default (no background)
     fn background_style(

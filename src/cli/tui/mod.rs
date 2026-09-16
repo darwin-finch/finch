@@ -1426,8 +1426,9 @@ pub struct TuiRenderer {
     // Messages already committed to permanent scrollback.
     printed_ids: HashSet<MessageId>,
 
-    // Disclosure state is a projection over retained WorkUnits. It never
-    // mutates canonical message content or permanent native scrollback.
+    // Accordion focus and hit regions. Expand/collapse choices live on the
+    // WorkUnit rows themselves (`set_disclosure`); this map is only the last
+    // painted frame plus in-flight toggles until the next projection.
     accordion: AccordionState,
 
     // Bounded child viewports for tool-use output rows (#656): per-row scroll
@@ -2815,9 +2816,21 @@ impl TuiRenderer {
         if !self.accordion.handle_key(key) {
             return false;
         }
+        self.persist_last_disclosure();
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
         true
+    }
+
+    fn persist_last_disclosure(&mut self) {
+        let Some((row_id, expanded)) = self.accordion.take_last_toggled() else {
+            return;
+        };
+        for message in self.output_manager.get_messages() {
+            if message.id() == row_id.message_id {
+                message.set_disclosure(&row_id.path, expanded);
+            }
+        }
     }
 
     /// Keyboard equivalents for a bounded tool-result control (#656).
@@ -2872,6 +2885,7 @@ impl TuiRenderer {
         if !self.accordion.handle_mouse(mouse) {
             return false;
         }
+        self.persist_last_disclosure();
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
         true
