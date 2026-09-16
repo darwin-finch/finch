@@ -114,6 +114,8 @@ pub trait OAuthDialect: Send + Sync {
     fn authorization_code_request(&self, grant: &AuthorizationCodeGrant) -> Result<OAuthHttpRequest>;
     fn refresh_request(&self, refresh_token: &str) -> Result<OAuthHttpRequest>;
     fn revoke_request(&self, token: &str) -> Result<OAuthHttpRequest>;
+    async fn validate_tokens(&self, status: StatusCode, body: Value, previous: Option<&OAuthTokenRecord>, context: &TokenValidationContext, cancel: &CancellationToken) -> Result<OAuthTokenRecord>;
+    async fn validate_token_response(&self, status: StatusCode, body: &[u8], previous: Option<&OAuthTokenRecord>, context: &TokenValidationContext, cancel: &CancellationToken) -> Result<OAuthTokenRecord>;
 }
 ```
 

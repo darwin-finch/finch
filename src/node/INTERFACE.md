@@ -10,6 +10,7 @@ Everything below is what callers outside this module can reach. Implementation m
 ## Types
 
 ```rust
+#[cfg(unix)]
 pub struct IsolatedNodeRootSwap { … }
 impl IsolatedNodeRootSwap {
     pub fn external_sentinel_unchanged(&self) -> bool;
@@ -17,6 +18,7 @@ impl IsolatedNodeRootSwap {
     pub fn replacement_node_id_exists(&self) -> bool;
 }
 /// Opaque disposable state owned by worker-node integration tests.
+#[cfg(unix)]
 pub struct IsolatedNodeTestState { … }
 impl IsolatedNodeTestState {
     pub fn fifo_node_id_fixture(&self) -> anyhow::Result<()>;

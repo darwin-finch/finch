@@ -498,6 +498,7 @@ pub trait Tool: Send + Sync {
     fn effect(&self) -> ExecutionEffect;
     fn description(&self) -> &str;
     fn input_schema(&self) -> ToolInputSchema;
+    async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String>;
     fn definition(&self) -> ToolDefinition;
 }
 ```

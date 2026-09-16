@@ -133,15 +133,20 @@ pub struct WireProtocolCapability { … }
 ```rust
 /// Non-overridable validated dispatch API shared by every provider backend. Re-exported from `finch-providers`.
 pub trait LlmProvider: ProviderBackend {
+    async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse>;
+    async fn send_message_stream(&self, request: &ProviderRequest) -> Result<Receiver<Result<StreamChunk>>>;
     fn supports_streaming(&self) -> bool;
     fn supports_tools(&self) -> bool;
 }
 /// Injected JWS/JWKS verification boundary. Re-exported from `finch-providers`.
 pub trait OpenAiTokenVerifier: Send + Sync {
     fn preflight(&self) -> Result<()>;
+    async fn verify(&self, id_token: Option<&str>, access_token: &str, cancel: &CancellationToken) -> Result<VerifiedOpenAiClaims>;
 }
 /// Provider implementation hooks. Re-exported from `finch-providers`.
 pub trait ProviderBackend: ProviderConcreteType + Send + Sync {
+    async fn send_message_validated(&self, request: ValidatedProviderRequest) -> Result<ProviderResponse>;
+    async fn send_message_stream_validated(&self, request: ValidatedProviderRequest) -> Result<Receiver<Result<StreamChunk>>>;
     fn name(&self) -> &str;
     fn default_model(&self) -> &str;
     fn capabilities(&self, model: &str) -> ModelCapabilities;

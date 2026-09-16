@@ -497,18 +497,25 @@ pub trait CredentialResolver: Send + Sync {
     fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential>;
 }
 /// Bounded HTTP POST used by OAuth and catalog transports.
-pub trait HttpTransport: Send + Sync { … }
+pub trait HttpTransport: Send + Sync {
+    async fn post(&self, request: OAuthHttpRequest, timeout: Duration, cancel: &CancellationToken) -> Result<(StatusCode, Vec<u8>)>;
+}
 /// Non-overridable validated dispatch API shared by every provider backend.
 pub trait LlmProvider: ProviderBackend {
+    async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse>;
+    async fn send_message_stream(&self, request: &ProviderRequest) -> Result<Receiver<Result<StreamChunk>>>;
     fn supports_streaming(&self) -> bool;
     fn supports_tools(&self) -> bool;
 }
 /// Injected JWS/JWKS verification boundary.
 pub trait OpenAiTokenVerifier: Send + Sync {
     fn preflight(&self) -> Result<()>;
+    async fn verify(&self, id_token: Option<&str>, access_token: &str, cancel: &CancellationToken) -> Result<VerifiedOpenAiClaims>;
 }
 /// Provider implementation hooks.
 pub trait ProviderBackend: ProviderConcreteType + Send + Sync {
+    async fn send_message_validated(&self, request: ValidatedProviderRequest) -> Result<ProviderResponse>;
+    async fn send_message_stream_validated(&self, request: ValidatedProviderRequest) -> Result<Receiver<Result<StreamChunk>>>;
     fn name(&self) -> &str;
     fn default_model(&self) -> &str;
     fn capabilities(&self, model: &str) -> ModelCapabilities;
@@ -523,7 +530,9 @@ pub trait ProviderTelemetry: Send + Sync {
     fn event(&self, name: &str, fields: &[(&str, &str)]);
 }
 /// Backoff/sleeper used by OAuth polling and HTTP retry.
-pub trait Sleeper: Send + Sync { … }
+pub trait Sleeper: Send + Sync {
+    async fn sleep(&self, duration: Duration);
+}
 ```
 
 ## Functions
