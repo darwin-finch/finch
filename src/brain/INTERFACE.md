@@ -33,11 +33,13 @@ impl AttachedBrainClient {
     pub fn local(target: RemoteBrainTarget, ipc: crate::ipc::IpcClient) -> Self;
     pub fn remote(client: RemoteBrainClient) -> Self;
 }
-/// Stable identity of one client projection of a Brain.
+/// Stable identity of one client projection of a Brain. Re-exported from `brain::attachment`.
 pub struct AttachmentId(pub uuid::Uuid);
+/// Re-exported from `brain::attachment`.
 pub enum AttachmentRole { Runner, Driver, Consultant, Observer }
-/// Exact participant/environment boundary to which a Brain-owned approval request is addressed.
+/// Exact participant/environment boundary to which a Brain-owned approval request is addressed. Re-exported from `brain::attachment`.
 pub struct BrainApprovalAudience { … }
+/// Re-exported from `brain::attachment`.
 pub struct BrainAttachment { … }
 pub struct BrainCredentialAuthority { … }
 impl BrainCredentialAuthority {
@@ -66,38 +68,47 @@ impl BrainCredentialClaims {
 }
 pub struct BrainCredentialRequest { … }
 pub enum BrainCredentialScope { BrainRead, BrainAttach, BrainDetach, BrainSubmit, BrainApprove, BrainControl, EnvironmentExecute, EnvironmentAdmin, ComputeSubmit }
-/// The one machine/workspace boundary in which a brain may cause effects.
+/// The one machine/workspace boundary in which a brain may cause effects. Re-exported from `brain::projection`.
 pub struct BrainEnvironment { … }
+/// Re-exported from `brain::journal`.
 pub struct BrainEvent { … }
+/// Re-exported from `brain::journal`.
 pub enum BrainEventKind { MutationRecorded, RunnerLeaseAcquired, RunnerLeaseReleased, RunnerHandoffRequested, RunnerHandoffCompleted, RunnerHandoffCancelled, ClientAttached, ClientDetached, RunStarted, RunStatusChanged, Prompt, SpeculativePrompt, ParticipantMessage, TaskListReplaced, ToolCall, ToolResult, ApprovalRequested, ApprovalDecided, Program, ProgramPopped, Result, RuntimeCommitted, EffectRecorded, EffectAuditTransition, ScheduleChanged, ScheduleDue }
-/// Stable identity of one durable Brain.
+/// Stable identity of one durable Brain. Re-exported from `brain::journal`.
 pub struct BrainId(pub uuid::Uuid);
-/// Reviewed, immutable program that establishes a Brain's initial typed state.
+/// Reviewed, immutable program that establishes a Brain's initial typed state. Re-exported from `brain::schedule`.
 pub struct BrainInitialization { … }
 /// A short-lived, single-use bootstrap grant that can be handed to a collaborator without disclosing the daemon-wide Brain password.
 pub struct BrainInvitationClaims { … }
 pub struct BrainInvitationRequest { … }
+/// Re-exported from `brain::journal`.
 pub enum BrainMutationOutcome { RunCancellationReserved, RunCancellationDispatching, RunCancellationReconciled, RunAlreadyCancelled, RunCancellationNoop, ScheduleCancellationNoop, HandoffCancellationNoop, ApprovalDecisionDelivered }
-/// Durable identity and preconditions for one authorized Brain mutation.
+/// Durable identity and preconditions for one authorized Brain mutation. Re-exported from `brain::journal`.
 pub struct BrainMutationReceipt { … }
+/// Re-exported from `brain::journal`.
 pub struct BrainProgram { … }
+/// Re-exported from `brain::run`.
 pub struct BrainRun { … }
+/// Re-exported from `brain::run`.
 pub struct BrainRunCancellationReservation { … }
+/// Re-exported from `brain::run`.
 pub enum BrainRunKind { Interactive, Speculative, Scheduled, Subagent, Maintenance }
+/// Re-exported from `brain::run`.
 pub enum BrainRunStatus { QueuedForEnvironment, Running, AwaitingApproval, Completed, Failed, Cancelled, Interrupted }
+/// Re-exported from `brain::run`.
 pub struct BrainRunnerHandoff { … }
+/// Re-exported from `brain::run`.
 pub struct BrainRunnerLease { … }
+/// Re-exported from `brain::schedule`.
 pub struct BrainSchedule { … }
+/// Re-exported from `brain::schedule`.
 pub enum BrainScheduleDeliveryPolicy { Coalesce, BoundedCatchUp }
-/// One durable schedule delivery and the queued run that owns it.
+/// One durable schedule delivery and the queued run that owns it. Re-exported from `brain::schedule`.
 pub struct BrainScheduleDue { … }
-/// Durable, non-authority-bearing identity for a reviewed module scheduled by the Brain itself.
+/// Durable, non-authority-bearing identity for a reviewed module scheduled by the Brain itself. Re-exported from `brain::schedule`.
 pub struct BrainScheduleModuleIdentity { … }
+/// Re-exported from `brain::projection`.
 pub struct BrainSnapshot { … }
-impl BrainSnapshot {
-    /// Whether this exact runner lease was durably replaced by an addressed handoff.
-    pub fn runner_lease_was_handed_off(&self, lease_id: RunnerLeaseId) -> bool;
-}
 /// Authoritative persistent store of named Brains.
 pub struct BrainStore { … }
 impl BrainStore {
@@ -203,8 +214,9 @@ pub struct BrainTask { … }
 pub enum BrainTaskPriority { High, Medium, Low }
 /// Lifecycle status of one Brain-owned task.
 pub enum BrainTaskStatus { Pending, InProgress, Completed }
+/// Re-exported from `brain::projection`.
 pub enum BrainWireMessage { Snapshot, Event }
-/// Identity of one live transport connection for a durable attachment.
+/// Identity of one live transport connection for a durable attachment. Re-exported from `brain::attachment`.
 pub struct ConnectionId(pub uuid::Uuid);
 /// Opaque daemon-side authority for one runner capability.
 pub(crate) struct EffectAuditAuthorityGrant { … }
@@ -219,6 +231,7 @@ impl IsolatedTestProof {
 }
 /// Observable pathname version for accidental-race detection, not a non-repeating identity.
 pub(crate) struct IsolatedTestSocketIdentity { … }
+/// Re-exported from `brain::schedule`.
 pub enum ProgramLanguage { Forth, Lisp }
 /// Dynamic node information returned only after Brain-scoped authentication.
 pub struct RemoteBrainCapabilities { … }
@@ -297,9 +310,13 @@ impl RemoteBrainTarget {
     pub fn local(brain: &str, daemon_base_url: &str) -> Result<Self>;
     pub fn parse(value: &str) -> Result<Self>;
 }
+/// Re-exported from `brain::run`.
 pub struct RunId(pub uuid::Uuid);
+/// Re-exported from `brain::run`.
 pub struct RunnerHandoffId(pub uuid::Uuid);
+/// Re-exported from `brain::run`.
 pub struct RunnerLeaseId(pub uuid::Uuid);
+/// Re-exported from `brain::schedule`.
 pub struct ScheduleId(pub uuid::Uuid);
 ```
 
@@ -333,4 +350,4 @@ pub(crate) mod effect_audit_archive;
 
 ## Referenced but not exported
 
-These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `BrainApprovalDecisionReservation`, `BrainExecutableMutationAppend`, `BrainListSummary`, `BrainMutationAppend`, `BrainMutationHandle`
+These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `BrainMutationHandle`
