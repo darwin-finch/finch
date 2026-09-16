@@ -61,12 +61,26 @@ type PendingApprovalsMap = Arc<
 
 const MAX_TERMINAL_AGENT_ROOTS: usize = 1024;
 
+fn append_pending_user_messages(
+    history: &mut ConversationHistory,
+    pending_user_messages: &[String],
+) {
+    for text in pending_user_messages {
+        history.add_user_message(text.clone());
+    }
+}
+
+fn pending_user_texts(pending: &[(String, bool, bool)]) -> Vec<String> {
+    pending.iter().map(|(text, _, _)| text.clone()).collect()
+}
+
 async fn commit_tool_round_and_continue(
     conversation: &Arc<RwLock<ConversationHistory>>,
     query_id: Uuid,
     round_token: ToolRoundToken,
     llm_tx: &mpsc::UnboundedSender<LlmRequest>,
     checkpoint_path: Option<&std::path::Path>,
+    pending_user_messages: &[String],
 ) -> std::result::Result<(), crate::cli::conversation::ToolRoundError> {
     let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -92,6 +106,7 @@ async fn commit_tool_round_and_continue(
         let before_commit = history.clone();
         history.commit_tool_round(query_id, round_token)?;
         history.finalize_tool_round_commit();
+        append_pending_user_messages(&mut history, pending_user_messages);
         before_commit
     };
     let _ = admit_tx.send(());
@@ -497,6 +512,9 @@ pub struct EventLoop {
     llm_tx: mpsc::UnboundedSender<LlmRequest>,
     /// Receiver held until `run()` hands it off to `LlmLoop`.
     llm_rx: Option<mpsc::UnboundedReceiver<LlmRequest>>,
+    /// Test fixtures must not write conversation checkpoints into `~/.finch`.
+    #[cfg(test)]
+    test_conversation_checkpoint: Option<std::path::PathBuf>,
     #[cfg(test)]
     effect_audit_test_wrapper: Option<
         Arc<
@@ -2050,6 +2068,8 @@ impl EventLoop {
             llm_tx,
             llm_rx: Some(llm_rx),
             #[cfg(test)]
+            test_conversation_checkpoint: None,
+            #[cfg(test)]
             effect_audit_test_wrapper: None,
         };
 
@@ -2901,6 +2921,16 @@ impl EventLoop {
             });
         });
         self.render_tui().await
+    }
+
+    fn take_pending_queries(&mut self) -> Vec<(String, bool, bool)> {
+        self.pending_queries.drain(..).collect()
+    }
+
+    fn restore_pending_queries(&mut self, pending: Vec<(String, bool, bool)>) {
+        for item in pending.into_iter().rev() {
+            self.pending_queries.push_front(item);
+        }
     }
 
     /// Execute a query with echo (used by /run where the query hasn't been displayed yet).
@@ -3898,6 +3928,11 @@ impl EventLoop {
     }
 
     fn conversation_checkpoint_path(&self) -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        {
+            return self.test_conversation_checkpoint.clone();
+        }
+        #[cfg(not(test))]
         dirs::home_dir().map(|home| {
             home.join(".finch")
                 .join("sessions")

@@ -454,11 +454,16 @@ async fn continuation_is_admitted_exactly_once_for_one_complete_validated_round(
         .record_tool_result(query_id, token, "A", &Ok("a".into()))
         .unwrap();
     let conversation = std::sync::Arc::new(tokio::sync::RwLock::new(conversation));
-    assert!(
-        super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx, None)
-            .await
-            .is_err()
-    );
+    assert!(super::commit_tool_round_and_continue(
+        &conversation,
+        query_id,
+        token,
+        &llm_tx,
+        None,
+        &[],
+    )
+    .await
+    .is_err());
     assert!(
         observed_rx.try_recv().is_err(),
         "incomplete round must admit zero continuations"
@@ -480,6 +485,7 @@ async fn continuation_is_admitted_exactly_once_for_one_complete_validated_round(
         token,
         &llm_tx,
         Some(&checkpoint),
+        &[],
     )
     .await
     .unwrap();
@@ -491,11 +497,16 @@ async fn continuation_is_admitted_exactly_once_for_one_complete_validated_round(
         serde_json::to_value(conversation.read().await.get_messages()).unwrap(),
         "durable bytes must contain the exact finalized/trimmed history"
     );
-    assert!(
-        super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx, None)
-            .await
-            .is_err()
-    );
+    assert!(super::commit_tool_round_and_continue(
+        &conversation,
+        query_id,
+        token,
+        &llm_tx,
+        None,
+        &[],
+    )
+    .await
+    .is_err());
     assert!(
         observed_rx.try_recv().is_err(),
         "completed round must admit only one continuation"
@@ -528,7 +539,7 @@ async fn closed_worker_leaves_complete_round_staged_and_provider_invisible() {
     drop(rx);
 
     assert_eq!(
-        super::commit_tool_round_and_continue(&conversation, query_id, token, &tx, None).await,
+        super::commit_tool_round_and_continue(&conversation, query_id, token, &tx, None, &[]).await,
         Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
     );
     assert!(conversation.read().await.get_messages().is_empty());
@@ -588,6 +599,7 @@ async fn worker_exit_after_commit_rolls_complete_pair_back_to_stage() {
             token,
             &tx,
             Some(&checkpoint),
+            &[],
         )
         .await,
         Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
@@ -634,6 +646,7 @@ async fn checkpoint_failure_revokes_spawned_continuation_and_restores_live_histo
             token,
             &tx,
             Some(directory.path()),
+            &[],
         )
         .await,
         Err(crate::cli::conversation::ToolRoundError::PersistenceUnavailable(_))
@@ -3911,6 +3924,426 @@ async fn test_usage_reset_command_clears_session_totals_and_checkpoint() {
                     .iter()
                     .any(|message| message.contains("Session usage reset.")),
                 "the reset confirmation must reach the scrollback; messages={messages:?}"
+            );
+        })
+        .await;
+}
+
+type ObservedLlmQuery = (Uuid, String, Vec<crate::providers::Message>);
+
+fn observe_llm_queries(
+    event_loop: &mut EventLoop,
+) -> tokio::sync::mpsc::UnboundedReceiver<ObservedLlmQuery> {
+    let conversation = Arc::clone(&event_loop.conversation);
+    let mut llm_rx = event_loop
+        .llm_rx
+        .take()
+        .expect("test fixture must observe LlmRequest before the worker starts");
+    let (observed_tx, observed_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(LlmRequest::Query {
+            id,
+            text,
+            admission,
+            admission_ready,
+            spawned,
+            publication,
+            ..
+        }) = llm_rx.recv().await
+        {
+            if let Some(ready) = admission_ready {
+                let _ = ready.send(());
+            }
+            if let Some(admission) = admission {
+                if admission.await.is_err() {
+                    continue;
+                }
+            }
+            // Snapshot after admission so a tool-round continuation has already
+            // committed results (and any injected user text) before generate.
+            let snapshot = conversation.read().await.get_messages();
+            if let Some(spawned) = spawned {
+                let _ = spawned.send(());
+            }
+            if let Some(publication) = publication {
+                if publication.await.is_err() {
+                    continue;
+                }
+            }
+            let _ = observed_tx.send((id, text, snapshot));
+        }
+    });
+    observed_rx
+}
+
+async fn start_executing_tools_query(
+    event_loop: &mut EventLoop,
+    tool_id: &str,
+) -> (Uuid, crate::cli::conversation::ToolRoundToken) {
+    let query_id = event_loop.query_states.create_query(Vec::new()).await;
+    assert!(
+        event_loop
+            .query_states
+            .begin_tool_execution(query_id, 1)
+            .await,
+        "the in-flight query must be ExecutingTools so finalize_tool_execution runs"
+    );
+    *event_loop.active_query_id.write().await = Some(query_id);
+    event_loop
+        .conversation
+        .write()
+        .await
+        .add_user_message("original turn".to_string());
+    let round_token = event_loop
+        .conversation
+        .write()
+        .await
+        .stage_assistant(
+            query_id,
+            crate::providers::Message {
+                role: "assistant".into(),
+                content: vec![crate::providers::ContentBlock::ToolUse {
+                    id: tool_id.into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+            },
+        )
+        .expect("stage the tool round whose completing result finalizes");
+    let work_unit = event_loop.output_manager.start_work_unit("Tools");
+    let row_idx = work_unit.add_row("Read(README.md)");
+    event_loop.active_tool_uses.write().await.insert(
+        tool_id.to_string(),
+        (
+            "Read".into(),
+            serde_json::json!({"path": "README.md"}),
+            Arc::clone(&work_unit),
+            row_idx,
+        ),
+    );
+    (query_id, round_token)
+}
+
+fn user_text_messages(messages: &[crate::providers::Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .filter_map(|message| {
+            let text = message.text_content();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        })
+        .collect()
+}
+
+/// Queued user text submitted during ExecutingTools must appear in conversation
+/// after the current tool-round results and before the next provider generate.
+/// It must not start a second `execute_query_inner` / `active_query_id`.
+#[tokio::test]
+async fn test_pending_user_message_injects_before_next_tool_round_generate() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let mut observed_rx = observe_llm_queries(&mut event_loop);
+            let tool_id = "call_inject_round";
+            let (query_id, round_token) =
+                start_executing_tools_query(&mut event_loop, tool_id).await;
+
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "steer now".to_string(),
+                })
+                .await
+                .expect("queuing a user turn during ExecutingTools must succeed");
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "and also this".to_string(),
+                })
+                .await
+                .expect("a second queued turn must preserve order");
+            assert_eq!(
+                event_loop
+                    .pending_queries
+                    .iter()
+                    .map(|(text, _, _)| text.as_str())
+                    .collect::<Vec<_>>(),
+                ["steer now", "and also this"],
+                "both turns must sit on pending_queries until the tool-round boundary; queued={:?}",
+                event_loop.pending_queries
+            );
+            assert_eq!(
+                *event_loop.active_query_id.read().await,
+                Some(query_id),
+                "queuing must not start a second active_query_id"
+            );
+
+            event_loop
+                .handle_event(ReplEvent::ToolResult {
+                    query_id,
+                    round_token,
+                    tool_id: tool_id.to_string(),
+                    result: Ok("readme contents".to_string()),
+                })
+                .await
+                .expect("completing the tool round must finalize");
+
+            assert!(
+                event_loop.pending_queries.is_empty(),
+                "the tool-round boundary must drain pending_queries so StreamingComplete cannot start them as a new query; queued={:?}",
+                event_loop.pending_queries
+            );
+            assert_eq!(
+                *event_loop.active_query_id.read().await,
+                Some(query_id),
+                "inject must keep the in-flight query; a second execute_query_inner would replace active_query_id"
+            );
+
+            let live = event_loop.conversation.read().await.get_messages();
+            assert_eq!(
+                user_text_messages(&live),
+                ["original turn", "steer now", "and also this"],
+                "queued user text must be committed after the tool results, in order; messages={live:?}"
+            );
+            let last = live.last().expect("conversation must include the injected turn");
+            assert_eq!(
+                last.role, "user",
+                "the last provider-visible message before the next generate must be the injected user text; last={last:?}"
+            );
+            assert_eq!(last.text_content(), "and also this");
+            match live.get(live.len().saturating_sub(3)) {
+                Some(message)
+                    if message.content.iter().any(|block| {
+                        matches!(
+                            block,
+                            crate::providers::ContentBlock::ToolResult { tool_use_id, .. }
+                                if tool_use_id == tool_id
+                        )
+                    }) => {}
+                other => panic!(
+                    "tool results must precede the injected user messages so the next generate sees them in round order; preceding={other:?} messages={live:?}"
+                ),
+            }
+
+            let observed = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                observed_rx.recv(),
+            )
+            .await
+            .expect("the completing tool round must send a continuation LlmRequest::Query")
+            .expect("the LLM request channel must stay open for the continuation");
+            assert_eq!(
+                observed.0, query_id,
+                "continuation must reuse the in-flight query id, not start a second query; observed={observed:?}"
+            );
+            assert_eq!(
+                observed.1, "",
+                "tool-round continuation Query text is empty; the injected user text lives in conversation; observed={observed:?}"
+            );
+            assert_eq!(
+                user_text_messages(&observed.2),
+                ["original turn", "steer now", "and also this"],
+                "the continuation snapshot taken after admission must already contain the queued user text; snapshot={:?}",
+                observed.2
+            );
+
+            event_loop
+                .handle_event(ReplEvent::StreamingComplete {
+                    query_id,
+                    full_response: "done".to_string(),
+                })
+                .await
+                .expect("terminal StreamingComplete must dispatch");
+            assert!(
+                observed_rx.try_recv().is_err(),
+                "StreamingComplete must not re-start injected strings as a new query; a second LlmRequest would appear here"
+            );
+        })
+        .await;
+}
+
+/// A query that never executes tools still starts queued input on
+/// StreamingComplete, the drain that existed before tool-round inject.
+#[tokio::test]
+async fn test_pending_user_message_without_tools_drains_on_streaming_complete() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let mut observed_rx = observe_llm_queries(&mut event_loop);
+
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "first turn".to_string(),
+                })
+                .await
+                .expect("the first user turn must start a query");
+            let first_id = event_loop
+                .active_query_id
+                .read()
+                .await
+                .expect("the no-tools query must own active_query_id");
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "queued no-tools".to_string(),
+                })
+                .await
+                .expect("a second turn during Processing must queue");
+            assert_eq!(
+                event_loop
+                    .pending_queries
+                    .iter()
+                    .map(|(text, _, _)| text.as_str())
+                    .collect::<Vec<_>>(),
+                ["queued no-tools"],
+                "without a tool round the queue must wait for StreamingComplete; queued={:?}",
+                event_loop.pending_queries
+            );
+
+            let first = tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx.recv())
+                .await
+                .expect("the first turn must dispatch LlmRequest::Query")
+                .expect("the LLM request channel must stay open");
+            assert_eq!(first.0, first_id);
+            assert_eq!(first.1, "first turn");
+
+            event_loop
+                .handle_event(ReplEvent::StreamingComplete {
+                    query_id: first_id,
+                    full_response: "first reply".to_string(),
+                })
+                .await
+                .expect("no-tools StreamingComplete must drain pending_queries");
+
+            assert!(
+                event_loop.pending_queries.is_empty(),
+                "StreamingComplete must pop the queued no-tools turn; queued={:?}",
+                event_loop.pending_queries
+            );
+            let second_id = event_loop
+                .active_query_id
+                .read()
+                .await
+                .expect("draining pending on StreamingComplete must start the queued turn");
+            assert_ne!(
+                second_id, first_id,
+                "the queued no-tools turn is a new query, not an inject into the finished one"
+            );
+            let second =
+                tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx.recv())
+                    .await
+                    .expect("StreamingComplete must start the queued turn as LlmRequest::Query")
+                    .expect("the LLM request channel must stay open for the drained turn");
+            assert_eq!(second.0, second_id);
+            assert_eq!(
+                second.1, "queued no-tools",
+                "the drained turn must be a new Query with the queued text; observed={second:?}"
+            );
+            assert!(
+                user_text_messages(&second.2)
+                    .iter()
+                    .any(|text| text == "queued no-tools"),
+                "the drained turn must be in conversation; snapshot={:?}",
+                second.2
+            );
+        })
+        .await;
+}
+
+/// Cancel must not leave queued text to re-fire after a later turn completes
+/// (#463: queued turn must not execute out of order after cancel).
+#[tokio::test]
+async fn test_cancel_does_not_refire_queued_turn_out_of_order() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let mut observed_rx = observe_llm_queries(&mut event_loop);
+            let tool_id = "call_cancel_queued";
+            let (query_id, _round_token) =
+                start_executing_tools_query(&mut event_loop, tool_id).await;
+
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "queued during tools".to_string(),
+                })
+                .await
+                .expect("queuing during ExecutingTools must succeed");
+            assert_eq!(
+                event_loop.pending_queries.len(),
+                1,
+                "the cancel fixture must have a queued turn; queued={:?}",
+                event_loop.pending_queries
+            );
+
+            event_loop
+                .handle_event(ReplEvent::CancelQuery)
+                .await
+                .expect("CancelQuery must dispatch");
+            assert!(
+                event_loop.pending_queries.is_empty(),
+                "CancelQuery must take pending_queries so a later StreamingComplete cannot start the queued turn out of order; queued={:?}",
+                event_loop.pending_queries
+            );
+            assert_eq!(
+                *event_loop.active_query_id.read().await,
+                None,
+                "cancel must clear the in-flight query"
+            );
+
+            event_loop
+                .handle_event(ReplEvent::StreamingComplete {
+                    query_id,
+                    full_response: "late cancelled prose".to_string(),
+                })
+                .await
+                .expect("late StreamingComplete for the cancelled query must be discarded");
+            assert!(
+                observed_rx.try_recv().is_err(),
+                "a cancelled query must not dispatch the queued turn; observed a Query after cancel"
+            );
+
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "later turn".to_string(),
+                })
+                .await
+                .expect("a subsequent turn after cancel must start");
+            let later_id = event_loop
+                .active_query_id
+                .read()
+                .await
+                .expect("the subsequent turn must own active_query_id");
+            let later = tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx.recv())
+                .await
+                .expect("the subsequent turn must dispatch LlmRequest::Query")
+                .expect("the LLM request channel must stay open");
+            assert_eq!(later.0, later_id);
+            assert_eq!(
+                later.1, "later turn",
+                "the first Query after cancel must be the subsequent user turn, not the pre-cancel queue; observed={later:?}"
+            );
+
+            event_loop
+                .handle_event(ReplEvent::StreamingComplete {
+                    query_id: later_id,
+                    full_response: "later reply".to_string(),
+                })
+                .await
+                .expect("the subsequent turn must complete");
+            assert!(
+                observed_rx.try_recv().is_err(),
+                "the pre-cancel queued turn must not re-fire after a later StreamingComplete; that is the queued-turn-out-of-order cancel bug"
+            );
+            assert!(
+                !user_text_messages(&event_loop.conversation.read().await.get_messages())
+                    .iter()
+                    .any(|text| text == "queued during tools"),
+                "cancel discards queued text rather than attaching it to a later turn; messages={:?}",
+                event_loop.conversation.read().await.get_messages()
             );
         })
         .await;

@@ -226,11 +226,15 @@ impl EventLoop {
                 // trigger loop detection when Claude calls them again during execution.
                 self.tool_call_history.write().await.remove(&query_id);
 
-                // Reset conversation to a single clear execution prompt.
+                // Reset conversation to a single clear execution prompt, then
+                // append any user text queued while tools ran so it is not wiped.
+                let pending = self.take_pending_queries();
                 let mut proposed_history = self.conversation.read().await.clone();
                 proposed_history.clear();
                 proposed_history.add_user_message(directive);
+                append_pending_user_messages(&mut proposed_history, &pending_user_texts(&pending));
                 if let Err(error) = self.checkpoint_history(&proposed_history) {
+                    self.restore_pending_queries(pending);
                     let _ = self.event_tx.send(ReplEvent::QueryFailed {
                         query_id,
                         error: format!(
@@ -254,6 +258,7 @@ impl EventLoop {
             }
         }
 
+        let pending = self.take_pending_queries();
         let checkpoint_path = self.conversation_checkpoint_path();
         let committed = commit_tool_round_and_continue(
             &self.conversation,
@@ -261,9 +266,11 @@ impl EventLoop {
             round_token,
             &self.llm_tx,
             checkpoint_path.as_deref(),
+            &pending_user_texts(&pending),
         )
         .await;
         if let Err(error) = committed {
+            self.restore_pending_queries(pending);
             let _ = self.event_tx.send(ReplEvent::QueryFailed {
                 query_id,
                 error: format!("Tool continuation could not be admitted: {error}"),
