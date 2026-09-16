@@ -20,12 +20,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::config::{AudienceBinding, CredentialKind, CredentialProvider, EndpointFamily};
 use crate::oauth::{
     validate_secret_field, AuthorizationCodeGrant, DeviceAuthorization, DevicePoll, OAuthDialect,
     OAuthDialectDescriptor, OAuthHttpRequest, OAuthRequestBody, OAuthTokenRecord,
     TokenValidationContext,
 };
+use crate::{AudienceBinding, CredentialKind, CredentialProvider, EndpointFamily};
 
 pub const CHATGPT_OAUTH_PROTOCOL_REVISION: &str =
     "openai-codex-public-client@94cbbddafc1776d5e377bca1b05932c697e82238+finch-binding-v2";
@@ -145,11 +145,12 @@ pub struct OpenAiChatGptOAuthDialect<V> {
     auth_origin: String,
 }
 
-impl OpenAiChatGptOAuthDialect<crate::providers::openai_jwks::OpenAiJwksVerifier> {
+#[cfg(feature = "chatgpt")]
+impl OpenAiChatGptOAuthDialect<crate::openai_jwks::OpenAiJwksVerifier> {
     pub fn production() -> Result<Self> {
         Self::new(
             OPENAI_AUTH_ORIGIN,
-            Arc::new(crate::providers::openai_jwks::OpenAiJwksVerifier::production()?),
+            Arc::new(crate::openai_jwks::OpenAiJwksVerifier::production()?),
             false,
         )
     }
@@ -193,8 +194,7 @@ where
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(auth_origin: &str, verifier: Arc<V>) -> Result<Self> {
+    pub fn for_test(auth_origin: &str, verifier: Arc<V>) -> Result<Self> {
         Self::new(auth_origin, verifier, true)
     }
 }

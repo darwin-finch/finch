@@ -1251,6 +1251,13 @@ pub(crate) async fn process_query_with_tools(
                                 work_unit.set_response(&text);
                             }
                         }
+                        Ok(StreamChunk::ThinkingDelta { .. })
+                        | Ok(StreamChunk::ToolCallDelta { .. }) => {}
+                        Ok(StreamChunk::ToolCallComplete {
+                            id, name, input, ..
+                        }) => {
+                            blocks.push(ContentBlock::ToolUse { id, name, input });
+                        }
                         Ok(StreamChunk::ContentBlockComplete(block)) => {
                             tracing::debug!(
                                 block_type = match &block {

@@ -3,7 +3,7 @@
 //! Every caller that builds, inspects, or persists a conversation turn uses
 //! these types: `Message`, `ContentBlock`, and `ImageSource` are the repo's
 //! universal message shapes, not a Claude client detail. They live behind the
-//! providers facade (`crate::providers::Message`); the Claude HTTP client
+//! providers facade (`crate::Message`); the Claude HTTP client
 //! (`crate::claude`) consumes them like any other transport and keeps only its
 //! own request/response envelopes. Serde shapes here are the durable
 //! conversation format and must not change casually.

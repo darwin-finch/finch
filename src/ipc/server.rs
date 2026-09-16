@@ -1755,6 +1755,14 @@ impl finch_daemon::Server for FinchDaemonImpl {
                             .set_secondary_used_percent(secondary_used_percent.unwrap_or_default());
                         r.send().promise.await?;
                     }
+                    Ok(StreamChunk::ThinkingDelta { .. })
+                    | Ok(StreamChunk::ToolCallDelta { .. })
+                    | Ok(StreamChunk::ToolCallComplete { .. }) => {
+                        // Provider-native reasoning/tool deltas are crate events.
+                        // Cap'n Proto IPC (#775 follow-up / not this schema) keeps
+                        // the existing complete-block encoding.
+                        continue;
+                    }
                     Ok(StreamChunk::ContentBlockComplete(block)) => {
                         let mut r = receiver.on_chunk_request();
                         let mut encoded = r.get().init_chunk().init_content_block_complete();

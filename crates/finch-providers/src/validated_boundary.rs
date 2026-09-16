@@ -9,7 +9,7 @@ use super::*;
 /// provider backend elsewhere in the crate cannot fabricate a token.
 ///
 /// ```compile_fail
-/// use finch::providers::ValidatedProviderRequest;
+/// use finch_providers::ValidatedProviderRequest;
 ///
 /// let _ = ValidatedProviderRequest {
 ///     request: panic!("unreachable"),

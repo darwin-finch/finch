@@ -28,6 +28,8 @@ authoritative.
 
 - [Root design index](../DESIGN.md): subsystem map, current dependency cycles, and intended
   direction
+- [finch-providers crate](../crates/finch-providers/AGENTS.md): extracted provider transports,
+  OAuth, catalogs, and credential ports
 - [Configuration types](../src/config/settings.rs),
   [provider profiles](../src/config/provider.rs), and
   [configuration notes](../src/config/CONFIGURATION.md)

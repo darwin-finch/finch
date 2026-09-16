@@ -33,6 +33,8 @@ CURRENT_DOCS = (
     Path("crates/finch-vm-core/docs/README.md"),
     Path("crates/finch-vm/AGENTS.md"),
     Path("crates/finch-vm/docs/README.md"),
+    Path("crates/finch-providers/AGENTS.md"),
+    Path("crates/finch-providers/docs/README.md"),
     Path("src/memory/AGENTS.md"),
     Path("src/programs/AGENTS.md"),
     Path("docs/README.md"),
@@ -128,12 +130,12 @@ EVIDENCE_RULES = (
 REVISION_RULES = (
     (
         TRANSPORT_DOCUMENT,
-        Path("src/providers/chatgpt_subscription.rs"),
+        Path("crates/finch-providers/src/chatgpt_subscription.rs"),
         "CHATGPT_INFERENCE_PROTOCOL_REVISION",
     ),
     (
         OAUTH_DOCUMENT,
-        Path("src/providers/chatgpt_oauth.rs"),
+        Path("crates/finch-providers/src/chatgpt_oauth.rs"),
         "CHATGPT_OAUTH_PROTOCOL_REVISION",
     ),
 )

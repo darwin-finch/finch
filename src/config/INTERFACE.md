@@ -10,12 +10,8 @@ Everything below is what callers outside this module can reach. Implementation m
 ## Types
 
 ```rust
-/// Audience or endpoint-family binding persisted with a credential/profile.
+/// Audience or endpoint-family binding persisted with a credential/profile. Re-exported from `finch-providers`.
 pub struct AudienceBinding { … }
-impl AudienceBinding {
-    pub fn custom(endpoint: &str) -> Result<Self>;
-    pub fn standard(family: EndpointFamily) -> Self;
-}
 /// Backend configuration for model inference
 pub struct BackendConfig { … }
 impl BackendConfig {
@@ -82,22 +78,19 @@ impl CoreMlComputeUnits {
 }
 /// CoreML execution-provider options.
 pub struct CoreMlConfig { … }
-/// Profile-side authentication contract.
+/// Profile-side authentication contract. Re-exported from `finch-providers`.
 pub struct CredentialBinding { … }
-/// Authentication mechanism represented by a named credential.
+/// Authentication mechanism represented by a named credential. Re-exported from `finch-providers`.
 pub enum CredentialKind { ApiKey, Bearer, OauthDevice, OauthBrowserPkce, CloudIdentity, LocalSocket, None }
-/// Persisted lifecycle metadata.
+/// Persisted lifecycle metadata. Re-exported from `finch-providers`.
 pub enum CredentialLifecycle { Active, Revoked, LegacyAmbiguous }
-/// Provider/account namespace.
+/// Provider/account namespace. Re-exported from `finch-providers`.
 pub enum CredentialProvider { Anthropic, OpenaiPlatform, ChatgptSubscription, Xai, GeminiAiStudio, GoogleVertex, Mistral, Groq, Openrouter }
-impl CredentialProvider {
-    pub fn as_str(self) -> &'static str;
-}
 /// Dialog color configuration Re-exported from `theme`.
 pub struct DialogColors { … }
-/// Normalized service family.
+/// Normalized service family. Re-exported from `finch-providers`.
 pub enum EndpointFamily { AnthropicApi, OpenaiPlatform, ChatgptSubscription, XaiApi, GeminiAiStudio, GoogleVertex, MistralApi, GroqApi, OpenrouterApi, Custom }
-/// Production resolver for explicit `env:VARIABLE_NAME` opaque references.
+/// Production resolver for explicit `env:VARIABLE_NAME` opaque references. Re-exported from `finch-providers`.
 pub struct EnvironmentCredentialResolver;
 /// Execution target for inference (hardware where code runs)  All targets use ONNX Runtime as the inference provider.
 pub enum ExecutionTarget { CoreML, Cuda, Cpu, Auto }
@@ -121,7 +114,8 @@ pub struct FeaturesConfig { … }
 pub struct LicenseConfig { … }
 /// Whether this installation has a commercial license key
 pub enum LicenseType { Noncommercial, Commercial }
-pub(crate) struct LifecycleRevocation(Arc<AtomicBool>);
+/// Re-exported from `finch-providers`.
+pub struct LifecycleRevocation(Arc<AtomicBool>);
 /// Semantic full-row bands used by the transcript renderer. Re-exported from `theme`.
 pub enum MessageBand { LocalUser, Participant, Assistant, ProgramSource, Tool, ProgramOutput }
 /// Message display colors Re-exported from `theme`.
@@ -150,7 +144,7 @@ impl Persona {
     /// Get persona verbosity
     pub fn verbosity(&self) -> &str;
 }
-/// Secret-free, named provider credential metadata.
+/// Secret-free, named provider credential metadata. Re-exported from `finch-providers`.
 pub struct ProviderCredential { … }
 /// A single provider entry — either a cloud API or a local inference backend.
 pub enum ProviderEntry { Credentialed, LegacyChatgptSubscription, Claude, Openai, Grok, Gemini, Mistral, Groq, Openrouter, Ollama, RemoteDaemon, Local }
@@ -182,18 +176,12 @@ impl ProviderEntry {
     /// Convert this cloud provider to a `TeacherEntry` for backward compat.
     pub fn to_teacher_entry(&self) -> Option<TeacherEntry>;
 }
-/// Provider-controlled reasoning depth.
+/// Provider-controlled reasoning depth. Re-exported from `finch-providers`.
 pub enum ReasoningEffort { None, Minimal, Low, Medium, High, Xhigh, Max }
-impl ReasoningEffort {
-    pub fn as_str(self) -> &'static str;
-}
-/// Immutable, redaction-safe resolved credential handle.
+/// Immutable, redaction-safe resolved credential handle. Re-exported from `finch-providers`.
 pub struct ResolvedCredential { … }
-/// Secret bytes returned by an injected local credential resolver.
+/// Secret bytes returned by an injected local credential resolver. Re-exported from `finch-providers`.
 pub struct ResolvedSecret(String);
-impl ResolvedSecret {
-    pub fn new(secret: impl Into<String>) -> Result<Self>;
-}
 /// Server configuration for daemon mode
 pub struct ServerConfig { … }
 /// Status bar color configuration Re-exported from `theme`.
@@ -207,7 +195,7 @@ pub struct UiColors { … }
 ## Traits
 
 ```rust
-/// Injected secret store boundary.
+/// Injected secret store boundary. Re-exported from `finch-providers`.
 pub trait CredentialResolver: Send + Sync {
     fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential>;
 }
@@ -218,7 +206,9 @@ pub trait CredentialResolver: Send + Sync {
 ```rust
 /// Decide whether the licence notice is due, recording the decision in the runtime-state file rather than in `config.toml` (#76).
 pub fn claim_notice_showing_now(legacy_suppress_until: Option<&str>, today: chrono::NaiveDate) -> bool { … }
-/// Validate all credential metadata and return a stable name index.
+/// Names of profiles that depend on a credential, for revoke/delete UX. Re-exported from `finch-providers`.
+pub fn credential_dependencies<'a>(credential_name: &str, profiles: impl IntoIterator<Item = (String, Option<&'a CredentialBinding>)>) -> Vec<String> { … }
+/// Validate all credential metadata and return a stable name index. Re-exported from `finch-providers`.
 pub fn credential_index(credentials: &[ProviderCredential]) -> Result<BTreeMap<&str, &ProviderCredential>> { … }
 /// Forget any recorded notice suppression, so the next start shows it.
 pub fn forget_notice_suppression() { … }
@@ -228,7 +218,13 @@ pub(crate) fn load_config_from_path(config_path: &std::path::Path) -> Result<Con
 pub(crate) fn load_config_from_path_with_paths(config_path: &std::path::Path, metrics_dir: std::path::PathBuf, constitution_path: Option<std::path::PathBuf>) -> Result<Config> { … }
 /// Load the persisted configuration without substituting environment or empty state when an existing file is invalid.
 pub fn load_persisted_config() -> Result<Option<Config>> { … }
-/// Validate a profile reference against one named credential without resolving secret material or performing external activity.
+/// Normalize a configured base URL to its lowercase scheme/host/port origin. Re-exported from `finch-providers`.
+pub fn normalize_origin(endpoint: &str) -> Result<String> { … }
+/// Determine the binding required by a provider profile and endpoint. Re-exported from `finch-providers`.
+pub fn required_audience(provider: CredentialProvider, endpoint: Option<&str>) -> Result<AudienceBinding> { … }
+/// Reject absolute authenticated path overrides that leave the bound origin. Re-exported from `finch-providers`.
+pub fn validate_authenticated_endpoints(provider: CredentialProvider, base_url: Option<&str>, overrides: &[Option<&str>]) -> Result<()> { … }
+/// Validate a profile reference against one named credential without resolving secret material or performing external activity. Re-exported from `finch-providers`.
 pub fn validate_binding(provider: CredentialProvider, endpoint: Option<&str>, binding: &CredentialBinding, credential: &ProviderCredential, now: DateTime<Utc>) -> Result<()> { … }
 ```
 
@@ -236,7 +232,7 @@ pub fn validate_binding(provider: CredentialProvider, endpoint: Option<&str>, bi
 
 ```rust
 pub const DEFAULT_BRAIN_TLS_PORT: u16 = 11436;
-/// Default Claude model used when no model is specified in config.
+/// Default Claude model used when a transport does not override it. Re-exported from `finch-providers`.
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5";
 /// Default bind address for the finch daemon.
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:11435";

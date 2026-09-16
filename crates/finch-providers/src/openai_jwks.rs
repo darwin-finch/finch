@@ -120,8 +120,7 @@ impl OpenAiJwksVerifier {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(
+    pub fn for_test(
         authority_origin: &str,
         expected_issuer: &str,
         client_id: &str,
@@ -651,10 +650,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chatgpt_oauth::{OpenAiChatGptOAuthDialect, OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE};
     use crate::oauth::{OAuthCredentialStore, OAuthDialect, TokenValidationContext};
-    use crate::providers::chatgpt_oauth::{
-        OpenAiChatGptOAuthDialect, OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE,
-    };
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::Response;
@@ -1009,8 +1006,8 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            error.downcast_ref::<crate::providers::chatgpt_oauth::ChatGptAuthStageError>(),
-            Some(&crate::providers::chatgpt_oauth::ChatGptAuthStageError::IdentityVerification)
+            error.downcast_ref::<crate::chatgpt_oauth::ChatGptAuthStageError>(),
+            Some(&crate::chatgpt_oauth::ChatGptAuthStageError::IdentityVerification)
         );
         assert!(store.load("chatgpt:invalid-identity").unwrap().is_none());
         let rendered = format!("{error:#}");
@@ -1053,8 +1050,8 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            error.downcast_ref::<crate::providers::chatgpt_oauth::ChatGptAuthStageError>(),
-            Some(&crate::providers::chatgpt_oauth::ChatGptAuthStageError::AccountEntitlement)
+            error.downcast_ref::<crate::chatgpt_oauth::ChatGptAuthStageError>(),
+            Some(&crate::chatgpt_oauth::ChatGptAuthStageError::AccountEntitlement)
         );
         assert!(store.load("chatgpt:missing-account").unwrap().is_none());
         let rendered = format!("{error:#}");

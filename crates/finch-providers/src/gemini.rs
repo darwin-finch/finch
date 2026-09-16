@@ -17,8 +17,8 @@ use super::types::{
     WireProtocol,
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
-use crate::claude::retry::{with_retry, NonRetriableError};
-use crate::providers::ContentBlock;
+use crate::retry::{with_retry, NonRetriableError};
+use crate::ContentBlock;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";

@@ -164,50 +164,9 @@ pub struct ResponseMetadata {
     pub secondary_allowance_used_percent: Option<f32>,
 }
 
-/// Streaming chunk (text delta or complete block)
-#[derive(Debug, Clone)]
-pub enum StreamChunk {
-    TextDelta(String),                  // Incremental text
-    ContentBlockComplete(ContentBlock), // Complete tool_use or text block
-    /// Best available completed-inference model identity.
-    ///
-    /// Providers report an explicit serving model when available and may fall
-    /// back to their validated dispatch identity when it is not.
-    ResponseMetadata {
-        model: String,
-    },
-    /// Usage metadata from message_start — carries the input token count
-    /// reported by the API before any text arrives.
-    Usage {
-        input_tokens: u32,
-        output_tokens: u32,
-    },
-    /// Provider-owned subscription allowance snapshot. Percentages are
-    /// bounded to 0..=100 and are not Platform billing data.
-    Allowance {
-        primary_used_percent: Option<f32>,
-        secondary_used_percent: Option<f32>,
-    },
-}
+pub use finch_providers::StreamChunk;
 
-/// Tool use request from generator
-#[derive(Debug, Clone)]
-pub struct ToolUse {
-    pub id: String,
-    pub name: String,
-    pub input: Value,
-}
-
-impl ToolUse {
-    /// Convert to ContentBlock for conversation history
-    pub fn to_content_block(&self) -> ContentBlock {
-        ContentBlock::ToolUse {
-            id: self.id.clone(),
-            name: self.name.clone(),
-            input: self.input.clone(),
-        }
-    }
-}
+pub use finch_providers::ToolUse;
 
 #[cfg(test)]
 mod tests {

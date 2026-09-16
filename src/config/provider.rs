@@ -1,38 +1,10 @@
 // Unified provider entry — covers both cloud and local inference backends.
 
 use crate::config::backend::ExecutionTarget;
-use crate::config::credential::{CredentialBinding, CredentialProvider};
+use crate::config::{CredentialBinding, CredentialProvider, ReasoningEffort};
 use crate::models::{InferenceProvider, ModelFamily, ModelSize};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-
-/// Provider-controlled reasoning depth. Unsupported providers ignore this by
-/// omitting the field from their profile schema.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
-    None,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-impl ReasoningEffort {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Xhigh => "xhigh",
-            Self::Max => "max",
-        }
-    }
-}
 
 fn default_true() -> bool {
     true

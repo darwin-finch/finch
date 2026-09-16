@@ -3,7 +3,6 @@
 
 mod backend;
 mod constants;
-mod credential;
 mod loader;
 mod notice_state;
 
@@ -55,21 +54,21 @@ pub use crate::theme::{
     UiColors,
 };
 pub use constants::{
-    DEFAULT_BRAIN_TLS_PORT, DEFAULT_CLAUDE_MODEL, DEFAULT_DAEMON_ADDR, DEFAULT_HTTP_ADDR,
-    DEFAULT_MAX_TOKENS, DEFAULT_WORKER_ADDR,
+    DEFAULT_BRAIN_TLS_PORT, DEFAULT_DAEMON_ADDR, DEFAULT_HTTP_ADDR, DEFAULT_MAX_TOKENS,
+    DEFAULT_WORKER_ADDR,
 };
-pub(crate) use credential::LifecycleRevocation;
-pub use credential::{credential_index, validate_binding};
-pub use credential::{
-    AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle, CredentialProvider,
-    CredentialResolver, EndpointFamily, EnvironmentCredentialResolver, ProviderCredential,
-    ResolvedCredential, ResolvedSecret,
+pub use finch_providers::{
+    credential_dependencies, credential_index, normalize_origin, required_audience,
+    validate_authenticated_endpoints, validate_binding, AudienceBinding, CredentialBinding,
+    CredentialKind, CredentialLifecycle, CredentialProvider, CredentialResolver, EndpointFamily,
+    EnvironmentCredentialResolver, LifecycleRevocation, ProviderCredential, ReasoningEffort,
+    ResolvedCredential, ResolvedSecret, DEFAULT_CLAUDE_MODEL,
 };
 pub use loader::{load_config, load_persisted_config};
 #[cfg(test)]
 pub(crate) use loader::{load_config_from_path, load_config_from_path_with_paths};
 pub use persona::Persona;
-pub use provider::{ProviderEntry, ReasoningEffort};
+pub use provider::ProviderEntry;
 pub use settings::{
     ClientConfig, Config, FeaturesConfig, LicenseConfig, LicenseType, ServerConfig, TeacherEntry,
 };

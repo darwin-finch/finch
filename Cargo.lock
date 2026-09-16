@@ -1646,6 +1646,7 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "finch-language",
+ "finch-providers",
  "finch-vm",
  "fs2",
  "futures",
@@ -1733,6 +1734,40 @@ dependencies = [
  "finch-coforth",
  "finch-colisp",
  "finch-vm-core",
+]
+
+[[package]]
+name = "finch-providers"
+version = "0.7.30"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "dirs 5.0.1",
+ "fs2",
+ "futures",
+ "h2",
+ "hex",
+ "mockito",
+ "nix 0.29.0",
+ "png 0.17.16",
+ "rand 0.8.8",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

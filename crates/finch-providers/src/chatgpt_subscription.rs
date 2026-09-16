@@ -25,12 +25,12 @@ use super::{
     CapabilitySupport, ModelCapabilities, ModelFeature, ProviderBackend, ProviderRequest,
     ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest, WireProtocol,
 };
-use crate::config::{
+use crate::oauth::{FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthTokenRecord};
+use crate::ToolDefinition;
+use crate::{
     AudienceBinding, CredentialProvider, EndpointFamily, ProviderCredential, ReasoningEffort,
 };
-use crate::oauth::{FileOAuthCredentialStore, OAuthClient, OAuthCredentialStore, OAuthTokenRecord};
-use crate::providers::{ContentBlock, Message};
-use crate::tools::ToolDefinition;
+use crate::{ContentBlock, Message};
 
 pub const CHATGPT_INFERENCE_PROTOCOL_REVISION: &str =
     "openai-codex-responses-lite@6478a751fde8884b2fdc76486fe23175a8e795d4";
@@ -211,7 +211,7 @@ pub trait ChatGptCredentialSource: Send + Sync {
 }
 
 type ProductionOAuthClient = OAuthClient<
-    OpenAiChatGptOAuthDialect<crate::providers::openai_jwks::OpenAiJwksVerifier>,
+    OpenAiChatGptOAuthDialect<crate::openai_jwks::OpenAiJwksVerifier>,
     FileOAuthCredentialStore,
 >;
 

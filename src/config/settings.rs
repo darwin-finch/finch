@@ -591,7 +591,7 @@ impl Config {
 
         // Validate the complete named-credential graph before any provider,
         // fallback, catalogue, or transport object is constructed.
-        let credentials = super::credential::credential_index(&self.credentials)
+        let credentials = super::credential_index(&self.credentials)
             .context("Invalid named credential records")?;
         let mut profile_names = std::collections::BTreeSet::new();
         for provider in &self.providers {
@@ -619,7 +619,7 @@ impl Config {
                 ..
             } = provider
             {
-                super::credential::validate_authenticated_endpoints(
+                super::validate_authenticated_endpoints(
                     *credential_provider,
                     base_url.as_deref(),
                     &[chat_path.as_deref(), models_path.as_deref()],
@@ -631,7 +631,7 @@ impl Config {
                     )
                 })?;
             }
-            super::credential::validate_binding(
+            super::validate_binding(
                 provider
                     .credential_provider()
                     .expect("credentialed profiles declare provider namespace"),
@@ -956,7 +956,7 @@ impl Config {
 
     /// Profiles that reference a named credential, for dependency-aware UX.
     pub fn credential_dependents(&self, credential_name: &str) -> Vec<String> {
-        super::credential::credential_dependencies(
+        super::credential_dependencies(
             credential_name,
             self.providers
                 .iter()
