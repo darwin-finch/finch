@@ -1135,7 +1135,7 @@ pub(super) fn handle_models_input(
             if !accepts_api_key {
                 *editing_mode = false;
                 *error = Some(
-                    "ChatGPT subscription uses a named Finch device credential, not an API key"
+                    "This provider uses a named subscription credential, not an API key. Console API keys bill separately and are a different provider."
                         .into(),
                 );
                 return Ok(false);
@@ -1251,10 +1251,10 @@ pub(super) fn handle_models_input(
                             provider_idx,
                             name: name.clone(),
                             model: model.clone(),
-                            api_key: if provider.eq_ignore_ascii_case("chatgpt") {
-                                None
-                            } else {
+                            api_key: if provider_requires_inline_api_key(provider) {
                                 Some(api_key.clone())
+                            } else {
+                                None
                             },
                             focused_field: 1,
                             editing_idx: Some(*selected_idx),

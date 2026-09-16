@@ -613,7 +613,7 @@ pub(super) fn render_models_section(
         let panel = Paragraph::new("Named Finch device credential; no API key input").block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("ChatGPT authentication")
+                .title("Subscription authentication")
                 .border_style(Style::default().fg(Color::Yellow)),
         );
         f.render_widget(panel, chunks[3]);

@@ -1455,6 +1455,18 @@ fn chatgpt_configuration_has_no_api_key_input_buffer_or_render_path() {
     handle_models_input(&mut state, key(KeyCode::Up)).unwrap();
     handle_models_input(&mut state, key(KeyCode::Up)).unwrap();
     handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+    assert!(
+        matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote {
+                api_key: Some(_),
+                ..
+            })
+        ),
+        "the Console Grok API row after ChatGPT and SuperGrok must expose an API-key buffer; step={:?}",
+        get_step(&state)
+    );
     for character in "sk-platform-must-not-cross".chars() {
         handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
         handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
@@ -1471,6 +1483,7 @@ fn chatgpt_configuration_has_no_api_key_input_buffer_or_render_path() {
             ..
         }) if key == "sk-platform-must-not-cross"
     ));
+    handle_models_input(&mut state, key(KeyCode::Left)).unwrap();
     handle_models_input(&mut state, key(KeyCode::Left)).unwrap();
     let step = get_step(&state).unwrap();
     assert!(matches!(
@@ -6224,7 +6237,7 @@ fn confirming_a_grok_sub_provider_runs_the_device_exchange_in_the_dialog() {
 }
 
 #[test]
-fn grok_sub_device_404_offers_api_key_instead_of_a_fake_oauth_button() {
+fn grok_sub_device_404_fails_closed_without_api_key_fallback() {
     let fake = Arc::new(ScriptedGrokAddTimeAuthenticator::new(
         [Err(
             crate::providers::GrokDeviceEndpointError::StartDisabledOrUnsupported.into(),
@@ -6251,18 +6264,23 @@ fn grok_sub_device_404_offers_api_key_instead_of_a_fake_oauth_button() {
 
     let rendered = render_wizard_text(&state);
     assert!(
-        rendered.contains("disabled or unsupported") && rendered.contains("console.x.ai"),
-        "a missing public device flow must offer an API key instead of a fake OAuth button; rendered={rendered}"
+        rendered.contains("disabled or unsupported") && rendered.contains("No credential was"),
+        "a missing public device flow must fail closed with no credential; rendered={rendered}"
     );
     assert!(
-        rendered.contains("will not invent") || rendered.contains("API-key"),
-        "404 copy must refuse a fake OAuth button; rendered={rendered}"
+        rendered.contains("will not invent")
+            && rendered.contains("Console API-key billing"),
+        "404 copy must refuse a fake OAuth button and Console billing fallback; rendered={rendered}"
+    );
+    assert!(
+        !rendered.to_lowercase().contains("use an xai api key"),
+        "API keys bill separately and must not be an automatic fallback; rendered={rendered}"
     );
     assert!(state.credentials.is_empty());
 }
 
 #[test]
-fn grok_sub_invalid_client_fails_closed_to_api_key() {
+fn grok_sub_invalid_client_fails_closed_without_api_key_fallback() {
     let fake = Arc::new(ScriptedGrokAddTimeAuthenticator::new(
         [Err(
             crate::providers::GrokDeviceEndpointError::ClientRejected.into(),
@@ -6289,12 +6307,80 @@ fn grok_sub_invalid_client_fails_closed_to_api_key() {
 
     let rendered = render_wizard_text(&state);
     assert!(
-        rendered.contains("invalid_client") && rendered.contains("API key"),
-        "independent-client rejection must fail closed to an API key; rendered={rendered}"
+        rendered.contains("invalid_client") && rendered.contains("No credential was saved"),
+        "independent-client rejection must fail closed with no credential; rendered={rendered}"
     );
     assert!(
-        rendered.contains("will not silently"),
-        "invalid_client copy must refuse silent billing fallback; rendered={rendered}"
+        rendered.contains("will not switch to Console API-key billing"),
+        "invalid_client copy must refuse Console billing fallback; rendered={rendered}"
+    );
+    assert!(
+        !rendered.to_lowercase().contains("use an xai api key"),
+        "API keys bill separately and must not be an automatic fallback; rendered={rendered}"
     );
     assert!(state.credentials.is_empty());
+}
+
+#[test]
+fn grok_sub_does_not_accept_console_api_key_edits() {
+    let grok_sub = ModelConfig::Remote {
+        provider: "grok-sub".into(),
+        name: "Grok subscription (SuperGrok)".into(),
+        api_key: String::new(),
+        model: "grok-4.6".into(),
+        enabled: true,
+        persisted: None,
+    };
+    let grok_api = ModelConfig::Remote {
+        provider: "grok".into(),
+        name: "Grok API (xAI Console)".into(),
+        api_key: String::new(),
+        model: String::new(),
+        enabled: true,
+        persisted: None,
+    };
+    assert!(
+        !grok_sub.accepts_api_key(),
+        "SuperGrok must not take a Console API key; that lane bills separately"
+    );
+    assert!(
+        grok_api.accepts_api_key(),
+        "the explicit xAI Console provider still takes an API key"
+    );
+
+    let mut state = WizardState::new_with_catalog_cache_dir(None, None);
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models {
+        primary_model,
+        editing_mode,
+        selected_idx,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *primary_model = grok_sub;
+        *editing_mode = true;
+        *selected_idx = 0;
+    }
+    handle_models_input(&mut state, key(KeyCode::Char('x'))).unwrap();
+    assert!(
+        matches!(
+            get_primary(&state),
+            Some(ModelConfig::Remote {
+                provider,
+                api_key,
+                ..
+            }) if provider == "grok-sub" && api_key.is_empty()
+        ),
+        "typing into SuperGrok must not store a Console key; primary={:?}",
+        get_primary(&state)
+    );
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("not an API key") || rendered.contains("bill separately"),
+        "the editor must refuse Console billing on grok-sub; rendered={rendered}"
+    );
+    assert!(
+        !rendered.contains("Edit API Key"),
+        "SuperGrok must not open the API-key editor; rendered={rendered}"
+    );
 }

@@ -78,10 +78,10 @@ pub(super) fn grok_setup_failure_summary(cause: GrokSetupFailureCause) -> String
             "Grok subscription sign-in was denied. No credential was saved."
         }
         GrokSetupFailureCause::StartDisabledOrUnsupported => {
-            "Grok subscription device authorization is disabled or unsupported for this account. Finch will not invent an OAuth button. Add the separate Grok API-key provider from console.x.ai if you want Console billing."
+            "Grok subscription device authorization is disabled or unsupported for this account. No credential was saved. Finch will not invent an OAuth button or switch to Console API-key billing."
         }
         GrokSetupFailureCause::ClientRejected => {
-            "xAI rejected Finch as an OAuth client (invalid_client). SuperGrok device login is not available for this independent client. Use an xAI API key from console.x.ai instead. Finch will not silently switch credentials."
+            "xAI rejected Finch as an OAuth client (invalid_client). SuperGrok device login is not available for this independent client. No credential was saved. Finch will not switch to Console API-key billing."
         }
         GrokSetupFailureCause::ProviderRejected => {
             "Grok subscription sign-in was rejected. No credential was saved. Finch will not fall back to an API key."
@@ -168,12 +168,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn client_rejection_and_missing_device_flow_offer_api_key_instead_of_fake_oauth() {
+    fn client_rejection_and_missing_device_flow_fail_closed_without_api_key_fallback() {
         let client = grok_setup_failure_summary(GrokSetupFailureCause::ClientRejected);
-        assert!(client.contains("invalid_client") || client.contains("API key"));
-        assert!(client.contains("will not silently"));
+        assert!(
+            client.contains("invalid_client"),
+            "independent-client rejection must name invalid_client; summary={client}"
+        );
+        assert!(
+            client.contains("No credential was saved"),
+            "OAuth failure must not persist a credential; summary={client}"
+        );
+        assert!(
+            client.contains("will not switch to Console API-key billing"),
+            "OAuth failure must not offer Console billing as the next step; summary={client}"
+        );
+        assert!(
+            !client.to_lowercase().contains("use an xai api key"),
+            "API keys bill separately and must not be an automatic fallback; summary={client}"
+        );
         let missing = grok_setup_failure_summary(GrokSetupFailureCause::StartDisabledOrUnsupported);
-        assert!(missing.contains("API-key") || missing.contains("console.x.ai"));
-        assert!(missing.contains("will not invent") || missing.contains("disabled"));
+        assert!(
+            missing.contains("disabled or unsupported"),
+            "missing device flow must say so; summary={missing}"
+        );
+        assert!(
+            missing.contains("will not invent") && missing.contains("No credential was saved"),
+            "missing device flow must refuse a fake OAuth button and save nothing; summary={missing}"
+        );
+        assert!(
+            missing.contains("Console API-key billing"),
+            "missing device flow must refuse Console billing fallback; summary={missing}"
+        );
+        assert!(
+            !missing.contains("console.x.ai"),
+            "missing device flow must not steer into Console API keys; summary={missing}"
+        );
     }
 }

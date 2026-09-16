@@ -26,7 +26,8 @@ Console API-key provider (`api.x.ai`):
 - `api.x.ai`, Console API keys, compatible endpoints, and silent account
   fallback are rejected by this adapter.
 - If xAI returns `invalid_client` or HTTP 404 for device authorization, Finch
-  fails closed and offers an API key as a separate setup action.
+  fails closed and saves no credential. Console API keys are a separate
+  provider with different billing; they are never an automatic fallback.
 
 The ChatGPT adapter is
 strictly separate from the OpenAI Platform API-key provider:

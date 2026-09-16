@@ -14,7 +14,7 @@
 //! | [`render`] | drawing, one function per wizard section and overlay |
 //! | [`apply`] | from wizard state to a saved `crate::config::Config` |
 //! | [`chatgpt_recovery`] | the ChatGPT credential ceremony, its recovery loop, and the add-time device dialog flow (#424) |
-//! | [`grok_recovery`] | SuperGrok add-time device dialog and fail-closed API-key offer |
+//! | [`grok_recovery`] | SuperGrok add-time device dialog; OAuth failure is fail-closed |
 
 mod apply;
 mod catalog;

@@ -475,7 +475,10 @@ impl ModelConfig {
     }
 
     pub(super) fn accepts_api_key(&self) -> bool {
-        matches!(self, Self::Remote { provider, .. } if !provider.eq_ignore_ascii_case("chatgpt"))
+        match self {
+            Self::Remote { provider, .. } => provider_requires_inline_api_key(provider),
+            Self::Local { .. } => false,
+        }
     }
 
     #[allow(dead_code)]
