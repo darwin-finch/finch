@@ -6,6 +6,10 @@
 //! host-width integer overflow.
 
 use crate::ipc::schema::finch_ipc_capnp as wire;
+use crate::runtime::{
+    DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, ProgramRun,
+    RuntimeApplicationMessage, VmEffectEnvelope, VmEffectHandle, VmResume, VmResumeResponse,
+};
 use crate::vm::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
 use crate::vm::{
     CapabilityKind, CapabilityRequirement, EffectSet, FileSelector, FileSelectorTemplate,
@@ -25,6 +29,8 @@ use crate::vm::{TaskKind, Type, TypedValue};
 use crate::vm::{VerifiedFunction, VerifiedModule};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
+use uuid::Uuid;
 
 const MAX_NESTING: usize = 128;
 
@@ -2325,6 +2331,254 @@ pub(super) fn decode_checkpoint(
     })
 }
 
+fn optional_uuid(has: bool, value: capnp::text::Reader<'_>) -> Result<Option<Uuid>> {
+    if !has {
+        return Ok(None);
+    }
+    Ok(Some(text(value)?.parse()?))
+}
+
+fn encode_program_run(mut builder: wire::program_run::Builder<'_>, value: &ProgramRun) {
+    builder.set_abi_version(value.abi_version);
+    builder.set_execution_id(&value.execution_id.to_string());
+    builder.set_has_brain_id(value.brain_id.is_some());
+    if let Some(brain_id) = value.brain_id {
+        builder.set_brain_id(&brain_id.to_string());
+    }
+    builder.set_has_client_id(value.client_id.is_some());
+    if let Some(client_id) = value.client_id {
+        builder.set_client_id(&client_id.to_string());
+    }
+}
+
+fn decode_program_run(reader: wire::program_run::Reader<'_>) -> Result<ProgramRun> {
+    Ok(ProgramRun {
+        abi_version: reader.get_abi_version(),
+        execution_id: text(reader.get_execution_id()?)?.parse()?,
+        brain_id: optional_uuid(reader.get_has_brain_id(), reader.get_brain_id()?)?,
+        client_id: optional_uuid(reader.get_has_client_id(), reader.get_client_id()?)?,
+    })
+}
+
+fn encode_effect_handle(mut builder: wire::vm_effect_handle::Builder<'_>, value: &VmEffectHandle) {
+    builder.set_execution_id(&value.execution_id.to_string());
+    builder.set_sequence(value.sequence);
+}
+
+fn decode_effect_handle(reader: wire::vm_effect_handle::Reader<'_>) -> Result<VmEffectHandle> {
+    Ok(VmEffectHandle {
+        execution_id: text(reader.get_execution_id()?)?.parse()?,
+        sequence: reader.get_sequence(),
+    })
+}
+
+fn encode_effect_envelope(
+    mut builder: wire::vm_effect_envelope::Builder<'_>,
+    value: &VmEffectEnvelope,
+) -> Result<()> {
+    builder.set_execution_id(&value.execution_id.to_string());
+    encode_vm_side_effect(builder.reborrow().init_effect(), &value.effect)
+}
+
+fn decode_effect_envelope(
+    reader: wire::vm_effect_envelope::Reader<'_>,
+) -> Result<VmEffectEnvelope> {
+    Ok(VmEffectEnvelope {
+        execution_id: text(reader.get_execution_id()?)?.parse()?,
+        effect: decode_vm_side_effect(reader.get_effect()?)?,
+    })
+}
+
+fn encode_resume(mut builder: wire::vm_resume::Builder<'_>, value: &VmResume) -> Result<()> {
+    builder.set_execution_id(&value.execution_id.to_string());
+    builder.set_sequence(value.sequence);
+    let mut response = builder.reborrow().init_response();
+    match &value.response {
+        VmResumeResponse::Result { values } => {
+            encode_value_list(response.init_result(values.len() as u32), values, 0)?;
+        }
+        VmResumeResponse::Denied { reason } => response.set_denied(reason),
+        VmResumeResponse::Cancelled { reason } => {
+            let mut cancelled = response.init_cancelled();
+            cancelled.set_has_reason(reason.is_some());
+            if let Some(reason) = reason {
+                cancelled.set_reason(reason);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_resume(reader: wire::vm_resume::Reader<'_>) -> Result<VmResume> {
+    use wire::vm_resume_response::Which;
+    let response = match reader.get_response()?.which()? {
+        Which::Result(values) => VmResumeResponse::Result {
+            values: decode_value_list(values?, 0)?,
+        },
+        Which::Denied(reason) => VmResumeResponse::Denied {
+            reason: text(reason?)?,
+        },
+        Which::Cancelled(cancelled) => {
+            let cancelled = cancelled?;
+            VmResumeResponse::Cancelled {
+                reason: cancelled
+                    .get_has_reason()
+                    .then(|| text(cancelled.get_reason()?))
+                    .transpose()?,
+            }
+        }
+    };
+    Ok(VmResume {
+        execution_id: text(reader.get_execution_id()?)?.parse()?,
+        sequence: reader.get_sequence(),
+        response,
+    })
+}
+
+fn encode_output_handle(
+    mut builder: wire::output_handle_ref::Builder<'_>,
+    value: &OutputHandleRef,
+) {
+    builder.set_execution_id(&value.execution_id.to_string());
+    builder.set_handle(&value.handle);
+    builder.set_generation(value.generation);
+}
+
+fn decode_output_handle(reader: wire::output_handle_ref::Reader<'_>) -> Result<OutputHandleRef> {
+    Ok(OutputHandleRef {
+        execution_id: text(reader.get_execution_id()?)?.parse()?,
+        handle: text(reader.get_handle()?)?,
+        generation: reader.get_generation(),
+    })
+}
+
+fn encode_delivery_identity(
+    mut builder: wire::delivery_consumer_identity::Builder<'_>,
+    value: &DeliveryConsumerIdentity,
+) {
+    builder.set_brain_id(&value.brain_id.to_string());
+    builder.set_client_id(&value.client_id.to_string());
+}
+
+fn decode_delivery_identity(
+    reader: wire::delivery_consumer_identity::Reader<'_>,
+) -> Result<DeliveryConsumerIdentity> {
+    Ok(DeliveryConsumerIdentity {
+        brain_id: text(reader.get_brain_id()?)?.parse()?,
+        client_id: text(reader.get_client_id()?)?.parse()?,
+    })
+}
+
+fn encode_delivery_cursor(mut builder: wire::delivery_cursor::Builder<'_>, value: &DeliveryCursor) {
+    builder.set_execution_id(&value.execution_id.to_string());
+    builder.set_through_sequence(value.through_sequence);
+}
+
+fn decode_delivery_cursor(reader: wire::delivery_cursor::Reader<'_>) -> Result<DeliveryCursor> {
+    Ok(DeliveryCursor {
+        execution_id: text(reader.get_execution_id()?)?.parse()?,
+        through_sequence: reader.get_through_sequence(),
+    })
+}
+
+fn encode_runtime_application_message(
+    mut builder: wire::runtime_application_message::Builder<'_>,
+    value: &RuntimeApplicationMessage,
+) -> Result<()> {
+    builder.set_abi_version(value.abi_version());
+    match value {
+        RuntimeApplicationMessage::ProgramRun { run } => {
+            encode_program_run(builder.reborrow().init_program_run(), run);
+        }
+        RuntimeApplicationMessage::Diagnostic { diagnostic } => {
+            encode_diagnostic(builder.reborrow().init_diagnostic(), diagnostic, 0)?;
+        }
+        RuntimeApplicationMessage::Envelope { envelope } => {
+            encode_effect_envelope(builder.reborrow().init_envelope(), envelope)?;
+        }
+        RuntimeApplicationMessage::Resume { resume } => {
+            encode_resume(builder.reborrow().init_resume(), resume)?;
+        }
+        RuntimeApplicationMessage::EffectHandle { handle } => {
+            encode_effect_handle(builder.reborrow().init_effect_handle(), handle);
+        }
+        RuntimeApplicationMessage::OutputHandle { handle } => {
+            encode_output_handle(builder.reborrow().init_output_handle(), handle);
+        }
+        RuntimeApplicationMessage::CursorAck { consumer, cursor } => {
+            let mut ack = builder.reborrow().init_cursor_ack();
+            encode_delivery_identity(ack.reborrow().init_consumer(), consumer);
+            encode_delivery_cursor(ack.reborrow().init_cursor(), cursor);
+        }
+    }
+    Ok(())
+}
+
+fn decode_runtime_application_message(
+    reader: wire::runtime_application_message::Reader<'_>,
+) -> Result<RuntimeApplicationMessage> {
+    use wire::runtime_application_message::Which;
+    Ok(match reader.which()? {
+        Which::ProgramRun(run) => RuntimeApplicationMessage::ProgramRun {
+            run: decode_program_run(run?)?,
+        },
+        Which::Diagnostic(diagnostic) => RuntimeApplicationMessage::Diagnostic {
+            diagnostic: decode_diagnostic(diagnostic?, 0)?,
+        },
+        Which::Envelope(envelope) => RuntimeApplicationMessage::Envelope {
+            envelope: decode_effect_envelope(envelope?)?,
+        },
+        Which::Resume(resume) => RuntimeApplicationMessage::Resume {
+            resume: decode_resume(resume?)?,
+        },
+        Which::EffectHandle(handle) => RuntimeApplicationMessage::EffectHandle {
+            handle: decode_effect_handle(handle?)?,
+        },
+        Which::OutputHandle(handle) => RuntimeApplicationMessage::OutputHandle {
+            handle: decode_output_handle(handle?)?,
+        },
+        Which::CursorAck(ack) => {
+            let ack = ack?;
+            RuntimeApplicationMessage::CursorAck {
+                consumer: decode_delivery_identity(ack.get_consumer()?)?,
+                cursor: decode_delivery_cursor(ack.get_cursor()?)?,
+            }
+        }
+    })
+}
+
+/// Compact packed Cap'n Proto frame for the Runtime/Application ABI. Local
+/// IPC and WebSocket clients share this encoding; live console streaming is
+/// issue #57 and is not implemented here.
+pub(crate) fn encode_runtime_application_message_packed(
+    value: &RuntimeApplicationMessage,
+) -> Result<Vec<u8>> {
+    let mut message = capnp::message::Builder::new_default();
+    encode_runtime_application_message(
+        message.init_root::<wire::runtime_application_message::Builder<'_>>(),
+        value,
+    )?;
+    let mut packed = Vec::new();
+    capnp::serialize_packed::write_message(&mut packed, &message)?;
+    Ok(packed)
+}
+
+/// Decode one packed Runtime/Application ABI frame. Trailing bytes are
+/// rejected so a content-addressed record has one unambiguous representation.
+pub(crate) fn decode_runtime_application_message_packed(
+    encoded: &[u8],
+) -> Result<RuntimeApplicationMessage> {
+    let mut cursor = Cursor::new(encoded);
+    let message =
+        capnp::serialize_packed::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
+    if cursor.position() != encoded.len() as u64 {
+        bail!("runtime application ABI frame contains trailing bytes");
+    }
+    decode_runtime_application_message(
+        message.get_root::<wire::runtime_application_message::Reader<'_>>()?,
+    )
+}
+
 /// Encode one durable typed-runtime checkpoint using the same closed native
 /// schema used by runner registration and result transport.
 pub(crate) fn encode_checkpoint_bytes(value: &TypedRuntimeCheckpoint) -> Result<Vec<u8>> {
@@ -2917,6 +3171,91 @@ mod tests {
             advanced.values.last(),
             Some(TypedValue::Result { is_ok: true, value, .. }) if **value == TypedValue::Int(11)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn packed_runtime_application_abi_round_trips_and_rejects_trailing_bytes() -> Result<()> {
+        let execution_id = uuid::Uuid::new_v4();
+        let brain_id = uuid::Uuid::new_v4();
+        let client_id = uuid::Uuid::new_v4();
+        let identity = DeliveryConsumerIdentity::new(brain_id, client_id);
+        let messages = vec![
+            RuntimeApplicationMessage::ProgramRun {
+                run: ProgramRun::new(execution_id).with_identity(identity),
+            },
+            RuntimeApplicationMessage::Diagnostic {
+                diagnostic: VmDiagnostic::error(
+                    "E-RESUME-003",
+                    DiagnosticPhase::HostCall,
+                    "host resume returned 0 values but the awaited operation requires 1",
+                    Some(SourceOrigin::generated("file-read")),
+                ),
+            },
+            RuntimeApplicationMessage::Envelope {
+                envelope: VmEffectEnvelope {
+                    execution_id,
+                    effect: VmSideEffect {
+                        protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                        sequence: 0,
+                        requirement: sample_requirement(),
+                        event: HostSideEffect::Request {
+                            arguments: vec![TypedValue::String("Cargo.toml".into())],
+                        },
+                        output: vec![Type::Bytes],
+                        origin: SourceOrigin::generated("file-read"),
+                    },
+                },
+            },
+            RuntimeApplicationMessage::Resume {
+                resume: VmResume {
+                    execution_id,
+                    sequence: 0,
+                    response: VmResumeResponse::Result {
+                        values: vec![TypedValue::Bytes(b"ok".to_vec())],
+                    },
+                },
+            },
+            RuntimeApplicationMessage::Resume {
+                resume: VmResume {
+                    execution_id,
+                    sequence: 0,
+                    response: VmResumeResponse::Cancelled {
+                        reason: Some("timeout".into()),
+                    },
+                },
+            },
+            RuntimeApplicationMessage::EffectHandle {
+                handle: VmEffectHandle {
+                    execution_id,
+                    sequence: 0,
+                },
+            },
+            RuntimeApplicationMessage::OutputHandle {
+                handle: OutputHandleRef::new(execution_id, "download", 4),
+            },
+            RuntimeApplicationMessage::CursorAck {
+                consumer: identity,
+                cursor: DeliveryCursor::through(execution_id, 0),
+            },
+        ];
+        for message in messages {
+            let packed = encode_runtime_application_message_packed(&message)?;
+            assert_eq!(
+                decode_runtime_application_message_packed(&packed)?,
+                message,
+                "packed Runtime/Application ABI must round-trip"
+            );
+            let mut trailing = packed.clone();
+            trailing.push(0);
+            assert!(
+                decode_runtime_application_message_packed(&trailing)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("trailing bytes"),
+                "packed ABI frames must reject trailing bytes"
+            );
+        }
         Ok(())
     }
 }

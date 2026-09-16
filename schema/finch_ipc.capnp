@@ -813,6 +813,82 @@ struct VmSideEffect {
   origin @5 :SourceOrigin;
 }
 
+# Portable Runtime/Application ABI (#90). Embedder-neutral records for
+# verified execution, diagnostics, effects, resumes, output handles, and
+# delivery cursors. Local IPC and compact packed WebSocket frames share this
+# schema. Live attached-console streaming is #57 and is not defined here.
+struct ProgramRun {
+  abiVersion @0 :UInt32;
+  executionId @1 :Text;
+  hasBrainId @2 :Bool;
+  brainId @3 :Text;
+  hasClientId @4 :Bool;
+  clientId @5 :Text;
+}
+
+struct VmEffectHandle {
+  executionId @0 :Text;
+  sequence @1 :UInt64;
+}
+
+struct VmEffectEnvelope {
+  executionId @0 :Text;
+  effect @1 :VmSideEffect;
+}
+
+struct VmResumeCancelled {
+  hasReason @0 :Bool;
+  reason @1 :Text;
+}
+
+struct VmResumeResponse {
+  union {
+    result @0 :List(TypedValue);
+    denied @1 :Text;
+    cancelled @2 :VmResumeCancelled;
+  }
+}
+
+struct VmResume {
+  executionId @0 :Text;
+  sequence @1 :UInt64;
+  response @2 :VmResumeResponse;
+}
+
+struct OutputHandleRef {
+  executionId @0 :Text;
+  handle @1 :Text;
+  generation @2 :UInt64;
+}
+
+struct DeliveryConsumerIdentity {
+  brainId @0 :Text;
+  clientId @1 :Text;
+}
+
+struct DeliveryCursor {
+  executionId @0 :Text;
+  throughSequence @1 :UInt64;
+}
+
+struct DeliveryCursorAck {
+  consumer @0 :DeliveryConsumerIdentity;
+  cursor @1 :DeliveryCursor;
+}
+
+struct RuntimeApplicationMessage {
+  abiVersion @0 :UInt32;
+  union {
+    programRun @1 :ProgramRun;
+    diagnostic @2 :VmDiagnostic;
+    envelope @3 :VmEffectEnvelope;
+    resume @4 :VmResume;
+    effectHandle @5 :VmEffectHandle;
+    outputHandle @6 :OutputHandleRef;
+    cursorAck @7 :DeliveryCursorAck;
+  }
+}
+
 struct VmEffectJournalState {
   union {
     proposed @0 :Void;

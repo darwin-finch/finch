@@ -7611,6 +7611,179 @@ mod agent_capability {
 }
 
 #[test]
+fn runtime_application_abi_json_records_are_byte_stable() {
+    assert_eq!(crate::vm::RUNTIME_APPLICATION_ABI_VERSION, 1);
+    let execution_id = uuid::Uuid::nil();
+    let run = ProgramRun::new(execution_id);
+    assert_eq!(
+        serde_json::to_string(&run).unwrap(),
+        r#"{"abi_version":1,"execution_id":"00000000-0000-0000-0000-000000000000"}"#
+    );
+    let resume = VmResume {
+        execution_id,
+        sequence: 0,
+        response: VmResumeResponse::Cancelled {
+            reason: Some("timeout".into()),
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&resume).unwrap(),
+        r#"{"execution_id":"00000000-0000-0000-0000-000000000000","sequence":0,"response":{"kind":"cancelled","reason":"timeout"}}"#
+    );
+    let handle = OutputHandleRef::new(execution_id, "download", 4);
+    assert_eq!(
+        serde_json::to_string(&handle).unwrap(),
+        r#"{"execution_id":"00000000-0000-0000-0000-000000000000","handle":"download","generation":4}"#
+    );
+}
+
+#[tokio::test]
+async fn delivery_log_observes_awaited_effect_before_local_resume_and_rejects_stale_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let brain = uuid::Uuid::new_v4();
+    let client = DeliveryConsumerIdentity::new(brain, uuid::Uuid::new_v4());
+    let log = Arc::new(Mutex::new(
+        VmEffectDeliveryLog::open_bound(directory.path().join("effects.jsonl"), brain).unwrap(),
+    ));
+    let (live, receiver) = typed_effect_channel();
+    let sink = bind_delivery_log(Arc::clone(&log), Some(live));
+    let runtime = ProgramRuntime::new();
+    runtime
+        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./**").unwrap(),
+        ))
+        .unwrap();
+
+    let pending = runtime
+        .submit_with_deferred_host_effects(
+            submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"does-not-need-to-exist.txt\"))",
+                ExecutionEffect::WorkspaceRead,
+            ),
+            sink,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.status, ExecutionStatus::Suspended);
+    assert_eq!(pending.program_run().execution_id, pending.execution_id);
+
+    let envelope = receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("observer must receive the awaited effect");
+    assert_eq!(envelope.effect.output, vec![Type::Bytes]);
+    {
+        let mut log = log.lock().unwrap();
+        assert_eq!(
+            log.get(envelope.handle()).cloned().as_ref(),
+            Some(&envelope),
+            "durable delivery must precede observer projection"
+        );
+        assert!(log
+            .acknowledge_identity(
+                client,
+                DeliveryCursor::through(envelope.execution_id, envelope.effect.sequence)
+            )
+            .unwrap());
+        assert!(log.pending_for(&client).is_empty());
+    }
+
+    let stale = runtime
+        .resume_vm_effect(VmResume {
+            execution_id: envelope.execution_id,
+            sequence: envelope.effect.sequence + 1,
+            response: VmResumeResponse::Result {
+                values: vec![TypedValue::Bytes(b"stale".to_vec())],
+            },
+        })
+        .await;
+    assert!(
+        stale
+            .unwrap_err()
+            .to_string()
+            .contains("stale typed effect resume"),
+        "a mismatched sequence must not consume the continuation"
+    );
+    assert!(runtime
+        .pending_typed_execution(pending.execution_id)
+        .unwrap()
+        .is_some());
+
+    let completed = runtime
+        .resume_vm_effect(VmResume {
+            execution_id: envelope.execution_id,
+            sequence: envelope.effect.sequence,
+            response: VmResumeResponse::Result {
+                values: vec![TypedValue::Bytes(b"embedder bytes".to_vec())],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    assert_eq!(
+        completed.values,
+        vec![crate::programs::ProgramValue::Bytes(
+            b"embedder bytes".to_vec()
+        )]
+    );
+    assert!(runtime
+        .pending_typed_execution(pending.execution_id)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn delivery_bound_concurrent_output_handles_survive_disconnect() {
+    let directory = tempfile::tempdir().unwrap();
+    let brain = uuid::Uuid::new_v4();
+    let client = DeliveryConsumerIdentity::new(brain, uuid::Uuid::new_v4());
+    let path = directory.path().join("effects.jsonl");
+    let log = Arc::new(Mutex::new(
+        VmEffectDeliveryLog::open_bound(&path, brain).unwrap(),
+    ));
+    let (live, receiver) = typed_effect_channel();
+    let sink = bind_delivery_log(Arc::clone(&log), Some(live));
+    let runtime = ProgramRuntime::new();
+    let outcome = runtime
+        .submit_with_typed_effect_sink(
+            submission(
+                ProgramLanguage::Lisp,
+                "(let ((download (output-open \"download\")) (log (output-open \"log\")))
+                       (begin (output-status download \"starting\")
+                              (output-status log \"line\")
+                              (output-complete download)
+                              (output-complete log)))",
+                ExecutionEffect::VmRead,
+            ),
+            sink,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, ExecutionStatus::Completed);
+    let events = receiver.try_iter().collect::<Vec<_>>();
+    assert!(events.len() >= 4, "create/status/complete for two handles");
+    drop(log);
+
+    let mut reopened = VmEffectDeliveryLog::open_bound(&path, brain).unwrap();
+    let handles = reopened.output_handles(outcome.execution_id);
+    assert_eq!(
+        handles.len(),
+        2,
+        "concurrent output handles must survive restart; handles={handles:?}"
+    );
+    let pending = reopened.pending_for(&client);
+    assert_eq!(pending.len(), events.len());
+    assert!(reopened
+        .acknowledge_identity(
+            client,
+            DeliveryCursor::through(outcome.execution_id, events.last().unwrap().effect.sequence),
+        )
+        .unwrap());
+    assert!(reopened.pending_for(&client).is_empty());
+}
+
+#[test]
 fn runtime_facade_keeps_child_modules_private() {
     let facade = include_str!("mod.rs");
     let published = facade
@@ -7628,6 +7801,7 @@ fn runtime_facade_keeps_child_modules_private() {
 #[test]
 fn runtime_callers_use_facade_not_child_modules() {
     let children = [
+        "abi",
         "agent_vm",
         "agents",
         "archive_store",
@@ -7662,6 +7836,11 @@ fn runtime_facade_reexports_caller_types() {
     let _ = std::any::type_name::<AutomationBroker>();
     let _ = std::any::type_name::<AgentTaskSpec>();
     let _ = std::any::type_name::<RunnerEffectAuditControl>();
+    let _ = std::any::type_name::<ProgramRun>();
+    let _ = std::any::type_name::<DeliveryConsumerIdentity>();
+    let _ = std::any::type_name::<DeliveryCursor>();
+    let _ = std::any::type_name::<OutputHandleRef>();
+    let _ = std::any::type_name::<RuntimeApplicationMessage>();
     let _ = MAX_ACTIVE_EFFECT_AUDITS_PER_RUN;
     let _ = permission_context_key();
 }

@@ -384,6 +384,8 @@ pub fn wire_diagnostic_code(diagnostic: &str) -> Option<String> { … }
 ## Constants
 
 ```rust
+/// Version of the portable Runtime/Application effect, resume, and delivery ABI.
+pub const RUNTIME_APPLICATION_ABI_VERSION: u32 = 1;
 /// Version of the frontend-facing semantic-construction protocol. Re-exported from `finch-vm-core`.
 pub const SEMANTIC_CONSTRUCTION_VERSION: u32 = 1;
 /// Version of the typed VM contract and serialized IR family. Re-exported from `finch-vm-core`.

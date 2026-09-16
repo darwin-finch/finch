@@ -44,6 +44,7 @@ ProducerFiberRecord
 ProducerFiberState
 ProgramLanguage
 ProgramSelectorTemplate
+RUNTIME_APPLICATION_ABI_VERSION
 ResourceRoot
 ResourceSelector
 SEMANTIC_CONSTRUCTION_VERSION

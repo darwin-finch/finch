@@ -28,6 +28,15 @@ pub use finch_vm_core::{
     VerifiedModule, Verifier, VmDiagnostic, Vocabulary, SEMANTIC_CONSTRUCTION_VERSION,
     VM_TYPE_SYSTEM_VERSION,
 };
+
+/// Version of the portable Runtime/Application effect, resume, and delivery ABI.
+///
+/// Independent of [`VM_TYPE_SYSTEM_VERSION`], which versions serialized IR and
+/// typed-runtime checkpoints. Bump this when `ProgramRun`, diagnostics,
+/// `VmSideEffect`, `VmResume`, output rows, or effect handles change on the
+/// wire. Existing JSON goldens for those records must stay byte-identical
+/// across a version that claims compatibility.
+pub const RUNTIME_APPLICATION_ABI_VERSION: u32 = 1;
 pub use interpreter::instantiate_requirement;
 pub use interpreter::{
     CapabilityHandler, HostSideEffect, InterpreterConfig, UiProgress, VmContinuation, VmFrame,

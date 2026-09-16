@@ -64,6 +64,11 @@ pub struct ExecutionOutcome {
 }
 
 impl ExecutionOutcome {
+    /// Frozen ProgramRun identity for this outcome.
+    pub fn program_run(&self) -> crate::runtime::ProgramRun {
+        crate::runtime::ProgramRun::new(self.execution_id)
+    }
+
     pub fn failed(
         execution_id: Uuid,
         revision: u64,

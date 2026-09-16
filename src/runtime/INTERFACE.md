@@ -59,6 +59,22 @@ pub enum AutomationRequest { Availability, Displays, Windows, Click, Type }
 pub enum AutomationState { Disabled, Unsupported, PermissionRequired, Available }
 /// Selects which awaited host calls leave the VM suspended for an external embedder.
 pub enum DeferredHostEffects { None, ProgramInvocations, Schedules, AllAwaited }
+/// Embedder-neutral delivery consumer.
+pub struct DeliveryConsumerIdentity { … }
+impl DeliveryConsumerIdentity {
+    /// Construct a Brain/client delivery identity.
+    pub fn new(brain_id: Uuid, client_id: Uuid) -> Self;
+    /// Parse a canonical Brain/client wire key.
+    pub fn parse_wire_key(key: &str) -> Option<Self>;
+    /// Canonical durable-log key for this identity.
+    pub fn wire_key(self) -> String;
+}
+/// Per-consumer delivery cursor over one ProgramRun's effect sequence.
+pub struct DeliveryCursor { … }
+impl DeliveryCursor {
+    /// Cursor that has acknowledged `through_sequence` inclusive.
+    pub fn through(execution_id: Uuid, through_sequence: u64) -> Self;
+}
 /// Provenance minted by the daemon when it creates a run-scoped reverse capability.
 pub struct EffectAuditAuthority { … }
 pub struct EffectAuditEntry { … }
@@ -104,6 +120,8 @@ impl ExecutionContext {
 pub struct ExecutionOutcome { … }
 impl ExecutionOutcome {
     pub fn failed(execution_id: Uuid, revision: u64, effect: ExecutionEffect, backend: ExecutionBackend, diagnostic: impl Into<String>, elapsed_ms: u64) -> Self;
+    /// Frozen ProgramRun identity for this outcome.
+    pub fn program_run(&self) -> crate::runtime::ProgramRun;
 }
 pub enum ExecutionStatus { Completed, Suspended, AuthorizationRequired, Failed, Cancelled }
 /// Proof that the daemon durably committed `AwaitingHostResult`.
@@ -113,9 +131,25 @@ impl HostEffectPermit {
 }
 /// The spawner a runtime has before a host attaches one.
 pub struct NoAgentSpawning;
+/// Host-issued concurrent output handle bound to one ProgramRun.
+pub struct OutputHandleRef { … }
+impl OutputHandleRef {
+    /// Construct a ProgramRun-owned output handle reference.
+    pub fn new(execution_id: Uuid, handle: impl Into<String>, generation: u64) -> Self;
+}
 /// UI-safe metadata for a daemon-owned typed continuation.
 pub struct PendingTypedExecutionInfo { … }
 pub enum PendingTypedReason { Yielded, AwaitingHostEffect, AuthorizationRequired }
+/// Frozen identity of one verified ProgramRun.
+pub struct ProgramRun { … }
+impl ProgramRun {
+    /// Named handle for one journaled effect on this run.
+    pub fn effect_handle(self, sequence: u64) -> VmEffectHandle;
+    /// Identify a ProgramRun from its VM execution id.
+    pub fn new(execution_id: Uuid) -> Self;
+    /// Bind embedder-neutral Brain/client ports onto this run identity.
+    pub fn with_identity(mut self, identity: DeliveryConsumerIdentity) -> Self;
+}
 /// One session's persistent language runtimes.
 pub struct ProgramRuntime { … }
 impl ProgramRuntime {
@@ -276,6 +310,12 @@ pub struct RunnerHostEffectPermit { … }
 impl RunnerHostEffectPermit {
     pub async fn finish(self, outcome: RunnerHostEffectOutcome) -> Result<(), String>;
 }
+/// One versioned Runtime/Application ABI record.
+pub enum RuntimeApplicationMessage { ProgramRun, Diagnostic, Envelope, Resume, EffectHandle, OutputHandle, CursorAck }
+impl RuntimeApplicationMessage {
+    /// ABI version carried by this record family.
+    pub fn abi_version(&self) -> u32;
+}
 /// Host-specific projection of one portable typed VM event.
 pub type TypedEffectSink = Arc<dyn Fn(VmEffectEnvelope) + Send + Sync>;
 pub struct TypedVmStackCell { … }
@@ -284,16 +324,39 @@ pub struct VmEffectDeliveryLog { … }
 impl VmEffectDeliveryLog {
     /// Record that one consumer durably projected a contiguous prefix.
     pub fn acknowledge(&mut self, consumer: impl Into<String>, execution_id: Uuid, through_sequence: u64) -> Result<bool>;
+    /// Record that one Brain/client identity durably projected a cursor.
+    pub fn acknowledge_identity(&mut self, consumer: DeliveryConsumerIdentity, cursor: DeliveryCursor) -> Result<bool>;
     /// Persist one event before projecting it.
     pub fn append(&mut self, envelope: VmEffectEnvelope) -> Result<bool>;
+    /// Optional Brain identity this log is bound to.
+    pub fn brain_id(&self) -> Option<Uuid>;
+    /// Current cursor for a string consumer on one ProgramRun, if any.
+    pub fn cursor(&self, consumer: &str, execution_id: Uuid) -> Option<DeliveryCursor>;
+    /// Current cursor for a Brain/client identity on one ProgramRun, if any.
+    pub fn cursor_for(&self, consumer: &DeliveryConsumerIdentity, execution_id: Uuid) -> Option<DeliveryCursor>;
+    /// Look up one persisted envelope by its effect handle.
+    pub fn get(&self, handle: VmEffectHandle) -> Option<&VmEffectEnvelope>;
     pub fn open(path: impl Into<PathBuf>) -> Result<Self>;
+    /// Open a delivery log bound to one Brain identity.
+    pub fn open_bound(path: impl Into<PathBuf>, brain_id: Uuid) -> Result<Self>;
+    /// Concurrent output handles observed for one ProgramRun.
+    pub fn output_handles(&self, execution_id: Uuid) -> Vec<OutputHandleRef>;
     pub fn path(&self) -> &Path;
     pub fn pending(&self, consumer: &str) -> Vec<VmEffectEnvelope>;
+    /// Unacknowledged suffix for one Brain/client identity.
+    pub fn pending_for(&self, consumer: &DeliveryConsumerIdentity) -> Vec<VmEffectEnvelope>;
+    /// Unacknowledged events that target one concurrent output handle.
+    pub fn pending_for_handle(&self, consumer: &DeliveryConsumerIdentity, handle: &OutputHandleRef) -> Vec<VmEffectEnvelope>;
 }
 /// A portable VM event attached to its owning ProgramRun.
 pub struct VmEffectEnvelope { … }
 impl VmEffectEnvelope {
+    /// Stable `(execution_id, sequence)` handle for this envelope.
     pub fn handle(&self) -> VmEffectHandle;
+    /// Concurrent output handle targeted by this event, if any.
+    pub fn output_handle(&self) -> Option<OutputHandleRef>;
+    /// ProgramRun identity carried by this envelope.
+    pub fn program_run(&self) -> ProgramRun;
 }
 /// Stable identity for one journaled VM effect.
 pub struct VmEffectHandle { … }
@@ -318,6 +381,8 @@ pub trait AgentSpawning: Send + Sync { … }
 ## Functions
 
 ```rust
+/// Persist each envelope before projecting it to a live observer.
+pub fn bind_delivery_log(log: Arc<Mutex<VmEffectDeliveryLog>>, downstream: Option<TypedEffectSink>) -> TypedEffectSink { … }
 pub fn parse_task_id(value: &str) -> Result<Uuid> { … }
 /// Conservative key for scoping prior permission observations.
 pub fn permission_context_key() -> String { … }

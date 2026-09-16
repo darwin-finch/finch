@@ -1,5 +1,6 @@
 //! Provider-neutral execution service for Finch's Forth and Lisp VMs.
 
+mod abi;
 mod agent_vm;
 mod agents;
 mod archive_store;
@@ -14,6 +15,10 @@ mod outcome;
 
 use host::*;
 
+pub use abi::{
+    DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, ProgramRun,
+    RuntimeApplicationMessage,
+};
 pub use agent_vm::{parse_task_id, AgentVmBinding};
 pub use agents::{
     AgentActivitySnapshot, AgentBudget, AgentContextReference, AgentEvent, AgentIdentity,
@@ -41,14 +46,14 @@ pub(crate) use effect_audit::{
 };
 pub(crate) use effect_log::replay_fence_transition;
 pub use effect_log::{
-    EffectAuditAuthority, EffectAuditEntry, EffectAuditIdentity, EffectAuditIntent,
-    EffectAuditReducer, EffectAuditState, EffectAuditTerminalOutcome, EffectAuditTransition,
-    HostEffectPermit, VmEffectDeliveryLog, EFFECT_AUDIT_REPLAY_INDEX_BUDGET_BYTES,
-    MAX_ACTIVE_EFFECT_AUDITS_PER_BRAIN, MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
-    MAX_ACTIVE_EFFECT_AUDIT_BYTES_PER_BRAIN, MAX_EFFECT_AUDIT_INTENT_BYTES,
-    MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN, MAX_EFFECT_AUDIT_OUTCOME_BYTES,
-    MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN, MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES,
-    MAX_EFFECT_AUDIT_REPLAY_FENCE_TRANSITION_BYTES,
+    bind_delivery_log, EffectAuditAuthority, EffectAuditEntry, EffectAuditIdentity,
+    EffectAuditIntent, EffectAuditReducer, EffectAuditState, EffectAuditTerminalOutcome,
+    EffectAuditTransition, HostEffectPermit, VmEffectDeliveryLog,
+    EFFECT_AUDIT_REPLAY_INDEX_BUDGET_BYTES, MAX_ACTIVE_EFFECT_AUDITS_PER_BRAIN,
+    MAX_ACTIVE_EFFECT_AUDITS_PER_RUN, MAX_ACTIVE_EFFECT_AUDIT_BYTES_PER_BRAIN,
+    MAX_EFFECT_AUDIT_INTENT_BYTES, MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN,
+    MAX_EFFECT_AUDIT_OUTCOME_BYTES, MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN,
+    MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES, MAX_EFFECT_AUDIT_REPLAY_FENCE_TRANSITION_BYTES,
 };
 pub use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 
@@ -119,11 +124,22 @@ pub struct VmEffectHandle {
 }
 
 impl VmEffectEnvelope {
+    /// Stable `(execution_id, sequence)` handle for this envelope.
     pub fn handle(&self) -> VmEffectHandle {
         VmEffectHandle {
             execution_id: self.execution_id,
             sequence: self.effect.sequence,
         }
+    }
+
+    /// ProgramRun identity carried by this envelope.
+    pub fn program_run(&self) -> ProgramRun {
+        ProgramRun::new(self.execution_id)
+    }
+
+    /// Concurrent output handle targeted by this event, if any.
+    pub fn output_handle(&self) -> Option<OutputHandleRef> {
+        abi::output_handle_ref(self.execution_id, &self.effect)
     }
 }
 
