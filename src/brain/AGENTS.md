@@ -2,16 +2,20 @@
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `src/brain/`: `BrainStore` persistence, runs and their statuses, schedules and delivery
-policies, events and attachments, the credential authority, remote brain clients, task records,
-and name generation. The daemon subtree is owned from here but implemented in `src/daemon`
-(its own capsule). Server, IPC, client, and agent composition live outside this subtree.
+**Owns** `src/brain/`: `BrainStore` composition, the credential authority, remote brain clients,
+task records, and name generation. Persistence and coordination internals live in nested
+facades: [`journal`](journal/AGENTS.md), [`schedule`](schedule/AGENTS.md), [`run`](run/AGENTS.md),
+[`attachment`](attachment/AGENTS.md), and [`projection`](projection/AGENTS.md). The daemon
+subtree is owned from here but implemented in `src/daemon` (its own capsule). Server, IPC,
+client, and agent composition live outside this subtree.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature.
-Child modules are private (`credential`, `names`, `remote`, `store`, `tasks`), so the `pub use`
-list in `src/brain/mod.rs` is the whole public surface; `effect_audit_archive` stays
-`pub(crate)`. Callers outside this directory use `crate::brain::Item`; they must not name
-`brain::store::`, `brain::tasks::`, `brain::remote::`, `brain::credential::`, or `brain::names::`.
+Child modules are private (`attachment`, `credential`, `journal`, `names`, `projection`,
+`remote`, `run`, `schedule`, `store`, `tasks`), so the `pub use` list in `src/brain/mod.rs` is
+the whole public surface; `effect_audit_archive` stays `pub(crate)`. Callers outside this
+directory use `crate::brain::Item`; they must not name `brain::store::`, `brain::journal::`,
+`brain::schedule::`, `brain::run::`, `brain::attachment::`, `brain::projection::`,
+`brain::tasks::`, `brain::remote::`, `brain::credential::`, or `brain::names::`.
 
 **Dependencies:** `runtime` (layer 2; the one allowed incoming direction), `models`, `tools`,
 `claude`. Persistence, isolation, credential, and HTTP behavior are not facade concerns: do not

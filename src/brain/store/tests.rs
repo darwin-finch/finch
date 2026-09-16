@@ -1,4 +1,6 @@
 use super::*;
+use std::fs::OpenOptions;
+use std::io::Write;
 // The two shared fixtures live at module scope so the `src/server/handlers.rs`
 // boundary tests can use the same ones; aliased back to their local names here.
 use super::directory_listing_for_tests as directory_listing;
@@ -1197,10 +1199,7 @@ fn indexed_due_keys(store: &BrainStore) -> Vec<(u64, String, ScheduleId)> {
         .schedule_index
         .read()
         .expect("schedule index lock poisoned")
-        .due
-        .keys()
-        .cloned()
-        .collect()
+        .due_keys()
 }
 
 /// Drop the in-memory copy of a Brain without touching its disk state or
@@ -7178,4 +7177,162 @@ fn future_effect_audit_schema_fails_closed() {
         .unwrap_err()
         .to_string()
         .contains("unsupported event schema version"));
+}
+
+/// Concurrent archive and unused-delete must not resurrect the Brain and must
+/// leave at most one terminal namespace outcome.
+#[test]
+fn test_concurrent_archive_and_remove_if_unused_do_not_resurrect() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let attachment = store
+        .attach("shared", "alice", AttachmentRole::Driver, None)
+        .unwrap();
+    store
+        .detach(
+            "shared",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        )
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let archive_store = store.clone();
+    let archive_barrier = barrier.clone();
+    let archive = std::thread::spawn(move || {
+        archive_barrier.wait();
+        archive_store.archive("shared")
+    });
+    let remove_store = store.clone();
+    let remove_barrier = barrier.clone();
+    let remove = std::thread::spawn(move || {
+        remove_barrier.wait();
+        remove_store.remove_if_unused("shared")
+    });
+    barrier.wait();
+    let archived = archive.join().unwrap();
+    let removed = remove.join().unwrap();
+    assert!(
+        archived.is_ok() && removed.is_ok(),
+        "archive/remove must not panic or poison; archive={archived:?} remove={removed:?}"
+    );
+    let names = store.list_names_unhydrated();
+    assert!(
+        !names.iter().any(|name| name == "shared"),
+        "the active namespace must not contain the Brain after concurrent archive/delete; names={names:?}"
+    );
+    let resurrected = BrainStore::with_root("box.local", Some(temp.path().into()));
+    assert!(
+        !resurrected
+            .list_names_unhydrated()
+            .iter()
+            .any(|name| name == "shared"),
+        "a restarted store must not recreate an archived or deleted Brain; names={:?}",
+        resurrected.list_names_unhydrated()
+    );
+}
+
+/// A late completion after cancel must not change the terminal run.
+#[test]
+fn test_late_completion_after_cancel_leaves_run_cancelled() {
+    let store = BrainStore::with_root("box.local", None);
+    let attachment = store
+        .attach("shared", "alice", AttachmentRole::Driver, None)
+        .unwrap();
+    let prompt = store
+        .push(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "late".into(),
+            },
+        )
+        .unwrap();
+    let run = store
+        .start_run(
+            "shared",
+            "alice",
+            BrainRunKind::Interactive,
+            prompt.seq,
+            attachment.attachment_id,
+            BrainRunStatus::QueuedForEnvironment,
+        )
+        .unwrap();
+    store
+        .transition_run("shared", "alice", run.run_id, BrainRunStatus::Running, None)
+        .unwrap();
+    let cancelled = store
+        .transition_run(
+            "shared",
+            "alice",
+            run.run_id,
+            BrainRunStatus::Cancelled,
+            Some("user cancel".into()),
+        )
+        .unwrap();
+    let late = store.transition_run(
+        "shared",
+        "alice",
+        run.run_id,
+        BrainRunStatus::Completed,
+        None,
+    );
+    assert!(
+        late.is_err(),
+        "late completion must be rejected; cancelled={cancelled:?} late={late:?}"
+    );
+    let inspected = store.inspect_run("shared", run.run_id).unwrap();
+    assert_eq!(
+        inspected.status,
+        BrainRunStatus::Cancelled,
+        "exact-once terminal state must remain Cancelled after a late completion; run={inspected:?}"
+    );
+}
+
+/// Restart must replay an idempotent mutation exactly once.
+#[test]
+fn test_replay_mutation_is_stable_across_store_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let attachment = store
+        .attach("shared", "alice", AttachmentRole::Driver, None)
+        .unwrap();
+    let receipt = BrainMutationReceipt {
+        mutation_id: uuid::Uuid::from_u128(7),
+        attachment_id: attachment.attachment_id,
+        expected_revision: store.snapshot("shared").unwrap().revision,
+        environment_generation: store.environment().generation,
+        command_sha256: "prompt".into(),
+    };
+    let first = store
+        .push_idempotent(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "hello".into(),
+            },
+            receipt.clone(),
+        )
+        .unwrap();
+    let replayed = store
+        .push_idempotent(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "hello".into(),
+            },
+            receipt.clone(),
+        )
+        .unwrap();
+    assert!(
+        replayed.replayed && replayed.event.seq == first.event.seq,
+        "in-process retry must return the original event; first={first:?} replayed={replayed:?}"
+    );
+    drop(store);
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let after_restart = restarted.replay_mutation("shared", &receipt).unwrap();
+    assert_eq!(
+        after_restart.as_ref().map(|event| event.seq),
+        Some(first.event.seq),
+        "restart replay must resolve the same mutation without appending; after={after_restart:?}"
+    );
 }

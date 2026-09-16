@@ -8,811 +8,53 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
+use super::attachment::sorted_attachments;
+use super::attachment::{self};
+pub use super::attachment::{
+    AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, ConnectionId,
+};
+pub(crate) use super::journal::BrainJournalRecord;
+use super::journal::{
+    self, backfill_legacy_speculative_run_correlation, initial_environment_generation,
+    BRAIN_METADATA_VERSION,
+};
+pub(super) use super::journal::{create_dir_all_durable, sync_directory};
+pub use super::journal::{
+    BrainApprovalDecisionReservation, BrainEvent, BrainEventKind, BrainExecutableMutationAppend,
+    BrainId, BrainMetadata, BrainMutationAppend, BrainMutationOutcome, BrainMutationReceipt,
+    BrainProgram, BRAIN_EVENT_SCHEMA_VERSION,
+};
+use super::projection::{self, observer_effect_audit_event};
+pub use super::projection::{
+    BrainEnvironment, BrainListAgent, BrainListAttachment, BrainListSummary, BrainSnapshot,
+    BrainWireMessage,
+};
+use super::run::sorted_runs;
+use super::run::{self, validate_run_transition, DisconnectTerminalizationIntent};
+pub use super::run::{
+    BrainRun, BrainRunCancellationReservation, BrainRunKind, BrainRunStatus, BrainRunnerHandoff,
+    BrainRunnerLease, RunId, RunnerHandoffId, RunnerLeaseId,
+};
+pub(crate) use super::schedule::DEFAULT_INITIALIZATION_SOURCE;
+use super::schedule::{
+    self, legacy_schedule_attachment_id, queued_schedule_run, schedule_due_window,
+    sorted_schedule_dues, sorted_schedules, ScheduleIndex,
+};
+pub use super::schedule::{
+    BrainInitialization, BrainSchedule, BrainScheduleDeliveryPolicy, BrainScheduleDue,
+    BrainScheduleModuleIdentity, ProgramLanguage, ScheduleId,
+};
+
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 15;
 
 /// Completed audit histories retained per named Brain. Together with the
 /// bounded intent/outcome encodings this caps the audit projection and its
 /// share of `events.jsonl`; unresolved write-ahead entries are never pruned.
 const MAX_RETAINED_TERMINAL_EFFECT_AUDITS: usize = 128;
-const BRAIN_METADATA_VERSION: u32 = 1;
-const BRAIN_INITIALIZATION_VERSION: u32 = 1;
-const DEFAULT_INITIALIZATION_MODULE: &str = "finch.brain.initialization";
-const DEFAULT_INITIALIZATION_SOURCE: &str = "(define (finch-brain-initialized) : int 1)";
-
-/// Stable identity of one durable Brain. Names are mutable human aliases;
-/// this ID is what future runs, attachments, cursors, and grants reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct BrainId(pub uuid::Uuid);
-
-impl BrainId {
-    fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-
-    fn nil() -> Self {
-        Self(uuid::Uuid::nil())
-    }
-}
-
-/// Stable identity of one client projection of a Brain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AttachmentId(pub uuid::Uuid);
-
-impl AttachmentId {
-    fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-}
-
-/// Durable identity and preconditions for one authorized Brain mutation.
-/// The receipt lives on the first canonical event produced by the mutation,
-/// making acceptance and deduplication one append-only commit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainMutationReceipt {
-    pub mutation_id: uuid::Uuid,
-    pub attachment_id: AttachmentId,
-    pub expected_revision: u64,
-    pub environment_generation: u64,
-    pub command_sha256: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrainMutationAppend {
-    pub event: BrainEvent,
-    pub replayed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrainExecutableMutationAppend {
-    pub accepted: BrainEvent,
-    pub run: BrainRun,
-    pub replayed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrainRunCancellationReservation {
-    pub run: BrainRun,
-    pub needs_runner_cancel: bool,
-    pub replayed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrainApprovalDecisionReservation {
-    pub event: BrainEvent,
-    pub delivered: bool,
-    pub replayed: bool,
-}
-
-/// Identity of one live transport connection for a durable attachment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ConnectionId(pub uuid::Uuid);
-
-impl ConnectionId {
-    fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-}
-
-impl Default for ConnectionId {
-    fn default() -> Self {
-        Self(uuid::Uuid::nil())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RunnerLeaseId(pub uuid::Uuid);
-
-impl RunnerLeaseId {
-    fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RunnerHandoffId(pub uuid::Uuid);
-
-impl RunnerHandoffId {
-    fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RunId(pub uuid::Uuid);
-
-impl RunId {
-    fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-}
-
-// `Ord` so the due index can key on `(next_due_ms, ScheduleId)` and keep a
-// total order: two schedules due in the same millisecond still have a stable,
-// deterministic position rather than colliding (#374).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ScheduleId(pub uuid::Uuid);
-
-impl ScheduleId {
-    fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BrainRunKind {
-    Interactive,
-    Speculative,
-    Scheduled,
-    Subagent,
-    Maintenance,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BrainRunStatus {
-    QueuedForEnvironment,
-    Running,
-    AwaitingApproval,
-    Completed,
-    Failed,
-    Cancelled,
-    Interrupted,
-}
-
-impl BrainRunStatus {
-    pub(crate) fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainRun {
-    pub run_id: RunId,
-    pub kind: BrainRunKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_run_id: Option<RunId>,
-    pub request_seq: u64,
-    pub initiating_attachment_id: AttachmentId,
-    pub initiated_by: String,
-    pub status: BrainRunStatus,
-    pub started_ms: u64,
-    pub updated_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainRunnerLease {
-    pub lease_id: RunnerLeaseId,
-    pub subject: String,
-    pub environment_generation: u64,
-    pub acquired_ms: u64,
-    pub expires_ms: u64,
-}
-
-/// Opaque daemon-side authority for one runner capability. The Cap'n Proto
-/// peer never receives these fields; it can only invoke the capability that
-/// holds this grant.
-#[derive(Debug, Clone)]
-pub(crate) struct EffectAuditAuthorityGrant {
-    brain: String,
-    run_id: RunId,
-    authority: crate::runtime::EffectAuditAuthority,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainRunnerHandoff {
-    pub handoff_id: RunnerHandoffId,
-    pub from_lease_id: RunnerLeaseId,
-    pub requested_by: String,
-    pub target_subject: String,
-    pub environment_generation: u64,
-    pub requested_ms: u64,
-    pub expires_ms: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachmentRole {
-    Runner,
-    Driver,
-    Consultant,
-    Observer,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainAttachment {
-    pub attachment_id: AttachmentId,
-    pub subject: String,
-    pub role: AttachmentRole,
-    pub acknowledged_seq: u64,
-    pub connected: bool,
-    pub connection_id: Option<ConnectionId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct AttachmentCursorFile {
-    version: u32,
-    brain_id: BrainId,
-    cursors: HashMap<AttachmentId, u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct BrainMetadata {
-    version: u32,
-    brain_id: BrainId,
-    created_ms: u64,
-}
-
-/// Reviewed, immutable program that establishes a Brain's initial typed state.
-/// Loading this record is inert: execution requires an explicit scheduled run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainInitialization {
-    pub version: u32,
-    pub brain_id: BrainId,
-    pub module: String,
-    pub module_revision: u32,
-    pub language: ProgramLanguage,
-    pub source: String,
-    pub source_sha256: String,
-    pub capability_budget: crate::vm::EffectSet,
-}
-
-/// Durable, non-authority-bearing identity for a reviewed module scheduled by
-/// the Brain itself. Public schedule creation never accepts this marker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainScheduleModuleIdentity {
-    pub module: String,
-    pub module_revision: u32,
-    pub source_sha256: String,
-}
-
-impl BrainInitialization {
-    fn reviewed_default(brain_id: BrainId) -> Self {
-        Self {
-            version: BRAIN_INITIALIZATION_VERSION,
-            brain_id,
-            module: DEFAULT_INITIALIZATION_MODULE.into(),
-            module_revision: 1,
-            language: ProgramLanguage::Lisp,
-            source: DEFAULT_INITIALIZATION_SOURCE.into(),
-            source_sha256: hex::encode(Sha256::digest(DEFAULT_INITIALIZATION_SOURCE.as_bytes())),
-            capability_budget: crate::vm::EffectSet::pure(),
-        }
-    }
-
-    fn validate(&self, brain_id: BrainId) -> Result<()> {
-        anyhow::ensure!(
-            self.version == BRAIN_INITIALIZATION_VERSION,
-            "unsupported Brain initialization version {}",
-            self.version
-        );
-        anyhow::ensure!(
-            self.brain_id == brain_id,
-            "Brain initialization identity does not match metadata"
-        );
-        anyhow::ensure!(
-            !self.module.trim().is_empty() && self.module_revision > 0,
-            "Brain initialization module identity is invalid"
-        );
-        anyhow::ensure!(
-            !self.source.trim().is_empty(),
-            "Brain initialization program is empty"
-        );
-        let actual = hex::encode(Sha256::digest(self.source.as_bytes()));
-        anyhow::ensure!(
-            self.source_sha256 == actual,
-            "Brain initialization program digest does not match its source"
-        );
-        anyhow::ensure!(
-            self == &Self::reviewed_default(brain_id),
-            "Brain initialization contract is not the reviewed built-in module"
-        );
-        Ok(())
-    }
-
-    fn module_identity(&self) -> BrainScheduleModuleIdentity {
-        BrainScheduleModuleIdentity {
-            module: self.module.clone(),
-            module_revision: self.module_revision,
-            source_sha256: self.source_sha256.clone(),
-        }
-    }
-
-    fn validate_schedule(&self, schedule: &BrainSchedule) -> Result<()> {
-        let identity = schedule
-            .module_identity
-            .as_ref()
-            .context("reviewed Brain-module schedule is missing its module identity")?;
-        anyhow::ensure!(
-            identity == &self.module_identity(),
-            "Brain-module schedule identity does not match the reviewed initialization module"
-        );
-        anyhow::ensure!(
-            schedule.language == self.language,
-            "Brain initialization schedule language does not match the reviewed module"
-        );
-        let actual = hex::encode(Sha256::digest(schedule.source.as_bytes()));
-        anyhow::ensure!(
-            identity.source_sha256 == actual,
-            "Brain initialization schedule digest does not match its source"
-        );
-        anyhow::ensure!(
-            schedule.source == self.source,
-            "Brain initialization schedule source is not the reviewed module"
-        );
-        anyhow::ensure!(
-            schedule.grant_ceiling == self.capability_budget,
-            "Brain initialization schedule capability budget is not the reviewed ceiling"
-        );
-        anyhow::ensure!(
-            schedule.interval_ms.is_none()
-                && schedule.delivery_policy == BrainScheduleDeliveryPolicy::Coalesce,
-            "Brain initialization schedule must be a coalesced one-shot"
-        );
-        Ok(())
-    }
-
-    fn validate_schedule_due(
-        &self,
-        schedule: &BrainSchedule,
-        due: &BrainScheduleDue,
-    ) -> Result<()> {
-        self.validate_schedule(schedule)?;
-        anyhow::ensure!(
-            due.language == schedule.language
-                && due.source == schedule.source
-                && due.grant_ceiling == schedule.grant_ceiling,
-            "Brain initialization delivery does not match its reviewed schedule"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProgramLanguage {
-    Forth,
-    Lisp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BrainScheduleDeliveryPolicy {
-    Coalesce,
-    BoundedCatchUp {
-        max_catch_up: u32,
-        expires_after_ms: u64,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainSchedule {
-    pub schedule_id: ScheduleId,
-    #[serde(default = "legacy_schedule_attachment_id")]
-    pub initiating_attachment_id: AttachmentId,
-    #[serde(default)]
-    pub created_by: String,
-    #[serde(default)]
-    pub grant_ceiling: crate::vm::EffectSet,
-    pub language: ProgramLanguage,
-    pub source: String,
-    pub next_due_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interval_ms: Option<u64>,
-    pub delivery_policy: BrainScheduleDeliveryPolicy,
-    /// Set only by trusted, reviewed Brain-module scheduling paths. This is
-    /// persisted so source-equivalent public schedules cannot impersonate or
-    /// suppress the module.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub module_identity: Option<BrainScheduleModuleIdentity>,
-    pub active: bool,
-}
-
-/// One durable schedule delivery and the queued run that owns it. Keeping the
-/// run in this event makes due calculation -> runnable work one atomic append.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainScheduleDue {
-    pub schedule_id: ScheduleId,
-    pub run: BrainRun,
-    /// Immutable program snapshot for this delivery. Later schedule edits do
-    /// not change already queued work.
-    #[serde(default = "legacy_schedule_language")]
-    pub language: ProgramLanguage,
-    #[serde(default)]
-    pub source: String,
-    #[serde(default)]
-    pub grant_ceiling: crate::vm::EffectSet,
-    pub due_at_ms: u64,
-    pub first_missed_at_ms: u64,
-    pub missed_count: u32,
-    /// The next occurrence after all ticks represented by this delivery.
-    /// `None` atomically retires a one-shot schedule.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_due_ms: Option<u64>,
-}
-
-/// The one machine/workspace boundary in which a brain may cause effects.
-///
-/// There is deliberately no separate `execution_head`: the machine that owns
-/// the workspace is the only machine allowed to execute the brain's programs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainEnvironment {
-    pub machine: String,
-    pub workspace: PathBuf,
-    pub generation: u64,
-}
-
-/// Exact participant/environment boundary to which a Brain-owned approval
-/// request is addressed. This is policy input, not a bearer credential;
-/// possession of this record does not authorize a decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainApprovalAudience {
-    pub brain_id: BrainId,
-    pub brain: String,
-    pub attachment_id: AttachmentId,
-    pub subject: String,
-    pub role: AttachmentRole,
-    pub environment_generation: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BrainEventKind {
-    /// Durable typed result for an accepted mutation that either reserves an
-    /// external effect or makes no projection change.
-    MutationRecorded {
-        outcome: BrainMutationOutcome,
-    },
-    RunnerLeaseAcquired {
-        lease: BrainRunnerLease,
-    },
-    RunnerLeaseReleased {
-        lease_id: RunnerLeaseId,
-    },
-    RunnerHandoffRequested {
-        handoff: BrainRunnerHandoff,
-    },
-    RunnerHandoffCompleted {
-        handoff_id: RunnerHandoffId,
-        lease: BrainRunnerLease,
-    },
-    RunnerHandoffCancelled {
-        handoff_id: RunnerHandoffId,
-    },
-    ClientAttached {
-        attachment_id: AttachmentId,
-        #[serde(default)]
-        connection_id: ConnectionId,
-        subject: String,
-        role: AttachmentRole,
-    },
-    ClientDetached {
-        attachment_id: AttachmentId,
-        #[serde(default)]
-        connection_id: ConnectionId,
-    },
-    RunStarted {
-        run: BrainRun,
-    },
-    RunStatusChanged {
-        run_id: RunId,
-        status: BrainRunStatus,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-    Prompt {
-        text: String,
-    },
-    /// An explicitly requested helper turn. Its transcript is durable and
-    /// inspectable, but is never injected into later interactive context.
-    SpeculativePrompt {
-        text: String,
-    },
-    /// A participant-to-participant message. It is durable and enters later
-    /// prompt context, but never schedules a provider turn by itself.
-    ParticipantMessage {
-        text: String,
-    },
-    /// Atomically replace the Brain-owned task list. The append-only event is
-    /// authoritative; frontend lists are projections rebuilt from snapshots.
-    TaskListReplaced {
-        tasks: Vec<super::tasks::BrainTask>,
-    },
-    ToolCall {
-        request_seq: u64,
-        tool_id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    ToolResult {
-        request_seq: u64,
-        tool_id: String,
-        output: String,
-        is_error: bool,
-    },
-    ApprovalRequested {
-        request_seq: u64,
-        approval_id: String,
-        approval_kind: String,
-        subject: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        audience: Option<BrainApprovalAudience>,
-        detail: serde_json::Value,
-    },
-    ApprovalDecided {
-        request_seq: u64,
-        approval_id: String,
-        decision: serde_json::Value,
-    },
-    Program {
-        language: ProgramLanguage,
-        source: String,
-    },
-    ProgramPopped {
-        program_seq: u64,
-    },
-    Result {
-        request_seq: u64,
-        output: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-        /// Exact ordered provider/tool continuation. Legacy results decode as
-        /// empty and retain their historical projection.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        continuation_messages: Vec<crate::providers::Message>,
-        /// Provider identity/accounting captured at the completed invocation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        invocation_metadata: Option<crate::providers::InvocationMetadata>,
-    },
-    /// Content-addressed typed-VM state committed after one accepted program.
-    /// This is an internal Brain event, not a request to replay source after
-    /// restart; the checkpoint bytes live beside the append-only log.
-    RuntimeCommitted {
-        request_seq: u64,
-        runtime_revision: u64,
-        checkpoint_sha256: String,
-    },
-    /// Execute-once VM host-effect fact. This is deliberately stored in the
-    /// append-only event log rather than the reducible runtime checkpoint.
-    EffectRecorded {
-        request_seq: u64,
-        execution_id: uuid::Uuid,
-        effect: crate::vm::VmSideEffect,
-        state: crate::vm::EffectJournalState,
-    },
-    /// Monotonic write-ahead audit transition for one physical host effect.
-    /// Schema-v14 `EffectRecorded` values remain readable as legacy terminal
-    /// snapshots; all new execution uses this reducer-backed form.
-    EffectAuditTransition {
-        transition: crate::runtime::EffectAuditTransition,
-    },
-    ScheduleChanged {
-        schedule: BrainSchedule,
-    },
-    ScheduleDue {
-        due: BrainScheduleDue,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum BrainMutationOutcome {
-    RunCancellationReserved {
-        run_id: RunId,
-    },
-    RunCancellationDispatching {
-        run_id: RunId,
-        mutation_id: uuid::Uuid,
-    },
-    RunCancellationReconciled {
-        run_id: RunId,
-        mutation_id: uuid::Uuid,
-    },
-    RunAlreadyCancelled {
-        run_id: RunId,
-    },
-    RunCancellationNoop {
-        run_id: RunId,
-    },
-    ScheduleCancellationNoop {
-        schedule_id: ScheduleId,
-    },
-    HandoffCancellationNoop {
-        handoff_id: RunnerHandoffId,
-    },
-    ApprovalDecisionDelivered {
-        request_seq: u64,
-        approval_id: String,
-        mutation_id: uuid::Uuid,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BrainEvent {
-    /// Version of this durable event envelope. Old logs deserialize as v1 and
-    /// are projected into the owning Brain's stable identity while loading.
-    #[serde(default = "legacy_brain_event_schema_version")]
-    pub schema_version: u32,
-    #[serde(default = "BrainId::nil")]
-    pub brain_id: BrainId,
-    pub seq: u64,
-    /// Binds this event to the exact environment revision in which it ran.
-    #[serde(default = "initial_environment_generation")]
-    pub environment_generation: u64,
-    pub sender: String,
-    pub created_ms: u64,
-    /// Canonical lifecycle correlation. Legacy and non-run events have none.
-    #[serde(
-        default,
-        rename = "correlation_run_id",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub run_id: Option<RunId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mutation: Option<BrainMutationReceipt>,
-    #[serde(flatten)]
-    pub kind: BrainEventKind,
-}
-
-/// One physical canonical journal append. Legacy lines remain bare events;
-/// compound transitions use this tagged record while preserving a cursor for
-/// every contained logical event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "journal_record", rename_all = "snake_case")]
-enum BrainJournalRecord {
-    EventBatch {
-        /// New batches carry their logical framing inside the physical JSONL
-        /// record. Optional fields keep journals written by the first batch
-        /// implementation readable.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        event_count: Option<usize>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        payload_sha256: Option<String>,
-        events: Vec<BrainEvent>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DisconnectTerminalizationIntent {
-    sender: String,
-    run_id: RunId,
-    request_seq: u64,
-    status: BrainRunStatus,
-    detail: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainProgram {
-    pub seq: u64,
-    pub sender: String,
-    pub language: ProgramLanguage,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BrainSnapshot {
-    pub brain_id: BrainId,
-    pub name: String,
-    pub environment: BrainEnvironment,
-    pub revision: u64,
-    pub events: Vec<BrainEvent>,
-    pub program_stack: Vec<BrainProgram>,
-    pub attachments: Vec<BrainAttachment>,
-    pub runner_lease: Option<BrainRunnerLease>,
-    #[serde(default)]
-    pub runner_handoff: Option<BrainRunnerHandoff>,
-    #[serde(default)]
-    pub runs: Vec<BrainRun>,
-    /// Current task-list projection derived from `TaskListReplaced` events.
-    #[serde(default)]
-    pub tasks: Vec<super::tasks::BrainTask>,
-    #[serde(default)]
-    pub schedules: Vec<BrainSchedule>,
-    #[serde(default)]
-    pub pending_schedule_dues: Vec<BrainScheduleDue>,
-    /// Canonical projection of the schema-v15 effect-audit transitions.
-    #[serde(default)]
-    pub effect_audits: Vec<crate::runtime::EffectAuditEntry>,
-}
-
-/// One currently connected participant, as projected from the event log
-/// without hydrating the Brain.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainListAttachment {
-    pub subject: String,
-    pub role: AttachmentRole,
-}
-
-/// One live subagent run, as projected from the event log without hydrating.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainListAgent {
-    pub run_id: RunId,
-    pub status: BrainRunStatus,
-    pub initiated_by: String,
-}
-
-/// Directory-and-journal facts about one named Brain, gathered without
-/// replaying the reducer, opening effect-audit databases, or creating files.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrainListSummary {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub brain_id: Option<BrainId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_ms: Option<u64>,
-    pub bytes: u64,
-    pub events: u64,
-    pub revision: u64,
-    pub turns: u64,
-    pub attached: Vec<BrainListAttachment>,
-    pub agents: Vec<BrainListAgent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub runner: Option<String>,
-}
-
-impl BrainSnapshot {
-    /// Whether this exact runner lease was durably replaced by an addressed
-    /// handoff. Frontends use this terminal fact to stop renewal instead of
-    /// treating a deliberate transfer like an incidental lease expiry.
-    pub fn runner_lease_was_handed_off(&self, lease_id: RunnerLeaseId) -> bool {
-        let requested: std::collections::HashSet<_> = self
-            .events
-            .iter()
-            .filter_map(|event| match &event.kind {
-                BrainEventKind::RunnerHandoffRequested { handoff }
-                    if handoff.from_lease_id == lease_id =>
-                {
-                    Some(handoff.handoff_id)
-                }
-                _ => None,
-            })
-            .collect();
-        self.events.iter().any(|event| {
-            matches!(
-                &event.kind,
-                BrainEventKind::RunnerHandoffCompleted { handoff_id, .. }
-                    if requested.contains(handoff_id)
-            )
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum BrainWireMessage {
-    Snapshot { brain: BrainSnapshot },
-    Event { event: BrainEvent },
-}
-
-fn observer_effect_audit_event(event: &BrainEvent) -> BrainEvent {
-    let mut projected = event.clone();
-    if let BrainEventKind::EffectAuditTransition { transition } = &event.kind {
-        projected.kind = BrainEventKind::EffectAuditTransition {
-            transition: transition.observer_projection(),
-        };
-    }
-    projected
-}
 
 struct BrainState {
     brain_id: BrainId,
@@ -831,141 +73,6 @@ struct BrainState {
     recent_effect_audits: std::collections::VecDeque<crate::runtime::EffectAuditEntry>,
     revision: u64,
     tx: broadcast::Sender<BrainEvent>,
-}
-
-/// Every active schedule in the store, ordered by when it next comes due.
-///
-/// Schedule delivery used to select by *Brain*: the daemon enumerated the whole
-/// Brain root once a second and hydrated every Brain to discover whether any of
-/// them had work. Ordering by `next_due_ms` existed, but only inside a single
-/// Brain and only after that Brain was already loaded, because
-/// `BrainState::schedules` is a per-Brain `HashMap`. This is the same ordering
-/// lifted to the store, so the daemon can select by *due time* and hydrate only
-/// the Brains that actually have work (#374).
-///
-/// `due` is the ordering; `by_brain` exists so a single schedule can be moved
-/// without scanning the map. The key carries the Brain name as well as the
-/// schedule id: keying on `(next_due_ms, ScheduleId)` alone assumed schedule
-/// ids are unique across Brains, and nothing enforces that at this boundary —
-/// two Brains holding the same id at the same instant would silently overwrite
-/// each other's entry, and the loser could never be repaired because
-/// `by_brain` would still claim it was indexed.
-type DueKey = (u64, String, ScheduleId);
-
-#[derive(Debug, Default)]
-struct ScheduleIndex {
-    due: std::collections::BTreeMap<DueKey, ()>,
-    by_brain: HashMap<String, HashMap<ScheduleId, u64>>,
-    /// Brains whose *whole* schedule set has been read into the index, whether
-    /// or not any of it is currently active.
-    ///
-    /// `by_brain` cannot answer this: `upsert` drops a Brain's entry the moment
-    /// its last active slot goes, so a Brain that has one thousand spent
-    /// one-shots and nothing active is absent from `by_brain` while being
-    /// perfectly well indexed. `warm_schedule_index` gates its repair on this
-    /// set so the gate is O(1) per Brain per warm; gating on `by_brain` would
-    /// rescan every such Brain's entire lifetime schedule map, once a minute,
-    /// forever — the growth curve `upsert`'s own doc comment exists to
-    /// describe.
-    indexed: HashSet<String>,
-}
-
-impl ScheduleIndex {
-    /// Move or insert one schedule. O(log n), not O(the Brain's schedules).
-    ///
-    /// The whole-Brain rescan this replaced was O(every schedule the Brain had
-    /// ever held): `BrainState::schedules` is never pruned — deactivation sets
-    /// a flag in place and one-shot schedules stay in the map forever — and
-    /// the rescan ran inside the process-wide `brains` write guard, once per
-    /// schedule event. A Brain with thousands of retired one-shots made every
-    /// subsequent event pay for all of them, and blocked every other Brain's
-    /// request for the duration.
-    fn upsert(&mut self, name: &str, schedule: &BrainSchedule) {
-        let slots = self.by_brain.entry(name.to_string()).or_default();
-        if let Some(previous) = slots.remove(&schedule.schedule_id) {
-            self.due
-                .remove(&(previous, name.to_string(), schedule.schedule_id));
-        }
-        if schedule.active {
-            self.due.insert(
-                (schedule.next_due_ms, name.to_string(), schedule.schedule_id),
-                (),
-            );
-            slots.insert(schedule.schedule_id, schedule.next_due_ms);
-        }
-        if slots.is_empty() {
-            self.by_brain.remove(name);
-        }
-    }
-
-    /// Replace everything known about `name` with its current active schedules.
-    ///
-    /// Used where the whole set is the unit of work — a Brain becoming
-    /// resident — rather than on the per-event path.
-    fn reindex(&mut self, name: &str, schedules: &HashMap<ScheduleId, BrainSchedule>) {
-        self.forget(name);
-        for schedule in schedules.values().filter(|schedule| schedule.active) {
-            self.upsert(name, schedule);
-        }
-        // After `forget`, so the Brain ends up marked known rather than
-        // unknown. This is the only place a Brain becomes known: every other
-        // mutation either moves a single schedule of an already-known Brain
-        // (`upsert`) or makes it unknown again (`forget`).
-        self.indexed.insert(name.to_string());
-    }
-
-    /// Forget a Brain entirely, for removal and archival.
-    fn forget(&mut self, name: &str) {
-        self.indexed.remove(name);
-        if let Some(previous) = self.by_brain.remove(name) {
-            for (schedule_id, next_due_ms) in previous {
-                self.due
-                    .remove(&(next_due_ms, name.to_string(), schedule_id));
-            }
-        }
-    }
-
-    /// Whether this Brain's schedule set has been read into the index.
-    ///
-    /// `false` means the index holds nothing for it *and* has not established
-    /// that there is nothing to hold — the state a prune leaves behind, and the
-    /// only state `warm_schedule_index` has to repair.
-    fn is_indexed(&self, name: &str) -> bool {
-        self.indexed.contains(name)
-    }
-
-    /// When the earliest active schedule in the store comes due.
-    fn next_due_ms(&self) -> Option<u64> {
-        self.due
-            .keys()
-            .next()
-            .map(|(next_due_ms, _, _)| *next_due_ms)
-    }
-
-    /// Brains holding at least one schedule due at or before `now_ms`, in due
-    /// order, each named once.
-    fn due_brains(&self, now_ms: u64) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut brains = Vec::new();
-        // The upper bound is the largest id at `now_ms`, so every schedule due at
-        // exactly `now_ms` is included rather than dropped by an exclusive range.
-        // Exclusive upper bound on the *next* millisecond rather than a
-        // synthetic maximum key. `Brain` names are unbounded strings, so there
-        // is no largest one to construct; `..(now_ms + 1, "", nil)` includes
-        // every key whose instant is `now_ms` or earlier and excludes the rest,
-        // whatever the name or id.
-        let ceiling = (
-            now_ms.saturating_add(1),
-            String::new(),
-            ScheduleId(uuid::Uuid::nil()),
-        );
-        for ((_, name, _), ()) in self.due.range(..ceiling) {
-            if seen.insert(name.clone()) {
-                brains.push(name.clone());
-            }
-        }
-        brains
-    }
 }
 
 #[cfg(test)]
@@ -1315,6 +422,23 @@ impl BrainState {
         }
         self.events.push(event);
     }
+}
+
+/// Opaque daemon-side authority for one runner capability. The Cap'n Proto
+/// peer never receives these fields; it can only invoke the capability that
+/// holds this grant.
+#[derive(Debug, Clone)]
+pub(crate) struct EffectAuditAuthorityGrant {
+    brain: String,
+    run_id: RunId,
+    authority: crate::runtime::EffectAuditAuthority,
+}
+
+pub(crate) fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Authoritative persistent store of named Brains.
@@ -1879,72 +1003,7 @@ impl BrainStore {
     }
 
     fn summarize_unhydrated(&self, name: &str) -> BrainListSummary {
-        let path = self.root.as_ref().map(|root| root.join(name));
-        let mut summary = BrainListSummary {
-            name: name.to_string(),
-            path: path.clone(),
-            brain_id: None,
-            created_ms: None,
-            updated_ms: None,
-            bytes: 0,
-            events: 0,
-            revision: 0,
-            turns: 0,
-            attached: Vec::new(),
-            agents: Vec::new(),
-            runner: None,
-        };
-        let Some(directory) = path else {
-            return summary;
-        };
-        summary.bytes = directory_bytes(&directory);
-        if let Ok(bytes) = std::fs::read(directory.join("metadata.json")) {
-            if let Ok(metadata) = serde_json::from_slice::<BrainMetadata>(&bytes) {
-                if metadata.version == BRAIN_METADATA_VERSION && metadata.brain_id != BrainId::nil()
-                {
-                    summary.brain_id = Some(metadata.brain_id);
-                    summary.created_ms = Some(metadata.created_ms);
-                }
-            }
-        }
-        let projection = scan_journal_readonly(&directory.join("events.jsonl"));
-        summary.events = projection.events;
-        summary.revision = projection.revision;
-        summary.turns = projection.turns;
-        summary.updated_ms = projection.updated_ms;
-        let now = unix_millis();
-        summary.runner = projection
-            .runner
-            .filter(|lease| lease.expires_ms > now)
-            .map(|lease| lease.subject);
-        let mut attached: Vec<BrainListAttachment> = projection
-            .attachments
-            .into_values()
-            .filter(|attachment| attachment.connected)
-            .map(|attachment| BrainListAttachment {
-                subject: attachment.subject,
-                role: attachment.role,
-            })
-            .collect();
-        attached.sort_by(|left, right| {
-            left.subject
-                .cmp(&right.subject)
-                .then_with(|| format!("{:?}", left.role).cmp(&format!("{:?}", right.role)))
-        });
-        summary.attached = attached;
-        let mut agents: Vec<BrainListAgent> = projection
-            .runs
-            .into_values()
-            .filter(|run| run.kind == BrainRunKind::Subagent && !run.status.is_terminal())
-            .map(|run| BrainListAgent {
-                run_id: run.run_id,
-                status: run.status,
-                initiated_by: run.initiated_by,
-            })
-            .collect();
-        agents.sort_by_key(|agent| agent.run_id.0);
-        summary.agents = agents;
-        summary
+        projection::summarize_unhydrated(self.root.as_deref(), name, unix_millis())
     }
 
     /// How many Brains are actually resident in memory, i.e. hydrated.
@@ -3196,7 +2255,7 @@ impl BrainStore {
                 .schedule_index
                 .write()
                 .expect("schedule index lock poisoned");
-            let was_indexed = index.by_brain.contains_key(name);
+            let was_indexed = index.has_active(name);
             index.forget(name);
             was_indexed
         };
@@ -3359,7 +2418,6 @@ impl BrainStore {
         self.schedule_index
             .read()
             .expect("schedule index lock poisoned")
-            .due
             .len()
     }
 
@@ -3438,7 +2496,7 @@ impl BrainStore {
                         )?;
                         queued.push(run);
                     } else {
-                        let run = queued_schedule_run(state, &schedule, now_ms);
+                        let run = queued_schedule_run(&schedule, state.revision + 1, now_ms);
                         let due = BrainScheduleDue {
                             schedule_id: schedule.schedule_id,
                             run: run.clone(),
@@ -3486,7 +2544,7 @@ impl BrainStore {
                         let delivery_next = schedule
                             .interval_ms
                             .and_then(|interval| due_at_ms.checked_add(interval));
-                        let run = queued_schedule_run(state, &schedule, now_ms);
+                        let run = queued_schedule_run(&schedule, state.revision + 1, now_ms);
                         let due = BrainScheduleDue {
                             schedule_id: schedule.schedule_id,
                             run: run.clone(),
@@ -6391,43 +5449,16 @@ impl BrainStore {
         name: &str,
         brain_id: BrainId,
     ) -> Result<HashMap<AttachmentId, u64>> {
-        let Some(root) = &self.root else {
-            return Ok(HashMap::new());
-        };
-        let path = root.join(name).join("attachments.json");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Ok(HashMap::new());
-        };
-        let file: AttachmentCursorFile =
-            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-        if file.version != 1 || file.brain_id != brain_id {
-            anyhow::bail!("attachment cursor identity mismatch at {}", path.display());
-        }
-        Ok(file.cursors)
+        attachment::read_cursors(self.root.as_deref(), name, brain_id)
     }
 
     fn write_attachment_cursors(&self, name: &str, state: &BrainState) -> Result<()> {
-        let Some(root) = &self.root else {
-            return Ok(());
-        };
-        let file = AttachmentCursorFile {
-            version: 1,
-            brain_id: state.brain_id,
-            cursors: state
-                .attachments
-                .iter()
-                .map(|(id, attachment)| (*id, attachment.acknowledged_seq))
-                .collect(),
-        };
-        let directory = root.join(name);
-        create_dir_all_durable(&directory)
-            .with_context(|| format!("create {}", directory.display()))?;
-        let path = directory.join("attachments.json");
-        let temporary = directory.join(format!(".attachments.{}.tmp", uuid::Uuid::new_v4()));
-        std::fs::write(&temporary, serde_json::to_vec_pretty(&file)?)
-            .with_context(|| format!("write {}", temporary.display()))?;
-        std::fs::rename(&temporary, &path).with_context(|| format!("commit {}", path.display()))?;
-        Ok(())
+        attachment::write_cursors(
+            self.root.as_deref(),
+            name,
+            state.brain_id,
+            &state.attachments,
+        )
     }
 
     fn load_or_create_metadata(&self, name: &str) -> Result<BrainMetadata> {
@@ -6507,9 +5538,7 @@ impl BrainStore {
     }
 
     fn event_path(&self, name: &str) -> Option<PathBuf> {
-        self.root
-            .as_ref()
-            .map(|root| root.join(name).join("events.jsonl"))
+        journal::event_path(self.root.as_deref(), name)
     }
 
     fn with_effect_audit_storage_mut<T>(
@@ -6599,11 +5628,7 @@ impl BrainStore {
     }
 
     fn disconnect_intent_path(&self, name: &str, run_id: RunId) -> Option<PathBuf> {
-        self.root.as_ref().map(|root| {
-            root.join(name)
-                .join("disconnect-terminalizations")
-                .join(format!("{}.json", run_id.0))
-        })
+        run::disconnect_intent_path(self.root.as_deref(), name, run_id)
     }
 
     fn persist_disconnect_intent(
@@ -6611,135 +5636,22 @@ impl BrainStore {
         name: &str,
         intent: &DisconnectTerminalizationIntent,
     ) -> Result<()> {
-        let Some(path) = self.disconnect_intent_path(name, intent.run_id) else {
-            return Ok(());
-        };
-        let directory = path.parent().expect("disconnect intent has a parent");
-        create_dir_all_durable(directory)?;
-        let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-        std::fs::write(&temporary, serde_json::to_vec(intent)?)?;
-        std::fs::File::open(&temporary)?.sync_all()?;
-        std::fs::rename(&temporary, &path)?;
-        sync_directory(directory)
+        run::persist_disconnect_intent(self.root.as_deref(), name, intent)
     }
 
     fn clear_disconnect_intent(&self, name: &str, run_id: RunId) -> Result<()> {
-        let Some(path) = self.disconnect_intent_path(name, run_id) else {
-            return Ok(());
-        };
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-            if let Some(parent) = path.parent() {
-                sync_directory(parent)?;
-            }
-        }
-        Ok(())
+        run::clear_disconnect_intent(self.root.as_deref(), name, run_id)
     }
 
     fn read_disconnect_intents(
         &self,
         name: &str,
     ) -> Result<HashMap<RunId, DisconnectTerminalizationIntent>> {
-        let Some(root) = &self.root else {
-            return Ok(HashMap::new());
-        };
-        let directory = root.join(name).join("disconnect-terminalizations");
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            return Ok(HashMap::new());
-        };
-        let mut intents = HashMap::new();
-        for entry in entries {
-            let entry = entry?;
-            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let intent: DisconnectTerminalizationIntent =
-                serde_json::from_slice(&std::fs::read(entry.path())?)?;
-            intents.insert(intent.run_id, intent);
-        }
-        Ok(intents)
+        run::read_disconnect_intents(self.root.as_deref(), name)
     }
 
     fn read_events(&self, name: &str) -> Result<Vec<BrainEvent>> {
-        let Some(path) = self.event_path(name) else {
-            return Ok(Vec::new());
-        };
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Ok(Vec::new());
-        };
-        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
-            let committed_len = bytes
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map(|offset| offset + 1)
-                .unwrap_or(0);
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .with_context(|| format!("open {} for torn-tail recovery", path.display()))?;
-            file.set_len(committed_len as u64)
-                .with_context(|| format!("truncate torn tail in {}", path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("sync recovered {}", path.display()))?;
-        }
-        let mut events = Vec::new();
-        let records = bytes
-            .split_inclusive(|byte| *byte == b'\n')
-            .collect::<Vec<_>>();
-        let mut committed_offset = 0usize;
-        for (line_no, terminated) in records.iter().enumerate() {
-            // Committed records are newline-terminated. A torn final append
-            // projects none of its logical events after restart.
-            if terminated.last() != Some(&b'\n') {
-                break;
-            }
-            let line = &terminated[..terminated.len() - 1];
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            let parsed = match serde_json::from_slice::<BrainJournalRecord>(line) {
-                Ok(BrainJournalRecord::EventBatch {
-                    event_count,
-                    payload_sha256,
-                    events: batch,
-                }) => {
-                    let valid_framing = match (event_count, payload_sha256) {
-                        (None, None) => true,
-                        (Some(count), Some(checksum)) => {
-                            count == batch.len()
-                                && serde_json::to_vec(&batch).is_ok_and(|payload| {
-                                    hex::encode(Sha256::digest(payload)) == checksum
-                                })
-                        }
-                        _ => false,
-                    };
-                    valid_framing.then_some(batch)
-                }
-                Err(_) => serde_json::from_slice::<BrainEvent>(line)
-                    .ok()
-                    .map(|event| vec![event]),
-            };
-            if let Some(batch) = parsed {
-                events.extend(batch);
-                committed_offset += terminated.len();
-                continue;
-            }
-            if line_no + 1 == records.len() {
-                let file = OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .with_context(|| {
-                        format!("open {} for corrupt-tail recovery", path.display())
-                    })?;
-                file.set_len(committed_offset as u64)
-                    .with_context(|| format!("truncate corrupt tail in {}", path.display()))?;
-                file.sync_all()
-                    .with_context(|| format!("sync recovered {}", path.display()))?;
-                break;
-            }
-            anyhow::bail!("parse {} line {}", path.display(), line_no + 1);
-        }
-        Ok(events)
+        journal::read_events(self.root.as_deref(), name)
     }
 
     fn append_event(&self, name: &str, event: &BrainEvent) -> Result<()> {
@@ -6767,7 +5679,7 @@ impl BrainStore {
         {
             anyhow::bail!("injected reserved cancellation terminal append failure");
         }
-        self.append_journal_value(name, event)
+        journal::append_event(self.root.as_deref(), name, event)
     }
 
     fn append_event_batch(&self, name: &str, events: &[BrainEvent]) -> Result<()> {
@@ -6790,47 +5702,14 @@ impl BrainStore {
         {
             anyhow::bail!("injected Brain event batch append failure");
         }
-        let payload = serde_json::to_vec(events)?;
-        self.append_journal_value(
-            name,
-            &BrainJournalRecord::EventBatch {
-                event_count: Some(events.len()),
-                payload_sha256: Some(hex::encode(Sha256::digest(payload))),
-                events: events.to_vec(),
-            },
-        )
+        journal::append_event_batch(self.root.as_deref(), name, events)
     }
 
     /// Atomically replace the canonical journal with an equivalent sequence
     /// of individual events. This is used only for bounded audit-history
     /// compaction; mutation receipts and every non-audit event are preserved.
     fn rewrite_events(&self, name: &str, events: &[BrainEvent]) -> Result<()> {
-        let Some(path) = self.event_path(name) else {
-            return Ok(());
-        };
-        let directory = path.parent().context("Brain event log has no parent")?;
-        create_dir_all_durable(directory)?;
-        let temporary = directory.join(format!(".events.{}.tmp", uuid::Uuid::new_v4()));
-        let rewrite = (|| -> Result<()> {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)
-                .with_context(|| format!("create {}", temporary.display()))?;
-            for event in events {
-                serde_json::to_writer(&mut file, event)?;
-                file.write_all(b"\n")?;
-            }
-            file.sync_all()
-                .with_context(|| format!("sync {}", temporary.display()))?;
-            std::fs::rename(&temporary, &path)
-                .with_context(|| format!("replace {}", path.display()))?;
-            sync_directory(directory)
-        })();
-        if rewrite.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        rewrite
+        journal::rewrite_events(self.root.as_deref(), name, events)
     }
 
     #[cfg(test)]
@@ -6934,63 +5813,6 @@ impl BrainStore {
         self.fail_cancellation_terminal_appends
             .store(count, std::sync::atomic::Ordering::SeqCst);
     }
-
-    fn append_journal_value<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
-        let Some(path) = self.event_path(name) else {
-            return Ok(());
-        };
-        if let Some(parent) = path.parent() {
-            create_dir_all_durable(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        let new_file = !path.exists();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
-        let mut record = serde_json::to_vec(value)?;
-        record.push(b'\n');
-        file.write_all(&record)?;
-        file.sync_all()
-            .with_context(|| format!("sync {}", path.display()))?;
-        if new_file {
-            if let Some(parent) = path.parent() {
-                std::fs::File::open(parent)
-                    .with_context(|| format!("open {} for directory sync", parent.display()))?
-                    .sync_all()
-                    .with_context(|| format!("sync directory {}", parent.display()))?;
-            }
-        }
-        Ok(())
-    }
-}
-
-pub(super) fn sync_directory(path: &std::path::Path) -> Result<()> {
-    std::fs::File::open(path)
-        .with_context(|| format!("open {} for directory sync", path.display()))?
-        .sync_all()
-        .with_context(|| format!("sync directory {}", path.display()))
-}
-
-/// Create and durably link every missing directory component, including the
-/// configured Brain root when it does not yet exist.
-pub(super) fn create_dir_all_durable(path: &std::path::Path) -> Result<()> {
-    let mut missing = Vec::new();
-    let mut cursor = path;
-    while !cursor.exists() {
-        missing.push(cursor.to_path_buf());
-        let Some(parent) = cursor.parent() else { break };
-        cursor = parent;
-    }
-    std::fs::create_dir_all(path)?;
-    for directory in missing {
-        sync_directory(&directory)?;
-        if let Some(parent) = directory.parent() {
-            sync_directory(parent)?;
-        }
-    }
-    Ok(())
 }
 
 fn validate_participant_subject<'a>(label: &str, subject: &'a str) -> Result<&'a str> {
@@ -6999,356 +5821,6 @@ fn validate_participant_subject<'a>(label: &str, subject: &'a str) -> Result<&'a
         anyhow::bail!("{label} must be 1-128 printable characters");
     }
     Ok(subject)
-}
-
-#[derive(Default)]
-struct JournalProjection {
-    events: u64,
-    revision: u64,
-    turns: u64,
-    updated_ms: Option<u64>,
-    attachments: HashMap<AttachmentId, BrainAttachment>,
-    runs: HashMap<RunId, BrainRun>,
-    runner: Option<BrainRunnerLease>,
-}
-
-fn directory_bytes(root: &Path) -> u64 {
-    let mut total = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(directory) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if let Ok(metadata) = entry.metadata() {
-                total += metadata.len();
-            }
-        }
-    }
-    total
-}
-
-/// Best-effort read of a Brain journal. Unreadable or torn lines are skipped;
-/// the file is never truncated.
-fn scan_journal_readonly(path: &Path) -> JournalProjection {
-    let mut projection = JournalProjection::default();
-    let Ok(bytes) = std::fs::read(path) else {
-        return projection;
-    };
-    for terminated in bytes.split_inclusive(|byte| *byte == b'\n') {
-        if terminated.last() != Some(&b'\n') {
-            break;
-        }
-        let line = &terminated[..terminated.len() - 1];
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let parsed = match serde_json::from_slice::<BrainJournalRecord>(line) {
-            Ok(BrainJournalRecord::EventBatch { events: batch, .. }) => batch,
-            Err(_) => match serde_json::from_slice::<BrainEvent>(line) {
-                Ok(event) => vec![event],
-                Err(_) => continue,
-            },
-        };
-        for event in parsed {
-            apply_scan_event(&mut projection, event);
-        }
-    }
-    projection
-}
-
-fn apply_scan_event(projection: &mut JournalProjection, event: BrainEvent) {
-    projection.events += 1;
-    projection.revision = projection.revision.max(event.seq);
-    projection.updated_ms = Some(projection.updated_ms.unwrap_or(0).max(event.created_ms));
-    match event.kind {
-        BrainEventKind::Prompt { .. } => {
-            projection.turns += 1;
-        }
-        BrainEventKind::ClientAttached {
-            attachment_id,
-            connection_id,
-            subject,
-            role,
-        } => {
-            let acknowledged_seq = projection
-                .attachments
-                .get(&attachment_id)
-                .map(|attachment| attachment.acknowledged_seq)
-                .unwrap_or(0);
-            projection.attachments.insert(
-                attachment_id,
-                BrainAttachment {
-                    attachment_id,
-                    subject,
-                    role,
-                    acknowledged_seq,
-                    connected: true,
-                    connection_id: Some(connection_id),
-                },
-            );
-        }
-        BrainEventKind::ClientDetached {
-            attachment_id,
-            connection_id,
-        } => {
-            if let Some(attachment) = projection.attachments.get_mut(&attachment_id) {
-                if attachment.connection_id == Some(connection_id) {
-                    attachment.connected = false;
-                    attachment.connection_id = None;
-                }
-            }
-        }
-        BrainEventKind::RunStarted { run } => {
-            projection.runs.insert(run.run_id, run);
-        }
-        BrainEventKind::RunStatusChanged {
-            run_id,
-            status,
-            detail,
-        } => {
-            if let Some(run) = projection.runs.get_mut(&run_id) {
-                run.status = status;
-                run.updated_ms = event.created_ms;
-                run.detail = detail;
-            }
-        }
-        BrainEventKind::ScheduleDue { due } => {
-            projection.runs.insert(due.run.run_id, due.run);
-        }
-        BrainEventKind::RunnerLeaseAcquired { lease } => {
-            projection.runner = Some(lease);
-        }
-        BrainEventKind::RunnerLeaseReleased { lease_id } => {
-            if projection
-                .runner
-                .as_ref()
-                .is_some_and(|lease| lease.lease_id == lease_id)
-            {
-                projection.runner = None;
-            }
-        }
-        BrainEventKind::RunnerHandoffCompleted { lease, .. } => {
-            projection.runner = Some(lease);
-        }
-        _ => {}
-    }
-}
-
-pub(crate) fn unix_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn sorted_attachments(
-    attachments: &HashMap<AttachmentId, BrainAttachment>,
-) -> Vec<BrainAttachment> {
-    let mut attachments = attachments.values().cloned().collect::<Vec<_>>();
-    attachments.sort_by_key(|attachment| attachment.attachment_id.0);
-    attachments
-}
-
-fn sorted_runs(runs: &HashMap<RunId, BrainRun>) -> Vec<BrainRun> {
-    let mut runs = runs.values().cloned().collect::<Vec<_>>();
-    runs.sort_by_key(|run| (run.request_seq, run.run_id.0));
-    runs
-}
-
-fn queued_schedule_run(state: &BrainState, schedule: &BrainSchedule, now_ms: u64) -> BrainRun {
-    BrainRun {
-        run_id: RunId::new(),
-        kind: BrainRunKind::Scheduled,
-        parent_run_id: None,
-        request_seq: state.revision + 1,
-        initiating_attachment_id: schedule.initiating_attachment_id,
-        initiated_by: schedule.created_by.clone(),
-        status: BrainRunStatus::QueuedForEnvironment,
-        started_ms: now_ms,
-        updated_ms: now_ms,
-        detail: None,
-    }
-}
-
-fn schedule_due_window(schedule: &BrainSchedule, now_ms: u64) -> Result<(u32, u64, Option<u64>)> {
-    let Some(interval_ms) = schedule.interval_ms else {
-        return Ok((1, schedule.next_due_ms, None));
-    };
-    let elapsed = now_ms.saturating_sub(schedule.next_due_ms);
-    let count = elapsed / interval_ms + 1;
-    let last_due_ms = schedule
-        .next_due_ms
-        .checked_add(
-            (count - 1)
-                .checked_mul(interval_ms)
-                .context("schedule overflow")?,
-        )
-        .context("schedule overflow")?;
-    let next_due_ms = last_due_ms
-        .checked_add(interval_ms)
-        .context("schedule overflow")?;
-    Ok((
-        u32::try_from(count).unwrap_or(u32::MAX),
-        last_due_ms,
-        Some(next_due_ms),
-    ))
-}
-
-fn sorted_schedules(schedules: &HashMap<ScheduleId, BrainSchedule>) -> Vec<BrainSchedule> {
-    let mut schedules = schedules.values().cloned().collect::<Vec<_>>();
-    schedules.sort_by_key(|schedule| (schedule.next_due_ms, schedule.schedule_id.0));
-    schedules
-}
-
-fn sorted_schedule_dues(dues: &HashMap<RunId, BrainScheduleDue>) -> Vec<BrainScheduleDue> {
-    let mut dues = dues.values().cloned().collect::<Vec<_>>();
-    dues.sort_by_key(|due| (due.due_at_ms, due.schedule_id.0, due.run.run_id.0));
-    dues
-}
-
-fn validate_run_transition(from: BrainRunStatus, to: BrainRunStatus) -> Result<()> {
-    use BrainRunStatus::*;
-    let allowed = match from {
-        QueuedForEnvironment => matches!(to, Running | Cancelled | Failed),
-        Running => matches!(
-            to,
-            AwaitingApproval | Completed | Failed | Cancelled | Interrupted
-        ),
-        AwaitingApproval => matches!(to, Running | Failed | Cancelled | Interrupted),
-        Interrupted => matches!(to, Running | Failed | Cancelled),
-        Completed | Failed | Cancelled => false,
-    };
-    if !allowed {
-        anyhow::bail!("invalid Brain run transition from {from:?} to {to:?}");
-    }
-    if from.is_terminal() {
-        anyhow::bail!("terminal Brain run cannot transition");
-    }
-    Ok(())
-}
-
-const fn initial_environment_generation() -> u64 {
-    1
-}
-
-const fn legacy_brain_event_schema_version() -> u32 {
-    1
-}
-
-/// Schema v14 added explicit event-envelope RunId correlation. Reconstruct
-/// completed v13 speculative transcripts from the durable run lifecycle so an
-/// old helper turn cannot enter ordinary provider context after upgrade.
-fn backfill_legacy_speculative_run_correlation(events: &mut [BrainEvent]) {
-    struct LegacySpeculativeRun {
-        run_id: RunId,
-        request_seq: u64,
-        started_seq: u64,
-        terminal_seq: Option<u64>,
-    }
-
-    let runs = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            BrainEventKind::RunStarted { run }
-                if event.schema_version < 14 && run.kind == BrainRunKind::Speculative =>
-            {
-                let terminal_seq = events.iter().find_map(|candidate| match &candidate.kind {
-                    BrainEventKind::RunStatusChanged { run_id, status, .. }
-                        if *run_id == run.run_id
-                            && candidate.seq > event.seq
-                            && status.is_terminal() =>
-                    {
-                        Some(candidate.seq)
-                    }
-                    _ => None,
-                });
-                Some(LegacySpeculativeRun {
-                    run_id: run.run_id,
-                    request_seq: run.request_seq,
-                    started_seq: event.seq,
-                    terminal_seq,
-                })
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    for run in runs {
-        let end_seq = run.terminal_seq.unwrap_or_else(|| {
-            events
-                .iter()
-                .filter_map(|event| match &event.kind {
-                    BrainEventKind::RunStarted { run: later }
-                        if event.seq > run.started_seq && later.request_seq > run.request_seq =>
-                    {
-                        Some(later.request_seq.saturating_sub(1))
-                    }
-                    _ => None,
-                })
-                .min()
-                .unwrap_or(u64::MAX)
-        });
-        let provider_program_seqs = events
-            .iter()
-            .filter(|event| {
-                event.seq > run.started_seq
-                    && event.seq <= end_seq
-                    && event.sender == "provider"
-                    && matches!(event.kind, BrainEventKind::Program { .. })
-            })
-            .map(|event| event.seq)
-            .collect::<HashSet<_>>();
-
-        for event in events.iter_mut() {
-            if event.run_id.is_some() || event.schema_version >= 14 {
-                continue;
-            }
-            let lifecycle_match = match &event.kind {
-                BrainEventKind::RunStarted { run: started } => started.run_id == run.run_id,
-                BrainEventKind::RunStatusChanged { run_id, .. } => *run_id == run.run_id,
-                _ => false,
-            };
-            let referenced_seq = match &event.kind {
-                BrainEventKind::ToolCall { request_seq, .. }
-                | BrainEventKind::ToolResult { request_seq, .. }
-                | BrainEventKind::ApprovalRequested { request_seq, .. }
-                | BrainEventKind::ApprovalDecided { request_seq, .. }
-                | BrainEventKind::EffectRecorded { request_seq, .. }
-                | BrainEventKind::Result { request_seq, .. }
-                | BrainEventKind::RuntimeCommitted { request_seq, .. } => Some(*request_seq),
-                _ => None,
-            };
-            let correlated = event.seq == run.request_seq
-                || lifecycle_match
-                || (event.seq > run.started_seq
-                    && event.seq <= end_seq
-                    && event.sender == "provider"
-                    && matches!(event.kind, BrainEventKind::Program { .. }))
-                || referenced_seq.is_some_and(|seq| {
-                    seq == run.request_seq || provider_program_seqs.contains(&seq)
-                });
-            if correlated {
-                event.run_id = Some(run.run_id);
-            }
-        }
-    }
-}
-
-fn legacy_schedule_attachment_id() -> AttachmentId {
-    AttachmentId(uuid::Uuid::nil())
-}
-
-const fn legacy_schedule_language() -> ProgramLanguage {
-    ProgramLanguage::Forth
 }
 
 #[cfg(test)]

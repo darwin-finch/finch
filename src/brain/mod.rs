@@ -4,32 +4,44 @@
 //! the named Brain service. There is deliberately no second client-local
 //! "Brain session" or hidden context-injection path here.
 
+mod attachment;
 mod credential;
 pub(crate) mod effect_audit_archive;
+mod journal;
+mod projection;
+mod run;
+mod schedule;
 
 // Re-export the caller-facing items of the private children so callers use
 // `crate::brain::Item` and never name a child module.
+pub use attachment::{
+    AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, ConnectionId,
+};
 pub use credential::{
     default_participant_scopes, permitted_participant_scopes, BrainCredentialAuthority,
     BrainCredentialClaims, BrainCredentialRequest, BrainCredentialScope, BrainInvitationClaims,
     BrainInvitationRequest,
 };
+pub use journal::{
+    BrainEvent, BrainEventKind, BrainId, BrainMutationOutcome, BrainMutationReceipt, BrainProgram,
+};
 pub use names::generate;
+pub use projection::{BrainEnvironment, BrainSnapshot, BrainWireMessage};
 pub use remote::{
     AttachedBrainClient, RemoteBrainCapabilities, RemoteBrainClient, RemoteBrainTarget,
 };
+pub use run::{
+    BrainRun, BrainRunCancellationReservation, BrainRunKind, BrainRunStatus, BrainRunnerHandoff,
+    BrainRunnerLease, RunId, RunnerHandoffId, RunnerLeaseId,
+};
+pub use schedule::{
+    BrainInitialization, BrainSchedule, BrainScheduleDeliveryPolicy, BrainScheduleDue,
+    BrainScheduleModuleIdentity, ProgramLanguage, ScheduleId,
+};
+pub use store::BrainStore;
 #[cfg(test)]
 pub(crate) use store::{directory_listing_for_tests, seed_scheduled_brain_for_tests};
 pub(crate) use store::{unix_millis, EffectAuditAuthorityGrant};
-pub use store::{
-    AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
-    BrainEvent, BrainEventKind, BrainId, BrainInitialization, BrainMutationOutcome,
-    BrainMutationReceipt, BrainProgram, BrainRun, BrainRunCancellationReservation, BrainRunKind,
-    BrainRunStatus, BrainRunnerHandoff, BrainRunnerLease, BrainSchedule,
-    BrainScheduleDeliveryPolicy, BrainScheduleDue, BrainScheduleModuleIdentity, BrainSnapshot,
-    BrainStore, BrainWireMessage, ConnectionId, ProgramLanguage, RunId, RunnerHandoffId,
-    RunnerLeaseId, ScheduleId,
-};
 pub use tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 mod names;
 mod remote;
