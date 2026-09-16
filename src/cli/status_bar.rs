@@ -120,39 +120,45 @@ impl StatusBar {
             });
         }
 
-        if let Some(content) = lines.get(&StatusLineType::ConversationTopic) {
-            result.push(StatusLine {
-                line_type: StatusLineType::ConversationTopic,
-                content: content.clone(),
-            });
-        }
+        let has_brain_context = lines
+            .keys()
+            .any(|key| matches!(key, StatusLineType::BrainContextLine(_)));
 
-        if let Some(content) = lines.get(&StatusLineType::ConversationFocus) {
-            result.push(StatusLine {
-                line_type: StatusLineType::ConversationFocus,
-                content: content.clone(),
-            });
-        }
+        // MemTree centroid lines (📋 / now) duplicate the Brain log (💬 / now)
+        // once a named Brain is attached. Keep 🧠 recalled N; show only the
+        // durable Brain transcript tree when it exists.
+        if !has_brain_context {
+            if let Some(content) = lines.get(&StatusLineType::ConversationTopic) {
+                result.push(StatusLine {
+                    line_type: StatusLineType::ConversationTopic,
+                    content: content.clone(),
+                });
+            }
 
-        // ContextLine(N) — depth-sliced context summary lines, sorted by index.
-        // These replace ConversationTopic + ConversationFocus in new code; both
-        // can coexist without collision since they use distinct map keys.
-        let mut ctx_entries: Vec<(usize, String)> = lines
-            .iter()
-            .filter_map(|(k, v)| {
-                if let StatusLineType::ContextLine(n) = k {
-                    Some((*n, v.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        ctx_entries.sort_by_key(|(n, _)| *n);
-        for (n, content) in ctx_entries {
-            result.push(StatusLine {
-                line_type: StatusLineType::ContextLine(n),
-                content,
-            });
+            if let Some(content) = lines.get(&StatusLineType::ConversationFocus) {
+                result.push(StatusLine {
+                    line_type: StatusLineType::ConversationFocus,
+                    content: content.clone(),
+                });
+            }
+
+            let mut ctx_entries: Vec<(usize, String)> = lines
+                .iter()
+                .filter_map(|(k, v)| {
+                    if let StatusLineType::ContextLine(n) = k {
+                        Some((*n, v.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            ctx_entries.sort_by_key(|(n, _)| *n);
+            for (n, content) in ctx_entries {
+                result.push(StatusLine {
+                    line_type: StatusLineType::ContextLine(n),
+                    content,
+                });
+            }
         }
 
         let mut brain_entries: Vec<(usize, String)> = lines
@@ -593,6 +599,37 @@ mod tests {
         assert_eq!(lines[0].line_type, StatusLineType::MemoryContext);
         assert_eq!(lines[1].line_type, StatusLineType::BrainContextLine(0));
         assert_eq!(lines[1].content, "Brain turn");
+    }
+
+    #[test]
+    fn brain_log_hides_duplicate_memtree_conversation_tree() {
+        let status = StatusBar::new();
+        status.update_line(StatusLineType::MemoryContext, "🧠 recalled 2");
+        status.update_line(StatusLineType::ContextLine(0), "📋 semantic topic");
+        status.update_line(StatusLineType::ContextLine(1), "   └─ now: semantic focus");
+        status.update_line(StatusLineType::BrainContextLine(0), "💬 shammah: test");
+        status.update_line(
+            StatusLineType::BrainContextLine(1),
+            "   └─ now: daemon: Test received successfully.",
+        );
+
+        let lines = status.get_lines();
+        let contents: Vec<&str> = lines.iter().map(|line| line.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            [
+                "🧠 recalled 2",
+                "💬 shammah: test",
+                "   └─ now: daemon: Test received successfully.",
+            ],
+            "MemTree 📋/now must not stack under the Brain 💬/now tree"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| matches!(line.line_type, StatusLineType::ContextLine(_))),
+            "ContextLine must stay stored but not rendered while BrainContextLine is present"
+        );
     }
 
     #[test]
