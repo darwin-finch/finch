@@ -782,11 +782,12 @@ impl EventLoop {
                         self.pending_queries.clear();
                     }
 
-                    // If we were in plan/executing mode, cancel that too so the
+                    // Plan/executing overlays cancel with the query so the
                     // user doesn't have to press Ctrl+C again to escape.
+                    // AutoAccept is a working mode: keep it across query cancel.
                     {
                         let mode = self.mode.read().await.clone();
-                        if !matches!(mode, ReplMode::Normal) {
+                        if mode.is_plan_overlay() {
                             *self.mode.write().await = ReplMode::Normal;
                             self.update_plan_mode_indicator(&ReplMode::Normal);
                         }
@@ -803,10 +804,10 @@ impl EventLoop {
                     tracing::info!("Query {} cancellation requested by user", qid);
                 } else {
                     // No active query — Ctrl+C when idle:
-                    //   • in plan/executing mode → exit that mode, stay in finch
-                    //   • in normal mode → exit finch entirely (like /quit)
+                    //   • in plan/executing overlay → exit that mode, stay in finch
+                    //   • in Normal or AutoAccept → exit finch entirely (like /quit)
                     let mode = self.mode.read().await.clone();
-                    if !matches!(mode, ReplMode::Normal) {
+                    if mode.is_plan_overlay() {
                         *self.mode.write().await = ReplMode::Normal;
                         self.update_plan_mode_indicator(&ReplMode::Normal);
                         self.output_manager

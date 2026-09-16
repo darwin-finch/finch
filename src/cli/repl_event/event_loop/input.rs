@@ -206,61 +206,92 @@ Rules:\n\
                         let current_mode = self.mode.read().await.clone();
                         match current_mode {
                             ReplMode::Normal => {
-                                // Gobble ALL items from the vocabulary stack.
-                                // If multiple words have accumulated, drain the whole stack and
-                                // stream a plan response — non-blocking so the user can keep
-                                // pushing more words while the AI is thinking.
-                                // If only one word (or re-planning the stored word), use the full
-                                // IMCPD planner for a deeper, multi-iteration plan.
-                                let all_words: Vec<String> = {
-                                    let mut s = self.stack.lock().await;
-                                    std::mem::take(&mut *s)
-                                };
-
-                                if all_words.len() >= 2 {
-                                    // Multiple concepts — gobble all, stream a combined plan.
-                                    self.plan_word = None; // consumed; re-plan starts fresh
-                                    let task = format!(
-                                        "I've been building a vocabulary: {}. \
-                                         Synthesise these concepts into a concrete plan. \
-                                         What connects them? What should I build or do?",
-                                        all_words.join(", ")
+                                // Empty Shift+Tab enters auto-accept. Stack words still
+                                // start a plan from Normal (unchanged).
+                                let stack_len = self.stack.lock().await.len();
+                                if stack_len == 0 && self.plan_word.is_none() {
+                                    *self.mode.write().await = ReplMode::AutoAccept;
+                                    self.output_manager.write_info(
+                                        "⏵⏵ Auto-accept on. Tools and programs run without prompts.\n\
+                                         Shift+tab cycles to plan mode.",
                                     );
-                                    self.execute_chat_response(task).await?;
+                                    self.update_plan_mode_indicator(&ReplMode::AutoAccept);
+                                    self.render_tui().await?;
                                 } else {
-                                    // Single word (or re-plan): full IMCPD plan loop.
-                                    let stack_word = if let Some(word) = self.plan_word.clone() {
-                                        Some(word)
-                                    } else {
-                                        all_words.into_iter().next().map(|word| {
-                                            self.plan_word = Some(word.clone());
-                                            word
-                                        })
+                                    // Gobble ALL items from the vocabulary stack.
+                                    // If multiple words have accumulated, drain the whole stack and
+                                    // stream a plan response — non-blocking so the user can keep
+                                    // pushing more words while the AI is thinking.
+                                    // If only one word (or re-planning the stored word), use the full
+                                    // IMCPD planner for a deeper, multi-iteration plan.
+                                    let all_words: Vec<String> = {
+                                        let mut s = self.stack.lock().await;
+                                        std::mem::take(&mut *s)
                                     };
 
-                                    if let Some(task) = stack_word {
-                                        // Kick off the full IMPCPD plan loop for the popped word.
-                                        self.handle_plan_task(task).await?;
+                                    if all_words.len() >= 2 {
+                                        // Multiple concepts — gobble all, stream a combined plan.
+                                        self.plan_word = None; // consumed; re-plan starts fresh
+                                        let task = format!(
+                                            "I've been building a vocabulary: {}. \
+                                         Synthesise these concepts into a concrete plan. \
+                                         What connects them? What should I build or do?",
+                                            all_words.join(", ")
+                                        );
+                                        self.execute_chat_response(task).await?;
                                     } else {
-                                        // No stack word — plain plan mode entry
-                                        let plan_path = std::env::temp_dir()
-                                            .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
-                                        let new_mode = ReplMode::Planning {
-                                            task: "Manual exploration".to_string(),
-                                            plan_path: plan_path.clone(),
-                                            created_at: chrono::Utc::now(),
+                                        // Single word (or re-plan): full IMCPD plan loop.
+                                        let stack_word = if let Some(word) = self.plan_word.clone()
+                                        {
+                                            Some(word)
+                                        } else {
+                                            all_words.into_iter().next().map(|word| {
+                                                self.plan_word = Some(word.clone());
+                                                word
+                                            })
                                         };
-                                        *self.mode.write().await = new_mode.clone();
-                                        self.output_manager.write_info(
-                                            "📋 Entered plan mode.\n\
+
+                                        if let Some(task) = stack_word {
+                                            // Kick off the full IMPCPD plan loop for the popped word.
+                                            self.handle_plan_task(task).await?;
+                                        } else {
+                                            // No stack word — plain plan mode entry
+                                            let plan_path = std::env::temp_dir()
+                                                .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
+                                            let new_mode = ReplMode::Planning {
+                                                task: "Manual exploration".to_string(),
+                                                plan_path: plan_path.clone(),
+                                                created_at: chrono::Utc::now(),
+                                            };
+                                            *self.mode.write().await = new_mode.clone();
+                                            self.output_manager.write_info(
+                                                "📋 Entered plan mode.\n\
                                          You can explore the codebase using read-only tools:\n\
                                          - Read files, glob, grep, web_fetch are allowed\n\
                                          - Write, edit, bash are restricted\n\
                                          Use /plan to exit plan mode.",
-                                        );
-                                        self.update_plan_mode_indicator(&new_mode);
+                                            );
+                                            self.update_plan_mode_indicator(&new_mode);
+                                        }
                                     }
-                                } // end single-word else branch
+                                }
+                            }
+                            ReplMode::AutoAccept => {
+                                let plan_path = std::env::temp_dir()
+                                    .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
+                                let new_mode = ReplMode::Planning {
+                                    task: "Manual exploration".to_string(),
+                                    plan_path: plan_path.clone(),
+                                    created_at: chrono::Utc::now(),
+                                };
+                                *self.mode.write().await = new_mode.clone();
+                                self.output_manager.write_info(
+                                    "📋 Entered plan mode.\n\
+                                     You can explore the codebase using read-only tools.\n\
+                                     Shift+tab returns to confirmation mode.",
+                                );
+                                self.update_plan_mode_indicator(&new_mode);
+                                self.render_tui().await?;
                             }
                             ReplMode::Planning { .. } | ReplMode::Executing { .. } => {
                                 // Exit plan mode, return to normal; clear plan_word

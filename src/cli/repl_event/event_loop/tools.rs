@@ -430,6 +430,10 @@ impl EventLoop {
         prompt: crate::vm::ApprovalPrompt,
         response_tx: tokio::sync::oneshot::Sender<crate::vm::ApprovalChoice>,
     ) -> Result<()> {
+        if self.mode.read().await.auto_accepts_host_effects() {
+            let _ = response_tx.send(crate::vm::ApprovalChoice::AllowSession);
+            return Ok(());
+        }
         if self.pending_vm_approval.is_some() {
             let _ = response_tx.send(crate::vm::ApprovalChoice::Deny);
             self.output_manager.write_error(

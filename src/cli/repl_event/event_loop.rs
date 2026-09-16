@@ -3783,6 +3783,40 @@ impl EventLoop {
         {
             return Ok(());
         }
+        if self.mode.read().await.auto_accepts_host_effects() {
+            while let Some(pending) = self.queued_remote_brain_approvals.pop_front() {
+                let decision = match &pending.kind {
+                    RemoteBrainApprovalKind::Tool(_) => {
+                        serde_json::json!({"choice": "approve_session"})
+                    }
+                    RemoteBrainApprovalKind::Vm { .. } => {
+                        serde_json::to_value(crate::vm::ApprovalChoice::AllowSession)
+                            .unwrap_or_else(|_| serde_json::json!({"choice": "deny"}))
+                    }
+                };
+                let client = pending.client;
+                let request_seq = pending.request_seq;
+                let approval_id = pending.approval_id;
+                let event_tx = self.event_tx.clone();
+                let target = client.target.display_name();
+                tokio::task::spawn_local(async move {
+                    if let Err(error) = client
+                        .push(crate::brain::BrainEventKind::ApprovalDecided {
+                            request_seq,
+                            approval_id,
+                            decision,
+                        })
+                        .await
+                    {
+                        let _ = event_tx.send(ReplEvent::RemoteBrainError {
+                            target,
+                            error: error.to_string(),
+                        });
+                    }
+                });
+            }
+            return Ok(());
+        }
         let mut tui = self.tui_renderer.lock().await;
         if tui.active_dialog.is_some() {
             return Ok(());
@@ -4314,12 +4348,17 @@ impl EventLoop {
 /// Status-bar text for a REPL mode.
 ///
 /// This is the only surface that reports the current mode, so the string must
-/// describe what the mode actually does. `crate::tools::PermissionManager::check_tool_use`
-/// decides every approval and does not take a `ReplMode`. The executor's only
-/// mode branch restricts tools in `Planning`; no variant waives an approval.
+/// describe what the mode actually does. `PermissionManager::check_tool_use`
+/// still returns AskUser for host-effect tools in every mode, including
+/// `AutoAccept`. The waiver lives at the REPL dialog (`ToolExecutionCoordinator`
+/// and `handle_vm_approval_request`), not inside the permission manager. The
+/// executor's only mode branch still *restricts* `Planning`.
 pub(crate) fn plan_mode_indicator(mode: &ReplMode) -> &'static str {
     match mode {
-        ReplMode::Normal => "⏵ tools require confirmation (shift+tab for plan mode)",
+        ReplMode::Normal => "⏵ tools require confirmation (shift+tab cycles modes)",
+        ReplMode::AutoAccept => {
+            "⏵⏵ auto-accept on — tools and programs run without prompts (shift+tab to cycle)"
+        }
         ReplMode::Planning { .. } => "⏸ plan mode: inspection tools only (shift+tab to exit)",
         ReplMode::Executing { .. } => {
             "▶ executing plan: tools still require confirmation (shift+tab to exit)"
