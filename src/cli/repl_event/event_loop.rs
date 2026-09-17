@@ -4543,16 +4543,14 @@ fn project_brain_context(
     let lines = projected_brain_context_lines(events, depth, local_machine);
     let count = lines.len();
     for (index, text) in lines.into_iter().enumerate() {
-        let label = if count == 1 || index + 1 == count {
-            format!("   └─ now: {text}")
-        } else if index == 0 {
-            format!("💬 {text}")
-        } else {
-            format!("   ├─ {text}")
-        };
         status_bar.update_line(
             crate::cli::status_bar::StatusLineType::BrainContextLine(index),
-            label,
+            crate::cli::status_bar::recap_tree_label(
+                index,
+                count,
+                &text,
+                crate::cli::status_bar::RECAP_BRAIN_ROOT,
+            ),
         );
     }
     for index in count..8 {

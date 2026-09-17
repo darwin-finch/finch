@@ -49,6 +49,35 @@ pub enum StatusLineType {
     Custom(String),
 }
 
+/// First-line glyph for a MemTree recap tree.
+pub(crate) const RECAP_MEMTREE_ROOT: &str = "📋";
+/// First-line glyph for a Brain recap tree.
+pub(crate) const RECAP_BRAIN_ROOT: &str = "💬";
+
+const RECAP_NOW_PREFIX: &str = "   └─ now: ";
+const RECAP_BRANCH_PREFIX: &str = "   ├─ ";
+
+/// Label one recap line. Only a singleton or the last of several is `now:`.
+pub(crate) fn recap_tree_label(index: usize, count: usize, text: &str, root_glyph: &str) -> String {
+    let text = recap_line_body(text);
+    if count <= 1 || index + 1 == count {
+        format!("{RECAP_NOW_PREFIX}{text}")
+    } else if index == 0 {
+        format!("{root_glyph} {text}")
+    } else {
+        format!("{RECAP_BRANCH_PREFIX}{text}")
+    }
+}
+
+fn recap_line_body(content: &str) -> &str {
+    content
+        .strip_prefix(RECAP_NOW_PREFIX)
+        .or_else(|| content.strip_prefix(RECAP_BRANCH_PREFIX))
+        .or_else(|| content.strip_prefix("💬 "))
+        .or_else(|| content.strip_prefix("📋 "))
+        .unwrap_or(content)
+}
+
 /// A single status line
 #[derive(Debug, Clone)]
 pub struct StatusLine {
@@ -124,9 +153,9 @@ impl StatusBar {
             .keys()
             .any(|key| matches!(key, StatusLineType::BrainContextLine(_)));
 
-        // MemTree centroid lines (📋 / now) duplicate the Brain log (💬 / now)
-        // once a named Brain is attached. Keep 🧠 recalled N; show only the
-        // durable Brain transcript tree when it exists.
+        // Legacy topic/focus slots stay hidden once a Brain recap exists.
+        // ContextLine + BrainContextLine fold into one recap tree so two
+        // singleton projectors cannot each print `└─ now:`.
         if !has_brain_context {
             if let Some(content) = lines.get(&StatusLineType::ConversationTopic) {
                 result.push(StatusLine {
@@ -141,26 +170,20 @@ impl StatusBar {
                     content: content.clone(),
                 });
             }
-
-            let mut ctx_entries: Vec<(usize, String)> = lines
-                .iter()
-                .filter_map(|(k, v)| {
-                    if let StatusLineType::ContextLine(n) = k {
-                        Some((*n, v.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            ctx_entries.sort_by_key(|(n, _)| *n);
-            for (n, content) in ctx_entries {
-                result.push(StatusLine {
-                    line_type: StatusLineType::ContextLine(n),
-                    content,
-                });
-            }
         }
 
+        let mut recap_entries: Vec<(StatusLineType, String)> = Vec::new();
+        let mut ctx_entries: Vec<(usize, String)> = lines
+            .iter()
+            .filter_map(|(k, v)| {
+                if let StatusLineType::ContextLine(n) = k {
+                    Some((*n, v.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ctx_entries.sort_by_key(|(n, _)| *n);
         let mut brain_entries: Vec<(usize, String)> = lines
             .iter()
             .filter_map(|(key, value)| match key {
@@ -169,10 +192,38 @@ impl StatusBar {
             })
             .collect();
         brain_entries.sort_by_key(|(index, _)| *index);
-        for (index, content) in brain_entries {
+
+        // A full Brain 💬/now tree still hides the MemTree 📋/now tree.
+        // Two singleton `now:` projectors are one recap, not two trees: keep
+        // both lines and re-prefix so only the last is `now:`.
+        let fold_singleton_now = ctx_entries.len() == 1
+            && brain_entries.len() == 1
+            && ctx_entries[0].1.contains("└─ now:")
+            && brain_entries[0].1.contains("└─ now:");
+        if has_brain_context && !fold_singleton_now {
+            ctx_entries.clear();
+        }
+
+        recap_entries.extend(
+            ctx_entries
+                .into_iter()
+                .map(|(n, content)| (StatusLineType::ContextLine(n), content)),
+        );
+        recap_entries.extend(
+            brain_entries
+                .into_iter()
+                .map(|(index, content)| (StatusLineType::BrainContextLine(index), content)),
+        );
+
+        let recap_count = recap_entries.len();
+        let root_glyph = match recap_entries.first().map(|(line_type, _)| line_type) {
+            Some(StatusLineType::ContextLine(_)) => RECAP_MEMTREE_ROOT,
+            _ => RECAP_BRAIN_ROOT,
+        };
+        for (index, (line_type, content)) in recap_entries.into_iter().enumerate() {
             result.push(StatusLine {
-                line_type: StatusLineType::BrainContextLine(index),
-                content,
+                line_type,
+                content: recap_tree_label(index, recap_count, &content, root_glyph),
             });
         }
 
@@ -598,7 +649,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].line_type, StatusLineType::MemoryContext);
         assert_eq!(lines[1].line_type, StatusLineType::BrainContextLine(0));
-        assert_eq!(lines[1].content, "Brain turn");
+        assert_eq!(lines[1].content, "   └─ now: Brain turn");
     }
 
     #[test]
@@ -628,7 +679,43 @@ mod tests {
             !lines
                 .iter()
                 .any(|line| matches!(line.line_type, StatusLineType::ContextLine(_))),
-            "ContextLine must stay stored but not rendered while BrainContextLine is present"
+            "ContextLine must stay stored but not rendered while a Brain 💬/now tree is present"
+        );
+    }
+
+    #[test]
+    fn two_singleton_now_recaps_fold_into_one_tree() {
+        let status = StatusBar::new();
+        status.update_line(StatusLineType::MemoryContext, "🧠 recalled 2");
+        status.update_line(
+            StatusLineType::ContextLine(0),
+            "   └─ now: I think Finch is unusually ambitious…",
+        );
+        status.update_line(
+            StatusLineType::BrainContextLine(0),
+            "   └─ now: shammah: hello",
+        );
+
+        let contents: Vec<String> = status
+            .get_lines()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        assert_eq!(
+            contents,
+            vec![
+                "🧠 recalled 2".to_string(),
+                "📋 I think Finch is unusually ambitious…".to_string(),
+                "   └─ now: shammah: hello".to_string(),
+            ],
+            "two singleton now: projectors must render as one recap tree"
+        );
+        assert_eq!(
+            contents
+                .iter()
+                .filter(|line| line.contains("└─ now:"))
+                .count(),
+            1
         );
     }
 
