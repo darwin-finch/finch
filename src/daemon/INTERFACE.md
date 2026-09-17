@@ -22,8 +22,10 @@ impl DaemonLifecycle {
     pub fn acquire_instance(&self) -> Result<DaemonInstanceGuard>;
     /// Remove PID file (called on shutdown)
     pub fn cleanup(&self) -> Result<()>;
-    /// True when a pid file or IPC socket remains but no daemon process is alive.
+    /// True when crash leftovers remain that [`Self::stop_daemon`] would reap.
     pub fn has_stale_files(&self) -> bool;
+    /// True when something is listening on the daemon IPC socket right now.
+    pub fn ipc_listener_alive(&self) -> bool;
     /// Check if daemon is currently running  Returns true if: - PID file exists - PID can be parsed - Process with that PID exists
     pub fn is_running(&self) -> bool;
     /// Create a new daemon lifecycle manager

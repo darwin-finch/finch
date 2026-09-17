@@ -1445,10 +1445,8 @@ fn run_daemon_stop() -> Result<()> {
 
     let lifecycle = DaemonLifecycle::new()?;
 
-    // Always run stop_daemon, including when is_running is false. A crashed
-    // daemon leaves a pid file (and often a socket) whose process is gone;
-    // skipping cleanup is what printed "Daemon is not running" while those
-    // leftovers remained.
+    // Always call stop_daemon so crash leftovers are reaped even when
+    // is_running is false.
     if lifecycle.is_running() {
         let pid = lifecycle.read_pid()?;
         println!("Stopping daemon (PID: {})...", pid);
@@ -1472,6 +1470,21 @@ async fn run_daemon_status() -> Result<()> {
     // Check if daemon is running
     if !lifecycle.is_running() {
         use crossterm::style::Stylize as _;
+        if lifecycle.ipc_listener_alive() {
+            // A live listener is not crash leftovers: daemon-stop refuses to
+            // unlink a live socket, so suggesting it as cleanup would never
+            // clear the warning.
+            println!(
+                "{}",
+                "⚠ No daemon PID file, but the IPC socket still has a live listener"
+                    .yellow()
+                    .bold()
+            );
+            println!("  A process is still serving on the IPC socket; it may be a daemon");
+            println!("  whose PID file was lost. `finch daemon-stop` will not remove a");
+            println!("  live socket.");
+            return Ok(());
+        }
         println!("{}", "⚠ Daemon is not running".yellow().bold());
         if lifecycle.has_stale_files() {
             println!("  Leftover pid or socket files remain from a crashed process.");
