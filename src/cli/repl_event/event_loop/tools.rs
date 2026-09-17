@@ -81,15 +81,16 @@ impl EventLoop {
             }
         };
 
-        // Look up the tool's WorkUnit and row index
-        let (tool_name, tool_input, work_unit, row_idx) = {
+        // Look up the tool's WorkUnit and row index. An untracked id must
+        // still land on the query's live Tools unit rather than a new root
+        // titled with the raw provider tool id.
+        let tracked = {
             let mut map = self.active_tool_uses.write().await;
-            map.remove(&tool_id).unwrap_or_else(|| {
-                // Fallback: create a standalone WorkUnit for untracked tools
-                let fallback = self.output_manager.start_work_unit("Tool");
-                let row_idx = fallback.add_row(&tool_id);
-                (tool_id.clone(), serde_json::Value::Null, fallback, row_idx)
-            })
+            map.remove(&tool_id)
+        };
+        let (tool_name, tool_input, work_unit, row_idx) = match tracked {
+            Some(entry) => entry,
+            None => self.attach_untracked_tool_result(query_id, &tool_id).await,
         };
 
         // Update the row in the WorkUnit with a semantic summary + optional body
@@ -177,6 +178,51 @@ impl EventLoop {
         }
 
         Ok(())
+    }
+
+    /// Attach a ToolResult whose id was never registered to the query Tools
+    /// unit. Creating `start_work_unit("Tool")` with the raw provider id is
+    /// how loop-detect used to spawn a second sticky root.
+    async fn attach_untracked_tool_result(
+        &self,
+        query_id: Uuid,
+        tool_id: &str,
+    ) -> (
+        String,
+        serde_json::Value,
+        Arc<crate::cli::messages::WorkUnit>,
+        usize,
+    ) {
+        if let Some(unit) = self.query_states.tool_work_unit(query_id).await {
+            let row_idx = unit.add_row("tool");
+            return (tool_id.to_string(), serde_json::Value::Null, unit, row_idx);
+        }
+        if let Some(unit) = self
+            .query_states
+            .live_tool_work_units()
+            .await
+            .into_iter()
+            .next()
+        {
+            let row_idx = unit.add_row("tool");
+            return (tool_id.to_string(), serde_json::Value::Null, unit, row_idx);
+        }
+        let map = self.active_tool_uses.read().await;
+        if let Some((_, _, unit, _)) = map.values().next() {
+            let unit = Arc::clone(unit);
+            drop(map);
+            let row_idx = unit.add_row("tool");
+            return (tool_id.to_string(), serde_json::Value::Null, unit, row_idx);
+        }
+        drop(map);
+        let fallback = self.output_manager.start_work_unit("Tools");
+        let row_idx = fallback.add_row("tool");
+        (
+            tool_id.to_string(),
+            serde_json::Value::Null,
+            fallback,
+            row_idx,
+        )
     }
 
     /// Finalize tool execution (all tools complete, re-invoke Claude)

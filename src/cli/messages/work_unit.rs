@@ -380,6 +380,32 @@ impl WorkUnit {
         self.add_row_with_presentation(label, WorkRowPresentation::Tool)
     }
 
+    /// Indices of `spawn_agent` tool rows, newest last.
+    ///
+    /// Labels may include ANSI from `format_tool_label`; the tool name itself
+    /// is still present as a substring.
+    pub(crate) fn spawn_agent_row_indices(&self) -> Vec<usize> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        inner
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.label.contains("spawn_agent"))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// True when this unit is internal lifecycle activity, not a Tools group.
+    pub(crate) fn is_activity_presentation(&self) -> bool {
+        matches!(
+            self.inner
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .presentation,
+            WorkUnitPresentation::Activity { .. }
+        )
+    }
+
     /// Add a running internal lifecycle row that is not a model tool call.
     pub fn add_activity_row(&self, label: impl Into<String>) -> usize {
         self.add_row_with_presentation(label, WorkRowPresentation::Activity)

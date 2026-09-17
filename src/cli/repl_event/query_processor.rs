@@ -809,6 +809,41 @@ async fn persist_completed_turn_memory(
     refresh_context_strip(memory_system, session_label, cwd, status_bar, context_lines).await;
 }
 
+/// Register a tool row and emit a terminal `ToolResult` without spawning.
+///
+/// The row must be in `active_tool_uses` so `handle_tool_result` updates this
+/// labeled call instead of creating a fallback WorkUnit titled with the raw
+/// provider tool id.
+async fn register_unexecuted_tool_result(
+    tool_id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    work_unit: &Arc<crate::cli::messages::WorkUnit>,
+    active_tool_uses: &ActiveToolUsesMap,
+    event_tx: &mpsc::UnboundedSender<ReplEvent>,
+    query_id: Uuid,
+    round_token: crate::cli::conversation::ToolRoundToken,
+    error_msg: String,
+) {
+    use super::tool_display::format_tool_label;
+    let row_idx = work_unit.add_row(format_tool_label(name, input));
+    active_tool_uses.write().await.insert(
+        tool_id.to_string(),
+        (
+            name.to_string(),
+            input.clone(),
+            Arc::clone(work_unit),
+            row_idx,
+        ),
+    );
+    let _ = event_tx.send(ReplEvent::ToolResult {
+        query_id,
+        round_token,
+        tool_id: tool_id.to_string(),
+        result: Err(anyhow::anyhow!("{error_msg}")),
+    });
+}
+
 /// Dispatch a batch of tool uses for one query turn.
 ///
 /// Called from both the streaming and non-streaming response paths — they used
@@ -879,9 +914,6 @@ pub(super) async fn dispatch_tool_uses(
             *count
         };
         if !input_is_empty && call_count > 1 {
-            let label = format_tool_label(&tool_use.name, &tool_use.input);
-            let row_idx = work_unit.add_row(label);
-            work_unit.fail_row(row_idx, "loop detected");
             let error_msg = format!(
                 "LOOP DETECTED: You have called {} with the same arguments {} time(s) and received the same result each time.\n\
                  Repeating this call will not produce different output.\n\
@@ -889,20 +921,23 @@ pub(super) async fn dispatch_tool_uses(
                 tool_use.name,
                 call_count - 1
             );
-            let _ = event_tx.send(ReplEvent::ToolResult {
+            register_unexecuted_tool_result(
+                &tool_use.id,
+                &tool_use.name,
+                &tool_use.input,
+                work_unit,
+                active_tool_uses,
+                event_tx,
                 query_id,
                 round_token,
-                tool_id: tool_use.id.clone(),
-                result: Err(anyhow::anyhow!("{}", error_msg)),
-            });
+                error_msg,
+            )
+            .await;
             continue;
         }
 
         // Plan-mode gate: block destructive tools while exploring
         if !is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
-            let label = format_tool_label(&tool_use.name, &tool_use.input);
-            let row_idx = work_unit.add_row(label);
-            work_unit.fail_row(row_idx, "blocked in plan mode");
             let error_msg = format!(
                 "Tool '{}' is not allowed in planning mode.\n\
                  Reason: This tool can modify system state.\n\
@@ -910,12 +945,18 @@ pub(super) async fn dispatch_tool_uses(
                  Type /approve to execute your plan with all tools enabled.",
                 tool_use.name
             );
-            let _ = event_tx.send(ReplEvent::ToolResult {
+            register_unexecuted_tool_result(
+                &tool_use.id,
+                &tool_use.name,
+                &tool_use.input,
+                work_unit,
+                active_tool_uses,
+                event_tx,
                 query_id,
                 round_token,
-                tool_id: tool_use.id.clone(),
-                result: Err(anyhow::anyhow!("{}", error_msg)),
-            });
+                error_msg,
+            )
+            .await;
             continue;
         }
 
@@ -4123,6 +4164,148 @@ mod tests {
                  dispatch_tool_uses path; got Ok({text:?})"
             ),
         }
+    }
+
+    /// Loop-detect historically sent ToolResult without registering the id,
+    /// so handle_tool_result spawned a raw-id fallback root. The blocked
+    /// call must stay in `active_tool_uses` on a labeled bash row.
+    #[tokio::test]
+    async fn test_loop_detected_dispatch_registers_labeled_row_in_active_tool_uses() {
+        use crate::cli::output_manager::OutputManager;
+        use crate::cli::tui::TuiRenderer;
+        use crate::tools::{PermissionManager, ToolExecutor, ToolRegistry};
+
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+        let mode = Arc::new(RwLock::new(ReplMode::Normal));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(crate::tools::BashTool));
+        let tempdir = tempfile::tempdir().expect("isolated tool-pattern store for loop dispatch");
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct executor for loop-detection dispatch");
+        let (event_tx, _events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::clone(&conversation),
+            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
+            Arc::clone(&mode),
+            Arc::new(RwLock::new(None)),
+        );
+        let work_unit = output.start_work_unit("Tools");
+        query_states
+            .set_tool_work_unit(query_id, Some(Arc::clone(&work_unit)))
+            .await;
+        let active_tool_uses: ActiveToolUsesMap = Arc::new(RwLock::new(HashMap::new()));
+        let tool_call_history: Arc<RwLock<HashMap<Uuid, HashMap<String, u32>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let command = serde_json::json!({"command": "git status --porcelain"});
+        let call_key = format!("bash:{command}");
+        tool_call_history
+            .write()
+            .await
+            .entry(query_id)
+            .or_default()
+            .insert(call_key, 1);
+        let tool_id = "call_tyIrmyNxiUxYGF7QhOT1vslZ".to_string();
+        let tool_use = crate::tools::ToolUse {
+            id: tool_id.clone(),
+            name: "bash".to_string(),
+            input: command.clone(),
+        };
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                crate::providers::Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: tool_id.clone(),
+                        name: "bash".to_string(),
+                        input: command.clone(),
+                    }],
+                },
+            )
+            .expect("stage the loop-detected provider tool round");
+
+        dispatch_tool_uses(
+            vec![tool_use],
+            query_id,
+            round_token,
+            &work_unit,
+            &mode,
+            &tool_call_history,
+            &event_tx,
+            &active_tool_uses,
+            &tui_renderer,
+            &output,
+            &query_states,
+            &tool_coordinator,
+            &None,
+            crate::memory_status::Recall::none(),
+            "test-session",
+            "/test/workspace",
+            &status,
+            4,
+        )
+        .await;
+
+        let active = active_tool_uses.read().await;
+        assert!(
+            active.contains_key(&tool_id),
+            "the blocked call must stay in active_tool_uses so handle_tool_result \
+             updates the bash row instead of a raw-id fallback; keys={:?}",
+            active.keys().collect::<Vec<_>>()
+        );
+        let (name, _, unit, row_idx) = active.get(&tool_id).expect("blocked id registered");
+        assert_eq!(name, "bash");
+        let projected = unit
+            .transcript_row(&crate::theme::ColorScheme::default())
+            .expect("blocked call still belongs to the query WorkUnit");
+        let call = projected.children.get(*row_idx).unwrap_or_else(|| {
+            panic!(
+                "blocked row {row_idx} missing from transcript children; labels={:?}",
+                projected
+                    .children
+                    .iter()
+                    .map(|child| child.label.clone())
+                    .collect::<Vec<_>>()
+            )
+        });
+        assert!(
+            call.label.contains("bash"),
+            "blocked row must keep the bash label, not the provider id; got {}",
+            call.label
+        );
+        assert!(
+            !call.label.contains(&tool_id),
+            "blocked row must not be titled with the raw provider tool id; got {}",
+            call.label
+        );
+        assert_eq!(
+            output.get_messages().len(),
+            1,
+            "loop-detect dispatch must not start a second Tools root"
+        );
     }
 
     // ── Summarised request assembly (committed-range summary reuse) ────────
