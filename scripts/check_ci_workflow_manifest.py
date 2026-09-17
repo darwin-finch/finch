@@ -155,13 +155,21 @@ EXPECTED_PULL_REQUEST_OPTIONS = {
     for name in EXPECTED_PATHS
 }
 
-# Main-only jobs keep Mac/Windows off the pull-request merge gate. Equality is
-# the contract: do not invent a parser for `if:`.
+# Main-only jobs keep platform suites and release preflights off the
+# pull-request merge gate. Equality is the contract: do not invent a parser
+# for `if:`.
 MAIN_ONLY_IF = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+
+# (workflow, job) pairs that must carry MAIN_ONLY_IF, with the reason a PR
+# must not pay their cost.
+MAIN_ONLY_JOBS = {
+    ("ci.yml", "test-macos"): "the 120-minute macOS suite is not a pull-request merge gate",
+    ("ci.yml", "build"): "release preflight compiles are not pull-request merge gates",
+}
 
 EXPECTED_CHECKS = {
     "ci.yml": (
-        "Build Release (x86_64-unknown-linux-gnu)", "Runtime Authority (Ubuntu)",
+        "Runtime Authority (Ubuntu)",
         "Security Audit",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract",
@@ -1079,18 +1087,24 @@ def isolation_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     return errors
 
 
+def main_only_job_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
+    """Platform suites and release preflights stay trusted-main-only, never PR gates."""
+    errors: list[str] = []
+    for (workflow, job_id), reason in MAIN_ONLY_JOBS.items():
+        job = documents.get(workflow, {}).get("jobs", {}).get(job_id)
+        if not isinstance(job, dict) or job.get("if") != MAIN_ONLY_IF:
+            errors.append(
+                f"{workflow}: job {job_id!r} must stay main-only ({MAIN_ONLY_IF!r}); {reason}"
+            )
+    return errors
+
+
 def ordinary_ci_supervision_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     """Keep supervised isolation out of ordinary CI except the trusted-main cache warm."""
     errors = required_step_errors(
         documents, "ci.yml", "test-macos", SUPERVISOR_WARM_STEP,
         None, None, SUPERVISOR_WARM_COMMANDS,
     )
-    macos_job = documents.get("ci.yml", {}).get("jobs", {}).get("test-macos")
-    if not isinstance(macos_job, dict) or macos_job.get("if") != MAIN_ONLY_IF:
-        errors.append(
-            "ci.yml: job 'test-macos' must stay main-only "
-            f"({MAIN_ONLY_IF!r}); Mac/Windows are not pull-request merge gates"
-        )
     jobs = documents.get("ci.yml", {}).get("jobs")
     for job_id, job in (jobs.items() if isinstance(jobs, dict) else ()):
         steps = job.get("steps") if isinstance(job, dict) else None
@@ -1307,6 +1321,7 @@ def compare_contract(root: Path) -> list[str]:
                 f"unexpected={sorted(set(actual) - set(wanted))!r}"
             )
     errors.extend(migrated_boundary_errors(documents))
+    errors.extend(main_only_job_errors(documents))
     errors.extend(isolation_errors(documents))
     errors.extend(ordinary_ci_supervision_errors(documents))
     errors.extend(cache_contract_errors(documents))

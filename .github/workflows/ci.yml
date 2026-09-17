@@ -243,8 +243,15 @@ jobs:
     - name: Test all targets
       run: timeout --signal=TERM --kill-after=30s 15m cargo test --all-targets -- --nocapture
 
+  # The Linux release preflight mirrors the Apple Silicon one below: prove the
+  # release profile still compiles, warm the release cache family that
+  # release.yml restores on a v* tag, and carry the release-mode atomic history
+  # regression (#846). It is not a pull-request merge gate: the same
+  # conversation tests run in debug on every PR, and release packages are
+  # published only from tags.
   build:
     name: Build Release (x86_64-unknown-linux-gnu)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
 
     steps:
