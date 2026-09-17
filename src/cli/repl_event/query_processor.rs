@@ -999,6 +999,7 @@ pub(super) async fn dispatch_tool_uses(
         .await
         .and_then(|metadata| metadata.effect_audit);
     let current_mode = mode.read().await;
+    let mut spawn_queue: Vec<(crate::tools::ToolUse, usize)> = Vec::new();
     for tool_use in tool_uses {
         let declared_effect = {
             let executor = tool_coordinator.tool_executor().lock().await;
@@ -1106,18 +1107,42 @@ pub(super) async fn dispatch_tool_uses(
                 result,
             });
         } else {
-            // Regular tool: run concurrently in a background task
-            tool_coordinator.spawn_tool_execution(
-                query_id,
-                round_token,
-                tool_use,
-                Arc::clone(work_unit),
-                row_idx,
-                effect_audit.clone(),
-            );
+            spawn_queue.push((tool_use, row_idx));
         }
     }
     drop(current_mode);
+
+    for group in
+        super::changeset::group_consecutive_changeset(spawn_queue, |item| item.0.name.as_str())
+    {
+        let changeset_batch = group.len() > 1
+            && group
+                .iter()
+                .all(|(tool, _)| super::changeset::is_reviewed_changeset_tool(&tool.name));
+        if changeset_batch {
+            let calls = group
+                .into_iter()
+                .map(|(tool_use, row_idx)| (tool_use, Arc::clone(work_unit), row_idx))
+                .collect();
+            tool_coordinator.spawn_changeset_batch(
+                query_id,
+                round_token,
+                calls,
+                effect_audit.clone(),
+            );
+        } else {
+            for (tool_use, row_idx) in group {
+                tool_coordinator.spawn_tool_execution(
+                    query_id,
+                    round_token,
+                    tool_use,
+                    Arc::clone(work_unit),
+                    row_idx,
+                    effect_audit.clone(),
+                );
+            }
+        }
+    }
 
     // Update memory status bar now that tools are queued
     if let Some(ref mem) = memory_system {
@@ -4628,6 +4653,50 @@ mod tests {
             events
         }
 
+        async fn dispatch_tools(&mut self, tools: Vec<crate::tools::ToolUse>) {
+            let content = tools
+                .iter()
+                .map(|tool_use| ContentBlock::ToolUse {
+                    id: tool_use.id.clone(),
+                    name: tool_use.name.clone(),
+                    input: tool_use.input.clone(),
+                })
+                .collect();
+            let round_token = self
+                .conversation
+                .write()
+                .await
+                .stage_assistant(
+                    self.query_id,
+                    crate::providers::Message {
+                        role: "assistant".to_string(),
+                        content,
+                    },
+                )
+                .expect("stage the provider tool round that dispatch_tool_uses consumes");
+            dispatch_tool_uses(
+                tools,
+                self.query_id,
+                round_token,
+                &self.work_unit,
+                &self.mode,
+                &self.tool_call_history,
+                &self.event_tx,
+                &self.active_tool_uses,
+                &self.tui_renderer,
+                &self.output,
+                &self.query_states,
+                &self.tool_coordinator,
+                &None,
+                crate::memory_status::Recall::none(),
+                "test-session",
+                "/test/workspace",
+                &self.status,
+                4,
+            )
+            .await;
+        }
+
         async fn collect_until_result_or_approval(&mut self, tool_id: &str) -> Vec<ReplEvent> {
             let mut collected = Vec::new();
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -5350,6 +5419,364 @@ mod tests {
                 "empty-input tools must never loop-detect, including the third call; events={events:?}"
             );
         }
+    }
+
+    fn changeset_tool(id: &str, name: &str, input: serde_json::Value) -> crate::tools::ToolUse {
+        crate::tools::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        }
+    }
+
+    async fn recv_until(
+        events: &mut mpsc::UnboundedReceiver<ReplEvent>,
+        deadline: tokio::time::Instant,
+        mut on_event: impl FnMut(ReplEvent) -> bool,
+    ) {
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Some(event)) => {
+                    if on_event(event) {
+                        return;
+                    }
+                }
+                Ok(None) | Err(_) => return,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_one_turn_write_edit_patch_emits_one_aggregate_approval() {
+        let directory = tempfile::tempdir().expect("changeset workspace");
+        let write_path = directory.path().join("created.txt");
+        let edit_path = directory.path().join("edited.txt");
+        let patch_path = directory.path().join("patched.txt");
+        std::fs::write(&edit_path, "fn main() {}\n").expect("seed edit target");
+        std::fs::write(&patch_path, "aaa\nbbb\n").expect("seed patch target");
+        let mut harness = LoopDispatchHarness::new();
+        harness
+            .dispatch_tools(vec![
+                changeset_tool(
+                    "w1",
+                    "write",
+                    serde_json::json!({
+                        "file_path": write_path.to_string_lossy(),
+                        "content": "created\n"
+                    }),
+                ),
+                changeset_tool(
+                    "e1",
+                    "edit",
+                    serde_json::json!({
+                        "file_path": edit_path.to_string_lossy(),
+                        "old_string": "fn main() {}",
+                        "new_string": "fn main() { 1 }"
+                    }),
+                ),
+                changeset_tool(
+                    "p1",
+                    "patch",
+                    serde_json::json!({
+                        "file_path": patch_path.to_string_lossy(),
+                        "patch": "@@ -1,2 +1,2 @@\n aaa\n-bbb\n+ccc\n"
+                    }),
+                ),
+            ])
+            .await;
+
+        let mut approvals = Vec::new();
+        let mut results = std::collections::HashMap::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        recv_until(&mut harness.events, deadline, |event| {
+            match event {
+                ReplEvent::ToolApprovalNeeded {
+                    tool_use,
+                    batch,
+                    response_tx,
+                    ..
+                } => {
+                    approvals.push((tool_use.name, batch.len(), batch));
+                    let _ = response_tx.send(crate::cli::repl_event::ConfirmationResult::Deny);
+                }
+                ReplEvent::ToolResult {
+                    tool_id, result, ..
+                } => {
+                    results.insert(tool_id, result.map_err(|error| error.to_string()));
+                }
+                _ => {}
+            }
+            approvals.len() == 1 && results.len() == 3
+        })
+        .await;
+
+        assert_eq!(
+            approvals.len(),
+            1,
+            "one turn of write+edit+patch must prompt once; approvals={approvals:?}"
+        );
+        assert_eq!(
+            approvals[0].1, 3,
+            "the one prompt must carry all three calls; batch_len={}",
+            approvals[0].1
+        );
+        let batch_names: Vec<&str> = approvals[0]
+            .2
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(
+            batch_names,
+            ["write", "edit", "patch"],
+            "aggregate must keep apply order; names={batch_names:?}"
+        );
+        for id in ["w1", "e1", "p1"] {
+            let result = results
+                .get(id)
+                .unwrap_or_else(|| panic!("missing result {id}"));
+            assert!(
+                result.as_ref().is_err_and(|error| error.contains("denied")),
+                "rejecting the batch must deny every call; {id}={result:?}"
+            );
+        }
+        assert!(
+            !write_path.exists(),
+            "rejected write must not create the file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&edit_path).unwrap(),
+            "fn main() {}\n",
+            "rejected edit must leave the target unchanged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&patch_path).unwrap(),
+            "aaa\nbbb\n",
+            "rejected patch must leave the target unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_turn_changeset_accept_applies_every_file_in_order() {
+        let directory = tempfile::tempdir().expect("changeset accept workspace");
+        let write_path = directory.path().join("created.txt");
+        let edit_path = directory.path().join("edited.txt");
+        std::fs::write(&edit_path, "alpha\n").expect("seed edit target");
+        let mut harness = LoopDispatchHarness::new();
+        harness
+            .dispatch_tools(vec![
+                changeset_tool(
+                    "w1",
+                    "write",
+                    serde_json::json!({
+                        "file_path": write_path.to_string_lossy(),
+                        "content": "created\n"
+                    }),
+                ),
+                changeset_tool(
+                    "e1",
+                    "edit",
+                    serde_json::json!({
+                        "file_path": edit_path.to_string_lossy(),
+                        "old_string": "alpha",
+                        "new_string": "beta"
+                    }),
+                ),
+            ])
+            .await;
+
+        let mut approval_count = 0usize;
+        let mut results = std::collections::HashMap::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        recv_until(&mut harness.events, deadline, |event| {
+            match event {
+                ReplEvent::ToolApprovalNeeded {
+                    batch, response_tx, ..
+                } => {
+                    assert_eq!(
+                        batch.len(),
+                        2,
+                        "accept path must still be one aggregate review; batch={batch:?}"
+                    );
+                    approval_count += 1;
+                    let _ =
+                        response_tx.send(crate::cli::repl_event::ConfirmationResult::ApproveOnce);
+                }
+                ReplEvent::ToolResult {
+                    tool_id, result, ..
+                } => {
+                    results.insert(tool_id, result.map_err(|error| error.to_string()));
+                }
+                _ => {}
+            }
+            approval_count == 1 && results.len() == 2
+        })
+        .await;
+
+        assert_eq!(approval_count, 1, "accept must not prompt per file");
+        assert!(
+            results.get("w1").is_some_and(|result| result.is_ok()),
+            "accepted write must run; result={:?}",
+            results.get("w1")
+        );
+        assert!(
+            results.get("e1").is_some_and(|result| result.is_ok()),
+            "accepted edit must run; result={:?}",
+            results.get("e1")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&write_path).unwrap(),
+            "created\n",
+            "accepted write must persist"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&edit_path).unwrap(),
+            "beta\n",
+            "accepted edit must persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_changeset_hostile_cancel_applies_nothing() {
+        let directory = tempfile::tempdir().expect("changeset cancel workspace");
+        let write_path = directory.path().join("created.txt");
+        let edit_path = directory.path().join("edited.txt");
+        std::fs::write(&edit_path, "keep\n").expect("seed edit target");
+        let mut harness = LoopDispatchHarness::new();
+        harness
+            .dispatch_tools(vec![
+                changeset_tool(
+                    "w1",
+                    "write",
+                    serde_json::json!({
+                        "file_path": write_path.to_string_lossy(),
+                        "content": "created\n"
+                    }),
+                ),
+                changeset_tool(
+                    "e1",
+                    "edit",
+                    serde_json::json!({
+                        "file_path": edit_path.to_string_lossy(),
+                        "old_string": "keep",
+                        "new_string": "gone"
+                    }),
+                ),
+            ])
+            .await;
+
+        let mut results = std::collections::HashMap::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        recv_until(&mut harness.events, deadline, |event| {
+            match event {
+                ReplEvent::ToolApprovalNeeded {
+                    response_tx, batch, ..
+                } => {
+                    assert_eq!(batch.len(), 2, "cancel must drop one aggregate review");
+                    drop(response_tx);
+                }
+                ReplEvent::ToolResult {
+                    tool_id, result, ..
+                } => {
+                    results.insert(tool_id, result.map_err(|error| error.to_string()));
+                }
+                _ => {}
+            }
+            results.len() == 2
+        })
+        .await;
+
+        for id in ["w1", "e1"] {
+            let result = results
+                .get(id)
+                .unwrap_or_else(|| panic!("missing result {id}"));
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("cancelled")),
+                "dropping the batch approval must cancel every call; {id}={result:?}"
+            );
+        }
+        assert!(
+            !write_path.exists(),
+            "cancelled write must not create the file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&edit_path).unwrap(),
+            "keep\n",
+            "cancelled edit must leave the target unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_then_bash_does_not_fold_bash_into_the_changeset() {
+        let directory = tempfile::tempdir().expect("flush workspace");
+        let write_path = directory.path().join("created.txt");
+        let touch_path = directory.path().join("touched.txt");
+        let mut harness = LoopDispatchHarness::new();
+        harness
+            .dispatch_tools(vec![
+                changeset_tool(
+                    "w1",
+                    "write",
+                    serde_json::json!({
+                        "file_path": write_path.to_string_lossy(),
+                        "content": "created\n"
+                    }),
+                ),
+                changeset_tool(
+                    "b1",
+                    "bash",
+                    serde_json::json!({
+                        "command": format!("touch {}", touch_path.display())
+                    }),
+                ),
+            ])
+            .await;
+
+        let mut approvals: Vec<(String, usize, Vec<String>)> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        recv_until(&mut harness.events, deadline, |event| match event {
+            ReplEvent::ToolApprovalNeeded {
+                tool_use,
+                batch,
+                response_tx,
+                ..
+            } => {
+                let names = if batch.is_empty() {
+                    vec![tool_use.name.clone()]
+                } else {
+                    batch.iter().map(|tool| tool.name.clone()).collect()
+                };
+                approvals.push((tool_use.name.clone(), batch.len(), names));
+                let _ = response_tx.send(crate::cli::repl_event::ConfirmationResult::Deny);
+                true
+            }
+            _ => false,
+        })
+        .await;
+
+        assert_eq!(
+            approvals.len(),
+            1,
+            "the first prompt must be the write, not a write+bash batch; approvals={approvals:?}"
+        );
+        assert_eq!(
+            approvals[0].0, "write",
+            "bash must not be the first review; approvals={approvals:?}"
+        );
+        assert!(
+            !approvals[0].2.iter().any(|name| name == "bash"),
+            "bash must not be folded into the write changeset; approvals={approvals:?}"
+        );
+        assert!(
+            approvals[0].1 <= 1,
+            "a lone write is not an aggregate changeset; approvals={approvals:?}"
+        );
+        assert!(
+            !write_path.exists(),
+            "denied write must not create the file before bash"
+        );
     }
 
     // ── Summarised request assembly (committed-range summary reuse) ────────

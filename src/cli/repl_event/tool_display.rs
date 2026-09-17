@@ -1661,3 +1661,47 @@ pub(crate) fn assemble_tool_approval(
         crate::cli::diff::DiffColorMode::production(),
     )
 }
+
+/// One Yes/No dialog for consecutive write/edit/patch proposals.
+///
+/// The body is the aggregate unified diff in apply order. Partial accept is
+/// out of scope (#433): Yes applies every call, No applies none.
+pub(crate) fn assemble_changeset_approval(
+    tools: &[crate::tools::ToolUse],
+    summary: &str,
+) -> crate::cli::tui::Dialog {
+    assemble_changeset_approval_with(
+        tools,
+        summary,
+        &crate::theme::ColorScheme::default(),
+        crate::cli::diff::DiffColorMode::production(),
+    )
+}
+
+fn assemble_changeset_approval_with(
+    tools: &[crate::tools::ToolUse],
+    summary: &str,
+    colors: &crate::theme::ColorScheme,
+    mode: crate::cli::diff::DiffColorMode,
+) -> crate::cli::tui::Dialog {
+    let title = format!("changeset ({})\n{}", tools.len(), summary);
+    let mut dialog = crate::cli::tui::Dialog::select(
+        title,
+        vec![
+            crate::cli::tui::DialogOption::new("1. Yes"),
+            crate::cli::tui::DialogOption::new("2. No"),
+        ],
+    );
+    let planned = super::changeset::planned_changeset(tools);
+    let mut body = crate::cli::diff::render_files(&planned.diffs, colors, mode);
+    if !planned.notes.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&crate::cli::diff::sanitize_multiline(
+            &planned.notes.join("\n"),
+        ));
+    }
+    dialog.body = Some(body);
+    dialog
+}

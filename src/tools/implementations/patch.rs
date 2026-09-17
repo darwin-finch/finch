@@ -282,6 +282,16 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<(String, ApplySummary)>
     ))
 }
 
+/// Apply a unified diff in memory so a batch review can show the resulting file.
+pub(crate) fn preview_patched_text(original: &str, patch: &str) -> Result<String> {
+    let hunks = parse_hunks(patch).context("Failed to parse unified diff")?;
+    if hunks.is_empty() {
+        anyhow::bail!("No hunks found in patch. Ensure the diff contains @@ ... @@ headers.");
+    }
+    let (patched, _) = apply_hunks(original, &hunks)?;
+    Ok(patched)
+}
+
 /// Apply a single hunk, returning the replacement lines and (added, removed) counts.
 /// The returned lines replace the `-` lines in `orig_lines`.
 fn apply_single_hunk(orig_lines: &[String], hunk: &Hunk) -> Result<(Vec<String>, usize, usize)> {

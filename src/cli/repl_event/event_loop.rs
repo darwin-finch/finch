@@ -47,17 +47,13 @@ use super::tool_execution::ToolExecutionCoordinator;
 // refresh_context_strip, dispatch_tool_uses, process_query_with_tools,
 // ActiveToolUsesMap, and apply_sliding_window live in query_processor.rs.
 
-type PendingApprovalsMap = Arc<
-    RwLock<
-        std::collections::HashMap<
-            Uuid,
-            (
-                crate::tools::ToolUse,
-                tokio::sync::oneshot::Sender<super::events::ConfirmationResult>,
-            ),
-        >,
-    >,
->;
+struct PendingToolApproval {
+    tool_use: crate::tools::ToolUse,
+    batch: Vec<crate::tools::ToolUse>,
+    response_tx: tokio::sync::oneshot::Sender<super::events::ConfirmationResult>,
+}
+
+type PendingApprovalsMap = Arc<RwLock<std::collections::HashMap<Uuid, PendingToolApproval>>>;
 
 const MAX_TERMINAL_AGENT_ROOTS: usize = 1024;
 
@@ -2654,16 +2650,26 @@ impl EventLoop {
                                     drop(approvals);
                                     let mut tui = self.tui_renderer.lock().await;
                                     tui.pending_dialog_result = Some(dialog_result);
-                                } else if let Some((query_id, (_tool_use, _response_tx))) = approvals.iter().next() {
+                                } else if let Some((query_id, _pending)) = approvals.iter().next() {
                                     let query_id = *query_id;
-                                    let (tool_use, response_tx) = approvals.remove(&query_id)
+                                    let PendingToolApproval { tool_use, batch, response_tx } = approvals.remove(&query_id)
                                         .expect("query_id was just obtained from the same map");
 
-                                    // Check for "Edit in $EDITOR" (option index 1 for write/edit tools)
-                                    let is_file_mutating = matches!(tool_use.name.as_str(), "write" | "Write" | "edit" | "Edit");
+                                    // A multi-file changeset is Yes/No only. Edit-in-editor
+                                    // on one payload would break accept-or-reject-as-a-unit.
+                                    let is_changeset_batch = batch.len() > 1;
+                                    let is_file_mutating = !is_changeset_batch
+                                        && matches!(tool_use.name.as_str(), "write" | "Write" | "edit" | "Edit");
                                     let is_editor_option = is_file_mutating && matches!(dialog_result, crate::cli::tui::DialogResult::Selected(1));
 
-                                    let confirmation = if is_editor_option {
+                                    let confirmation = if is_changeset_batch {
+                                        match dialog_result {
+                                            crate::cli::tui::DialogResult::Selected(0) => {
+                                                super::events::ConfirmationResult::ApproveOnce
+                                            }
+                                            _ => super::events::ConfirmationResult::Deny,
+                                        }
+                                    } else if is_editor_option {
                                         // Extract proposed content
                                         let proposed = tool_use.input.get("content")
                                             .or_else(|| tool_use.input.get("new_string"))

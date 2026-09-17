@@ -518,6 +518,8 @@ pub(crate) fn deferred_frontend_restart_from_tool_result(result: &std::result::R
 pub(crate) fn frontend_replacement_args<I>(current: I, brain: &str) -> Vec<OsString> where I: IntoIterator<Item = OsString>, { … }
 /// Generate a context-specific signature for a tool use
 pub fn generate_tool_signature(tool_use: &ToolUse, working_dir: &std::path::Path) -> ToolSignature { … }
+/// Apply a unified diff in memory so a batch review can show the resulting file.
+pub(crate) fn preview_patched_text(original: &str, patch: &str) -> Result<String> { … }
 /// Open a proposal artifact in the user editor and preserve the explicit `execute`/`chat`/`cancel` decision.
 pub async fn propose_artifact_with_decision(language: &str, description: &str, source: &str) -> Result<ProposalDecision> { … }
 /// Effect a tool use presents at the approval boundary.
