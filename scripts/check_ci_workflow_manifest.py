@@ -229,7 +229,7 @@ COMMON_CACHE_INPUTS = {
 CI_SHARED_ENV = {
     "CARGO_TERM_COLOR": "always",
     "RUST_BACKTRACE": 1,
-    "CARGO_BUILD_JOBS": 1,
+    "CARGO_BUILD_JOBS": 2,
     "CARGO_PROFILE_RELEASE_LTO": "false",
     "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
 }
@@ -261,7 +261,7 @@ CACHE_SPECS = {
         "name": "Restore compatible Cargo dependencies and build artifacts",
         "shared-key": MATRIX_CACHE_KEY,
         "save-if": MAIN_SAVE_IF,
-        "before": "Run clippy (binary only, warnings allowed for now)",
+        "before": "Compile all targets",
     },
     ("ci.yml", "test-macos"): {
         "name": "Restore compatible Cargo dependencies and build artifacts",
@@ -307,7 +307,7 @@ CACHE_SPECS = {
         "save-if": MAIN_SAVE_IF,
         "before": "Restore pinned isolation supervisor",
         "env": {
-            "CARGO_BUILD_JOBS": 1, "CARGO_PROFILE_TEST_DEBUG": 0,
+            "CARGO_BUILD_JOBS": 2, "CARGO_PROFILE_TEST_DEBUG": 0,
             "CARGO_TERM_COLOR": "always", "RUST_BACKTRACE": 1,
         },
     },
@@ -939,9 +939,9 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
         ("cargo test --doc -- ValidatedProviderRequest",),
     ))
     errors.extend(required_step_errors(
-        documents, "ci.yml", "test", "Run release-mode atomic history regression",
-        "matrix.feature_name == 'default'", None,
-        ("cargo test --release --lib cli::conversation::tests -- --nocapture",),
+        documents, "ci.yml", "build", "Run release-mode atomic history regression",
+        None, None,
+        ("cargo test --release --target x86_64-unknown-linux-gnu --lib cli::conversation::tests -- --nocapture",),
     ))
     errors.extend(required_step_errors(
         documents, "ci.yml", "test", "Verify shared skill discovery",

@@ -60,7 +60,7 @@ concurrency:
 # Each job's effective Cargo/Rust environment is part of its cache identity, so
 # the job-level additions below must match the cache family each job restores.
 env:
-  CARGO_BUILD_JOBS: 1
+  CARGO_BUILD_JOBS: 2
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
