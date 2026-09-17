@@ -69,7 +69,7 @@ impl EventLoop {
                 self.pending_agent_lifecycle.push(event);
                 continue;
             }
-            self.ensure_unbound_agent_lifecycle(root_agent_id);
+            self.ensure_unbound_agent_lifecycle(root_agent_id).await;
             self.apply_bound_agent_lifecycle(&event, root_agent_id);
         }
     }
@@ -142,18 +142,66 @@ impl EventLoop {
         }
     }
 
-    fn ensure_unbound_agent_lifecycle(&mut self, root_agent_id: Uuid) {
-        self.agent_lifecycle_bindings
-            .entry(root_agent_id)
-            .or_insert_with(|| {
-                let title = format!("Agent activity {root_agent_id}");
-                let unit = self.output_manager.start_work_unit(&title);
-                unit.set_activity_presentation(title);
-                AgentLifecycleBinding {
-                    unit,
-                    owner_row: None,
+    async fn ensure_unbound_agent_lifecycle(&mut self, root_agent_id: Uuid) {
+        if self.agent_lifecycle_bindings.contains_key(&root_agent_id) {
+            return;
+        }
+        if let Some((unit, owner_row)) = self.find_live_spawn_parent().await {
+            self.agent_lifecycle_bindings
+                .insert(root_agent_id, AgentLifecycleBinding { unit, owner_row });
+            return;
+        }
+        let title = format!("Agent activity {root_agent_id}");
+        let unit = self.output_manager.start_work_unit(&title);
+        unit.set_activity_presentation(title);
+        self.agent_lifecycle_bindings.insert(
+            root_agent_id,
+            AgentLifecycleBinding {
+                unit,
+                owner_row: None,
+            },
+        );
+    }
+
+    /// Prefer a live spawn_agent row / Tools unit over `start_work_unit`.
+    async fn find_live_spawn_parent(
+        &self,
+    ) -> Option<(Arc<crate::cli::messages::WorkUnit>, Option<usize>)> {
+        {
+            let map = self.active_tool_uses.read().await;
+            if let Some((_, _, unit, row_idx)) =
+                map.values().find(|(name, _, _, _)| name == "spawn_agent")
+            {
+                return Some((Arc::clone(unit), Some(*row_idx)));
+            }
+            for (_, _, unit, _) in map.values() {
+                if let Some(row) = self.unbound_spawn_row_on(unit) {
+                    return Some((Arc::clone(unit), Some(row)));
                 }
-            });
+            }
+        }
+        for unit in self.query_states.live_tool_work_units().await {
+            if let Some(row) = self.unbound_spawn_row_on(&unit) {
+                return Some((unit, Some(row)));
+            }
+        }
+        self.query_states
+            .live_tool_work_units()
+            .await
+            .into_iter()
+            .next()
+            .map(|unit| (unit, None))
+    }
+
+    fn unbound_spawn_row_on(&self, unit: &Arc<crate::cli::messages::WorkUnit>) -> Option<usize> {
+        unit.spawn_agent_row_indices()
+            .into_iter()
+            .rev()
+            .find(|row| {
+                !self.agent_lifecycle_bindings.values().any(|binding| {
+                    binding.owner_row == Some(*row) && Arc::ptr_eq(&binding.unit, unit)
+                })
+            })
     }
 
     fn apply_bound_agent_lifecycle(
@@ -226,7 +274,7 @@ impl EventLoop {
                     body,
                     result.status == crate::scheduler::AgentTaskStatus::Failed,
                 );
-                if binding.owner_row.is_none() {
+                if binding.owner_row.is_none() && binding.unit.is_activity_presentation() {
                     binding.unit.set_complete();
                 }
                 let active = self
@@ -726,6 +774,11 @@ impl EventLoop {
                     if !named_turn {
                         *self.active_query_id.write().await = None;
                         self.tool_call_history.write().await.remove(&qid);
+                        // Drop the queue rather than let it re-fire after a later
+                        // turn's StreamingComplete (#463, queued turn must not
+                        // execute out of order after cancel). Tool-round inject
+                        // already drained anything that belonged on the in-flight query.
+                        self.pending_queries.clear();
                     }
 
                     // If we were in plan/executing mode, cancel that too so the
