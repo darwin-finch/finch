@@ -102,13 +102,51 @@ feature is actually implemented. A case can and should be authored *before* its 
 that's the mechanism for catching a spec contradiction at authoring time instead of at
 re-architecture time (the original ask that started this epic).
 
-## Next action
+## Spec review findings (2026-09-17, ~half the doc read directly, rest verified by targeted grep)
 
-Two independent options, either is a reasonable next pick:
-1. Resolve the CoLisp ownership-parameter-syntax spec gap (blocks #674's fixture, and #674 is a
-   stated M1 prerequisite for closures/suspension/FFI representation).
-2. Pick up #66, #67, or #68 (no known blockers) via the normal `finch-implement-ticket` flow, in
-   its own claimed sub-worktree, merging into this branch when done.
+Not exhaustive — flag anything found later here rather than assuming this list is complete.
 
-Run `scripts/ticket_triage.py`/`scripts/ticket_poset.py` over the M1 issue set to get value/cost/
-unblocking scores before picking, per the backlog skill's queue rules, rather than picking by feel.
+1. **`! pure` is spec-invalid; the entire shipping implementation uses it exclusively.**
+   `FINCH_LANGUAGE_DESIGN.md:1029-1031` states purity is proven by a separate `guarantees pure`
+   clause and `! pure` is invalid — the only occurrence of that string in the document. All 46
+   `core.json` fixtures and the current Co-Forth parser use `! pure` throughout. The `:1632`
+   compatibility carve-out (classic `( ... )` comments) never mentions this spelling, so it isn't
+   even clear the spec means to grandfather it. **Blocks nothing today, but every fixture and every
+   real program written against the current parser is non-conformant the moment this is enforced.**
+   Needs a decision before M1 adds much more surface using the old spelling.
+2. **"Initial module layout" (`:4393-4414`) is stale.** Names `src/vm/*.rs`, `src/coforth/frontend/`,
+   `src/lisp/frontend/` — the pre-extraction layout. Actual layout (#673/#65/#667/#670, all closed):
+   `crates/finch-vm-core/`, `crates/finch-colisp/`, `crates/finch-coforth/`, `crates/finch-language/`,
+   `crates/finch-vm/`. Cheap fix, no decision needed — just wrong and should be corrected or marked
+   historical.
+3. **CoLisp per-parameter ownership syntax has no worked example** — see M1/#674 row above.
+
+## Plan: spec fixes first, then M1 by dependency order
+
+### Step 0 — resolve found spec defects (do this before M1 issues generate more surface on old ground)
+
+| Item | Tier (per `finch-backlog`) | Action | Owner |
+|---|---|---|---|
+| `! pure` vs `guarantees pure` | Decision needed, then Tier 2/3 depending on choice | Shammah decides: (a) grandfather `! pure` explicitly as compatibility syntax and say so in the spec next to `:1632`, or (b) migrate — add `guarantees pure` fixtures at a new level, cut over `ACTIVE_CONFORMANCE_LEVELS`, then delete `! pure` parsing. CLAUDE.md's own stance ("migrate checked-in programs and delete superseded compiler paths rather than preserving a known wart solely because it was implemented first") argues for (b) while the surface is still 46 fixtures, not hundreds. | Shammah (decision) → whoever implements |
+| Stale module layout (`:4393-4414`) | Tier 1 | Rewrite to the actual crate layout or mark the section historical/superseded-by-roadmap. No contract, no review round needed. | anyone, immediately |
+| CoLisp ownership-parameter example missing | Decision needed | Shammah writes the missing worked example, or explicitly hands it to whoever picks up #674 as a stated blocker. | Shammah or #674's owner |
+
+### Step 1 — M1 issues, dependency-ordered
+
+Run `scripts/ticket_triage.py`/`scripts/ticket_poset.py` over #66, #67, #68, #674, #675, #677, #86
+to get real value/cost/unblocking scores and a dependency-ordered wave before picking by feel, per
+the backlog skill's queue rules. Known dependency shape from the roadmap text alone (not yet
+poset-verified): #674 (ownership) is a stated prerequisite for closures/suspension/FFI
+representation staying cheap to change, so it likely gates more than it looks like from issue
+number order; #677 (tests) explicitly completes in two passes (a first pass now, gated on nothing
+below, and a second pass in M2 "over concepts and injected effects").
+
+### Step 2 — M2 onward
+
+Follow `IMPLEMENTATION_ROADMAP.md` as written; re-run triage/poset per milestone rather than
+planning M2–M5 in detail now, since M1's actual shape will change what's ready.
+
+Each M1+ issue: normal `finch-implement-ticket` flow (claim, isolated worktree, review, gate
+stages), merging into `language/full-spec-implementation`, not `main`. Paired fixtures land in
+`core.json` at that issue's level tag; `ACTIVE_CONFORMANCE_LEVELS` gains that level only once the
+issue is actually merged, not when it's claimed.
