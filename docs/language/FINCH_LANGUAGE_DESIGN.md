@@ -2573,6 +2573,15 @@ function. Every generated form is checked with the same rules as handwritten cod
 name user form, pretty-printed expansion, and fault span (SDC mixin style). There is no untyped
 `defmacro` and no user `eval`.
 
+The intended **power level is D CTFE**, not Common Lisp macros. `foreach` over a compile-time
+tuple and `switch` / `if` on compile-time strings or types **unroll**: each iteration or arm is
+a specialized copy, type-checked, able to “jump to” handling for that type without a runtime
+type switch. That is enough for binders, serializers, and most “I would have used a macro”
+code. Syntax CTFE (`syntax -> syntax` then `splice`) is the hatch D lacked: **manipulate an AST
+and feed it back to the same compiler**, not `mixin(string)`. It is slightly less general than
+`defmacro` (no running host effects while expanding; no `eval`). That is acceptable: the usual
+need is typed, cached, inspectable generation, not an untyped expander.
+
 `let` in such a function is the usual expression: bindings, then a body whose **value** is the
 result (typically a quasiquoted list). Nothing further is bound unless the caller `define`s a
 name or `splice`s the value into the module.
