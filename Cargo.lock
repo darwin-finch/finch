@@ -1616,7 +1616,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "finch"
-version = "0.7.30"
+version = "0.7.31"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "finch-generation"
-version = "0.7.30"
+version = "0.7.31"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "finch-providers"
-version = "0.7.30"
+version = "0.7.31"
 dependencies = [
  "anyhow",
  "async-trait",
