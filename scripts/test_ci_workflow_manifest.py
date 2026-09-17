@@ -496,7 +496,7 @@ class WorkflowContractTests(unittest.TestCase):
                 "Prove validated request tokens cannot be forged", "commands changed",
             ),
             (
-                "cargo test --release --lib cli::conversation::tests -- --nocapture",
+                "cargo test --release --target x86_64-unknown-linux-gnu --lib cli::conversation::tests -- --nocapture",
                 "cargo test --lib cli::conversation::tests -- --nocapture",
                 "Run release-mode atomic history regression", "commands changed",
             ),
@@ -675,13 +675,15 @@ class WorkflowContractTests(unittest.TestCase):
             "    - name: Restore compatible Cargo dependencies and build artifacts\n"
         )
         end = source.index(
-            "    - name: Run clippy (binary only, warnings allowed for now)\n", start
+            "    - name: Compile all targets\n", start
         )
         cache = source[start:end]
         source = source[:start] + source[end:]
-        insertion = source.index("    - name: Build binary\n")
+        insertion = source.index(
+            "    - name: Prove the removed finch::ssh API stays absent downstream\n"
+        )
         path.write_text(source[:insertion] + cache + source[insertion:])
-        self.assert_fails("cache must run after the pinned toolchain", "Run clippy")
+        self.assert_fails("cache must run after the pinned toolchain", "Compile all targets")
 
     def test_alternate_cache_action_and_release_permission_drift_fail(self) -> None:
         for action in ("actions/cache@v4", "mozilla-actions/sccache-action@v0.0.9"):
