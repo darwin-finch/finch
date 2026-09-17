@@ -148,12 +148,16 @@ EXPECTED_PULL_REQUEST_OPTIONS = {
     for name in EXPECTED_PATHS
 }
 
+# Main-only jobs keep Mac/Windows off the pull-request merge gate. Equality is
+# the contract: do not invent a parser for `if:`.
+MAIN_ONLY_IF = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+
 EXPECTED_CHECKS = {
     "ci.yml": (
         "Build Release (x86_64-unknown-linux-gnu)", "Runtime Authority (Ubuntu)",
-        "Security Audit", "Test (macos-14, default)",
+        "Security Audit",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
-        "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
+        "Toolchain and formatting contract",
     ),
     "docs.yml": ("Current docs links, claims, and shell syntax",),
     "issue-201-chatgpt-auth.yml": ("windows-verifier-compile",),
@@ -244,6 +248,12 @@ CACHE_SPECS = {
         "shared-key": MATRIX_CACHE_KEY,
         "save-if": MAIN_SAVE_IF,
         "before": "Run clippy (binary only, warnings allowed for now)",
+    },
+    ("ci.yml", "test-macos"): {
+        "name": "Restore compatible Cargo dependencies and build artifacts",
+        "shared-key": literal_cache_key("macos-14", "aarch64-apple-darwin", MACOS_FAMILY),
+        "save-if": MAIN_SAVE_IF,
+        "before": "Build binary",
     },
     ("ci.yml", "runtime-authority"): {
         "name": "Restore Linux default-family Cargo state",
@@ -410,6 +420,8 @@ def expanded_checks(document: dict[str, Any], display: str) -> tuple[str, ...]:
     for job_id, job in jobs.items():
         if not isinstance(job_id, str) or not isinstance(job, dict):
             raise ContractError(f"{display}: each job must have a string id and mapping body")
+        if job.get("if") == MAIN_ONLY_IF:
+            continue
         explicit_name = job.get("name")
         if explicit_name is not None and not isinstance(explicit_name, str):
             raise ContractError(f"{display}: job {job_id!r} name must be a string")
@@ -779,12 +791,6 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
             "cache_family": "debug-no-default-features",
             "cargo_args": "--no-default-features", "timeout_minutes": 45,
         },
-        {
-            "os": "macos-14", "target": "aarch64-apple-darwin",
-            "feature_name": "default",
-            "cache_family": "debug-default_supervisor-release_apple-release-default",
-            "cargo_args": "", "timeout_minutes": 120,
-        },
     ]
     actual_test_matrix = (
         documents.get("ci.yml", {}).get("jobs", {}).get("test", {})
@@ -852,12 +858,12 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
 
     errors.extend(required_step_errors(
         documents, "ci.yml", "test", "Prove validated request tokens cannot be forged",
-        "runner.os == 'Linux' && matrix.feature_name == 'default'", None,
+        "matrix.feature_name == 'default'", None,
         ("cargo test --doc -- ValidatedProviderRequest",),
     ))
     errors.extend(required_step_errors(
         documents, "ci.yml", "test", "Run release-mode atomic history regression",
-        "runner.os == 'Linux' && matrix.feature_name == 'default'", None,
+        "matrix.feature_name == 'default'", None,
         ("cargo test --release --lib cli::conversation::tests -- --nocapture",),
     ))
     errors.extend(required_step_errors(
@@ -999,9 +1005,15 @@ def isolation_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
 def ordinary_ci_supervision_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     """Keep supervised isolation out of ordinary CI except the trusted-main cache warm."""
     errors = required_step_errors(
-        documents, "ci.yml", "test", SUPERVISOR_WARM_STEP,
-        "github.event_name == 'push' && runner.os == 'macOS'", None, SUPERVISOR_WARM_COMMANDS,
+        documents, "ci.yml", "test-macos", SUPERVISOR_WARM_STEP,
+        None, None, SUPERVISOR_WARM_COMMANDS,
     )
+    macos_job = documents.get("ci.yml", {}).get("jobs", {}).get("test-macos")
+    if not isinstance(macos_job, dict) or macos_job.get("if") != MAIN_ONLY_IF:
+        errors.append(
+            "ci.yml: job 'test-macos' must stay main-only "
+            f"({MAIN_ONLY_IF!r}); Mac/Windows are not pull-request merge gates"
+        )
     jobs = documents.get("ci.yml", {}).get("jobs")
     for job_id, job in (jobs.items() if isinstance(jobs, dict) else ()):
         steps = job.get("steps") if isinstance(job, dict) else None

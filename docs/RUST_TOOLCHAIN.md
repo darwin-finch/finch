@@ -14,7 +14,9 @@ evidence for a truthful MSRV.
 
 The pin makes compiler and formatter selection reproducible. It does not claim reproducible
 dependency resolution or byte-identical release artifacts; dependency policy belongs to #150.
-The full platform/feature matrix remains a required merge gate for this contract.
+Pull-request merge gates are Linux-only (`cargo fmt` and the Ubuntu test matrix). Apple Silicon
+and Windows remain listed toolchain targets and future build surfaces; they are not required
+on every PR. Trusted `main` still runs the macOS test job to warm the isolation cache.
 
 The contract follows rustup's repository toolchain-file mechanism and Cargo's distinction between a
 tested compiler and the optional `rust-version` package field:

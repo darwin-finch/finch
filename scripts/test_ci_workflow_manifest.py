@@ -260,7 +260,7 @@ class WorkflowContractTests(unittest.TestCase):
              "'isolation-boundaries-macos' cache inputs changed"),
             ("apple-release-default-${{", "apple-release-isolation-${{",
              "'isolation-boundaries-macos' cache inputs changed",
-             "Cargo cache identity set changed; expected 6 identities across 7 locations",
+             "Cargo cache identity set changed; expected 6 identities across 8 locations",
              "apple-release-isolation"),
             ('      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"\n', "",
              "'isolation-boundaries-macos' effective Cargo/Rust environment changed"),
@@ -304,12 +304,19 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_supervisor_cache_warm_stays_trusted_main_only(self) -> None:
         mutations = (
-            ("      if: github.event_name == 'push' && runner.os == 'macOS'\n      run: |\n        cargo test --bin finch-test-supervisor",
-             "      if: runner.os == 'macOS'\n      run: |\n        cargo test --bin finch-test-supervisor",
-             "Warm macOS isolation supervisor cache on trusted main", "condition changed"),
-            ("        cargo build --release --bin finch-test-supervisor\n",
-             "        cargo build --release --bin finch-test-supervisor\n        ./scripts/test_brain_isolation.sh\n",
-             "Warm macOS isolation supervisor cache on trusted main", "commands changed"),
+            (
+                "    - name: Warm macOS isolation supervisor cache on trusted main\n"
+                "      # Keeps the macOS cache family's workload union",
+                "    - name: Warm macOS isolation supervisor cache on trusted main\n"
+                "      if: github.event_name == 'pull_request'\n"
+                "      # Keeps the macOS cache family's workload union",
+                "condition changed",
+            ),
+            (
+                "        cargo build --release --bin finch-test-supervisor\n",
+                "        cargo build --release --bin finch-test-supervisor\n        ./scripts/test_brain_isolation.sh\n",
+                "Warm macOS isolation supervisor cache on trusted main", "commands changed",
+            ),
         )
         for old, new, *diagnostics in mutations:
             with self.subTest(diagnostics=diagnostics):
@@ -425,10 +432,25 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_matrix_fanout_drift_is_caught_outside_representative_fixtures(self) -> None:
         self.repository.replace(
-            "ci.yml", "          - os: macos-14\n",
-            "          - os: windows-2025\n            feature_name: default\n            cargo_args: \"\"\n            timeout_minutes: 45\n          - os: macos-14\n",
+            "ci.yml",
+            "            cargo_args: --no-default-features\n            timeout_minutes: 45\n",
+            "            cargo_args: --no-default-features\n            timeout_minutes: 45\n"
+            "          - os: windows-2025\n            target: x86_64-pc-windows-msvc\n"
+            "            feature_name: default\n            cache_family: debug-windows\n"
+            '            cargo_args: ""\n            timeout_minutes: 45\n',
         )
         self.assert_fails("ci.yml: expanded check allocation changed", "Test (windows-2025, default)")
+
+    def test_macos_test_job_is_not_a_pull_request_gate(self) -> None:
+        self.repository.replace(
+            "ci.yml",
+            "    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
+            "    if: true\n",
+        )
+        self.assert_fails(
+            "ci.yml: expanded check allocation changed",
+            "Test (macos-14, default)",
+        )
 
     def test_migrated_preflights_must_run_before_cargo_setup(self) -> None:
         path = self.repository.workflow("ci.yml")
@@ -449,8 +471,13 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_duplicate_expanded_check_names_fail_actionably(self) -> None:
         self.repository.replace(
-            "ci.yml", "          - os: macos-14\n",
-            "          - os: ubuntu-24.04\n            feature_name: default\n            cargo_args: \"\"\n            timeout_minutes: 45\n          - os: macos-14\n",
+            "ci.yml",
+            "            cargo_args: --no-default-features\n            timeout_minutes: 45\n",
+            "            cargo_args: --no-default-features\n            timeout_minutes: 45\n"
+            "          - os: ubuntu-24.04\n            target: x86_64-unknown-linux-gnu\n"
+            "            feature_name: default\n"
+            "            cache_family: debug-default_all-features-clippy_release-default\n"
+            '            cargo_args: ""\n            timeout_minutes: 45\n',
         )
         self.assert_fails("ci.yml: duplicate expanded check names", "Test (ubuntu-24.04, default)")
 

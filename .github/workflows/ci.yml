@@ -32,27 +32,6 @@ jobs:
     - name: Verify pinned toolchain and clean-checkout formatting
       run: tests/toolchain_contract.sh
 
-  windows-format-contract:
-    name: Toolchain and formatting contract (Windows)
-    runs-on: windows-2025
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install repository Rust toolchain
-      uses: dtolnay/rust-toolchain@1.98.0
-      with:
-        components: rustfmt
-
-    - name: Verify pinned Rust and rustfmt versions
-      shell: pwsh
-      run: |
-        if (-not ((rustc --version) -like "rustc 1.98.0 *")) { exit 1 }
-        if (-not ((rustfmt --version) -like "rustfmt 1.9.0-*")) { exit 1 }
-
-    - name: Verify clean-checkout formatting
-      run: cargo fmt --all -- --check
-
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.feature_name }})
     runs-on: ${{ matrix.os }}
@@ -73,12 +52,6 @@ jobs:
             cache_family: debug-no-default-features
             cargo_args: --no-default-features
             timeout_minutes: 45
-          - os: macos-14
-            target: aarch64-apple-darwin
-            feature_name: default
-            cache_family: debug-default_supervisor-release_apple-release-default
-            cargo_args: ""
-            timeout_minutes: 120
 
     steps:
     - name: Checkout code
@@ -101,18 +74,7 @@ jobs:
         .agents/skills/finch-backlog/scripts/test-with-cargo-slot
 
     - name: Install capnproto (Ubuntu)
-      if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y capnproto
-
-    - name: Install capnproto (macOS)
-      if: runner.os == 'macOS'
-      run: brew install capnp ripgrep
-
-    - name: Install Python for native repository checks
-      if: runner.os == 'macOS'
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
 
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
@@ -133,7 +95,7 @@ jobs:
         save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
     - name: Run clippy (binary only, warnings allowed for now)
-      if: runner.os == 'Linux' && matrix.feature_name == 'default'
+      if: matrix.feature_name == 'default'
       run: cargo clippy --bin finch --all-features
       continue-on-error: true
 
@@ -152,37 +114,92 @@ jobs:
       run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
 
     - name: Prove validated request tokens cannot be forged
-      if: runner.os == 'Linux' && matrix.feature_name == 'default'
+      if: matrix.feature_name == 'default'
       run: cargo test --doc -- ValidatedProviderRequest
 
     - name: Run release-mode atomic history regression
-      if: runner.os == 'Linux' && matrix.feature_name == 'default'
+      if: matrix.feature_name == 'default'
       run: cargo test --release --lib cli::conversation::tests -- --nocapture
+
+    - name: Verify binary reports its version
+      # Exercise Cargo's default binary selection so adding a test-only binary
+      # cannot silently break the documented `cargo run -- <args>` workflow.
+      run: cargo run ${{ matrix.cargo_args }} -- --version
+
+  # Apple Silicon and Windows remain future build surfaces (`rust-toolchain.toml`
+  # still lists those targets). They are not pull-request merge gates: fixing a
+  # Linux architectural bug must not wait on a 120-minute macOS suite or a
+  # second rustfmt. This job warms the macOS cache family on trusted main so
+  # isolation-boundaries-macos can restore it.
+  test-macos:
+    name: Test (macos-14, default)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install capnproto (macOS)
+      run: brew install capnp ripgrep
+
+    - name: Install Python for native repository checks
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install repository Rust toolchain
+      uses: dtolnay/rust-toolchain@1.98.0
+      with:
+        components: clippy
+        targets: aarch64-apple-darwin
+
+    - name: Restore compatible Cargo dependencies and build artifacts
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      continue-on-error: true
+      with:
+        cache-provider: github
+        shared-key: finch-cargo-v5-macos-14-${{ runner.arch }}-aarch64-apple-darwin-rust-1.98.0-debug-default_supervisor-release_apple-release-default-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
+        cache-targets: true
+        cache-bin: false
+        cache-workspace-crates: false
+        cache-all-crates: false
+        cache-on-failure: false
+        save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+    - name: Build binary
+      run: cargo build --bin finch --verbose
+
+    - name: Compile all targets
+      run: cargo test --all-targets --no-run
+
+    - name: Prove the removed finch::ssh API stays absent downstream
+      env:
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      run: python3 scripts/check_removed_ssh_api.py
+
+    - name: Test all targets
+      run: cargo test --all-targets -- --nocapture
 
     - name: Warm macOS isolation supervisor cache on trusted main
       # Keeps the macOS cache family's workload union for the restore-only
       # isolation job in issue-56-brain-isolation.yml; it proves nothing itself.
-      if: github.event_name == 'push' && runner.os == 'macOS'
       run: |
         cargo test --bin finch-test-supervisor --no-run
         cargo build --bin finch-test-supervisor
         cargo build --release --bin finch-test-supervisor
 
     - name: Build Apple Silicon release preflight on trusted main
-      if: github.event_name == 'push' && runner.os == 'macOS'
       run: cargo build --release --target aarch64-apple-darwin
 
     - name: Upload Apple Silicon release preflight
-      if: github.event_name == 'push' && runner.os == 'macOS'
       uses: actions/upload-artifact@v4
       with:
         name: finch-aarch64-apple-darwin
         path: target/aarch64-apple-darwin/release/finch
 
     - name: Verify binary reports its version
-      # Exercise Cargo's default binary selection so adding a test-only binary
-      # cannot silently break the documented `cargo run -- <args>` workflow.
-      run: cargo run ${{ matrix.cargo_args }} -- --version
+      run: cargo run -- --version
 
   runtime-authority:
     name: Runtime Authority (Ubuntu)
