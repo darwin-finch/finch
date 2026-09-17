@@ -226,8 +226,9 @@ impl EventLoop {
                 // trigger loop detection when Claude calls them again during execution.
                 self.tool_call_history.write().await.remove(&query_id);
 
-                // Reset conversation to a single clear execution prompt, then
-                // append any user text queued while tools ran so it is not wiped.
+                // Reset conversation to a single execution prompt. Queued user
+                // text folds into that one user message; a second user turn
+                // here is consecutive-user and Claude 400s.
                 let pending = self.take_pending_queries();
                 let mut proposed_history = self.conversation.read().await.clone();
                 proposed_history.clear();

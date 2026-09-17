@@ -65,9 +65,11 @@ fn append_pending_user_messages(
     history: &mut ConversationHistory,
     pending_user_messages: &[String],
 ) {
-    for text in pending_user_messages {
-        history.add_user_message(text.clone());
-    }
+    let attached = history.append_text_blocks_to_last_user_message(pending_user_messages);
+    debug_assert!(
+        attached,
+        "queued user text must attach to the last user message so the provider never sees consecutive user roles"
+    );
 }
 
 fn pending_user_texts(pending: &[(String, bool, bool)]) -> Vec<String> {
@@ -127,6 +129,7 @@ async fn commit_tool_round_and_continue(
         }
     }
     if publication_tx.send(()).is_err() {
+        *conversation.write().await = before_commit;
         return Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable);
     }
     Ok(())

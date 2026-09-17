@@ -615,6 +615,75 @@ async fn worker_exit_after_commit_rolls_complete_pair_back_to_stage() {
 }
 
 #[tokio::test]
+async fn publication_failure_rolls_back_injected_pending_user_text() {
+    use crate::providers::{ContentBlock, Message};
+    let query_id = uuid::Uuid::new_v4();
+    let mut history = crate::cli::conversation::ConversationHistory::new();
+    history.add_user_message("original".to_string());
+    let token = history
+        .stage_assistant(
+            query_id,
+            Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "A".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({}),
+                }],
+            },
+        )
+        .unwrap();
+    history
+        .record_tool_result(query_id, token, "A", &Ok("a".into()))
+        .unwrap();
+    let conversation = std::sync::Arc::new(tokio::sync::RwLock::new(history));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        if let Some(super::LlmRequest::Query {
+            admission,
+            admission_ready,
+            spawned,
+            publication,
+            ..
+        }) = rx.recv().await
+        {
+            let _ = admission_ready.unwrap().send(());
+            let _ = admission.unwrap().await;
+            let _ = spawned.unwrap().send(());
+            drop(publication);
+        }
+    });
+
+    assert_eq!(
+        super::commit_tool_round_and_continue(
+            &conversation,
+            query_id,
+            token,
+            &tx,
+            None,
+            &["steer now".to_string()],
+        )
+        .await,
+        Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
+    );
+    let live = conversation.read().await.get_messages();
+    assert_eq!(
+        live.len(),
+        1,
+        "publication failure must restore pre-inject history; live={live:?}"
+    );
+    assert_eq!(live[0].text_content(), "original");
+    assert!(
+        conversation
+            .read()
+            .await
+            .completed_tool_results(query_id, token)
+            .is_ok(),
+        "the tool round must be staged again so a retry does not double-commit"
+    );
+}
+
+#[tokio::test]
 async fn checkpoint_failure_revokes_spawned_continuation_and_restores_live_history() {
     use crate::providers::{ContentBlock, Message};
     let query_id = uuid::Uuid::new_v4();
@@ -4039,6 +4108,16 @@ fn user_text_messages(messages: &[crate::providers::Message]) -> Vec<String> {
         .collect()
 }
 
+fn assert_no_consecutive_user_roles(messages: &[crate::providers::Message], detail: &str) {
+    for window in messages.windows(2) {
+        assert_ne!(
+            (window[0].role.as_str(), window[1].role.as_str()),
+            ("user", "user"),
+            "{detail}; consecutive user roles would Claude 400 / hang; messages={messages:?}"
+        );
+    }
+}
+
 /// Queued user text submitted during ExecutingTools must appear in conversation
 /// after the current tool-round results and before the next provider generate.
 /// It must not start a second `execute_query_inner` / `active_query_id`.
@@ -4103,30 +4182,35 @@ async fn test_pending_user_message_injects_before_next_tool_round_generate() {
             );
 
             let live = event_loop.conversation.read().await.get_messages();
-            assert_eq!(
-                user_text_messages(&live),
-                ["original turn", "steer now", "and also this"],
-                "queued user text must be committed after the tool results, in order; messages={live:?}"
+            assert_no_consecutive_user_roles(
+                &live,
+                "tool-round inject must not add a second user message",
             );
-            let last = live.last().expect("conversation must include the injected turn");
+            let last = live
+                .last()
+                .expect("conversation must include the injected turn");
             assert_eq!(
                 last.role, "user",
-                "the last provider-visible message before the next generate must be the injected user text; last={last:?}"
+                "the last provider-visible message before the next generate must be the tool-result user turn; last={last:?}"
             );
-            assert_eq!(last.text_content(), "and also this");
-            match live.get(live.len().saturating_sub(3)) {
-                Some(message)
-                    if message.content.iter().any(|block| {
-                        matches!(
-                            block,
-                            crate::providers::ContentBlock::ToolResult { tool_use_id, .. }
-                                if tool_use_id == tool_id
-                        )
-                    }) => {}
-                other => panic!(
-                    "tool results must precede the injected user messages so the next generate sees them in round order; preceding={other:?} messages={live:?}"
+            assert!(
+                matches!(
+                    last.content.as_slice(),
+                    [
+                        crate::providers::ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error: None
+                        },
+                        crate::providers::ContentBlock::Text { text: first },
+                        crate::providers::ContentBlock::Text { text: second },
+                    ] if tool_use_id == tool_id
+                        && content == "readme contents"
+                        && first == "steer now"
+                        && second == "and also this"
                 ),
-            }
+                "queued text must be ContentBlock::Text on the same user message as the ToolResult; last={last:?}"
+            );
 
             let observed = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
@@ -4143,11 +4227,24 @@ async fn test_pending_user_message_injects_before_next_tool_round_generate() {
                 observed.1, "",
                 "tool-round continuation Query text is empty; the injected user text lives in conversation; observed={observed:?}"
             );
-            assert_eq!(
-                user_text_messages(&observed.2),
-                ["original turn", "steer now", "and also this"],
-                "the continuation snapshot taken after admission must already contain the queued user text; snapshot={:?}",
-                observed.2
+            assert_no_consecutive_user_roles(
+                &observed.2,
+                "continuation snapshot must not contain consecutive user roles",
+            );
+            let observed_last = observed
+                .2
+                .last()
+                .expect("continuation snapshot must include the tool-result user turn");
+            assert!(
+                matches!(
+                    observed_last.content.as_slice(),
+                    [
+                        crate::providers::ContentBlock::ToolResult { .. },
+                        crate::providers::ContentBlock::Text { text: first },
+                        crate::providers::ContentBlock::Text { text: second },
+                    ] if first == "steer now" && second == "and also this"
+                ),
+                "the continuation snapshot taken after admission must already contain queued text on the tool-result user message; last={observed_last:?}"
             );
 
             event_loop
@@ -4160,6 +4257,208 @@ async fn test_pending_user_message_injects_before_next_tool_round_generate() {
             assert!(
                 observed_rx.try_recv().is_err(),
                 "StreamingComplete must not re-start injected strings as a new query; a second LlmRequest would appear here"
+            );
+        })
+        .await;
+}
+
+/// Plan-approval resets history to one execution directive. Queued steering
+/// folds into that same user message rather than a second user turn.
+#[tokio::test]
+async fn test_pending_user_message_folds_into_plan_approval_directive() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let mut observed_rx = observe_llm_queries(&mut event_loop);
+            let tool_id = "call_present_plan";
+            let (query_id, round_token) =
+                start_executing_tools_query(&mut event_loop, tool_id).await;
+            let at = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid timestamp");
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::Executing {
+                task: "implement".to_string(),
+                plan_path: std::path::PathBuf::from("/nonexistent/finch-814-plan.md"),
+                approved_at: at,
+            };
+
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "do the tests first".to_string(),
+                })
+                .await
+                .expect("queuing during plan execution must succeed");
+
+            let directive =
+                "Plan approved by user. Execute this plan step by step:\n\n1. write tests";
+            event_loop
+                .handle_event(ReplEvent::ToolResult {
+                    query_id,
+                    round_token,
+                    tool_id: tool_id.to_string(),
+                    result: Ok(directive.to_string()),
+                })
+                .await
+                .expect("plan-approval finalize must dispatch");
+
+            assert!(
+                event_loop.pending_queries.is_empty(),
+                "plan-approval must drain pending_queries; queued={:?}",
+                event_loop.pending_queries
+            );
+            assert_eq!(
+                *event_loop.active_query_id.read().await,
+                Some(query_id),
+                "plan continuation must reuse the in-flight query"
+            );
+
+            let live = event_loop.conversation.read().await.get_messages();
+            assert_eq!(
+                live.len(),
+                1,
+                "plan-approval must reset to a single user message; messages={live:?}"
+            );
+            assert_no_consecutive_user_roles(
+                &live,
+                "plan-approval must not append a second user message after the directive",
+            );
+            assert_eq!(live[0].role, "user");
+            assert!(
+                matches!(
+                    live[0].content.as_slice(),
+                    [
+                        crate::providers::ContentBlock::Text { text: first },
+                        crate::providers::ContentBlock::Text { text: second },
+                    ] if first == directive && second == "do the tests first"
+                ),
+                "queued steering must fold into the one directive user message; last={:?}",
+                live[0]
+            );
+
+            let observed =
+                tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx.recv())
+                    .await
+                    .expect("plan continuation must send LlmRequest::Query")
+                    .expect("the LLM request channel must stay open");
+            assert_eq!(observed.0, query_id);
+            assert_eq!(observed.1, "");
+            assert_eq!(observed.2.len(), 1);
+            assert_no_consecutive_user_roles(&observed.2, "plan continuation snapshot");
+        })
+        .await;
+}
+
+/// Continuation publication failure must restore live history and put the
+/// drained queue back in FIFO order so QueryFailed can start those turns.
+#[tokio::test]
+async fn test_pending_user_messages_restored_in_order_when_continuation_fails() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let conversation = Arc::clone(&event_loop.conversation);
+            let mut llm_rx = event_loop
+                .llm_rx
+                .take()
+                .expect("test fixture must observe LlmRequest before the worker starts");
+            tokio::spawn(async move {
+                if let Some(LlmRequest::Query {
+                    admission,
+                    admission_ready,
+                    spawned,
+                    publication,
+                    ..
+                }) = llm_rx.recv().await
+                {
+                    let _ = admission_ready.unwrap().send(());
+                    let _ = admission.unwrap().await;
+                    let _ = spawned.unwrap().send(());
+                    drop(publication);
+                    drop(llm_rx);
+                }
+            });
+            let tool_id = "call_restore_fifo";
+            let (query_id, round_token) =
+                start_executing_tools_query(&mut event_loop, tool_id).await;
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "steer now".to_string(),
+                })
+                .await
+                .expect("queue first");
+            event_loop
+                .handle_event(ReplEvent::UserInput {
+                    input: "and also this".to_string(),
+                })
+                .await
+                .expect("queue second");
+
+            event_loop
+                .handle_event(ReplEvent::ToolResult {
+                    query_id,
+                    round_token,
+                    tool_id: tool_id.to_string(),
+                    result: Ok("readme contents".to_string()),
+                })
+                .await
+                .expect("completing the tool round must attempt continuation");
+
+            assert_eq!(
+                event_loop
+                    .pending_queries
+                    .iter()
+                    .map(|(text, _, _)| text.as_str())
+                    .collect::<Vec<_>>(),
+                ["steer now", "and also this"],
+                "publication failure must restore pending_queries in FIFO order; queued={:?}",
+                event_loop.pending_queries
+            );
+            let live = conversation.read().await.get_messages();
+            assert_eq!(
+                live.len(),
+                1,
+                "publication failure must roll history back to pre-inject; live={live:?}"
+            );
+            assert_eq!(live[0].text_content(), "original turn");
+            assert_no_consecutive_user_roles(&live, "rolled-back history");
+            assert!(
+                live.iter()
+                    .all(|message| !message.text_content().contains("steer now")),
+                "queued text must not remain in live history after rollback; live={live:?}"
+            );
+
+            let mut failed = None;
+            while let Ok(event) = event_loop.event_rx.try_recv() {
+                if matches!(
+                    event,
+                    ReplEvent::QueryFailed {
+                        query_id: id,
+                        ..
+                    } if id == query_id
+                ) {
+                    failed = Some(event);
+                }
+            }
+            let failed = failed.expect("finalize must emit QueryFailed after continuation failure");
+            event_loop
+                .handle_event(failed)
+                .await
+                .expect("QueryFailed must drain the restored queue");
+            assert_eq!(
+                event_loop
+                    .pending_queries
+                    .iter()
+                    .map(|(text, _, _)| text.as_str())
+                    .collect::<Vec<_>>(),
+                ["and also this"],
+                "QueryFailed must start the first restored turn and leave the rest queued; queued={:?}",
+                event_loop.pending_queries
+            );
+            let after_fail = event_loop.conversation.read().await.get_messages();
+            assert!(
+                user_text_messages(&after_fail)
+                    .iter()
+                    .any(|text| text == "steer now"),
+                "the first restored turn must start as its own query; messages={after_fail:?}"
             );
         })
         .await;
