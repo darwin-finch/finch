@@ -377,6 +377,11 @@ impl EventLoop {
         // its one authoritative late outcome.
         drop(effect_audit);
         if cancellation_requested {
+            self.apply_named_brain_run_status(
+                run_id,
+                crate::brain::BrainRunStatus::Cancelled,
+                Some("named Brain run cancelled"),
+            );
             let _ = response_tx.send(Err(crate::server::RunnerTurnError {
                 message: "named Brain run cancelled".into(),
                 turn_events,
@@ -384,6 +389,9 @@ impl EventLoop {
             }));
             return;
         }
+        // Local say/output is already on screen. Do not wait for the daemon
+        // RunStatusChanged event or the dump's `status — running` persists (#820).
+        self.apply_named_brain_run_status(run_id, crate::brain::BrainRunStatus::Completed, None);
         let commit_ack = restart.map(|restart| {
             let (commit_tx, mut commit_rx) =
                 tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerTurnCommitNotice>();
@@ -971,19 +979,8 @@ impl EventLoop {
                 status,
                 detail,
             } => {
-                let projection = self.ensure_remote_brain_run_projection(*run_id, None, *status);
-                let summary = detail
-                    .as_deref()
-                    .map(|detail| format!("{}: {detail}", format!("{status:?}").to_lowercase()))
-                    .unwrap_or_else(|| format!("{status:?}").to_lowercase());
-                if *status == crate::brain::BrainRunStatus::Failed {
-                    projection.unit.fail_row(projection.status_row, summary);
-                } else {
-                    projection.unit.complete_row(projection.status_row, summary);
-                }
-                if status.is_terminal() {
-                    projection.unit.set_complete();
-                }
+                self.ensure_remote_brain_run_projection(*run_id, None, *status);
+                self.apply_named_brain_run_status(*run_id, *status, detail.as_deref());
             }
             BrainEventKind::Prompt { text } => {
                 self.output_manager

@@ -4995,6 +4995,125 @@ async fn typed_program_complete_presents_successful_say_as_prose() {
         .await;
 }
 
+fn brain_run_status_child_labels(row: &crate::cli::messages::TranscriptRow) -> Vec<String> {
+    row.children
+        .iter()
+        .filter(|child| child.label.contains("status"))
+        .map(|child| child.label.clone())
+        .collect()
+}
+
+/// Production-boundary regression for #820: after a successful named-Brain
+/// `(say …)` the Brain run line must not keep saying `running`.
+#[tokio::test]
+async fn named_brain_say_complete_does_not_leave_run_status_running() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::cli::messages::{Message, MessageStatus};
+
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let tempdir =
+                tempfile::tempdir().expect("named-brain say fixture: isolated tool state");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("named-brain say fixture: construct inert tool executor");
+            let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&runtime),
+            );
+            event_loop.output_manager.disable_stdout();
+            event_loop.runner_brain = Some("home".into());
+            event_loop.home_runner_lease_active = true;
+
+            let run_id = crate::brain::RunId(Uuid::new_v4());
+            let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_event(super::ReplEvent::NamedBrainTurnRequested(
+                    crate::server::RunnerTurnRequest {
+                        brain: "home".into(),
+                        run_id,
+                        request_seq: 1,
+                        prompt: "hello".into(),
+                        context: vec![crate::providers::Message::user("hello")],
+                        approval_audience: crate::brain::BrainApprovalAudience {
+                            brain_id: crate::brain::BrainId(Uuid::new_v4()),
+                            brain: "home".into(),
+                            attachment_id: crate::brain::AttachmentId(Uuid::new_v4()),
+                            subject: "runner".into(),
+                            role: crate::brain::AttachmentRole::Runner,
+                            environment_generation: 1,
+                        },
+                        approval_connection_id: None,
+                        approval_tx: None,
+                        effect_audit: None,
+                        response_tx,
+                    },
+                ))
+                .await
+                .expect("named-Brain turn must dispatch");
+
+            let run_unit = event_loop
+                .remote_brain_run_units
+                .get(&run_id)
+                .expect("dispatch_named_brain_turn must project the Brain run unit")
+                .unit
+                .clone();
+            let before = projected_work_unit(&run_unit);
+            let before_status = brain_run_status_child_labels(&before);
+            assert!(
+                before_status.iter().any(|label| label.contains("running")),
+                "fixture must start from the dump's running status line; labels={before_status:?}; row={before:?}"
+            );
+            assert_eq!(
+                run_unit.status(),
+                MessageStatus::InProgress,
+                "fixture run unit must still be InProgress before say completes; row={before:?}"
+            );
+
+            let output_unit = event_loop
+                .output_manager
+                .start_work_unit("VM program output");
+            output_unit.set_program_output();
+            output_unit.append_response("Hello");
+            event_loop
+                .handle_event(super::ReplEvent::TypedProgramComplete {
+                    output_unit: Arc::clone(&output_unit),
+                    result: Ok(completed_execution_outcome("Hello")),
+                })
+                .await
+                .expect("successful typed-program completion must dispatch");
+
+            let after = projected_work_unit(&run_unit);
+            let after_status = brain_run_status_child_labels(&after);
+            let diag = format!(
+                "status_labels={after_status:?}; unit_status={:?}; row={after:?}",
+                run_unit.status()
+            );
+            assert!(
+                !after_status
+                    .iter()
+                    .any(|label| label.to_lowercase().contains("running")),
+                "invariant: after TypedProgramComplete of untitled say, the Brain run line is not running; {diag}"
+            );
+            assert_ne!(
+                run_unit.status(),
+                MessageStatus::InProgress,
+                "invariant: the Brain run unit is not InProgress after successful say; {diag}"
+            );
+            assert!(
+                after_status.iter().any(|label| label.contains("completed")),
+                "invariant: Brain run status is completed once say output is shown; {diag}"
+            );
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn typed_program_complete_keeps_failures_as_program_output() {
     tokio::task::LocalSet::new()

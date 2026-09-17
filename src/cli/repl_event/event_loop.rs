@@ -1096,6 +1096,30 @@ fn ensure_remote_brain_run_projection<'a>(
     })
 }
 
+/// Project a Brain run's lifecycle onto its status child. The home runner
+/// bakes `running` at turn start (`complete_row(..., "running")`); without a
+/// later call here the dump's `status — running` survives after `say` output
+/// is already on screen (#820).
+fn apply_brain_run_status(
+    unit: &crate::cli::messages::WorkUnit,
+    status_row: usize,
+    status: crate::brain::BrainRunStatus,
+    detail: Option<&str>,
+) {
+    let summary = detail
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| format!("{}: {detail}", format!("{status:?}").to_lowercase()))
+        .unwrap_or_else(|| format!("{status:?}").to_lowercase());
+    if status == crate::brain::BrainRunStatus::Failed {
+        unit.fail_row(status_row, summary);
+    } else {
+        unit.complete_row(status_row, summary);
+    }
+    if status.is_terminal() {
+        unit.set_complete();
+    }
+}
+
 /// Project a correlated event into its canonical RunId work unit. Snapshot
 /// reattachment and live delivery share this path, so acknowledgement never
 /// strips durable run contents from the shadow buffer.
@@ -1130,18 +1154,12 @@ fn project_remote_brain_run_event(
     match &event.kind {
         BrainEventKind::RunStarted { .. } => {}
         BrainEventKind::RunStatusChanged { status, detail, .. } => {
-            let summary = detail
-                .as_deref()
-                .map(|detail| format!("{}: {detail}", format!("{status:?}").to_lowercase()))
-                .unwrap_or_else(|| format!("{status:?}").to_lowercase());
-            if *status == BrainRunStatus::Failed {
-                projection.unit.fail_row(projection.status_row, summary);
-            } else {
-                projection.unit.complete_row(projection.status_row, summary);
-            }
-            if status.is_terminal() {
-                projection.unit.set_complete();
-            }
+            apply_brain_run_status(
+                &projection.unit,
+                projection.status_row,
+                *status,
+                detail.as_deref(),
+            );
         }
         BrainEventKind::SpeculativePrompt { text } => {
             let row = *projection
@@ -3894,6 +3912,31 @@ impl EventLoop {
             kind,
             status,
         )
+    }
+
+    /// Home-console counterpart of `RunStatusChanged`. After a successful
+    /// local `say`, this is what clears the dump's `status — running` (#820).
+    fn apply_named_brain_run_status(
+        &mut self,
+        run_id: crate::brain::RunId,
+        status: crate::brain::BrainRunStatus,
+        detail: Option<&str>,
+    ) {
+        let Some(projection) = self.remote_brain_run_units.get(&run_id) else {
+            return;
+        };
+        apply_brain_run_status(&projection.unit, projection.status_row, status, detail);
+    }
+
+    fn pending_named_brain_run_id(&self) -> Option<crate::brain::RunId> {
+        match self.pending_named_brain_turns.len() {
+            1 => self
+                .pending_named_brain_turns
+                .values()
+                .next()
+                .map(|turn| turn.run_id),
+            _ => None,
+        }
     }
 
     /// Render the TUI
