@@ -39,7 +39,7 @@ use crate::tools::ToolDefinition;
 use super::events::{LlmRequest, ReplEvent, RunnerReconnectTarget};
 use super::llm_loop::LlmLoop;
 use super::model_selection::{activate_local_when_ready, LocalActivationOutcome, ModelSelection};
-use super::query_processor::{refresh_context_strip, ActiveToolUsesMap};
+use super::query_processor::{refresh_context_strip, ActiveToolUsesMap, ToolCallHistory};
 use super::query_state::{QueryState, QueryStateManager};
 use super::tool_display::tool_result_to_display;
 use super::tool_execution::ToolExecutionCoordinator;
@@ -484,10 +484,9 @@ pub struct EventLoop {
     /// Data for a pending Co-Forth poset run that is waiting on a confirmation dialog.
     pending_poset_run: Option<PendingPosetRun>,
 
-    /// Per-query tool call history: query_id -> set of "tool_name:input_json" strings.
-    /// Used to detect infinite loops (same tool called with same args multiple times).
-    tool_call_history:
-        Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
+    /// Per-query completed tool-result hashes, keyed by `name:input`.
+    /// Used to detect uninformative loops of loop-eligible tools.
+    tool_call_history: ToolCallHistory,
 
     /// Execution graph for the current (or most recent) query.
     current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>,
