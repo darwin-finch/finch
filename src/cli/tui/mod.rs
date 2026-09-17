@@ -542,6 +542,48 @@ fn live_message_row_budget(terminal_height: usize, reserved_rows: usize) -> usiz
     terminal_height.saturating_sub(reserved_rows)
 }
 
+/// Physical rows owned by the composer: session separator, input, completion,
+/// status rule, and status text. Live transcript and activity rows must yield
+/// this many rows so a typed draft cannot be clipped off the bottom.
+fn composer_physical_rows(
+    inputs: &LiveFrameInputs<'_>,
+    width: usize,
+    completion_lines: &[String],
+) -> usize {
+    let input_rows =
+        input_line_physical_rows_with_ghost(inputs.input_lines, width, inputs.ghost_text)
+            .into_iter()
+            .sum::<usize>();
+    let completion_rows = completion_lines
+        .iter()
+        .map(|line| shadow_buffer::physical_rows(line, width))
+        .sum::<usize>();
+    let status_rows = 1 + inputs
+        .effective_status
+        .lines()
+        .map(|line| shadow_buffer::physical_rows(line, width))
+        .sum::<usize>();
+    1 + input_rows + completion_rows + status_rows
+}
+
+/// Drop oldest prefix lines until the remaining prefix fits in `budget` rows.
+///
+/// Session tasks and child-agent rows are reserved against the live budget but
+/// were still painted in full. When they filled the viewport the composer was
+/// pushed off the bottom — typed draft hidden until the turn finished (#136).
+fn pin_composer_by_clipping_prefix(frame: &mut LiveFrame, width: usize, budget: usize) {
+    while !frame.lines.is_empty() && frame.physical_rows(width) > budget {
+        let dropped = frame.lines.remove(0);
+        if frame
+            .visible_live
+            .first()
+            .is_some_and(|line| line.text.trim_end_matches('\r') == dropped.as_str())
+        {
+            frame.visible_live.remove(0);
+        }
+    }
+}
+
 fn input_physical_rows(lines: &[String], terminal_width: usize) -> usize {
     input_line_physical_rows(lines, terminal_width)
         .into_iter()
@@ -1329,6 +1371,14 @@ pub(crate) fn plan_live_frame(
     // ── 1d. Co-Forth panel ───────────────────────────────────────────────────
     // Drawn as a floating overlay by draw_poset_overlay(), which saves and
     // restores the cursor and so owns no rows here.
+
+    // Pin the composer in the viewport. Live transcript is already budgeted,
+    // but activity rows were painted in full and could still consume every
+    // remaining row. Clip that prefix so separator + draft + status always fit.
+    if !dialog_active {
+        let composer_rows = composer_physical_rows(inputs, width, &content_frame.completion_lines);
+        pin_composer_by_clipping_prefix(&mut frame, width, height.saturating_sub(composer_rows));
+    }
 
     // ── 2. Separator: "──  ~/repos/finch ──────── jade-river ──" ─────────────
     let separator = session_separator_line(width, inputs.cwd_label, inputs.session_label);
@@ -7906,6 +7956,123 @@ mod tests {
              frame lines were {:?}",
             frame.lines
         );
+    }
+
+    #[test]
+    fn test_live_frame_keeps_composer_draft_while_transcript_streams() {
+        // #136 dump: while program/tool/result rows streamed, a second draft
+        // ("fdsfsa" / "Test") stayed invisible until the turn finished.
+        let width = 40;
+        let streaming_status = "running · tool bash";
+        let live: Vec<RenderedTranscriptLine> = (0..40)
+            .map(|index| RenderedTranscriptLine {
+                text: format!("tool result line {index} wrapping-{}", "x".repeat(48)),
+                ..RenderedTranscriptLine::default()
+            })
+            .collect();
+        let typed = ["fdsfsa", "Test"];
+        let mut autocomplete = AutocompleteState::new();
+        // Session tasks are reserved against the live budget but were still
+        // painted in full. Enough active rows filled the viewport and clipped
+        // the composer off the bottom — the dump: typed draft hidden until
+        // the turn finished.
+        let tasks = (0..12)
+            .map(|index| {
+                activity::ActivityRow::new(format!("todo {index}"), activity::ActivityState::Active)
+            })
+            .collect::<Vec<_>>();
+        let mut child =
+            activity::ActivityRow::new("spawned agent", activity::ActivityState::Active);
+        child.detail = Some(" · model".to_string());
+        let tracked = vec![child];
+
+        for height in [8usize, 12, 24] {
+            for live_count in [1usize, 8, 20, live.len()] {
+                for draft_len in 1..=typed.len() {
+                    let input = typed[..draft_len]
+                        .iter()
+                        .map(|line| (*line).to_string())
+                        .collect::<Vec<_>>();
+                    let mut inputs = live_inputs(width, height, &input, streaming_status);
+                    inputs.live_rendered = &live[..live_count];
+                    inputs.task_rows = &tasks;
+                    inputs.tracked_rows = &tracked;
+                    inputs.input_cursor =
+                        (input.len() - 1, input.last().map(String::len).unwrap_or(0));
+                    let frame = plan_live_frame(&inputs, &mut autocomplete);
+                    let physical = frame.physical_rows(width);
+                    let rows = frame.to_shadow_buffer(width, height).rows_as_text();
+                    let painted = rows.join("\n");
+                    assert!(
+                        physical <= height,
+                        "INVARIANT: a streaming live frame must not overflow the viewport, or \
+                         the composer is clipped off the bottom; height={height} \
+                         live_count={live_count} physical_rows={physical} frame={:?}",
+                        frame.lines
+                    );
+                    for line in &input {
+                        assert!(
+                            painted.contains(line),
+                            "INVARIANT: plan_live_frame must keep composer draft {line:?} in the \
+                             visible {width}x{height} frame while {live_count} live transcript \
+                             rows stream (the dump: typed draft hidden until the turn finished); \
+                             cursor_visible={} cursor=({}, {}) physical_rows={physical} \
+                             frame={:?} visible_rows={rows:?}",
+                            frame.cursor_visible,
+                            frame.cursor_row,
+                            frame.cursor_col,
+                            frame.lines
+                        );
+                    }
+                    assert!(
+                        frame.cursor_visible,
+                        "INVARIANT: the composer cursor must stay visible while live rows \
+                         stream; height={height} live_count={live_count} draft={input:?} \
+                         cursor=({}, {}) frame={:?}",
+                        frame.cursor_row, frame.cursor_col, frame.lines
+                    );
+                    assert!(
+                        frame.cursor_row < height,
+                        "INVARIANT: the composer cursor must remain inside the viewport while \
+                         live rows stream; cursor_row={} height={height} live_count={live_count} \
+                         physical_rows={physical} frame={:?}",
+                        frame.cursor_row,
+                        frame.lines
+                    );
+                    let cursor_text = rows.get(frame.cursor_row).map(String::as_str).unwrap_or("");
+                    let expected_cursor_line = input.last().expect("draft is non-empty");
+                    assert!(
+                        cursor_text.contains(expected_cursor_line),
+                        "INVARIANT: the visible cursor must sit on the current draft row while \
+                         live rows stream; cursor_row={} cursor_line={cursor_text:?} \
+                         expected={expected_cursor_line:?} height={height} live_count={live_count} \
+                         frame={:?} rows={rows:?}",
+                        frame.cursor_row,
+                        frame.lines
+                    );
+
+                    let mut bytes = Vec::new();
+                    write_live_frame(&mut bytes, &frame, width).unwrap();
+                    let mut terminal = VtOracle::new(width, height);
+                    terminal.feed(&bytes);
+                    for line in &input {
+                        assert_vt(
+                            terminal.find_row(line).is_some(),
+                            &format!(
+                                "production writer must paint composer draft {line:?} while \
+                                 {live_count} live rows stream on a {width}x{height} terminal"
+                            ),
+                            &terminal,
+                        );
+                    }
+                    assert_vt(
+                        terminal.cursor().2,
+                        "production writer must restore the composer cursor while live rows stream",
+                        &terminal,
+                    );
+                }
+            }
+        }
     }
 
     #[test]
