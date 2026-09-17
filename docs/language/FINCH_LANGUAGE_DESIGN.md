@@ -2432,7 +2432,8 @@ versioned specification must state:
 
 Initially exclude general continuations. There is no user-facing `eval` or `compile(syntax)` that
 runs an arbitrary tree in the current environment. Mix-back of generated syntax is **compile-time
-only** (CTFE, `static if`, generics, `splice` into the module being compiled). Shipping a program
+only** (CTFE, ordinary `if` when the condition is a compile-time constant, generics, `splice` into
+the module being compiled). Shipping a program
 to a node is compiling a **compilation unit** with a granted capability set, not `(eval form)` in
 the language. Add continuations only with a clear typed/effect model.
 
@@ -2562,12 +2563,14 @@ verify) treat that tree as source. The expander **returns data**; later phases m
 Calling `pkg.ensure` inside a `syntax -> syntax` function would be a compile-time host effect and is
 forbidden; list surgery and quasiquote only **construct** forms.
 
-Staging follows D more than Lisp-with-eval: **CTFE** on values (including `static if` / compile-time
-`if` when the condition is a compile-time constant), **generics** instantiated then type-checked
-(the instantiated IR is what the verifier sees), and **syntax CTFE** only where evaluation order or
-bindings cannot be a function. Every generated form is checked with the same rules as handwritten
-code. Diagnostics name user form, pretty-printed expansion, and fault span (SDC mixin style). There
-is no untyped `defmacro` and no user `eval`.
+Staging follows D’s CTFE/generics more than Lisp-with-eval, without D’s extra `static if`
+keyword. **CTFE** on values: if an `if` condition is a compile-time constant, that `if` **is**
+compile-time — the dead arm is dropped and is not type-checked as residual IR (the live arm still
+is). There is no `static-if` form. **Generics** instantiate then type-check (the instantiated IR is
+what the verifier sees). **Syntax CTFE** only where evaluation order or bindings cannot be a
+function. Every generated form is checked with the same rules as handwritten code. Diagnostics
+name user form, pretty-printed expansion, and fault span (SDC mixin style). There is no untyped
+`defmacro` and no user `eval`.
 
 `let` in such a function is the usual expression: bindings, then a body whose **value** is the
 result (typically a quasiquoted list). Nothing further is bound unless the caller `define`s a

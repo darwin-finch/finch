@@ -163,7 +163,7 @@ still blocks the corresponding Brain phase until it is unified.
   only the transformer call. No user-facing `eval` or `compile(syntax)` in the language. Mix-back
   is compile-time `splice` into the module being compiled; loading a payload on a Brain or node
   invokes the compiler on a compilation unit with granted capabilities. Staging is D-like: CTFE,
-  `static if`, generics instantiated then type-checked, syntax CTFE only where a function would
+  ordinary `if` when the condition is CTFE-constant (no `static if` keyword), generics instantiated then type-checked, syntax CTFE only where a function would
   evaluate too early. Add
   normalization conformance fixtures proving that each sugared program and its canonical
   S-expression produce structurally identical `syntax` modulo spelling-specific source origins,
