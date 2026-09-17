@@ -822,6 +822,186 @@ async fn test_named_brain_runner_attaches_its_scheduler() {
         .await;
 }
 
+/// Production-boundary regression for the loop-detected TUI dump: a blocked
+/// bash result must update the labeled bash row and must not spawn a second
+/// WorkUnit titled with the raw provider tool id (`call_tyIrmyNxiUxYGF7QhOT1vslZ`).
+#[tokio::test]
+async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::cli::messages::Message;
+
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let query_id = event_loop.query_states.create_query(Vec::new()).await;
+            let tool_id = "call_tyIrmyNxiUxYGF7QhOT1vslZ".to_string();
+            let command = serde_json::json!({"command": "git status --porcelain"});
+            let round_token = event_loop
+                .conversation
+                .write()
+                .await
+                .stage_assistant(
+                    query_id,
+                    crate::providers::Message {
+                        role: "assistant".to_string(),
+                        content: vec![crate::providers::ContentBlock::ToolUse {
+                            id: tool_id.clone(),
+                            name: "bash".to_string(),
+                            input: command.clone(),
+                        }],
+                    },
+                )
+                .expect("stage the tool round handle_tool_result records into");
+
+            let work_unit = output.start_work_unit("Tools");
+            event_loop
+                .query_states
+                .set_tool_work_unit(query_id, Some(Arc::clone(&work_unit)))
+                .await;
+            let row_idx = work_unit.add_row(
+                crate::cli::repl_event::tool_display::format_tool_label("bash", &command),
+            );
+            event_loop.active_tool_uses.write().await.insert(
+                tool_id.clone(),
+                (
+                    "bash".to_string(),
+                    command,
+                    Arc::clone(&work_unit),
+                    row_idx,
+                ),
+            );
+
+            let error = anyhow::anyhow!(
+                "LOOP DETECTED: You have called bash with the same arguments 1 time(s) and received the same result each time.\n\
+                 Repeating this call will not produce different output."
+            );
+            event_loop
+                .handle_tool_result(query_id, round_token, tool_id.clone(), Err(error))
+                .await
+                .expect("loop ToolResult must apply to the registered bash row");
+
+            let labels: Vec<String> = output
+                .get_messages()
+                .iter()
+                .filter_map(|message| {
+                    message
+                        .transcript_row(&crate::theme::ColorScheme::default())
+                        .map(|row| row.label)
+                })
+                .collect();
+            assert_eq!(
+                labels.len(),
+                1,
+                "handle_tool_result must not spawn a fallback WorkUnit titled with the raw tool id; labels={labels:?}"
+            );
+            assert!(
+                labels[0].contains("bash"),
+                "Tools header must keep the bash label; got {}",
+                labels[0]
+            );
+            assert!(
+                !labels[0].contains(&tool_id),
+                "Tools header must not echo the raw provider tool id; got {}",
+                labels[0]
+            );
+            assert!(
+                labels[0].to_ascii_lowercase().contains("loop detected")
+                    || labels[0].contains("failed"),
+                "Tools header must name the loop failure; got {}",
+                labels[0]
+            );
+
+            let projected = work_unit
+                .transcript_row(&crate::theme::ColorScheme::default())
+                .expect("registered bash row still projects");
+            let call = &projected.children[0];
+            assert!(
+                call.label.contains("bash"),
+                "child must stay a bash row, not {tool_id}; got {}",
+                call.label
+            );
+            assert!(
+                !call.label.contains(&tool_id),
+                "child must not be titled with the raw provider tool id; got {}",
+                call.label
+            );
+            assert!(
+                call.label.contains("failed"),
+                "labeled bash row must be Error; got {}",
+                call.label
+            );
+        })
+        .await;
+}
+
+/// A loop-detected ToolResult that was never registered must still attach to
+/// the query Tools unit instead of `start_work_unit("Tool")`.
+#[tokio::test]
+async fn test_untracked_tool_result_attaches_to_query_tools_unit() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let query_id = event_loop.query_states.create_query(Vec::new()).await;
+            let tool_id = "call_itsGgV2WKoaKTE5SuU6nTg1N".to_string();
+            let round_token = event_loop
+                .conversation
+                .write()
+                .await
+                .stage_assistant(
+                    query_id,
+                    crate::providers::Message {
+                        role: "assistant".to_string(),
+                        content: vec![crate::providers::ContentBlock::ToolUse {
+                            id: tool_id.clone(),
+                            name: "bash".to_string(),
+                            input: serde_json::json!({"command": "git status"}),
+                        }],
+                    },
+                )
+                .expect("stage the untracked tool round");
+            let work_unit = output.start_work_unit("Tools");
+            work_unit.add_row(crate::cli::repl_event::tool_display::format_tool_label(
+                "bash",
+                &serde_json::json!({"command": "git status"}),
+            ));
+            event_loop
+                .query_states
+                .set_tool_work_unit(query_id, Some(Arc::clone(&work_unit)))
+                .await;
+
+            event_loop
+                .handle_tool_result(
+                    query_id,
+                    round_token,
+                    tool_id.clone(),
+                    Err(anyhow::anyhow!("LOOP DETECTED: You have called bash")),
+                )
+                .await
+                .expect("untracked ToolResult must attach to the query Tools unit");
+
+            let labels: Vec<String> = output
+                .get_messages()
+                .iter()
+                .filter_map(|message| {
+                    message
+                        .transcript_row(&crate::theme::ColorScheme::default())
+                        .map(|row| row.label)
+                })
+                .collect();
+            assert_eq!(
+                labels.len(),
+                1,
+                "untracked ToolResult must not start a second Tools root; labels={labels:?}"
+            );
+            assert!(
+                !labels.iter().any(|label| label.contains(&tool_id)),
+                "no root may be titled with the raw provider tool id; labels={labels:?}"
+            );
+        })
+        .await;
+}
+
 fn lifecycle_identity(
     agent_id: uuid::Uuid,
     task_id: uuid::Uuid,
@@ -1328,6 +1508,75 @@ fn test_issue_652_lifecycle_nested_interleaved_roots_keep_ownership() {
                 output.get_messages().len(),
                 3,
                 "await/cancel remain independent normal tool WorkUnits and never replace spawn lifecycle ownership"
+            );
+        }));
+}
+
+/// spawn_agent is gone from `active_tool_uses` when TaskFinished Failed
+/// arrives: attach to the spawn parent Tools unit, not `Agent activity {uuid}`.
+#[test]
+fn test_spawn_agent_task_finished_failed_attaches_to_spawn_parent_not_new_root() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(tokio::task::LocalSet::new().run_until(async {
+            use crate::cli::messages::Message;
+
+            let (mut event_loop, output) = lifecycle_test_event_loop();
+            output.disable_stdout();
+            let query_id = event_loop.query_states.create_query(Vec::new()).await;
+            let unit = output.start_work_unit("Tools");
+            event_loop
+                .query_states
+                .set_tool_work_unit(query_id, Some(Arc::clone(&unit)))
+                .await;
+            let spawn = unit.add_row("spawn_agent(inspect max turns)");
+            unit.complete_row(spawn, "spawned");
+
+            let agent_id = uuid::Uuid::new_v4();
+            let identity = lifecycle_identity(agent_id, uuid::Uuid::new_v4(), None, agent_id, 0);
+            event_loop
+                .handle_event(ReplEvent::AgentLifecycle(lifecycle_task_finished(
+                    identity,
+                    crate::scheduler::AgentTaskStatus::Failed,
+                    "agent reached its turn limit without a final response: configured max_turns=3, consumed provider attempts=3",
+                )))
+                .await
+                .unwrap();
+
+            let messages = output.get_messages();
+            let labels: Vec<String> = messages
+                .iter()
+                .filter_map(|message| {
+                    message
+                        .transcript_row(&crate::theme::ColorScheme::default())
+                        .map(|row| row.label)
+                })
+                .collect();
+            assert_eq!(
+                messages.len(),
+                1,
+                "child TaskFinished Failed must not start a new root; labels={labels:?}"
+            );
+            assert!(
+                labels.iter().all(|label| !label.contains("Agent activity")),
+                "must not create Agent activity {{uuid}}; labels={labels:?}"
+            );
+            assert!(
+                labels.iter().all(|label| {
+                    !(label.contains(&agent_id.to_string()) && label.to_ascii_lowercase().contains("failed"))
+                }),
+                "compact root must not be child {{uuid}} Failed; labels={labels:?}"
+            );
+            let rendered = unit.complete_transcript(&crate::theme::ColorScheme::default());
+            assert!(
+                rendered.contains("spawn_agent"),
+                "failure must remain on the spawn parent unit; rendered={rendered:?}"
+            );
+            assert!(
+                rendered.contains("turn limit") || rendered.to_ascii_lowercase().contains("failed"),
+                "spawn parent must show the child failure; rendered={rendered:?}"
             );
         }));
 }
