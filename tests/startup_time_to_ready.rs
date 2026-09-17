@@ -1007,10 +1007,6 @@ fn expected_order() -> Vec<&'static str> {
 /// this list.
 const NOT_ON_THE_FIXTURE_PATH: &[(&str, &str)] = &[
     (
-        "session_restore",
-        "reached only with `--restore-session`, which no fixture passes",
-    ),
-    (
         "brain_attach",
         "needs a daemon; every fixture sets `use_daemon = false`",
     ),
@@ -1796,7 +1792,6 @@ fn test_the_startup_report_leaks_no_private_content() {
         "metrics_logger_init",
         "daemon_http_connect",
         "repl_construct",
-        "session_restore",
         "ipc_connect",
         "terminal_init",
         "memory_open",

@@ -42,8 +42,6 @@ current limitations and the issues below.
   ([#217](https://github.com/darwin-finch/finch/issues/217)).
 - Complete accessible file-context selection
   ([#310](https://github.com/darwin-finch/finch/issues/310)).
-- Replace legacy UUID-session output with named-Brain attach and resume UX
-  ([#314](https://github.com/darwin-finch/finch/issues/314)).
 - Stream truthful Brain progress and converge work on typed task handles
   ([#57](https://github.com/darwin-finch/finch/issues/57),
   [#60](https://github.com/darwin-finch/finch/issues/60)).

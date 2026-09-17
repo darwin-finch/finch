@@ -11,7 +11,6 @@
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
-use uuid::Uuid;
 
 use crate::cli::conversation::ConversationHistory;
 use crate::cli::output_manager::OutputManager;
@@ -27,7 +26,6 @@ pub struct SessionParts {
     pub active_persona: Arc<RwLock<crate::config::Persona>>,
     pub mode: Arc<RwLock<ReplMode>>,
     pub label: String,
-    pub uuid: Uuid,
 }
 
 /// What produces tokens, and which provider is currently chosen.

@@ -39,6 +39,11 @@ startup TUI line, #794).
 `EventLoop` whose field list is long. Before adding a field, check whether the state belongs to a
 query (`query_state.rs`) or to a tool run (`tool_execution.rs`) instead.
 
+**Resume identity.** A clean interactive exit prints `To resume, run: finch attach <brain-name>`
+after the home Brain was attached, or a visible persistence failure. It does not mint or
+checkpoint a client-owned UUID session file. `ConversationHistory` stays an in-memory
+projection; named Brains are the durable store.
+
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::repl_event::`. Tests for the
 loop are in `event_loop/tests.rs` and reach private items through `use super::*` exactly as they
 did when they were inline.

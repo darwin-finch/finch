@@ -1082,6 +1082,7 @@ tests/live.rs
 tests/live/impcpd.rs
 tests/live/parity.rs
 tests/live/providers.rs
+tests/named_brain_attach.rs
 tests/no_external_provider_binary_test.rs
 tests/service_discovery_test.rs
 tests/startup_time_to_ready.rs

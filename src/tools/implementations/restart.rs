@@ -71,7 +71,7 @@ where
             args.push(argument);
         }
     }
-    args.push(OsString::from("--brain"));
+    args.push(OsString::from("attach"));
     args.push(OsString::from(brain));
     args
 }
@@ -205,7 +205,7 @@ mod tests {
         );
         assert_eq!(
             args,
-            ["--raw", "--brain", "durable-brain"]
+            ["--raw", "attach", "durable-brain"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()

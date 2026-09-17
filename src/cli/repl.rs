@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
-use uuid::Uuid;
 
 use crate::claude::{ClaudeClient, MessageRequest};
 use crate::config::Config;
@@ -643,8 +642,6 @@ pub struct Repl {
 
     // Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
-    /// Stable durable checkpoint identity, retained across `--resume`.
-    session_uuid: Uuid,
 
     // Number of context-summary lines to display in the status strip
     memory_context_lines: usize,
@@ -1277,7 +1274,6 @@ impl Repl {
 
             // Session identity
             session_label,
-            session_uuid: Uuid::new_v4(),
             memory_context_lines,
             max_verbatim_messages,
             context_recall_k,
@@ -2176,28 +2172,6 @@ impl Repl {
         Ok(full_response)
     }
 
-    /// Restore conversation from a saved state
-    pub fn restore_conversation(&mut self, history: ConversationHistory) {
-        self.conversation = Arc::new(RwLock::new(history));
-    }
-
-    /// Restore history and retain a UUID-named checkpoint as the active
-    /// session identity so later atomic checkpoints replace the same file.
-    pub fn restore_conversation_from(
-        &mut self,
-        history: ConversationHistory,
-        checkpoint: &std::path::Path,
-    ) {
-        self.restore_conversation(history);
-        if let Some(id) = checkpoint
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| Uuid::parse_str(stem).ok())
-        {
-            self.session_uuid = id;
-        }
-    }
-
     /// Run REPL with an optional initial prompt
     pub async fn run_with_initial_prompt(&mut self, initial_prompt: Option<String>) -> Result<()> {
         // `--raw` and `--no-tui` reach the REPL through here, never through
@@ -2389,7 +2363,6 @@ impl Repl {
                 active_persona: Arc::clone(&self.active_persona),
                 mode,
                 label: self.session_label.clone(),
-                uuid: self.session_uuid,
             },
             GenerationParts {
                 generator: qwen_gen,

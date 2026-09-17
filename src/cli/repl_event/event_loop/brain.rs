@@ -35,7 +35,6 @@ impl EventLoop {
                 active_persona: Arc::new(RwLock::new(crate::config::Persona::default())),
                 mode: Arc::new(RwLock::new(ReplMode::Normal)),
                 label: "audit-test".into(),
-                uuid: Uuid::new_v4(),
             },
             GenerationParts {
                 generator,

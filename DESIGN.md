@@ -198,15 +198,15 @@ The source contains ONNX Runtime and Candle loaders. Historical backend experime
 ├── usage/               # Per-Brain session token burn checkpoint (status-line readout)
 ├── notice_state.toml    # Licence-notice bookkeeping; kept out of config.toml (#76)
 ├── tool_patterns.json   # Approved tool patterns
-├── sessions/            # Saved REPL sessions
-└── brains/              # Named Brain event logs and state
+├── sessions/            # Leftover legacy UUID transcripts; not the current resume model
+└── brains/              # Named Brain event logs and state (resume with `finch attach`)
 
 ~/.cache/huggingface/hub/  # Base models (HF standard)
 ```
 
 ### Operating modes
 
-- **Interactive REPL:** `finch`
+- **Interactive REPL:** `finch` or `finch attach <brain-name>`
 - **Single query / pipe:** `finch query "..."` or `echo "..." | finch`
 - **Foreground HTTP server:** `finch daemon` (default `127.0.0.1:8000`)
 - **Managed background daemon:** `finch daemon-start` (default `127.0.0.1:11435`)

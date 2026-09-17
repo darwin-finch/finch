@@ -139,7 +139,6 @@ declare_names! {
     /// it was merely late once.
     PHASE_DAEMON_RETRY_BACKOFF = "daemon_retry_backoff";
     PHASE_REPL_NEW = "repl_construct";
-    PHASE_SESSION_RESTORE = "session_restore";
     PHASE_IPC_CONNECT = "ipc_connect";
     PHASE_TERMINAL_INIT = "terminal_init";
     PHASE_MEMORY_OPEN = "memory_open";
