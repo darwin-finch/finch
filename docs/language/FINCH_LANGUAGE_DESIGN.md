@@ -2484,7 +2484,7 @@ incremental and gives both humans and models a stable primary blame location.
 The frontend performs:
 
 1. parse with exact source spans;
-2. hygienic macro expansion in a restricted compile-time environment;
+2. hygienic expansion by ordinary bounded CTFE (`syntax -> syntax`), not a second evaluator;
 3. name resolution and lexical binding;
 4. directional local inference plus explicit effect rows and practical subtyping/refinement checks;
 5. desugaring of `let`, `begin`, `if`, pattern matching, and named functions;
@@ -2536,6 +2536,64 @@ or explicit concept evidence, all of which retain expansion provenance and pass 
 coherence and verification pipeline. Optional `mixin` surface sugar may only invoke that ordinary
 structured macro protocol; it is not inheritance, textual member injection, or another expansion
 engine. Runtime composition remains record embedding, delegation, and concept evidence.
+
+Quote produces `syntax`, not a stripped runtime list. `'form` and nested `quote` mean the form is
+**data**: it is not evaluated at that site. Quasiquote `` ` `` builds syntax by template; unquote
+`,` fills a hole with a `syntax` or CTFE value; splice inserts a list of syntax values into a
+surrounding list. These operations copy origin and expansion ancestry onto constructed cells.
+They never parse source bytes. The current symbol-only `quote` restriction is transitional and
+must be replaced by this full nested quote/quasiquote/unquote/splice over `syntax`.
+
+A CTFE function on numbers is not a macro: `(+ 1 2)` at compile time is the integer `3`. A CTFE
+function whose contract is `syntax -> syntax` **is** a macro. The only remaining difference from
+an ordinary function is **call convention**, not a second evaluator:
+
+- function: arguments are evaluated first; the caller writes `(expand '(pkg.ensure nginx))`;
+- `define-syntax`: arguments are not evaluated; `(require-pkg nginx)` is compiled as
+  `(splice (expand-require-pkg '(require-pkg nginx)))`.
+
+`splice` is an ordinary word (Co-Forth: the explicit splice word already listed with
+`macro:` / `syntax[ ... ]`). Its meaning is: this `syntax` **value** is the next form in the
+current module. It does not `eval`. The compiler’s following phases (check, lower, verify) treat
+that tree as source. The expander **returns data**; later phases make it executable. Calling
+`pkg.ensure` inside a `syntax -> syntax` function would be a compile-time host effect and is
+forbidden; list surgery and quasiquote only **construct** forms.
+
+`let` in such a function is the usual expression: bindings, then a body whose **value** is the
+result (typically a quasiquoted list). Nothing further is bound unless the caller `define`s a
+name or `splice`s the value into the module.
+
+Example without `define-syntax` sugar:
+
+```
+(define (expand-require-pkg form)
+  (let ((name (second form)))
+    `(begin
+       (pkg.ensure ,name)
+       (svc.enable ,name))))
+
+(splice (expand-require-pkg '(require-pkg nginx)))
+```
+
+After CTFE, the spliced form is `(begin (pkg.ensure nginx) (svc.enable nginx))`. Type and effect
+checking apply to **that** tree. `define-syntax` is only registration that implicit-quotes the
+call and splices the result.
+
+Diagnostics for syntax CTFE follow SDC mixin reporting, not DMD’s “blame the mixin line.” A
+failure names (1) the **user form** and its span, (2) a pretty-printed **expansion** the
+transformer actually returned, (3) the **fault** in that expansion with a span, plus ancestry
+to the transforming function. Dropping spans on quote/quasiquote is a defect: CTFE over
+spanless lists is a string mixin. Fuel, recursion, and allocation limits still apply.
+
+Runtime compilation of a `syntax` value (a Brain receiving a quoted program, a node converging
+a payload, an explicit compile API) uses **this same pipeline**: expand, check, lower, verify,
+then run with the granted capability set. There is no `eval` that skips the verifier. Generating
+syntax is always allowed as data; executing it is never ambient.
+
+Until that kernel exists, `define-syntax` remains a capture-free **template**: substitution
+before type checking, no CTFE body, no capabilities, and no introducing `let` or other binding
+forms. That path is deleted after migration fixtures prove `syntax -> syntax` CTFE plus `splice`
+preserve hygiene, spans, and IR.
 
 The S-expression is the visible structural notation, while `Syntax` is the compiler-facing value.
 An identifier syntax object carries its spelling, scope marks, phase, source origin, and eventually

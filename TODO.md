@@ -149,13 +149,19 @@ still blocks the corresponding Brain phase until it is unified.
   module/symbol-reference values. `syntax` must retain origin/expansion ancestry, lexical scope
   marks, and stable symbol identity so transformation functions remain hygienic and diagnostic-rich;
   do not add a privileged macro evaluator, string mixins, or a parallel template language.
-  `define-syntax` may be sugar for registering a `syntax -> syntax` CTFE function. Keep classic
-  S-expressions as the canonical structural Lisp reader, while allowing a later lighter
-  expression/indentation reader that immediately produces the identical syntax tree. Reader sugar
-  must disappear before expansion/elaboration and must not create a second semantic path. Add
-  full nested `quote`, `quasiquote`, `unquote`, and splice support over first-class `syntax` values;
-  replace the current symbol-only `quote` restriction, and test that quoted calls remain data while
-  unquoted calls execute. Preserve spans and hygiene through every nested quoted form. Add
+  `define-syntax` may be sugar for registering a `syntax -> syntax` CTFE function (implicit quote
+  of arguments plus `splice` of the result). Keep classic S-expressions as the canonical
+  structural Lisp reader, while allowing a later lighter expression/indentation reader that
+  immediately produces the identical syntax tree. Reader sugar must disappear before
+  expansion/elaboration and must not create a second semantic path. Add full nested `quote`,
+  `quasiquote`, `unquote`, and splice support over first-class `syntax` values; replace the
+  current symbol-only `quote` restriction; add `splice` as an ordinary word meaning “this syntax
+  value is the next module form” (not eval). Test that quoted calls remain data while unquoted
+  calls execute, and that a `syntax -> syntax` CTFE function plus explicit quote/`splice` matches
+  `define-syntax` sugar. Preserve spans and hygiene through every nested quoted form. Diagnostics
+  must report user form, pretty-printed expansion, and fault span (SDC mixin style), not blame
+  only the transformer call. Runtime compile of `syntax` uses this same expand/check/verify
+  pipeline with granted capabilities; no eval that skips the verifier. Add
   normalization conformance fixtures proving that each sugared program and its canonical
   S-expression produce structurally identical `syntax` modulo spelling-specific source origins,
   then identical elaborated HIR/IR. Do not brand or implement the notation as a third language.
