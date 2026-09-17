@@ -14,6 +14,10 @@ pub struct BrainRun { … }
 pub struct BrainRunCancellationReservation { … }
 pub enum BrainRunKind { Interactive, Speculative, Scheduled, Subagent, Maintenance }
 pub enum BrainRunStatus { QueuedForEnvironment, Running, AwaitingApproval, Completed, Failed, Cancelled, Interrupted }
+impl BrainRunStatus {
+    /// Human status label for TUI, raw mode, and screen-reader text.
+    pub fn human_label(self) -> &'static str;
+}
 pub struct BrainRunnerHandoff { … }
 pub struct BrainRunnerLease { … }
 pub struct DisconnectTerminalizationIntent { … }

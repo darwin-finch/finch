@@ -464,6 +464,8 @@ pub struct EventLoop {
     /// Last runner-registration failure shown to the user. Lease renewal is
     /// periodic, so identical transport failures must not spam scrollback.
     last_home_runner_error: Option<String>,
+    /// Classified reason the home runner is absent, used by queued-run labels.
+    last_runner_recovery: Option<super::runner_recovery::RunnerRecovery>,
 
     /// Generation of the authoritative home event watch.
     home_watch_epoch: u64,
@@ -1070,6 +1072,7 @@ fn ensure_remote_brain_run_projection<'a>(
     run_id: crate::brain::RunId,
     kind: Option<crate::brain::BrainRunKind>,
     status: crate::brain::BrainRunStatus,
+    recovery: Option<&super::runner_recovery::RunnerRecovery>,
 ) -> &'a mut RemoteBrainRunProjection {
     projections.entry(run_id).or_insert_with(|| {
         let label = brain_run_group_label(run_id, kind);
@@ -1079,7 +1082,10 @@ fn ensure_remote_brain_run_projection<'a>(
         // misclassifying lifecycle rows as model tool calls.
         unit.set_activity_presentation(&label);
         let status_row = unit.add_activity_row(format!("{label} · status"));
-        unit.complete_row(status_row, format!("{status:?}").to_lowercase());
+        unit.complete_row(
+            status_row,
+            super::runner_recovery::brain_run_status_label(status, recovery),
+        );
         RemoteBrainRunProjection {
             unit,
             status_row,
@@ -1125,18 +1131,21 @@ fn project_remote_brain_run_event(
         _ => return false,
     };
     let projection =
-        ensure_remote_brain_run_projection(output_manager, projections, run_id, kind, status);
+        ensure_remote_brain_run_projection(output_manager, projections, run_id, kind, status, None);
 
     match &event.kind {
         BrainEventKind::RunStarted { .. } => {}
         BrainEventKind::RunStatusChanged { status, detail, .. } => {
-            let summary = detail
-                .as_deref()
-                .map(|detail| format!("{}: {detail}", format!("{status:?}").to_lowercase()))
-                .unwrap_or_else(|| format!("{status:?}").to_lowercase());
+            let label = super::runner_recovery::brain_run_status_label(*status, None);
             if *status == BrainRunStatus::Failed {
-                projection.unit.fail_row(projection.status_row, summary);
+                projection
+                    .unit
+                    .fail_row(projection.status_row, detail.clone().unwrap_or(label));
             } else {
+                let summary = detail
+                    .as_deref()
+                    .map(|detail| format!("{label}: {detail}"))
+                    .unwrap_or(label);
                 projection.unit.complete_row(projection.status_row, summary);
             }
             if status.is_terminal() {
@@ -2065,6 +2074,7 @@ impl EventLoop {
             runner_brain: None,
             runner_renewal_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_home_runner_error: None,
+            last_runner_recovery: None,
             home_watch_epoch: 0,
             last_home_watch_error: None,
             daemon_base_url,
@@ -2166,7 +2176,7 @@ impl EventLoop {
             })
             .unwrap_or_else(|| "~".to_string());
         self.cwd = cwd.clone();
-        let home_runner_state = {
+        let attach_home = {
             // Four serial IPC round-trips, before the first frame (#364).
             let mut phase = crate::startup::phase(crate::startup::PHASE_BRAIN_REGISTER);
             match self.register_home_brain().await {
@@ -2178,12 +2188,14 @@ impl EventLoop {
                     } else {
                         crate::startup::PhaseDetail::count(0).with_category("offline")
                     });
-                    state
+                    self.apply_home_runner_startup(Ok(state))
                 }
                 Err(error) => {
                     phase.detail(crate::startup::PhaseDetail::count(0).with_category("failed"));
-                    tracing::warn!("could not register home Brain: {error}");
-                    None
+                    // Outer register failures must reach the TUI. Swallowing
+                    // them as `None` made leftover/environment mismatches look
+                    // like a mute daemon-offline driver.
+                    self.apply_home_runner_startup(Err(error))
                 }
             }
         };
@@ -2192,36 +2204,6 @@ impl EventLoop {
         // report's `unaccounted_ms` was for, and why this now has a name
         // (#364).
         let header_phase = crate::startup::phase(crate::startup::PHASE_STARTUP_HEADER);
-        self.home_runner_lease_id = home_runner_state
-            .as_ref()
-            .and_then(|state| state.target.lease_id);
-        self.home_runner_lease_active = home_runner_state
-            .as_ref()
-            .is_some_and(|state| state.registration.is_ok());
-        self.runner_reconnect_target = home_runner_state.as_ref().map(|state| state.target.clone());
-        self.runner_brain = home_runner_state.as_ref().and_then(|state| {
-            state
-                .registration
-                .is_ok()
-                .then(|| state.target.brain.clone())
-        });
-        let home_runner_error = home_runner_state
-            .as_ref()
-            .and_then(|state| state.registration.as_ref().err())
-            .cloned();
-        self.last_home_runner_error = home_runner_error.clone();
-        self.status_bar.update_line(
-            crate::cli::status_bar::StatusLineType::SessionLabel,
-            match &home_runner_state {
-                Some(state) if state.registration.is_ok() => {
-                    format!("◆ brain: {} · runner", state.target.brain)
-                }
-                Some(_) => {
-                    format!("◆ brain: {} · home · no runner lease", self.session_label)
-                }
-                None => format!("◆ brain: {} · home · daemon offline", self.session_label),
-            },
-        );
 
         {
             let mut tui = self.tui_renderer.lock().await;
@@ -2237,23 +2219,7 @@ impl EventLoop {
         // appends to an in-memory buffer, so the first real paint happens on a
         // render tick after the loop below starts (#364).
         crate::startup::mark(crate::startup::MARK_HEADER_QUEUED);
-        if let Some(error) = self.daemon_ipc_error.take() {
-            self.output_manager
-                .write_info(format!("Brain daemon unavailable: {error}"));
-        }
-        if let Some(error) = home_runner_error {
-            self.output_manager.write_info(format!(
-                "{}: runner unavailable: {}",
-                self.session_label, error
-            ));
-            let epoch = self
-                .runner_renewal_epoch
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if let Some(target) = self.runner_reconnect_target.clone() {
-                self.schedule_home_runner_reconnect(epoch, 0, target);
-            }
-        }
-        if self.daemon_base_url.is_some() {
+        if attach_home && self.daemon_base_url.is_some() {
             // One Brain, whatever the size of the on-disk inventory: the
             // frontend attaches its own home Brain and never enumerates the
             // Brain root (#364).
@@ -3852,6 +3818,107 @@ impl EventLoop {
         }
     }
 
+    /// Project a home-runner register result onto the header and transcript.
+    ///
+    /// Outer `Err` values must not collapse into "daemon offline". Leftover
+    /// daemon and workspace/machine mismatches must not attach as a mute
+    /// driver. Returns whether home-Brain driver attach may proceed.
+    fn apply_home_runner_startup(
+        &mut self,
+        result: Result<Option<HomeRunnerRegistration>>,
+    ) -> bool {
+        use super::runner_recovery::RunnerRecovery;
+
+        match result {
+            Ok(Some(state)) => {
+                self.home_runner_lease_id = state.target.lease_id;
+                self.home_runner_lease_active = state.registration.is_ok();
+                self.runner_reconnect_target = Some(state.target.clone());
+                self.runner_brain = state
+                    .registration
+                    .is_ok()
+                    .then(|| state.target.brain.clone());
+                match state.registration {
+                    Ok(_) => {
+                        self.last_home_runner_error = None;
+                        self.last_runner_recovery = None;
+                        self.status_bar.update_line(
+                            crate::cli::status_bar::StatusLineType::SessionLabel,
+                            format!("◆ brain: {} · runner", state.target.brain),
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        let recovery = RunnerRecovery::from_error(&error);
+                        let message = recovery.human_message();
+                        self.last_home_runner_error = Some(message.clone());
+                        self.last_runner_recovery = Some(recovery.clone());
+                        self.status_bar.update_line(
+                            crate::cli::status_bar::StatusLineType::SessionLabel,
+                            format!(
+                                "◆ brain: {} · {}",
+                                state.target.brain,
+                                recovery.header_suffix()
+                            ),
+                        );
+                        self.output_manager
+                            .write_info(format!("{}: {}", state.target.brain, message));
+                        if recovery.should_auto_reconnect() {
+                            let epoch = self
+                                .runner_renewal_epoch
+                                .load(std::sync::atomic::Ordering::SeqCst);
+                            self.schedule_home_runner_reconnect(epoch, 0, state.target);
+                        }
+                        !recovery.blocks_driver_attach()
+                    }
+                }
+            }
+            Ok(None) => {
+                let ipc_error = self.daemon_ipc_error.take();
+                let recovery = ipc_error
+                    .as_deref()
+                    .map(RunnerRecovery::from_error)
+                    .unwrap_or(RunnerRecovery::DaemonIpcUnavailable {
+                        detail: "daemon offline".into(),
+                    });
+                let message = recovery.human_message();
+                self.last_home_runner_error = Some(message.clone());
+                self.last_runner_recovery = Some(recovery.clone());
+                self.status_bar.update_line(
+                    crate::cli::status_bar::StatusLineType::SessionLabel,
+                    format!(
+                        "◆ brain: {} · {}",
+                        self.session_label,
+                        recovery.header_suffix()
+                    ),
+                );
+                if ipc_error.is_some() {
+                    self.output_manager.write_info(message);
+                }
+                !recovery.blocks_driver_attach() && self.daemon_base_url.is_some()
+            }
+            Err(error) => {
+                let recovery = RunnerRecovery::from_error(&error.to_string());
+                let message = recovery.human_message();
+                self.home_runner_lease_active = false;
+                self.runner_brain = None;
+                self.last_home_runner_error = Some(message.clone());
+                self.last_runner_recovery = Some(recovery.clone());
+                self.status_bar.update_line(
+                    crate::cli::status_bar::StatusLineType::SessionLabel,
+                    format!(
+                        "◆ brain: {} · {}",
+                        self.session_label,
+                        recovery.header_suffix()
+                    ),
+                );
+                self.output_manager
+                    .write_info(format!("{}: {}", self.session_label, message));
+                false
+            }
+        }
+    }
+
     fn update_remote_brain_status(&self, runner_online: bool) {
         let Some(client) = self.selected_brain() else {
             return;
@@ -3865,10 +3932,18 @@ impl EventLoop {
         {
             format!("runner · {role}")
         } else {
-            format!(
-                "{role} · runner {}",
-                if runner_online { "online" } else { "offline" }
-            )
+            let runner = self
+                .last_runner_recovery
+                .as_ref()
+                .map(|recovery| recovery.header_suffix())
+                .unwrap_or_else(|| {
+                    if runner_online {
+                        "runner online".into()
+                    } else {
+                        "runner offline".into()
+                    }
+                });
+            format!("{role} · {runner}")
         };
         let target = if client.target.secure {
             client.target.display_name()
@@ -3887,12 +3962,14 @@ impl EventLoop {
         kind: Option<crate::brain::BrainRunKind>,
         status: crate::brain::BrainRunStatus,
     ) -> &mut RemoteBrainRunProjection {
+        let recovery = self.last_runner_recovery.clone();
         ensure_remote_brain_run_projection(
             &self.output_manager,
             &mut self.remote_brain_run_units,
             run_id,
             kind,
             status,
+            recovery.as_ref(),
         )
     }
 
@@ -4500,6 +4577,7 @@ fn project_remote_brain_snapshot_runs(
             group.run_id,
             Some(group.kind),
             group.status,
+            None,
         );
     }
     for event in events.iter().filter(|event| event.run_id.is_some()) {

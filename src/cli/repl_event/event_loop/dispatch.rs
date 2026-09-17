@@ -993,6 +993,8 @@ impl EventLoop {
                 }
                 match self.restore_home_runner(target.clone()).await {
                     Ok(()) => {
+                        self.last_home_runner_error = None;
+                        self.last_runner_recovery = None;
                         self.output_manager.write_info(format!(
                             "{}: runner callback reconnected",
                             self.session_label
@@ -1003,22 +1005,25 @@ impl EventLoop {
                         }
                     }
                     Err(error) => {
-                        let detail = error.to_string();
+                        let recovery = super::super::runner_recovery::RunnerRecovery::from_error(
+                            &error.to_string(),
+                        );
+                        let detail = recovery.human_message();
                         if self.last_home_runner_error.as_deref() != Some(&detail) {
-                            self.output_manager.write_info(format!(
-                                "{}: runner reconnect attempt failed: {}",
-                                self.session_label, detail
-                            ));
+                            self.output_manager
+                                .write_info(format!("{}: {}", self.session_label, detail));
                         }
                         self.last_home_runner_error = Some(detail);
-                        if self
-                            .last_home_runner_error
-                            .as_deref()
-                            .is_some_and(|detail| detail.contains("handed off"))
-                        {
+                        let handed_off = matches!(
+                            recovery,
+                            super::super::runner_recovery::RunnerRecovery::HandoffRequired
+                        );
+                        let should_reconnect = recovery.should_auto_reconnect();
+                        self.last_runner_recovery = Some(recovery);
+                        if handed_off {
                             self.home_runner_lease_id = None;
                             self.runner_reconnect_target = None;
-                        } else {
+                        } else if should_reconnect {
                             self.schedule_home_runner_reconnect(
                                 epoch,
                                 attempt.saturating_add(1),
@@ -1113,16 +1118,19 @@ impl EventLoop {
                         );
                     }
                     if let Some(error) = registration_error {
-                        let changed = self.last_home_runner_error.as_deref() != Some(&error);
-                        self.last_home_runner_error = Some(error.clone());
+                        let recovery =
+                            super::super::runner_recovery::RunnerRecovery::from_error(&error);
+                        let message = recovery.human_message();
+                        let changed = self.last_home_runner_error.as_deref() != Some(&message);
+                        self.last_home_runner_error = Some(message.clone());
+                        self.last_runner_recovery = Some(recovery);
                         if changed {
-                            self.output_manager.write_info(format!(
-                                "{}: runner unavailable: {}",
-                                self.session_label, error
-                            ));
+                            self.output_manager
+                                .write_info(format!("{}: {}", self.session_label, message));
                         }
                     } else {
                         self.last_home_runner_error = None;
+                        self.last_runner_recovery = None;
                     }
                     self.render_tui().await?;
                 }

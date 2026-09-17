@@ -95,8 +95,16 @@ pub(crate) fn encode_brain_remote_envelope(envelope: &BrainRemoteEnvelope) -> an
 pub(crate) fn encode_checkpoint_bytes(value: &TypedRuntimeCheckpoint) -> Result<Vec<u8>> { … }
 /// Compact packed Cap'n Proto frame for the Runtime/Application ABI. Re-exported from `ipc::codec`.
 pub(crate) fn encode_runtime_application_message_packed(value: &RuntimeApplicationMessage) -> Result<Vec<u8>> { … }
+/// One human leftover-daemon error naming both generations and the kick command.
+pub fn leftover_daemon_message(frontend_generation: u32, daemon_generation: u32, uptime_seconds: Option<u64>) -> String { … }
+/// Short package identity advertised on `/health` and IPC ping.
+pub fn package_identity() -> &'static str { … }
+/// Protocol generation advertised by a running daemon's `/health` document.
+pub fn protocol_generation_from_health_json(value: &serde_json::Value) -> u32 { … }
 /// Bind the Unix socket and accept Cap'n Proto connections in a `LocalSet`.
 pub async fn start_ipc_server(server: Arc<AgentServer>, shutdown: tokio_util::sync::CancellationToken) -> Result<()> { … }
+/// Uptime from a `/health` document, or 0 when the field is absent.
+pub fn uptime_seconds_from_health_json(value: &serde_json::Value) -> u64 { … }
 ```
 
 ## Constants

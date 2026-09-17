@@ -109,7 +109,7 @@ fn initialization_schedule_message(
         Some(status) => format!(
             "reviewed Brain initialization was already dispatched as {} ({})",
             &schedule_id[..8],
-            format!("{status:?}").to_ascii_lowercase(),
+            status.human_label(),
         ),
         None => format!(
             "reviewed Brain initialization was already delivered as {}",
@@ -574,6 +574,7 @@ impl EventLoop {
             lease_id: Some(lease.lease_id),
         });
         self.last_home_runner_error = None;
+        self.last_runner_recovery = None;
         self.start_runner_lease_renewal(
             ipc,
             target.brain,
@@ -727,9 +728,12 @@ impl EventLoop {
                     .map(|parent| format!(" · parent {}", &parent.0.to_string()[..8]))
                     .unwrap_or_default();
                 lines.push(format!(
-                    "  {}  {:?} · {:?} · event {}{}",
+                    "  {}  {} · {:?} · event {}{}",
                     &run_id[..8],
-                    run.status,
+                    super::runner_recovery::brain_run_status_label(
+                        run.status,
+                        self.last_runner_recovery.as_ref(),
+                    ),
                     run.kind,
                     run.request_seq,
                     parent
@@ -1301,6 +1305,134 @@ impl EventLoop {
             snapshot.name
         ));
         self.update_remote_brain_status(true);
+        self.render_tui().await
+    }
+
+    async fn handle_brain_runner_status(&mut self) -> Result<()> {
+        let recovery = self.last_runner_recovery.clone();
+        let mut lines = vec!["Runner status:".to_string()];
+        lines.push(format!(
+            "  frontend identity: {}",
+            self.runner_subject
+        ));
+        lines.push(format!(
+            "  lease: {}",
+            if self.home_runner_lease_active {
+                self.home_runner_lease_id
+                    .map(|id| format!("active {}", &id.0.to_string()[..8]))
+                    .unwrap_or_else(|| "active".into())
+            } else {
+                "none".into()
+            }
+        ));
+        if let Some(brain) = self.runner_brain.as_ref() {
+            lines.push(format!("  serving: {brain}"));
+        }
+        let queued = self
+            .home_brain
+            .as_ref()
+            .or(self.active_remote_brain.as_ref());
+        if let Some(client) = queued {
+            if let Ok(snapshot) = client.snapshot().await {
+                let queued_count = snapshot
+                    .runs
+                    .iter()
+                    .filter(|run| run.status == crate::brain::BrainRunStatus::QueuedForEnvironment)
+                    .count();
+                lines.push(format!("  environment: {} · {}", snapshot.environment.machine, snapshot.environment.workspace.display()));
+                lines.push(format!(
+                    "  owner: {}",
+                    snapshot
+                        .runner_lease
+                        .as_ref()
+                        .map(|lease| lease.subject.as_str())
+                        .unwrap_or("none")
+                ));
+                lines.push(format!("  queued runs: {queued_count}"));
+            }
+        }
+        if let Some(recovery) = recovery.as_ref() {
+            lines.push(format!("  state: {}", recovery.human_message()));
+            lines.push(format!("  next: {}", recovery.next_action()));
+        } else if self.home_runner_lease_active {
+            lines.push("  state: this frontend is the active environment runner".into());
+        } else {
+            lines.push("  state: no runner connected".into());
+            lines.push("  next: /brain runner claim".into());
+        }
+        if let Some(error) = self.last_home_runner_error.as_ref() {
+            if recovery
+                .as_ref()
+                .is_none_or(|item| &item.human_message() != error)
+            {
+                lines.push(format!("  last error: {error}"));
+            }
+        }
+        self.output_manager.write_info(lines.join("\n"));
+        self.render_tui().await
+    }
+
+    async fn handle_brain_runner_claim(&mut self) -> Result<()> {
+        if self.home_runner_lease_active {
+            self.output_manager.write_info(format!(
+                "this frontend already runs {}",
+                self.runner_brain
+                    .as_deref()
+                    .unwrap_or(&self.session_label)
+            ));
+            return self.render_tui().await;
+        }
+        if let Some(recovery) = self.last_runner_recovery.as_ref() {
+            if recovery.blocks_driver_attach() {
+                self.output_manager.write_info(recovery.human_message());
+                return self.render_tui().await;
+            }
+        }
+        let target = if let Some(target) = self.runner_reconnect_target.clone() {
+            target
+        } else {
+            let ipc = self
+                .ipc_client
+                .as_ref()
+                .context("Cap'n Proto daemon connection unavailable")?;
+            let snapshot = ipc.brain_snapshot(&self.session_label).await?;
+            verify_local_frontend_environment(&snapshot.environment)?;
+            RunnerReconnectTarget {
+                brain: snapshot.name,
+                environment: snapshot.environment,
+                lease_id: snapshot
+                    .runner_lease
+                    .filter(|lease| lease.subject == self.runner_subject)
+                    .map(|lease| lease.lease_id),
+            }
+        };
+        self.restore_home_runner(target).await?;
+        self.update_remote_brain_status(true);
+        self.output_manager.write_info(format!(
+            "{}: this frontend is now the environment runner",
+            self.session_label
+        ));
+        self.render_tui().await
+    }
+
+    async fn handle_brain_runner_release(&mut self) -> Result<()> {
+        if !self.home_runner_lease_active {
+            self.output_manager
+                .write_info("this frontend does not hold a runner lease");
+            return self.render_tui().await;
+        }
+        self.release_home_brain_presence().await;
+        self.last_runner_recovery = Some(super::runner_recovery::RunnerRecovery::NoLiveLease);
+        self.status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::SessionLabel,
+            format!(
+                "◆ brain: {} · {}",
+                self.session_label,
+                super::runner_recovery::RunnerRecovery::NoLiveLease.header_suffix()
+            ),
+        );
+        self.output_manager
+            .write_info("released the environment-runner lease");
         self.render_tui().await
     }
 }

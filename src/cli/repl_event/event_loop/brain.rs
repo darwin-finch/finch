@@ -972,13 +972,16 @@ impl EventLoop {
                 detail,
             } => {
                 let projection = self.ensure_remote_brain_run_projection(*run_id, None, *status);
-                let summary = detail
-                    .as_deref()
-                    .map(|detail| format!("{}: {detail}", format!("{status:?}").to_lowercase()))
-                    .unwrap_or_else(|| format!("{status:?}").to_lowercase());
+                let label = super::super::runner_recovery::brain_run_status_label(*status, None);
                 if *status == crate::brain::BrainRunStatus::Failed {
-                    projection.unit.fail_row(projection.status_row, summary);
+                    projection
+                        .unit
+                        .fail_row(projection.status_row, detail.clone().unwrap_or(label));
                 } else {
+                    let summary = detail
+                        .as_deref()
+                        .map(|detail| format!("{label}: {detail}"))
+                        .unwrap_or(label);
                     projection.unit.complete_row(projection.status_row, summary);
                 }
                 if status.is_terminal() {

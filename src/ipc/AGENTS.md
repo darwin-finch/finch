@@ -27,6 +27,9 @@ that schema; it does not generate or own it.
 **Wire behavior is not a facade concern.** `IPC_PROTOCOL_VERSION` and packed
 Runtime/Application envelopes stay as they are. Changing framing belongs to
 the codec capsule with a byte-level regression, not to a re-export commit.
+Leftover-daemon health advertisement (`leftover_daemon_message`,
+`protocol_generation_from_health_json`) lives on this facade so HTTP 200 is
+not treated as compatibility.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- ipc::`.
 Regenerate the facade digest with `python3 scripts/generate_interfaces.py --write`

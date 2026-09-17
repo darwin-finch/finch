@@ -2077,6 +2077,7 @@ fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
         run_id,
         Some(BrainRunKind::Speculative),
         BrainRunStatus::Running,
+        None,
     );
 
     let mut result = brain_event(
@@ -2460,6 +2461,7 @@ fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
         run_id,
         Some(BrainRunKind::Speculative),
         BrainRunStatus::Running,
+        None,
     )
     .unit
     .clone();
@@ -2576,6 +2578,7 @@ fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
         run_id,
         Some(BrainRunKind::Speculative),
         BrainRunStatus::Running,
+        None,
     )
     .unit
     .clone();
@@ -5459,6 +5462,183 @@ async fn test_shift_tab_enters_auto_accept_and_plan_stays_planning() {
                 ),
                 "/plan from AutoAccept must enter Planning, not stay in AutoAccept; mode={:?}",
                 event_loop.mode.read().await.clone()
+            );
+        })
+        .await;
+}
+
+fn runner_recovery_test_event_loop() -> super::EventLoop {
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let tempdir = tempfile::tempdir().expect("runner recovery fixture: isolated tool state");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        tempdir.path().join("patterns.json"),
+    )
+    .expect("runner recovery fixture: construct inert tool executor");
+    let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+    let event_loop = super::EventLoop::new_named_brain_test_runner(
+        generator,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        runtime,
+    );
+    event_loop.output_manager.disable_stdout();
+    std::mem::forget(tempdir);
+    event_loop
+}
+
+fn runner_recovery_messages(event_loop: &super::EventLoop) -> Vec<String> {
+    event_loop
+        .output_manager
+        .get_messages()
+        .iter()
+        .map(|message| message.content())
+        .collect()
+}
+
+#[tokio::test]
+async fn register_home_brain_outer_err_reaches_tui_and_does_not_attach() {
+    tokio::task::LocalSet::new().run_until(async {
+    let mut event_loop = runner_recovery_test_event_loop();
+    let error =
+        crate::ipc::leftover_daemon_message(crate::ipc::IPC_PROTOCOL_VERSION, 8, Some(7_200));
+    let attach = event_loop.apply_home_runner_startup(Err(anyhow::anyhow!(error)));
+    assert!(
+        !attach,
+        "a leftover daemon must not attach as a mute driver after register_home_brain fails"
+    );
+    let header = event_loop
+        .status_bar
+        .get_line(&crate::cli::status_bar::StatusLineType::SessionLabel)
+        .expect("startup must project a session header");
+    assert!(
+        header.contains("finch daemon-stop") || header.contains("leftover daemon"),
+        "header must name leftover-daemon recovery, not daemon offline; header={header}"
+    );
+    assert!(
+        !header.contains("daemon offline"),
+        "outer register Err must not collapse into daemon-offline; header={header}"
+    );
+    let messages = runner_recovery_messages(&event_loop);
+    assert!(
+        messages.iter().any(|message| {
+            message.contains("speaks 8")
+                && message.contains(&format!("protocol {}", crate::ipc::IPC_PROTOCOL_VERSION))
+                && message.contains("finch daemon-stop")
+        }),
+        "the leftover error must reach the TUI with both generations and the kick command; messages={messages:?}"
+    );
+    }).await;
+}
+
+#[tokio::test]
+async fn workspace_mismatch_outer_err_is_visible_and_not_protocol_mismatch() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut event_loop = runner_recovery_test_event_loop();
+            let attach = event_loop.apply_home_runner_startup(Err(anyhow::anyhow!(
+        "frontend workspace does not match the Brain environment (expected /tmp/a, found /tmp/b)"
+    )));
+            assert!(
+                !attach,
+                "workspace mismatch must not attach as a mute driver"
+            );
+            let messages = runner_recovery_messages(&event_loop);
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("/tmp/a") && message.contains("/tmp/b")),
+                "workspace mismatch must name expected vs found; messages={messages:?}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| !message.contains("speaks protocol")
+                        && !message.contains("leftover daemon")),
+                "workspace mismatch is not a leftover-daemon protocol error; messages={messages:?}"
+            );
+            let header = event_loop
+                .status_bar
+                .get_line(&crate::cli::status_bar::StatusLineType::SessionLabel)
+                .expect("startup must project a session header");
+            assert!(
+                header.contains("workspace mismatch"),
+                "header must distinguish workspace mismatch from leftover daemon; header={header}"
+            );
+        })
+        .await;
+}
+
+#[test]
+fn queued_run_projection_uses_human_labels_not_debug_enum() {
+    use crate::brain::{BrainRunKind, BrainRunStatus, RunId};
+    use crate::cli::messages::Message;
+    let output =
+        crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
+    output.disable_stdout();
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let mut projections = std::collections::HashMap::new();
+    let recovery = crate::cli::repl_event::runner_recovery::RunnerRecovery::ProtocolMismatch {
+        frontend: crate::ipc::IPC_PROTOCOL_VERSION,
+        daemon: 8,
+        uptime_seconds: Some(120),
+    };
+    super::ensure_remote_brain_run_projection(
+        &output,
+        &mut projections,
+        run_id,
+        Some(BrainRunKind::Interactive),
+        BrainRunStatus::QueuedForEnvironment,
+        Some(&recovery),
+    );
+    let unit = projections.get(&run_id).unwrap().unit.clone();
+    let projected = unit
+        .transcript_row(&crate::theme::ColorScheme::default())
+        .unwrap();
+    let haystack = format!("{} {:?}", projected.label, projected.children);
+    assert!(
+        !haystack.to_lowercase().contains("queuedforenvironment"),
+        "queued-run rows must use human labels; haystack={haystack}"
+    );
+    assert!(
+        haystack.contains("leftover daemon") && haystack.contains("finch daemon-stop"),
+        "queued leftover rows must name the kick command; haystack={haystack}"
+    );
+}
+
+#[tokio::test]
+async fn other_owner_inner_failure_still_allows_driver_attach() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut event_loop = runner_recovery_test_event_loop();
+            let attach =
+                event_loop.apply_home_runner_startup(Ok(Some(super::HomeRunnerRegistration {
+                    target: crate::cli::repl_event::events::RunnerReconnectTarget {
+                        brain: "slow-grove-155efd".into(),
+                        environment: crate::brain::BrainEnvironment {
+                            machine: "box.local".into(),
+                            workspace: std::path::PathBuf::from("/tmp/ws"),
+                            generation: 1,
+                        },
+                        lease_id: None,
+                    },
+                    registration: Err(
+                        "Brain runner lease belongs to another subject (alice@host/frontend)"
+                            .into(),
+                    ),
+                })));
+            assert!(
+        attach,
+        "another owner is observable as a driver so handoff can be requested; attach={attach}"
+    );
+            let messages = runner_recovery_messages(&event_loop);
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("alice@host/frontend")
+                        && message.contains("handoff")),
+                "other-owner recovery must name the owner and handoff; messages={messages:?}"
             );
         })
         .await;

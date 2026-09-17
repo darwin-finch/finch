@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn human_labels_never_leak_debug_enum_names() {
+    assert_eq!(
+        BrainRunStatus::QueuedForEnvironment.human_label(),
+        "Queued — no runner connected"
+    );
+    assert!(
+        !BrainRunStatus::QueuedForEnvironment
+            .human_label()
+            .to_lowercase()
+            .contains("queuedforenvironment"),
+        "raw Debug enum names must not reach TUI, raw mode, or screen-reader text"
+    );
+}
+
+#[test]
 fn test_validate_run_transition_rejects_terminal_and_skips() {
     assert!(
         validate_run_transition(BrainRunStatus::Running, BrainRunStatus::Completed).is_ok(),

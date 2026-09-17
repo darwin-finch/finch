@@ -21,6 +21,7 @@ them:
 | `event_loop/brain.rs` | remote and named Brain traffic, invitations, reconnection |
 | `event_loop/plan.rs` | plan mode, plan tasks, poset confirmation |
 | `event_loop/commands.rs` | slash-style commands: provider switch, feedback, demos |
+| `runner_recovery.rs` | leftover-daemon / lease / environment mismatch labels |
 
 **Adding an event.** Add the variant to `ReplEvent` in `events.rs`, then handle it in
 `dispatch.rs`. The compiler will tell you the match is non-exhaustive — that is the point of the

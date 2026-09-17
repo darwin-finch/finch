@@ -65,10 +65,17 @@ where
 {
     let base_url = format!("http://{}", bind);
 
-    // Quick health check first
-    if health_check_succeeds(&base_url).await {
-        debug!("Daemon already running and healthy");
-        return Ok(());
+    // Quick health check first. HTTP 200 is not compatibility: a leftover
+    // daemon from another protocol generation must not be reused.
+    match probe_daemon_health(&base_url).await {
+        HealthProbe::Compatible => {
+            debug!("Daemon already running and healthy");
+            return Ok(());
+        }
+        HealthProbe::Incompatible(mismatch) => {
+            return Err(mismatch.into_error());
+        }
+        HealthProbe::Unhealthy | HealthProbe::Unreachable => {}
     }
 
     // Check PID file
@@ -79,9 +86,15 @@ where
         info!("Daemon process exists, waiting for health check...");
         retry_backoff().await;
 
-        if health_check_succeeds(&base_url).await {
-            info!("Daemon now healthy");
-            return Ok(());
+        match probe_daemon_health(&base_url).await {
+            HealthProbe::Compatible => {
+                info!("Daemon now healthy");
+                return Ok(());
+            }
+            HealthProbe::Incompatible(mismatch) => {
+                return Err(mismatch.into_error());
+            }
+            HealthProbe::Unhealthy | HealthProbe::Unreachable => {}
         }
 
         warn!("Daemon process exists but not responding to health checks");
@@ -106,9 +119,15 @@ where
     for attempt in 0..20 {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        if health_check_succeeds(&base_url).await {
-            info!("Daemon started successfully");
-            return Ok(());
+        match probe_daemon_health(&base_url).await {
+            HealthProbe::Compatible => {
+                info!("Daemon started successfully");
+                return Ok(());
+            }
+            HealthProbe::Incompatible(mismatch) => {
+                return Err(mismatch.into_error());
+            }
+            HealthProbe::Unhealthy | HealthProbe::Unreachable => {}
         }
 
         if attempt % 4 == 0 && attempt > 0 {
@@ -340,7 +359,87 @@ async fn retry_backoff() {
 /// true and worth stating plainly: the timeline is "phases this process
 /// recorded", not "phases of startup", and a reader who dumps it mid-upgrade
 /// will see upgrade probes in it.
+/// Outcome of one `GET /health` probe, including leftover-daemon detection.
+#[derive(Debug)]
+pub(crate) enum HealthProbe {
+    Compatible,
+    Incompatible(LeftoverDaemon),
+    Unhealthy,
+    Unreachable,
+}
+
+/// A running daemon answered HTTP 200 but does not speak this protocol generation.
+#[derive(Debug, Clone)]
+pub(crate) struct LeftoverDaemon {
+    pub frontend_generation: u32,
+    pub daemon_generation: u32,
+    pub uptime_seconds: u64,
+}
+
+impl LeftoverDaemon {
+    fn into_error(self) -> anyhow::Error {
+        record_rejected_leftover_handshake(&self);
+        anyhow::Error::msg(crate::ipc::leftover_daemon_message(
+            self.frontend_generation,
+            self.daemon_generation,
+            Some(self.uptime_seconds).filter(|seconds| *seconds > 0),
+        ))
+    }
+}
+
+/// Append the rejected leftover handshake to `daemon.log` so users do not have
+/// to reconstruct it from a mute TUI. Best-effort: a missing log must not
+/// hide the error returned to the caller.
+fn record_rejected_leftover_handshake(mismatch: &LeftoverDaemon) {
+    let Ok(path) = crate::daemon::daemon_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let line = format!(
+        "leftover daemon handshake rejected: frontend protocol {}, daemon protocol {}, uptime {}s\n",
+        mismatch.frontend_generation, mismatch.daemon_generation, mismatch.uptime_seconds
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
+}
+
+/// Check if daemon health endpoint responds with a compatible generation.
+///
+/// Recorded as [`crate::startup::PHASE_DAEMON_RETRY_BACKOFF`]'s sibling,
+/// [`crate::startup::PHASE_DAEMON_HEALTH_PROBE`], nested inside
+/// `daemon_http_connect`. Instrumented here rather than at the three call
+/// sites so that every probe is timed -- the first one, the retry after the
+/// back-off, and each poll of the spawn wait -- and so that the category
+/// distinguishes "the daemon answered and said no" from "nothing answered
+/// inside the 500 ms timeout", which are different failures with different
+/// fixes and were previously indistinguishable in the report.
+///
+/// The timeline this writes into is process-global, and one caller is not on
+/// the startup path: `upgrade::wait_for_shadow_health` polls here up to sixty
+/// times while a shadow daemon comes up. That is left instrumented rather than
+/// scoped to startup, deliberately. The cost is bounded (sixty records, once,
+/// in a process that is performing an upgrade), and nothing reads those
+/// records: [`crate::startup::ready`] is the only thing that renders a report
+/// and `finch daemon-upgrade` never reaches it, so the entries are accumulated
+/// and dropped with the process. The alternative -- a startup-only flag
+/// threaded through this function -- would add a parameter whose only purpose
+/// is to suppress records no one sees, and would let a future startup caller
+/// pass the wrong value and lose the probe from the report silently. What is
+/// true and worth stating plainly: the timeline is "phases this process
+/// recorded", not "phases of startup", and a reader who dumps it mid-upgrade
+/// will see upgrade probes in it.
 pub(crate) async fn health_check_succeeds(base_url: &str) -> bool {
+    matches!(probe_daemon_health(base_url).await, HealthProbe::Compatible)
+}
+
+pub(crate) async fn probe_daemon_health(base_url: &str) -> HealthProbe {
     let mut phase = crate::startup::phase(crate::startup::PHASE_DAEMON_HEALTH_PROBE);
     let client = reqwest::Client::builder()
         .timeout(HEALTH_PROBE_TIMEOUT)
@@ -351,19 +450,39 @@ pub(crate) async fn health_check_succeeds(base_url: &str) -> bool {
 
     match client.get(&url).send().await {
         Ok(response) if response.status().is_success() => {
-            debug!(url = %url, "Health check succeeded");
-            phase.detail(crate::startup::PhaseDetail::category("healthy"));
-            true
+            let body = response.text().await.unwrap_or_default();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            let daemon_generation = crate::ipc::protocol_generation_from_health_json(&parsed);
+            let uptime_seconds = crate::ipc::uptime_seconds_from_health_json(&parsed);
+            if daemon_generation == crate::ipc::IPC_PROTOCOL_VERSION {
+                debug!(url = %url, generation = daemon_generation, "Health check succeeded");
+                phase.detail(crate::startup::PhaseDetail::category("healthy"));
+                HealthProbe::Compatible
+            } else {
+                debug!(
+                    url = %url,
+                    frontend = crate::ipc::IPC_PROTOCOL_VERSION,
+                    daemon = daemon_generation,
+                    "Health check found a leftover daemon"
+                );
+                phase.detail(crate::startup::PhaseDetail::category("incompatible"));
+                HealthProbe::Incompatible(LeftoverDaemon {
+                    frontend_generation: crate::ipc::IPC_PROTOCOL_VERSION,
+                    daemon_generation,
+                    uptime_seconds,
+                })
+            }
         }
         Ok(response) => {
             debug!(url = %url, status = %response.status(), "Health check failed");
             phase.detail(crate::startup::PhaseDetail::category("unhealthy"));
-            false
+            HealthProbe::Unhealthy
         }
         Err(e) => {
             debug!(url = %url, error = %e, "Health check request failed");
             phase.detail(crate::startup::PhaseDetail::category("unreachable"));
-            false
+            HealthProbe::Unreachable
         }
     }
 }
@@ -556,9 +675,33 @@ mod tests {
             .collect()
     }
 
-    /// Answer one request with `status`, then close. Returns the base URL.
+    fn compatible_health_body() -> String {
+        serde_json::json!({
+            "status": "healthy",
+            "uptime_seconds": 1,
+            "named_brains": 0,
+            "pending_brain_terminalizations": 0,
+            "protocol_generation": crate::ipc::IPC_PROTOCOL_VERSION,
+            "package_identity": crate::ipc::package_identity(),
+        })
+        .to_string()
+    }
+
+    fn leftover_health_body(generation: u32, uptime_seconds: u64) -> String {
+        serde_json::json!({
+            "status": "healthy",
+            "uptime_seconds": uptime_seconds,
+            "named_brains": 0,
+            "pending_brain_terminalizations": 0,
+            "protocol_generation": generation,
+        })
+        .to_string()
+    }
+
+    /// Answer one request with `status` and `body`, then close. Returns the base URL.
     async fn one_shot_health_endpoint(
         status: &'static str,
+        body: String,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -573,8 +716,11 @@ mod tests {
             let _ = stream.read(&mut scratch).await;
             let _ = stream
                 .write_all(
-                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                        .as_bytes(),
+                    format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
                 )
                 .await;
             let _ = stream.flush().await;
@@ -599,15 +745,16 @@ mod tests {
         let _serialised = timeline_lock().await;
         let before_backoffs = backoff_count();
 
-        let (healthy_url, healthy) = one_shot_health_endpoint("200 OK").await;
+        let (healthy_url, healthy) =
+            one_shot_health_endpoint("200 OK", compatible_health_body()).await;
         assert!(
             health_check_succeeds(&healthy_url).await,
-            "a 200 from /health is a healthy daemon"
+            "a 200 from /health is healthy only when protocol_generation matches this Finch"
         );
         let _ = healthy.await;
 
         let (unhealthy_url, unhealthy) =
-            one_shot_health_endpoint("500 Internal Server Error").await;
+            one_shot_health_endpoint("500 Internal Server Error", String::new()).await;
         assert!(
             !health_check_succeeds(&unhealthy_url).await,
             "a 500 from /health is not a healthy daemon"
@@ -752,6 +899,94 @@ mod tests {
             error.to_string().contains(&std::process::id().to_string()),
             "the diagnostic must name the PID it found in the PID file, which \
              is this test's own. Error was: {error:#}"
+        );
+    }
+
+    /// HTTP 200 from a leftover daemon is not compatibility. Older daemons omit
+    /// `protocol_generation` (read as 0) and must fail closed with the kick
+    /// command rather than being reused as a mute driver.
+    #[tokio::test]
+    async fn leftover_daemon_http_200_is_not_protocol_compatibility() {
+        let _serialised = timeline_lock().await;
+        let home = tempfile::tempdir().expect("disposable HOME for leftover daemon.log");
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        let _restore_home = RestoreHome(std::env::var_os("HOME"));
+        std::env::set_var("HOME", home.path());
+
+        let (legacy_url, legacy) = one_shot_health_endpoint(
+            "200 OK",
+            serde_json::json!({
+                "status": "healthy",
+                "uptime_seconds": 7200,
+                "named_brains": 1
+            })
+            .to_string(),
+        )
+        .await;
+        let probe = probe_daemon_health(&legacy_url).await;
+        let _ = legacy.await;
+        match &probe {
+            HealthProbe::Incompatible(mismatch) => {
+                assert_eq!(
+                    mismatch.daemon_generation, 0,
+                    "omitted protocol_generation must fail closed at 0; mismatch={mismatch:?}"
+                );
+                assert_eq!(mismatch.uptime_seconds, 7200);
+                assert_eq!(
+                    mismatch.frontend_generation,
+                    crate::ipc::IPC_PROTOCOL_VERSION
+                );
+            }
+            other => panic!("HTTP 200 without protocol_generation must be leftover, not {other:?}"),
+        }
+        assert!(
+            !matches!(probe, HealthProbe::Compatible),
+            "health_check_succeeds must not treat a leftover HTTP 200 as a reusable daemon; probe={probe:?}"
+        );
+
+        let (old_url, old) =
+            one_shot_health_endpoint("200 OK", leftover_health_body(8, 7200)).await;
+        let error = connect_or_spawn(old_url.trim_start_matches("http://"), || {
+            anyhow::bail!("leftover daemon must not reach PID-file or spawn construction")
+        })
+        .await
+        .expect_err("a leftover daemon must not be reused");
+        let _ = old.await;
+        let message = error.to_string();
+        assert!(
+            message.contains("speaks 8"),
+            "leftover error must name the running daemon generation; error={message}"
+        );
+        assert!(
+            message.contains(&format!("protocol {}", crate::ipc::IPC_PROTOCOL_VERSION)),
+            "leftover error must name this Finch generation; error={message}"
+        );
+        assert!(
+            message.contains("up for 2h"),
+            "leftover error must include uptime; error={message}"
+        );
+        assert!(
+            message.contains("finch daemon-stop"),
+            "leftover error must name the exact kick command; error={message}"
+        );
+
+        let log = std::fs::read_to_string(home.path().join(".finch").join("daemon.log"))
+            .unwrap_or_default();
+        assert!(
+            log.contains("leftover daemon handshake rejected"),
+            "daemon.log must record the rejected leftover handshake; log={log:?}"
+        );
+        assert!(
+            log.contains("frontend protocol") && log.contains("daemon protocol 8"),
+            "daemon.log must name expected vs found generation; log={log:?}"
         );
     }
 

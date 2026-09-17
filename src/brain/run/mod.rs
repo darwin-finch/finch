@@ -67,6 +67,22 @@ impl BrainRunStatus {
     pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
+
+    /// Human status label for TUI, raw mode, and screen-reader text.
+    ///
+    /// Never format this enum with `Debug` for a user-visible row: that is
+    /// how `queuedforenvironment` leaked into the transcript.
+    pub fn human_label(self) -> &'static str {
+        match self {
+            Self::QueuedForEnvironment => "Queued — no runner connected",
+            Self::Running => "Running",
+            Self::AwaitingApproval => "Awaiting approval",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+            Self::Interrupted => "Interrupted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -93,6 +93,8 @@ pub async fn health_check(
         uptime_seconds: server.uptime().as_secs(),
         named_brains,
         pending_brain_terminalizations,
+        protocol_generation: crate::ipc::IPC_PROTOCOL_VERSION,
+        package_identity: crate::ipc::package_identity().to_string(),
     };
 
     Ok(Json(status))
