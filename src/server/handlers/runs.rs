@@ -564,7 +564,7 @@ pub(super) async fn watch_named_brain(
     Ok(ws
         .on_upgrade(move |mut socket| async move {
             use axum::extract::ws::Message as WsMessage;
-            use crate::ipc::brain_codec::{
+            use crate::ipc::{
                 BrainRemoteCommand, BrainRemoteEnvelope, BrainRemoteReply,
             };
 
@@ -621,7 +621,7 @@ pub(super) async fn watch_named_brain(
             let initial = BrainRemoteEnvelope::Projection(
                 crate::brain::BrainWireMessage::Snapshot { brain: snapshot },
             );
-            if let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&initial) {
+            if let Ok(encoded) = crate::ipc::encode_brain_remote_envelope(&initial) {
                 if socket
                     .send(WsMessage::Binary(encoded.into()))
                     .await
@@ -648,17 +648,17 @@ pub(super) async fn watch_named_brain(
                         }
                         Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
                         Some(Ok(WsMessage::Binary(bytes))) => {
-                            match crate::ipc::brain_codec::decode_brain_remote_envelope(&bytes) {
+                            match crate::ipc::decode_brain_remote_envelope(&bytes) {
                                 Ok(BrainRemoteEnvelope::Command(command)) => {
                                     if matches!(
                                         &command.kind,
-                                        crate::ipc::brain_codec::BrainRemoteCommandKind::Detach
+                                        crate::ipc::BrainRemoteCommandKind::Detach
                                     ) {
                                         detach_request_id = Some(command.request_id);
                                     }
                                     let is_approval = matches!(
                                         &command.kind,
-                                        crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(
+                                        crate::ipc::BrainRemoteCommandKind::Submit(
                                             crate::brain::BrainEventKind::ApprovalDecided { .. }
                                         )
                                     );
@@ -687,7 +687,7 @@ pub(super) async fn watch_named_brain(
                         let detach_failed = matches!(&reply, BrainRemoteReply::Error { .. })
                             && detach_request_id == Some(reply_request_id);
                         let envelope = BrainRemoteEnvelope::Reply(reply);
-                        let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) else {
+                        let Ok(encoded) = crate::ipc::encode_brain_remote_envelope(&envelope) else {
                             break;
                         };
                         #[cfg(test)]
@@ -704,7 +704,7 @@ pub(super) async fn watch_named_brain(
                             detach_request_id = None;
                             if let Some(wire) = pending_detach_projection.take() {
                                 let envelope = BrainRemoteEnvelope::Projection(wire);
-                                let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) else {
+                                let Ok(encoded) = crate::ipc::encode_brain_remote_envelope(&envelope) else {
                                     break;
                                 };
                                 let _ = socket.send(WsMessage::Binary(encoded.into())).await;
@@ -739,7 +739,7 @@ pub(super) async fn watch_named_brain(
                             continue;
                         }
                         let envelope = BrainRemoteEnvelope::Projection(wire);
-                        let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) else {
+                        let Ok(encoded) = crate::ipc::encode_brain_remote_envelope(&envelope) else {
                             break;
                         };
                         if socket.send(WsMessage::Binary(encoded.into())).await.is_err()

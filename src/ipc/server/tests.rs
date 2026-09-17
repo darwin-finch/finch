@@ -2,7 +2,7 @@ use super::{
     decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc,
     require_approval_connection, BrainRpcService, BrainRunnerControlImpl, FinchDaemonImpl,
 };
-use crate::ipc::brain_codec::encode_approval_audience;
+use crate::ipc::codec::encode_approval_audience;
 
 #[test]
 fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
@@ -92,8 +92,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
             },
             origin: crate::vm::SourceOrigin::generated("capnp-effect-audit-test"),
         };
-        crate::ipc::checkpoint_codec::encode_vm_side_effect(reserve.get().init_effect(), &effect)
-            .unwrap();
+        crate::ipc::codec::encode_vm_side_effect(reserve.get().init_effect(), &effect).unwrap();
         let reservation = reserve
             .send()
             .promise
@@ -145,7 +144,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
         stale_reserve
             .get()
             .set_execution_id(&uuid::Uuid::new_v4().to_string());
-        crate::ipc::checkpoint_codec::encode_vm_side_effect(
+        crate::ipc::codec::encode_vm_side_effect(
             stale_reserve.get().init_effect(),
             &crate::vm::VmSideEffect {
                 sequence: 1,
@@ -234,8 +233,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
             });
         let mut replay = replay_control.reserve_effect_request();
         replay.get().set_execution_id(&execution_id.to_string());
-        crate::ipc::checkpoint_codec::encode_vm_side_effect(replay.get().init_effect(), &effect)
-            .unwrap();
+        crate::ipc::codec::encode_vm_side_effect(replay.get().init_effect(), &effect).unwrap();
         replay
             .send()
             .promise
@@ -250,7 +248,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
         conflicting
             .get()
             .set_execution_id(&execution_id.to_string());
-        crate::ipc::checkpoint_codec::encode_vm_side_effect(
+        crate::ipc::codec::encode_vm_side_effect(
             conflicting.get().init_effect(),
             &crate::vm::VmSideEffect {
                 event: crate::vm::HostSideEffect::Emit {
@@ -425,7 +423,7 @@ impl super::finch_ipc_capnp::brain_runner::Server for EffectEofRunner {
                 reserve
                     .get()
                     .set_execution_id(&uuid::Uuid::new_v4().to_string());
-                crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                crate::ipc::codec::encode_vm_side_effect(
                     reserve.get().init_effect(),
                     &crate::vm::VmSideEffect {
                         protocol_version: 1,
@@ -520,7 +518,7 @@ impl super::finch_ipc_capnp::brain_runner::Server for EffectNormalRunner {
             reserve
                 .get()
                 .set_execution_id(&uuid::Uuid::new_v4().to_string());
-            crate::ipc::checkpoint_codec::encode_vm_side_effect(
+            crate::ipc::codec::encode_vm_side_effect(
                 reserve.get().init_effect(),
                 &crate::vm::VmSideEffect {
                     protocol_version: 1,
@@ -1958,7 +1956,7 @@ fn encode_test_packed_delivery(
     mut encoded: capnp::data_list::Builder<'_>,
     records: &[crate::server::RunnerEffectRecord],
 ) {
-    let frames = super::super::checkpoint_codec::encode_packed_delivery_envelopes(records).unwrap();
+    let frames = crate::ipc::codec::encode_packed_delivery_envelopes(records).unwrap();
     encoded.set(0, &frames[0]);
 }
 
@@ -2167,7 +2165,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         result.set_language(super::finch_ipc_capnp::ProgramLanguage::Lisp);
         result.set_output("done");
         result.set_runtime_revision(1);
-        super::super::brain_codec::encode_continuation_messages(
+        crate::ipc::codec::encode_continuation_messages(
             result.reborrow().init_continuation_messages(3),
             &[
                 crate::providers::Message::with_content(
@@ -2200,7 +2198,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         )
         .unwrap();
         result.set_has_invocation_metadata(true);
-        super::super::brain_codec::encode_invocation_metadata(
+        crate::ipc::codec::encode_invocation_metadata(
             result.reborrow().init_invocation_metadata(),
             &crate::providers::InvocationMetadata {
                 requested_model: "gpt-5.6".into(),
@@ -2214,7 +2212,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         );
         super::encode_checkpoint(result.reborrow().init_checkpoint(), &checkpoint).unwrap();
         result.set_error("");
-        super::super::checkpoint_codec::encode_effect_record(
+        crate::ipc::codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2229,7 +2227,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         call.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::Call);
         call.set_tool_id("tool-1");
         call.set_name("search_word");
-        super::super::brain_codec::encode_json_value(
+        crate::ipc::codec::encode_json_value(
             call.reborrow().init_input(),
             &serde_json::json!({"query": "fib"}),
         )
@@ -2243,7 +2241,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
             approval.reborrow().init_approval_audience(),
             &test_approval_audience(),
         );
-        super::super::brain_codec::encode_json_value(
+        crate::ipc::codec::encode_json_value(
             approval.reborrow().init_detail(),
             &serde_json::json!({"input": {"query": "fib"}}),
         )
@@ -2251,7 +2249,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         let mut decision = events.reborrow().get(2);
         decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
         decision.set_approval_id("tool-1");
-        super::super::brain_codec::encode_json_value(
+        crate::ipc::codec::encode_json_value(
             decision.reborrow().init_decision(),
             &serde_json::json!({"choice": "approve_once"}),
         )
@@ -2314,7 +2312,7 @@ fn runner_turn_error_keeps_partial_lifecycle() {
     {
         let mut result = message.init_root::<super::finch_ipc_capnp::brain_turn_result::Builder>();
         result.set_error("provider failed after approval");
-        super::super::checkpoint_codec::encode_effect_record(
+        crate::ipc::codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2328,7 +2326,7 @@ fn runner_turn_error_keeps_partial_lifecycle() {
         let mut decision = events.reborrow().get(0);
         decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
         decision.set_approval_id("approval-1");
-        super::super::brain_codec::encode_json_value(
+        crate::ipc::codec::encode_json_value(
             decision.reborrow().init_decision(),
             &serde_json::json!({"choice": "deny"}),
         )
@@ -2358,7 +2356,7 @@ fn runner_program_error_keeps_execute_once_effects() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        super::super::checkpoint_codec::encode_effect_record(
+        crate::ipc::codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2385,16 +2383,15 @@ fn packed_delivery_on_runner_program_result_must_match_the_journal() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        super::super::checkpoint_codec::encode_effect_record(
+        crate::ipc::codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
         )
         .unwrap();
-        let frames = super::super::checkpoint_codec::encode_packed_delivery_envelopes(&[
-            expected_effect.clone(),
-        ])
-        .unwrap();
+        let frames =
+            crate::ipc::codec::encode_packed_delivery_envelopes(&[expected_effect.clone()])
+                .unwrap();
         result.reborrow().init_delivery(1).set(0, &frames[0]);
     }
     let reader = message
@@ -2410,15 +2407,13 @@ fn packed_delivery_on_runner_program_result_must_match_the_journal() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        super::super::checkpoint_codec::encode_effect_record(
+        crate::ipc::codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
         )
         .unwrap();
-        let frames =
-            super::super::checkpoint_codec::encode_packed_delivery_envelopes(&[mismatched])
-                .unwrap();
+        let frames = crate::ipc::codec::encode_packed_delivery_envelopes(&[mismatched]).unwrap();
         result.reborrow().init_delivery(1).set(0, &frames[0]);
     }
     let reader = message
@@ -2445,7 +2440,7 @@ fn omitted_packed_delivery_with_a_journal_fails_closed() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        super::super::checkpoint_codec::encode_effect_record(
+        crate::ipc::codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,

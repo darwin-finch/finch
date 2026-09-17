@@ -4773,7 +4773,7 @@ impl BrainStore {
         self.pending_effect_delivery(name, consumer)?
             .into_iter()
             .map(|envelope| {
-                crate::ipc::checkpoint_codec::encode_runtime_application_message_packed(
+                crate::ipc::encode_runtime_application_message_packed(
                     &crate::runtime::RuntimeApplicationMessage::Envelope { envelope },
                 )
             })
@@ -4852,7 +4852,7 @@ impl BrainStore {
         let checkpoint = snapshot.checkpoint.context(
             "typed runtime revision contains host-owned handles and cannot be persisted yet",
         )?;
-        let encoded = crate::ipc::checkpoint_codec::encode_checkpoint_bytes(&checkpoint)?;
+        let encoded = crate::ipc::encode_checkpoint_bytes(&checkpoint)?;
         let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
         self.write_runtime_checkpoint(name, &checkpoint_sha256, &encoded)?;
         self.runtime_checkpoints
@@ -4934,7 +4934,7 @@ impl BrainStore {
             runtime_revision,
         )?);
         self.bind_runtime_delivery_log(name, &restored)?;
-        let encoded = crate::ipc::checkpoint_codec::encode_checkpoint_bytes(&checkpoint)?;
+        let encoded = crate::ipc::encode_checkpoint_bytes(&checkpoint)?;
         let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
         self.write_runtime_checkpoint(name, &checkpoint_sha256, &encoded)?;
         self.runtime_checkpoints
@@ -4993,7 +4993,7 @@ impl BrainStore {
             anyhow::bail!("typed runtime checkpoint hash mismatch for {checkpoint_sha256}");
         }
         let checkpoint = if native {
-            crate::ipc::checkpoint_codec::decode_checkpoint_bytes(&encoded)
+            crate::ipc::decode_checkpoint_bytes(&encoded)
                 .with_context(|| format!("parse {}", path.display()))?
         } else {
             serde_json::from_slice(&encoded)

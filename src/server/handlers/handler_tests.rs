@@ -235,22 +235,20 @@ async fn websocket_teardown_is_bounded_and_connection_scoped() {
     let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
     lifecycle.register_test_runner("shared", lease.lease_id, runner_tx);
     let current = lifecycle.snapshot("shared").unwrap();
-    let command = crate::ipc::brain_codec::BrainRemoteCommand {
+    let command = crate::ipc::BrainRemoteCommand {
         request_id: 1,
-        mutation: Some(crate::ipc::brain_codec::BrainRemoteMutation {
+        mutation: Some(crate::ipc::BrainRemoteMutation {
             brain_id: current.brain_id,
             expected_revision: current.revision,
             environment_generation: current.environment.generation,
             idempotency_key: uuid::Uuid::new_v4(),
         }),
-        kind: crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(
-            BrainEventKind::SpeculativePrompt {
-                text: "disconnect mid-turn".into(),
-            },
-        ),
+        kind: crate::ipc::BrainRemoteCommandKind::Submit(BrainEventKind::SpeculativePrompt {
+            text: "disconnect mid-turn".into(),
+        }),
     };
-    let encoded = crate::ipc::brain_codec::encode_brain_remote_envelope(
-        &crate::ipc::brain_codec::BrainRemoteEnvelope::Command(command),
+    let encoded = crate::ipc::encode_brain_remote_envelope(
+        &crate::ipc::BrainRemoteEnvelope::Command(command),
     )
     .unwrap();
     socket
@@ -314,18 +312,18 @@ async fn websocket_teardown_is_bounded_and_connection_scoped() {
         }).await.expect("reverse approval did not reach durable suspension");
 
     let cancellation_snapshot = lifecycle.snapshot("shared").unwrap();
-    let cancellation_command = crate::ipc::brain_codec::BrainRemoteCommand {
+    let cancellation_command = crate::ipc::BrainRemoteCommand {
         request_id: 2,
-        mutation: Some(crate::ipc::brain_codec::BrainRemoteMutation {
+        mutation: Some(crate::ipc::BrainRemoteMutation {
             brain_id: cancellation_snapshot.brain_id,
             expected_revision: cancellation_snapshot.revision,
             environment_generation: cancellation_snapshot.environment.generation,
             idempotency_key: uuid::Uuid::new_v4(),
         }),
-        kind: crate::ipc::brain_codec::BrainRemoteCommandKind::CancelRun(run_id),
+        kind: crate::ipc::BrainRemoteCommandKind::CancelRun(run_id),
     };
-    let encoded = crate::ipc::brain_codec::encode_brain_remote_envelope(
-        &crate::ipc::brain_codec::BrainRemoteEnvelope::Command(cancellation_command),
+    let encoded = crate::ipc::encode_brain_remote_envelope(
+        &crate::ipc::BrainRemoteEnvelope::Command(cancellation_command),
     )
     .unwrap();
     socket
@@ -731,23 +729,23 @@ async fn ordinary_websocket_disconnect_cancels_exact_runner_and_preserves_comple
     let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
     lifecycle.register_test_runner("shared", lease.lease_id, runner_tx);
     let current = lifecycle.snapshot("shared").unwrap();
-    let command = crate::ipc::brain_codec::BrainRemoteCommand {
+    let command = crate::ipc::BrainRemoteCommand {
         request_id: 1,
-        mutation: Some(crate::ipc::brain_codec::BrainRemoteMutation {
+        mutation: Some(crate::ipc::BrainRemoteMutation {
             brain_id: current.brain_id,
             expected_revision: current.revision,
             environment_generation: current.environment.generation,
             idempotency_key: uuid::Uuid::new_v4(),
         }),
-        kind: crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
+        kind: crate::ipc::BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
             text: "ordinary disconnect".into(),
         }),
     };
     socket
         .send(tokio_tungstenite::tungstenite::Message::Binary(
-            crate::ipc::brain_codec::encode_brain_remote_envelope(
-                &crate::ipc::brain_codec::BrainRemoteEnvelope::Command(command),
-            )
+            crate::ipc::encode_brain_remote_envelope(&crate::ipc::BrainRemoteEnvelope::Command(
+                command,
+            ))
             .unwrap(),
         ))
         .await
@@ -1122,22 +1120,22 @@ async fn effect_audit_websocket_disconnect_fences_start_bind_and_turn_enqueue_ra
         };
         let mut release = Some(release);
         let current = lifecycle.snapshot(brain).unwrap();
-        let command = crate::ipc::brain_codec::BrainRemoteCommand {
+        let command = crate::ipc::BrainRemoteCommand {
             request_id: 1,
-            mutation: Some(crate::ipc::brain_codec::BrainRemoteMutation {
+            mutation: Some(crate::ipc::BrainRemoteMutation {
                 brain_id: current.brain_id,
                 expected_revision: current.revision,
                 environment_generation: current.environment.generation,
                 idempotency_key: uuid::Uuid::new_v4(),
             }),
-            kind: crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
+            kind: crate::ipc::BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
                 text: "race admission".into(),
             }),
         };
         socket
             .send(tokio_tungstenite::tungstenite::Message::Binary(
-                crate::ipc::brain_codec::encode_brain_remote_envelope(
-                    &crate::ipc::brain_codec::BrainRemoteEnvelope::Command(command),
+                crate::ipc::encode_brain_remote_envelope(
+                    &crate::ipc::BrainRemoteEnvelope::Command(command),
                 )
                 .unwrap(),
             ))

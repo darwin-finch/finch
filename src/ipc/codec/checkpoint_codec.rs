@@ -918,7 +918,7 @@ fn task_kind_from_wire(value: wire::TaskKind) -> TaskKind {
     }
 }
 
-pub(super) fn encode_value_list(
+pub(crate) fn encode_value_list(
     mut builder: capnp::struct_list::Builder<'_, wire::typed_value::Owned>,
     values: &[TypedValue],
     depth: usize,
@@ -929,7 +929,7 @@ pub(super) fn encode_value_list(
     Ok(())
 }
 
-pub(super) fn decode_value_list(
+pub(crate) fn decode_value_list(
     reader: capnp::struct_list::Reader<'_, wire::typed_value::Owned>,
     depth: usize,
 ) -> Result<Vec<TypedValue>> {
@@ -2129,7 +2129,7 @@ fn decode_producer(
     })
 }
 
-pub(super) fn encode_vm_side_effect(
+pub(crate) fn encode_vm_side_effect(
     mut builder: wire::vm_side_effect::Builder<'_>,
     value: &VmSideEffect,
 ) -> Result<()> {
@@ -2177,7 +2177,7 @@ pub(super) fn encode_vm_side_effect(
     encode_origin(builder.reborrow().init_origin(), &value.origin, 0)
 }
 
-pub(super) fn decode_vm_side_effect(
+pub(crate) fn decode_vm_side_effect(
     reader: wire::vm_side_effect::Reader<'_>,
 ) -> Result<VmSideEffect> {
     use wire::vm_host_side_effect::Which;
@@ -2223,7 +2223,7 @@ pub(super) fn decode_vm_side_effect(
     })
 }
 
-pub(super) fn encode_effect_journal_state(
+pub(crate) fn encode_effect_journal_state(
     mut builder: wire::vm_effect_journal_state::Builder<'_>,
     value: &EffectJournalState,
 ) -> Result<()> {
@@ -2243,7 +2243,7 @@ pub(super) fn encode_effect_journal_state(
     Ok(())
 }
 
-pub(super) fn decode_effect_journal_state(
+pub(crate) fn decode_effect_journal_state(
     reader: wire::vm_effect_journal_state::Reader<'_>,
 ) -> Result<EffectJournalState> {
     use wire::vm_effect_journal_state::Which;
@@ -2262,7 +2262,7 @@ pub(super) fn decode_effect_journal_state(
     })
 }
 
-pub(super) fn encode_effect_record(
+pub(crate) fn encode_effect_record(
     mut builder: wire::brain_effect_record::Builder<'_>,
     execution_id: uuid::Uuid,
     entry: &EffectJournalEntry,
@@ -2272,7 +2272,7 @@ pub(super) fn encode_effect_record(
     encode_effect_journal_state(builder.reborrow().init_state(), &entry.state)
 }
 
-pub(super) fn decode_effect_record(
+pub(crate) fn decode_effect_record(
     reader: wire::brain_effect_record::Reader<'_>,
 ) -> Result<(uuid::Uuid, EffectJournalEntry)> {
     Ok((
@@ -2284,7 +2284,7 @@ pub(super) fn decode_effect_record(
     ))
 }
 
-pub(super) fn encode_checkpoint(
+pub(crate) fn encode_checkpoint(
     mut builder: wire::typed_runtime_checkpoint::Builder<'_>,
     value: &TypedRuntimeCheckpoint,
 ) -> Result<()> {
@@ -2312,7 +2312,7 @@ pub(super) fn encode_checkpoint(
     Ok(())
 }
 
-pub(super) fn decode_checkpoint(
+pub(crate) fn decode_checkpoint(
     reader: wire::typed_runtime_checkpoint::Reader<'_>,
 ) -> Result<TypedRuntimeCheckpoint> {
     let mut producer_fibers = BTreeMap::new();
