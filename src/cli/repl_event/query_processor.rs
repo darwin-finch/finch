@@ -687,19 +687,17 @@ pub(super) async fn refresh_context_strip(
     //   first of multiple          → "📋 <text>"
     //   middle lines               → "   ├─ <text>"
     //   last of multiple           → "   └─ now: <text>"
+    // StatusBar::get_lines re-applies this across MemTree + Brain recap so two
+    // singleton projectors cannot each print `now:`.
     for (i, text) in summary.lines.iter().enumerate() {
-        let label = if n == 1 {
-            format!("   └─ now: {}", text)
-        } else if i == 0 {
-            format!("📋 {}", text)
-        } else if i == n - 1 {
-            format!("   └─ now: {}", text)
-        } else {
-            format!("   ├─ {}", text)
-        };
         status_bar.update_line(
             crate::cli::status_bar::StatusLineType::ContextLine(i),
-            label,
+            crate::cli::status_bar::recap_tree_label(
+                i,
+                n,
+                text,
+                crate::cli::status_bar::RECAP_MEMTREE_ROOT,
+            ),
         );
     }
 
@@ -2316,12 +2314,50 @@ pub(crate) fn apply_sliding_window(
 mod tests {
     use super::*;
     use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind, WorkUnit};
+    use crate::cli::status_bar::StatusLineType;
     use crate::generators::GeneratorCapabilities;
     use crate::tools::PermissionManager;
     use crate::tools::ToolExecutor;
     use crate::tools::ToolRegistry;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn refresh_context_strip_two_lines_have_one_now_prefix() {
+        let status = StatusBar::new();
+        let lines = ["overall topic", "recent focus"];
+        let n = lines.len();
+        for (i, text) in lines.iter().enumerate() {
+            status.update_line(
+                StatusLineType::ContextLine(i),
+                crate::cli::status_bar::recap_tree_label(
+                    i,
+                    n,
+                    text,
+                    crate::cli::status_bar::RECAP_MEMTREE_ROOT,
+                ),
+            );
+        }
+        let contents: Vec<String> = status
+            .get_lines()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        assert_eq!(
+            contents,
+            vec![
+                "📋 overall topic".to_string(),
+                "   └─ now: recent focus".to_string(),
+            ]
+        );
+        assert_eq!(
+            contents
+                .iter()
+                .filter(|line| line.contains("└─ now:"))
+                .count(),
+            1
+        );
+    }
 
     struct PacedStreamGenerator {
         receiver:

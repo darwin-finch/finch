@@ -1897,6 +1897,58 @@ fn canonical_brain_context_projects_conversation_without_program_source() {
 }
 
 #[test]
+fn project_brain_context_and_memtree_singleton_recaps_share_one_now_prefix() {
+    use crate::brain::BrainEventKind;
+    use crate::cli::status_bar::{StatusBar, StatusLineType};
+
+    let status = StatusBar::new();
+    status.update_line(StatusLineType::MemoryContext, "🧠 recalled 2");
+    // What `refresh_context_strip` writes when MemTree returns one centroid line.
+    status.update_line(
+        StatusLineType::ContextLine(0),
+        "   └─ now: I think Finch is unusually ambitious…",
+    );
+
+    super::project_brain_context(
+        &status,
+        &[brain_event(
+            1,
+            "shammah",
+            BrainEventKind::ParticipantMessage {
+                text: "hello".into(),
+            },
+        )],
+        1,
+        None,
+    );
+
+    let contents: Vec<String> = status
+        .get_lines()
+        .into_iter()
+        .map(|line| line.content)
+        .collect();
+    let now_lines: Vec<&String> = contents
+        .iter()
+        .filter(|line| line.contains("└─ now:"))
+        .collect();
+    assert_eq!(
+        now_lines.len(),
+        1,
+        "status recap must print └─ now: on exactly one line; got {contents:?}"
+    );
+    assert!(
+        contents.iter().any(|line| {
+            line.contains('💬') || line.contains('📋') || line.contains("├─")
+        }),
+        "the other recap line must be 💬 or 📋 (or ├─), never a second now:; got {contents:?}"
+    );
+    assert!(
+        now_lines[0].contains("shammah: hello"),
+        "the now: line must be the latest recap; now={now_lines:?} contents={contents:?}"
+    );
+}
+
+#[test]
 fn canonical_brain_context_ignores_failed_results_and_bounds_text() {
     use crate::brain::BrainEventKind;
     use crate::cli::status_bar::{StatusBar, StatusLineType};
