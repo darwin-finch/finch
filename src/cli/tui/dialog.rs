@@ -206,6 +206,8 @@ impl Dialog {
 
     /// Create a tool-approval dialog (Yes / Yes-always / No).
     ///
+    /// The dialog needs a name and a summary to show; Finch's `ToolUse` is converted
+    /// at the caller (`cli::repl_event::tool_display::tool_approval_dialog`).
     /// File-mutating tools (write/edit) get an extra "Edit in $EDITOR" option.
     /// The title is formatted as `"{tool_name}\n{summary}"` for two-line display.
     pub fn tool_approval(tool_name: &str, summary: &str) -> Self {
