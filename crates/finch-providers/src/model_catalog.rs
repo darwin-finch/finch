@@ -113,7 +113,7 @@ pub fn static_fallback(provider: &str) -> Vec<String> {
         // this offline snapshot only offers the three general-purpose API tiers
         // documented when STATIC_FALLBACK_AS_OF was reviewed.
         "openai" => &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
-        "grok" => &["grok-4.6"],
+        "grok" | "grok-sub" => &["grok-4.6"],
         "gemini" => &["gemini-2.5-flash"],
         "mistral" => &["mistral-large-2512"],
         "groq" => &["openai/gpt-oss-120b"],
