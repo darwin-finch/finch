@@ -1382,6 +1382,56 @@ fn canonical_request_preserves_ordered_reasoning_tools_results_and_lite_shape() 
 }
 
 #[test]
+fn mixed_tool_result_and_steering_text_keeps_function_output_then_user_text() {
+    let request = ProviderRequest::new(vec![
+        Message::user("run ls"),
+        Message::with_content(
+            "assistant",
+            vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                name: "read".to_string(),
+                input: json!({"path": "README.md"}),
+            }],
+        ),
+        Message::with_content(
+            "user",
+            vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: "contents".to_string(),
+                    is_error: None,
+                },
+                ContentBlock::text("steer now"),
+            ],
+        ),
+    ])
+    .with_model(DEFAULT_MODEL)
+    .with_tools(vec![tool()]);
+    let body = encode_responses_lite(&request, ReasoningEffort::High).unwrap();
+    let input = body["input"]
+        .as_array()
+        .expect("ChatGPT Responses-Lite request must have an input array");
+    let output_idx = input
+        .iter()
+        .position(|item| item["type"] == "function_call_output")
+        .expect("mixed user turn must still emit function_call_output");
+    let steering_idx = input
+        .iter()
+        .rposition(|item| item["type"] == "message" && item["role"] == "user")
+        .expect("steering text must remain a user message after the tool output");
+    assert!(
+        steering_idx > output_idx,
+        "ChatGPT must keep function_call_output before the steering user text; input={input:?}"
+    );
+    assert_eq!(input[output_idx]["call_id"], "call-1");
+    assert_eq!(input[output_idx]["output"], "contents");
+    assert_eq!(
+        input[steering_idx]["content"][0]["text"], "steer now",
+        "ordered block walk must keep steering as input_text after the tool output; input={input:?}"
+    );
+}
+
+#[test]
 fn collaboration_tools_use_reserved_wire_aliases_and_replay_symmetrically() {
     let request = ProviderRequest::new(vec![
         Message::user("delegate"),
