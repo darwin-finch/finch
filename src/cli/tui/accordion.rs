@@ -11,6 +11,9 @@ use crate::theme::ColorScheme;
 pub struct RenderedTranscriptLine {
     pub text: String,
     pub row_id: Option<TranscriptRowId>,
+    /// Expand/collapse for assistive consumers. Set on expandable header
+    /// lines; never encoded as a second visible `[expanded]`/`[collapsed]`
+    /// token in `text`.
     pub row_expanded: Option<bool>,
     /// Kind of the row that produced this line, when the line belongs to an
     /// interactive row. Set on the row's header line and on its body lines.
@@ -118,28 +121,13 @@ impl AccordionState {
             (true, false) => "▶",
             (false, _) => "•",
         };
-        let state = if expandable {
-            if expanded {
-                " [expanded]"
-            } else {
-                " [collapsed]"
-            }
-        } else {
-            ""
-        };
         let focus = if self.focused.as_ref() == Some(&row.id) {
             "> "
         } else {
             "  "
         };
         lines.push(RenderedTranscriptLine {
-            text: format!(
-                "{focus}{}{} {}{}",
-                "  ".repeat(depth),
-                marker,
-                row.label,
-                state
-            ),
+            text: format!("{focus}{}{} {}", "  ".repeat(depth), marker, row.label),
             row_id: expandable.then(|| row.id.clone()),
             row_expanded: expandable.then_some(expanded),
             kind: Some(row.kind),
@@ -466,7 +454,7 @@ mod tests {
             path: vec![0],
         };
         let lines = vec![RenderedTranscriptLine {
-            text: "▶ 世界世界 [collapsed]".into(),
+            text: "▶ 世界世界".into(),
             row_id: Some(id.clone()),
             row_expanded: Some(false),
             ..RenderedTranscriptLine::default()
@@ -630,16 +618,18 @@ mod tests {
         let state = AccordionState::default();
 
         let source_message: MessageRef = source;
-        let source_rendered = state
-            .render_message(&source_message, &colors)
-            .into_iter()
-            .map(|line| line.text)
-            .collect::<Vec<_>>();
-        let source_transcript = source_rendered.join("\n");
-        assert!(
-            source_rendered[0].contains("[collapsed]") && source_rendered.len() == 1,
+        let source_lines = state.render_message(&source_message, &colors);
+        let source_transcript = source_lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            (source_lines.len(), source_lines[0].row_expanded),
+            (1, Some(false)),
             "invariant: successful one-line (say …) source defaults collapsed; \
-             rendered transcript:\n{source_transcript}"
+             header was {:?}; rendered transcript:\n{source_transcript}",
+            source_lines[0].text
         );
 
         let output_message: MessageRef = output;
@@ -676,10 +666,10 @@ mod tests {
         let message: MessageRef = output;
         let colors = ColorScheme::default();
         let state = AccordionState::default();
-        let rendered = state
-            .render_message(&message, &colors)
-            .into_iter()
-            .map(|line| line.text)
+        let lines = state.render_message(&message, &colors);
+        let rendered = lines
+            .iter()
+            .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
         let transcript = rendered.join("\n");
         assert!(
@@ -687,11 +677,12 @@ mod tests {
             "invariant: a failed program remains labelled Program output; \
              rendered transcript:\n{transcript}"
         );
-        assert!(
-            rendered[0].contains("[expanded]"),
+        assert_eq!(
+            lines[0].row_expanded,
+            Some(true),
             "invariant: failures remain expanded and actionable; header was {:?}; \
              rendered transcript:\n{transcript}",
-            rendered[0]
+            lines[0].text
         );
         assert!(
             transcript.contains("VM error: type error"),
@@ -784,11 +775,11 @@ mod tests {
         let output_message: MessageRef = output;
 
         let collapsed = state.render_message(&source_message, &colors);
-        assert!(collapsed[0].text.contains("[collapsed]"));
+        assert_eq!(collapsed[0].row_expanded, Some(false));
         assert_eq!(collapsed.len(), 1);
         assert!(source.complete_transcript(&colors).contains("a\nb\nc\nd"));
         let visible = state.render_message(&output_message, &colors);
-        assert!(visible[0].text.contains("[expanded]"));
+        assert_eq!(visible[0].row_expanded, Some(true));
         assert!(visible
             .iter()
             .any(|line| line.text.contains("visible output")));
@@ -815,9 +806,65 @@ mod tests {
         replayed.set_complete();
         let replayed_message: MessageRef = replayed;
         let rendered = state.render_message(&replayed_message, &colors);
-        assert!(rendered[0].text.contains("[expanded]"));
+        assert_eq!(rendered[0].row_expanded, Some(true));
         assert!(rendered
             .iter()
             .any(|line| line.text.contains("after reconnect")));
+    }
+
+    /// Production dump: Program source / Program output headers still appended
+    /// a second visible `[expanded]` / `[collapsed]` token after ▼/▶ (#417).
+    /// Expand/collapse belongs on `row_expanded` (role/state), not in the text.
+    #[test]
+    fn test_disclosure_rows_do_not_append_expanded_collapsed_suffix() {
+        let source = Arc::new(WorkUnit::new("program"));
+        source.set_program_source("lisp");
+        source.set_response("(say \"Hello, Shammah!\")");
+        source.set_complete();
+        let output = Arc::new(WorkUnit::new("VM program output"));
+        output.set_program_output();
+        output.set_response("Hello, Shammah!");
+        output.set_complete();
+        let state = AccordionState::default();
+        let colors = ColorScheme::default();
+        let source_message: MessageRef = source;
+        let output_message: MessageRef = output;
+        let source_lines = state.render_message(&source_message, &colors);
+        let output_lines = state.render_message(&output_message, &colors);
+        let dump = source_lines
+            .iter()
+            .chain(output_lines.iter())
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !dump.contains("[expanded]") && !dump.contains("[collapsed]"),
+            "invariant: disclosure headers must not append [expanded]/[collapsed]; \
+             the dump was:\n{dump}"
+        );
+        assert_eq!(
+            source_lines[0].row_expanded,
+            Some(false),
+            "invariant: collapsed Program source still reports state on row_expanded, \
+             not a visible suffix; header was {:?}; dump:\n{dump}",
+            source_lines[0].text
+        );
+        assert_eq!(
+            output_lines[0].row_expanded,
+            Some(true),
+            "invariant: expanded Program output still reports state on row_expanded, \
+             not a visible suffix; header was {:?}; dump:\n{dump}",
+            output_lines[0].text
+        );
+        assert!(
+            source_lines[0].text.contains('▶') && output_lines[0].text.contains('▼'),
+            "invariant: the glyph remains the visible expand/collapse mark; dump:\n{dump}"
+        );
+        assert!(
+            dump.contains("Program source") && dump.contains("Program output"),
+            "invariant: the dump still names Program source and Program output; \
+             dump:\n{dump}"
+        );
     }
 }

@@ -5878,7 +5878,7 @@ mod tests {
         let projected = state.render_message(&message, &colors);
 
         assert_eq!(projected.len(), 1);
-        assert!(projected[0].text.contains("[collapsed]"));
+        assert_eq!(projected[0].row_expanded, Some(false));
         assert!(!projected[0].text.contains("line four"));
         assert!(work.complete_transcript(&colors).contains("line four"));
 
@@ -5895,7 +5895,14 @@ mod tests {
         let mut bytes = Vec::new();
         begin_full_viewport_paint(&mut bytes, plan, &text).expect("production viewport paint");
         let raw = String::from_utf8(bytes).unwrap();
-        assert!(raw.contains("[collapsed]"));
+        assert!(
+            !raw.contains("[collapsed]") && !raw.contains("[expanded]"),
+            "dump must not append [expanded]/[collapsed]; painted={raw:?}"
+        );
+        assert!(
+            raw.contains("▶") && raw.contains("Program source"),
+            "dump still names the collapsed Program source row; painted={raw:?}"
+        );
         assert!(!raw.contains("line four"));
         assert!(!raw.contains("\x1b[3J"), "must preserve native scrollback");
     }
@@ -5921,7 +5928,7 @@ mod tests {
             visible[0].row_id.is_some(),
             "disclosure control must stay visible"
         );
-        assert!(visible[0].text.contains("[expanded]"));
+        assert_eq!(visible[0].row_expanded, Some(true));
         assert!(visible.iter().any(|line| line.text.contains("row 39")));
         assert!(
             visible
@@ -5933,7 +5940,17 @@ mod tests {
         let tiny = viewport_tail_rendered_lines(&all, 8, 1);
         assert_eq!(tiny.len(), 1);
         assert!(tiny[0].row_id.is_some());
-        assert!(matches!(tiny[0].text.as_str(), "[expanded]" | "open"));
+        assert_eq!(
+            tiny[0].row_expanded,
+            Some(true),
+            "tiny squeezed header still reports expanded state; text was {:?}",
+            tiny[0].text
+        );
+        assert!(
+            !tiny[0].text.contains("[expanded]") && !tiny[0].text.contains("[collapsed]"),
+            "tiny squeezed header must not fall back to a second visible token; text was {:?}",
+            tiny[0].text
+        );
         assert_eq!(shadow_buffer::physical_rows(&tiny[0].text, 8), 1);
         let mut collapsed_state = AccordionState::default();
         collapsed_state.rebuild_hit_regions(&all, 0, 20);
@@ -5941,7 +5958,18 @@ mod tests {
         assert!(collapsed_state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
         let collapsed = collapsed_state.render_message(&message, &colors);
         let collapsed_tiny = viewport_tail_rendered_lines(&collapsed, 8, 1);
-        assert_eq!(collapsed_tiny[0].text, "closed");
+        assert_eq!(
+            collapsed_tiny[0].row_expanded,
+            Some(false),
+            "tiny squeezed header still reports collapsed state; text was {:?}",
+            collapsed_tiny[0].text
+        );
+        assert!(
+            !collapsed_tiny[0].text.contains("[expanded]")
+                && !collapsed_tiny[0].text.contains("[collapsed]"),
+            "tiny squeezed header must not fall back to a second visible token; text was {:?}",
+            collapsed_tiny[0].text
+        );
     }
 
     #[test]
@@ -5969,7 +5997,7 @@ mod tests {
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
         let before = state.render_message(&message, &colors);
-        assert!(before[0].text.contains("[collapsed]"));
+        assert_eq!(before[0].row_expanded, Some(false));
         let mut printed = HashSet::new();
         let mut failure = FlushFailure(Vec::new());
         assert!(commit_complete_messages(
