@@ -22,6 +22,8 @@ impl DaemonLifecycle {
     pub fn acquire_instance(&self) -> Result<DaemonInstanceGuard>;
     /// Remove PID file (called on shutdown)
     pub fn cleanup(&self) -> Result<()>;
+    /// True when a pid file or IPC socket remains but no daemon process is alive.
+    pub fn has_stale_files(&self) -> bool;
     /// Check if daemon is currently running  Returns true if: - PID file exists - PID can be parsed - Process with that PID exists
     pub fn is_running(&self) -> bool;
     /// Create a new daemon lifecycle manager
@@ -30,11 +32,13 @@ impl DaemonLifecycle {
     pub fn pid_file(&self) -> &PathBuf;
     /// Read PID from file
     pub fn read_pid(&self) -> Result<u32>;
-    /// Stop the daemon gracefully  Attempts graceful shutdown: 1.
-    pub fn stop_daemon(&self) -> Result<()>;
+    /// Stop the daemon gracefully, or reap leftover files from a crash.
+    pub fn stop_daemon(&self) -> Result<DaemonStopOutcome>;
     /// Write current process PID to file
     pub fn write_pid(&self) -> Result<()>;
 }
+/// Result of [`DaemonLifecycle::stop_daemon`].
+pub enum DaemonStopOutcome { NotRunning, ReapedStale, Stopped, StalePidLiveSocket }
 pub struct DaemonUpgradePlan { … }
 impl DaemonUpgradePlan {
     /// Boot the staged candidate as a complete daemon on isolated HTTP and IPC endpoints.

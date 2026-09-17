@@ -15,7 +15,7 @@ mod upgrade;
 pub const DETACHED_DAEMON_ENV: &str = "FINCH_DAEMON_DETACHED";
 
 pub use self::log::{daemon_log_path, log_status, LogStatus, RotatingLog, RotationPolicy};
-pub use lifecycle::{DaemonInstanceGuard, DaemonLifecycle};
+pub use lifecycle::{DaemonInstanceGuard, DaemonLifecycle, DaemonStopOutcome};
 pub use spawn::{ensure_daemon_running, spawn_daemon};
 pub use upgrade::{DaemonUpgradePlan, VerifiedDaemonUpgrade};
 
