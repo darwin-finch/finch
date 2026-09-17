@@ -22,7 +22,7 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent},
     execute,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    style::{Attribute, Color, Print, SetAttribute, SetForegroundColor},
     terminal::{
         disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType,
         EndSynchronizedUpdate,
@@ -82,16 +82,7 @@ pub use shadow_buffer::visible_length;
 /// remain enabled and their escape sequences leak into the user's shell.
 pub fn emergency_restore_terminal() {
     let mut stdout = io::stdout();
-    let _ = execute!(
-        stdout,
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::PopKeyboardEnhancementFlags,
-        crossterm::event::DisableBracketedPaste,
-        cursor::Show,
-        ResetColor,
-        Print("\r\n"),
-    );
+    let _ = mouse_capture::write_emergency_restore_modes(&mut stdout);
     let _ = stdout.lock().flush();
     let _ = disable_raw_mode();
 }
@@ -1582,9 +1573,9 @@ pub struct TuiRenderer {
     /// unconditional erase+draw every 33 ms tick when nothing changed.
     live_area_dirty: bool,
 
-    /// Whether this renderer currently holds mouse tracking. Held while
-    /// click-to-toggle should work; released on a wheel so native scrollback
-    /// is reachable (#441).
+    /// Whether this renderer currently holds mouse tracking. Default is off so
+    /// native click-drag selection works (#221). When held, a wheel releases
+    /// tracking so native scrollback is reachable (#441).
     mouse_tracking: mouse_capture::MouseTracking,
 }
 
@@ -1642,7 +1633,7 @@ impl TuiRenderer {
             typing_words: Vec::new(),
             pre_typing_mode: PosetPanelMode::Forth,
             live_area_dirty: true,
-            mouse_tracking: mouse_capture::MouseTracking::Held,
+            mouse_tracking: mouse_capture::MouseTracking::DEFAULT,
         }
     }
 
@@ -1653,52 +1644,22 @@ impl TuiRenderer {
     ) -> Result<Self> {
         enable_raw_mode().context("Failed to enable raw mode")?;
 
-        // Enable bracketed paste so the terminal wraps pasted content in
-        // \x1b[200~ ... \x1b[201~ markers.  Crossterm surfaces this as
-        // Event::Paste(String) which we handle without any Enter-confusion.
-        // Unlike kitty keyboard enhancement flags, bracketed paste cannot
-        // corrupt the terminal on unclean exit — it simply falls back to
-        // normal (unbounded) paste mode, which is safe.
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::EnableBracketedPaste,
-            crossterm::event::EnableMouseCapture
-        );
-
-        // Enable DISAMBIGUATE_ESCAPE_CODES so terminals that support the kitty
-        // keyboard protocol send distinct sequences for Shift+Enter (vs bare Enter).
-        // Without this, macOS Terminal.app and iTerm2 both send bare \r for
-        // Shift+Enter — the SHIFT modifier is never set — so the newline-insertion
-        // path in async_input.rs can never trigger.
+        // Bracketed paste so the terminal wraps pasted content in
+        // \x1b[200~ ... \x1b[201~ markers, plus kitty DISAMBIGUATE_ESCAPE_CODES
+        // so Shift+Enter is distinct from bare Enter. Mouse capture is omitted:
+        // click-drag selection stays with the host terminal (#221).
         //
-        // Terminals that don't support the protocol silently ignore the push
-        // (crossterm returns an error we discard with `let _ =`), so there is no
-        // regression for unsupported terminals.
-        //
-        // Cleanup: the Drop impl and the panic hook registered below both call
-        // PopKeyboardEnhancementFlags, so normal exit, panics, and most signals
-        // are covered.  SIGKILL terminates the session entirely so corruption
-        // doesn't persist.  This is the same risk level we already accept for
-        // enable_raw_mode().
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-            )
-        );
+        // Terminals that don't support the kitty protocol silently ignore the
+        // push. Cleanup: Drop and the panic hook both pop the flags, so normal
+        // exit, panics, and most signals are covered.
+        mouse_capture::write_startup_terminal_modes(&mut io::stdout())?;
 
         // Panic hook: restore terminal state so the shell is usable after a crash.
         std::panic::set_hook(Box::new(|info| {
-            let _ = execute!(
-                io::stdout(),
-                crossterm::event::DisableMouseCapture,
-                crossterm::event::PopKeyboardEnhancementFlags
-            );
+            let _ = mouse_capture::write_panic_restore_modes(&mut io::stdout());
             let _ = crossterm::terminal::disable_raw_mode();
             eprintln!("{info}");
         }));
-
-        execute!(io::stdout(), cursor::Show)?;
 
         // Suppress OutputManager's own stdout writes — we own the terminal.
         output_manager.disable_stdout();
@@ -1758,7 +1719,7 @@ impl TuiRenderer {
             pre_typing_mode: PosetPanelMode::Forth,
 
             live_area_dirty: true,
-            mouse_tracking: mouse_capture::MouseTracking::Held,
+            mouse_tracking: mouse_capture::MouseTracking::DEFAULT,
         })
     }
 
@@ -2690,14 +2651,7 @@ impl TuiRenderer {
         // Reset terminal state: show cursor, reset colours, move to a clean line.
         // The `\r\n` ensures the shell prompt lands on its own fresh line rather
         // than overwriting content from the erased live area.
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::PopKeyboardEnhancementFlags,
-            crossterm::event::DisableMouseCapture,
-            crossterm::event::DisableBracketedPaste,
-            cursor::Show,
-            ResetColor,
-        );
+        let _ = mouse_capture::write_shutdown_terminal_modes(&mut io::stdout());
         print!("\r\n");
         // Flush pending output BEFORE leaving raw mode — otherwise some terminals
         // silently discard buffered bytes after the mode switch.
@@ -2716,7 +2670,7 @@ impl TuiRenderer {
     /// setup wizard) can take over.  Call `resume()` after it exits.
     pub fn suspend(&self) -> anyhow::Result<()> {
         let _ = io::stdout().flush();
-        let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+        let _ = mouse_capture::write_suspend_terminal_modes(&mut io::stdout());
         disable_raw_mode()?;
         Ok(())
     }
@@ -2724,8 +2678,7 @@ impl TuiRenderer {
     /// Re-acquire the terminal after a `suspend()`.
     pub fn resume(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
-        let _ = execute!(io::stdout(), crossterm::event::EnableMouseCapture);
-        self.mouse_tracking = mouse_capture::MouseTracking::Held;
+        let _ = mouse_capture::write_resume_terminal_modes(&mut io::stdout(), self.mouse_tracking);
         // Force a full redraw so the REPL live area reappears.
         self.active_rows = 0;
         self.pending_viewport_size = None;
@@ -2739,21 +2692,15 @@ impl TuiRenderer {
     /// also pops keyboard enhancements and disables bracketed paste.
     pub(crate) fn resume_after_emergency_restore(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::EnableMouseCapture,
-            crossterm::event::EnableBracketedPaste,
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-            ),
-            cursor::Show,
+        let _ = mouse_capture::write_resume_after_emergency_modes(
+            &mut io::stdout(),
+            self.mouse_tracking,
         );
         self.output_manager.disable_stdout();
         self.active_rows = 0;
         self.pending_viewport_size = None;
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
-        self.mouse_tracking = mouse_capture::MouseTracking::Held;
         Ok(())
     }
 }
@@ -4787,7 +4734,70 @@ mod tests {
         let output = Arc::new(OutputManager::new(colors.clone()));
         let mut renderer = TuiRenderer::new_headless(output, Arc::new(StatusBar::new()), colors);
         renderer.is_active = true;
+        renderer.mouse_tracking = mouse_capture::MouseTracking::Held;
         renderer
+    }
+
+    /// Accordion expand/collapse stays on the keyboard when mouse capture is
+    /// off, which is the default so native click-drag copy works (#221).
+    #[test]
+    fn test_accordion_keyboard_toggles_without_mouse_capture() {
+        let colors = ColorScheme::default();
+        let work = Arc::new(WorkUnit::new("Tools"));
+        let call = work.add_row("bash(echo hi)");
+        work.complete_row_with_body(call, "1 line", vec!["hi".into()]);
+        work.set_complete();
+        let message: MessageRef = work.clone();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer = TuiRenderer::new_headless(output, Arc::new(StatusBar::new()), colors);
+        renderer.add_trait_message(work);
+        let lines = renderer
+            .accordion
+            .render_message(&message, &renderer.colors);
+        renderer.accordion.rebuild_hit_regions(&lines, 0, 80);
+        let root = message
+            .transcript_row(&renderer.colors)
+            .expect("the work unit projects a transcript row");
+
+        assert_eq!(
+            renderer.mouse_tracking,
+            mouse_capture::MouseTracking::DEFAULT,
+            "INVARIANT: the default TUI does not hold mouse tracking, so the host \
+             terminal owns click-drag selection (#221). tracking was {:?}",
+            renderer.mouse_tracking
+        );
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)),
+            "F6 must focus an accordion row without mouse capture"
+        );
+        assert_eq!(
+            renderer.accordion.focused.as_ref(),
+            Some(&root.id),
+            "F6 focuses the work-unit row so Enter can toggle it"
+        );
+        let expanded_before = renderer.accordion.is_expanded(&root);
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            "Enter must toggle accordion disclosure without mouse capture; \
+             focused={:?} expanded_before={expanded_before}",
+            renderer.accordion.focused
+        );
+        assert_ne!(
+            renderer.accordion.is_expanded(&root),
+            expanded_before,
+            "INVARIANT: keyboard Enter toggles accordion expand/collapse when \
+             mouse capture is off (#221). expanded_before={expanded_before}"
+        );
+        assert!(
+            renderer.handle_accordion_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            "a second Enter must toggle back"
+        );
+        assert_eq!(
+            renderer.accordion.is_expanded(&root),
+            expanded_before,
+            "INVARIANT: a second keyboard toggle restores the prior disclosure \
+             (#221). expanded_before={expanded_before}"
+        );
     }
 
     fn wheel_up() -> MouseEvent {
@@ -4952,6 +4962,7 @@ mod tests {
     #[test]
     fn test_wheel_over_tool_result_scrolls_it_without_touching_parent_scrollback() {
         let (mut renderer, output_row) = committed_tool_result_renderer(40);
+        renderer.mouse_tracking = mouse_capture::MouseTracking::Held;
         let top = renderer
             .tool_viewports
             .regions()
@@ -5102,6 +5113,7 @@ mod tests {
     #[test]
     fn test_wheel_outside_tool_result_still_releases_mouse_tracking() {
         let (mut renderer, _) = committed_tool_result_renderer(40);
+        renderer.mouse_tracking = mouse_capture::MouseTracking::Held;
         let region = renderer
             .tool_viewports
             .regions()
