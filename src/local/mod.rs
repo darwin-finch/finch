@@ -173,8 +173,11 @@ impl LocalGenerator {
                     }],
                     tool_uses: vec![], // TODO: Support tool use when integrated with QwenGenerator
                     metadata: ResponseMetadata {
-                        generator: "qwen-local".to_string(),
-                        model: "Qwen2.5-1.5B-Instruct".to_string(), // TODO: Get from config
+                        // The generator field names the local path; the model
+                        // field reports the family/model actually configured
+                        // or loaded (never a hardcoded claim).
+                        generator: "local".to_string(),
+                        model: self.model_name().to_string(),
                         confidence: Some(generated.confidence),
                         stop_reason: None,
                         input_tokens: None,

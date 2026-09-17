@@ -26,6 +26,16 @@ stays gone.
 end-to-end provider or local-model conformance. Do not change ONNX/Candle/loader/routing/training
 behavior in a facade commit.
 
+**One family declaration, claims from the catalog.** `unified_loader::ModelFamily` is the single
+model-family declaration (its variant names are the persisted config wire form; a source-scan test
+fails if a second enum reappears). Family capability claims exist only as
+`ModelFamily::local_engine_capabilities()` (`FamilyEngineCapabilities`) and must record only
+engine-proven paths — no quality or fitness marketing; the former claim-carrying
+`ModelFamily::description` and `InferenceProvider::description` are deleted. The compatibility
+matrix keeps only its wired job, repository resolution (`get_repository`); its unused family
+query functions were deleted rather than wired, and the adapters' duplicate family enum is gone
+(adapters are selected by model name via `AdapterRegistry::get_adapter`).
+
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- models::` plus a caller
 smoke (`local::`, `config::backend`). Run the full suite when changing a re-exported `pub`
 item. Regenerate the facade digest with `python3 scripts/generate_interfaces.py --write`

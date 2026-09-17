@@ -34,15 +34,6 @@ impl InferenceProvider {
             Self::Candle => "Candle",
         }
     }
-
-    /// Get description for users
-    pub fn description(&self) -> &'static str {
-        match self {
-            Self::Onnx => "ONNX Runtime (Recommended) - Cross-platform, optimized",
-            #[cfg(feature = "candle")]
-            Self::Candle => "Candle - Native Rust implementation, good for development",
-        }
-    }
 }
 
 /// Configuration for loading any model on any execution target with any provider
@@ -84,6 +75,12 @@ impl ModelLoadConfig {
 }
 
 /// Supported model families
+///
+/// This is the single `ModelFamily` declaration in the codebase. Its variant
+/// names are the persisted config wire form (`backend.model_family` in
+/// `config.toml`), so they must not change silently. A source-scan regression
+/// (`test_exactly_one_model_family_declaration`) fails if a second family enum
+/// reappears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelFamily {
     /// Qwen 2.5 series (1.5B, 3B, 7B, 14B)
@@ -100,6 +97,26 @@ pub enum ModelFamily {
     DeepSeek,
 }
 
+/// Capability claims for a model family's local runtime path.
+///
+/// Every `true` here must correspond to a path the engine executes today;
+/// claims are recorded from the engine, never aspirational, and never carry
+/// quality or fitness marketing. Families without an engine-proven local path
+/// carry no claims at all — dated loadability evidence belongs to the
+/// compatibility-matrix work (#74).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FamilyEngineCapabilities {
+    /// The engine exposes a per-token streaming callback for this family:
+    /// the ONNX backend implements `TextGeneration::generate_stream`, driven
+    /// through `LocalGenerator::try_generate_from_pattern_streaming` and
+    /// served by the daemon's SSE endpoint.
+    pub engine_streaming: bool,
+    /// The local path proposes tool calls for this family by parsing its
+    /// tool markup (`ToolCallParser` over the adapter's prompt format);
+    /// the event loop owns execution.
+    pub tool_markup_proposals: bool,
+}
+
 impl ModelFamily {
     /// Get human-readable name
     pub fn name(&self) -> &'static str {
@@ -113,15 +130,22 @@ impl ModelFamily {
         }
     }
 
-    /// Get description for users
-    pub fn description(&self) -> &'static str {
+    /// Capability claims for this family's local runtime path.
+    ///
+    /// This is the only place a family's local capability claim may be made.
+    /// Generator adapters derive their capability fields from it rather than
+    /// hardcoding claims with prose justifications, so two surfaces cannot
+    /// contradict each other about the same model.
+    pub fn local_engine_capabilities(&self) -> FamilyEngineCapabilities {
         match self {
-            Self::Qwen2 => "Qwen 2.5 (Recommended) - Best overall quality",
-            Self::Gemma2 => "Gemma 2 - Google's model, good for chat",
-            Self::Llama3 => "Llama 3 - Meta's model, popular choice",
-            Self::Mistral => "Mistral - Efficient 7B model",
-            Self::Phi => "Phi - Microsoft's compact model, efficient",
-            Self::DeepSeek => "DeepSeek - Specialized for coding tasks",
+            Self::Qwen2 => FamilyEngineCapabilities {
+                engine_streaming: true,
+                tool_markup_proposals: true,
+            },
+            _ => FamilyEngineCapabilities {
+                engine_streaming: false,
+                tool_markup_proposals: false,
+            },
         }
     }
 }
@@ -684,6 +708,7 @@ impl UnifiedModelLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn test_model_size_from_ram() {
@@ -694,6 +719,88 @@ mod tests {
 
         // Insufficient RAM
         assert!(ModelSize::from_ram(4).is_err());
+    }
+
+    /// #781: there must be exactly one `ModelFamily` declaration. Two competing
+    /// family enums each carried their own name/description tables and drifted
+    /// independently; this scan fails if a second declaration reappears.
+    #[test]
+    fn test_exactly_one_model_family_declaration() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut declarations = Vec::new();
+        for tree in ["src", "crates", "tests"] {
+            scan_for_model_family_declarations(&root.join(tree), &root, &mut declarations);
+        }
+        assert_eq!(
+            declarations.len(),
+            1,
+            "ModelFamily must be declared exactly once so family naming cannot drift; \
+             found {declarations:?}"
+        );
+        assert!(
+            declarations.first().is_some_and(|path| path.ends_with("src/models/unified_loader.rs")),
+            "the single ModelFamily declaration must live in the models loader; found {declarations:?}"
+        );
+    }
+
+    /// #781: capability claims must match what the engine actually runs. Only
+    /// the Qwen2 path has an engine-proven streaming callback and tool-markup
+    /// parser; every other family must carry no claims.
+    #[test]
+    fn test_local_engine_capabilities_claim_only_engine_proven_paths() {
+        let qwen = ModelFamily::Qwen2.local_engine_capabilities();
+        assert!(
+            qwen.engine_streaming && qwen.tool_markup_proposals,
+            "the Qwen2 local path has an engine streaming callback and tool-markup \
+             proposals; catalog said {qwen:?}"
+        );
+        for family in [
+            ModelFamily::Gemma2,
+            ModelFamily::Llama3,
+            ModelFamily::Mistral,
+            ModelFamily::Phi,
+            ModelFamily::DeepSeek,
+        ] {
+            let caps = family.local_engine_capabilities();
+            assert!(
+                !caps.engine_streaming && !caps.tool_markup_proposals,
+                "{family:?} has no engine-proven local streaming or tool path, so its \
+                 catalog entry must carry no claims; said {caps:?}"
+            );
+        }
+    }
+
+    fn scan_for_model_family_declarations(
+        dir: &Path,
+        root: &Path,
+        declarations: &mut Vec<PathBuf>,
+    ) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                scan_for_model_family_declarations(&path, root, declarations);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if source
+                .lines()
+                .any(|line| line.trim_start().starts_with("pub enum ModelFamily"))
+            {
+                declarations.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+            }
+        }
     }
 
     #[test]
