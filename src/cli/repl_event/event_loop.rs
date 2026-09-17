@@ -2947,9 +2947,21 @@ impl EventLoop {
         chat_only: bool,
     ) -> Result<()> {
         if self.selected_brain().is_some() {
-            return self
-                .push_remote_brain(crate::brain::BrainEventKind::Prompt { text: input })
-                .await;
+            let mentions = self.take_mention_snapshots(&input).await;
+            match mentions {
+                Ok(snapshots) => {
+                    return self
+                        .push_remote_brain(crate::brain::BrainEventKind::Prompt {
+                            text: input,
+                            attached_mentions: prompt_attachments(&snapshots),
+                        })
+                        .await;
+                }
+                Err(diagnostic) => {
+                    self.output_manager.write_error(diagnostic);
+                    return self.restore_failed_mention_turn(input).await;
+                }
+            }
         }
 
         // One interactive Brain owns a single ordered conversation and VM
@@ -2974,6 +2986,18 @@ impl EventLoop {
             .map(|(_, b64, media_type)| (media_type.clone(), b64.clone()))
             .collect();
 
+        let mention_snapshots = match self.take_mention_snapshots(&input).await {
+            Ok(snapshots) => snapshots,
+            Err(diagnostic) => {
+                {
+                    let mut tui = self.tui_renderer.lock().await;
+                    tui.pending_images.extend(pending_image_entries);
+                }
+                self.output_manager.write_error(diagnostic);
+                return self.restore_failed_mention_turn(input).await;
+            }
+        };
+
         // Echo query to output buffer (skip when caller already echoed)
         if echo {
             self.output_manager.write_user(input.clone());
@@ -2986,18 +3010,25 @@ impl EventLoop {
         // Build and durably checkpoint the next provider-visible history
         // before publishing it in memory or dispatching provider work.
         let mut proposed_history = self.conversation.read().await.clone();
-        if pending_images.is_empty() {
-            proposed_history.add_user_message(input.clone());
+        let mut user_blocks =
+            crate::context::mention::assemble_user_content(&input, &mention_snapshots);
+        if !pending_images.is_empty() {
+            let mut blocks: Vec<ContentBlock> = pending_images
+                .iter()
+                .map(|(media_type, data)| ContentBlock::image(media_type.clone(), data.clone()))
+                .collect();
+            blocks.append(&mut user_blocks);
+            proposed_history.add_user_message_with_content(blocks);
         } else {
-            proposed_history.add_user_message_with_images(input.clone(), &pending_images);
+            proposed_history.add_user_message_with_content(user_blocks);
         }
         if let Err(error) = self.checkpoint_history(&proposed_history) {
             self.query_states.remove_query(query_id).await;
-            self.tui_renderer
-                .lock()
-                .await
-                .pending_images
-                .extend(pending_image_entries);
+            {
+                let mut tui = self.tui_renderer.lock().await;
+                tui.pending_images.extend(pending_image_entries);
+                tui.pending_mentions.extend(mention_snapshots);
+            }
             self.report_checkpoint_error(
                 "Query was not sent; its conversation checkpoint could not be written",
                 &error,
@@ -3024,6 +3055,41 @@ impl EventLoop {
         });
 
         Ok(())
+    }
+
+    async fn take_mention_snapshots(
+        &self,
+        input: &str,
+    ) -> std::result::Result<Vec<crate::context::mention::MentionSnapshot>, String> {
+        let (catalog, prior) = {
+            let mut tui = self.tui_renderer.lock().await;
+            let prior = tui.pending_mentions.drain(..).collect::<Vec<_>>();
+            (tui.mention_catalog.clone(), prior)
+        };
+        match crate::context::mention::snapshots_for_prompt(&catalog, input, &prior) {
+            Ok(snapshots) => Ok(snapshots),
+            Err(errors) => {
+                {
+                    let mut tui = self.tui_renderer.lock().await;
+                    tui.pending_mentions.extend(prior);
+                }
+                Err(errors
+                    .iter()
+                    .map(crate::context::mention::MentionError::speakable)
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+        }
+    }
+
+    async fn restore_failed_mention_turn(&mut self, input: String) -> Result<()> {
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            tui.input_textarea =
+                crate::cli::tui::TuiRenderer::create_clean_textarea_with_text(&input);
+            tui.mark_dirty();
+        }
+        self.render_tui().await
     }
 
     /// Handle /local command - query local model directly (bypass routing)
@@ -4504,6 +4570,23 @@ pub(crate) fn plan_mode_indicator(mode: &ReplMode) -> &'static str {
     }
 }
 
+fn prompt_attachments(
+    snapshots: &[crate::context::mention::MentionSnapshot],
+) -> Vec<crate::brain::PromptAttachment> {
+    snapshots
+        .iter()
+        .map(|snapshot| crate::brain::PromptAttachment {
+            path: snapshot.relative_path.clone(),
+            kind: snapshot.kind.as_str().to_string(),
+            sha256: snapshot.sha256.clone(),
+            byte_len: snapshot.byte_len,
+            truncated: snapshot.truncated,
+            truncation_note: snapshot.truncation_note.clone(),
+            content: snapshot.content.clone(),
+        })
+        .collect()
+}
+
 fn brain_context_text(
     event: &crate::brain::BrainEvent,
     local_machine: Option<&str>,
@@ -4511,7 +4594,7 @@ fn brain_context_text(
     use crate::brain::BrainEventKind;
 
     let text = match &event.kind {
-        BrainEventKind::Prompt { text } | BrainEventKind::ParticipantMessage { text } => text,
+        BrainEventKind::Prompt { text, .. } | BrainEventKind::ParticipantMessage { text } => text,
         BrainEventKind::Result {
             output,
             error: None,

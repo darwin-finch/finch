@@ -17,6 +17,8 @@ impl AutocompleteState {
     pub fn ensure_selection_visible(&mut self, visible_rows: usize);
     /// Get the currently selected command (if any)
     pub fn get_selected(&self) -> Option<&CommandSpec>;
+    /// Selected mention row, when the mention pane is showing.
+    pub fn get_selected_mention(&self) -> Option<&MentionCandidate>;
     /// Hide the dropdown
     pub fn hide(&mut self);
     /// Whether keyboard navigation is backed by a currently visible pane.
@@ -28,6 +30,8 @@ impl AutocompleteState {
     pub fn select_previous(&mut self);
     /// Update matches and show dropdown
     pub fn show_matches(&mut self, matches: Vec<CommandSpec>);
+    /// Show project-file mention candidates.
+    pub fn show_mentions(&mut self, matches: Vec<MentionCandidate>);
 }
 /// Color scheme for TUI elements Re-exported from `theme`.
 pub struct ColorScheme { … }

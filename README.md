@@ -113,6 +113,11 @@ Run `finch --help` and `finch <command> --help` for the full generated CLI refer
 currently reach the same profile selector; generated help emphasizes `/model` while retaining the
 other spellings for compatibility.
 
+Typing `@` at a token boundary opens a keyboard-navigable file picker. Selecting a file or
+directory inserts a visible `@path` mention and attaches a snapshot of its contents to the
+turn. Email addresses and `\@` stay ordinary prompt text. Slash commands remain actions;
+`@` is not a shell escape.
+
 ## Shared brains (experimental)
 
 Tests and live smokes involving Brains must not be invoked directly. Give the

@@ -24,6 +24,7 @@ fn test_summarize_unhydrated_reads_journal_without_creating_files() {
             mutation: None,
             kind: BrainEventKind::Prompt {
                 text: "hello".into(),
+                attached_mentions: Vec::new(),
             },
         },
     )

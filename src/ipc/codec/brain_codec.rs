@@ -562,7 +562,7 @@ pub(crate) fn encode_brain_submission(
     kind: &BrainEventKind,
 ) -> anyhow::Result<()> {
     match kind {
-        BrainEventKind::Prompt { text } => builder.set_prompt(text),
+        BrainEventKind::Prompt { text, .. } => builder.set_prompt(text),
         BrainEventKind::SpeculativePrompt { text } => builder.set_speculative_prompt(text),
         BrainEventKind::ParticipantMessage { text } => builder.set_participant_message(text),
         BrainEventKind::TaskListReplaced { tasks } => {
@@ -599,6 +599,7 @@ pub(crate) fn decode_brain_submission(
     Ok(match reader.which()? {
         Which::Prompt(value) => BrainEventKind::Prompt {
             text: text(value?)?,
+            attached_mentions: Vec::new(),
         },
         Which::SpeculativePrompt(value) => BrainEventKind::SpeculativePrompt {
             text: text(value?)?,
@@ -1525,7 +1526,7 @@ pub(crate) fn encode_event(
                 changed.set_detail(detail);
             }
         }
-        BrainEventKind::Prompt { text } => builder.set_prompt(text),
+        BrainEventKind::Prompt { text, .. } => builder.set_prompt(text),
         BrainEventKind::SpeculativePrompt { text } => builder.set_speculative_prompt(text),
         BrainEventKind::ParticipantMessage { text } => builder.set_participant_message(text),
         BrainEventKind::TaskListReplaced { tasks } => {
@@ -1769,6 +1770,7 @@ pub(crate) fn decode_event(
         }
         Which::Prompt(value) => BrainEventKind::Prompt {
             text: text(value?)?,
+            attached_mentions: Vec::new(),
         },
         Which::SpeculativePrompt(value) => BrainEventKind::SpeculativePrompt {
             text: text(value?)?,
@@ -2061,6 +2063,7 @@ mod tests {
         let submissions = vec![
             BrainEventKind::Prompt {
                 text: "inspect the workspace".into(),
+                attached_mentions: Vec::new(),
             },
             BrainEventKind::SpeculativePrompt {
                 text: "inspect likely context".into(),
@@ -2179,6 +2182,7 @@ mod tests {
             },
             BrainEventKind::Prompt {
                 text: "inspect it".into(),
+                attached_mentions: Vec::new(),
             },
             BrainEventKind::ParticipantMessage {
                 text: "hello, collaborators".into(),
@@ -2287,6 +2291,7 @@ mod tests {
             5,
             BrainEventKind::Prompt {
                 text: "inspect it".into(),
+                attached_mentions: Vec::new(),
             },
         );
         accepted.mutation = Some(crate::brain::BrainMutationReceipt {
@@ -2346,6 +2351,7 @@ mod tests {
                 mutation: Some(remote_mutation.clone()),
                 kind: BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
                     text: "inspect it".into(),
+                    attached_mentions: Vec::new(),
                 }),
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
@@ -2531,6 +2537,7 @@ mod tests {
                         1,
                         BrainEventKind::Prompt {
                             text: "hello".into(),
+                            attached_mentions: Vec::new(),
                         },
                     ),
                     event(

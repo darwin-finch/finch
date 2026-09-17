@@ -1,10 +1,19 @@
-// Context assembly for the system prompt
+// Context assembly for the system prompt and explicit turn attachments.
 //
-// This module collects project-level instructions (AGENTS.md, CLAUDE.md, and related files) and other
-// context that should be prepended to every conversation's system prompt.
+// Instruction files (AGENTS.md, CLAUDE.md, and related names) are collected into
+// the system prompt. Composer `@` mentions are a separate path: they snapshot
+// selected project files/directories and lower them into structured user-turn
+// context. Instruction-file `@path` imports are still not expanded.
 
 pub mod claude_md;
+pub mod mention;
+
 pub use claude_md::{
     collect_claude_md_context, collect_instructions, InstructionSource, InstructionSources,
     SourceStatus,
+};
+pub use mention::{
+    assemble_user_content, format_attachment_document, mention_query_at, parse_visible_mentions,
+    snapshots_for_prompt, AttachmentBody, MentionCandidate, MentionCatalog, MentionError,
+    MentionKind, MentionSnapshot, ParsedMention, MAX_DIR_BYTES, MAX_DIR_FILES, MAX_FILE_BYTES,
 };

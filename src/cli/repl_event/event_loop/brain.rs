@@ -982,7 +982,7 @@ impl EventLoop {
                 self.ensure_remote_brain_run_projection(*run_id, None, *status);
                 self.apply_named_brain_run_status(*run_id, *status, detail.as_deref());
             }
-            BrainEventKind::Prompt { text } => {
+            BrainEventKind::Prompt { text, .. } => {
                 self.output_manager
                     .write_brain_participant(sender.clone(), text.clone(), true)
             }

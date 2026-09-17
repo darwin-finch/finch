@@ -2457,6 +2457,7 @@ mod tests {
                     &attachment,
                     crate::brain::BrainEventKind::Prompt {
                         text: "queue this smoke-test turn".into(),
+                        attached_mentions: Vec::new(),
                     },
                 )
                 .await

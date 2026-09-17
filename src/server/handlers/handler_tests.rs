@@ -589,6 +589,7 @@ async fn websocket_teardown_is_bounded_and_connection_scoped() {
             replacement_connection,
             BrainEventKind::Prompt {
                 text: "later prompt".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .await
@@ -739,6 +740,7 @@ async fn ordinary_websocket_disconnect_cancels_exact_runner_and_preserves_comple
         }),
         kind: crate::ipc::BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
             text: "ordinary disconnect".into(),
+            attached_mentions: Vec::new(),
         }),
     };
     socket
@@ -893,6 +895,7 @@ async fn ordinary_websocket_disconnect_cancels_exact_runner_and_preserves_comple
                 replacement_connection,
                 BrainEventKind::Prompt {
                     text: "lane recovered".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .await
@@ -935,6 +938,7 @@ async fn ordinary_websocket_disconnect_cancels_exact_runner_and_preserves_comple
             "carol",
             BrainEventKind::Prompt {
                 text: "already complete".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -1130,6 +1134,7 @@ async fn effect_audit_websocket_disconnect_fences_start_bind_and_turn_enqueue_ra
             }),
             kind: crate::ipc::BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
                 text: "race admission".into(),
+                attached_mentions: Vec::new(),
             }),
         };
         socket
@@ -1393,6 +1398,7 @@ fn provider_context_snapshot(tasks: Vec<BrainTask>) -> BrainSnapshot {
                 "driver",
                 BrainEventKind::Prompt {
                     text: "continue the work".into(),
+                    attached_mentions: Vec::new(),
                 },
             ),
         ],
@@ -1547,6 +1553,7 @@ fn restarted_snapshot_reinjects_durable_task_context() {
             "driver",
             BrainEventKind::Prompt {
                 text: "resume after reconnect".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -1559,6 +1566,50 @@ fn restarted_snapshot_reinjects_durable_task_context() {
     assert!(text.contains("\"relation\":\"current\""));
     assert!(text.contains("\"id\":\"resume\""));
     assert!(text.contains("resume after reconnect"));
+}
+
+#[test]
+fn named_brain_replay_keeps_mention_digest_without_rereading_disk() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("foo.rs"), "DISK CHANGED").unwrap();
+    let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
+    store
+        .push(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "explain @foo.rs".into(),
+                attached_mentions: vec![crate::brain::PromptAttachment {
+                    path: "foo.rs".into(),
+                    kind: "file".into(),
+                    sha256: "digest-original".into(),
+                    byte_len: 8,
+                    truncated: false,
+                    truncation_note: None,
+                    content: "original".into(),
+                }],
+            },
+        )
+        .unwrap();
+    let snapshot = store.snapshot("shared").unwrap();
+    let messages = named_brain_provider_messages(&snapshot);
+    let text = messages
+        .iter()
+        .map(Message::text_content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("explain @foo.rs"),
+        "visible prompt must survive replay: {text}"
+    );
+    assert!(
+        text.contains("original") && text.contains("digest-original"),
+        "replay must keep the stored mention payload and digest: {text}"
+    );
+    assert!(
+        !text.contains("DISK CHANGED"),
+        "replay must not reread changed disk contents: {text}"
+    );
 }
 
 #[test]
@@ -1682,6 +1733,7 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
                 &driver.subject,
                 BrainEventKind::Prompt {
                     text: "older queued prompt".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();
@@ -1716,6 +1768,7 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
                 &driver.subject,
                 BrainEventKind::Prompt {
                     text: "newer queued prompt".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();
@@ -1973,6 +2026,7 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
             replacement_connection,
             BrainEventKind::Prompt {
                 text: "later prompt".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .await
@@ -2010,6 +2064,7 @@ fn brain_history_remains_conversation_data_not_system_text() {
                 "driver",
                 BrainEventKind::Prompt {
                     text: "compute it".into(),
+                    attached_mentions: Vec::new(),
                 },
             ),
             event(
@@ -2106,6 +2161,7 @@ fn brain_history_reconstructs_provider_tool_protocol() {
                 "driver",
                 BrainEventKind::Prompt {
                     text: "inspect fib".into(),
+                    attached_mentions: Vec::new(),
                 },
             ),
             event(
@@ -2286,6 +2342,7 @@ fn attachment_roles_bound_which_events_the_client_may_submit() {
 
     let prompt = BrainEventKind::Prompt {
         text: "hello".into(),
+        attached_mentions: Vec::new(),
     };
     let participant_message = BrainEventKind::ParticipantMessage {
         text: "hello, collaborators".into(),
@@ -2388,6 +2445,7 @@ async fn approval_decision_is_durable_before_the_runner_resumes() {
             "alice@box.local",
             BrainEventKind::Prompt {
                 text: "read it".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap()
@@ -2449,6 +2507,7 @@ async fn durable_approval_delivery_rejects_stale_and_recovers_uncertain_boundari
             "alice",
             BrainEventKind::Prompt {
                 text: "approve".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap()
@@ -2592,6 +2651,7 @@ async fn durable_approval_delivery_rejects_stale_and_recovers_uncertain_boundari
             "alice",
             BrainEventKind::Prompt {
                 text: "uncertain".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap()
@@ -2834,6 +2894,7 @@ async fn live_prompt_can_be_approved_while_its_turn_lane_is_held() {
             &prompt_driver,
             BrainEventKind::Prompt {
                 text: "read README after approval".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .await
@@ -2994,6 +3055,7 @@ async fn wrong_attachment_cannot_consume_an_approval_decision() {
             "alice@box.local",
             BrainEventKind::Prompt {
                 text: "read it".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap()
@@ -3047,6 +3109,7 @@ fn final_turn_flush_deduplicates_live_approval_lifecycle() {
             "alice@box.local",
             BrainEventKind::Prompt {
                 text: "search".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap()
@@ -3547,6 +3610,7 @@ async fn named_brain_prompt_runs_the_full_turn_on_the_registered_frontend() {
             "driver@box.local",
             BrainEventKind::Prompt {
                 text: "define triple".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -3735,6 +3799,7 @@ async fn failed_named_brain_turn_persists_partial_approval_lifecycle() {
             "driver@box.local",
             BrainEventKind::Prompt {
                 text: "try an effect".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap()
@@ -4461,6 +4526,7 @@ async fn transport_neutral_submission_enforces_roles_and_creates_one_queued_run(
         &driver,
         BrainEventKind::Prompt {
             text: "inspect the workspace".into(),
+            attached_mentions: Vec::new(),
         },
     )
     .await
@@ -4484,7 +4550,10 @@ async fn transport_neutral_submission_enforces_roles_and_creates_one_queued_run(
             &approvals,
             "shared",
             &observer,
-            BrainEventKind::Prompt { text: "run".into() },
+            BrainEventKind::Prompt {
+                text: "run".into(),
+                attached_mentions: Vec::new()
+            },
         )
         .await,
         Err(BrainSubmissionError::Forbidden(_))
@@ -4672,6 +4741,7 @@ async fn speculative_prompt_is_sent_once_and_only_its_correlated_transcript_is_h
         &driver,
         BrainEventKind::Prompt {
             text: "ordinary follow-up".into(),
+            attached_mentions: Vec::new(),
         },
     )
     .await
@@ -4865,6 +4935,7 @@ async fn v13_completed_speculative_restart_backfills_context_isolation_end_to_en
         &driver,
         BrainEventKind::Prompt {
             text: "ordinary-after-v13".into(),
+            attached_mentions: Vec::new(),
         },
     )
     .await;
@@ -5007,6 +5078,7 @@ async fn daemon_projects_memory_only_after_the_successful_turn_is_committed() {
         &driver,
         BrainEventKind::Prompt {
             text: "remember this".into(),
+            attached_mentions: Vec::new(),
         },
     )
     .await
@@ -5034,6 +5106,7 @@ async fn runner_registration_can_replay_committed_memory_idempotently() {
             &driver.subject,
             BrainEventKind::Prompt {
                 text: "remember after restart".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -5140,6 +5213,7 @@ fn seed_completed_brain_runs(
                 &driver.subject,
                 BrainEventKind::Prompt {
                     text: format!("prompt {turn}"),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();
@@ -5410,6 +5484,7 @@ async fn participant_message_is_durable_context_without_creating_a_run() {
             &consultant,
             BrainEventKind::Prompt {
                 text: "execute this instead".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .await,

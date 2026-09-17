@@ -62,6 +62,9 @@ module of this crate, **or** the remaining ones are written down here with the r
   `cli::command_autocomplete`, `cli::suggestions`, `StatusBar`, `AskUserQuestion*`) — the renderer
   is still composed into Finch's frontend. Accordion/transcript ownership is #235/#350 and is not
   this capsule's rewrite.
+- **`crate::context::mention`** — picker rows and pending snapshots. Filesystem policy,
+  ignore rules, budgets, and digest identity live in `context::mention`; the renderer only
+  draws speakable rows and inserts the visible token.
 - **`crate::ABOUT`** — startup header copy.
 - **`crate::is_editor_active` and `crate::finch_ipc_capnp` in `async_input.rs`** — the input task
   must not steal keys while `$EDITOR` is in the foreground, and it talks to the local control

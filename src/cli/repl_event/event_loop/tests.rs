@@ -1788,6 +1788,7 @@ fn snapshot_replay_keeps_conversation_and_hides_presence_churn() {
         "alice",
         BrainEventKind::Prompt {
             text: "hello".into(),
+            attached_mentions: Vec::new(),
         },
     );
     let attached = brain_event(
@@ -1849,6 +1850,7 @@ fn canonical_brain_context_projects_conversation_without_program_source() {
             "alice",
             BrainEventKind::Prompt {
                 text: "please compute forty two squared".into(),
+                attached_mentions: Vec::new(),
             },
         ),
         brain_event(
@@ -1959,6 +1961,7 @@ fn canonical_brain_context_ignores_failed_results_and_bounds_text() {
             "alice",
             BrainEventKind::Prompt {
                 text: "a".repeat(100),
+                attached_mentions: Vec::new(),
             },
         ),
         brain_event(

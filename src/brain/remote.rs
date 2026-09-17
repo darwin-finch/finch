@@ -4060,6 +4060,7 @@ mod tests {
             mutation: None,
             kind: BrainEventKind::Prompt {
                 text: "hello from another console".into(),
+                attached_mentions: Vec::new(),
             },
         };
         let fixture_attachment = attachment.clone();
@@ -4087,7 +4088,7 @@ mod tests {
             };
             assert!(matches!(
                 submit.kind,
-                BrainRemoteCommandKind::Submit(BrainEventKind::Prompt { ref text })
+                BrainRemoteCommandKind::Submit(BrainEventKind::Prompt { ref text, .. })
                     if text == "inspect it"
             ));
             let mutation = submit
@@ -4255,6 +4256,7 @@ mod tests {
         );
         let submit_kind = BrainEventKind::Prompt {
             text: "inspect it".into(),
+            attached_mentions: Vec::new(),
         };
         let submit_handle = BrainMutationHandle {
             idempotency_key: uuid::Uuid::new_v4(),
@@ -4436,6 +4438,7 @@ mod tests {
         );
         let kind = crate::ipc::BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
             text: "once".into(),
+            attached_mentions: Vec::new(),
         });
         let handle = BrainMutationHandle {
             idempotency_key: uuid::Uuid::new_v4(),
@@ -4950,6 +4953,7 @@ mod tests {
                 "alice",
                 BrainEventKind::Prompt {
                     text: "cancel remotely".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();
@@ -5049,6 +5053,7 @@ mod tests {
         // lane, including when the exact same decision arrives concurrently.
         let live_prompt = BrainEventKind::Prompt {
             text: "wait for a remote approval".into(),
+            attached_mentions: Vec::new(),
         };
         let live_prompt_handle = client.prepare_push_mutation(&live_prompt).await.unwrap();
         let (approval_ready_tx, approval_ready_rx) = tokio::sync::oneshot::channel();
@@ -5511,6 +5516,7 @@ mod tests {
         client
             .push(BrainEventKind::Prompt {
                 text: "remote binary lifecycle smoke".into(),
+                attached_mentions: Vec::new(),
             })
             .await
             .unwrap();
@@ -5648,6 +5654,7 @@ mod tests {
                     &local_attachment,
                     BrainEventKind::Prompt {
                         text: "same lifecycle".into(),
+                        attached_mentions: Vec::new(),
                     },
                 )
                 .await
@@ -5689,6 +5696,7 @@ mod tests {
             let remote_outcome = remote
                 .send_remote_command(BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
                     text: "same lifecycle".into(),
+                    attached_mentions: Vec::new(),
                 }))
                 .await
                 .unwrap();

@@ -2234,6 +2234,17 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
         return Ok(());
     }
 
+    let query = match finch::context::mention::prepare_prompt_for_query(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        query,
+    ) {
+        Ok((prepared, _)) => prepared,
+        Err(diagnostic) => {
+            anyhow::bail!("{diagnostic}");
+        }
+    };
+    let query = query.as_str();
+
     // Load configuration
     let config = load_config()?;
 
@@ -3974,6 +3985,7 @@ mod tests {
                 "alice",
                 finch::brain::BrainEventKind::Prompt {
                     text: "hello".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .expect("prompt");
@@ -3983,6 +3995,7 @@ mod tests {
                 "alice",
                 finch::brain::BrainEventKind::Prompt {
                     text: "again".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .expect("second prompt");

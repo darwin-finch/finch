@@ -30,6 +30,7 @@ use crossterm::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tui_textarea::TextArea;
@@ -68,7 +69,7 @@ use tool_viewport::{
 
 pub use async_input::{spawn_input_task, InputEvent};
 pub use autocomplete_widget::AutocompleteState;
-use autocomplete_widget::{completion_pane_lines, replace_command_prefix};
+use autocomplete_widget::{completion_pane_lines, replace_command_prefix, replace_mention_prefix};
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use graph::{GraphNode, GraphNodeAuthor, GraphNodeKind, GraphNodeStatus, GraphView};
@@ -811,6 +812,35 @@ fn replace_textarea_command(textarea: &mut TextArea<'static>, command_name: &str
         textarea.move_cursor(CursorMove::Forward);
     }
     true
+}
+
+fn replace_textarea_mention(textarea: &mut TextArea<'static>, token: &str) -> bool {
+    use tui_textarea::CursorMove;
+
+    let Some((lines, target_cursor)) =
+        replace_mention_prefix(textarea.lines(), textarea.cursor(), token)
+    else {
+        return false;
+    };
+    *textarea = TuiRenderer::create_clean_textarea_with_text(&lines.join("\n"));
+    textarea.move_cursor(CursorMove::Top);
+    for _ in 0..target_cursor.0 {
+        textarea.move_cursor(CursorMove::Down);
+    }
+    let (_, column) = textarea.cursor();
+    if column > 0 {
+        textarea.move_cursor(CursorMove::Head);
+    }
+    for _ in 0..target_cursor.1 {
+        textarea.move_cursor(CursorMove::Forward);
+    }
+    true
+}
+
+fn mention_query_from_textarea(textarea: &TextArea<'_>) -> Option<(usize, String)> {
+    let (row, col) = textarea.cursor();
+    let line = textarea.lines().get(row)?;
+    crate::context::mention::mention_query_at(line, col)
 }
 
 fn dispatch_completion_key(
@@ -1582,6 +1612,11 @@ pub struct TuiRenderer {
     pub pending_images: Vec<(usize, String, String)>,
     pub(crate) image_counter: usize,
 
+    /// Project-rooted `@` mention catalog. Policy lives in `context::mention`.
+    pub(crate) mention_catalog: crate::context::mention::MentionCatalog,
+    /// Snapshots taken when a mention was selected. Submit uses these bytes.
+    pub pending_mentions: Vec<crate::context::mention::MentionSnapshot>,
+
     // Rate limiting - removed in favor of event loop control
 
     // Polled each frame for the session task list (set after construction).
@@ -1670,6 +1705,10 @@ impl TuiRenderer {
             autocomplete_state: AutocompleteState::default(),
             pending_images: Vec::new(),
             image_counter: 0,
+            mention_catalog: crate::context::mention::MentionCatalog::new(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ),
+            pending_mentions: Vec::new(),
             task_rows: None,
             tracked_rows: HashMap::new(),
             tracked_agent_usage: HashMap::new(),
@@ -1753,6 +1792,10 @@ impl TuiRenderer {
 
             pending_images: Vec::new(),
             image_counter: 0,
+            mention_catalog: crate::context::mention::MentionCatalog::new(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ),
+            pending_mentions: Vec::new(),
 
             task_rows: None,
             tracked_rows: HashMap::new(),
@@ -3475,19 +3518,37 @@ impl TuiRenderer {
             self.live_area_dirty = true;
             return;
         }
-        let (matches, ghost) = command_completion_at_cursor(
-            self.input_textarea.lines(),
-            self.input_textarea.cursor(),
-            &self.command_registry,
-        );
-        if matches.is_empty() {
-            self.autocomplete_state.hide();
-            self.ghost_text = None;
-        } else {
-            self.autocomplete_state.show_matches(matches);
-            self.ghost_text = ghost;
-            self.sync_ghost_to_selected_completion();
+        let lines = self.input_textarea.lines();
+        if lines.first().is_some_and(|line| line.starts_with('/')) {
+            let (matches, ghost) = command_completion_at_cursor(
+                lines,
+                self.input_textarea.cursor(),
+                &self.command_registry,
+            );
+            if matches.is_empty() {
+                self.autocomplete_state.hide();
+                self.ghost_text = None;
+            } else {
+                self.autocomplete_state.show_matches(matches);
+                self.ghost_text = ghost;
+                self.sync_ghost_to_selected_completion();
+            }
+            self.live_area_dirty = true;
+            return;
         }
+        if let Some((_, query)) = mention_query_from_textarea(&self.input_textarea) {
+            let rows = self.mention_catalog.candidates(&query);
+            if rows.is_empty() {
+                self.autocomplete_state.hide();
+            } else {
+                self.autocomplete_state.show_mentions(rows);
+            }
+            self.ghost_text = None;
+            self.live_area_dirty = true;
+            return;
+        }
+        self.autocomplete_state.hide();
+        self.ghost_text = None;
         self.live_area_dirty = true;
     }
 
@@ -3511,6 +3572,25 @@ impl TuiRenderer {
         if self.history_index.is_some() && matches!(code, KeyCode::Up | KeyCode::Down) {
             return false;
         }
+        if self.autocomplete_state.is_mention_mode() && self.autocomplete_state.is_interactive() {
+            match code {
+                KeyCode::Up => self.autocomplete_state.select_previous(),
+                KeyCode::Down => self.autocomplete_state.select_next(),
+                KeyCode::Tab | KeyCode::Enter => {
+                    let _ = self.apply_selected_mention();
+                    return true;
+                }
+                KeyCode::Esc => {
+                    self.autocomplete_state.hide();
+                    self.ghost_text = None;
+                    self.mark_dirty();
+                    return true;
+                }
+                _ => return false,
+            }
+            self.mark_dirty();
+            return true;
+        }
         if !dispatch_completion_key(
             &mut self.input_textarea,
             &mut self.autocomplete_state,
@@ -3520,6 +3600,30 @@ impl TuiRenderer {
             return false;
         }
         self.mark_dirty();
+        true
+    }
+
+    fn apply_selected_mention(&mut self) -> bool {
+        let Some(candidate) = self.autocomplete_state.get_selected_mention().cloned() else {
+            return false;
+        };
+        let token = format!("{} ", candidate.insert_token());
+        if !replace_textarea_mention(&mut self.input_textarea, &token) {
+            return false;
+        }
+        match self.mention_catalog.resolve_path(&candidate.relative_path) {
+            Ok(snapshot) => {
+                self.pending_mentions
+                    .retain(|existing| existing.relative_path != snapshot.relative_path);
+                self.pending_mentions.push(snapshot);
+                self.autocomplete_state.hide();
+                self.ghost_text = None;
+            }
+            Err(error) => {
+                self.autocomplete_state.set_mention_error(error.speakable());
+            }
+        }
+        self.live_area_dirty = true;
         true
     }
 
@@ -3599,6 +3703,13 @@ impl TuiRenderer {
         if input.trim().is_empty() {
             return None;
         }
+        let still_mentioned: std::collections::HashSet<String> =
+            crate::context::mention::parse_visible_mentions(&input)
+                .into_iter()
+                .map(|parsed| parsed.relative_path)
+                .collect();
+        self.pending_mentions
+            .retain(|snapshot| still_mentioned.contains(&snapshot.relative_path));
         self.command_history.push(input.clone());
         self.history_index = None;
         self.history_draft = None;
@@ -3634,6 +3745,13 @@ impl TuiRenderer {
                     input_changed: true,
                 };
             }
+            if self.autocomplete_state.is_mention_mode() && self.autocomplete_state.is_interactive()
+            {
+                let _ = self.apply_selected_mention();
+                return ComposerDispatch::Handled {
+                    input_changed: true,
+                };
+            }
             return match self.take_submitted_input() {
                 Some(input) => ComposerDispatch::Submit(input),
                 None => ComposerDispatch::Handled {
@@ -3663,6 +3781,10 @@ impl TuiRenderer {
     }
 
     pub(crate) fn handle_tab_key(&mut self, key: KeyEvent) -> bool {
+        if self.autocomplete_state.is_mention_mode() && self.autocomplete_state.is_interactive() {
+            let _ = self.apply_selected_mention();
+            return true;
+        }
         let modified = route_tab_key(
             &mut self.input_textarea,
             &mut self.autocomplete_state,
@@ -3675,6 +3797,13 @@ impl TuiRenderer {
             self.mark_dirty();
         }
         modified
+    }
+
+    /// Tests and query assembly inject a project root without touching cwd.
+    #[cfg(test)]
+    pub(crate) fn set_mention_root(&mut self, root: impl Into<PathBuf>) {
+        self.mention_catalog = crate::context::mention::MentionCatalog::new(root.into());
+        self.pending_mentions.clear();
     }
 }
 
@@ -6957,6 +7086,143 @@ mod tests {
             renderer.autocomplete_state.visible,
             "restored slash draft must show completions again"
         );
+    }
+
+    fn paint_mention_completions(renderer: &mut TuiRenderer) {
+        renderer.update_ghost_text();
+        completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);
+    }
+
+    fn mention_project() -> (tempfile::TempDir, TuiRenderer) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/foo.rs"), "fn selected() {}\n").unwrap();
+        std::fs::write(tmp.path().join("src/bar.rs"), "fn other() {}\n").unwrap();
+        let mut renderer = headless_renderer();
+        renderer.set_mention_root(tmp.path());
+        (tmp, renderer)
+    }
+
+    #[test]
+    fn at_mention_picker_select_submits_exact_snapshot_and_keeps_visible_prompt() {
+        let (tmp, mut renderer) = mention_project();
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("explain @foo");
+        paint_mention_completions(&mut renderer);
+        assert!(
+            renderer.autocomplete_state.is_interactive(),
+            "token-boundary @ must open a painted mention pane"
+        );
+        let selected = renderer
+            .autocomplete_state
+            .get_selected_mention()
+            .expect("a file must be highlighted")
+            .relative_path
+            .clone();
+        assert_eq!(dispatch_composer(&mut renderer, KeyCode::Tab), None);
+        assert!(
+            !renderer.autocomplete_state.visible,
+            "Tab inserts a mention without submitting"
+        );
+        let submitted = dispatch_composer(&mut renderer, KeyCode::Enter)
+            .expect("Enter after insert must submit the composer");
+        assert!(
+            submitted.starts_with("explain "),
+            "visible prompt must remain intact, got {submitted:?}"
+        );
+        assert!(
+            submitted.contains('@'),
+            "submitted prompt must keep the visible mention token: {submitted:?}"
+        );
+        std::fs::write(tmp.path().join("src/foo.rs"), "CHANGED ON DISK").unwrap();
+        assert_eq!(
+            renderer.pending_mentions.len(),
+            1,
+            "selection must snapshot the chosen file"
+        );
+        assert_eq!(
+            renderer.pending_mentions[0].relative_path, selected,
+            "pending snapshot must be the selected path"
+        );
+        assert_eq!(
+            renderer.pending_mentions[0].content, "fn selected() {}\n",
+            "submit must keep selection bytes, not a later disk read"
+        );
+        let blocks =
+            crate::context::mention::assemble_user_content(&submitted, &renderer.pending_mentions);
+        assert_eq!(
+            blocks[0].as_text(),
+            Some(submitted.as_str()),
+            "provider-visible prompt block must equal the composer text"
+        );
+        let attached = blocks[1].as_text().expect("attachment block");
+        assert!(
+            attached.contains("fn selected() {}"),
+            "provider request must receive the exact selected content: {attached}"
+        );
+        assert!(
+            !attached.contains("CHANGED ON DISK"),
+            "changed disk must not replace the snapshot: {attached}"
+        );
+        assert!(
+            attached.contains(&renderer.pending_mentions[0].sha256),
+            "attachment must name the content digest"
+        );
+    }
+
+    #[test]
+    fn email_and_escaped_at_do_not_open_the_mention_picker() {
+        let (_tmp, mut renderer) = mention_project();
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("user@example.com");
+        paint_mention_completions(&mut renderer);
+        assert!(
+            !renderer.autocomplete_state.visible,
+            "email @ must stay ordinary prompt text"
+        );
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("see \\@foo");
+        paint_mention_completions(&mut renderer);
+        assert!(
+            !renderer.autocomplete_state.visible,
+            "escaped \\@ must not open a mention picker"
+        );
+    }
+
+    #[test]
+    fn mention_enter_inserts_without_submitting_and_esc_keeps_composer() {
+        let (_tmp, mut renderer) = mention_project();
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("@foo");
+        paint_mention_completions(&mut renderer);
+        assert!(renderer.autocomplete_state.is_interactive());
+        assert_eq!(
+            dispatch_composer(&mut renderer, KeyCode::Enter),
+            None,
+            "Enter on a mention row inserts, it does not submit the turn"
+        );
+        assert!(
+            renderer.input_textarea.lines()[0].contains('@'),
+            "inserted mention must remain in the composer"
+        );
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("@foo");
+        paint_mention_completions(&mut renderer);
+        assert_eq!(dispatch_composer(&mut renderer, KeyCode::Esc), None);
+        assert_eq!(renderer.input_textarea.lines(), ["@foo"]);
+        assert!(
+            !renderer.autocomplete_state.visible,
+            "Esc must dismiss the mention pane without rewriting the composer"
+        );
+    }
+
+    #[test]
+    fn mention_resize_invalidates_keyboard_authority_without_rewriting_draft() {
+        let (_tmp, mut renderer) = mention_project();
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("@foo");
+        paint_mention_completions(&mut renderer);
+        assert!(renderer.autocomplete_state.is_interactive());
+        renderer.autocomplete_state.invalidate_rendered_rows();
+        assert!(
+            !renderer.autocomplete_state.is_interactive(),
+            "resize must drop keyboard authority on the old mention pane"
+        );
+        assert_eq!(renderer.input_textarea.lines(), ["@foo"]);
     }
 
     #[test]

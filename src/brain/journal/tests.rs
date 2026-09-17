@@ -1,6 +1,53 @@
 use super::*;
 use crate::brain::attachment::AttachmentId;
 
+#[test]
+fn test_legacy_prompt_json_deserializes_with_empty_mentions() {
+    let kind: BrainEventKind = serde_json::from_str(r#"{"kind":"prompt","text":"hello"}"#).unwrap();
+    match kind {
+        BrainEventKind::Prompt {
+            text,
+            attached_mentions,
+        } => {
+            assert_eq!(text, "hello");
+            assert!(
+                attached_mentions.is_empty(),
+                "legacy Prompt events must load without mention fields: {attached_mentions:?}"
+            );
+        }
+        other => panic!("expected Prompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_prompt_attachment_round_trip_keeps_digest_and_content() {
+    let kind = BrainEventKind::Prompt {
+        text: "explain @src/foo.rs".into(),
+        attached_mentions: vec![PromptAttachment {
+            path: "src/foo.rs".into(),
+            kind: "file".into(),
+            sha256: "abc123".into(),
+            byte_len: 5,
+            truncated: false,
+            truncation_note: None,
+            content: "hello".into(),
+        }],
+    };
+    let json = serde_json::to_string(&kind).unwrap();
+    let loaded: BrainEventKind = serde_json::from_str(&json).unwrap();
+    match loaded {
+        BrainEventKind::Prompt {
+            text,
+            attached_mentions,
+        } => {
+            assert_eq!(text, "explain @src/foo.rs");
+            assert_eq!(attached_mentions[0].sha256, "abc123");
+            assert_eq!(attached_mentions[0].content, "hello");
+        }
+        other => panic!("expected Prompt, got {other:?}"),
+    }
+}
+
 fn prompt(brain_id: BrainId, seq: u64, text: &str) -> BrainEvent {
     BrainEvent {
         schema_version: BRAIN_EVENT_SCHEMA_VERSION,
@@ -11,7 +58,10 @@ fn prompt(brain_id: BrainId, seq: u64, text: &str) -> BrainEvent {
         created_ms: seq,
         run_id: None,
         mutation: None,
-        kind: BrainEventKind::Prompt { text: text.into() },
+        kind: BrainEventKind::Prompt {
+            text: text.into(),
+            attached_mentions: Vec::new(),
+        },
     }
 }
 
@@ -78,7 +128,10 @@ fn test_replay_mutation_is_idempotent_and_rejects_key_reuse() {
         created_ms: 1,
         run_id: None,
         mutation: Some(receipt.clone()),
-        kind: BrainEventKind::Prompt { text: "go".into() },
+        kind: BrainEventKind::Prompt {
+            text: "go".into(),
+            attached_mentions: Vec::new(),
+        },
     };
     let replayed = replay_mutation(std::slice::from_ref(&event), &receipt)
         .unwrap()
