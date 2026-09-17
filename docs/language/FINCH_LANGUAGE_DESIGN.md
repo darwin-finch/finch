@@ -2622,22 +2622,23 @@ A Brain or node that **loads** a CoLisp payload compiles it as a compilation uni
 lower, verify) with a granted capability set. That is the compiler invoked by the host, not a
 language `eval`. Generating syntax as data is always allowed; executing it is never ambient.
 
-**Interned compiled callables (LINQ-style compile cache).** When a mapping or binder is not known
-until runtime (DB row → record, query shape × type), user code may ask the **compiler as a
-library** for a function:
+**Interned callables (compile-or-interpret once, then call).** When a mapping or binder is not
+known until runtime (DB row → record, query shape × type), user code may ask for a function:
 
 - Input: `syntax` and/or a `type` (and a stable fingerprint of the query/schema), not a string of
   source.
-- The compiler runs the same expand → check → lower → verify pipeline and returns a **typed
-  callable** (bytecode or JIT).
-- The host **interns** that callable under `(fingerprint, type-id, capability set)`. The first
-  use compiles; later uses are an ordinary call. Per-row work must not re-expand or re-verify.
-- Diagnostics are SDC-style on that compilation (user form / expansion / fault), not a runtime
-  interpreter stack.
-- This is C# `Expression.Compile` plus a cache, not Lisp `eval`. Prefer CTFE/generics when the
-  record type is known at module compile (zero runtime compile). Use the interned hatch when the
-  shape is only known then (ad-hoc query, reflected schema).
-- Capability and fuel apply to **compilation** as well as to the resulting function’s effects.
+- The **same pipeline** as a module (expand → check → lower → verify) produces a **typed
+  callable**. If a JIT (e.g. Cranelift) is present, that callable may be machine code; if not,
+  it is **bytecode the existing VM already interprets**. The API does not change. There is no
+  second “eval language.”
+- The host **interns** that callable under `(fingerprint, type-id, capability set)`. First use
+  pays expand/check/lower; later uses are an ordinary **call** (or VM call). Per-row work must
+  not re-expand, re-verify, or walk trees.
+- Diagnostics are SDC-style on that first lowering (user form / expansion / fault).
+- This is C# `Expression.Compile` plus a dictionary, or D CTFE when the type is known in the
+  module (then there is no runtime lowering at all). Unfamiliar machinery is out of scope: no
+  user `eval`, no string mixin, no per-row interpreter of lists.
+- Capability and fuel apply to the **first lowering** and to the resulting function’s effects.
   An LLM does not get this hatch unless that Brain is granted it.
 
 Until that kernel exists, `define-syntax` remains a capture-free **template**: substitution
