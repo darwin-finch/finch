@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = Path(".github/workflows")
 
 EXPECTED_WORKFLOWS = (
+    "ci-main-breakage.yml",
     "ci-superseded-run-cancellation.yml",
     "ci.yml", "docs.yml", "issue-201-chatgpt-auth.yml",
     "issue-56-brain-isolation.yml", "release.yml", "repository-hygiene.yml",
@@ -35,6 +36,23 @@ CANCELLATION_WORKFLOW_RUN = {
 }
 CANCELLATION_STEP = "Cancel superseded canonical CI runs"
 CANCELLATION_TOKEN = "${{ github.token }}"
+
+# Trusted default-branch controller that keeps one open "CI failed on main"
+# issue as long as main-branch CI is red. Main-only jobs (#848) make a red
+# main push the only detection point for the release preflight, the
+# release-mode atomic history regression, and the macOS suite.
+BREAKAGE_WORKFLOW = "ci-main-breakage.yml"
+BREAKAGE_JOB = "report-main-breakage"
+BREAKAGE_JOB_IF = (
+    "github.event.workflow_run.event == 'push' && "
+    "github.event.workflow_run.head_branch == 'main'"
+)
+BREAKAGE_PERMISSIONS = {"actions": "read", "issues": "write"}
+BREAKAGE_WORKFLOW_RUN = {"workflows": ["CI"], "types": ["completed"]}
+BREAKAGE_STEP = "Update the main breakage issue"
+BREAKAGE_TOKEN = "${{ github.token }}"
+BREAKAGE_ISSUE_TITLE = 'ISSUE_TITLE = "CI failed on main"'
+BREAKAGE_LABEL = 'LABEL = "ci-main-breakage"'
 
 # Exact triggers are reviewed separately from fixture activation so a path change cannot hide
 # merely because none of the representative fixtures exercises it.
@@ -1252,6 +1270,126 @@ def cancellation_controller_errors(documents: dict[str, dict[str, Any]]) -> list
     return errors
 
 
+def breakage_controller_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
+    """Check the effective privileged envelope of the main breakage filer.
+
+    One workflow_run subscription, exact read/write split (Actions read to list
+    failed jobs, Issues write to file and close), exactly one trusted heredoc
+    step, and the pinned issue title and label that give the dedupe its stable
+    identity across runs.
+    """
+    document = documents.get(BREAKAGE_WORKFLOW)
+    if document is None:
+        return []
+    errors: list[str] = []
+    display = BREAKAGE_WORKFLOW
+    if document.get("name") != "CI main breakage":
+        errors.append(
+            f"{display}: workflow name changed; "
+            f"expected='CI main breakage' actual={document.get('name')!r}"
+        )
+    triggers = document.get("on")
+    if not isinstance(triggers, dict) or set(triggers) != {"workflow_run"}:
+        errors.append(
+            f"{display}: trusted controller must subscribe only to workflow_run; "
+            f"actual={triggers!r}"
+        )
+    elif triggers.get("workflow_run") != BREAKAGE_WORKFLOW_RUN:
+        errors.append(
+            f"{display}: workflow_run trigger changed; "
+            f"expected={BREAKAGE_WORKFLOW_RUN!r} actual={triggers.get('workflow_run')!r}"
+        )
+    if document.get("permissions") != BREAKAGE_PERMISSIONS:
+        errors.append(
+            f"{display}: effective permissions changed; "
+            f"expected={BREAKAGE_PERMISSIONS!r} actual={document.get('permissions')!r}"
+        )
+    if "concurrency" in document:
+        errors.append(
+            f"{display}: concurrency groups cannot encode completion ordering; remove them"
+        )
+    if "defaults" in document:
+        errors.append(
+            f"{display}: workflow-level defaults would rewrite the trusted step; remove them"
+        )
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict) or tuple(jobs) != (BREAKAGE_JOB,):
+        actual = list(jobs) if isinstance(jobs, dict) else jobs
+        errors.append(
+            f"{display}: exactly one job {BREAKAGE_JOB!r} is required; actual={actual!r}"
+        )
+        return errors
+    job = jobs[BREAKAGE_JOB]
+    if not isinstance(job, dict):
+        errors.append(f"{display}: job {BREAKAGE_JOB!r} must be a mapping")
+        return errors
+    if job.get("if") != BREAKAGE_JOB_IF:
+        errors.append(
+            f"{display}: job {BREAKAGE_JOB!r} condition changed; "
+            f"expected={BREAKAGE_JOB_IF!r} actual={job.get('if')!r}"
+        )
+    if job.get("runs-on") != "ubuntu-24.04":
+        errors.append(
+            f"{display}: job {BREAKAGE_JOB!r} must run on ubuntu-24.04; "
+            f"actual={job.get('runs-on')!r}"
+        )
+    if job.get("timeout-minutes") != 5:
+        errors.append(
+            f"{display}: job {BREAKAGE_JOB!r} timeout-minutes must be 5; "
+            f"actual={job.get('timeout-minutes')!r}"
+        )
+    if "permissions" in job:
+        errors.append(
+            f"{display}: job {BREAKAGE_JOB!r} must inherit workflow permissions; "
+            f"actual={job.get('permissions')!r}"
+        )
+    if "concurrency" in job:
+        errors.append(f"{display}: job {BREAKAGE_JOB!r} must not set a concurrency group")
+    if job.get("continue-on-error") not in (None, False):
+        errors.append(f"{display}: job {BREAKAGE_JOB!r} must gate failure")
+    steps = job.get("steps")
+    for step in steps if isinstance(steps, list) else ():
+        if isinstance(step, dict) and "uses" in step:
+            errors.append(
+                f"{display}: trusted controller must not checkout or run an action; "
+                f"uses={step.get('uses')!r}"
+            )
+    if not isinstance(steps, list) or len(steps) != 1 or not isinstance(steps[0], dict):
+        errors.append(f"{display}: job {BREAKAGE_JOB!r} must contain exactly one trusted step")
+        return errors
+    step = steps[0]
+    if step.get("name") != BREAKAGE_STEP:
+        errors.append(f"{display}: trusted step name changed; actual={step.get('name')!r}")
+    if "uses" in step:
+        errors.append(
+            f"{display}: trusted controller must not checkout or run an action; "
+            f"uses={step.get('uses')!r}"
+        )
+    if step.get("env") != {"TOKEN": BREAKAGE_TOKEN}:
+        errors.append(
+            f"{display}: trusted step token binding changed; "
+            f"expected={{'TOKEN': {BREAKAGE_TOKEN!r}}} actual={step.get('env')!r}"
+        )
+    run = step.get("run")
+    if not isinstance(run, str) or "python3 - <<'PYTHON'" not in run or not run.rstrip().endswith("PYTHON"):
+        errors.append(f"{display}: trusted step must run one literal PYTHON heredoc")
+    else:
+        for pinned, what in (
+            (BREAKAGE_ISSUE_TITLE, "breakage issue title"),
+            (BREAKAGE_LABEL, "breakage issue label"),
+        ):
+            if pinned not in run:
+                errors.append(f"{display}: trusted step {what} changed; expected {pinned!r}")
+    if step.get("if") is not None:
+        errors.append(
+            f"{display}: trusted step must run whenever the job runs; "
+            f"actual if={step.get('if')!r}"
+        )
+    if step.get("continue-on-error") not in (None, False):
+        errors.append(f"{display}: trusted step must gate failure")
+    return errors
+
+
 def compare_contract(root: Path) -> list[str]:
     directory = root / WORKFLOWS
     actual_files = tuple(sorted(path.name for path in directory.glob("*.y*ml")))
@@ -1326,6 +1464,7 @@ def compare_contract(root: Path) -> list[str]:
     errors.extend(ordinary_ci_supervision_errors(documents))
     errors.extend(cache_contract_errors(documents))
     errors.extend(cancellation_controller_errors(documents))
+    errors.extend(breakage_controller_errors(documents))
     errors.extend(escape_api_errors(root))
     return errors
 
