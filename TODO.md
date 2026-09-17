@@ -163,7 +163,9 @@ still blocks the corresponding Brain phase until it is unified.
   only the transformer call. No user-facing `eval`. Mix-back into a module is compile-time `splice`.
   Loading a payload invokes the compiler on a compilation unit. Staging is D-like: CTFE, ordinary
   `if` when the condition is CTFE-constant, generics instantiated then type-checked, syntax CTFE
-  only where a function would evaluate too early. Allow an interned compiler-as-library hatch
+  only where a function would evaluate too early. The usual path is const generic tuples plus
+  ordinary `foreach`/`if` (unrolled residual IR, no AST). Syntax CTFE is the optional hatch.
+  Allow an interned compiler-as-library hatch
   (LINQ `Expression.Compile` + cache): `syntax`/`type` in, typed callable out, interned by
   fingerprint×type, first use compiles, later uses call; not per-row tree walking. Add
   normalization conformance fixtures proving that each sugared program and its canonical

@@ -2489,7 +2489,7 @@ incremental and gives both humans and models a stable primary blame location.
 The frontend performs:
 
 1. parse with exact source spans;
-2. hygienic expansion by ordinary bounded CTFE (`syntax -> syntax`), not a second evaluator;
+2. CTFE of values (`if`/`foreach` unroll) then, where needed, hygienic `syntax -> syntax` CTFE, not a second evaluator;
 3. name resolution and lexical binding;
 4. directional local inference plus explicit effect rows and practical subtyping/refinement checks;
 5. desugaring of `let`, `begin`, `if`, pattern matching, and named functions;
@@ -2517,141 +2517,104 @@ return
 
 It does not construct `"3 4 2 * +"` and re-enter the Forth text parser.
 
-### Macros
+### Compile-time staging (CTFE)
 
-Do not create a privileged second macro language. A macro is an ordinary pure, bounded Finch CTFE
-function whose contract is `syntax -> syntax` (or a richer typed syntax/context/result record when
-needed). The same staged evaluator used for compile-time `if`, `foreach`, generics, concepts, and
-derivation executes it. Convenient declarations such as `define-syntax` may remain reader sugar for
-defining/registering such a function, but may not acquire separate evaluation semantics.
+Do not create a privileged second macro language, a string mixin, `compile(text)`, or user-facing
+`eval`. Staging is **D-shaped**: ordinary code over compile-time **values**, generics instantiated
+then type-checked, and — only when that is not enough — typed `syntax -> syntax` CTFE. The same
+evaluator runs compile-time `if`, `foreach`, generics, concepts, derivation, and syntax
+transformers. Residual IR is what the verifier sees. There is no untyped `defmacro`.
+
+**Power level is D CTFE, not Common Lisp macros.** The **usual path does not touch `syntax`.** A
+compile-time tuple (fields, tags, type names) is an ordinary **value** passed as a const
+generic/template parameter. The author writes ordinary `foreach` / `if` / `switch` over those
+values; they do not construct, quote, or inspect AST. It just works because the values are
+compile-time constants. `foreach` and `if`/`switch` on compile-time strings or types **unroll in
+the residual IR**: the compiler emits specialized copies of the body (one per field, token, or
+type) for **that instantiation**. Later calls are that already-unrolled function — straight-line
+or jump-to-handler code, as in a high-speed D parser, not a runtime loop over a schema. If an
+`if` condition is a compile-time constant, that `if` **is** compile-time: the dead arm is dropped
+and is not residual IR. There is no `static-if` keyword.
+
+**When AST is required** (evaluation order, new bindings, forms a function would evaluate too
+early): a pure, bounded CTFE function `syntax -> syntax` (or a richer typed syntax record). Fuel,
+recursion, and allocation limits apply. Host effects in the transformer are forbidden; quasiquote
+and list surgery only **construct** forms. The expander **returns data**; later phases
+(check, lower, verify) make it executable. This is the hatch D lacked: feed an AST back to the
+**same** compiler, not `mixin(string)`. It is slightly less general than `defmacro`; that is
+acceptable. Wrapping two ordinary calls is **not** a reason to use syntax CTFE — that is a
+function.
+
+**Quote and quasiquote.** `'form` produces `syntax` (data, not evaluated). `` ` `` is a template;
+`,` fills **one** hole with a value (if that value is a list, it stays one nested list); `,@`
+spreads a list’s **elements** into the surrounding quoted list and is legal **only inside**
+quasiquote (the module is code-first, not an implicit template). These operations copy origin and
+expansion ancestry. They never parse source bytes. The current symbol-only `quote` restriction is
+transitional.
+
+**`splice` vs `,@`.** `,@` is list surgery inside `` ` ``. `splice` is a compile-time word: this
+`syntax` **value** is the next form in the **module being compiled** (conceptually `,@` onto the
+module’s form list, then compile each form). `splice` is not runtime `eval` and is not valid as
+the body of a `define` that is supposed to return a function.
+
+**`define` vs `define-syntax`.** `define` / `lambda` bind a **value** (a function is a value).
+`define-syntax` **registers** a `syntax -> syntax` CTFE function in the expander: arguments are
+not evaluated; `(when test body)` compiles as `(splice (expand-when '(when test body)))`. Without
+`define-syntax`, the transformer is an ordinary function and the caller must quote. `let` in a
+transformer is an expression: bindings, then a body whose **value** is the result (typically a
+quasiquoted list).
+
+```
+(define (require-pkg (name : string)) : void
+  (pkg.ensure name)
+  (svc.enable name))
+
+(define (expand-when (form : syntax)) : syntax
+  (let ((test (second form))
+        (body (third form)))
+    `(if ,test ,body #f)))
+
+(define-syntax when expand-when)
+
+(define (maybe-install (ready? : bool)) : void
+  (when ready?
+    (require-pkg "nginx")))
+```
+
+`,` before `(second form)` means “compute `second` **now** (in the expander) and insert that
+syntax.” `(second ,form)` would **generate** a future call to `second`. `#f` is boolean false
+(the `if` else). `expand-when` does not run `pkg.ensure`. After expansion, `maybe-install` is
+ordinary bytecode with an `if`.
+
+Without `define-syntax`, one-shot mix-back is explicit quote plus `splice` of a **`define` or
+other module form**, not `eval` of a tree when the function is later called.
+
+**Diagnostics** follow SDC mixin reporting, not DMD’s “blame the mixin line”: (1) user form and
+span, (2) pretty-printed expansion the transformer returned, (3) fault in that expansion with
+span and ancestry. Dropping spans on quote/quasiquote is a defect.
+
+**No user `eval`.** A Brain or node that **loads** a payload invokes the compiler on a
+compilation unit with granted capabilities. Generating syntax as data is always allowed;
+executing it is never ambient.
+
+**Interned callables.** When a binder is only known at runtime (DB row → record), ask the **same
+pipeline** for a typed function: `syntax` and/or `type` plus a fingerprint in; expand → check →
+lower → verify; bytecode the VM interprets, or machine code if a JIT exists. Intern under
+`(fingerprint, type-id, caps)`. First use lowers; later uses **call**. Per-row work must not walk
+trees. Prefer module CTFE when the type is known in the file. An LLM does not get this hatch
+unless that Brain is granted it.
 
 Syntax values are not bare lists. They retain source origin, expansion ancestry, lexical scope
 marks, and stable module/symbol identity. Public syntax constructors and projections preserve those
 properties so ordinary structural Finch code can be hygienic without receiving ambient host access.
-Macro execution has explicit fuel, recursion, and allocation limits. Expansion provenance maps
-generated forms back to both macro invocation and macro definition. A macro cannot hide effects:
-the expanded IR is what the verifier analyzes.
+A syntax transformer cannot hide effects: the expanded IR is what the verifier analyzes.
 
 Finch has no string mixin or `compile(text)` facility. Compile-time code cannot manufacture source
-bytes and ask a frontend to parse them inside the current module; that would create a second parse
-boundary, discard hygiene and binding identity, and move diagnostics onto generated text. The useful
-declaration-composition behavior sometimes called a mixin is expressed by a structured syntax macro
-that returns declaration nodes. It may generate fields, callables, nested declarations, attributes,
-or explicit concept evidence, all of which retain expansion provenance and pass through the normal
-coherence and verification pipeline. Optional `mixin` surface sugar may only invoke that ordinary
-structured macro protocol; it is not inheritance, textual member injection, or another expansion
-engine. Runtime composition remains record embedding, delegation, and concept evidence.
-
-Quote produces `syntax`, not a stripped runtime list. `'form` and nested `quote` mean the form is
-**data**: it is not evaluated at that site. Quasiquote `` ` `` builds syntax by template; unquote
-`,` fills a hole with a `syntax` or CTFE value; splice inserts a list of syntax values into a
-surrounding list. These operations copy origin and expansion ancestry onto constructed cells.
-They never parse source bytes. The current symbol-only `quote` restriction is transitional and
-must be replaced by this full nested quote/quasiquote/unquote/splice over `syntax`.
-
-A CTFE function on numbers is not a macro: `(+ 1 2)` at compile time is the integer `3`. A CTFE
-function whose contract is `syntax -> syntax` **is** a macro. The only remaining difference from
-an ordinary function is **call convention**, not a second evaluator:
-
-- function: arguments are evaluated first; the caller writes `(expand-when '(when ready? (pkg.ensure nginx)))`;
-- `define-syntax`: arguments are not evaluated; `(when ready? (pkg.ensure nginx))` is compiled as
-  `(splice (expand-when '(when ready? (pkg.ensure nginx))))`.
-
-`splice` is an ordinary **compile-time** word (Co-Forth: the explicit splice word already listed
-with `macro:` / `syntax[ ... ]`). Its meaning is: this `syntax` **value** is the next form in the
-**module being compiled**. It is not runtime `eval`. The compiler’s following phases (check, lower,
-verify) treat that tree as source. The expander **returns data**; later phases make it executable.
-Calling `pkg.ensure` inside a `syntax -> syntax` function would be a compile-time host effect and is
-forbidden; list surgery and quasiquote only **construct** forms.
-
-Staging follows D’s CTFE/generics more than Lisp-with-eval, without D’s extra `static if`
-keyword. **CTFE** on values: if an `if` condition is a compile-time constant, that `if` **is**
-compile-time — the dead arm is dropped and is not type-checked as residual IR (the live arm still
-is). There is no `static-if` form. **Generics** instantiate then type-check (the instantiated IR is
-what the verifier sees). **Syntax CTFE** only where evaluation order or bindings cannot be a
-function. Every generated form is checked with the same rules as handwritten code. Diagnostics
-name user form, pretty-printed expansion, and fault span (SDC mixin style). There is no untyped
-`defmacro` and no user `eval`.
-
-The intended **power level is D CTFE**, not Common Lisp macros. The **usual path does not
-touch `syntax`**. A compile-time tuple (fields, tags, type names) is an ordinary **value**
-passed as a const generic/template parameter. `foreach` over that tuple and `if` / `switch` on
-compile-time strings or types **unroll in the residual IR**: the compiler emits specialized
-copies of the body (one per field, token, or type) for **that instantiation**, type-checked,
-not a runtime loop over types. Later calls of that generic are just that already-unrolled function. The author writes ordinary `foreach` / `if` / `switch` over values; they do not construct, quote, or inspect `syntax`. It just works because those values are compile-time constants. That is the same trick as a high-speed D parser: generated straight-line or
-jump-to-handler code, not an interpreter of the schema, and not an AST API. Syntax CTFE
-(`syntax -> syntax` then `splice`) is the optional hatch D lacked (manipulate an AST and feed
-it back to the same compiler, not `mixin(string)`). Most Finch metaprogramming should stay on
-the tuple/`foreach`/`if` path. Syntax CTFE is slightly less general than `defmacro`; that is
-acceptable.
-
-`let` in such a function is the usual expression: bindings, then a body whose **value** is the
-result (typically a quasiquoted list). Nothing further is bound unless the caller `define`s a
-name or `splice`s the value into the module.
-
-A transformer that only wraps two calls is not a reason to use syntax CTFE. That is an ordinary
-function:
-
-```
-(define (require-pkg name)
-  (pkg.ensure name)
-  (svc.enable name))
-
-(require-pkg "nginx")
-```
-
-Syntax CTFE is for forms a function cannot implement because it would **evaluate** arguments.
-`when` must not run `pkg.ensure` unless `ready?` is true:
-
-```
-(define (expand-when form)
-  (let ((test (second form))
-        (body (third form)))
-    `(if ,test ,body #f)))
-```
-
-`expand-when` only **builds a list**. It does not run `if` or `pkg.ensure`. `splice` pastes that
-list **once** into the module as source — it does not define a word named `when`:
-
-```
-(splice (expand-when '(when ready? (pkg.ensure nginx))))
-;; the next form in the file is:
-;; (if ready? (pkg.ensure nginx) #f)
-```
-
-`define-syntax` **registers** the transformer so every later `(when …)` is implicit-quote plus
-splice. Without it, `when` is not a callable; you would write `splice` at each use. Type and
-effect checking apply to the **expanded** `if` tree. A converge `require` that yields until
-another form is Done is the same shape: syntax, not “two host calls with a wrapper name.”
-
-Diagnostics for syntax CTFE follow SDC mixin reporting, not DMD’s “blame the mixin line.” A
-failure names (1) the **user form** and its span, (2) a pretty-printed **expansion** the
-transformer actually returned, (3) the **fault** in that expansion with a span, plus ancestry
-to the transforming function. Dropping spans on quote/quasiquote is a defect: CTFE over
-spanless lists is a string mixin. Fuel, recursion, and allocation limits still apply.
-
-A Brain or node that **loads** a CoLisp payload compiles it as a compilation unit (expand, check,
-lower, verify) with a granted capability set. That is the compiler invoked by the host, not a
-language `eval`. Generating syntax as data is always allowed; executing it is never ambient.
-
-**Interned callables (compile-or-interpret once, then call).** When a mapping or binder is not
-known until runtime (DB row → record, query shape × type), user code may ask for a function:
-
-- Input: `syntax` and/or a `type` (and a stable fingerprint of the query/schema), not a string of
-  source.
-- The **same pipeline** as a module (expand → check → lower → verify) produces a **typed
-  callable**. If a JIT (e.g. Cranelift) is present, that callable may be machine code; if not,
-  it is **bytecode the existing VM already interprets**. The API does not change. There is no
-  second “eval language.”
-- The host **interns** that callable under `(fingerprint, type-id, capability set)`. First use
-  pays expand/check/lower; later uses are an ordinary **call** (or VM call). Per-row work must
-  not re-expand, re-verify, or walk trees.
-- Diagnostics are SDC-style on that first lowering (user form / expansion / fault).
-- This is C# `Expression.Compile` plus a dictionary, or D CTFE when the type is known in the
-  module (then there is no runtime lowering at all). Unfamiliar machinery is out of scope: no
-  user `eval`, no string mixin, no per-row interpreter of lists.
-- Capability and fuel apply to the **first lowering** and to the resulting function’s effects.
-  An LLM does not get this hatch unless that Brain is granted it.
+bytes and ask a frontend to parse them inside the current module. The useful declaration-composition
+behavior sometimes called a mixin is expressed by a structured `syntax -> syntax` function that
+returns declaration nodes (fields, callables, nested declarations, attributes, or explicit concept
+evidence), all of which retain expansion provenance. Optional `mixin` surface sugar may only invoke
+that protocol. Runtime composition remains record embedding, delegation, and concept evidence.
 
 Until that kernel exists, `define-syntax` remains a capture-free **template**: substitution
 before type checking, no CTFE body, no capabilities, and no introducing `let` or other binding
