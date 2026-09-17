@@ -387,6 +387,7 @@ impl MentionCatalog {
         let link_meta = fs::symlink_metadata(&abs).map_err(|error| map_io(&relative, error))?;
         if link_meta.file_type().is_symlink() {
             self.ensure_symlink_stays(&abs, &relative)?;
+            self.reject_secret_or_ignored_target(&relative, &abs)?;
         }
         let meta = fs::metadata(&abs).map_err(|error| map_io(&relative, error))?;
         if meta.is_dir() {
@@ -430,6 +431,33 @@ impl MentionCatalog {
             return Err(MentionError::SymlinkEscape {
                 path: relative.to_string(),
                 target: target.display().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_secret_or_ignored_target(
+        &self,
+        mention_path: &str,
+        abs: &Path,
+    ) -> Result<(), MentionError> {
+        let target = fs::canonicalize(abs).map_err(|error| map_io(mention_path, error))?;
+        let root = fs::canonicalize(&self.root).map_err(|error| MentionError::Unreadable {
+            path: mention_path.to_string(),
+            reason: error.to_string(),
+        })?;
+        let Some(target_rel) = relative_utf8(&root, &target) else {
+            return Ok(());
+        };
+        if let Some(rule) = secret_rule(&target_rel) {
+            return Err(MentionError::Secret {
+                path: mention_path.to_string(),
+                rule: rule.to_string(),
+            });
+        }
+        if path_is_ignored(&root, &target) {
+            return Err(MentionError::Ignored {
+                path: mention_path.to_string(),
             });
         }
         Ok(())
@@ -487,9 +515,8 @@ impl MentionCatalog {
             path: relative.to_string(),
             reason: "could not walk directory".to_string(),
         })?;
-        let mut files = Vec::new();
+        let mut candidates = Vec::new();
         let mut skipped = Vec::new();
-        let mut total_bytes = 0u64;
         let mut seen = 0usize;
         let mut walk_capped = false;
         for entry in walker {
@@ -512,11 +539,14 @@ impl MentionCatalog {
             let Some(child_rel) = relative_utf8(&self.root, path) else {
                 continue;
             };
-            if is_skip_dir_component(&child_rel) || path_is_hidden(&child_rel) {
+            if is_skip_dir_component(&child_rel) {
                 continue;
             }
             if let Some(rule) = secret_rule(&child_rel) {
                 skipped.push(format!("{child_rel} secret ({rule})"));
+                continue;
+            }
+            if path_is_hidden_relative_to(&child_rel, relative) {
                 continue;
             }
             let depth = child_rel
@@ -534,7 +564,18 @@ impl MentionCatalog {
             };
             if file_type.is_symlink() {
                 match self.ensure_symlink_stays(path, &child_rel) {
-                    Ok(()) => {}
+                    Ok(()) => match self.reject_secret_or_ignored_target(&child_rel, path) {
+                        Ok(()) => {}
+                        Err(MentionError::Secret { path, rule }) => {
+                            skipped.push(format!("{path} secret ({rule})"));
+                            continue;
+                        }
+                        Err(MentionError::Ignored { path }) => {
+                            skipped.push(format!("{path} ignored"));
+                            continue;
+                        }
+                        Err(_) => continue,
+                    },
                     Err(MentionError::SymlinkEscape { path, target }) => {
                         skipped.push(format!("{path} symlink escapes to {target}"));
                         continue;
@@ -545,29 +586,31 @@ impl MentionCatalog {
             if !file_type.is_file() {
                 continue;
             }
-            match self.resolve_file(
-                &child_rel,
-                path,
+            candidates.push((
+                child_rel,
+                path.to_path_buf(),
                 entry.metadata().map(|m| m.len()).unwrap_or(0),
-            ) {
+            ));
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut included = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut budget_truncated = false;
+        for (child_rel, path, size) in candidates {
+            if included.len() >= MAX_DIR_FILES || total_bytes >= MAX_DIR_BYTES {
+                budget_truncated = true;
+                break;
+            }
+            match self.resolve_file(&child_rel, &path, size) {
                 Ok(file) => {
-                    if files.len() >= MAX_DIR_FILES || total_bytes + file.byte_len > MAX_DIR_BYTES {
-                        let note = format!(
-                            "included {} of the directory's files because of the directory mention budget ({MAX_DIR_FILES} files / {}).",
-                            files.len(),
-                            format_bytes(MAX_DIR_BYTES)
-                        );
-                        let content = directory_payload(relative, &files, &skipped, Some(&note));
-                        return Ok(snapshot(
-                            relative,
-                            MentionKind::Directory,
-                            content,
-                            true,
-                            Some(note),
-                        ));
+                    if included.len() >= MAX_DIR_FILES
+                        || total_bytes + file.byte_len > MAX_DIR_BYTES
+                    {
+                        budget_truncated = true;
+                        break;
                     }
                     total_bytes += file.byte_len;
-                    files.push(file);
+                    included.push(file);
                 }
                 Err(MentionError::Binary { path }) => skipped.push(format!("{path} binary")),
                 Err(MentionError::Oversized { path, bytes, cap }) => skipped.push(format!(
@@ -576,19 +619,28 @@ impl MentionCatalog {
                     format_bytes(cap)
                 )),
                 Err(MentionError::Ignored { path }) => skipped.push(format!("{path} ignored")),
+                Err(MentionError::Secret { path, rule }) => {
+                    skipped.push(format!("{path} secret ({rule})"))
+                }
                 Err(other) => skipped.push(other.speakable()),
             }
         }
-        files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-        let truncation = if walk_capped {
+        let truncation = if budget_truncated {
+            Some(format!(
+                "included {} of the directory's files because of the directory mention budget ({MAX_DIR_FILES} files / {}).",
+                included.len(),
+                format_bytes(MAX_DIR_BYTES)
+            ))
+        } else if walk_capped {
             Some(format!(
                 "directory walk stopped after {MAX_WALK_ENTRIES} entries; included {} file(s).",
-                files.len()
+                included.len()
             ))
         } else {
             None
         };
-        let content = directory_payload(relative, &files, &skipped, truncation.as_deref());
+        let content = directory_payload(relative, &included, &skipped, truncation.as_deref());
+        let truncated = budget_truncated || walk_capped;
         let note = match (truncation, skipped.is_empty()) {
             (Some(note), _) => Some(note),
             (None, false) => Some(format!("skipped {}", skipped.join("; "))),
@@ -598,7 +650,7 @@ impl MentionCatalog {
             relative,
             MentionKind::Directory,
             content,
-            walk_capped,
+            truncated,
             note,
         ))
     }
@@ -819,6 +871,20 @@ fn path_is_hidden(relative: &str) -> bool {
         .any(|part| part.starts_with('.') && part != "." && part != "..")
 }
 
+fn path_is_hidden_relative_to(relative: &str, mention_root: &str) -> bool {
+    if mention_root.is_empty() {
+        return path_is_hidden(relative);
+    }
+    if relative == mention_root {
+        return false;
+    }
+    let rest = relative
+        .strip_prefix(mention_root)
+        .and_then(|s| s.strip_prefix('/'))
+        .unwrap_or(relative);
+    path_is_hidden(rest)
+}
+
 fn is_skip_dir_component(relative: &str) -> bool {
     relative
         .split('/')
@@ -895,6 +961,9 @@ pub fn mention_query_at(text: &str, cursor_chars: usize) -> Option<(usize, Strin
         if !prev.is_whitespace() {
             return None;
         }
+    }
+    if leading_finch_addressee_end(text).is_some_and(|end| at < end) {
+        return None;
     }
     let after = &before[at + 1..];
     if let Some(rest) = after.strip_prefix('"') {
@@ -1131,6 +1200,21 @@ mod tests {
         assert_eq!(mention_query_at("user@example.com", 16), None);
         assert_eq!(mention_query_at("\\@foo", 5), None);
         assert_eq!(mention_query_at("see\\@foo", 8), None);
+        assert_eq!(
+            mention_query_at("@finch", 6),
+            None,
+            "leading @finch addressee must not become a file-mention query"
+        );
+        assert_eq!(
+            mention_query_at("@finch please", 6),
+            None,
+            "cursor on a leading @finch addressee must not open a file mention"
+        );
+        assert_eq!(
+            mention_query_at("@./finch", 8),
+            Some((0, "./finch".into())),
+            "@./finch remains a file mention"
+        );
     }
 
     #[test]
@@ -1398,5 +1482,139 @@ mod tests {
         let paths: Vec<_> = rows.iter().map(|r| r.relative_path.as_str()).collect();
         assert!(paths.contains(&"src/util.rs"), "{paths:?}");
         assert!(paths.contains(&"src/utils.rs"), "{paths:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_in_root_symlink_to_secret_or_ignored_target_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), ".env", "SECRET=1\n");
+        write_file(
+            tmp.path(),
+            "id_ed25519",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        );
+        write_file(tmp.path(), ".gitignore", "ignored.txt\n");
+        write_file(tmp.path(), "ignored.txt", "ignored-payload\n");
+        std::os::unix::fs::symlink(tmp.path().join(".env"), tmp.path().join("readme.txt")).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("ignored.txt"),
+            tmp.path().join("visible.txt"),
+        )
+        .unwrap();
+        let catalog = MentionCatalog::new(tmp.path());
+        match catalog.resolve_path("readme.txt") {
+            Err(MentionError::Secret { path, rule }) => {
+                assert_eq!(path, "readme.txt", "diagnostic must name the mention path");
+                assert!(
+                    rule.contains("dotenv"),
+                    "secret rule must name the canonical target heuristic, got {rule}"
+                );
+            }
+            other => panic!("symlink to .env must be Secret, got {other:?}"),
+        }
+        match catalog.resolve_path("visible.txt") {
+            Err(MentionError::Ignored { path }) => {
+                assert_eq!(path, "visible.txt", "diagnostic must name the mention path");
+            }
+            other => panic!("symlink to a gitignored file must be Ignored, got {other:?}"),
+        }
+        let err = snapshots_for_prompt(&catalog, "read @readme.txt", &[]).unwrap_err();
+        assert!(
+            err.iter().all(|e| matches!(e, MentionError::Secret { .. })),
+            "failed secret symlink must not produce a partial attachment: {err:?}"
+        );
+        let err = snapshots_for_prompt(&catalog, "read @visible.txt", &[]).unwrap_err();
+        assert!(
+            err.iter()
+                .all(|e| matches!(e, MentionError::Ignored { .. })),
+            "failed ignored symlink must not produce a partial attachment: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_hidden_directory_attaches_children_and_names_nested_secrets() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), ".github/workflows/ci.yml", "name: ci\n");
+        write_file(tmp.path(), ".github/.env", "SECRET=1\n");
+        write_file(tmp.path(), ".github/.cache/tmp.txt", "stale\n");
+        let catalog = MentionCatalog::new(tmp.path());
+        let rows = catalog.candidates(".github");
+        assert!(
+            rows.iter()
+                .any(|row| row.relative_path == ".github" && row.kind == MentionKind::Directory),
+            "typing @.github must list the hidden directory, got {rows:?}"
+        );
+        let snap = catalog.resolve_path(".github").unwrap();
+        assert!(
+            snap.content.contains("name: ci"),
+            "explicit .github mention must attach workflow files, got {}",
+            snap.content
+        );
+        assert!(
+            snap.content.contains(".github/workflows/ci.yml"),
+            "attachment must name the included child: {}",
+            snap.content
+        );
+        assert!(
+            !snap.content.contains("stale"),
+            "nested hidden .cache must stay omitted: {}",
+            snap.content
+        );
+        assert!(
+            snap.content.contains(".env") && snap.content.to_lowercase().contains("secret"),
+            "nested .github/.env must be a named skip, got {}",
+            snap.content
+        );
+    }
+
+    #[test]
+    fn test_prepare_prompt_for_query_attaches_exact_file_bytes() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/foo.rs", "fn answer() { 42 }\n");
+        let (prepared, snapshots) =
+            prepare_prompt_for_query(tmp.path(), "explain @src/foo.rs").unwrap();
+        assert!(
+            prepared.contains("explain @src/foo.rs"),
+            "visible query must stay intact: {prepared}"
+        );
+        assert_eq!(snapshots.len(), 1, "one mention must produce one snapshot");
+        assert_eq!(snapshots[0].content, "fn answer() { 42 }\n");
+        assert!(
+            prepared.contains("fn answer() { 42 }"),
+            "finch query must attach exact file bytes: {prepared}"
+        );
+    }
+
+    #[test]
+    fn test_directory_budget_selects_a_stable_sorted_subset() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..(MAX_DIR_FILES + 4) {
+            write_file(tmp.path(), &format!("tree/f{i:02}.txt"), "hello-dir\n");
+        }
+        let catalog = MentionCatalog::new(tmp.path());
+        let first = catalog.resolve_path("tree").unwrap();
+        let second = catalog.resolve_path("tree").unwrap();
+        assert_eq!(
+            first.sha256, second.sha256,
+            "directory mention identity must be stable across resolve_path calls"
+        );
+        assert!(
+            first.truncated,
+            "budget exhaustion must still name truncation, note={:?}",
+            first.truncation_note
+        );
+        let included: Vec<_> = first
+            .content
+            .lines()
+            .filter_map(|line| line.strip_prefix("--- file: "))
+            .map(|line| line.split(' ').next().unwrap_or(line))
+            .collect();
+        let mut sorted = included.clone();
+        sorted.sort();
+        assert_eq!(
+            included, sorted,
+            "budgeted directory subset must be relative-path order: {included:?}"
+        );
     }
 }

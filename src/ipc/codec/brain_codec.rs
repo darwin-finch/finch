@@ -3,7 +3,7 @@ use crate::brain::{
     BrainEvent, BrainEventKind, BrainId, BrainProgram, BrainRun, BrainRunKind, BrainRunStatus,
     BrainRunnerHandoff, BrainRunnerLease, BrainSchedule, BrainScheduleDeliveryPolicy,
     BrainScheduleDue, BrainScheduleModuleIdentity, BrainSnapshot, BrainWireMessage, ConnectionId,
-    ProgramLanguage, RunId, RunnerHandoffId, RunnerLeaseId, ScheduleId,
+    ProgramLanguage, PromptAttachment, RunId, RunnerHandoffId, RunnerLeaseId, ScheduleId,
 };
 use crate::brain::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
@@ -557,12 +557,73 @@ pub(crate) fn decode_approval_audience(
     })
 }
 
+fn encode_prompt(
+    mut builder: finch_ipc_capnp::brain_prompt::Builder<'_>,
+    text: &str,
+    attached_mentions: &[PromptAttachment],
+) {
+    builder.set_text(text);
+    let mut encoded = builder.init_attached_mentions(attached_mentions.len() as u32);
+    for (index, attachment) in attached_mentions.iter().enumerate() {
+        encode_prompt_attachment(encoded.reborrow().get(index as u32), attachment);
+    }
+}
+
+fn encode_prompt_attachment(
+    mut builder: finch_ipc_capnp::brain_prompt_attachment::Builder<'_>,
+    attachment: &PromptAttachment,
+) {
+    builder.set_path(&attachment.path);
+    builder.set_kind(&attachment.kind);
+    builder.set_sha256(&attachment.sha256);
+    builder.set_byte_len(attachment.byte_len);
+    builder.set_truncated(attachment.truncated);
+    if let Some(note) = &attachment.truncation_note {
+        builder.set_has_truncation_note(true);
+        builder.set_truncation_note(note);
+    }
+    builder.set_content(&attachment.content);
+}
+
+fn decode_prompt(
+    reader: finch_ipc_capnp::brain_prompt::Reader<'_>,
+) -> anyhow::Result<(String, Vec<PromptAttachment>)> {
+    let attached_mentions = reader
+        .get_attached_mentions()?
+        .iter()
+        .map(decode_prompt_attachment)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((text(reader.get_text()?)?, attached_mentions))
+}
+
+fn decode_prompt_attachment(
+    reader: finch_ipc_capnp::brain_prompt_attachment::Reader<'_>,
+) -> anyhow::Result<PromptAttachment> {
+    Ok(PromptAttachment {
+        path: text(reader.get_path()?)?,
+        kind: text(reader.get_kind()?)?,
+        sha256: text(reader.get_sha256()?)?,
+        byte_len: reader.get_byte_len(),
+        truncated: reader.get_truncated(),
+        truncation_note: reader
+            .get_has_truncation_note()
+            .then(|| reader.get_truncation_note())
+            .transpose()?
+            .map(text)
+            .transpose()?,
+        content: text(reader.get_content()?)?,
+    })
+}
+
 pub(crate) fn encode_brain_submission(
     mut builder: finch_ipc_capnp::brain_submission::Builder<'_>,
     kind: &BrainEventKind,
 ) -> anyhow::Result<()> {
     match kind {
-        BrainEventKind::Prompt { text, .. } => builder.set_prompt(text),
+        BrainEventKind::Prompt {
+            text,
+            attached_mentions,
+        } => encode_prompt(builder.init_prompt(), text, attached_mentions),
         BrainEventKind::SpeculativePrompt { text } => builder.set_speculative_prompt(text),
         BrainEventKind::ParticipantMessage { text } => builder.set_participant_message(text),
         BrainEventKind::TaskListReplaced { tasks } => {
@@ -597,10 +658,13 @@ pub(crate) fn decode_brain_submission(
     use finch_ipc_capnp::brain_submission::Which;
 
     Ok(match reader.which()? {
-        Which::Prompt(value) => BrainEventKind::Prompt {
-            text: text(value?)?,
-            attached_mentions: Vec::new(),
-        },
+        Which::Prompt(value) => {
+            let (text, attached_mentions) = decode_prompt(value?)?;
+            BrainEventKind::Prompt {
+                text,
+                attached_mentions,
+            }
+        }
         Which::SpeculativePrompt(value) => BrainEventKind::SpeculativePrompt {
             text: text(value?)?,
         },
@@ -1526,7 +1590,10 @@ pub(crate) fn encode_event(
                 changed.set_detail(detail);
             }
         }
-        BrainEventKind::Prompt { text, .. } => builder.set_prompt(text),
+        BrainEventKind::Prompt {
+            text,
+            attached_mentions,
+        } => encode_prompt(builder.init_prompt(), text, attached_mentions),
         BrainEventKind::SpeculativePrompt { text } => builder.set_speculative_prompt(text),
         BrainEventKind::ParticipantMessage { text } => builder.set_participant_message(text),
         BrainEventKind::TaskListReplaced { tasks } => {
@@ -1768,10 +1835,13 @@ pub(crate) fn decode_event(
                     .transpose()?,
             }
         }
-        Which::Prompt(value) => BrainEventKind::Prompt {
-            text: text(value?)?,
-            attached_mentions: Vec::new(),
-        },
+        Which::Prompt(value) => {
+            let (text, attached_mentions) = decode_prompt(value?)?;
+            BrainEventKind::Prompt {
+                text,
+                attached_mentions,
+            }
+        }
         Which::SpeculativePrompt(value) => BrainEventKind::SpeculativePrompt {
             text: text(value?)?,
         },
@@ -2065,6 +2135,18 @@ mod tests {
                 text: "inspect the workspace".into(),
                 attached_mentions: Vec::new(),
             },
+            BrainEventKind::Prompt {
+                text: "explain @src/foo.rs".into(),
+                attached_mentions: vec![crate::brain::PromptAttachment {
+                    path: "src/foo.rs".into(),
+                    kind: "file".into(),
+                    sha256: "digest-original".into(),
+                    byte_len: 8,
+                    truncated: false,
+                    truncation_note: None,
+                    content: "original".into(),
+                }],
+            },
             BrainEventKind::SpeculativePrompt {
                 text: "inspect likely context".into(),
             },
@@ -2125,6 +2207,104 @@ mod tests {
     }
 
     #[test]
+    fn named_brain_codec_submit_journal_keeps_mention_digest_without_rereading_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = "fn selected() { 1 }\n";
+        std::fs::write(temp.path().join("foo.rs"), original).unwrap();
+        let catalog = crate::context::mention::MentionCatalog::new(temp.path());
+        let snapshot = catalog.resolve_path("foo.rs").unwrap();
+        assert_eq!(snapshot.content, original);
+        let kind = BrainEventKind::Prompt {
+            text: "explain @foo.rs".into(),
+            attached_mentions: vec![crate::brain::PromptAttachment {
+                path: snapshot.relative_path.clone(),
+                kind: snapshot.kind.as_str().to_string(),
+                sha256: snapshot.sha256.clone(),
+                byte_len: snapshot.byte_len,
+                truncated: snapshot.truncated,
+                truncation_note: snapshot.truncation_note.clone(),
+                content: snapshot.content.clone(),
+            }],
+        };
+
+        let mut message = capnp::message::Builder::new_default();
+        encode_brain_submission(
+            message.init_root::<finch_ipc_capnp::brain_submission::Builder<'_>>(),
+            &kind,
+        )
+        .unwrap();
+        let encoded = capnp::serialize::write_message_to_words(&message);
+        let mut cursor = std::io::Cursor::new(encoded);
+        let decoded =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .unwrap();
+        let submitted = decode_brain_submission(
+            decoded
+                .get_root::<finch_ipc_capnp::brain_submission::Reader<'_>>()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let store = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
+        store.push("shared", "alice", submitted).unwrap();
+        std::fs::write(temp.path().join("foo.rs"), "DISK CHANGED").unwrap();
+
+        let restarted = crate::brain::BrainStore::with_root("box.local", Some(temp.path().into()));
+        let journaled = restarted
+            .snapshot("shared")
+            .unwrap()
+            .events
+            .into_iter()
+            .find_map(|event| match event.kind {
+                BrainEventKind::Prompt {
+                    text,
+                    attached_mentions,
+                } => Some((text, attached_mentions)),
+                _ => None,
+            })
+            .expect("codec submit must journal a Prompt");
+        assert_eq!(
+            journaled.0, "explain @foo.rs",
+            "visible prompt must survive codec submit: {:?}",
+            journaled.0
+        );
+        assert_eq!(
+            journaled.1.len(),
+            1,
+            "named-Brain submit must persist mention snapshots, got {:?}",
+            journaled.1
+        );
+        assert_eq!(
+            journaled.1[0].sha256, snapshot.sha256,
+            "journal must keep the selection digest, got {:?}",
+            journaled.1[0]
+        );
+        assert_eq!(
+            journaled.1[0].content, original,
+            "journal must keep the selection payload, got {:?}",
+            journaled.1[0]
+        );
+        let bodies = vec![crate::context::mention::AttachmentBody {
+            relative_path: &journaled.1[0].path,
+            kind: crate::context::mention::MentionKind::File,
+            sha256: &journaled.1[0].sha256,
+            byte_len: journaled.1[0].byte_len,
+            truncated: journaled.1[0].truncated,
+            truncation_note: journaled.1[0].truncation_note.as_deref(),
+            content: &journaled.1[0].content,
+        }];
+        let replayed = crate::context::mention::format_attachment_document(&bodies);
+        assert!(
+            replayed.contains(original) && replayed.contains(&snapshot.sha256),
+            "restarted BrainStore replay must use stored payload: {replayed}"
+        );
+        assert!(
+            !replayed.contains("DISK CHANGED"),
+            "replay must not substitute later disk bytes: {replayed}"
+        );
+    }
+
+    #[test]
     fn every_current_brain_event_round_trips_through_capnp() {
         let brain_id = BrainId(uuid::Uuid::new_v4());
         let attachment_id = AttachmentId(uuid::Uuid::new_v4());
@@ -2182,7 +2362,15 @@ mod tests {
             },
             BrainEventKind::Prompt {
                 text: "inspect it".into(),
-                attached_mentions: Vec::new(),
+                attached_mentions: vec![crate::brain::PromptAttachment {
+                    path: "src/foo.rs".into(),
+                    kind: "file".into(),
+                    sha256: "digest-original".into(),
+                    byte_len: 8,
+                    truncated: false,
+                    truncation_note: None,
+                    content: "original".into(),
+                }],
             },
             BrainEventKind::ParticipantMessage {
                 text: "hello, collaborators".into(),

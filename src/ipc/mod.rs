@@ -38,7 +38,9 @@ pub use transport::DAEMON_SOCK_PATH;
 /// so new frontends fail before acquiring Brain identities or callbacks.
 /// Generation 9 requires packed `RuntimeApplicationMessage` envelopes on
 /// runner-result delivery and exposes `pendingDelivery` / cursor ack.
-pub const IPC_PROTOCOL_VERSION: u32 = 9;
+/// Generation 10 carries named-Brain Prompt mention snapshots (path, digest,
+/// content) on Cap'n Proto submit and event Prompt.
+pub const IPC_PROTOCOL_VERSION: u32 = 10;
 
 /// Short package identity advertised on `/health` and IPC ping.
 pub fn package_identity() -> &'static str {

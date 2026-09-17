@@ -788,6 +788,24 @@ mod script_tests {
     }
 
     #[test]
+    fn mention_tokens_in_query_are_not_executed_as_forth() {
+        for prose in ["explain @src/foo.rs", "@src/foo.rs"] {
+            assert!(
+                !is_clearly_forth(prose),
+                "composer mentions must route to query assembly, not Co-Forth: {prose:?}"
+            );
+        }
+        assert!(
+            is_clearly_forth("dup @"),
+            "standalone Forth fetch @ must still run as a typed program"
+        );
+        assert!(
+            is_clearly_forth("5 @"),
+            "standalone Forth fetch @ after a number must still run as a typed program"
+        );
+    }
+
+    #[test]
     fn test_a_forth_string_may_still_contain_an_apostrophe() {
         // A string opener is matched before any disqualifier, so quoting prose still works.
         assert!(is_clearly_forth("s\"it's fine\" say"));
@@ -2186,6 +2204,11 @@ fn is_clearly_forth(s: &str) -> bool {
         return false;
     }
     if t.starts_with(|c: char| c.is_uppercase()) {
+        return false;
+    }
+    // Token-boundary `@path` mentions are query attachments, not Forth fetch.
+    // A trailing bare `@` (`dup @`, `5 @`) is not a mention and stays Forth.
+    if !finch::context::mention::parse_visible_mentions(t).is_empty() {
         return false;
     }
     // Forth operator characters that have no place in natural language

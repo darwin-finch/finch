@@ -1332,6 +1332,24 @@ struct BrainTaskList {
   tasks @0 :List(BrainTask);
 }
 
+# Prompt text plus the file/directory snapshots selected with it. Replay uses
+# these bytes and digests; it must not reread the project files.
+struct BrainPromptAttachment {
+  path @0 :Text;
+  kind @1 :Text;
+  sha256 @2 :Text;
+  byteLen @3 :UInt64;
+  truncated @4 :Bool;
+  hasTruncationNote @5 :Bool;
+  truncationNote @6 :Text;
+  content @7 :Text;
+}
+
+struct BrainPrompt {
+  text @0 :Text;
+  attachedMentions @1 :List(BrainPromptAttachment);
+}
+
 struct BrainEvent {
   schemaVersion        @0 :UInt32;
   brainId              @1 :Text;
@@ -1346,7 +1364,7 @@ struct BrainEvent {
     runnerLeaseReleased @7  :Text;
     clientAttached      @8  :BrainClientAttached;
     clientDetached      @9  :BrainClientDetached;
-    prompt              @10 :Text;
+    prompt              @10 :BrainPrompt;
     toolCall            @11 :BrainToolCall;
     toolResult          @12 :BrainToolResult;
     approvalRequested   @13 :BrainApprovalRequested;
@@ -1512,7 +1530,7 @@ struct BrainRemoteEnvelope {
 # lifecycle event.
 struct BrainSubmission {
   union {
-    prompt          @0 :Text;
+    prompt          @0 :BrainPrompt;
     program         @1 :BrainProgramSubmitted;
     programPopped   @2 :UInt64;
     approvalDecided @3 :BrainApprovalDecided;

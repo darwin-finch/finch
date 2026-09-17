@@ -7187,6 +7187,42 @@ mod tests {
     }
 
     #[test]
+    fn leading_at_finch_addressee_does_not_open_the_mention_picker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/finch.rs"), "fn finch() {}\n").unwrap();
+        std::fs::write(tmp.path().join("src/foo.rs"), "fn selected() {}\n").unwrap();
+        let mut renderer = headless_renderer();
+        renderer.set_mention_root(tmp.path());
+
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("@finch");
+        paint_mention_completions(&mut renderer);
+        assert!(
+            !renderer.autocomplete_state.visible,
+            "leading @finch addressee must not open the file picker"
+        );
+        let submitted = dispatch_composer(&mut renderer, KeyCode::Enter)
+            .expect("Enter on a leading @finch addressee must submit");
+        assert_eq!(submitted, "@finch");
+
+        renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("@./finch");
+        paint_mention_completions(&mut renderer);
+        assert!(
+            renderer.autocomplete_state.is_interactive(),
+            "@./finch must still list a matching project file"
+        );
+        let selected = renderer
+            .autocomplete_state
+            .get_selected_mention()
+            .expect("a file named finch must be highlighted");
+        assert!(
+            selected.relative_path.contains("finch"),
+            "file mention for @./finch must list a finch path, got {:?}",
+            selected.relative_path
+        );
+    }
+
+    #[test]
     fn mention_enter_inserts_without_submitting_and_esc_keeps_composer() {
         let (_tmp, mut renderer) = mention_project();
         renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("@foo");
