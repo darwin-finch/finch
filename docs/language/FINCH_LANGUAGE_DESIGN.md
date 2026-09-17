@@ -2536,14 +2536,18 @@ or jump-to-handler code, as in a high-speed D parser, not a runtime loop over a 
 `if` condition is a compile-time constant, that `if` **is** compile-time: the dead arm is dropped
 and is not residual IR. There is no `static-if` keyword.
 
-**When AST is required** (evaluation order, new bindings, forms a function would evaluate too
-early): a pure, bounded CTFE function `syntax -> syntax` (or a richer typed syntax record). Fuel,
+**When AST is required** (evaluation order, new bindings, wrapping a **form** without a thunk):
+a pure, bounded CTFE function `syntax -> syntax` (or a richer typed syntax record). Fuel,
 recursion, and allocation limits apply. Host effects in the transformer are forbidden; quasiquote
 and list surgery only **construct** forms. The expander **returns data**; later phases
 (check, lower, verify) make it executable. This is the hatch D lacked: feed an AST back via
 `mixin` to the **same** compiler, not D `mixin(string)`. It is slightly less general than
-`defmacro`; that is acceptable. Wrapping two ordinary calls is **not** a reason to use syntax
-CTFE — that is a function.
+`defmacro`; that is acceptable.
+
+Do **not** add `when` as syntax sugar for `if`. Runtime `if` already skips the else; CTFE `if`
+already drops a constant-false arm. Wrapping two ordinary calls is a **function**, not syntax
+CTFE. Reach for `syntax -> syntax` for things like `timed` around a call (no extra `lambda`),
+`with-lock` introducing bindings around a body, or a converge `require` that yields.
 
 **Quote and quasiquote.** `'form` produces `syntax` (data, not evaluated). `` ` `` is a template;
 `,` fills **one** hole with a value (if that value is a list, it stays one nested list); `,@`
@@ -2561,32 +2565,37 @@ not valid as the body of a `define` that is supposed to return a function.
 
 **`define` vs `define-syntax`.** `define` / `lambda` bind a **value** (a function is a value).
 `define-syntax` **registers** a `syntax -> syntax` CTFE function in the expander: arguments are
-not evaluated; `(when test body)` compiles as `(mixin (expand-when '(when test body)))`. Without
-`define-syntax`, the transformer is an ordinary function and the caller must quote. `let` in a
-transformer is an expression: bindings, then a body whose **value** is the result (typically a
-quasiquoted list).
+not evaluated; `(timed (require-pkg name))` compiles as
+`(mixin (expand-timed '(timed (require-pkg name))))`. Without `define-syntax`, the transformer
+is an ordinary function and the caller must quote. `let` in a transformer is an expression:
+bindings, then a body whose **value** is the result (typically a quasiquoted list).
 
 ```
 (define (require-pkg (name : string)) : void
   (pkg.ensure name)
   (svc.enable name))
 
-(define (expand-when (form : syntax)) : syntax
-  (let ((test (second form))
-        (body (third form)))
-    `(if ,test ,body #f)))
+(define (expand-timed (form : syntax)) : syntax
+  (let ((body (second form)))
+    `(let ((t (now)))
+       (let ((r ,body))
+         (log-elapsed t)
+         r))))
 
-(define-syntax when expand-when)
+(define-syntax timed expand-timed)
 
-(define (maybe-install (ready? : bool)) : void
-  (when ready?
-    (require-pkg "nginx")))
+(define (require-package (name : string)) : void
+  (timed (require-pkg name)))
 ```
 
 `,` before `(second form)` means “compute `second` **now** (in the expander) and insert that
-syntax.” `(second ,form)` would **generate** a future call to `second`. `#f` is boolean false
-(the `if` else). `expand-when` does not run `pkg.ensure`. After expansion, `maybe-install` is
-ordinary bytecode with an `if`.
+syntax into the template.” `(second ,form)` would **generate** a future call to `second`.
+`expand-timed` does not run `require-pkg`; it wraps the **form**. After mixin, `require-package`
+is ordinary bytecode: clocks around `(require-pkg name)`, and `name` is still the parameter.
+A function `timed` would need `(timed (lambda () (require-pkg name)))`.
+
+`(if ready? (require-pkg "nginx") #f)` is enough for skip-the-body; do not add `when`. If
+`ready?` is a compile-time constant, that `if` is already CTFE.
 
 Without `define-syntax`, one-shot mix-back is explicit quote plus `mixin` of a **`define` or
 other module form**, not `eval` of a tree when the function is later called.
