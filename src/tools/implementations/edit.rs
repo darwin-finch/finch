@@ -7,11 +7,11 @@
 //      199 -   // Old comment
 //      199 +   // New comment
 //
-// Interactive review (#437): the artifact opened in `$EDITOR` is the unified
-// diff of the proposed change, not a program that would perform it. Approval
-// is a security boundary, so the reviewed bytes are the human-readable change
-// itself; the edit is then applied here, in Rust, from the tool's own
-// parameters. Nothing on this path is handed to a shell.
+// Interactive review (#437 / #517): the artifact opened in `$EDITOR` is the
+// unified diff of the proposed change, not a program that would perform it.
+// Approval is a security boundary: the saved diff body is parsed into a
+// bounded typed patch, bound to the reviewed target, and applied here in
+// Rust. Nothing on this path is handed to a shell.
 
 use crate::programs::ExecutionEffect;
 use crate::tools::registry::Tool;
@@ -22,15 +22,14 @@ use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
 
-use super::propose::open_review_artifact;
+use super::propose::{open_review_artifact, reconstruct_reviewed_text};
 use crate::cli::diff::FileDiff;
 
 /// Separates the machine-read decision header from the human-read diff.
 ///
 /// Matched as a whole line, so no diff content can be mistaken for it: every
 /// line of a unified diff body is prefixed with `-`, `+`, ` `, `@`, or `\`.
-const REVIEW_DIFF_MARKER: &str =
-    "# ---- proposed diff below (review only; edits to it are not applied) ----";
+const REVIEW_DIFF_MARKER: &str = "# ---- proposed diff below; saving applies this patch ----";
 
 /// Run `~/.finch/hooks/post-save <file_path>` if that script exists.
 ///
@@ -51,16 +50,13 @@ fn run_post_save_hook(file_path: &str) {
 /// What the user's saved review artifact says to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReviewOutcome {
-    /// Apply the edit exactly as it was presented.
-    Apply,
+    /// Apply the patch represented by the saved unified-diff body.
+    Apply { saved_diff: String },
     /// Do not apply; the user rejected it, cleared the artifact, or left an
     /// action Finch does not recognise.
     Cancel { reason: String },
     /// Do not apply; the user wants a different change and wrote why.
     Chat { context: String },
-    /// Do not apply; the diff body was edited and no longer describes the
-    /// change this tool call would perform.
-    Modified,
 }
 
 /// What a single header line says about the user's decision.
@@ -115,6 +111,7 @@ fn header_comment(line: &str) -> String {
 fn build_review_artifact(description: &str, diff: &str) -> String {
     let mut out = String::new();
     out.push_str("# Finch proposal. Read the diff below, then save and quit to apply it.\n");
+    out.push_str("# Edits to added, removed, or context lines change what is written.\n");
     out.push_str("# To reject it or ask for something different, change the value on the\n");
     out.push_str("# next line to cancel or chat, then save and quit.\n");
     out.push_str("# finch: action=execute\n");
@@ -182,22 +179,12 @@ fn parse_review_artifact(returned: &str, expected: &str) -> ReviewOutcome {
                 .to_string(),
         };
     };
-    let (_expected_header, expected_body) = split_review_artifact(expected);
-    let expected_diff = expected_body.unwrap_or_default();
-    let expected_diff = expected_diff.as_str();
-
     match header_decision(&header) {
         HeaderDecision::Cancel(reason) => ReviewOutcome::Cancel { reason },
         HeaderDecision::Chat => ReviewOutcome::Chat {
             context: user_prose(returned, expected),
         },
-        HeaderDecision::Execute => {
-            if normalize_body(&body) == normalize_body(expected_diff) {
-                ReviewOutcome::Apply
-            } else {
-                ReviewOutcome::Modified
-            }
-        }
+        HeaderDecision::Execute => ReviewOutcome::Apply { saved_diff: body },
     }
 }
 
@@ -582,17 +569,35 @@ where
             "Edit not applied. The user asked for a different change instead of approving:\n{}",
             context
         )),
-        ReviewOutcome::Modified => Ok(format!(
-            "Edit not applied: the proposed diff for {} was edited during review.\n\
-             That diff is a read-only view of this tool call — the change is applied from \
-             old_string/new_string, so edits to the diff would not have been what was written. \
-             Re-issue the edit with the content you want, or set `# finch: action=chat` to \
-             describe it.",
-            file_path
-        )),
-        ReviewOutcome::Apply => {
-            commit_reviewed_edit(file_path, &mut target, &original, &planned)?;
-            Ok(diff)
+        ReviewOutcome::Apply { saved_diff } => {
+            if file_diff.binary {
+                if normalize_body(&saved_diff) != normalize_body(&diff) {
+                    return Ok(format!(
+                        "Edit not applied: the binary review for {file_path} cannot be reconstructed \
+                         from an edited artifact. Re-issue the edit or set `# finch: action=chat`."
+                    ));
+                }
+                commit_reviewed_edit(file_path, &mut target, &original, &planned)?;
+                return Ok(diff);
+            }
+            let reconstructed = match reconstruct_reviewed_text(
+                "edit",
+                &file_diff.old_path,
+                &file_diff.new_path,
+                &original,
+                &saved_diff,
+            ) {
+                Ok(text) => text,
+                Err(error) => return Ok(error.to_string()),
+            };
+            commit_reviewed_edit(file_path, &mut target, &original, &reconstructed)?;
+            if reconstructed == original {
+                Ok(format!(
+                    "Edit not applied: the reviewed patch leaves {file_path} unchanged."
+                ))
+            } else {
+                Ok(FileDiff::from_texts(file_path, &original, &reconstructed).to_unified())
+            }
         }
     }
 }
@@ -981,12 +986,12 @@ mod tests {
             "Edit /tmp/x\nfinch: action=cancel\n# finch: action=chat",
             "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
         );
-        assert_eq!(
-            parse_review_artifact(&artifact, &artifact),
-            ReviewOutcome::Apply,
-            "a description line must not be readable as the reserved action directive.\n\
-             Artifact:\n{artifact}"
-        );
+        let ReviewOutcome::Apply { .. } = parse_review_artifact(&artifact, &artifact) else {
+            panic!(
+                "a description line must not be readable as the reserved action directive.\n\
+                 Artifact:\n{artifact}"
+            );
+        };
     }
 
     #[tokio::test]
@@ -1524,6 +1529,150 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "before\n",
             "action=chat must not write"
+        );
+    }
+
+    /// Fail-before for #517: editing the saved unified diff with action=execute
+    /// must apply the reconstructed saved patch, not old_string/new_string.
+    #[tokio::test]
+    async fn test_review_and_apply_edit_uses_saved_diff_not_planned() {
+        let (_dir, path) = temp_file("edit.txt", "before\n");
+        let result = review_and_apply_edit(
+            &path,
+            "before",
+            "planned-bytes",
+            false,
+            replying_editor(|artifact| Some(artifact.replace("+planned-bytes", "+reviewed-edit"))),
+        )
+        .await
+        .expect("interactive edit");
+
+        let final_bytes = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            final_bytes, "reviewed-edit\n",
+            "saving an edited review diff with action=execute must apply the saved patch, not \
+             old_string/new_string; independently reconstructed result is reviewed-edit\\n; \
+             tool said: {result}"
+        );
+        assert!(
+            !final_bytes.contains("planned-bytes"),
+            "planned-only bytes must not appear after a reviewed edit; tool said: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_and_apply_edit_cancel_leaves_file_unchanged() {
+        let (_dir, path) = temp_file("keep.txt", "before\n");
+        let result = review_and_apply_edit(
+            &path,
+            "before",
+            "after",
+            false,
+            replying_editor(|artifact| {
+                Some(artifact.replace("# finch: action=execute", "# finch: action=cancel"))
+            }),
+        )
+        .await
+        .expect("cancelled edit");
+
+        assert!(
+            result.contains("aborted by user"),
+            "cancel must explain itself; tool said: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "before\n",
+            "cancel must leave the target byte-for-byte unchanged; tool said: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_and_apply_edit_malformed_hunk_does_not_write() {
+        let (_dir, path) = temp_file("keep.txt", "before\n");
+        let result = review_and_apply_edit(
+            &path,
+            "before",
+            "after",
+            false,
+            replying_editor(|artifact| Some(format!("{artifact}\n+not-a-complete-hunk\n"))),
+        )
+        .await
+        .expect("malformed edit review");
+
+        assert!(
+            result.contains("left unchanged")
+                && (result.contains("malformed") || result.contains("hunk")),
+            "a malformed saved hunk must explain the refusal; tool said: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "before\n",
+            "a malformed saved hunk must leave the target unchanged; tool said: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_and_apply_edit_extra_file_is_rejected() {
+        let (_dir, path) = temp_file("keep.txt", "before\n");
+        let result = review_and_apply_edit(
+            &path,
+            "before",
+            "after",
+            false,
+            replying_editor(|artifact| {
+                Some(format!(
+                    "{artifact}--- /dev/null\n+++ b/other.txt\n@@ -0,0 +1,1 @@\n+pwned\n"
+                ))
+            }),
+        )
+        .await
+        .expect("extra-file edit review");
+
+        assert!(
+            result.contains("left unchanged") && result.contains("additional file"),
+            "an extra file in the saved diff must be rejected; tool said: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "before\n",
+            "rejecting an extra file must leave the target unchanged; tool said: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_and_apply_edit_path_change_is_rejected() {
+        let (_dir, path) = temp_file("keep.txt", "before\n");
+        let result = review_and_apply_edit(
+            &path,
+            "before",
+            "after",
+            false,
+            replying_editor(|artifact| {
+                let edited = artifact
+                    .lines()
+                    .map(|line| {
+                        if line.starts_with("+++ ") {
+                            "+++ b/etc/passwd".to_string()
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(format!("{edited}\n"))
+            }),
+        )
+        .await
+        .expect("path-change edit review");
+
+        assert!(
+            result.contains("left unchanged") && result.contains("target path"),
+            "a changed +++ header must be rejected; tool said: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "before\n",
+            "rejecting a path/header change must leave the target unchanged; tool said: {result}"
         );
     }
 

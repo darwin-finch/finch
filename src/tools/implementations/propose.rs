@@ -10,7 +10,9 @@
 // The user can read the comment to understand intent and edit the code before
 // approving.  Clearing the file aborts execution.
 
-use crate::cli::diff::{FileDiff, MAX_DIFF_LINE_CHARS};
+use crate::cli::diff::{
+    FileDiff, MAX_DIFF_HUNKS, MAX_DIFF_INPUT_BYTES, MAX_DIFF_LINES, MAX_DIFF_LINE_CHARS,
+};
 use anyhow::Result;
 use crossterm::{cursor, event, execute, style::ResetColor, terminal};
 use std::io::{IsTerminal, Read as _, Write as _};
@@ -264,6 +266,597 @@ fn hunk_counts(line: &str) -> Option<(usize, usize)> {
         }
     };
     Some((count(old)?, count(new)?))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReviewedLineKind {
+    Context,
+    Add,
+    Remove,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewedLine {
+    kind: ReviewedLineKind,
+    text: String,
+    no_newline: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewedHunk {
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+    lines: Vec<ReviewedLine>,
+}
+
+struct ReviewedPatch {
+    old_path: String,
+    new_path: String,
+    hunks: Vec<ReviewedHunk>,
+}
+
+fn reviewed_refusal(operation: &str, path: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!("Refusing to {operation} {path}: {reason}. The file was left unchanged.")
+}
+
+/// Reconstruct target bytes from a saved unified-diff body.
+///
+/// The patch is a bounded typed document: it is never executed as a shell
+/// script, and its path headers are authenticated against the originally
+/// reviewed target rather than trusted as a destination. The two apply
+/// methods must agree before any caller may write.
+pub(crate) fn reconstruct_reviewed_text(
+    operation: &str,
+    expected_old_path: &str,
+    expected_new_path: &str,
+    original: &str,
+    saved_diff: &str,
+) -> Result<String> {
+    if saved_diff.len() > MAX_DIFF_INPUT_BYTES {
+        return Err(reviewed_refusal(
+            operation,
+            expected_new_path,
+            "the saved review diff exceeds the bounded review size",
+        ));
+    }
+    let patch = parse_reviewed_patch(operation, expected_new_path, saved_diff)?;
+    if patch.old_path != expected_old_path || patch.new_path != expected_new_path {
+        return Err(reviewed_refusal(
+            operation,
+            expected_new_path,
+            &format!(
+                "the saved review diff changed the target path ({} -> {} became {} -> {})",
+                expected_old_path, expected_new_path, patch.old_path, patch.new_path
+            ),
+        ));
+    }
+    let stitched = stitch_reviewed_patch(operation, expected_new_path, original, &patch)?;
+    let spliced = splice_reviewed_patch(operation, expected_new_path, original, &patch)?;
+    if stitched != spliced {
+        return Err(reviewed_refusal(
+            operation,
+            expected_new_path,
+            "the saved review diff could not be reconstructed consistently",
+        ));
+    }
+    ensure_reconstructed_text_is_writable(operation, expected_new_path, &stitched)?;
+    Ok(stitched)
+}
+
+fn parse_reviewed_patch(operation: &str, path: &str, saved_diff: &str) -> Result<ReviewedPatch> {
+    let mut lines = saved_diff.lines().peekable();
+    while matches!(lines.peek(), Some(&"")) {
+        lines.next();
+    }
+    let Some(old_header) = lines.next() else {
+        return Err(reviewed_refusal(
+            operation,
+            path,
+            "the saved review diff is empty",
+        ));
+    };
+    if old_header.starts_with("Binary files ") || old_header.contains("GIT binary patch") {
+        return Err(reviewed_refusal(
+            operation,
+            path,
+            "the saved review diff is an unsupported binary edit",
+        ));
+    }
+    if !old_header.starts_with("--- ") {
+        return Err(reviewed_refusal(
+            operation,
+            path,
+            "the saved review diff is missing a --- file header",
+        ));
+    }
+    let Some(new_header) = lines.next() else {
+        return Err(reviewed_refusal(
+            operation,
+            path,
+            "the saved review diff is missing a +++ file header",
+        ));
+    };
+    if !new_header.starts_with("+++ ") {
+        return Err(reviewed_refusal(
+            operation,
+            path,
+            "the saved review diff is missing a +++ file header",
+        ));
+    }
+    let old_path = parse_reviewed_path(old_header)
+        .map_err(|reason| reviewed_refusal(operation, path, &reason))?;
+    let new_path = parse_reviewed_path(new_header)
+        .map_err(|reason| reviewed_refusal(operation, path, &reason))?;
+
+    let mut hunks = Vec::new();
+    let mut current: Option<ReviewedHunk> = None;
+    let mut body_lines = 0usize;
+
+    let finish_hunk = |hunk: ReviewedHunk| -> Result<ReviewedHunk> {
+        let (old_seen, new_seen) = counted_reviewed_lines(&hunk);
+        if old_seen != hunk.old_count || new_seen != hunk.new_count {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                &format!(
+                    "the saved review diff has a malformed hunk (header claims {} old and {} new lines but the body has {} and {})",
+                    hunk.old_count, hunk.new_count, old_seen, new_seen
+                ),
+            ));
+        }
+        Ok(hunk)
+    };
+
+    for line in lines {
+        if line.starts_with("Binary files ") || line == "GIT binary patch" {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                "the saved review diff is an unsupported binary edit",
+            ));
+        }
+        if line.starts_with("# finch:") || line.contains("[line truncated]") {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                "the saved review diff contains hidden or truncated content",
+            ));
+        }
+        let hunk_open = current.as_ref().is_some_and(|hunk| {
+            let (old_seen, new_seen) = counted_reviewed_lines(hunk);
+            old_seen < hunk.old_count || new_seen < hunk.new_count
+        });
+        if !hunk_open && line.starts_with("--- ") {
+            if let Some(hunk) = current.take() {
+                hunks.push(finish_hunk(hunk)?);
+            }
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                "the saved review diff includes an additional file",
+            ));
+        }
+        if line.starts_with("@@ ") {
+            if let Some(hunk) = current.take() {
+                hunks.push(finish_hunk(hunk)?);
+            }
+            if hunks.len() >= MAX_DIFF_HUNKS {
+                return Err(reviewed_refusal(
+                    operation,
+                    path,
+                    "the saved review diff exceeds the bounded hunk count",
+                ));
+            }
+            let (old_start, old_count, new_start, new_count) = parse_reviewed_hunk_header(line)
+                .map_err(|reason| reviewed_refusal(operation, path, &reason))?;
+            current = Some(ReviewedHunk {
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                lines: Vec::new(),
+            });
+            continue;
+        }
+        let Some(hunk) = current.as_mut() else {
+            if line.is_empty() {
+                continue;
+            }
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                &format!(
+                    "the saved review diff has a malformed hunk line ({})",
+                    crate::cli::diff::sanitize_terminal(line)
+                ),
+            ));
+        };
+        if line == "\\ No newline at end of file" {
+            let Some(previous) = hunk.lines.last_mut() else {
+                return Err(reviewed_refusal(
+                    operation,
+                    path,
+                    "the saved review diff has a no-newline marker without a preceding hunk line",
+                ));
+            };
+            previous.no_newline = true;
+            continue;
+        }
+        let (kind, text) = if let Some(rest) = line.strip_prefix('+') {
+            (ReviewedLineKind::Add, rest.to_string())
+        } else if let Some(rest) = line.strip_prefix('-') {
+            (ReviewedLineKind::Remove, rest.to_string())
+        } else if let Some(rest) = line.strip_prefix(' ') {
+            (ReviewedLineKind::Context, rest.to_string())
+        } else if line.is_empty() {
+            (ReviewedLineKind::Context, String::new())
+        } else {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                &format!(
+                    "the saved review diff has a malformed hunk line ({})",
+                    crate::cli::diff::sanitize_terminal(line)
+                ),
+            ));
+        };
+        if text.chars().count() > MAX_DIFF_LINE_CHARS {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                "the saved review diff has a hunk line that exceeds the display bound",
+            ));
+        }
+        body_lines += 1;
+        if body_lines > MAX_DIFF_LINES {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                "the saved review diff exceeds the bounded line count",
+            ));
+        }
+        hunk.lines.push(ReviewedLine {
+            kind,
+            text,
+            no_newline: false,
+        });
+    }
+    if let Some(hunk) = current.take() {
+        hunks.push(finish_hunk(hunk)?);
+    }
+    Ok(ReviewedPatch {
+        old_path,
+        new_path,
+        hunks,
+    })
+}
+
+fn parse_reviewed_path(header: &str) -> Result<String, String> {
+    let rest = header
+        .strip_prefix("--- ")
+        .or_else(|| header.strip_prefix("+++ "))
+        .ok_or_else(|| "the saved review diff has a malformed file header".to_string())?;
+    let raw = rest.split('\t').next().unwrap_or(rest).trim();
+    if raw.is_empty() {
+        return Err("the saved review diff has an empty file path header".to_string());
+    }
+    let decoded = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        lossless_unquote(&raw[1..raw.len() - 1])?
+    } else {
+        raw.to_string()
+    };
+    if decoded == "/dev/null" {
+        return Ok(decoded);
+    }
+    Ok(decoded
+        .strip_prefix("a/")
+        .or_else(|| decoded.strip_prefix("b/"))
+        .unwrap_or(&decoded)
+        .to_string())
+}
+
+fn lossless_unquote(value: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    Ok(out)
+}
+
+fn parse_reviewed_hunk_header(line: &str) -> Result<(usize, usize, usize, usize), String> {
+    let rest = line
+        .strip_prefix("@@ ")
+        .ok_or_else(|| "the saved review diff has a malformed hunk header".to_string())?;
+    let (ranges, _) = rest
+        .split_once(" @@")
+        .ok_or_else(|| "the saved review diff has a malformed hunk header".to_string())?;
+    let mut parts = ranges.split_whitespace();
+    let old = parts
+        .next()
+        .ok_or_else(|| "the saved review diff has a malformed hunk header".to_string())?;
+    let new = parts
+        .next()
+        .ok_or_else(|| "the saved review diff has a malformed hunk header".to_string())?;
+    let parse_range = |value: &str, sign: char| -> Result<(usize, usize), String> {
+        let rest = value
+            .strip_prefix(sign)
+            .ok_or_else(|| "the saved review diff has a malformed hunk header".to_string())?;
+        match rest.split_once(',') {
+            Some((start, count)) => Ok((
+                start
+                    .parse()
+                    .map_err(|_| "the saved review diff has a malformed hunk header".to_string())?,
+                count
+                    .parse()
+                    .map_err(|_| "the saved review diff has a malformed hunk header".to_string())?,
+            )),
+            None => Ok((
+                rest.parse()
+                    .map_err(|_| "the saved review diff has a malformed hunk header".to_string())?,
+                1,
+            )),
+        }
+    };
+    let (old_start, old_count) = parse_range(old, '-')?;
+    let (new_start, new_count) = parse_range(new, '+')?;
+    Ok((old_start, old_count, new_start, new_count))
+}
+
+fn counted_reviewed_lines(hunk: &ReviewedHunk) -> (usize, usize) {
+    let mut old = 0usize;
+    let mut new = 0usize;
+    for line in &hunk.lines {
+        match line.kind {
+            ReviewedLineKind::Context => {
+                old += 1;
+                new += 1;
+            }
+            ReviewedLineKind::Remove => old += 1,
+            ReviewedLineKind::Add => new += 1,
+        }
+    }
+    (old, new)
+}
+
+fn split_text_lines(text: &str) -> (Vec<&str>, bool) {
+    if text.is_empty() {
+        return (Vec::new(), false);
+    }
+    let trailing = text.ends_with('\n');
+    let body = if trailing {
+        &text[..text.len() - 1]
+    } else {
+        text
+    };
+    (body.split('\n').collect(), trailing)
+}
+
+fn join_text_lines(lines: &[String], trailing: bool) -> String {
+    let mut out = lines.join("\n");
+    if trailing {
+        out.push('\n');
+    }
+    out
+}
+
+impl ReviewedHunk {
+    fn old_range(&self) -> Result<(usize, usize), String> {
+        if self.old_count == 0 {
+            return Ok((self.old_start, self.old_start));
+        }
+        let start = self
+            .old_start
+            .checked_sub(1)
+            .ok_or_else(|| "the saved review diff has an out-of-range hunk".to_string())?;
+        let end = start
+            .checked_add(self.old_count)
+            .ok_or_else(|| "the saved review diff has an out-of-range hunk".to_string())?;
+        Ok((start, end))
+    }
+
+    fn old_side(&self) -> Vec<&str> {
+        self.lines
+            .iter()
+            .filter(|line| line.kind != ReviewedLineKind::Add)
+            .map(|line| line.text.as_str())
+            .collect()
+    }
+
+    fn new_side(&self) -> Vec<String> {
+        self.lines
+            .iter()
+            .filter(|line| line.kind != ReviewedLineKind::Remove)
+            .map(|line| line.text.clone())
+            .collect()
+    }
+
+    fn new_missing_newline(&self) -> Option<bool> {
+        self.lines
+            .iter()
+            .rev()
+            .find(|line| line.kind != ReviewedLineKind::Remove)
+            .map(|line| line.no_newline)
+    }
+}
+
+fn result_trailing_newline(
+    orig_len: usize,
+    orig_trailing: bool,
+    hunks: &[ReviewedHunk],
+) -> Result<bool, String> {
+    let mut trailing = orig_trailing;
+    for hunk in hunks {
+        let (start, end) = hunk.old_range()?;
+        let inserts_at_eof = hunk.old_count == 0 && start == orig_len;
+        if end == orig_len || inserts_at_eof {
+            match hunk.new_missing_newline() {
+                Some(missing) => trailing = !missing,
+                None => trailing = start > 0,
+            }
+        }
+    }
+    Ok(trailing)
+}
+
+fn stitch_reviewed_patch(
+    operation: &str,
+    path: &str,
+    original: &str,
+    patch: &ReviewedPatch,
+) -> Result<String> {
+    let (orig_lines, orig_trailing) = split_text_lines(original);
+    let mut out = Vec::new();
+    let mut old_i = 0usize;
+    let mut new_i = 0usize;
+    let mut last_empty_insert = None;
+    for hunk in &patch.hunks {
+        let (start, end) = hunk
+            .old_range()
+            .map_err(|reason| reviewed_refusal(operation, path, &reason))?;
+        if start < old_i || end > orig_lines.len() {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                "the saved review diff has overlapping or out-of-range hunks",
+            ));
+        }
+        if hunk.old_count == 0 {
+            if last_empty_insert == Some(start) {
+                return Err(reviewed_refusal(
+                    operation,
+                    path,
+                    "the saved review diff has overlapping or out-of-range hunks",
+                ));
+            }
+            last_empty_insert = Some(start);
+        } else {
+            last_empty_insert = None;
+        }
+        new_i += start - old_i;
+        out.extend(
+            orig_lines[old_i..start]
+                .iter()
+                .map(|line| (*line).to_string()),
+        );
+        let expected_new_start = if hunk.new_count == 0 {
+            new_i
+        } else {
+            new_i + 1
+        };
+        if hunk.new_start != expected_new_start {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                "the saved review diff has a hunk header that does not match the reconstructed file",
+            ));
+        }
+        let old_side = hunk.old_side();
+        if old_side != orig_lines[start..end] {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                &format!(
+                    "the saved review diff does not match the original file at line {}",
+                    start.saturating_add(1)
+                ),
+            ));
+        }
+        let new_side = hunk.new_side();
+        new_i += new_side.len();
+        out.extend(new_side);
+        old_i = end;
+    }
+    out.extend(orig_lines[old_i..].iter().map(|line| (*line).to_string()));
+    let trailing = result_trailing_newline(orig_lines.len(), orig_trailing, &patch.hunks)
+        .map_err(|reason| reviewed_refusal(operation, path, &reason))?;
+    Ok(join_text_lines(&out, trailing_for_join(&out, trailing)))
+}
+
+fn splice_reviewed_patch(
+    operation: &str,
+    path: &str,
+    original: &str,
+    patch: &ReviewedPatch,
+) -> Result<String> {
+    let (orig_lines, orig_trailing) = split_text_lines(original);
+    let mut lines: Vec<String> = orig_lines.iter().map(|line| (*line).to_string()).collect();
+    for hunk in patch.hunks.iter().rev() {
+        let (start, end) = hunk
+            .old_range()
+            .map_err(|reason| reviewed_refusal(operation, path, &reason))?;
+        if end > lines.len() {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                "the saved review diff has overlapping or out-of-range hunks",
+            ));
+        }
+        let old_side: Vec<&str> = hunk.old_side();
+        if old_side
+            != lines[start..end]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        {
+            return Err(reviewed_refusal(
+                operation,
+                path,
+                &format!(
+                    "the saved review diff does not match the original file at line {}",
+                    start.saturating_add(1)
+                ),
+            ));
+        }
+        lines.splice(start..end, hunk.new_side());
+    }
+    let trailing = result_trailing_newline(orig_lines.len(), orig_trailing, &patch.hunks)
+        .map_err(|reason| reviewed_refusal(operation, path, &reason))?;
+    Ok(join_text_lines(&lines, trailing_for_join(&lines, trailing)))
+}
+
+fn trailing_for_join(lines: &[String], trailing: bool) -> bool {
+    if lines.is_empty() {
+        false
+    } else {
+        trailing
+    }
+}
+
+fn ensure_reconstructed_text_is_writable(operation: &str, path: &str, text: &str) -> Result<()> {
+    for (offset, character) in text.char_indices() {
+        if character == '\n' || character == '\t' || !character.is_control() {
+            continue;
+        }
+        let name = match character {
+            '\r' => "CR/CRLF".to_string(),
+            '\u{1b}' => "ESCAPE".to_string(),
+            other => format!("control character U+{:04X}", other as u32),
+        };
+        return Err(reviewed_refusal(
+            operation,
+            path,
+            &format!("the saved review diff reconstructs {name} at byte {offset}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Editor-backed proposal API that preserves the user's explicit action.
@@ -1298,6 +1891,117 @@ mod tests {
         assert!(
             !interactive_review_already_granted(false, false),
             "invariant: without a grant, interactive TTY review still opens $EDITOR"
+        );
+    }
+
+    #[test]
+    fn reconstruct_reviewed_text_roundtrips_generated_unified_diffs() {
+        let cases = [
+            ("replace", "alpha\nkeep\n", "omega\nkeep\n"),
+            ("create", "", "hello\nworld\n"),
+            (
+                "blank-context",
+                "alpha\n\nbravo\n\ncharlie\n",
+                "alpha\n\nBRAVO\n\ncharlie\n",
+            ),
+            ("no-final-newline", "before", "after"),
+            ("add-trailing-newline", "before", "after\n"),
+            ("delete-line", "keep\ngone\n", "keep\n"),
+            (
+                "sql-double-dash",
+                "SELECT 1;\n-- keep totals\n-- and averages\nSELECT 2;\n",
+                "SELECT 1;\nSELECT 2;\n",
+            ),
+        ];
+        for (label, original, planned) in cases {
+            let diff = if original.is_empty() {
+                FileDiff::from_created("demo.txt", planned)
+            } else {
+                FileDiff::from_texts("demo.txt", original, planned)
+            };
+            let reconstructed = reconstruct_reviewed_text(
+                "write",
+                &diff.old_path,
+                &diff.new_path,
+                original,
+                &diff.to_unified(),
+            )
+            .unwrap_or_else(|error| panic!("{label}: generated diff must reconstruct: {error:#}"));
+            assert_eq!(
+                reconstructed, planned,
+                "{label}: independently reconstructed bytes must equal the planned file"
+            );
+        }
+    }
+
+    #[test]
+    fn reconstruct_reviewed_text_applies_saved_added_line_not_planned() {
+        let original = "alpha\nkeep\n";
+        let planned = "planned-bytes\nkeep\n";
+        let diff = FileDiff::from_texts("demo.txt", original, planned);
+        let saved = diff
+            .to_unified()
+            .replace("+planned-bytes", "+reviewed-edit");
+        let reconstructed =
+            reconstruct_reviewed_text("write", &diff.old_path, &diff.new_path, original, &saved)
+                .expect("valid edited hunk must reconstruct");
+        assert_eq!(reconstructed, "reviewed-edit\nkeep\n");
+        assert!(!reconstructed.contains("planned-bytes"));
+    }
+
+    #[test]
+    fn reconstruct_reviewed_text_rejects_extra_file_and_path_change() {
+        let original = "before\n";
+        let planned = "after\n";
+        let diff = FileDiff::from_texts("demo.txt", original, planned);
+        let generated = diff.to_unified();
+        let extra = format!("{generated}--- /dev/null\n+++ b/other.txt\n@@ -0,0 +1,1 @@\n+pwned\n");
+        let extra_error =
+            reconstruct_reviewed_text("edit", &diff.old_path, &diff.new_path, original, &extra)
+                .expect_err("extra file must fail closed");
+        assert!(
+            extra_error.to_string().contains("additional file"),
+            "extra file refusal must name the extra file; error: {extra_error:#}"
+        );
+
+        let path_changed = generated
+            .lines()
+            .map(|line| {
+                if line.starts_with("+++ ") {
+                    "+++ b/etc/passwd".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let path_error = reconstruct_reviewed_text(
+            "edit",
+            &diff.old_path,
+            &diff.new_path,
+            original,
+            &path_changed,
+        )
+        .expect_err("path/header change must fail closed");
+        assert!(
+            path_error.to_string().contains("target path"),
+            "path-change refusal must name the header change; error: {path_error:#}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_reviewed_text_rejects_malformed_hunk() {
+        let original = "before\n";
+        let planned = "after\n";
+        let diff = FileDiff::from_texts("demo.txt", original, planned);
+        let malformed = format!("{}\n+not-a-complete-hunk\n", diff.to_unified());
+        let error =
+            reconstruct_reviewed_text("edit", &diff.old_path, &diff.new_path, original, &malformed)
+                .expect_err("malformed extra hunk line must fail closed");
+        assert!(
+            error.to_string().contains("malformed"),
+            "malformed hunk refusal must name the defect; error: {error:#}"
         );
     }
 }
