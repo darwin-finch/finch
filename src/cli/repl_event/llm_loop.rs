@@ -48,8 +48,7 @@ pub struct LlmLoop {
     tool_coordinator: ToolExecutionCoordinator,
     /// Shared typed runtime that receives raw provider VM-wire programs.
     program_runtime: Arc<crate::runtime::ProgramRuntime>,
-    tool_call_history:
-        Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
+    tool_call_history: super::query_processor::ToolCallHistory,
 
     // ── Shared state (Arc clones also held by EventLoop) ───────────────────
     conversation: Arc<RwLock<ConversationHistory>>,

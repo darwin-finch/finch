@@ -2723,8 +2723,8 @@ mod tests {
         let idx = wu.add_row("bash(git status)");
         wu.fail_row_with_body(
             idx,
-            "loop detected: bash called 3 times with the same arguments",
-            vec!["Repeating this exact call is unlikely to produce new information.".into()],
+            "loop detected: bash called 3 times with the same arguments and the same result",
+            vec!["Repeating this call produced no new information.".into()],
         );
         wu.set_complete();
         let projected = wu.transcript_row(&colors()).unwrap();
@@ -2755,7 +2755,7 @@ mod tests {
             output
                 .body
                 .iter()
-                .any(|line| line.contains("unlikely to produce new information")),
+                .any(|line| line.contains("produced no new information")),
             "expanding the failed call must show the full loop diagnostic; output={output:?}"
         );
     }
