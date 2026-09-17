@@ -121,8 +121,14 @@ Not exhaustive — flag anything found later here rather than assuming this list
    historical.
 3. **CoLisp per-parameter ownership syntax has no worked example** — see M1/#674 row above.
    **Drafted 2026-09-17** (`FINCH_LANGUAGE_DESIGN.md`, end of "Co-Forth parity and IR
-   verification"), clearly marked as a draft, not a decision — Shammah still needs to accept,
-   amend, or reject it before #674 can treat it as settled.
+   verification"): `consume-value` (scalar), `take`/`borrow` (declarations, tied to the existing
+   `retain`/`inspect` use-after-move example), plus cross-references to the paired examples that
+   already existed elsewhere for `Unique`/`Shared` construction and drop/guards. Clearly marked as
+   draft, not a decision — Shammah still needs to accept, amend, or reject it.
+4. **`borrow-mut` has no worked declaration example, in either syntax, anywhere in the document** —
+   found while filling #3. Blocked on naming an in-place mutation primitive and its effect-row
+   spelling; every record operation currently in the spec is immutable/functional-update. Needs a
+   decision from Shammah, not a drafted guess — logging it rather than inventing one.
 
 ## Plan: spec fixes first, then M1 by dependency order
 

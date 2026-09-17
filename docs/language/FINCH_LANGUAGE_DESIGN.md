@@ -2432,6 +2432,43 @@ has no shared operand stack to preserve, so a borrowed parameter never appears i
 not the path. A literal field-for-field transliteration of the Co-Forth output row into CoLisp's
 return type would be wrong; the parity is in the ownership semantics, not the surface shape.
 
+**Take, and the rest of #674's scope.** `square` above only exercises `consume-value`, which is
+itself a lowering-level cell mode for an already-`Copy` scalar ("Typed stack signatures" above) —
+the narrowest case in the ownership model, not a representative one. The declaration syntax for
+`take` still needed a worked example; "Borrowing and taking" already gives the *call-site* behavior
+in CoLisp (`:2062`, the `retain`/`inspect`/`Foo` use-after-move example) but only pseudocode for the
+*declarations* being called (`:2046-2048`). Here are those two declarations, concretely, using the
+same names so the two passages now read as one example instead of two disconnected ones:
+
+```lisp
+(define (inspect (x : Foo)) : unit ...)                    ; ordinary parameter, borrow by default
+(define (retain (take x : Owner<Foo>)) : unit ...)         ; take; x may escape the invocation
+```
+
+Explicit `(borrow x : Foo)` is also accepted and is equivalent to the unannotated form — stated
+explicitly rather than only inferred, for a reader comparing two mixed-mode parameters at a glance.
+
+The rest of #674's scope already has a paired example elsewhere in this document; #674's owner
+should use these directly rather than re-deriving them:
+
+- **`Unique`/`Shared` construction and promotion** — "Stack, heap, and deterministic destruction"
+  (`:2236-2241`): `(new unique Foo ...)`, `(new shared Foo ...)`, `(share local)`.
+- **Deterministic drop / cleanup ordering** — "Typed failures and scope guards" (`:2004-2008`):
+  `(scope exit cleanup)`, `(scope success publish)`, `(scope failure compensate)`, paired with the
+  Co-Forth `scope-exit`/`scope-success`/`scope-failure` words.
+- **Closure capture ownership modes** (`borrow`/`take`/`retain` on a capture, distinct from an
+  ordinary parameter) — "Closure conversion and capture ownership" (`:1751-1774`), already paired.
+
+**Named gap, not fabricated:** `borrow-mut` (exclusive mutable borrow) has no worked declaration
+example in either syntax, and I did not invent one here. A real one needs an in-place mutation
+primitive to call inside the body — the document's own record operations (`record-get`,
+`record-set`) are immutable/functional-update, returning a new record rather than mutating in
+place, and no mutating counterpart is named anywhere in this file. Writing a `borrow-mut` example
+would mean guessing that primitive's name and effect-row spelling with nothing to check it against,
+which is exactly the kind of unreviewed invention this section exists to avoid. This is a fourth,
+narrower open item for #674 beyond the three already logged in the epic tracker — it needs an
+actual decision from Shammah (name and spell the mutation primitive), not a drafted guess.
+
 The common IR records moves, owner/evidence erasure, borrows where relevant to verification, and
 cleanup edges. Its verifier rejects use-after-move, double drop, leaked required ownership, escaping
 borrows, mutable aliasing, and borrows live across suspension. The interpreter and future Cranelift
