@@ -174,6 +174,20 @@ EXPECTED_PULL_REQUEST_OPTIONS = {
     for name in EXPECTED_PATHS
 }
 
+# Reviewed runner labels per workflow. An unavailable or misspelled label
+# queues forever, so the inventory is pinned; availability itself is proven
+# by the runs (the #518 Blacksmith pilot records runner identity separately).
+EXPECTED_RUNNERS = {
+    "ci.yml": ("blacksmith-4vcpu-ubuntu-2404", "macos-14", "ubuntu-24.04"),
+    "ci-main-breakage.yml": ("ubuntu-24.04",),
+    "ci-superseded-run-cancellation.yml": ("ubuntu-24.04",),
+    "docs.yml": ("ubuntu-24.04",),
+    "issue-201-chatgpt-auth.yml": ("windows-2022",),
+    "issue-56-brain-isolation.yml": ("macos-14", "ubuntu-24.04"),
+    "release.yml": ("${{ matrix.os }}", "ubuntu-latest"),
+    "repository-hygiene.yml": ("ubuntu-24.04",),
+}
+
 # Main-only jobs keep platform suites and release preflights off the
 # pull-request merge gate. Equality is the contract: do not invent a parser
 # for `if:`.
@@ -958,7 +972,7 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
 
 def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     errors: list[str] = []
-    errors.extend(active_owner_job_errors(documents, "ci.yml", "test", "${{ matrix.os }}"))
+    errors.extend(active_owner_job_errors(documents, "ci.yml", "test", "blacksmith-4vcpu-ubuntu-2404"))
 
     errors.extend(required_step_errors(
         documents, "ci.yml", "test", "Prove validated request tokens cannot be forged",
@@ -1103,6 +1117,26 @@ def isolation_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
                 )
         if positions != sorted(positions):
             errors.append(f"{ISOLATION_WORKFLOW}: job {job_id!r} ({runner}) fatal steps are out of order")
+    return errors
+
+
+def runner_label_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
+    """Pin the reviewed runner-label inventory; a misspelled label queues forever."""
+    errors: list[str] = []
+    for workflow, expected in EXPECTED_RUNNERS.items():
+        document = documents.get(workflow)
+        if document is None:
+            continue
+        jobs = document.get("jobs")
+        labels = {
+            job.get("runs-on") for job in jobs.values()
+            if isinstance(job, dict)
+        } if isinstance(jobs, dict) else set()
+        if labels != set(expected):
+            errors.append(
+                f"{workflow}: runner label inventory changed; "
+                f"expected={sorted(expected)!r} actual={sorted(labels)!r}"
+            )
     return errors
 
 
@@ -1462,6 +1496,7 @@ def compare_contract(root: Path) -> list[str]:
             )
     errors.extend(migrated_boundary_errors(documents))
     errors.extend(main_only_job_errors(documents))
+    errors.extend(runner_label_errors(documents))
     errors.extend(isolation_errors(documents))
     errors.extend(ordinary_ci_supervision_errors(documents))
     errors.extend(cache_contract_errors(documents))
