@@ -178,7 +178,7 @@ EXPECTED_PULL_REQUEST_OPTIONS = {
 # queues forever, so the inventory is pinned; availability itself is proven
 # by the runs (the #518 Blacksmith pilot records runner identity separately).
 EXPECTED_RUNNERS = {
-    "ci.yml": ("blacksmith-4vcpu-ubuntu-2404", "macos-14", "ubuntu-24.04"),
+    "ci.yml": ("blacksmith-8vcpu-ubuntu-2404", "macos-14", "ubuntu-24.04"),
     "ci-main-breakage.yml": ("ubuntu-24.04",),
     "ci-superseded-run-cancellation.yml": ("ubuntu-24.04",),
     "docs.yml": ("ubuntu-24.04",),
@@ -297,12 +297,21 @@ EXPECTED_CACHE_IDENTITIES = frozenset(
 )
 
 
+TEST_JOB_ENV = {
+    "CARGO_BUILD_JOBS": 6,
+    "CARGO_PROFILE_RELEASE_LTO": "false",
+    "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
+    "CARGO_TERM_COLOR": "always",
+    "RUST_BACKTRACE": 1,
+}
+
 CACHE_SPECS = {
     ("ci.yml", "test"): {
         "name": "Restore compatible Cargo dependencies and build artifacts",
         "shared-key": MATRIX_CACHE_KEY,
         "save-if": MAIN_SAVE_IF,
         "before": "Compile all targets",
+        "env": TEST_JOB_ENV,
     },
     ("ci.yml", "test-macos"): {
         "name": "Restore compatible Cargo dependencies and build artifacts",
@@ -318,6 +327,7 @@ CACHE_SPECS = {
         ),
         "save-if": False,
         "before": "Run runtime authority regressions",
+        "env": TEST_JOB_ENV,
     },
     ("ci.yml", "build"): {
         "name": "Restore compatible Linux release Cargo state",
@@ -972,7 +982,7 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
 
 def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     errors: list[str] = []
-    errors.extend(active_owner_job_errors(documents, "ci.yml", "test", "blacksmith-4vcpu-ubuntu-2404"))
+    errors.extend(active_owner_job_errors(documents, "ci.yml", "test", "blacksmith-8vcpu-ubuntu-2404"))
 
     errors.extend(required_step_errors(
         documents, "ci.yml", "test", "Prove validated request tokens cannot be forged",

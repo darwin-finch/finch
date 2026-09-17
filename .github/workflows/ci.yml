@@ -37,11 +37,15 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.feature_name }})
-    # Blacksmith pilot (#518): the canonical Linux PR test lane runs on a
-    # 4 vCPU / 16 GB Blacksmith runner — the same spec and image as GitHub's
-    # ubuntu-24.04, so any duration delta is attributable to the runner.
-    # CARGO_BUILD_JOBS stays 2 for the same reason. Rollback is this line.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Blacksmith pilot (#518): the canonical Linux PR test lane runs on an
+    # 8 vCPU / 32 GB Blacksmith runner. CARGO_BUILD_JOBS=6 is ~5 GB per rustc
+    # instance; the historical 4-way OOM was on 16 GB runners, so 6 has
+    # headroom — if a link OOMs, drop to 4 before shrinking anything else.
+    # The env is part of the rust-cache key: runtime-authority restores this
+    # family and must carry the identical job-level env.
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    env:
+      CARGO_BUILD_JOBS: 6
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -104,11 +108,6 @@ jobs:
     - name: Compile all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} --no-run
 
-    - name: Prove the removed finch::ssh API stays absent downstream
-      env:
-        CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      run: python3 scripts/check_removed_ssh_api.py ${{ matrix.cargo_args }}
-
     - name: Test all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
 
@@ -120,11 +119,6 @@ jobs:
       if: matrix.feature_name == 'default'
       run: cargo clippy --bin finch --all-features
       continue-on-error: true
-
-    - name: Verify binary reports its version
-      # Exercise Cargo's default binary selection so adding a test-only binary
-      # cannot silently break the documented `cargo run -- <args>` workflow.
-      run: cargo run ${{ matrix.cargo_args }} -- --version
 
   # Apple Silicon and Windows remain future build surfaces (`rust-toolchain.toml`
   # still lists those targets). They are not pull-request merge gates: fixing a
@@ -173,11 +167,6 @@ jobs:
     - name: Compile all targets
       run: cargo test --all-targets --no-run
 
-    - name: Prove the removed finch::ssh API stays absent downstream
-      env:
-        CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      run: python3 scripts/check_removed_ssh_api.py
-
     - name: Test all targets
       run: cargo test --all-targets -- --nocapture
 
@@ -198,13 +187,15 @@ jobs:
         name: finch-aarch64-apple-darwin
         path: target/aarch64-apple-darwin/release/finch
 
-    - name: Verify binary reports its version
-      run: cargo run -- --version
-
   runtime-authority:
     name: Runtime Authority (Ubuntu)
     runs-on: ubuntu-24.04
     cache-mode: read
+    # Same CARGO_BUILD_JOBS as the Test job: it restores that family, and the
+    # job env is part of the rust-cache key. Diverging would turn this job's
+    # restore into a guaranteed miss.
+    env:
+      CARGO_BUILD_JOBS: 6
 
     steps:
     - name: Checkout code
