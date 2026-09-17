@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
+use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -14,6 +15,74 @@ use tracing::{info, warn};
 /// Manages daemon lifecycle (PID file, shutdown)
 pub struct DaemonLifecycle {
     pid_file: PathBuf,
+}
+
+/// Result of [`DaemonLifecycle::stop_daemon`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStopOutcome {
+    /// No pid file and no leftover IPC socket.
+    NotRunning,
+    /// The recorded process was already gone. Leftover files that were safe
+    /// to remove have been reaped.
+    ReapedStale {
+        /// PID from the leftover file, if it could be parsed.
+        pid: Option<u32>,
+        /// Whether a leftover IPC socket with no listener was removed.
+        removed_socket: bool,
+    },
+    /// A live daemon process was signalled and is no longer running.
+    Stopped {
+        /// PID that was stopped.
+        pid: u32,
+    },
+    /// A leftover pid file named a dead process, but the IPC socket still has
+    /// a live listener. The pid file was removed; the socket was left in place.
+    StalePidLiveSocket {
+        /// PID from the leftover file, if it could be parsed.
+        pid: Option<u32>,
+    },
+}
+
+impl fmt::Display for DaemonStopOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRunning => write!(f, "Daemon is not running"),
+            Self::ReapedStale {
+                pid: Some(pid),
+                removed_socket: true,
+            } => write!(
+                f,
+                "Daemon is not running (cleaned leftover PID {pid} and socket from a crashed process)"
+            ),
+            Self::ReapedStale {
+                pid: Some(pid),
+                removed_socket: false,
+            } => write!(
+                f,
+                "Daemon is not running (cleaned leftover PID {pid} from a crashed process)"
+            ),
+            Self::ReapedStale {
+                pid: None,
+                removed_socket: true,
+            } => write!(
+                f,
+                "Daemon is not running (cleaned leftover IPC socket from a crashed process)"
+            ),
+            Self::ReapedStale {
+                pid: None,
+                removed_socket: false,
+            } => write!(f, "Daemon is not running"),
+            Self::Stopped { pid } => write!(f, "Daemon stopped successfully (PID: {pid})"),
+            Self::StalePidLiveSocket { pid: Some(pid) } => write!(
+                f,
+                "Removed stale PID file ({pid}), but the IPC socket still has a live listener"
+            ),
+            Self::StalePidLiveSocket { pid: None } => write!(
+                f,
+                "No daemon PID file, but the IPC socket still has a live listener"
+            ),
+        }
+    }
 }
 
 /// Process-lifetime ownership of the daemon namespace.
@@ -142,21 +211,89 @@ impl DaemonLifecycle {
         &self.pid_file
     }
 
-    /// Stop the daemon gracefully
+    /// True when a pid file or IPC socket remains but no daemon process is alive.
+    pub fn has_stale_files(&self) -> bool {
+        !self.is_running() && (self.pid_file.exists() || self.socket_path().exists())
+    }
+
+    fn socket_path(&self) -> PathBuf {
+        self.pid_file.with_extension("sock")
+    }
+
+    /// Remove the IPC socket only when nothing is listening on it.
     ///
-    /// Attempts graceful shutdown:
+    /// Blind unlinking would let this command steal a live listener's pathname
+    /// while that process kept serving through its open file descriptor. The
+    /// bind path in `src/ipc/server.rs` uses the same connect-then-unlink rule.
+    fn reap_stale_socket(&self) -> Result<StaleSocketReap> {
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+            Ok(StaleSocketReap::Absent)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::net::UnixStream;
+            let path = self.socket_path();
+            if !path.exists() {
+                return Ok(StaleSocketReap::Absent);
+            }
+            match UnixStream::connect(&path) {
+                Ok(_) => Ok(StaleSocketReap::Live),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    fs::remove_file(&path).with_context(|| {
+                        format!("Failed to remove stale IPC socket: {}", path.display())
+                    })?;
+                    Ok(StaleSocketReap::Removed)
+                }
+                Err(error) => Err(error).with_context(|| {
+                    format!("could not determine whether {} is stale", path.display())
+                }),
+            }
+        }
+    }
+
+    fn outcome_after_dead_process(&self, pid: Option<u32>) -> Result<DaemonStopOutcome> {
+        match self.reap_stale_socket()? {
+            StaleSocketReap::Live => Ok(DaemonStopOutcome::StalePidLiveSocket { pid }),
+            StaleSocketReap::Removed => Ok(DaemonStopOutcome::ReapedStale {
+                pid,
+                removed_socket: true,
+            }),
+            StaleSocketReap::Absent => {
+                if pid.is_some() {
+                    Ok(DaemonStopOutcome::ReapedStale {
+                        pid,
+                        removed_socket: false,
+                    })
+                } else {
+                    Ok(DaemonStopOutcome::NotRunning)
+                }
+            }
+        }
+    }
+
+    /// Stop the daemon gracefully, or reap leftover files from a crash.
+    ///
+    /// Attempts graceful shutdown of a live process:
     /// 1. Send SIGTERM
     /// 2. Wait up to 5 seconds for process to exit
     /// 3. If still running, send SIGKILL
-    /// 4. Remove PID file
+    /// 4. Remove PID file and a leftover IPC socket with no listener
     ///
-    /// Returns Ok if daemon stopped successfully or wasn't running.
-    /// Returns Err if failed to stop process.
-    pub fn stop_daemon(&self) -> Result<()> {
-        // Check if daemon is running
+    /// If the pid file names a process that is already gone, this still removes
+    /// that file and a stale socket. Callers must not skip this when
+    /// [`Self::is_running`] is false: that is how a crashed daemon left pid and
+    /// socket files that `finch daemon-stop` used to ignore.
+    pub fn stop_daemon(&self) -> Result<DaemonStopOutcome> {
         if !self.pid_file.exists() {
             info!("Daemon not running (PID file does not exist)");
-            return Ok(());
+            return self.outcome_after_dead_process(None);
         }
 
         let pid = match self.read_pid() {
@@ -164,7 +301,7 @@ impl DaemonLifecycle {
             Err(e) => {
                 warn!("Stale PID file exists but cannot read: {}. Removing...", e);
                 self.cleanup()?;
-                return Ok(());
+                return self.outcome_after_dead_process(None);
             }
         };
 
@@ -174,7 +311,7 @@ impl DaemonLifecycle {
                 "Daemon not running (process does not exist). Removing stale PID file..."
             );
             self.cleanup()?;
-            return Ok(());
+            return self.outcome_after_dead_process(Some(pid));
         }
 
         info!(pid = pid, "Stopping daemon with SIGTERM...");
@@ -197,7 +334,8 @@ impl DaemonLifecycle {
                 if !process_exists(pid) {
                     info!(pid = pid, "Daemon stopped gracefully");
                     self.cleanup()?;
-                    return Ok(());
+                    let _ = self.reap_stale_socket()?;
+                    return Ok(DaemonStopOutcome::Stopped { pid });
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -226,7 +364,8 @@ impl DaemonLifecycle {
                 info!(pid = pid, "Daemon force-stopped with SIGKILL");
             }
             self.cleanup()?;
-            Ok(())
+            let _ = self.reap_stale_socket()?;
+            Ok(DaemonStopOutcome::Stopped { pid })
         }
 
         #[cfg(target_family = "windows")]
@@ -245,9 +384,17 @@ impl DaemonLifecycle {
 
             info!(pid = pid, "Daemon stopped");
             self.cleanup()?;
-            Ok(())
+            Ok(DaemonStopOutcome::Stopped { pid })
         }
     }
+}
+
+/// Whether [`DaemonLifecycle::reap_stale_socket`] removed a leftover socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleSocketReap {
+    Absent,
+    Removed,
+    Live,
 }
 
 impl DaemonInstanceGuard {
@@ -371,5 +518,146 @@ mod tests {
 
         // Very high PID should not exist
         assert!(!process_exists(999999999));
+    }
+
+    #[test]
+    fn stop_daemon_reaps_stale_pid_file_for_a_dead_process() {
+        let temp_dir = TempDir::new().unwrap();
+        let pid_file = temp_dir.path().join("daemon.pid");
+        fs::write(&pid_file, "999999999").unwrap();
+        let lifecycle = DaemonLifecycle {
+            pid_file: pid_file.clone(),
+        };
+
+        assert!(
+            !lifecycle.is_running(),
+            "a pid file for a dead process must not count as running; pid_file={}",
+            pid_file.display()
+        );
+        assert!(
+            lifecycle.has_stale_files(),
+            "a leftover pid file for a dead process is stale; pid_file={}",
+            pid_file.display()
+        );
+
+        let outcome = lifecycle.stop_daemon().unwrap();
+        assert_eq!(
+            outcome,
+            DaemonStopOutcome::ReapedStale {
+                pid: Some(999_999_999),
+                removed_socket: false,
+            },
+            "stop_daemon must reap a crashed pid file even when is_running is false; leftover still present={}",
+            pid_file.exists()
+        );
+        assert!(
+            !pid_file.exists(),
+            "reaping a crashed daemon must remove the leftover pid file at {}",
+            pid_file.display()
+        );
+        assert!(
+            !lifecycle.has_stale_files(),
+            "no leftover files should remain after reaping {}",
+            pid_file.display()
+        );
+    }
+
+    #[test]
+    fn stop_daemon_is_not_running_when_nothing_is_left() {
+        let temp_dir = TempDir::new().unwrap();
+        let pid_file = temp_dir.path().join("daemon.pid");
+        let lifecycle = DaemonLifecycle { pid_file };
+        assert_eq!(
+            lifecycle.stop_daemon().unwrap(),
+            DaemonStopOutcome::NotRunning,
+            "stop_daemon with no pid or socket must report NotRunning"
+        );
+    }
+
+    #[cfg(unix)]
+    fn short_unix_dir() -> TempDir {
+        // macOS sockaddr_un.sun_path is 104 bytes; the default TempDir lives
+        // under a long /var/folders path and cannot be bound as a Unix socket.
+        tempfile::Builder::new()
+            .prefix("fds")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_daemon_reaps_stale_socket_when_nothing_is_listening() {
+        use std::os::unix::net::UnixListener;
+
+        let temp_dir = short_unix_dir();
+        let pid_file = temp_dir.path().join("daemon.pid");
+        let socket = temp_dir.path().join("daemon.sock");
+        fs::write(&pid_file, "999999999").unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        drop(listener);
+
+        let lifecycle = DaemonLifecycle {
+            pid_file: pid_file.clone(),
+        };
+        let outcome = lifecycle.stop_daemon().unwrap();
+        assert_eq!(
+            outcome,
+            DaemonStopOutcome::ReapedStale {
+                pid: Some(999_999_999),
+                removed_socket: true,
+            },
+            "a leftover unix socket with no listener must be reaped with the dead pid; pid_exists={} socket_exists={}",
+            pid_file.exists(),
+            socket.exists()
+        );
+        assert!(
+            !pid_file.exists() && !socket.exists(),
+            "crashed-daemon leftovers must be gone; pid_exists={} socket_exists={}",
+            pid_file.exists(),
+            socket.exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_daemon_does_not_unlink_a_live_ipc_socket() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let temp_dir = short_unix_dir();
+        let pid_file = temp_dir.path().join("daemon.pid");
+        let socket = temp_dir.path().join("daemon.sock");
+        fs::write(&pid_file, "999999999").unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let lifecycle = DaemonLifecycle {
+            pid_file: pid_file.clone(),
+        };
+        let outcome = lifecycle.stop_daemon().unwrap();
+        assert_eq!(
+            outcome,
+            DaemonStopOutcome::StalePidLiveSocket {
+                pid: Some(999_999_999),
+            },
+            "a live listener must not be unlinked because the pid file is stale; pid_exists={} socket_exists={}",
+            pid_file.exists(),
+            socket.exists()
+        );
+        assert!(
+            !pid_file.exists(),
+            "the stale pid file should still be removed; path={}",
+            pid_file.display()
+        );
+        assert!(
+            socket.exists(),
+            "the live IPC socket must remain at {}",
+            socket.display()
+        );
+        UnixStream::connect(&socket).unwrap_or_else(|error| {
+            panic!(
+                "the live listener at {} must still accept connects after stop_daemon: {error}",
+                socket.display()
+            )
+        });
+        drop(listener);
     }
 }
