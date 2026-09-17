@@ -3605,7 +3605,7 @@ impl TuiRenderer {
         dialog: &Dialog,
         box_width: usize,
     ) -> Result<usize> {
-        Self::draw_dialog_with_control_start(out, dialog, box_width).map(|(rows, _)| rows)
+        Self::draw_dialog_with_control_start(out, dialog, box_width, None).map(|(rows, _)| rows)
     }
 
     /// Paint a dialog and report the logical line index where the control
@@ -3613,10 +3613,15 @@ impl TuiRenderer {
     ///
     /// That index is structural: options always follow the body, so a markdown
     /// payload that happens to contain `●` cannot shift the pin.
+    ///
+    /// `max_rows` is the live-area budget. Keyboard-hint rows are omitted when
+    /// they would force `pin_dialog_controls` to clip the title on a short
+    /// terminal.
     fn draw_dialog_with_control_start(
         out: &mut impl io::Write,
         dialog: &Dialog,
         box_width: usize,
+        max_rows: Option<usize>,
     ) -> Result<(usize, usize)> {
         // Wrap width inside the 2-space left indent (no right border to reserve for).
         let inner = box_width.saturating_sub(2).max(1);
@@ -3864,6 +3869,20 @@ impl TuiRenderer {
             execute!(out, Print("   "))?;
             print_dialog_token(out, "[ Cancel ]", cursor == cancel_idx)?;
             execute!(out, Print("\r\n"))?;
+            rows += 1;
+
+            let hint = "↑/↓: Navigate | Space: Toggle | Enter: Submit | Esc: Cancel";
+            let hint_lines = wrap_text(hint, inner);
+            // Bottom rule is one more row after this block.
+            let fits = max_rows
+                .map(|max| rows + hint_lines.len() + 1 <= max)
+                .unwrap_or(true);
+            if fits {
+                for line in hint_lines {
+                    print_dialog_line(out, &line, Some(Color::DarkGrey), false)?;
+                    rows += 1;
+                }
+            }
         } else if matches!(&dialog.dialog_type, DialogType::Select { .. }) {
             // Select: [ Cancel ]  (no Submit — Enter on an option submits directly)
             let hint = if dialog.custom_mode_active {
@@ -3880,13 +3899,15 @@ impl TuiRenderer {
                 SetAttribute(Attribute::Reset),
                 Print("\r\n"),
             )?;
+            rows += 1;
         } else {
             // Confirm / TextInput: just a keybinding hint
             let help = "↑/↓ Navigate  Enter Select  Esc Cancel";
             print_dialog_line(out, help, Some(Color::DarkGrey), false)?;
+            rows += 1;
         }
         execute!(out, Print(&rule), Print("\r\n"))?;
-        rows += 2; // buttons row + bottom rule
+        rows += 1;
 
         Ok((rows, control_start))
     }
@@ -3934,8 +3955,12 @@ impl TuiRenderer {
         }
         let width = width.max(1);
         let mut rendered = Vec::new();
-        let control_start = match Self::draw_dialog_with_control_start(&mut rendered, dialog, width)
-        {
+        let control_start = match Self::draw_dialog_with_control_start(
+            &mut rendered,
+            dialog,
+            width,
+            Some(max_rows),
+        ) {
             Ok((_, start)) => start,
             Err(_) => return Vec::new(),
         };
@@ -7241,7 +7266,7 @@ mod tests {
                     terminal.feed(&bytes);
                 }
                 let rule = "─".repeat(width);
-                let expected = [
+                let mut expected = vec![
                     "──  ~/repos/finch  jade-river ──".to_string(),
                     rule.clone(),
                     format!("  {title}"),
@@ -7249,8 +7274,12 @@ mod tests {
                     "    ☐ Keep".to_string(),
                     rule.clone(),
                     "  [ Submit ]   [ Cancel ]".to_string(),
-                    rule,
                 ];
+                if height > 8 {
+                    expected.push("  ↑/↓: Navigate | Space: Toggle".to_string());
+                    expected.push("  | Enter: Submit | Esc: Cancel".to_string());
+                }
+                expected.push(rule);
                 for (row, expected) in expected.iter().enumerate() {
                     assert_vt(
                         terminal.row(plan.live_top + row) == *expected,
@@ -7259,23 +7288,37 @@ mod tests {
                     );
                 }
                 assert_vt(
-                    active_rows == 8
-                        && frame.cursor_row == 7
+                    active_rows == expected.len()
+                        && frame.cursor_row == expected.len() - 1
                         && terminal.cursor() == (height - 1, 0, false),
-                    "dialog paint must own exactly eight rows and hide its cursor on the final row",
+                    "dialog paint must own every expected row and hide its cursor on the final row",
                     &terminal,
                 );
-                for row in 0..plan.live_top {
-                    let expected = match row {
-                        2 => "retained first",
-                        3 => "retained last",
-                        _ => "",
-                    };
+                if height == 12 {
+                    let first =
+                        (0..plan.live_top).find(|&row| terminal.row(row) == "retained first");
+                    let last = (0..plan.live_top).find(|&row| terminal.row(row) == "retained last");
                     assert_vt(
-                        terminal.row(row) == expected,
-                        "dialog paint and repaint must preserve the retained transcript and top padding",
+                        first.is_some()
+                            && last.is_some()
+                            && first < last
+                            && (0..plan.live_top).all(|row| {
+                                matches!(
+                                    terminal.row(row).as_str(),
+                                    "" | "retained first" | "retained last"
+                                )
+                            }),
+                        "taller dialog may consume padding but must keep retained transcript above live_top",
                         &terminal,
                     );
+                } else {
+                    for row in 0..plan.live_top {
+                        assert_vt(
+                            terminal.row(row).is_empty(),
+                            "short dialog must not paint into the region above live_top",
+                            &terminal,
+                        );
+                    }
                 }
             }
 
@@ -8517,6 +8560,52 @@ mod draw_dialog_tests {
         );
         let lines = render_lines(&dialog);
         check_widths(&lines, 72);
+    }
+
+    #[test]
+    fn test_live_multiselect_renders_and_honors_complete_keyboard_hint() {
+        let mut dialog = Dialog::multiselect(
+            "Choose all that apply",
+            vec![DialogOption::new("Option A"), DialogOption::new("Option B")],
+        );
+        let mut output = Vec::new();
+        let rendered_rows =
+            TuiRenderer::draw_dialog_inline_static_with_width(&mut output, &dialog, 72).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        let visible = rendered
+            .lines()
+            .map(strip_ansi)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            rendered_rows,
+            rendered.lines().count(),
+            "live multiselect row accounting must include every rendered keyboard-hint row"
+        );
+
+        for expected in [
+            "↑/↓: Navigate",
+            "Space: Toggle",
+            "Enter: Submit",
+            "Esc: Cancel",
+        ] {
+            assert!(
+                visible.contains(expected),
+                "live multiselect omitted the documented keyboard hint {expected:?}:\n{visible}"
+            );
+        }
+
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char(' '))),
+            None,
+            "Space must toggle the focused option without submitting the live multiselect"
+        );
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Enter)),
+            Some(DialogResult::MultiSelected(vec![0])),
+            "Enter must submit the options toggled with the rendered keyboard controls"
+        );
     }
 
     #[test]

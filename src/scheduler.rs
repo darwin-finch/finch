@@ -3647,8 +3647,10 @@ mod tests {
             .count();
         assert_eq!(
             (tool_started, tool_completed),
-            (1, 1),
-            "cancellation at the turn-two boundary dispatches no extra tool; task_id={task_id} events={observed:?}"
+            (0, 0),
+            "scripted unavailable-test-tool is rejected by the child catalog \
+             (no ToolStarted); cancellation at turn-two must still dispatch no \
+             extra tool; task_id={task_id} events={observed:?}"
         );
         let finished = terminal_results(&observed);
         assert_eq!(

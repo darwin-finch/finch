@@ -1316,6 +1316,7 @@ impl OpenAIProvider {
                     let mut content_parts: Vec<OpenAIContentPart> = Vec::new();
                     let mut compatible_text_parts: Vec<&str> = Vec::new();
                     let mut tool_results: Vec<(String, String)> = Vec::new();
+                    let mut has_image = false;
 
                     for block in &msg.content {
                         match block {
@@ -1330,16 +1331,19 @@ impl OpenAIProvider {
                             } => {
                                 tool_results.push((tool_use_id.clone(), content.clone()));
                             }
-                            ContentBlock::Image { source } => match rule {
-                                TransportRule::CanonicalGpt56ChatCompletions => {
-                                    content_parts.push(OpenAIContentPart::ImageUrl {
-                                        image_url: validate_image_source(source)?,
-                                    });
+                            ContentBlock::Image { source } => {
+                                has_image = true;
+                                match rule {
+                                    TransportRule::CanonicalGpt56ChatCompletions => {
+                                        content_parts.push(OpenAIContentPart::ImageUrl {
+                                            image_url: validate_image_source(source)?,
+                                        });
+                                    }
+                                    TransportRule::CompatibleChatCompletions => {
+                                        compatible_text_parts.push("[image]");
+                                    }
                                 }
-                                TransportRule::CompatibleChatCompletions => {
-                                    compatible_text_parts.push("[image]");
-                                }
-                            },
+                            }
                             ContentBlock::OpaqueReasoning { .. } => {
                                 anyhow::bail!("OpenAI Chat Completions cannot carry opaque Responses continuation")
                             }
@@ -1353,10 +1357,12 @@ impl OpenAIProvider {
                         }
                     }
 
-                    if rule == TransportRule::CanonicalGpt56ChatCompletions
-                        && !content_parts.is_empty()
-                        && !tool_results.is_empty()
-                    {
+                    // ToolResult+Text is Anthropic's mixed user turn (queued
+                    // steering attached to the tool-result message). Split it
+                    // into OpenAI tool-role messages, then a user message.
+                    // Image+tool_result cannot be a legal tool-then-user split
+                    // of the same payload, so keep the mix bail.
+                    if has_image && !tool_results.is_empty() {
                         anyhow::bail!(
                             "OpenAI user messages cannot mix tool results with user content"
                         );
@@ -1375,15 +1381,18 @@ impl OpenAIProvider {
                             (!text.trim().is_empty()).then_some(OpenAIMessageContent::Text(text))
                         }
                     };
-                    if let Some(content) = content {
-                        messages.push(OpenAIMessage::Regular {
-                            role: msg.role.clone(),
-                            content,
-                        });
+                    let split_steering = content.is_some() && !tool_results.is_empty();
+                    if !split_steering {
+                        if let Some(content) = content.clone() {
+                            messages.push(OpenAIMessage::Regular {
+                                role: msg.role.clone(),
+                                content,
+                            });
+                        }
                     }
 
                     // One tool message per result (OpenAI requires separate messages)
-                    for (tool_call_id, content) in tool_results {
+                    for (tool_call_id, result) in tool_results {
                         if rule == TransportRule::CanonicalGpt56ChatCompletions
                             && !outstanding_tool_ids.remove(&tool_call_id)
                         {
@@ -1393,13 +1402,21 @@ impl OpenAIProvider {
                         }
                         messages.push(OpenAIMessage::Tool {
                             role: "tool".to_string(),
-                            content: if content.trim().is_empty() {
+                            content: if result.trim().is_empty() {
                                 "(no output)".to_string()
                             } else {
-                                content
+                                result
                             },
                             tool_call_id,
                         });
+                    }
+                    if split_steering {
+                        if let Some(content) = content {
+                            messages.push(OpenAIMessage::Regular {
+                                role: msg.role.clone(),
+                                content,
+                            });
+                        }
                     }
                 }
             }
@@ -3483,6 +3500,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unknown function call ID"));
+        let image_and_tool = ProviderRequest::new(vec![
+            crate::Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
+                    id: "call_x".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                }],
+            ),
+            crate::Message::with_content(
+                "user",
+                vec![
+                    ContentBlock::tool_result("call_x".into(), "ok".into(), None),
+                    ContentBlock::image("image/png", VALID_PNG_BASE64),
+                ],
+            ),
+        ])
+        .with_model("gpt-5.6-sol")
+        .with_tools(vec![crate::ToolDefinition {
+            name: "read".into(),
+            description: "read".into(),
+            input_schema: crate::ToolInputSchema::simple(vec![]),
+        }]);
+        assert_eq!(
+            provider
+                .encode_request(&image_and_tool)
+                .unwrap_err()
+                .to_string(),
+            "OpenAI user messages cannot mix tool results with user content"
+        );
     }
 
     #[test]
@@ -3655,42 +3702,6 @@ mod tests {
         ] {
             let error = provider.send_message(&request).await.unwrap_err();
             assert!(error.to_string().len() < 256);
-        }
-        for blocks in [
-            vec![
-                ContentBlock::tool_result("call_x".into(), "ok".into(), None),
-                ContentBlock::text("next"),
-            ],
-            vec![
-                ContentBlock::text("next"),
-                ContentBlock::tool_result("call_x".into(), "ok".into(), None),
-            ],
-        ] {
-            let request = ProviderRequest::new(vec![
-                crate::Message::with_content(
-                    "assistant",
-                    vec![ContentBlock::ToolUse {
-                        id: "call_x".into(),
-                        name: "read".into(),
-                        input: serde_json::json!({}),
-                    }],
-                ),
-                crate::Message::with_content("user", blocks),
-            ])
-            .with_model("gpt-5.6-sol")
-            .with_tools(vec![crate::ToolDefinition {
-                name: "read".into(),
-                description: "read".into(),
-                input_schema: crate::ToolInputSchema::simple(vec![]),
-            }]);
-            assert_eq!(
-                provider
-                    .send_message(&request)
-                    .await
-                    .unwrap_err()
-                    .to_string(),
-                "OpenAI user messages cannot mix tool results with user content"
-            );
         }
         assert!(
             tokio::time::timeout(Duration::from_millis(1), listener.accept())
@@ -4327,6 +4338,86 @@ mod tests {
             error.contains("not in this request's binding table"),
             "unadvertised history identity must fail closed, got {error}"
         );
+    }
+
+    fn mixed_tool_result_and_steering_request() -> crate::ProviderRequest {
+        use crate::ProviderRequest;
+        use crate::{ContentBlock, Message};
+        ProviderRequest::new(vec![
+            Message::user("run ls"),
+            Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                }],
+            ),
+            Message::with_content(
+                "user",
+                vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: "file.txt".to_string(),
+                        is_error: None,
+                    },
+                    ContentBlock::Text {
+                        text: "steer now".to_string(),
+                    },
+                ],
+            ),
+        ])
+        .with_tools(vec![crate::ToolDefinition {
+            name: "bash".into(),
+            description: "bash".into(),
+            input_schema: crate::ToolInputSchema::simple(vec![]),
+        }])
+    }
+
+    fn assert_tool_then_user_steering(openai_req: &OpenAIRequest) {
+        let wire = serde_json::to_value(openai_req).unwrap();
+        let messages = wire["messages"]
+            .as_array()
+            .expect("encoded OpenAI request must have a messages array");
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            roles,
+            ["user", "assistant", "tool", "user"],
+            "mixed ToolResult+Text must encode assistant(tool_calls) → tool → user, never user-before-tool; messages={messages:?}"
+        );
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+        assert_eq!(messages[2]["content"], "file.txt");
+        let steering = match &messages[3]["content"] {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(""),
+            other => panic!("steering user content must be text or parts, got {other:?}"),
+        };
+        assert_eq!(
+            steering, "steer now",
+            "queued steering text must be the trailing user message; messages={messages:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_tool_result_and_steering_text_encodes_tool_then_user_on_canonical_and_compatible() {
+        let canonical = canonical_test_provider("http://127.0.0.1:1".into());
+        let encoded = canonical
+            .encode_request(&mixed_tool_result_and_steering_request())
+            .expect("ToolResult+Text after a matching ToolUse must split, not bail");
+        assert_tool_then_user_steering(&encoded);
+
+        let compatible = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        let encoded = compatible
+            .encode_request(&mixed_tool_result_and_steering_request())
+            .expect("compatible Chat Completions must emit tool then user, not user-before-tool");
+        assert_tool_then_user_steering(&encoded);
     }
 
     #[test]

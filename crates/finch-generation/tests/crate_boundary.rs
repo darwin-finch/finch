@@ -8,7 +8,7 @@ fn package_graph_does_not_include_finch() {
             "metadata",
             "--format-version",
             "1",
-            "--offline",
+            "--locked",
             "--manifest-path",
         ])
         .arg(&manifest)

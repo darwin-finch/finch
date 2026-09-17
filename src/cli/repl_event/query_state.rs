@@ -253,6 +253,17 @@ impl QueryStateManager {
             .and_then(|metadata| metadata.tool_work_unit.clone())
     }
 
+    /// Every in-flight query's Tools unit, used to attach orphan tool/child
+    /// results instead of starting a new root.
+    pub(crate) async fn live_tool_work_units(&self) -> Vec<Arc<WorkUnit>> {
+        self.states
+            .read()
+            .await
+            .values()
+            .filter_map(|metadata| metadata.tool_work_unit.clone())
+            .collect()
+    }
+
     pub async fn set_brain_output_work_unit(&self, query_id: Uuid, unit: Option<Arc<WorkUnit>>) {
         if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
             metadata.brain_output_work_unit = unit;

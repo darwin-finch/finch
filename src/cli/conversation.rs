@@ -125,6 +125,30 @@ impl ConversationHistory {
         self.trim_if_needed();
     }
 
+    /// Append text blocks to the last user message.
+    ///
+    /// Queued steering during a tool round must ride on the committed
+    /// tool-result user turn (or the single plan-execution directive). A
+    /// second `role: "user"` message is consecutive-user and Claude 400s.
+    pub fn append_text_blocks_to_last_user_message(&mut self, texts: &[String]) -> bool {
+        if texts.is_empty() {
+            return true;
+        }
+        let Some(last) = self.messages.last_mut() else {
+            return false;
+        };
+        if last.role != "user" {
+            return false;
+        }
+        last.content.extend(
+            texts
+                .iter()
+                .cloned()
+                .map(|text| ContentBlock::Text { text }),
+        );
+        true
+    }
+
     /// Add a user message with optional image attachments.
     /// Each image is `(media_type, base64_data)`.
     pub fn add_user_message_with_images(&mut self, text: String, images: &[(String, String)]) {
@@ -905,6 +929,50 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn test_queued_steering_attaches_to_tool_result_user_message() {
+        let mut history = ConversationHistory::new();
+        history.add_user_message("inspect".to_string());
+        let query_id = Uuid::new_v4();
+        let token = history
+            .stage_assistant(query_id, tool_assistant(&["A"]))
+            .unwrap();
+        history
+            .record_tool_result(query_id, token, "A", &Ok("value".to_string()))
+            .unwrap();
+        history.commit_tool_round(query_id, token).unwrap();
+        assert!(history.append_text_blocks_to_last_user_message(&[
+            "steer now".to_string(),
+            "and also this".to_string(),
+        ]));
+
+        let messages = history.get_messages();
+        assert_eq!(messages.len(), 3);
+        for window in messages.windows(2) {
+            assert_ne!(
+                (window[0].role.as_str(), window[1].role.as_str()),
+                ("user", "user"),
+                "queued steering must not create consecutive user roles; messages={messages:?}"
+            );
+        }
+        assert_eq!(messages[2].role, "user");
+        assert!(
+            matches!(
+                messages[2].content.as_slice(),
+                [
+                    ContentBlock::ToolResult { tool_use_id, content, is_error: None },
+                    ContentBlock::Text { text: first },
+                    ContentBlock::Text { text: second },
+                ] if tool_use_id == "A"
+                    && content == "value"
+                    && first == "steer now"
+                    && second == "and also this"
+            ),
+            "last user message must be ToolResult then queued text; last={:?}",
+            messages[2]
+        );
     }
 
     #[test]
