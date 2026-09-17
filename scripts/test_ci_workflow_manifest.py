@@ -452,6 +452,19 @@ class WorkflowContractTests(unittest.TestCase):
             "Test (macos-14, default)",
         )
 
+    def test_release_build_job_is_not_a_pull_request_gate(self) -> None:
+        self.repository.replace(
+            "ci.yml",
+            "    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
+            "    if: true\n",
+            after="    name: Build Release (x86_64-unknown-linux-gnu)\n",
+        )
+        self.assert_fails(
+            "ci.yml: job 'build' must stay main-only",
+            "release preflight compiles are not pull-request merge gates",
+            "expanded check allocation changed",
+        )
+
     def test_migrated_preflights_must_run_before_cargo_setup(self) -> None:
         path = self.repository.workflow("ci.yml")
         source = path.read_text()
