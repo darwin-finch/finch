@@ -955,8 +955,8 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
             );
 
             let error = anyhow::anyhow!(
-                "loop detected: bash called 3 times with the same arguments\n\
-                 Repeating this exact call is unlikely to produce new information. \
+                "loop detected: bash called 3 times with the same arguments and the same result\n\
+                 Repeating this call produced no new information. \
                  Inspect the previous results or use a different command."
             );
             event_loop
@@ -1024,7 +1024,7 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
                 output_row
                     .body
                     .iter()
-                    .any(|line| line.contains("unlikely to produce new information")),
+                    .any(|line| line.contains("produced no new information")),
                 "expanding the failed bash row must show the full loop diagnostic; output={output_row:?}"
             );
         })

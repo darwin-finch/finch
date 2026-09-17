@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli::repl_event::query_processor::record_completed_tool_result;
 
 /// Split a tool error into a collapsed-row summary and expandable body.
 ///
@@ -120,6 +121,14 @@ impl EventLoop {
         // Update the row in the WorkUnit with a semantic summary + optional body
         match &result {
             Ok(content) => {
+                record_completed_tool_result(
+                    &self.tool_call_history,
+                    query_id,
+                    &tool_name,
+                    &tool_input,
+                    content,
+                )
+                .await;
                 let (summary, mut body) = tool_result_to_display(&tool_name, content);
                 // A provider-native VM submission is executable source, not an
                 // opaque tool argument.  Preserve the exact source in the
@@ -142,7 +151,18 @@ impl EventLoop {
                 work_unit.complete_row_with_body(row_idx, summary, body);
             }
             Err(e) => {
-                let (short_err, body) = tool_error_display(&e.to_string());
+                let text = e.to_string();
+                if !text.starts_with("loop detected:") {
+                    record_completed_tool_result(
+                        &self.tool_call_history,
+                        query_id,
+                        &tool_name,
+                        &tool_input,
+                        &text,
+                    )
+                    .await;
+                }
+                let (short_err, body) = tool_error_display(&text);
                 work_unit.fail_row_with_body(row_idx, short_err, body);
             }
         }

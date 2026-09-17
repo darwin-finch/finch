@@ -18,10 +18,12 @@ use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::TuiRenderer;
 use crate::generators::{Generator, StreamChunk};
 use crate::models::GeneratorState;
+use crate::programs::ExecutionEffect;
 use crate::providers::{ContentBlock, EventProvenance};
 use crate::router::Router;
 use crate::tools::{
-    PreparedCall, ToolCatalog, ToolDefinition, ToolLoop, ToolLoopIdentity, ToolLoopResult, ToolUse,
+    refined_effect_for_approval, PreparedCall, ToolCatalog, ToolDefinition, ToolLoop,
+    ToolLoopIdentity, ToolLoopResult, ToolUse,
 };
 
 /// Preserve a provider response as submitted wire source.
@@ -656,6 +658,13 @@ pub(crate) type ActiveToolUsesMap = Arc<
     >,
 >;
 
+/// Per-query completed tool-result hashes, keyed by `name:input`.
+///
+/// A loop-eligible tool is refused on the third identical-args call only when
+/// the last two completed results were byte-identical.
+pub(crate) type ToolCallHistory =
+    Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, Vec<u64>>>>>;
+
 /// Refresh the ContextLine status-strip entries and the terminal window/tab title.
 ///
 /// `context_lines` is the total number of lines to show including the 🧠 stats
@@ -813,45 +822,97 @@ async fn persist_completed_turn_memory(
     refresh_context_strip(memory_system, session_label, cwd, status_bar, context_lines).await;
 }
 
-/// A third identical (name, arguments) call in one query is treated as a loop.
-/// The first repeat is allowed: models often retry a command after reading its
-/// output, or re-read a file after an edit. Empty `{}` inputs are skipped —
-/// Run/Clear/View are intentionally stateless.
+/// A third identical (name, arguments) call in one query is treated as a loop
+/// only when the tool is loop-eligible and the last two completed results were
+/// byte-identical. The first repeat is allowed: models often retry a command
+/// after reading its output, or re-read a file after an edit. Empty `{}`
+/// inputs are skipped — Run/Clear/View are intentionally stateless. Mutating
+/// tools (write/edit/patch/non-readonly bash, and anything whose refined
+/// effect is not a read) are never loop-eligible.
 const IDENTICAL_TOOL_CALL_LIMIT: u32 = 3;
 
 fn tool_input_is_empty(input: &serde_json::Value) -> bool {
     input == &serde_json::json!({})
 }
 
+fn loop_call_key(name: &str, input: &serde_json::Value) -> String {
+    format!("{name}:{input}")
+}
+
+fn hash_tool_output(output: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    output.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn effect_is_loop_eligible(effect: ExecutionEffect) -> bool {
+    matches!(
+        effect,
+        ExecutionEffect::Pure
+            | ExecutionEffect::VmRead
+            | ExecutionEffect::WorkspaceRead
+            | ExecutionEffect::ExternalRead
+    )
+}
+
 fn identical_tool_call_loop_error(name: &str, call_count: u32) -> String {
     format!(
-        "loop detected: {name} called {call_count} times with the same arguments\n\
-         Repeating this exact call is unlikely to produce new information. \
+        "loop detected: {name} called {call_count} times with the same arguments and the same result\n\
+         Repeating this call produced no new information. \
          Inspect the previous results or use a different command."
     )
 }
 
-async fn record_tool_call_and_detect_loop(
-    tool_call_history: &Arc<
-        RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
-    >,
+async fn detect_identical_tool_call_loop(
+    tool_call_history: &ToolCallHistory,
     query_id: Uuid,
     name: &str,
     input: &serde_json::Value,
+    declared_effect: ExecutionEffect,
 ) -> Option<String> {
     if tool_input_is_empty(input) {
         return None;
     }
-    let call_key = format!("{name}:{input}");
-    let call_count = {
-        let mut history = tool_call_history.write().await;
-        let entry = history.entry(query_id).or_default();
-        let count = entry.entry(call_key).or_insert(0);
-        *count += 1;
-        *count
-    };
-    (call_count >= IDENTICAL_TOOL_CALL_LIMIT)
-        .then(|| identical_tool_call_loop_error(name, call_count))
+    let refined = refined_effect_for_approval(declared_effect, name, input);
+    if !effect_is_loop_eligible(refined) {
+        return None;
+    }
+    let call_key = loop_call_key(name, input);
+    let needed = (IDENTICAL_TOOL_CALL_LIMIT - 1) as usize;
+    let history = tool_call_history.read().await;
+    let hashes = history.get(&query_id)?.get(&call_key)?;
+    if hashes.len() < needed {
+        return None;
+    }
+    let suffix = &hashes[hashes.len() - needed..];
+    let first = suffix[0];
+    suffix
+        .iter()
+        .all(|hash| *hash == first)
+        .then(|| identical_tool_call_loop_error(name, hashes.len() as u32 + 1))
+}
+
+/// Record a completed tool output so later identical-args calls can compare results.
+pub(crate) async fn record_completed_tool_result(
+    tool_call_history: &ToolCallHistory,
+    query_id: Uuid,
+    name: &str,
+    input: &serde_json::Value,
+    output: &str,
+) {
+    if tool_input_is_empty(input) {
+        return;
+    }
+    let call_key = loop_call_key(name, input);
+    let hash = hash_tool_output(output);
+    let mut history = tool_call_history.write().await;
+    history
+        .entry(query_id)
+        .or_default()
+        .entry(call_key)
+        .or_default()
+        .push(hash);
 }
 
 /// Register a tool row and emit a terminal `ToolResult` without spawning.
@@ -895,7 +956,8 @@ async fn register_unexecuted_tool_result(
 /// to each contain an identical 115-line block.  This function is the single
 /// source of truth for:
 ///
-/// * Loop detection (same tool+args called three times → terminal error)
+/// * Loop detection (loop-eligible tool, same args, last two completed
+///   results identical → refuse the third)
 /// * Plan-mode tool gating (blocks Write/Edit/Bash in Planning mode)
 /// * WorkUnit row creation and `active_tool_uses` registration
 /// * Inline dispatch for `AskUserQuestion` and `PresentPlan`
@@ -908,9 +970,7 @@ pub(super) async fn dispatch_tool_uses(
     round_token: crate::cli::conversation::ToolRoundToken,
     work_unit: &Arc<crate::cli::messages::WorkUnit>,
     mode: &Arc<RwLock<ReplMode>>,
-    tool_call_history: &Arc<
-        RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
-    >,
+    tool_call_history: &ToolCallHistory,
     event_tx: &mpsc::UnboundedSender<ReplEvent>,
     active_tool_uses: &ActiveToolUsesMap,
     tui_renderer: &Arc<tokio::sync::Mutex<crate::cli::tui::TuiRenderer>>,
@@ -940,11 +1000,16 @@ pub(super) async fn dispatch_tool_uses(
         .and_then(|metadata| metadata.effect_audit);
     let current_mode = mode.read().await;
     for tool_use in tool_uses {
-        if let Some(error_msg) = record_tool_call_and_detect_loop(
+        let declared_effect = {
+            let executor = tool_coordinator.tool_executor().lock().await;
+            executor.registry().declared_effect(&tool_use.name)
+        };
+        if let Some(error_msg) = detect_identical_tool_call_loop(
             tool_call_history,
             query_id,
             &tool_use.name,
             &tool_use.input,
+            declared_effect,
         )
         .await
         {
@@ -1116,9 +1181,7 @@ async fn dispatch_prepared_calls(
     round_token: crate::cli::conversation::ToolRoundToken,
     work_unit: &Arc<crate::cli::messages::WorkUnit>,
     mode: &Arc<RwLock<ReplMode>>,
-    tool_call_history: &Arc<
-        RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
-    >,
+    tool_call_history: &ToolCallHistory,
     event_tx: &mpsc::UnboundedSender<ReplEvent>,
     active_tool_uses: &ActiveToolUsesMap,
     tui_renderer: &Arc<tokio::sync::Mutex<crate::cli::tui::TuiRenderer>>,
@@ -1217,9 +1280,7 @@ pub(crate) async fn process_query_with_tools(
     auto_compact_enabled: bool,
     summary_gen: Arc<dyn Generator>,
     summary_cache: crate::cli::conversation_compactor::SharedSummaryCache,
-    tool_call_history: Arc<
-        RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
-    >,
+    tool_call_history: ToolCallHistory,
     wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
     persona_system_prompt: String,
 ) {
@@ -4381,24 +4442,31 @@ mod tests {
 
     #[test]
     fn test_identical_tool_call_loop_error_is_honest() {
-        let msg = identical_tool_call_loop_error("bash", 3);
+        let msg = identical_tool_call_loop_error("read", 3);
         assert!(
-            msg.contains("loop detected: bash called 3 times with the same arguments"),
-            "first line must be a short, honest summary; got {msg}"
+            msg.contains(
+                "loop detected: read called 3 times with the same arguments and the same result"
+            ),
+            "first line must name the repeated call and the compared result; got {msg}"
         );
         assert!(
-            !msg.to_lowercase().contains("same result"),
-            "loop detection does not inspect results; claiming it did is a lie: {msg}"
+            msg.contains("produced no new information"),
+            "remedy must tell the model the repeat was uninformative; got {msg}"
         );
         assert!(
             !msg.contains("PresentPlan"),
-            "a bash loop during coding is not a planning-mode cue: {msg}"
+            "a loop during coding is not a planning-mode cue: {msg}"
         );
         assert_eq!(IDENTICAL_TOOL_CALL_LIMIT, 3);
         assert!(tool_input_is_empty(&serde_json::json!({})));
         assert!(!tool_input_is_empty(
             &serde_json::json!({"command": "git status"})
         ));
+        assert!(effect_is_loop_eligible(ExecutionEffect::WorkspaceRead));
+        assert!(effect_is_loop_eligible(ExecutionEffect::ExternalRead));
+        assert!(!effect_is_loop_eligible(ExecutionEffect::WorkspaceWrite));
+        assert!(!effect_is_loop_eligible(ExecutionEffect::ExternalWrite));
+        assert!(!effect_is_loop_eligible(ExecutionEffect::Unclassified));
     }
 
     fn bash_tool_use(id: &str, command: &str) -> crate::tools::ToolUse {
@@ -4409,12 +4477,28 @@ mod tests {
         }
     }
 
+    fn read_tool_use(id: &str, path: &std::path::Path) -> crate::tools::ToolUse {
+        crate::tools::ToolUse {
+            id: id.to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({"file_path": path.to_string_lossy()}),
+        }
+    }
+
+    fn named_tool_use(id: &str, name: &str, input: serde_json::Value) -> crate::tools::ToolUse {
+        crate::tools::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        }
+    }
+
     struct LoopDispatchHarness {
         query_id: Uuid,
         conversation: Arc<RwLock<ConversationHistory>>,
         work_unit: Arc<crate::cli::messages::WorkUnit>,
         mode: Arc<RwLock<ReplMode>>,
-        tool_call_history: Arc<RwLock<HashMap<Uuid, HashMap<String, u32>>>>,
+        tool_call_history: ToolCallHistory,
         event_tx: mpsc::UnboundedSender<ReplEvent>,
         events: mpsc::UnboundedReceiver<ReplEvent>,
         active_tool_uses: ActiveToolUsesMap,
@@ -4443,6 +4527,10 @@ mod tests {
             let mode = Arc::new(RwLock::new(ReplMode::Normal));
             let mut registry = ToolRegistry::new();
             registry.register(Box::new(crate::tools::BashTool));
+            registry.register(Box::new(crate::tools::ReadTool));
+            registry.register(Box::new(crate::tools::WriteTool));
+            registry.register(Box::new(crate::tools::EditTool));
+            registry.register(Box::new(crate::tools::PatchTool));
             let tempdir =
                 tempfile::tempdir().expect("isolated tool-pattern store for loop dispatch");
             let executor = ToolExecutor::new(
@@ -4481,6 +4569,9 @@ mod tests {
         }
 
         async fn dispatch_round(&mut self, tool_use: crate::tools::ToolUse) -> Vec<ReplEvent> {
+            let tool_id = tool_use.id.clone();
+            let name = tool_use.name.clone();
+            let input = tool_use.input.clone();
             let round_token = self
                 .conversation
                 .write()
@@ -4519,7 +4610,46 @@ mod tests {
             )
             .await;
             self.conversation.write().await.abort_staged(self.query_id);
+            let events = self.collect_until_result_or_approval(&tool_id).await;
+            // Same recorder `handle_tool_result` uses; this harness does not
+            // run the event loop, so completed spawn results are recorded here.
+            if loop_error_from_events(&events, &tool_id).is_none() {
+                if let Some(output) = tool_output_from_events(&events, &tool_id) {
+                    record_completed_tool_result(
+                        &self.tool_call_history,
+                        self.query_id,
+                        &name,
+                        &input,
+                        &output,
+                    )
+                    .await;
+                }
+            }
+            events
+        }
+
+        async fn collect_until_result_or_approval(&mut self, tool_id: &str) -> Vec<ReplEvent> {
             let mut collected = Vec::new();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if loop_error_from_events(&collected, tool_id).is_some()
+                    || tool_output_from_events(&collected, tool_id).is_some()
+                {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, self.events.recv()).await {
+                    Ok(Some(ReplEvent::ToolApprovalNeeded { response_tx, .. })) => {
+                        self.held_approvals.push(response_tx);
+                        break;
+                    }
+                    Ok(Some(other)) => collected.push(other),
+                    Ok(None) | Err(_) => break,
+                }
+            }
             while let Ok(event) = self.events.try_recv() {
                 match event {
                     ReplEvent::ToolApprovalNeeded { response_tx, .. } => {
@@ -4541,67 +4671,39 @@ mod tests {
                 tool_id: id,
                 result: Err(error),
                 ..
-            } if id == tool_id => Some(error),
+            } if id == tool_id && error.to_string().starts_with("loop detected:") => Some(error),
             _ => None,
         })
     }
 
-    /// Production-boundary regression: a second identical bash in the same
-    /// query is a normal retry, not a loop. The third identical call is the
-    /// loop, and its ToolResult must land on the labeled bash row rather than
-    /// a fallback WorkUnit titled with the raw provider tool id.
-    #[tokio::test]
-    async fn test_dispatch_allows_one_identical_bash_retry_then_blocks_the_third() {
-        let mut harness = LoopDispatchHarness::new();
-        let command = "git status --porcelain";
-        let first = bash_tool_use("call_loop_first", command);
-        let second = bash_tool_use("call_loop_second", command);
-        let third = bash_tool_use("call_tyIrmyNxiUxYGF7QhOT1vslZ", command);
+    fn tool_output_from_events(events: &[ReplEvent], tool_id: &str) -> Option<String> {
+        events.iter().find_map(|event| match event {
+            ReplEvent::ToolResult {
+                tool_id: id,
+                result,
+                ..
+            } if id == tool_id => match result {
+                Ok(text) => Some(text.clone()),
+                Err(error) => Some(error.to_string()),
+            },
+            _ => None,
+        })
+    }
 
-        let first_events = harness.dispatch_round(first).await;
-        assert!(
-            loop_error_from_events(&first_events, "call_loop_first").is_none(),
-            "the first bash must run, not loop-detect; events={first_events:?}"
-        );
-
-        let second_events = harness.dispatch_round(second).await;
-        assert!(
-            loop_error_from_events(&second_events, "call_loop_second").is_none(),
-            "the second identical bash is a retry, not a loop; events={second_events:?}"
-        );
-
-        let third_events = harness.dispatch_round(third.clone()).await;
-        let error = loop_error_from_events(&third_events, "call_tyIrmyNxiUxYGF7QhOT1vslZ")
-            .unwrap_or_else(|| {
-                panic!(
-                    "the third identical bash must be refused as a loop; events={third_events:?}"
-                )
-            })
-            .to_string();
-        assert!(
-            error.contains("loop detected: bash called 3 times with the same arguments"),
-            "loop copy must be honest about call count, not fabricated results: {error}"
-        );
-        assert!(
-            !error.to_lowercase().contains("same result"),
-            "loop detection does not inspect results: {error}"
-        );
-        assert!(
-            !error.contains("PresentPlan"),
-            "coding-mode bash loop must not tell the model to PresentPlan: {error}"
-        );
-
+    async fn assert_blocked_call_keeps_labeled_row(
+        harness: &LoopDispatchHarness,
+        tool_id: &str,
+        expected_name: &str,
+    ) {
         let active = harness.active_tool_uses.read().await;
         assert!(
-            active.contains_key("call_tyIrmyNxiUxYGF7QhOT1vslZ"),
+            active.contains_key(tool_id),
             "the blocked call must stay in active_tool_uses so handle_tool_result \
-             updates the bash row instead of a raw-id fallback; keys={:?}",
+             updates the labeled row instead of a raw-id fallback; keys={:?}",
             active.keys().collect::<Vec<_>>()
         );
-        let (name, _, unit, row_idx) = active
-            .get("call_tyIrmyNxiUxYGF7QhOT1vslZ")
-            .expect("blocked id registered");
-        assert_eq!(name, "bash");
+        let (name, _, unit, row_idx) = active.get(tool_id).expect("blocked id registered");
+        assert_eq!(name, expected_name);
         let projected = unit
             .transcript_row(&crate::theme::ColorScheme::default())
             .expect("blocked call still belongs to the query WorkUnit");
@@ -4616,12 +4718,12 @@ mod tests {
             )
         });
         assert!(
-            call.label.contains("bash"),
-            "blocked row must keep the bash label, not the provider id; got {}",
+            call.label.contains(expected_name),
+            "blocked row must keep the {expected_name} label, not the provider id; got {}",
             call.label
         );
         assert!(
-            !call.label.contains("call_tyIrmyNxiUxYGF7QhOT1vslZ"),
+            !call.label.contains(tool_id),
             "blocked row must not be titled with the raw provider tool id; got {}",
             call.label
         );
@@ -4629,7 +4731,7 @@ mod tests {
             projected
                 .children
                 .iter()
-                .all(|child| !child.label.contains("call_tyIrmyNxiUxYGF7QhOT1vslZ")),
+                .all(|child| !child.label.contains(tool_id)),
             "no Tools row may be titled with the raw provider tool id; labels={:?}",
             projected
                 .children
@@ -4637,6 +4739,172 @@ mod tests {
                 .map(|child| child.label.clone())
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn assert_honest_loop_error(error: &str, name: &str) {
+        assert!(
+            error.contains(&format!(
+                "loop detected: {name} called 3 times with the same arguments and the same result"
+            )),
+            "loop copy must name the compared result; got {error}"
+        );
+        assert!(
+            error.contains("produced no new information"),
+            "loop copy must say the repeat was uninformative; got {error}"
+        );
+        assert!(
+            !error.contains("PresentPlan"),
+            "coding-mode loop must not tell the model to PresentPlan: {error}"
+        );
+    }
+
+    /// Production-boundary regression: a third identical read of an unchanged
+    /// file is a loop because the completed results were byte-identical. The
+    /// blocked ToolResult must land on the labeled read row.
+    #[tokio::test]
+    async fn test_dispatch_third_identical_read_with_same_result_is_a_loop() {
+        let dir = tempfile::tempdir().expect("isolated file for identical-read loop");
+        let path = dir.path().join("same.txt");
+        std::fs::write(&path, "unchanged\n").expect("write identical-read fixture");
+
+        let mut harness = LoopDispatchHarness::new();
+        let first = harness
+            .dispatch_round(read_tool_use("call_read_first", &path))
+            .await;
+        assert!(
+            loop_error_from_events(&first, "call_read_first").is_none(),
+            "the first read must run; events={first:?}"
+        );
+
+        let second = harness
+            .dispatch_round(read_tool_use("call_read_second", &path))
+            .await;
+        assert!(
+            loop_error_from_events(&second, "call_read_second").is_none(),
+            "the second identical read is allowed even with the same result; events={second:?}"
+        );
+
+        let third_id = "call_tyIrmyNxiUxYGF7QhOT1vslZ";
+        let third = harness.dispatch_round(read_tool_use(third_id, &path)).await;
+        let error = loop_error_from_events(&third, third_id)
+            .unwrap_or_else(|| {
+                panic!("the third identical read with the same result must be a loop; events={third:?}")
+            })
+            .to_string();
+        assert_honest_loop_error(&error, "read");
+        assert_blocked_call_keeps_labeled_row(&harness, third_id, "read").await;
+    }
+
+    /// Production-boundary regression: a repeated read whose result changed is
+    /// progress, so the second and third identical-args calls still run.
+    #[tokio::test]
+    async fn test_dispatch_identical_read_with_different_result_is_allowed() {
+        let dir = tempfile::tempdir().expect("isolated file for changing-read loop");
+        let path = dir.path().join("changing.txt");
+        std::fs::write(&path, "v1\n").expect("write first read fixture");
+
+        let mut harness = LoopDispatchHarness::new();
+        let first = harness
+            .dispatch_round(read_tool_use("call_read_v1", &path))
+            .await;
+        assert!(
+            loop_error_from_events(&first, "call_read_v1").is_none(),
+            "the first read must run; events={first:?}"
+        );
+
+        std::fs::write(&path, "v2\n").expect("change file between identical reads");
+        let second = harness
+            .dispatch_round(read_tool_use("call_read_v2", &path))
+            .await;
+        assert!(
+            loop_error_from_events(&second, "call_read_v2").is_none(),
+            "the second identical read with a different result is progress; events={second:?}"
+        );
+
+        let third = harness
+            .dispatch_round(read_tool_use("call_read_v3", &path))
+            .await;
+        assert!(
+            loop_error_from_events(&third, "call_read_v3").is_none(),
+            "after differing results the third identical-args read must still run; events={third:?}"
+        );
+    }
+
+    /// Production-boundary regression: mutating tools are not loop-eligible.
+    /// A third identical write/edit/patch/non-readonly bash must still dispatch.
+    #[tokio::test]
+    async fn test_dispatch_does_not_loop_detect_mutating_tools() {
+        let cases = [
+            (
+                "write",
+                serde_json::json!({"path": "/tmp/loop-write.txt", "contents": "x"}),
+            ),
+            (
+                "edit",
+                serde_json::json!({
+                    "path": "/tmp/loop-edit.txt",
+                    "old_string": "a",
+                    "new_string": "b"
+                }),
+            ),
+            (
+                "patch",
+                serde_json::json!({
+                    "path": "/tmp/loop-patch.txt",
+                    "diff": "--- a/x\n+++ b/x\n"
+                }),
+            ),
+            (
+                "bash",
+                serde_json::json!({"command": "git status --porcelain"}),
+            ),
+            ("bash", serde_json::json!({"command": "ls | cat"})),
+        ];
+        for (name, input) in cases {
+            let mut harness = LoopDispatchHarness::new();
+            for index in 1..=3 {
+                let id = format!("call_{name}_{index}");
+                let events = harness
+                    .dispatch_round(named_tool_use(&id, name, input.clone()))
+                    .await;
+                assert!(
+                    loop_error_from_events(&events, &id).is_none(),
+                    "mutating tool {name} must not loop-detect on call {index}; events={events:?}"
+                );
+            }
+        }
+    }
+
+    /// Production-boundary regression: readonly bash (no shell operators) is
+    /// still loop-eligible when completed results are byte-identical.
+    #[tokio::test]
+    async fn test_dispatch_readonly_bash_with_identical_results_is_a_loop() {
+        let mut harness = LoopDispatchHarness::new();
+        let first = harness
+            .dispatch_round(bash_tool_use("call_pwd_first", "pwd"))
+            .await;
+        assert!(
+            loop_error_from_events(&first, "call_pwd_first").is_none(),
+            "the first readonly bash must run; events={first:?}"
+        );
+        let second = harness
+            .dispatch_round(bash_tool_use("call_pwd_second", "pwd"))
+            .await;
+        assert!(
+            loop_error_from_events(&second, "call_pwd_second").is_none(),
+            "the second identical readonly bash is allowed; events={second:?}"
+        );
+        let third_id = "call_pwd_third";
+        let third = harness.dispatch_round(bash_tool_use(third_id, "pwd")).await;
+        let error = loop_error_from_events(&third, third_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the third identical readonly bash with the same result must be a loop; events={third:?}"
+                )
+            })
+            .to_string();
+        assert_honest_loop_error(&error, "bash");
+        assert_blocked_call_keeps_labeled_row(&harness, third_id, "bash").await;
     }
 
     /// Production-boundary regression for #426: `dispatch_tool_uses` is the

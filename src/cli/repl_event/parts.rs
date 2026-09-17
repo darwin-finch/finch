@@ -114,8 +114,7 @@ pub struct LlmGeneration {
 pub struct LlmTools {
     pub definitions: Arc<RwLock<Vec<crate::tools::ToolDefinition>>>,
     pub coordinator: super::tool_execution::ToolExecutionCoordinator,
-    pub call_history:
-        Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
+    pub call_history: super::query_processor::ToolCallHistory,
     pub active_uses: super::query_processor::ActiveToolUsesMap,
 }
 

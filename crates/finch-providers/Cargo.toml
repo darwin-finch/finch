@@ -1,6 +1,6 @@
 [package]
 name = "finch-providers"
-version = "0.7.30"
+version = "0.7.31"
 publish = false
 rust-version = "1.98"
 edition = "2021"
