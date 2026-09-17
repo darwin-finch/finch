@@ -58,6 +58,10 @@ rustup component add rustfmt
 # Rust linter
 rustup component add clippy
 
+# Language server (same 1.98.0 overlay as rustc; required for Grok/editor LSP)
+rustup component add rust-analyzer
+rust-analyzer --version   # must print 1.98.0, not an older stable analyzer
+
 # Cargo tools
 cargo install cargo-watch  # Auto-rebuild on changes
 cargo install cargo-expand # Expand macros for debugging
