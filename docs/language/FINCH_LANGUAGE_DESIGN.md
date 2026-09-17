@@ -2553,11 +2553,11 @@ expansion ancestry. They never parse source bytes. The current symbol-only `quot
 transitional.
 
 **`mixin` vs `,@`.** `,@` is **array-style splice**: it is legal only inside quasiquote and
-spreads list elements into the quoted list. `mixin` is the compile-time word that **places
-syntax back into the program**: this `syntax` value is the next form(s) in the **module being
-compiled** (the compiler treats that tree as source). `mixin` is not runtime `eval`, not `,@`,
-and not D `mixin(string)`. It is not valid as the body of a `define` that is supposed to return
-a function.
+spreads list elements into the quoted list. `(mixin ast)` is **in-place mix-back**: the
+`mixin` form is **replaced**, right there, by the S-expression tree `ast` already is (`syntax`
+is lists plus spans, not text to re-parse). Those forms are then compiled as if they had been
+written at that site. `mixin` is not runtime `eval`, not `,@`, and not D `mixin(string)`. It is
+not valid as the body of a `define` that is supposed to return a function.
 
 **`define` vs `define-syntax`.** `define` / `lambda` bind a **value** (a function is a value).
 `define-syntax` **registers** a `syntax -> syntax` CTFE function in the expander: arguments are
