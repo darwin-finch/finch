@@ -1519,6 +1519,9 @@ pub struct TuiRenderer {
     // Dialog state — tool-approval dialogs shown in the live area.
     pub active_dialog: Option<Dialog>,
     pub active_tabbed_dialog: Option<TabbedDialog>,
+    /// True while `active_dialog` occupies the live surface. A rising edge
+    /// writes one terminal bell (`\x07`); later draws of the same overlay do not.
+    attention_dialog_live: bool,
 
     // Generic flags
     is_active: bool,
@@ -1613,6 +1616,7 @@ impl TuiRenderer {
             expanded_tool: None,
             active_dialog: None,
             active_tabbed_dialog: None,
+            attention_dialog_live: false,
             is_active: false,
             needs_full_refresh: false,
             last_render_error: None,
@@ -1722,6 +1726,7 @@ impl TuiRenderer {
 
             active_dialog: None,
             active_tabbed_dialog: None,
+            attention_dialog_live: false,
 
             is_active: true,
             needs_full_refresh: false,
@@ -1995,9 +2000,14 @@ impl TuiRenderer {
     /// Layout is decided by [`plan_live_frame`], which needs no terminal;
     /// this function only gathers renderer state, paints the result, and
     /// records the frame's measured height so the next erase clears exactly
-    /// the rows that were drawn.
+    /// the rows that were drawn. A newly live approval/AskUser dialog writes
+    /// one terminal bell (`\x07`) after the frame; redraws of that overlay do not.
     pub fn draw_live_area(&mut self) -> Result<()> {
-        let mut stdout = io::stdout();
+        self.draw_live_area_to(&mut io::stdout())
+    }
+
+    /// Paint the live area to `out`. Tests capture the attention bell here.
+    fn draw_live_area_to(&mut self, out: &mut impl Write) -> Result<()> {
         let (term_width, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
         let (term_width, term_h) = (term_width as usize, term_h as usize);
 
@@ -2022,9 +2032,10 @@ impl TuiRenderer {
                 term_h,
                 term_width,
             );
-            let rows = write_tiny_live_frame(&mut stdout, &frame)?;
-            execute!(stdout, EndSynchronizedUpdate)?;
-            stdout.flush()?;
+            let rows = write_tiny_live_frame(out, &frame)?;
+            execute!(out, EndSynchronizedUpdate)?;
+            self.flush_attention_bell(out)?;
+            out.flush()?;
             self.active_rows = rows;
             self.cursor_row_from_top = frame.cursor_row;
             self.accordion.rebuild_hit_regions(&[], 0, term_width);
@@ -2087,13 +2098,25 @@ impl TuiRenderer {
         };
         let frame = plan_live_frame(&inputs, &mut self.autocomplete_state);
 
-        let rows = write_live_frame(&mut stdout, &frame, term_width.max(1))?;
-        execute!(stdout, EndSynchronizedUpdate)?;
-        stdout.flush()?;
+        let rows = write_live_frame(out, &frame, term_width.max(1))?;
+        execute!(out, EndSynchronizedUpdate)?;
+        self.flush_attention_bell(out)?;
+        out.flush()?;
 
         self.active_rows = rows;
         self.cursor_row_from_top = frame.cursor_row;
         self.rebuild_transcript_hit_regions(&frame.visible_live, rows, term_width, term_h);
+        Ok(())
+    }
+
+    /// Write `\x07` when an approval dialog first occupies the live surface.
+    /// Redraws of the same pending overlay, and draws with no dialog, stay silent.
+    fn flush_attention_bell(&mut self, out: &mut impl Write) -> io::Result<()> {
+        let dialog_live = self.active_dialog.is_some();
+        if dialog_live && !self.attention_dialog_live {
+            out.write_all(&[0x07])?;
+        }
+        self.attention_dialog_live = dialog_live;
         Ok(())
     }
 
@@ -9148,5 +9171,82 @@ mod draw_dialog_tests {
         }));
         assert!(wrapped.iter().all(|line| line.starts_with("\x1b[31m")));
         assert!(wrapped.iter().all(|line| line.ends_with("\x1b[0m")));
+    }
+}
+
+#[cfg(test)]
+mod attention_bell_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn headless_renderer() -> TuiRenderer {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        TuiRenderer::new_headless(output, Arc::new(StatusBar::new()), colors)
+    }
+
+    fn bell_count(bytes: &[u8]) -> usize {
+        bytes.iter().filter(|byte| **byte == 0x07).count()
+    }
+
+    /// Presenting a tool-approval dialog must write BEL once; a redraw of that
+    /// same pending overlay must stay silent. A later new approval bells again.
+    #[test]
+    fn test_presenting_tool_approval_dialog_emits_bell_once() {
+        let mut renderer = headless_renderer();
+        renderer.active_dialog = Some(Dialog::tool_approval("Write", "create foo.rs"));
+
+        let mut first = Vec::new();
+        renderer
+            .draw_live_area_to(&mut first)
+            .expect("first live draw of a tool-approval dialog must succeed");
+        assert_eq!(
+            bell_count(&first),
+            1,
+            "presenting a tool-approval dialog must emit BEL (\\x07) exactly once; \
+             bells={} payload_len={}",
+            bell_count(&first),
+            first.len()
+        );
+
+        let mut redraw = Vec::new();
+        renderer
+            .draw_live_area_to(&mut redraw)
+            .expect("redraw of the same pending approval must succeed");
+        assert_eq!(
+            bell_count(&redraw),
+            0,
+            "a redraw of the same pending approval must not bell again; \
+             bells={} payload_len={}",
+            bell_count(&redraw),
+            redraw.len()
+        );
+
+        renderer.active_dialog = None;
+        let mut cleared = Vec::new();
+        renderer
+            .draw_live_area_to(&mut cleared)
+            .expect("draw after dismissing the dialog must succeed");
+        assert_eq!(
+            bell_count(&cleared),
+            0,
+            "clearing the dialog must not emit a bell; bells={} payload_len={}",
+            bell_count(&cleared),
+            cleared.len()
+        );
+
+        renderer.active_dialog = Some(Dialog::tool_approval("Edit", "edit foo.rs"));
+        let mut next = Vec::new();
+        renderer
+            .draw_live_area_to(&mut next)
+            .expect("live draw of a new pending approval must succeed");
+        assert_eq!(
+            bell_count(&next),
+            1,
+            "a new pending approval after the previous one dismissed must bell once; \
+             bells={} payload_len={}",
+            bell_count(&next),
+            next.len()
+        );
     }
 }

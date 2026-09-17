@@ -25,6 +25,10 @@ draws a view, and the caller converts.
 | `Dialog::tool_approval(name, summary)` | a name and a summary line | Finch `ToolUse`, in `cli::repl_event::tool_display::tool_approval_dialog` |
 | [`cell_format::workbook_cell_to_string`](cell_format.rs) | one cell as text | calamine `Data`, inside `spreadsheet_preview_rows` |
 
+When `active_dialog` first occupies the live surface, `draw_live_area` writes one terminal bell
+(`\x07`). Redraws of the same pending overlay stay silent. OS notifications, duration-threshold
+run-complete toasts, and a config off-switch remain follow-up on #752 (notify on attention-needed).
+
 Splitting the poset widget out of the framework (rather than generalising it) remains open.
 Production does **not** convert at `set_poset` and does **not** draw `GraphView`:
 
