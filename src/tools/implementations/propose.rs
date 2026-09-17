@@ -64,6 +64,44 @@ pub enum ProposalDecision {
     Cancel,
 }
 
+/// User-editable proposal actions. [`parse_proposal_decision`] and the
+/// generated artifact header both iterate [`ProposalAction::ALL`], so a new
+/// accepted directive cannot exist in the parser without appearing in the
+/// file the user edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProposalAction {
+    Execute,
+    Cancel,
+    Chat,
+}
+
+impl ProposalAction {
+    const ALL: &'static [Self] = &[Self::Execute, Self::Cancel, Self::Chat];
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|action| action.name() == name)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Cancel => "cancel",
+            Self::Chat => "chat",
+        }
+    }
+
+    fn help(self) -> &'static str {
+        match self {
+            Self::Execute => "run it (default)",
+            Self::Cancel => "reject it",
+            Self::Chat => "keep it and ask for changes",
+        }
+    }
+}
+
 const PROPOSAL_BODY_MARKER: &str = "---- Finch proposal body ----";
 
 fn proposal_directive(line: &str) -> Option<&str> {
@@ -107,13 +145,17 @@ pub fn parse_proposal_decision(content: &str) -> ProposalDecision {
     };
     let header = &content[..header_end];
     let body = &content[body_start..];
-    let action = header.lines().filter_map(proposal_directive).last();
+    let action = header
+        .lines()
+        .filter_map(proposal_directive)
+        .last()
+        .and_then(ProposalAction::from_name);
     match action {
-        Some("cancel") => ProposalDecision::Cancel,
-        Some("chat") => ProposalDecision::Chat {
+        Some(ProposalAction::Cancel) => ProposalDecision::Cancel,
+        Some(ProposalAction::Chat) => ProposalDecision::Chat {
             context: body.to_string(),
         },
-        Some("execute") if !body.trim().is_empty() => ProposalDecision::Execute {
+        Some(ProposalAction::Execute) if !body.trim().is_empty() => ProposalDecision::Execute {
             source: body.to_string(),
         },
         _ => ProposalDecision::Cancel,
@@ -1326,16 +1368,35 @@ pub fn build_script(description: &str, code: &str) -> String {
 /// Format an editable source artifact without making its language executable.
 /// The comment marker belongs to the artifact language, so an accepted Lisp
 /// proposal is still valid Lisp rather than a shell file with a renamed suffix.
+fn append_proposal_header(out: &mut String, comment_prefix: &str) {
+    out.push_str(comment_prefix);
+    out.push_str(" Finch proposal — edit the action line below, then save and quit.\n");
+    let name_width = ProposalAction::ALL
+        .iter()
+        .map(|action| action.name().len())
+        .max()
+        .unwrap_or(0);
+    for action in ProposalAction::ALL {
+        out.push_str(comment_prefix);
+        out.push_str("   action=");
+        out.push_str(action.name());
+        out.push_str(&" ".repeat(name_width.saturating_sub(action.name().len()) + 3));
+        out.push_str(action.help());
+        out.push('\n');
+    }
+    out.push_str(comment_prefix);
+    out.push_str(" finch: action=");
+    out.push_str(ProposalAction::Execute.name());
+    out.push('\n');
+}
+
 fn build_artifact(description: &str, code: &str, comment_prefix: &str, executable: bool) -> String {
     let mut out = if executable {
         String::from("#!/bin/bash\n")
     } else {
         String::new()
     };
-    out.push_str(comment_prefix);
-    out.push_str(" Finch proposal: save and quit to accept; set action=cancel to reject or action=chat to request changes.\n");
-    out.push_str(comment_prefix);
-    out.push_str(" finch: action=execute\n");
+    append_proposal_header(&mut out, comment_prefix);
     for line in description.lines() {
         let clean = crate::cli::diff::sanitize_terminal(line);
         let candidate = format!("{comment_prefix} {clean}");
@@ -1798,11 +1859,62 @@ mod tests {
     }
 
     #[test]
-    fn generated_shell_proposal_exposes_all_review_actions() {
-        let artifact = build_script("Inspect files", "find . -type f");
-        assert!(artifact.contains("# finch: action=execute\n"));
-        assert!(artifact.contains("action=cancel to reject"));
-        assert!(artifact.contains("action=chat to request changes"));
+    fn generated_proposal_header_names_the_action_line_and_every_parser_value() {
+        assert_eq!(
+            ProposalAction::ALL
+                .iter()
+                .map(|action| action.name())
+                .collect::<Vec<_>>(),
+            ["execute", "cancel", "chat"],
+            "every name parse_proposal_decision accepts must be listed here so the generated header cannot silently omit it"
+        );
+        for prefix in ["#", ";;", "\\"] {
+            let artifact = build_artifact("Inspect files", "echo hi\n", prefix, false);
+            let header = artifact
+                .split_once(PROPOSAL_BODY_MARKER)
+                .map(|(head, _)| head)
+                .unwrap_or(&artifact);
+            assert!(
+                header.contains("edit the action line"),
+                "header must name the action line as the thing to edit for prefix {prefix:?}; got {header:?}"
+            );
+            assert!(
+                header.contains("save and quit"),
+                "header must say to save and quit for prefix {prefix:?}; got {header:?}"
+            );
+            assert!(
+                header.contains(&format!("{prefix} finch: action=execute\n")),
+                "action line must use comment_prefix={prefix:?}; got {header:?}"
+            );
+            for action in ProposalAction::ALL {
+                assert!(
+                    header.contains(&format!("action={}", action.name())),
+                    "header must advertise parser-accepted action {:?} for prefix {prefix:?}; got {header:?}",
+                    action.name()
+                );
+                assert_eq!(ProposalAction::from_name(action.name()), Some(*action));
+            }
+            assert_eq!(
+                parse_proposal_decision(&artifact),
+                ProposalDecision::Execute {
+                    source: "echo hi\n".into()
+                },
+                "enumerating action=cancel in the {prefix:?} header must not reject the default proposal"
+            );
+        }
+    }
+
+    #[test]
+    fn unprefixed_action_assignment_does_not_select_cancel() {
+        assert_eq!(
+            parse_proposal_decision(
+                "# action=cancel\n# finch: action=execute\n# ---- Finch proposal body ----\necho hi\n"
+            ),
+            ProposalDecision::Execute {
+                source: "echo hi\n".into()
+            },
+            "copying action=cancel without the finch: prefix must not reject the proposal"
+        );
     }
 
     #[test]
@@ -1817,7 +1929,7 @@ mod tests {
     #[test]
     fn lisp_artifacts_receive_lisp_comment_headers() {
         let artifact = build_artifact("Explain intent", "(say \"ok\")", ";;", false);
-        assert!(artifact.starts_with(";; Finch proposal:"));
+        assert!(artifact.starts_with(";; Finch proposal"));
         assert!(artifact.contains(";; finch: action=execute\n"));
         assert!(artifact.contains(";; Explain intent\n"));
         assert!(artifact.contains(";; ---- Finch proposal body ----\n"));
@@ -1845,7 +1957,7 @@ mod tests {
             build_review_artifact("Write x", "--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+generated\n");
         let returned = format!(
             "{}\n# please use a map instead\n",
-            expected.replace("action=execute", "action=chat")
+            expected.replace("finch: action=execute", "finch: action=chat")
         );
         assert_eq!(
             proposal_chat_context(&returned, &expected),

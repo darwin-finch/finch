@@ -48,8 +48,8 @@ if [[ "$declared_rust_version" != "$expected_rust_version" ]]; then
   exit 1
 fi
 
-if ! grep -Fxq 'components = ["clippy", "rustfmt"]' "$toolchain_file"; then
-  echo "rust-toolchain.toml must install exactly the required clippy and rustfmt components" >&2
+if ! grep -Fxq 'components = ["clippy", "rustfmt", "rust-analyzer"]' "$toolchain_file"; then
+  echo "rust-toolchain.toml must install clippy, rustfmt, and rust-analyzer" >&2
   exit 1
 fi
 

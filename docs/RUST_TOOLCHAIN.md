@@ -1,9 +1,14 @@
 # Rust Toolchain Contract
 
 Finch's tested and release toolchain is exactly Rust 1.98.0. The repository-owned
-`rust-toolchain.toml` selects that compiler together with rustfmt, Clippy, and the standard-library
-targets used by supported CI and release builds. Authoritative CI and release workflows must pin
-the same version; `tests/toolchain_contract.sh` rejects drift or an unqualified moving `stable`.
+`rust-toolchain.toml` selects that compiler together with rustfmt, Clippy, rust-analyzer, and the
+standard-library targets used by supported CI and release builds. rust-analyzer must come from this
+same 1.98.0 overlay: `~/.cargo/bin/rust-analyzer` is a rustup shim, and a missing component makes
+editors and Grok report that no Rust language server is configured. Authoritative CI and release
+workflows must pin the same compiler version; `tests/toolchain_contract.sh` rejects drift or an
+unqualified moving `stable`. CI jobs that pass an explicit `components:` list to
+`dtolnay/rust-toolchain` still only install what those jobs compile with; they do not have to
+invoke rust-analyzer.
 
 This tested/release version is not an MSRV claim. `Cargo.toml` declares `rust-version = "1.98"`
 (the pinned channel's major.minor), and `tests/toolchain_contract.sh` rejects drift between that

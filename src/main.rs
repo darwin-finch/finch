@@ -1423,24 +1423,25 @@ fn print_daemon_client_details(bind_address: &str) {
 
 /// Stop the running daemon
 fn run_daemon_stop() -> Result<()> {
-    use finch::daemon::DaemonLifecycle;
+    use finch::daemon::{DaemonLifecycle, DaemonStopOutcome};
 
     let lifecycle = DaemonLifecycle::new()?;
 
-    // Check if daemon is running
-    if !lifecycle.is_running() {
-        println!("Daemon is not running");
-        return Ok(());
+    // Always run stop_daemon, including when is_running is false. A crashed
+    // daemon leaves a pid file (and often a socket) whose process is gone;
+    // skipping cleanup is what printed "Daemon is not running" while those
+    // leftovers remained.
+    if lifecycle.is_running() {
+        let pid = lifecycle.read_pid()?;
+        println!("Stopping daemon (PID: {})...", pid);
     }
 
-    // Get PID for display
-    let pid = lifecycle.read_pid()?;
-    println!("Stopping daemon (PID: {})...", pid);
-
-    // Stop daemon
-    lifecycle.stop_daemon()?;
-
-    println!("✓ Daemon stopped successfully");
+    match lifecycle.stop_daemon()? {
+        DaemonStopOutcome::Stopped { .. } => {
+            println!("✓ Daemon stopped successfully");
+        }
+        outcome => println!("{outcome}"),
+    }
     Ok(())
 }
 
@@ -1454,6 +1455,10 @@ async fn run_daemon_status() -> Result<()> {
     if !lifecycle.is_running() {
         use crossterm::style::Stylize as _;
         println!("{}", "⚠ Daemon is not running".yellow().bold());
+        if lifecycle.has_stale_files() {
+            println!("  Leftover pid or socket files remain from a crashed process.");
+            println!("  Clean them with: {}", "finch daemon-stop".cyan().bold());
+        }
         println!("\nStart the daemon with:");
         println!("  {}", "finch daemon-start".cyan().bold());
         return Ok(());
