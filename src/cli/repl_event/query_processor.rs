@@ -2503,6 +2503,16 @@ mod tests {
         }
     }
 
+    fn isolated_git_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("isolated git workspace");
+        std::fs::create_dir(dir.path().join(".git")).expect("git root marker");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("canonical isolated workspace");
+        (dir, root)
+    }
+
     struct StreamingQueryHarness {
         stream_tx: Option<tokio::sync::mpsc::Sender<anyhow::Result<StreamChunk>>>,
         output: Arc<OutputManager>,
@@ -2515,6 +2525,8 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
         colors: crate::theme::ColorScheme,
         tool_coordinator: ToolExecutionCoordinator,
+        workspace_root: std::path::PathBuf,
+        _workspace: tempfile::TempDir,
         _tempdir: tempfile::TempDir,
     }
 
@@ -2574,9 +2586,12 @@ mod tests {
                 .await;
 
             let tempdir = tempfile::tempdir().expect("create isolated tool-pattern directory");
+            let (workspace, workspace_root) = isolated_git_workspace();
             let executor = ToolExecutor::new(
                 registry,
-                PermissionManager::new().with_default_rule(crate::tools::PermissionRule::Allow),
+                PermissionManager::new()
+                    .with_default_rule(crate::tools::PermissionRule::Allow)
+                    .with_workspace_root(workspace_root.clone()),
                 tempdir.path().join("patterns.json"),
             )
             .expect("construct inert tool executor");
@@ -2643,8 +2658,14 @@ mod tests {
                 task,
                 colors,
                 tool_coordinator: harness_coordinator,
+                workspace_root,
+                _workspace: workspace,
                 _tempdir: tempdir,
             }
+        }
+
+        fn workspace_path(&self, name: &str) -> std::path::PathBuf {
+            self.workspace_root.join(name)
         }
 
         async fn send(&self, chunk: anyhow::Result<StreamChunk>) {
@@ -3017,11 +3038,12 @@ mod tests {
         }));
         let mut harness =
             StreamingQueryHarness::spawn_with("inspect", registry, offered_read()).await;
+        let path = harness.workspace_path("a.txt");
         harness
             .send(Ok(StreamChunk::ToolCallComplete {
                 id: "call-1".into(),
                 name: "read".into(),
-                input: serde_json::json!({"file_path": "/tmp/a"}),
+                input: serde_json::json!({"file_path": path.to_string_lossy()}),
                 provenance: stream_prov(1),
             }))
             .await;
@@ -4532,6 +4554,8 @@ mod tests {
         query_states: Arc<QueryStateManager>,
         tool_coordinator: ToolExecutionCoordinator,
         status: Arc<StatusBar>,
+        workspace_root: std::path::PathBuf,
+        _workspace: tempfile::TempDir,
         held_approvals:
             Vec<tokio::sync::oneshot::Sender<crate::cli::repl_event::ConfirmationResult>>,
     }
@@ -4558,9 +4582,10 @@ mod tests {
             registry.register(Box::new(crate::tools::PatchTool));
             let tempdir =
                 tempfile::tempdir().expect("isolated tool-pattern store for loop dispatch");
+            let (workspace, workspace_root) = isolated_git_workspace();
             let executor = ToolExecutor::new(
                 registry,
-                PermissionManager::new(),
+                PermissionManager::new().with_workspace_root(workspace_root.clone()),
                 tempdir.path().join("patterns.json"),
             )
             .expect("construct executor for loop-detection dispatch");
@@ -4589,8 +4614,14 @@ mod tests {
                 query_states,
                 tool_coordinator,
                 status,
+                workspace_root,
+                _workspace: workspace,
                 held_approvals: Vec::new(),
             }
+        }
+
+        fn workspace_path(&self, name: &str) -> std::path::PathBuf {
+            self.workspace_root.join(name)
         }
 
         async fn dispatch_round(&mut self, tool_use: crate::tools::ToolUse) -> Vec<ReplEvent> {
@@ -4832,16 +4863,15 @@ mod tests {
     /// blocked ToolResult must land on the labeled read row.
     #[tokio::test]
     async fn test_dispatch_third_identical_read_with_same_result_is_a_loop() {
-        let dir = tempfile::tempdir().expect("isolated file for identical-read loop");
-        let path = dir.path().join("same.txt");
-        std::fs::write(&path, "unchanged\n").expect("write identical-read fixture");
-
         let mut harness = LoopDispatchHarness::new();
+        let path = harness.workspace_path("same.txt");
+        std::fs::write(&path, "unchanged\n").expect("write identical-read fixture");
         let first = harness
             .dispatch_round(read_tool_use("call_read_first", &path))
             .await;
         assert!(
-            loop_error_from_events(&first, "call_read_first").is_none(),
+            loop_error_from_events(&first, "call_read_first").is_none()
+                && tool_output_from_events(&first, "call_read_first").is_some(),
             "the first read must run; events={first:?}"
         );
 
@@ -4849,7 +4879,8 @@ mod tests {
             .dispatch_round(read_tool_use("call_read_second", &path))
             .await;
         assert!(
-            loop_error_from_events(&second, "call_read_second").is_none(),
+            loop_error_from_events(&second, "call_read_second").is_none()
+                && tool_output_from_events(&second, "call_read_second").is_some(),
             "the second identical read is allowed even with the same result; events={second:?}"
         );
 
@@ -4868,16 +4899,15 @@ mod tests {
     /// progress, so the second and third identical-args calls still run.
     #[tokio::test]
     async fn test_dispatch_identical_read_with_different_result_is_allowed() {
-        let dir = tempfile::tempdir().expect("isolated file for changing-read loop");
-        let path = dir.path().join("changing.txt");
-        std::fs::write(&path, "v1\n").expect("write first read fixture");
-
         let mut harness = LoopDispatchHarness::new();
+        let path = harness.workspace_path("changing.txt");
+        std::fs::write(&path, "v1\n").expect("write first read fixture");
         let first = harness
             .dispatch_round(read_tool_use("call_read_v1", &path))
             .await;
         assert!(
-            loop_error_from_events(&first, "call_read_v1").is_none(),
+            loop_error_from_events(&first, "call_read_v1").is_none()
+                && tool_output_from_events(&first, "call_read_v1").is_some(),
             "the first read must run; events={first:?}"
         );
 
@@ -4886,7 +4916,8 @@ mod tests {
             .dispatch_round(read_tool_use("call_read_v2", &path))
             .await;
         assert!(
-            loop_error_from_events(&second, "call_read_v2").is_none(),
+            loop_error_from_events(&second, "call_read_v2").is_none()
+                && tool_output_from_events(&second, "call_read_v2").is_some(),
             "the second identical read with a different result is progress; events={second:?}"
         );
 
@@ -4894,7 +4925,8 @@ mod tests {
             .dispatch_round(read_tool_use("call_read_v3", &path))
             .await;
         assert!(
-            loop_error_from_events(&third, "call_read_v3").is_none(),
+            loop_error_from_events(&third, "call_read_v3").is_none()
+                && tool_output_from_events(&third, "call_read_v3").is_some(),
             "after differing results the third identical-args read must still run; events={third:?}"
         );
     }
