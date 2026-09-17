@@ -2573,15 +2573,18 @@ function. Every generated form is checked with the same rules as handwritten cod
 name user form, pretty-printed expansion, and fault span (SDC mixin style). There is no untyped
 `defmacro` and no user `eval`.
 
-The intended **power level is D CTFE**, not Common Lisp macros. `foreach` over a compile-time
-tuple and `switch` / `if` on compile-time strings or types **unroll in the residual IR**: the
-compiler emits specialized copies of the body (one per field, token, or type), type-checked,
-not a runtime loop over types. That is the same trick as a high-speed D parser: generated
-straight-line or jump-to-handler code, not an interpreter of the schema at parse time. That is
-enough for binders, serializers, parsers, and most “I would have used a macro” code. Syntax CTFE (`syntax -> syntax` then `splice`) is the hatch D lacked: **manipulate an AST
-and feed it back to the same compiler**, not `mixin(string)`. It is slightly less general than
-`defmacro` (no running host effects while expanding; no `eval`). That is acceptable: the usual
-need is typed, cached, inspectable generation, not an untyped expander.
+The intended **power level is D CTFE**, not Common Lisp macros. The **usual path does not
+touch `syntax`**. A compile-time tuple (fields, tags, type names) is an ordinary **value**
+passed as a const generic/template parameter. `foreach` over that tuple and `if` / `switch` on
+compile-time strings or types **unroll in the residual IR**: the compiler emits specialized
+copies of the body (one per field, token, or type) for **that instantiation**, type-checked,
+not a runtime loop over types. Later calls of that generic are just that already-unrolled
+function. That is the same trick as a high-speed D parser: generated straight-line or
+jump-to-handler code, not an interpreter of the schema, and not an AST API. Syntax CTFE
+(`syntax -> syntax` then `splice`) is the optional hatch D lacked (manipulate an AST and feed
+it back to the same compiler, not `mixin(string)`). Most Finch metaprogramming should stay on
+the tuple/`foreach`/`if` path. Syntax CTFE is slightly less general than `defmacro`; that is
+acceptable.
 
 `let` in such a function is the usual expression: bindings, then a body whose **value** is the
 result (typically a quasiquoted list). Nothing further is bound unless the caller `define`s a
