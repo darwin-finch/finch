@@ -125,46 +125,10 @@ for workflow in "${authoritative_workflows[@]}"; do
 done
 
 ci_workflow=".github/workflows/ci.yml"
-windows_contract=$(awk '
-  /^  windows-format-contract:$/ { in_job = 1 }
-  in_job && /^  [[:alnum:]_-]+:$/ && $1 != "windows-format-contract:" { exit }
-  in_job { print }
-' "$ci_workflow")
-
-windows_contract_is_narrow() {
-  local contract="$1"
-  local cargo_lines
-  cargo_lines=$(grep -Ei '(^|[^[:alnum:]_])cargo([^[:alnum:]_]|$)' <<<"$contract" || true)
-
-  [[ "$contract" == *'runs-on: windows-2025'* ]] \
-    && [[ "$contract" == *'dtolnay/rust-toolchain@1.98.0'* ]] \
-    && [[ "$contract" == *'rustc 1.98.0'* ]] \
-    && [[ "$contract" == *'rustfmt 1.9.0-'* ]] \
-    && [[ "$cargo_lines" == '      run: cargo fmt --all -- --check' ]]
-}
-
-if ! windows_contract_is_narrow "$windows_contract"; then
-  echo "$ci_workflow must keep a narrow Windows Rust 1.98/rustfmt contract job" >&2
+if grep -Eq '^  windows-format-contract:' "$ci_workflow"; then
+  echo "$ci_workflow must not run a Windows formatting contract on pull requests" >&2
   exit 1
 fi
-
-# Guard the allowlist itself against Cargo spellings that previously bypassed
-# the narrower verb blacklist. The Windows job is a formatting contract, not a
-# supported Finch build surface, so its sole Cargo command must remain exact.
-windows_contract_mutations=(
-  "${windows_contract/cargo fmt --all -- --check/cargo --locked build}"
-  "${windows_contract/cargo fmt --all -- --check/cargo +1.98.0 test}"
-  "${windows_contract/cargo fmt --all -- --check/cargo rustc}"
-  "${windows_contract/cargo fmt --all -- --check/cargo doc}"
-  "${windows_contract/cargo fmt --all -- --check/CaRgO test}"
-  "${windows_contract}"$'\n''      run: cargo check'
-)
-for mutation in "${windows_contract_mutations[@]}"; do
-  if windows_contract_is_narrow "$mutation"; then
-    echo "$ci_workflow Windows Cargo allowlist accepted a forbidden mutation" >&2
-    exit 1
-  fi
-done
 
 if awk '
   /matrix:/ { in_matrix = 1 }
