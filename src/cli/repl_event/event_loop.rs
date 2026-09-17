@@ -462,7 +462,7 @@ pub struct EventLoop {
     runner_renewal_epoch: Arc<std::sync::atomic::AtomicU64>,
 
     /// Last runner-registration failure shown to the user. Lease renewal is
-    /// periodic, so identical transport failures must not spam scrollback.
+    /// periodic, so identical transport failures must not spam the header.
     last_home_runner_error: Option<String>,
     /// Classified reason the home runner is absent, used by queued-run labels.
     last_runner_recovery: Option<super::runner_recovery::RunnerRecovery>,
@@ -2228,11 +2228,8 @@ impl EventLoop {
             if let Err(error) = self.attach_home_brain().await {
                 phase.detail(crate::startup::PhaseDetail::count(0).with_category("failed"));
                 let detail = error.to_string();
-                self.last_home_watch_error = Some(detail.clone());
-                self.output_manager.write_info(format!(
-                    "{}: home event watch unavailable: {}; reconnecting independently of the runner callback",
-                    self.session_label, detail
-                ));
+                self.last_home_watch_error = Some(detail);
+                self.project_ipc_recovery_header(self.home_watch_reconnecting_header());
                 self.schedule_home_brain_reconnect(self.home_watch_epoch, 0);
             }
         }
@@ -3816,6 +3813,26 @@ impl EventLoop {
             tui.active_dialog = None;
             tui.pending_dialog_result = None;
         }
+    }
+
+    /// Peer/home/runner IPC recovery belongs in the live header, never the
+    /// transcript. `write_info` would commit sticky conversation rows between
+    /// program source and output (#819).
+    fn project_ipc_recovery_header(&self, line: impl Into<String>) {
+        self.status_bar
+            .update_line(crate::cli::status_bar::StatusLineType::SessionLabel, line);
+    }
+
+    fn home_watch_reconnecting_header(&self) -> String {
+        format!(
+            "◆ {} · {} · event watch reconnecting",
+            self.session_label,
+            if self.home_runner_lease_active {
+                "runner"
+            } else {
+                "runner offline"
+            },
+        )
     }
 
     /// Project a home-runner register result onto the header and transcript.
