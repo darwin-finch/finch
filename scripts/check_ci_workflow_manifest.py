@@ -77,17 +77,24 @@ ISOLATION_SCHEDULE = [{"cron": "0 9 * * 1"}]
 ISOLATION_JOBS = {"isolation-boundaries": "ubuntu-24.04", "isolation-boundaries-macos": "macos-14"}
 
 # The complete fatal sequence each isolation platform must run, in order.
+# Duplicate crate-wide cargo check and no_external_provider_binary_test stay on
+# the Test job. Pull requests skip the release supervisor; the harness already
+# treats a missing release pin as skip (#841).
 ISOLATION_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Check bins and tests", ("cargo check --lib --bins --tests",)),
-    ("Reject external provider binaries", (
-        "cargo test --test no_external_provider_binary_test -- --nocapture",
-    )),
     ("Build isolation supervisor", (
+        "set -euo pipefail",
+        "pin_debug=target/debug/finch-test-supervisor-pinned",
+        "if [[ ! -x \"$pin_debug\" ]]; then",
         "cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact",
         "cargo build --bin finch-test-supervisor",
+        "install -m 0555 target/debug/finch-test-supervisor \"$pin_debug\"",
+        "fi",
+        "echo \"isolation-supervisor-image-sha256=$(shasum -a 256 \"$pin_debug\" | awk '{print $1}')\"",
+        "echo \"FINCH_TEST_SUPERVISOR_BIN=${GITHUB_WORKSPACE}/${pin_debug}\" >> \"$GITHUB_ENV\"",
+        "if [[ \"${GITHUB_EVENT_NAME}\" != pull_request ]]; then",
         "cargo build --release --bin finch-test-supervisor",
-        "install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned",
         "install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned",
+        "fi",
     )),
     # The module, not two of its tests: a name list leaves anything added to the module scheduled
     # nowhere, and a test that never runs under the contract reports pass without asserting (#614).
@@ -196,6 +203,13 @@ EXPECTED_FIXTURES = {
 }
 
 RUST_CACHE_ACTION = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
+ACTIONS_CACHE_ACTION = "actions/cache@v4"
+SUPERVISOR_IMAGE_CACHE_NAME = "Restore pinned isolation supervisor"
+SUPERVISOR_IMAGE_CACHE_KEY = (
+    "isolation-supervisor-${{ runner.os }}-${{ runner.arch }}-rust-1.98.0-"
+    "${{ hashFiles('src/bin/finch-test-supervisor.rs', 'src/brain/mod.rs', "
+    "'Cargo.lock', 'rust-toolchain.toml', 'build.rs') }}"
+)
 GRAPH_HASH = "${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}"
 MATRIX_CACHE_KEY = (
     "finch-cargo-v5-${{ matrix.os }}-${{ runner.arch }}-${{ matrix.target }}-"
@@ -291,7 +305,7 @@ CACHE_SPECS = {
             "debug-default-test-debug-0_supervisor-release",
         ),
         "save-if": MAIN_SAVE_IF,
-        "before": "Check bins and tests",
+        "before": "Restore pinned isolation supervisor",
         "env": {
             "CARGO_BUILD_JOBS": 1, "CARGO_PROFILE_TEST_DEBUG": 0,
             "CARGO_TERM_COLOR": "always", "RUST_BACKTRACE": 1,
@@ -303,7 +317,7 @@ CACHE_SPECS = {
         "name": "Restore the macOS default Cargo family",
         "shared-key": literal_cache_key("macos-14", "aarch64-apple-darwin", MACOS_FAMILY),
         "save-if": False,
-        "before": "Check bins and tests",
+        "before": "Restore pinned isolation supervisor",
         "env": CI_SHARED_ENV,
     },
     ("release.yml", "build-release"): {
@@ -626,6 +640,7 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     """Check the small, explicit cache allocation; do not interpret arbitrary Actions code."""
     errors: list[str] = []
     found: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
+    supervisor_image_found: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
     for workflow, document in documents.items():
         jobs = document.get("jobs", {})
         if not isinstance(jobs, dict):
@@ -634,8 +649,18 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
             if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
                 continue
             for index, step in enumerate(job["steps"]):
-                if isinstance(step, dict) and cache_action(step.get("uses")):
-                    found.setdefault((workflow, job_id), []).append((index, step))
+                if not isinstance(step, dict) or not cache_action(step.get("uses")):
+                    continue
+                uses = step.get("uses")
+                location = (workflow, job_id)
+                if isinstance(uses, str) and "rust-cache@" in uses.lower():
+                    found.setdefault(location, []).append((index, step))
+                elif uses == ACTIONS_CACHE_ACTION:
+                    supervisor_image_found.setdefault(location, []).append((index, step))
+                else:
+                    errors.append(
+                        f"{workflow}: job {job_id!r} uses unreviewed cache action {uses!r}"
+                    )
 
     expected_locations = set(CACHE_SPECS)
     actual_locations = set(found)
@@ -727,6 +752,58 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
                     f"{workflow}: job {job_id!r} effective Cargo/Rust environment changed; "
                     f"expected={spec['env']!r} actual={effective!r}"
                 )
+
+    expected_supervisor_image_jobs = {
+        (ISOLATION_WORKFLOW, "isolation-boundaries"),
+        (ISOLATION_WORKFLOW, "isolation-boundaries-macos"),
+    }
+    if set(supervisor_image_found) != expected_supervisor_image_jobs:
+        errors.append(
+            "isolation supervisor image cache allocation changed; "
+            f"missing={sorted(expected_supervisor_image_jobs - set(supervisor_image_found))!r} "
+            f"unexpected={sorted(set(supervisor_image_found) - expected_supervisor_image_jobs)!r}"
+        )
+    expected_supervisor_paths = (
+        "target/debug/finch-test-supervisor",
+        "target/debug/finch-test-supervisor-pinned",
+    )
+    for location in sorted(expected_supervisor_image_jobs & set(supervisor_image_found)):
+        workflow, job_id = location
+        matches = supervisor_image_found[location]
+        if len(matches) != 1:
+            errors.append(
+                f"{workflow}: job {job_id!r} must contain exactly one isolation supervisor image cache; "
+                f"actual={len(matches)}"
+            )
+            continue
+        _, step = matches[0]
+        if step.get("name") != SUPERVISOR_IMAGE_CACHE_NAME:
+            errors.append(
+                f"{workflow}: job {job_id!r} supervisor image cache name changed; "
+                f"expected={SUPERVISOR_IMAGE_CACHE_NAME!r} actual={step.get('name')!r}"
+            )
+        if step.get("uses") != ACTIONS_CACHE_ACTION:
+            errors.append(
+                f"{workflow}: job {job_id!r} supervisor image cache must pin {ACTIONS_CACHE_ACTION}; "
+                f"actual={step.get('uses')!r}"
+            )
+        if step.get("if") is not None:
+            errors.append(f"{workflow}: job {job_id!r} supervisor image cache must run actively")
+        if step.get("continue-on-error") not in (None, False):
+            errors.append(
+                f"{workflow}: job {job_id!r} supervisor image cache failure must remain fatal"
+            )
+        actual_inputs = step.get("with") if isinstance(step.get("with"), dict) else {}
+        actual_path = actual_inputs.get("path")
+        actual_paths = tuple(
+            line.strip() for line in str(actual_path or "").splitlines() if line.strip()
+        )
+        if actual_paths != expected_supervisor_paths or actual_inputs.get("key") != SUPERVISOR_IMAGE_CACHE_KEY:
+            errors.append(
+                f"{workflow}: job {job_id!r} supervisor image cache inputs changed; "
+                f"expected_paths={expected_supervisor_paths!r} expected_key={SUPERVISOR_IMAGE_CACHE_KEY!r} "
+                f"actual={actual_inputs!r}"
+            )
 
     identities: set[str] = set()
     for (workflow, job_id), matches in found.items():
