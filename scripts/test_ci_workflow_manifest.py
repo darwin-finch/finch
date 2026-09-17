@@ -447,13 +447,13 @@ class WorkflowContractTests(unittest.TestCase):
     def test_blacksmith_pilot_runner_label_is_pinned(self) -> None:
         self.repository.replace(
             "ci.yml",
-            "    runs-on: blacksmith-4vcpu-ubuntu-2404\n",
-            "    runs-on: blacksmith-4vcpu-ubuntu-2405\n",
+            "    runs-on: blacksmith-8vcpu-ubuntu-2404\n",
+            "    runs-on: blacksmith-8vcpu-ubuntu-2405\n",
         )
         self.assert_fails(
             "ci.yml: runner label inventory changed",
-            "blacksmith-4vcpu-ubuntu-2404",
-            "owner job 'test' must run actively on blacksmith-4vcpu-ubuntu-2404",
+            "blacksmith-8vcpu-ubuntu-2404",
+            "owner job 'test' must run actively on blacksmith-8vcpu-ubuntu-2404",
         )
 
     def test_macos_test_job_is_not_a_pull_request_gate(self) -> None:
@@ -708,7 +708,7 @@ class WorkflowContractTests(unittest.TestCase):
         cache = source[start:end]
         source = source[:start] + source[end:]
         insertion = source.index(
-            "    - name: Prove the removed finch::ssh API stays absent downstream\n"
+            "    - name: Prove validated request tokens cannot be forged\n"
         )
         path.write_text(source[:insertion] + cache + source[insertion:])
         self.assert_fails("cache must run after the pinned toolchain", "Compile all targets")
