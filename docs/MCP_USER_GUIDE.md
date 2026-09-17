@@ -646,5 +646,5 @@ finch 2>&1 | grep -i "mcp\|jsonrpc"
 ---
 
 **Last Updated**: 2026-08-21
-**Finch Version**: 0.7.30+
+**Finch Version**: 0.7.31+
 **Newest MCP Protocol Version**: 2026-07-28 (with negotiation for earlier revisions)
