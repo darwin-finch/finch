@@ -615,6 +615,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_successful_say_renders_as_prose_not_program_output() {
+        let source = Arc::new(WorkUnit::new("typed program"));
+        source.set_program_source("lisp");
+        source.set_response("(say \"Hello\")");
+        source.set_complete();
+        let output = Arc::new(WorkUnit::new("VM program output"));
+        output.set_program_output();
+        output.set_response("Hello");
+        output.present_as_assistant_prose();
+        output.set_complete();
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+
+        let source_message: MessageRef = source;
+        let source_rendered = state
+            .render_message(&source_message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let source_transcript = source_rendered.join("\n");
+        assert!(
+            source_rendered[0].contains("[collapsed]") && source_rendered.len() == 1,
+            "invariant: successful one-line (say …) source defaults collapsed; \
+             rendered transcript:\n{source_transcript}"
+        );
+
+        let output_message: MessageRef = output;
+        let rendered = state
+            .render_message(&output_message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let transcript = rendered.join("\n");
+        assert!(
+            !transcript.contains("Program output") && !transcript.contains("Assistant response"),
+            "invariant: successful say is assistant prose, not Program output chrome; \
+             rendered transcript:\n{transcript}"
+        );
+        assert!(
+            rendered[0].contains('\u{23fa}'),
+            "invariant: completed say uses the filled activity glyph; header was {:?}; \
+             rendered transcript:\n{transcript}",
+            rendered[0]
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("Hello")),
+            "invariant: the user-facing say bytes stay visible; \
+             rendered transcript:\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn test_failed_program_output_stays_implementation_labelled() {
+        let output = Arc::new(WorkUnit::new("VM program output"));
+        output.set_program_output();
+        output.set_response("visible first\nVM error: type error");
+        output.set_complete();
+        let message: MessageRef = output;
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+        let rendered = state
+            .render_message(&message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let transcript = rendered.join("\n");
+        assert!(
+            transcript.contains("Program output"),
+            "invariant: a failed program remains labelled Program output; \
+             rendered transcript:\n{transcript}"
+        );
+        assert!(
+            rendered[0].contains("[expanded]"),
+            "invariant: failures remain expanded and actionable; header was {:?}; \
+             rendered transcript:\n{transcript}",
+            rendered[0]
+        );
+        assert!(
+            transcript.contains("VM error: type error"),
+            "invariant: the diagnostic stays visible; rendered transcript:\n{transcript}"
+        );
+        assert!(
+            !transcript.contains('\u{23fa}'),
+            "invariant: a failure must not wear the completed-prose glyph; \
+             rendered transcript:\n{transcript}"
+        );
+    }
+
     /// Production reaches this row constantly: `query_processor` creates the
     /// query WorkUnit empty and it stays empty for the whole provider round
     /// trip, and a stream error or an unstageable tool round terminalises that

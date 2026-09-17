@@ -576,6 +576,7 @@ impl EventLoop {
             } => {
                 match result {
                     Ok(outcome) if outcome.status == crate::runtime::ExecutionStatus::Completed => {
+                        output_unit.present_as_assistant_prose();
                     }
                     Ok(outcome) => {
                         let detail =

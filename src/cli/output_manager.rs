@@ -152,6 +152,7 @@ impl VmOutputProjection {
     /// from `project`: the portable VM event remains unchanged and another
     /// embedder may choose a different presentation for it.
     pub fn append_default(&self, text: &str) {
+        self.default_response.mark_host_lifecycle();
         self.default_response.append_response(text);
     }
 
@@ -732,6 +733,32 @@ mod tests {
         };
 
         assert_eq!(project_once(), project_once());
+    }
+
+    #[test]
+    fn append_default_clears_assistant_prose_so_proposals_stay_program_output() {
+        let manager = Arc::new(silent_manager());
+        let response = manager.start_work_unit("VM program output");
+        response.set_program_output();
+        response.set_response("Hello");
+        response.present_as_assistant_prose();
+        let projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&response));
+        projection.append_default("\nProposal awaiting review: intent [run 1, effect 0]");
+        response.set_complete();
+
+        let row = response
+            .transcript_row(&crate::theme::ColorScheme::default())
+            .expect("host-lifecycle row");
+        assert_eq!(
+            row.label, "Program output",
+            "invariant: append_default is host lifecycle, never assistant prose; row={row:?}"
+        );
+        assert!(
+            row.body
+                .iter()
+                .any(|line| line.contains("Proposal awaiting review")),
+            "invariant: the proposal notice remains on the row; row={row:?}"
+        );
     }
 
     #[test]

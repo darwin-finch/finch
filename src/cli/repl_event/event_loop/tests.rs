@@ -4896,3 +4896,146 @@ async fn test_cancel_does_not_refire_queued_turn_out_of_order() {
         })
         .await;
 }
+
+fn completed_execution_outcome(output: &str) -> crate::runtime::ExecutionOutcome {
+    crate::runtime::ExecutionOutcome {
+        execution_id: uuid::Uuid::new_v4(),
+        status: crate::runtime::ExecutionStatus::Completed,
+        values: Vec::new(),
+        output: output.to_string(),
+        output_chunks: Vec::new(),
+        side_effects: Vec::new(),
+        vm_side_effects: Vec::new(),
+        effect_journal: Vec::new(),
+        diagnostics: Vec::new(),
+        vm_diagnostics: Vec::new(),
+        inferred_capabilities: Vec::new(),
+        required_capabilities: Vec::new(),
+        approval_prompts: Vec::new(),
+        input_revision: 0,
+        output_revision: 0,
+        effect: crate::programs::ExecutionEffect::Pure,
+        backend: crate::runtime::ExecutionBackend::TypedVm,
+        elapsed_ms: 0,
+    }
+}
+
+fn projected_work_unit(
+    unit: &std::sync::Arc<crate::cli::messages::WorkUnit>,
+) -> crate::cli::messages::TranscriptRow {
+    use crate::cli::messages::Message;
+    unit.transcript_row(&crate::theme::ColorScheme::default())
+        .expect("typed program output must project")
+}
+
+#[tokio::test]
+async fn typed_program_complete_presents_successful_say_as_prose() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let tempdir = tempfile::tempdir().expect("typed-program fixture: isolated tool state");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("typed-program fixture: construct inert tool executor");
+            let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&runtime),
+            );
+            event_loop.output_manager.disable_stdout();
+
+            let output_unit = event_loop
+                .output_manager
+                .start_work_unit("VM program output");
+            output_unit.set_program_output();
+            output_unit.append_response("Hello");
+            event_loop
+                .handle_event(super::ReplEvent::TypedProgramComplete {
+                    output_unit: Arc::clone(&output_unit),
+                    result: Ok(completed_execution_outcome("Hello")),
+                })
+                .await
+                .expect("successful typed-program completion must dispatch");
+
+            let row = projected_work_unit(&output_unit);
+            assert_eq!(
+                row.label, "\u{23fa}",
+                "invariant: TypedProgramComplete success of untitled say is assistant prose; row={row:?}"
+            );
+            assert!(
+                !row.label.contains("Program output") && !row.label.contains("Assistant response"),
+                "invariant: reverting the success-arm present_as_assistant_prose call must fail this test; row={row:?}"
+            );
+            assert_eq!(
+                row.body,
+                vec!["Hello".to_string()],
+                "invariant: say bytes remain the row body; row={row:?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn typed_program_complete_keeps_failures_as_program_output() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let tempdir =
+                tempfile::tempdir().expect("typed-program failure fixture: isolated tool state");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("typed-program failure fixture: construct inert tool executor");
+            let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&runtime),
+            );
+            event_loop.output_manager.disable_stdout();
+
+            let output_unit = event_loop
+                .output_manager
+                .start_work_unit("VM program output");
+            output_unit.set_program_output();
+            output_unit.append_response("visible first\n");
+            event_loop
+                .handle_event(super::ReplEvent::TypedProgramComplete {
+                    output_unit: Arc::clone(&output_unit),
+                    result: Err("type error".to_string()),
+                })
+                .await
+                .expect("failed typed-program completion must dispatch");
+
+            let row = projected_work_unit(&output_unit);
+            assert_eq!(
+                row.label, "Program output",
+                "invariant: TypedProgramComplete Err stays ordinary Program output; row={row:?}"
+            );
+            assert!(
+                row.default_expanded,
+                "invariant: failures remain expanded; row={row:?}"
+            );
+            assert_eq!(
+                row.body,
+                vec![
+                    "visible first".to_string(),
+                    "VM error: type error".to_string()
+                ],
+                "invariant: emitted prefix then diagnostic stay on the row in order; row={row:?}"
+            );
+            assert!(
+                !row.label.contains('\u{23fa}'),
+                "invariant: a failure must not wear the completed-prose glyph; row={row:?}"
+            );
+        })
+        .await;
+}

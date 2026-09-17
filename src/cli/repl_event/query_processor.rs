@@ -428,6 +428,9 @@ async fn execute_wire_with_single_repair(
                 metric.terminal_failure = true;
             }
             record_wire_metric(metrics_logger, &metric);
+            if !outcome.output.is_empty() {
+                output_unit.present_as_assistant_prose();
+            }
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&output_unit),
             });
@@ -582,6 +585,9 @@ async fn execute_wire_with_single_repair(
                 metric.failure_class = Some(crate::metrics::WireFailureClass::MissingOutputEffect);
             }
             record_wire_metric(metrics_logger, &metric);
+            if !outcome.output.is_empty() {
+                repair_output_unit.present_as_assistant_prose();
+            }
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
@@ -3793,6 +3799,154 @@ mod tests {
         assert!(messages.iter().all(|message| !message
             .format(&crate::theme::ColorScheme::default())
             .contains("must not run")));
+    }
+
+    fn drain_vm_events_as_event_loop(event_rx: &mut mpsc::UnboundedReceiver<ReplEvent>) {
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                ReplEvent::VmEffect {
+                    projection,
+                    envelope,
+                } => {
+                    let projected = projection.project_envelope(envelope);
+                    for envelope in projected {
+                        if envelope.effect.requirement.capability
+                            != crate::vm::CapabilityKind::ProgramInvoke
+                        {
+                            continue;
+                        }
+                        let intent = match &envelope.effect.event {
+                            crate::vm::HostSideEffect::Request { arguments } => arguments
+                                .get(1)
+                                .and_then(|value| match value {
+                                    crate::vm::TypedValue::String(text) => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .unwrap_or("Review proposed program"),
+                            _ => "Review proposed program",
+                        };
+                        projection.append_default(&format!(
+                            "Proposal awaiting review: {intent} [run {}, effect {}]",
+                            envelope.execution_id, envelope.effect.sequence
+                        ));
+                    }
+                }
+                ReplEvent::VmOutputComplete { output_unit } => output_unit.set_complete(),
+                _ => {}
+            }
+        }
+    }
+
+    fn transcript_of(unit: &Arc<WorkUnit>) -> crate::cli::messages::TranscriptRow {
+        unit.transcript_row(&crate::theme::ColorScheme::default())
+            .expect("output unit must project a transcript row")
+    }
+
+    #[tokio::test]
+    async fn successful_say_wire_turn_projects_as_assistant_prose_not_program_output() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source_unit = output.start_work_unit("typed program");
+        source_unit.set_program_source("lisp");
+        source_unit.set_response("(say \"Hello\")");
+        source_unit.set_complete();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::providers::Message::user("hello")],
+            "(say \"Hello\")".to_string(),
+            None,
+            None,
+        )
+        .await;
+        drain_vm_events_as_event_loop(&mut event_rx);
+
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(execution.response, "Hello");
+        let source_row = transcript_of(&source_unit);
+        assert!(
+            !source_row.default_expanded,
+            "invariant: successful generated (say …) source defaults collapsed; row={source_row:?}"
+        );
+        let row = transcript_of(&execution.output_unit);
+        assert_eq!(
+            row.kind,
+            TranscriptRowKind::Output,
+            "invariant: kind stays Output so IR-swap still matches; row={row:?}"
+        );
+        assert_eq!(
+            row.label, "\u{23fa}",
+            "invariant: a successful (say \"Hello\") turn is assistant prose, not Program output chrome; row={row:?}"
+        );
+        assert!(
+            !row.label.contains("Program output") && !row.label.contains("Assistant response"),
+            "invariant: implementation labels must not be the primary user-visible row; row={row:?}"
+        );
+        assert_eq!(
+            row.body,
+            vec!["Hello".to_string()],
+            "invariant: the say bytes remain the row body; row={row:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_wire_turn_stays_expanded_program_output() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            output,
+            event_tx,
+            cancel,
+            generator.clone(),
+            &[crate::providers::Message::user("reply")],
+            source,
+            None,
+            None,
+        )
+        .await;
+        drain_vm_events_as_event_loop(&mut event_rx);
+
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
+        let row = transcript_of(&execution.output_unit);
+        assert_eq!(
+            row.label, "Program output",
+            "invariant: a failed program stays ordinary Program output, never assistant prose; row={row:?}"
+        );
+        assert!(
+            row.default_expanded,
+            "invariant: failures remain expanded and actionable; row={row:?}"
+        );
+        assert!(
+            row.body
+                .iter()
+                .any(|line| line.contains("VM wire error") || line.contains("E-WIRE-002"))
+                || execution.output_unit.content().contains("E-WIRE-002"),
+            "invariant: the diagnostic remains on the failed row; row={row:?}; content={:?}",
+            execution.output_unit.content()
+        );
+        assert!(
+            !row.label.contains('\u{23fa}'),
+            "invariant: a failure must not wear the completed-prose glyph; row={row:?}"
+        );
     }
 
     #[tokio::test]

@@ -198,6 +198,13 @@ struct WorkUnitInner {
     /// This is presentation state on the widget. Completing a row must not
     /// lose an expand/collapse choice stored in a renderer-global map.
     disclosure: HashMap<Vec<u32>, bool>,
+    /// Producer-owned: this untitled default-port output succeeded as user-facing
+    /// `say` and should project as assistant prose rather than `Program output`.
+    /// Content sniffing is forbidden; only the producer sets this (#350).
+    as_assistant_prose: bool,
+    /// Producer-owned: host-rendered lifecycle text (proposals, notices) was
+    /// appended to this port. That output is never assistant prose (#350).
+    host_lifecycle: bool,
 }
 
 // ============================================================================
@@ -256,6 +263,8 @@ impl WorkUnit {
                 progress: None,
                 agent_activity: Vec::new(),
                 disclosure: HashMap::new(),
+                as_assistant_prose: false,
+                host_lifecycle: false,
             })),
         }
     }
@@ -292,21 +301,19 @@ impl WorkUnit {
     /// block reveals tool calls; that provisional text must not remain labelled
     /// as an executable program.
     pub fn set_assistant_presentation(&self) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::Assistant;
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::Assistant;
+        reset_program_output_role(&mut inner);
     }
 
     /// Render retained rows as internal lifecycle activity rather than model
     /// tool calls.
     pub fn set_activity_presentation(&self, title: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::Activity {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::Activity {
             title: title.into(),
         };
+        reset_program_output_role(&mut inner);
     }
 
     /// Append a chunk to the response text (for partial updates).
@@ -320,33 +327,61 @@ impl WorkUnit {
 
     /// Render this unit as the exact program received from the provider.
     pub fn set_program_source(&self, language: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramSource {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramSource {
             language: language.into(),
         };
+        reset_program_output_role(&mut inner);
     }
 
     /// Render this unit as output emitted by a VM program, not an assistant
     /// message. `say` itself remains append-only; this only chooses UI chrome.
     pub fn set_program_output(&self) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        reset_program_output_role(&mut inner);
     }
 
     /// Render this unit as an independently addressable VM output handle.
     /// The title is presentation metadata supplied by `output-open`, not an
     /// emitted response fragment.
     pub fn set_output_handle(&self, title: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramOutput {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput {
             title: Some(title.into()),
         };
+        reset_program_output_role(&mut inner);
+    }
+
+    /// Mark successful untitled default-port `say` as assistant prose.
+    ///
+    /// The producer calls this only after it knows the run succeeded. Body
+    /// bytes may still be in flight on the event bus; projection waits until
+    /// they arrive. Host-lifecycle text and titled handles refuse the mark
+    /// so a later `append_default` cannot be attributed to the assistant
+    /// (#350). Empty output stays ordinary Program output.
+    pub fn present_as_assistant_prose(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.host_lifecycle {
+            return;
+        }
+        if !matches!(
+            inner.presentation,
+            WorkUnitPresentation::ProgramOutput { title: None }
+        ) {
+            return;
+        }
+        inner.as_assistant_prose = true;
+    }
+
+    /// Record that host-rendered lifecycle text belongs on this port.
+    ///
+    /// Clears any prior prose mark. A proposal notice that follows `say`
+    /// must not read as assistant conversation (#350).
+    pub fn mark_host_lifecycle(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.host_lifecycle = true;
+        inner.as_assistant_prose = false;
     }
 
     /// Update transient status independently from the durable visible body.
@@ -993,14 +1028,24 @@ impl Message for WorkUnit {
                 lines(&inner.response_text),
                 inner.status == MessageStatus::InProgress,
             ),
-            WorkUnitPresentation::ProgramOutput { title } => (
-                TranscriptRowKind::Output,
-                title
-                    .clone()
-                    .unwrap_or_else(|| "Program output".to_string()),
-                program_output_lines(&inner),
-                true,
-            ),
+            WorkUnitPresentation::ProgramOutput { title } => {
+                // Kind stays Output so the live list can still swap completed
+                // IR for this row. Only the label changes: successful untitled
+                // say uses the assistant glyph instead of `Program output`.
+                let label = if projects_as_assistant_prose(&inner) {
+                    assistant_prose_label(&self.verb, &inner)
+                } else {
+                    title
+                        .clone()
+                        .unwrap_or_else(|| "Program output".to_string())
+                };
+                (
+                    TranscriptRowKind::Output,
+                    label,
+                    program_output_lines(&inner),
+                    true,
+                )
+            }
         };
 
         Some(TranscriptRow {
@@ -1023,14 +1068,7 @@ impl Message for WorkUnit {
 
     fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
-        let band = match &inner.presentation {
-            WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
-            WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
-            WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
-                MessageBand::Assistant
-            }
-        };
-        Some(colors.message_band_style(band))
+        Some(colors.message_band_style(message_band_for_inner(&inner)))
     }
 
     fn background_style_for_line(
@@ -1041,14 +1079,7 @@ impl Message for WorkUnit {
     ) -> Option<ratatui::style::Style> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         if inner.rows.is_empty() {
-            let band = match &inner.presentation {
-                WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
-                WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
-                WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
-                    MessageBand::Assistant
-                }
-            };
-            return Some(colors.message_band_style(band));
+            return Some(colors.message_band_style(message_band_for_inner(&inner)));
         }
 
         if inner.status == MessageStatus::InProgress {
@@ -1057,7 +1088,7 @@ impl Message for WorkUnit {
                 WorkUnitPresentation::ProgramOutput { .. }
                     if program_output_has_visible_state(&inner) =>
                 {
-                    MessageBand::ProgramOutput
+                    program_output_band(&inner)
                 }
                 _ => MessageBand::Tool,
             };
@@ -1081,13 +1112,7 @@ impl Message for WorkUnit {
         let band = if line_index >= line_count.saturating_sub(tool_line_count) {
             MessageBand::Tool
         } else {
-            match &inner.presentation {
-                WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
-                WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
-                WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
-                    MessageBand::Assistant
-                }
-            }
+            message_band_for_inner(&inner)
         };
         Some(colors.message_band_style(band))
     }
@@ -1096,6 +1121,39 @@ impl Message for WorkUnit {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+fn reset_program_output_role(inner: &mut WorkUnitInner) {
+    inner.as_assistant_prose = false;
+    inner.host_lifecycle = false;
+}
+
+fn projects_as_assistant_prose(inner: &WorkUnitInner) -> bool {
+    inner.as_assistant_prose
+        && !inner.host_lifecycle
+        && !inner.response_text.is_empty()
+        && matches!(
+            inner.presentation,
+            WorkUnitPresentation::ProgramOutput { title: None }
+        )
+}
+
+fn program_output_band(inner: &WorkUnitInner) -> MessageBand {
+    if projects_as_assistant_prose(inner) {
+        MessageBand::Assistant
+    } else {
+        MessageBand::ProgramOutput
+    }
+}
+
+fn message_band_for_inner(inner: &WorkUnitInner) -> MessageBand {
+    match &inner.presentation {
+        WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+        WorkUnitPresentation::ProgramOutput { .. } => program_output_band(inner),
+        WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
+            MessageBand::Assistant
+        }
+    }
+}
 
 fn program_output_has_visible_state(inner: &WorkUnitInner) -> bool {
     !inner.response_text.is_empty()
@@ -2418,6 +2476,166 @@ mod tests {
         assert!(
             !row.default_expanded,
             "completed IR must not stay expanded beside program output"
+        );
+    }
+
+    #[test]
+    fn successful_untitled_say_projects_as_assistant_prose_not_program_output() {
+        let source = WorkUnit::new("typed program");
+        source.set_program_source("lisp");
+        source.set_response("(say \"Hello\")");
+        source.set_complete();
+        let source_row = source.transcript_row(&colors()).expect("source row");
+        let source_diag = format!("{source_row:?}");
+        assert_eq!(
+            source_row.kind,
+            super::TranscriptRowKind::Program,
+            "invariant: generated source stays a Program row inspectable through disclosure; {source_diag}"
+        );
+        assert!(
+            !source_row.default_expanded,
+            "invariant: successful generated program source, including one-line (say …), defaults collapsed; {source_diag}"
+        );
+        assert!(
+            source_row.label.contains("Program source"),
+            "invariant: source remains labelled as source behind disclosure; {source_diag}"
+        );
+
+        let output = WorkUnit::new("VM program output");
+        output.set_program_output();
+        output.set_response("Hello");
+        output.present_as_assistant_prose();
+        output.set_complete();
+        let row = output.transcript_row(&colors()).expect("output row");
+        let diag = format!("{row:?}");
+        assert_eq!(
+            row.kind,
+            super::TranscriptRowKind::Output,
+            "invariant: kind stays Output so the live IR-swap still finds this row; {diag}"
+        );
+        assert_eq!(
+            row.label, "\u{23fa}",
+            "invariant: successful untitled say is labelled with the filled assistant glyph, not `Program output`; {diag}"
+        );
+        assert!(
+            !row.label.contains("Program output") && !row.label.contains("Assistant response"),
+            "invariant: successful say must not show implementation chrome as the primary label; {diag}"
+        );
+        assert_eq!(
+            row.body,
+            vec!["Hello".to_string()],
+            "invariant: the user-facing say bytes remain the row body; {diag}"
+        );
+        assert!(
+            row.default_expanded,
+            "invariant: successful say body stays visible by default; {diag}"
+        );
+        assert_eq!(
+            output.format(&colors()),
+            "Hello",
+            "invariant: copyable format stays the say bytes without a second assistant bullet; format={:?}",
+            output.format(&colors())
+        );
+    }
+
+    #[test]
+    fn successful_say_that_looks_like_a_diagnostic_is_still_prose() {
+        // Content sniffing would leave `(say "VM error: maintenance scheduled")`
+        // as Program output. The producer mark is the only discriminator.
+        let output = WorkUnit::new("VM program output");
+        output.set_program_output();
+        output.set_response("VM error: maintenance scheduled");
+        output.present_as_assistant_prose();
+        output.set_complete();
+        let row = output.transcript_row(&colors()).expect("output row");
+        assert_eq!(
+            row.label, "\u{23fa}",
+            "invariant: producer-owned success is prose even when the say bytes look like a diagnostic; row={row:?}"
+        );
+        assert_eq!(
+            row.body,
+            vec!["VM error: maintenance scheduled".to_string()]
+        );
+    }
+
+    #[test]
+    fn failed_and_host_lifecycle_output_stay_program_output() {
+        let failed = WorkUnit::new("VM program output");
+        failed.set_program_output();
+        failed.set_response("visible first\nVM error: type error");
+        failed.set_complete();
+        let failed_row = failed.transcript_row(&colors()).expect("failed row");
+        let failed_diag = format!("{failed_row:?}");
+        assert_eq!(
+            failed_row.label, "Program output",
+            "invariant: a failure that never received the producer prose mark stays ordinary Program output; {failed_diag}"
+        );
+        assert!(
+            failed_row.default_expanded,
+            "invariant: failures remain expanded and actionable; {failed_diag}"
+        );
+        assert_eq!(
+            failed_row.body,
+            vec![
+                "visible first".to_string(),
+                "VM error: type error".to_string()
+            ],
+            "invariant: emitted prefix and diagnostic stay on the failed row; {failed_diag}"
+        );
+
+        let empty = WorkUnit::new("VM program output");
+        empty.set_program_output();
+        empty.present_as_assistant_prose();
+        empty.set_complete();
+        let empty_row = empty.transcript_row(&colors()).expect("empty row");
+        assert_eq!(
+            empty_row.label, "Program output",
+            "invariant: empty successful output (MissingOutputEffect) is not assistant prose; row={empty_row:?}"
+        );
+
+        let handle = WorkUnit::new("Download");
+        handle.set_output_handle("Download");
+        handle.set_response("bytes");
+        handle.present_as_assistant_prose();
+        handle.set_complete();
+        let handle_row = handle.transcript_row(&colors()).expect("handle row");
+        assert_eq!(
+            handle_row.label, "Download",
+            "invariant: titled output handles refuse the prose mark; row={handle_row:?}"
+        );
+
+        let host = WorkUnit::new("VM program output");
+        host.set_program_output();
+        host.set_response("Hello");
+        host.present_as_assistant_prose();
+        host.mark_host_lifecycle();
+        host.append_response("\nProposal awaiting review: intent [run 1, effect 0]");
+        host.set_complete();
+        let host_row = host.transcript_row(&colors()).expect("host row");
+        let host_diag = format!("{host_row:?}");
+        assert_eq!(
+            host_row.label, "Program output",
+            "invariant: host-lifecycle text after say restores ordinary Program output; {host_diag}"
+        );
+        assert!(
+            host_row
+                .body
+                .iter()
+                .any(|line| line.contains("Proposal awaiting review")),
+            "invariant: the proposal notice remains on the row; {host_diag}"
+        );
+
+        let marked_then_titled = WorkUnit::new("VM program output");
+        marked_then_titled.set_program_output();
+        marked_then_titled.set_response("rejected");
+        marked_then_titled.present_as_assistant_prose();
+        marked_then_titled.set_output_handle("VM program rejected");
+        let rejected = marked_then_titled
+            .transcript_row(&colors())
+            .expect("rejected row");
+        assert_eq!(
+            rejected.label, "VM program rejected",
+            "invariant: retitling as a handle clears the prose mark; row={rejected:?}"
         );
     }
 
