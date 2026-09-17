@@ -5643,3 +5643,126 @@ async fn other_owner_inner_failure_still_allows_driver_attach() {
         })
         .await;
 }
+
+fn transcript_projection_haystack(event_loop: &super::EventLoop) -> String {
+    let colors = crate::theme::ColorScheme::default();
+    event_loop
+        .output_manager
+        .get_messages()
+        .iter()
+        .map(|message| {
+            format!(
+                "{}\n{}",
+                message.content(),
+                message.complete_transcript(&colors)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn peer_disconnect_environment() -> crate::brain::BrainEnvironment {
+    crate::brain::BrainEnvironment {
+        machine: "box.local".into(),
+        workspace: std::path::PathBuf::from("/tmp/ws"),
+        generation: 1,
+    }
+}
+
+#[tokio::test]
+async fn peer_ipc_diagnostics_after_completed_turn_stay_off_transcript() {
+    tokio::task::LocalSet::new()
+        .run_until(peer_ipc_diagnostics_after_completed_turn_stay_off_transcript_scenario())
+        .await;
+}
+
+async fn peer_ipc_diagnostics_after_completed_turn_stay_off_transcript_scenario() {
+    let mut event_loop = runner_recovery_test_event_loop();
+    event_loop
+        .handle_event(super::ReplEvent::LispResult {
+            result: Ok("Hello, Shammah!".into()),
+        })
+        .await
+        .expect("completed say/Lisp turn must dispatch");
+
+    event_loop
+        .handle_event(super::ReplEvent::RemoteBrainError {
+            target: "quiet-peak-715803".into(),
+            error: "Disconnected: Peer disconnected.".into(),
+        })
+        .await
+        .expect("peer disconnect must dispatch");
+    event_loop
+        .handle_event(super::ReplEvent::HomeBrainWatchFailed {
+            epoch: 0,
+            error: Some("Disconnected: Peer disconnected.".into()),
+        })
+        .await
+        .expect("home event-watch failure must dispatch");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_loop.handle_event(super::ReplEvent::ReconnectHomeBrain {
+            epoch: 0,
+            attempt: 0,
+        }),
+    )
+    .await
+    .expect("home reconnect must not hang on isolated IPC")
+    .expect("home reconnect dispatch must settle");
+    event_loop
+        .handle_event(super::ReplEvent::RunnerLeaseStatus {
+            brain: "quiet-peak-715803".into(),
+            environment: peer_disconnect_environment(),
+            epoch: 0,
+            lease_id: None,
+            detail: "Disconnected: Peer disconnected.".into(),
+        })
+        .await
+        .expect("runner lease loss must dispatch");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_loop.handle_event(super::ReplEvent::ReconnectHomeRunner {
+            epoch: 0,
+            attempt: 0,
+            target: crate::cli::repl_event::events::RunnerReconnectTarget {
+                brain: "quiet-peak-715803".into(),
+                environment: peer_disconnect_environment(),
+                lease_id: None,
+            },
+        }),
+    )
+    .await
+    .expect("runner reconnect must not hang on isolated IPC")
+    .expect("runner reconnect dispatch must settle");
+
+    let haystack = transcript_projection_haystack(&event_loop);
+    assert!(
+        haystack.contains("Hello, Shammah!"),
+        "completed turn must remain in the transcript; haystack={haystack:?}"
+    );
+    for needle in [
+        "Peer disconnected",
+        "event watch unavailable",
+        "reconnect attempt failed",
+    ] {
+        assert!(
+            !haystack.contains(needle),
+            "peer/home/runner IPC diagnostics must not become sticky transcript rows after a completed turn; needle={needle:?} haystack={haystack:?}"
+        );
+    }
+
+    let header = event_loop
+        .status_bar
+        .get_line(&crate::cli::status_bar::StatusLineType::SessionLabel)
+        .unwrap_or_default();
+    let status = event_loop.status_bar.get_status();
+    let recovery = format!("{header}\n{status}");
+    assert!(
+        recovery.contains("no runner lease")
+            || recovery.contains("event watch reconnecting")
+            || recovery.contains("disconnected")
+            || recovery.contains("daemon IPC")
+            || recovery.contains("runner unavailable"),
+        "header/status must still show a compact runner/home recovery hint; header={header:?} status={status:?} haystack={haystack:?}"
+    );
+}

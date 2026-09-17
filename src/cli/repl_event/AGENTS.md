@@ -28,6 +28,13 @@ them:
 enum, so do not add a catch-all arm. Keep the arm short: if handling takes more than a few lines,
 put a `pub(super)` method in whichever file above it belongs to and call it.
 
+**IPC recovery is header/status, not transcript.** Peer disconnect, home event-watch loss, and
+runner reconnect attempts update `StatusBar` (`SessionLabel`) through
+`EventLoop::project_ipc_recovery_header`. They must not call `output_manager.write_info` — that
+commits sticky conversation rows between program source and output (#819). Leftover-daemon /
+environment mismatch at startup still uses `apply_home_runner_startup` (header plus the detailed
+startup TUI line, #794).
+
 **The state is shared, and that is the known weakness.** Every handler takes `&mut self` on an
 `EventLoop` whose field list is long. Before adding a field, check whether the state belongs to a
 query (`query_state.rs`) or to a tool run (`tool_execution.rs`) instead.

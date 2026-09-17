@@ -861,16 +861,17 @@ impl EventLoop {
                     };
                     self.render_remote_brain_message(message).await?;
                     if let Some(client) = self.selected_brain_mut() {
-                        if let Err(error) = client.acknowledge(acknowledged_seq).await {
-                            self.output_manager
-                                .write_info(format!("{target}: could not save cursor: {error}"));
+                        if client.acknowledge(acknowledged_seq).await.is_err() {
+                            self.project_ipc_recovery_header(format!(
+                                "◆ brain: {target} · disconnected"
+                            ));
                             self.render_tui().await?;
                         }
                     }
                 }
             }
-            ReplEvent::RemoteBrainError { target, error } => {
-                self.output_manager.write_info(format!("{target}: {error}"));
+            ReplEvent::RemoteBrainError { target, .. } => {
+                self.project_ipc_recovery_header(format!("◆ brain: {target} · disconnected"));
                 self.render_tui().await?;
             }
             ReplEvent::RemoteBrainDisconnected { target } => {
@@ -882,12 +883,8 @@ impl EventLoop {
                     } else {
                         "driver"
                     };
-                    self.status_bar.update_line(
-                        crate::cli::status_bar::StatusLineType::SessionLabel,
-                        format!("◆ brain: {target} · {role} · disconnected"),
-                    );
-                    self.output_manager.write_info(format!(
-                        "{target}: Brain event connection closed; detach or reattach to reconnect"
+                    self.project_ipc_recovery_header(format!(
+                        "◆ brain: {target} · {role} · disconnected"
                     ));
                     self.render_tui().await?;
                 }
@@ -907,7 +904,7 @@ impl EventLoop {
                     if let Err(error) = client.acknowledge(acknowledged_seq).await {
                         let detail = format!("home cursor acknowledgement failed: {error}");
                         if self.last_home_watch_error.as_deref() != Some(&detail) {
-                            self.output_manager.write_info(detail.clone());
+                            self.project_ipc_recovery_header(self.home_watch_reconnecting_header());
                         }
                         self.last_home_watch_error = Some(detail);
                     }
@@ -919,28 +916,9 @@ impl EventLoop {
                 }
                 self.unbind_home_brain_watch();
                 let detail = error.unwrap_or_else(|| "connection closed".into());
-                if self.last_home_watch_error.as_deref() != Some(&detail) {
-                    self.output_manager.write_info(format!(
-                        "{}: home event watch unavailable: {}; reconnecting (runner callback is {})",
-                        self.session_label,
-                        detail,
-                        if self.home_runner_lease_active { "still registered" } else { "offline" },
-                    ));
-                }
                 self.last_home_watch_error = Some(detail);
                 if self.active_remote_brain.is_none() {
-                    self.status_bar.update_line(
-                        crate::cli::status_bar::StatusLineType::SessionLabel,
-                        format!(
-                            "◆ {} · {} · event watch reconnecting",
-                            self.session_label,
-                            if self.home_runner_lease_active {
-                                "runner"
-                            } else {
-                                "runner offline"
-                            },
-                        ),
-                    );
+                    self.project_ipc_recovery_header(self.home_watch_reconnecting_header());
                     self.render_tui().await?;
                 }
                 self.schedule_home_brain_reconnect(epoch, 0);
@@ -951,24 +929,13 @@ impl EventLoop {
                 }
                 match self.reconnect_home_brain().await {
                     Ok(()) => {
-                        self.output_manager.write_info(format!(
-                            "{}: home event watch reconnected; runner callback {}",
-                            self.session_label,
-                            if self.home_runner_lease_active {
-                                "registered"
-                            } else {
-                                "still retrying"
-                            },
-                        ));
                         self.render_tui().await?;
                     }
                     Err(error) => {
                         let detail = error.to_string();
                         if self.last_home_watch_error.as_deref() != Some(&detail) {
-                            self.output_manager.write_info(format!(
-                                "{}: home reconnect attempt failed: {}",
-                                self.session_label, detail
-                            ));
+                            self.project_ipc_recovery_header(self.home_watch_reconnecting_header());
+                            self.render_tui().await?;
                         }
                         self.last_home_watch_error = Some(detail);
                         self.schedule_home_brain_reconnect(
@@ -995,10 +962,6 @@ impl EventLoop {
                     Ok(()) => {
                         self.last_home_runner_error = None;
                         self.last_runner_recovery = None;
-                        self.output_manager.write_info(format!(
-                            "{}: runner callback reconnected",
-                            self.session_label
-                        ));
                         if self.active_remote_brain.is_none() {
                             self.update_remote_brain_status(true);
                             self.render_tui().await?;
@@ -1009,9 +972,15 @@ impl EventLoop {
                             &error.to_string(),
                         );
                         let detail = recovery.human_message();
-                        if self.last_home_runner_error.as_deref() != Some(&detail) {
-                            self.output_manager
-                                .write_info(format!("{}: {}", self.session_label, detail));
+                        if self.last_home_runner_error.as_deref() != Some(&detail)
+                            && self.active_remote_brain.is_none()
+                        {
+                            self.project_ipc_recovery_header(format!(
+                                "◆ brain: {} · {}",
+                                self.session_label,
+                                recovery.header_suffix()
+                            ));
+                            self.render_tui().await?;
                         }
                         self.last_home_runner_error = Some(detail);
                         let handed_off = matches!(
@@ -1120,14 +1089,8 @@ impl EventLoop {
                     if let Some(error) = registration_error {
                         let recovery =
                             super::super::runner_recovery::RunnerRecovery::from_error(&error);
-                        let message = recovery.human_message();
-                        let changed = self.last_home_runner_error.as_deref() != Some(&message);
-                        self.last_home_runner_error = Some(message.clone());
+                        self.last_home_runner_error = Some(recovery.human_message());
                         self.last_runner_recovery = Some(recovery);
-                        if changed {
-                            self.output_manager
-                                .write_info(format!("{}: {}", self.session_label, message));
-                        }
                     } else {
                         self.last_home_runner_error = None;
                         self.last_runner_recovery = None;
