@@ -868,20 +868,10 @@ impl Message for WorkUnit {
                     return out;
                 }
 
-                // Time-driven throb: frame changes every 200 ms, no external counter
-                let frame_idx = (elapsed.as_millis() / 200) as usize % THROB_FRAMES.len();
-                let icon = THROB_FRAMES[frame_idx];
-                let secs = elapsed.as_secs();
-
-                let stats = if inner.token_count == 0 {
-                    format!("{} · thinking", fmt_elapsed(secs))
-                } else {
-                    format!(
-                        "{} · ↓ {} tokens",
-                        fmt_elapsed(secs),
-                        fmt_tokens(inner.token_count)
-                    )
-                };
+                // Time-driven throb: frame changes every 200 ms, no external counter.
+                // Shared with `assistant_prose_label` so the live accordion path
+                // cannot drift off this chrome (#821).
+                let (icon, stats) = thinking_throb_and_stats(&inner, self.started_at);
 
                 let mut out = format!(
                     "{}{}{}  {}… ({}){}",
@@ -1032,7 +1022,7 @@ impl Message for WorkUnit {
             }
             WorkUnitPresentation::Assistant => (
                 TranscriptRowKind::Response,
-                assistant_prose_label(&self.verb, &inner),
+                assistant_prose_label(&self.verb, &inner, self.started_at),
                 lines(&inner.response_text),
                 true,
             ),
@@ -1053,7 +1043,7 @@ impl Message for WorkUnit {
                 // IR for this row. Only the label changes: successful untitled
                 // say uses the assistant glyph instead of `Program output`.
                 let label = if projects_as_assistant_prose(&inner) {
-                    assistant_prose_label(&self.verb, &inner)
+                    assistant_prose_label(&self.verb, &inner, self.started_at)
                 } else {
                     title
                         .clone()
@@ -1356,17 +1346,53 @@ fn assistant_prose_glyph(status: MessageStatus) -> &'static str {
 /// the whole provider round trip, and a turn that failed before its first
 /// token. Those name their state in words as well as in a glyph, because a row
 /// that cannot be read aloud is not an accessible interface (Key Principle 5).
-fn assistant_prose_label(verb: &str, inner: &WorkUnitInner) -> String {
-    let glyph = assistant_prose_glyph(inner.status);
+///
+/// The wordless in-progress shape reuses `format()`'s throb and elapsed stats
+/// so the live accordion path actually updates (#821). Hollow `○` stays the
+/// marker for a turn that already has words of its own.
+fn assistant_prose_label(verb: &str, inner: &WorkUnitInner, started_at: Instant) -> String {
     if !inner.response_text.is_empty() {
-        return glyph.to_string();
+        return assistant_prose_glyph(inner.status).to_string();
     }
     match inner.status {
-        MessageStatus::InProgress if !verb.trim().is_empty() => format!("{glyph} {verb}\u{2026}"),
-        MessageStatus::InProgress => format!("{glyph} Working\u{2026}"),
-        MessageStatus::Complete => format!("{glyph} No assistant text"),
-        MessageStatus::Failed => format!("{glyph} Assistant turn failed"),
+        MessageStatus::InProgress => {
+            let (icon, stats) = thinking_throb_and_stats(inner, started_at);
+            let verb = if verb.trim().is_empty() {
+                "Working"
+            } else {
+                verb.trim()
+            };
+            format!("{icon} {verb}\u{2026} ({stats})")
+        }
+        MessageStatus::Complete => {
+            format!("{} No assistant text", assistant_prose_glyph(inner.status))
+        }
+        MessageStatus::Failed => format!(
+            "{} Assistant turn failed",
+            assistant_prose_glyph(inner.status)
+        ),
     }
+}
+
+/// Throb frame and `(elapsed · thinking|tokens)` stats for a live thinking row.
+///
+/// Time-driven: the frame is `started_at.elapsed() / 200ms`. Shared by
+/// `format()` and `transcript_row` so the unused-format path cannot be the
+/// only place elapsed is visible (#821).
+fn thinking_throb_and_stats(inner: &WorkUnitInner, started_at: Instant) -> (&'static str, String) {
+    let elapsed = started_at.elapsed();
+    let frame_idx = (elapsed.as_millis() / 200) as usize % THROB_FRAMES.len();
+    let icon = THROB_FRAMES[frame_idx];
+    let stats = if inner.token_count == 0 {
+        format!("{} · thinking", fmt_elapsed(elapsed.as_secs()))
+    } else {
+        format!(
+            "{} · ↓ {} tokens",
+            fmt_elapsed(elapsed.as_secs()),
+            fmt_tokens(inner.token_count)
+        )
+    };
+    (icon, stats)
 }
 
 fn lines(text: &str) -> Vec<String> {
@@ -2328,6 +2354,40 @@ mod tests {
         );
     }
 
+    fn unique_throb_frames(text: &str) -> usize {
+        ["✦", "✳", "✼"]
+            .iter()
+            .filter(|frame| text.contains(*frame))
+            .count()
+    }
+
+    fn assert_wordless_thinking_label(label: &str, verb: &str, row: &TranscriptRow) {
+        assert_eq!(
+            unique_throb_frames(label),
+            1,
+            "invariant: a wordless in-progress assistant row uses exactly one throb \
+             frame from format(), not the hollow ○ stacked under the accordion bullet \
+             (#821); label={label:?}; projected row: {row:?}"
+        );
+        assert!(
+            !label.contains('\u{25cb}') && !label.contains('\u{2022}'),
+            "invariant: the live thinking label must not carry ○ or • — those are \
+             the two glyphs that stacked as `• ○ Analyzing…` (#821); label={label:?}; \
+             projected row: {row:?}"
+        );
+        assert!(
+            label.contains(verb) && label.contains("thinking"),
+            "invariant: a wordless in-progress row names the verb and includes the \
+             elapsed/thinking stats format() already computed, so live redraws are \
+             visible (#821, #350, Key Principle 5); label={label:?}; projected row: {row:?}"
+        );
+        assert!(
+            label.contains("s · thinking"),
+            "invariant: elapsed is present while token_count == 0 (#821); \
+             label={label:?}; projected row: {row:?}"
+        );
+    }
+
     /// The wordless shapes are the ones production actually reaches. A query
     /// unit is created empty and stays empty for the whole provider round trip
     /// (`query_processor.rs` streaming and non-streaming entry), and a stream
@@ -2347,13 +2407,7 @@ mod tests {
         for verb in ["", "   ", "\t"] {
             let pending = WorkUnit::new(verb);
             let row = pending.transcript_row(&colors()).unwrap();
-            assert_eq!(
-                row.label, "\u{25cb} Working\u{2026}",
-                "invariant: a verb that carries no words falls back to words, never \
-                 to a bare glyph — an unreadable row is the defect this label \
-                 exists to prevent (#350, Key Principle 5); verb={verb:?}; \
-                 projected row: {row:?}"
-            );
+            assert_wordless_thinking_label(&row.label, "Working", &row);
         }
     }
 
@@ -2361,16 +2415,11 @@ mod tests {
     fn test_wordless_assistant_row_still_names_its_state_in_words() {
         let pending = WorkUnit::new("Channeling");
         let row = pending.transcript_row(&colors()).unwrap();
-        assert_eq!(
-            row.label, "\u{25cb} Channeling\u{2026}",
-            "invariant: an assistant row with no words of its own yet keeps readable \
-             text naming what is happening — a bare glyph is not an accessible \
-             interface (#350, Key Principle 5); projected row: {row:?}"
-        );
+        assert_wordless_thinking_label(&row.label, "Channeling", &row);
         assert!(
             row.body.is_empty(),
             "invariant: the wordless row has no body, so the accordion renders it as a \
-             non-expandable bullet with the label as its only text; projected row: {row:?}"
+             non-expandable leaf with the label as its only text; projected row: {row:?}"
         );
 
         let failed = WorkUnit::new("Channeling");
@@ -2767,6 +2816,14 @@ mod tests {
         assert!(f.contains("thinking"), "should contain 'thinking': {}", f);
         let has_throb = THROB_FRAMES.iter().any(|fr| f.contains(fr));
         assert!(has_throb, "should contain a throb frame: {}", f);
+        let row = wu.transcript_row(&colors()).unwrap();
+        assert!(
+            row.label.contains("thinking") && unique_throb_frames(&row.label) == 1,
+            "invariant: transcript_row must show the same thinking chrome format() \
+             already had, because the TUI paints transcript_row (#821); \
+             format={f}; label={}",
+            row.label
+        );
     }
 
     #[test]
@@ -2778,6 +2835,15 @@ mod tests {
         assert!(f.contains("tokens"));
         assert!(f.contains("5"));
         assert!(!f.contains("thinking"));
+        let row = wu.transcript_row(&colors()).unwrap();
+        assert!(
+            row.label.contains("tokens")
+                && row.label.contains("5")
+                && !row.label.contains("thinking"),
+            "invariant: transcript_row must show token stats once they exist, matching \
+             format() (#821); format={f}; label={}",
+            row.label
+        );
     }
 
     #[test]

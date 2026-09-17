@@ -41,6 +41,33 @@ pub struct AccordionState {
     last_toggled: Option<TranscriptRowId>,
 }
 
+/// Disclosure control for one projected row.
+///
+/// Expandable rows get a triangle. Leaf rows get `•` only when the label does
+/// not already start with its own status glyph. Stacking the list bullet on
+/// `○ Analyzing…` (or the live throb) was the `• ○ Analyzing…` thinking line
+/// (#821).
+fn disclosure_marker(expandable: bool, expanded: bool, label: &str) -> &'static str {
+    match (expandable, expanded) {
+        (true, true) => "▼",
+        (true, false) => "▶",
+        (false, _) if label_starts_with_status_glyph(label) => "",
+        (false, _) => "•",
+    }
+}
+
+fn label_starts_with_status_glyph(label: &str) -> bool {
+    // Keep in lockstep with `assistant_prose_glyph` and `THROB_FRAMES` in
+    // `cli::messages::work_unit`. Accordion must not import those internals.
+    const OWN: &[char] = &[
+        '\u{25cb}', // ○ in-progress prose that already has words
+        '\u{23fa}', // ⏺ complete
+        '\u{2298}', // ⊘ failed
+        '✦', '✳', '✼', // thinking throb
+    ];
+    label.chars().next().is_some_and(|c| OWN.contains(&c))
+}
+
 impl AccordionState {
     pub fn is_expanded(&self, row: &TranscriptRow) -> bool {
         self.expanded
@@ -113,11 +140,7 @@ impl AccordionState {
     ) {
         let expandable = !row.body.is_empty() || !row.children.is_empty();
         let expanded = expandable && (force_expanded || self.is_expanded(row));
-        let marker = match (expandable, expanded) {
-            (true, true) => "▼",
-            (true, false) => "▶",
-            (false, _) => "•",
-        };
+        let marker = disclosure_marker(expandable, expanded, &row.label);
         let state = if expandable {
             if expanded {
                 " [expanded]"
@@ -132,14 +155,14 @@ impl AccordionState {
         } else {
             "  "
         };
+        let indent = "  ".repeat(depth);
+        let text = if marker.is_empty() {
+            format!("{focus}{indent}{}{}", row.label, state)
+        } else {
+            format!("{focus}{indent}{marker} {}{}", row.label, state)
+        };
         lines.push(RenderedTranscriptLine {
-            text: format!(
-                "{focus}{}{} {}{}",
-                "  ".repeat(depth),
-                marker,
-                row.label,
-                state
-            ),
+            text,
             row_id: expandable.then(|| row.id.clone()),
             row_expanded: expandable.then_some(expanded),
             kind: Some(row.kind),
@@ -282,6 +305,32 @@ mod tests {
     use super::*;
     use crate::cli::messages::{Message, WorkUnit};
     use std::sync::Arc;
+
+    #[test]
+    fn test_disclosure_marker_omits_list_bullet_when_label_has_a_status_glyph() {
+        assert_eq!(disclosure_marker(true, true, "anything"), "▼");
+        assert_eq!(disclosure_marker(true, false, "anything"), "▶");
+        assert_eq!(disclosure_marker(false, false, "bash(echo hi)"), "•");
+        assert_eq!(
+            disclosure_marker(false, false, "✦ Analyzing\u{2026} (0s · thinking)"),
+            "",
+            "invariant: a leaf thinking label already carries the throb, so the \
+             accordion must not prefix • (#821)"
+        );
+        assert_eq!(
+            disclosure_marker(false, false, "\u{25cb} Channeling\u{2026}"),
+            "",
+            "invariant: a leaf hollow-glyph label must not stack • (#821)"
+        );
+        assert_eq!(
+            disclosure_marker(false, false, "\u{23fa} No assistant text"),
+            ""
+        );
+        assert_eq!(
+            disclosure_marker(false, false, "\u{2298} Assistant turn failed"),
+            ""
+        );
+    }
 
     #[test]
     fn test_nested_rows_keep_ids_and_hidden_content_across_toggle() {
@@ -765,6 +814,50 @@ mod tests {
             "invariant: a failed assistant turn carries its own mark and never the \
              completed or in-progress glyph, so a dead query cannot be read as an \
              answered or a still-running one; rendered transcript:\n{failed_transcript}"
+        );
+    }
+
+    #[test]
+    fn test_wordless_thinking_line_has_one_glyph_and_elapsed() {
+        // Production path: query_processor creates an empty WorkUnit and the TUI
+        // paints accordion(render_message) from transcript_row, not format().
+        // Before #821 the header was `• ○ Analyzing…` and never showed elapsed.
+        let work = Arc::new(WorkUnit::new("Analyzing"));
+        let message: MessageRef = work;
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+        let rendered = state.render_message(&message, &colors);
+        let header = &rendered[0].text;
+        let transcript = rendered
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let accordion_bullets = header.matches('\u{2022}').count();
+        let hollow_glyphs = header.matches('\u{25cb}').count();
+        let unique_throb = ["✦", "✳", "✼"]
+            .iter()
+            .filter(|frame| header.contains(*frame))
+            .count();
+        assert_eq!(
+            accordion_bullets + hollow_glyphs,
+            0,
+            "invariant: a wordless in-progress assistant row must not stack the \
+             accordion list bullet with the hollow activity glyph (#821); \
+             header was {header:?}; rendered transcript:\n{transcript}"
+        );
+        assert_eq!(
+            unique_throb, 1,
+            "invariant: the live thinking line carries exactly one throb frame, \
+             the chrome format() already used; header was {header:?}; \
+             rendered transcript:\n{transcript}"
+        );
+        assert!(
+            header.contains("Analyzing") && header.contains("s · thinking"),
+            "invariant: the live thinking line names the verb and includes elapsed \
+             while token_count == 0 so redraws are visible (#821); header was \
+             {header:?}; rendered transcript:\n{transcript}"
         );
     }
 
