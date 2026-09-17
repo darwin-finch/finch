@@ -1203,4 +1203,131 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn session_local_tools_skip_host_effect_confirmation_at_approval_boundary() {
+        // Issue #426: spawn_tool_execution auto-approves when
+        // refined_effect_for_approval(declared, name, input).runs_autonomously().
+        // Unclassified never does, so the canonical names prompted. The
+        // four-item todo_write payload is the reported failure.
+        use crate::tools::{
+            AskUserQuestionTool, PresentPlanTool, TodoReadTool, TodoWriteTool, ToolRegistry,
+        };
+
+        let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
+        registry.register(Box::new(TodoReadTool::new(todo_list)));
+        registry.register(Box::new(PresentPlanTool));
+        registry.register(Box::new(AskUserQuestionTool));
+        registry.register(Box::new(crate::tools::WriteTool));
+        registry.register_alias("TodoWrite", "todo_write");
+        registry.register_alias("TodoRead", "todo_read");
+        registry.register_alias("PresentPlan", "present_plan");
+        registry.register_alias("AskUserQuestion", "ask_user_question");
+
+        let four_item_list = serde_json::json!({"todos": [
+            {"content": "Identify the harness implementation, website source, and deployment target",
+             "id": "1", "priority": "high", "status": "in_progress"},
+            {"content": "Implement the typed program runner in the harness",
+             "id": "2", "priority": "high", "status": "pending"},
+            {"content": "Build the website source from the harness output",
+             "id": "3", "priority": "medium", "status": "pending"},
+            {"content": "Verify the deployment target accepts the build",
+             "id": "4", "priority": "low", "status": "completed"}
+        ]});
+
+        for (name, expected, input) in [
+            ("todo_write", ExecutionEffect::VmWrite, &four_item_list),
+            ("TodoWrite", ExecutionEffect::VmWrite, &four_item_list),
+            ("todo_read", ExecutionEffect::VmRead, &serde_json::json!({})),
+            (
+                "present_plan",
+                ExecutionEffect::VmWrite,
+                &serde_json::json!({"plan": "do the work"}),
+            ),
+            (
+                "ask_user_question",
+                ExecutionEffect::VmWrite,
+                &serde_json::json!({"questions": []}),
+            ),
+        ] {
+            let declared = registry.declared_effect(name);
+            let refined = refined_effect_for_approval(declared, name, input);
+            assert_eq!(
+                declared, expected,
+                "invariant: '{name}' must declare {expected:?} at the approval \
+                 boundary; Unclassified is AskUser in spawn_tool_execution \
+                 (declared={declared:?}, input={input})"
+            );
+            assert_ne!(
+                refined,
+                ExecutionEffect::Unclassified,
+                "invariant: '{name}' must not present Unclassified to \
+                 refined_effect_for_approval; that is the AskUser the user hits \
+                 (declared={declared:?}, refined={refined:?}, input={input})"
+            );
+            assert!(
+                refined.runs_autonomously(),
+                "invariant: '{name}' must skip host-effect confirmation; \
+                 spawn_tool_execution emits ToolApprovalNeeded when the refined \
+                 effect does not run autonomously (declared={declared:?}, \
+                 refined={refined:?}, input={input})"
+            );
+        }
+
+        let write_input = serde_json::json!({"file_path": "src/lib.rs", "content": "x"});
+        let write_refined =
+            refined_effect_for_approval(registry.declared_effect("write"), "write", &write_input);
+        assert!(
+            !write_refined.runs_autonomously(),
+            "control: workspace write must still demand host-effect confirmation; \
+             refined={write_refined:?}"
+        );
+
+        let owner = PermissionManager::new();
+        let peer = PermissionManager::for_peer();
+        for name in [
+            "todo_write",
+            "todo_read",
+            "present_plan",
+            "ask_user_question",
+        ] {
+            assert!(
+                !matches!(
+                    owner.check_tool_use(name, &serde_json::json!({})),
+                    PermissionCheck::Deny(_)
+                ),
+                "invariant: PermissionManager must not Deny '{name}'; \
+                 constitutional constraints still apply to bash/read/web_fetch \
+                 only (got {:?})",
+                owner.check_tool_use(name, &serde_json::json!({}))
+            );
+            assert!(
+                !matches!(
+                    peer.check_tool_use(name, &serde_json::json!({})),
+                    PermissionCheck::Deny(_)
+                ),
+                "invariant: '{name}' is not a peer hard-deny tool; got {:?}",
+                peer.check_tool_use(name, &serde_json::json!({}))
+            );
+        }
+
+        let restart =
+            crate::tools::Tool::name(&crate::tools::implementations::restart::RestartTool);
+        assert!(
+            matches!(
+                peer.check_tool_use(restart, &serde_json::json!({})),
+                PermissionCheck::Deny(_)
+            ),
+            "invariant: peer hard-deny still blocks '{restart}'"
+        );
+        assert!(
+            matches!(
+                owner.check_tool_use("bash", &serde_json::json!({"command": "rm -rf /"})),
+                PermissionCheck::Deny(_)
+            ),
+            "invariant: constitutional constraints still deny dangerous bash"
+        );
+    }
 }

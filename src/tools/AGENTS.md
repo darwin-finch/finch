@@ -50,10 +50,12 @@ pre-refactor classification. The planning allowlists (`PLANNING_MODE_ALLOWED_TOO
 `src/cli/repl_event/plan_handler.rs`, `REPL_PLANNING_ALLOWED_TOOLS` in `src/cli/repl.rs`,
 `EXECUTOR_PLANNING_ALLOWED_TOOLS` in `permissions.rs`) are keyed on registered names or alias
 keys and are conformance-tested in the same file; spellings nothing registers (`ExitPlanMode`,
-`Bash`) are deliberately blocked. Declaring `Unclassified` is a real decision: todo_read,
-todo_write, enter_plan_mode, present_plan, ask_user_question, inspect_memory, and the four agent
+`Bash`) are deliberately blocked. Declaring `Unclassified` is a real decision: enter_plan_mode, inspect_memory, and the four agent
 tools preserve their pre-refactor approval behavior that way, and re-authorizing any of them is a
-deliberate approval-policy change with its own review, not a drive-by declaration edit.
+deliberate approval-policy change with its own review, not a drive-by declaration edit. Issue #426
+re-authorized `todo_read` (`VmRead`), `todo_write` (`VmWrite`), `present_plan` (`VmWrite`), and
+`ask_user_question` (`VmWrite`): a session-local checklist and tools that already present their
+own dialogs must not demand a second host-effect confirmation.
 
 **A tool name is not an instruction.** Implementations receive model-supplied names, paths, and
 schemas as data. MCP names are namespaced before they reach the registry; do not invent a second
