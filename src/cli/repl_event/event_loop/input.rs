@@ -201,11 +201,37 @@ Rules:\n\
                     Command::Plan(task) => {
                         self.handle_plan_task(task).await?;
                     }
-                    Command::PlanModeToggle => {
-                        // Check current mode and toggle
+                    Command::CycleMode => {
                         let current_mode = self.mode.read().await.clone();
                         match current_mode {
                             ReplMode::Normal => {
+                                *self.mode.write().await = ReplMode::AutoAccept;
+                                self.output_manager.write_info(
+                                    "⏵⏵ Auto-accept on. Tools and programs run without prompts.\n\
+                                     Shift+tab cycles to plan mode.",
+                                );
+                                self.update_plan_mode_indicator(&ReplMode::AutoAccept);
+                            }
+                            ReplMode::AutoAccept => {
+                                self.enter_inspection_plan_mode().await?;
+                            }
+                            ReplMode::Planning { .. } | ReplMode::Executing { .. } => {
+                                *self.mode.write().await = ReplMode::Normal;
+                                self.plan_word = None;
+                                self.output_manager.write_info(
+                                    "✅ Exited plan mode. Returned to confirmation mode.",
+                                );
+                                self.update_plan_mode_indicator(&ReplMode::Normal);
+                            }
+                        }
+                        self.render_tui().await?;
+                    }
+                    Command::PlanModeToggle => {
+                        // `/plan` with no args: enter or leave planning.
+                        // Shift+Tab is CycleMode and does not share this path.
+                        let current_mode = self.mode.read().await.clone();
+                        match current_mode {
+                            ReplMode::Normal | ReplMode::AutoAccept => {
                                 // Gobble ALL items from the vocabulary stack.
                                 // If multiple words have accumulated, drain the whole stack and
                                 // stream a plan response — non-blocking so the user can keep
@@ -239,36 +265,17 @@ Rules:\n\
                                     };
 
                                     if let Some(task) = stack_word {
-                                        // Kick off the full IMPCPD plan loop for the popped word.
                                         self.handle_plan_task(task).await?;
                                     } else {
-                                        // No stack word — plain plan mode entry
-                                        let plan_path = std::env::temp_dir()
-                                            .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
-                                        let new_mode = ReplMode::Planning {
-                                            task: "Manual exploration".to_string(),
-                                            plan_path: plan_path.clone(),
-                                            created_at: chrono::Utc::now(),
-                                        };
-                                        *self.mode.write().await = new_mode.clone();
-                                        self.output_manager.write_info(
-                                            "📋 Entered plan mode.\n\
-                                         You can explore the codebase using read-only tools:\n\
-                                         - Read files, glob, grep, web_fetch are allowed\n\
-                                         - Write, edit, bash are restricted\n\
-                                         Use /plan to exit plan mode.",
-                                        );
-                                        self.update_plan_mode_indicator(&new_mode);
+                                        self.enter_inspection_plan_mode().await?;
                                     }
-                                } // end single-word else branch
+                                }
                             }
                             ReplMode::Planning { .. } | ReplMode::Executing { .. } => {
-                                // Exit plan mode, return to normal; clear plan_word
                                 *self.mode.write().await = ReplMode::Normal;
                                 self.plan_word = None;
                                 self.output_manager
                                     .write_info("✅ Exited plan mode. Returned to normal mode.");
-                                // Update status bar indicator
                                 self.update_plan_mode_indicator(&ReplMode::Normal);
                             }
                         }
@@ -711,5 +718,22 @@ Rules:\n\
         // with `:`, and other Co-Forth uses `/forth`. Never classify prose by
         // asking the historical semiotic dictionary whether its words exist.
         self.execute_query(input).await
+    }
+
+    async fn enter_inspection_plan_mode(&mut self) -> Result<()> {
+        let plan_path = std::env::temp_dir().join(format!("plan_{}.md", uuid::Uuid::new_v4()));
+        let new_mode = ReplMode::Planning {
+            task: "Manual exploration".to_string(),
+            plan_path,
+            created_at: chrono::Utc::now(),
+        };
+        *self.mode.write().await = new_mode.clone();
+        self.output_manager.write_info(
+            "📋 Entered plan mode.\n\
+             You can explore the codebase using read-only tools.\n\
+             Shift+tab returns to confirmation mode. /plan also exits.",
+        );
+        self.update_plan_mode_indicator(&new_mode);
+        Ok(())
     }
 }

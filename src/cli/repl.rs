@@ -533,8 +533,16 @@ mod gui_automation_startup_tests {
 /// REPL operating mode
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplMode {
-    /// Normal mode - all tools require confirmation
+    /// Normal mode - host-effect tools and unclassified programs require confirmation
     Normal,
+    /// Auto-accept host-effect tools and VM/program capability prompts.
+    ///
+    /// The REPL AskUser / VM dialog is skipped. `PermissionManager` Deny and
+    /// constitutional constraints still apply at execute time. Planning
+    /// restrictions do not apply. This is a working mode like `Normal`, not a
+    /// temporary overlay: Ctrl+C cancels a query without leaving it, and idle
+    /// Ctrl+C exits Finch.
+    AutoAccept,
     /// Planning mode - only inspection tools allowed (read, glob, grep, web_fetch)
     Planning {
         task: String,
@@ -547,6 +555,19 @@ pub enum ReplMode {
         plan_path: PathBuf,
         approved_at: chrono::DateTime<chrono::Utc>,
     },
+}
+
+impl ReplMode {
+    /// True when this mode actually waives AskUser / VM capability dialogs.
+    pub fn auto_accepts_host_effects(&self) -> bool {
+        matches!(self, Self::AutoAccept)
+    }
+
+    /// Plan and executing-plan overlays. Ctrl+C exits these without leaving Finch.
+    /// `AutoAccept` is a working mode like `Normal`, not an overlay.
+    pub fn is_plan_overlay(&self) -> bool {
+        matches!(self, Self::Planning { .. } | Self::Executing { .. })
+    }
 }
 
 #[allow(dead_code)]
@@ -2559,7 +2580,7 @@ impl Repl {
                     self.print_separator();
                     // Note: Can't use colored prompts in basic mode, so use plain text
                     let prompt = match &self.mode {
-                        ReplMode::Normal => "> ",
+                        ReplMode::Normal | ReplMode::AutoAccept => "> ",
                         ReplMode::Planning { .. } => "plan> ",
                         ReplMode::Executing { .. } => "exec> ",
                     };
@@ -3370,7 +3391,7 @@ impl Repl {
     /// Get mode-specific prompt string
     fn get_prompt(&self) -> String {
         match &self.mode {
-            ReplMode::Normal => "> ".to_string(),
+            ReplMode::Normal | ReplMode::AutoAccept => "> ".to_string(),
             ReplMode::Planning { .. } => format!("{} ", "plan>".blue()),
             ReplMode::Executing { .. } => format!("{} ", "exec>".green()),
         }
@@ -3405,6 +3426,7 @@ impl Repl {
         // Build mode indicator
         let mode_indicator = match &self.mode {
             ReplMode::Normal => String::new(),
+            ReplMode::AutoAccept => format!(" {}", "[AUTO-ACCEPT]".green().bold()),
             ReplMode::Planning { .. } => {
                 format!(" {}", "[PLANNING MODE - Inspection Only]".blue().bold())
             }

@@ -1970,8 +1970,14 @@ mod tests {
         let dark_body = dark.body.unwrap();
         let light_body = light.body.unwrap();
         assert_ne!(dark_body, light_body);
-        assert!(dark_body.contains("38;2;126;231;135"));
-        assert!(light_body.contains("38;2;0;92;38"));
+        assert!(
+            dark_body.contains("48;2;20;72;40") && dark_body.contains("38;2;236;246;238"),
+            "dark approval diffs must fill add rows; body={dark_body}"
+        );
+        assert!(
+            light_body.contains("48;2;204;240;214") && light_body.contains("38;2;12;56;28"),
+            "light approval diffs must fill add rows; body={light_body}"
+        );
     }
 
     #[test]

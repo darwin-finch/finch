@@ -562,13 +562,33 @@ impl WorkUnit {
         }
     }
 
-    /// Mark a sub-row as failed.
-    pub fn fail_row(&self, idx: usize, error: impl Into<String>) {
+    /// Mark a sub-row as failed, optionally attaching diagnostic body lines
+    /// shown when the row is expanded.
+    ///
+    /// Empty `body_lines` leaves any already-streamed output in place so a
+    /// bash failure still shows the command's stdout. Non-empty lines are
+    /// appended after that existing body.
+    pub fn fail_row_with_body(
+        &self,
+        idx: usize,
+        error: impl Into<String>,
+        body_lines: Vec<String>,
+    ) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());
             row.status = WorkRowStatus::Error(crate::cli::diff::sanitize_terminal(&error.into()));
+            row.body_lines.extend(
+                body_lines
+                    .into_iter()
+                    .map(|line| crate::cli::diff::sanitize_terminal(&line)),
+            );
         }
+    }
+
+    /// Mark a sub-row as failed.
+    pub fn fail_row(&self, idx: usize, error: impl Into<String>) {
+        self.fail_row_with_body(idx, error, Vec::new());
     }
 
     pub(crate) fn queue_agent_activity(
@@ -1962,9 +1982,16 @@ mod tests {
         );
         let plain = format_row_collapsed(&row, &colors(), DiffColorMode::NoColor);
         assert_ne!(dark, light);
-        assert!(dark.contains("38;2;126;231;135"));
-        assert!(light.contains("38;2;0;92;38"));
+        assert!(
+            dark.contains("48;2;20;72;40") && dark.contains("38;2;236;246;238"),
+            "collapsed dark diffs must fill add rows; dark={dark}"
+        );
+        assert!(
+            light.contains("48;2;204;240;214") && light.contains("38;2;12;56;28"),
+            "collapsed light diffs must fill add rows; light={light}"
+        );
         assert!(!plain.contains("38;2;"));
+        assert!(!plain.contains("48;2;"));
     }
 
     #[test]
@@ -2679,10 +2706,54 @@ mod tests {
     }
 
     #[test]
+    fn test_fail_row_with_body_is_visible_when_expanded() {
+        let wu = WorkUnit::new("Tools");
+        let idx = wu.add_row("bash(git status)");
+        wu.fail_row_with_body(
+            idx,
+            "loop detected: bash called 3 times with the same arguments",
+            vec!["Repeating this exact call is unlikely to produce new information.".into()],
+        );
+        wu.set_complete();
+        let projected = wu.transcript_row(&colors()).unwrap();
+        assert!(
+            projected.label.contains("bash(git status)"),
+            "group label must keep the tool row, not a raw provider id; got {}",
+            projected.label
+        );
+        assert!(
+            projected.label.contains("loop detected"),
+            "collapsed group must name the loop; got {}",
+            projected.label
+        );
+        let call = &projected.children[0];
+        assert!(
+            call.label.contains("bash(git status)"),
+            "child must keep the bash label; got {}",
+            call.label
+        );
+        let output = call
+            .children
+            .iter()
+            .find(|child| child.kind == TranscriptRowKind::ToolOutput)
+            .unwrap_or_else(|| {
+                panic!("loop body must be an expandable output child; call={call:?}")
+            });
+        assert!(
+            output
+                .body
+                .iter()
+                .any(|line| line.contains("unlikely to produce new information")),
+            "expanding the failed call must show the full loop diagnostic; output={output:?}"
+        );
+    }
+
+    #[test]
     fn test_out_of_bounds_row_ops_do_not_panic() {
         let wu = WorkUnit::new("X");
         wu.complete_row(99, "summary"); // should not panic
         wu.fail_row(99, "error"); // should not panic
+        wu.fail_row_with_body(99, "error", vec!["body".into()]);
     }
 
     // ── format() — InProgress ────────────────────────────────────────────────

@@ -306,6 +306,10 @@ impl ToolExecutionCoordinator {
             )
             .runs_autonomously();
 
+            // AutoAccept does not skip here. Named-Brain turns must still
+            // emit ToolApprovalNeeded so the event-loop presenter can record
+            // ApprovalRequested and round-trip the daemon. The dialog waiver
+            // lives in `handle_tool_approval_request` after that route.
             let needs_approval = !is_auto_approved
                 && matches!(approval_source, crate::tools::ApprovalSource::NotApproved);
 
@@ -512,4 +516,143 @@ async fn publish_tool_result(
         tool_id,
         result,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::programs::ExecutionEffect;
+    use crate::providers::{ContentBlock, Message};
+    use crate::theme::ColorScheme;
+    use crate::tools::{
+        PermissionManager, Tool, ToolExecutor, ToolInputSchema, ToolRegistry, ToolUse,
+    };
+
+    struct AutoAcceptWriteProbe;
+
+    #[async_trait::async_trait]
+    impl Tool for AutoAcceptWriteProbe {
+        fn name(&self) -> &str {
+            "write"
+        }
+
+        fn effect(&self) -> ExecutionEffect {
+            ExecutionEffect::WorkspaceWrite
+        }
+
+        fn description(&self) -> &str {
+            "probe: auto-accept must skip the AskUser dialog"
+        }
+
+        fn input_schema(&self) -> ToolInputSchema {
+            ToolInputSchema::simple(vec![("path", "unused")])
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: &crate::tools::ToolContext<'_>,
+        ) -> anyhow::Result<String> {
+            Ok("auto-accepted-write".to_string())
+        }
+    }
+
+    fn coordinator_with_write_probe(
+        mode: ReplMode,
+    ) -> (
+        ToolExecutionCoordinator,
+        mpsc::UnboundedReceiver<ReplEvent>,
+        tempfile::TempDir,
+    ) {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(AutoAcceptWriteProbe));
+        let tempdir = tempfile::tempdir().expect("isolated tool-pattern store");
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct executor for auto-accept write probe");
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let coordinator = ToolExecutionCoordinator::new(
+            event_tx,
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::new(OutputManager::new(ColorScheme::default())),
+            Arc::new(RwLock::new(ConversationHistory::new())),
+            Arc::new(RwLock::new(LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
+            Arc::new(RwLock::new(mode)),
+            Arc::new(RwLock::new(None)),
+        );
+        (coordinator, events, tempdir)
+    }
+
+    async fn spawn_write_probe(
+        coordinator: &ToolExecutionCoordinator,
+        events: &mut mpsc::UnboundedReceiver<ReplEvent>,
+    ) -> ReplEvent {
+        let query_id = Uuid::new_v4();
+        let tool_use = ToolUse::new(
+            "write".to_string(),
+            serde_json::json!({"path": "src/lib.rs", "content": "must not wait for a dialog"}),
+        );
+        let tool_id = tool_use.id.clone();
+        let round_token = coordinator
+            .conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: tool_id,
+                        name: "write".into(),
+                        input: tool_use.input.clone(),
+                    }],
+                },
+            )
+            .expect("stage the write probe round");
+        let work_unit = coordinator.output_manager.start_work_unit("write");
+        let row_idx = work_unit.add_row("write(src/lib.rs)");
+        coordinator.spawn_tool_execution(query_id, round_token, tool_use, work_unit, row_idx, None);
+        tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("write probe must emit an event")
+            .expect("event channel must stay open")
+    }
+
+    #[tokio::test]
+    async fn test_auto_accept_still_emits_tool_approval_needed_for_named_brain_route() {
+        let (coordinator, mut events, _tempdir) =
+            coordinator_with_write_probe(ReplMode::AutoAccept);
+        let event = spawn_write_probe(&coordinator, &mut events).await;
+        match event {
+            ReplEvent::ToolApprovalNeeded { tool_use, .. } => {
+                assert_eq!(
+                    tool_use.name, "write",
+                    "AutoAccept must still emit ToolApprovalNeeded so the event-loop \
+                     presenter can record named-Brain ApprovalRequested; tool={:?}",
+                    tool_use.name
+                );
+            }
+            other => panic!("AutoAccept must not skip ToolApprovalNeeded at spawn; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_normal_mode_still_requests_write_approval() {
+        let (coordinator, mut events, _tempdir) = coordinator_with_write_probe(ReplMode::Normal);
+        let event = spawn_write_probe(&coordinator, &mut events).await;
+        match event {
+            ReplEvent::ToolApprovalNeeded { tool_use, .. } => {
+                assert_eq!(
+                    tool_use.name, "write",
+                    "Normal must still prompt for write; tool={:?}",
+                    tool_use.name
+                );
+            }
+            other => panic!("Normal must emit ToolApprovalNeeded for write, not {other:?}"),
+        }
+    }
 }

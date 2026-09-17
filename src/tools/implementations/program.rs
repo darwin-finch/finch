@@ -960,6 +960,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let definition = tool
             .execute(json!({"language": "lisp"}), &context)
@@ -992,6 +993,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let result: Value =
             serde_json::from_str(&tool.execute(json!({}), &context).await.unwrap()).unwrap();
@@ -1022,6 +1024,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
             &tool
@@ -1053,6 +1056,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
             &tool
@@ -1090,6 +1094,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
 
         for tool in [&legacy as &dyn Tool, &canonical as &dyn Tool] {
@@ -1130,6 +1135,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let found: Value = serde_json::from_str(
             &search
@@ -1187,6 +1193,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
             &tool
@@ -1350,6 +1357,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
         let result = tool
             .execute(
@@ -1407,6 +1415,7 @@ mod tests {
             live_output: None,
             effect_audit: Some(effect_audit),
             poset: None,
+            skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
             &tool
@@ -1451,6 +1460,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
 
         let forth: Value = serde_json::from_str(
@@ -1506,6 +1516,7 @@ mod tests {
             live_output: None,
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
 
         let outcome = tool
@@ -1551,6 +1562,7 @@ mod tests {
             }),
             effect_audit: None,
             poset: None,
+            skip_interactive_review: false,
         };
 
         tool.execute(

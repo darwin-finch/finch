@@ -1193,6 +1193,7 @@ async fn execute_child_tool(tools: &[Box<dyn Tool>], name: &str, input: Value) -
         live_output: None,
         effect_audit: None,
         poset: None,
+        skip_interactive_review: true,
     };
     tool.execute(input, &context).await
 }

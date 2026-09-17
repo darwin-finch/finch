@@ -905,13 +905,14 @@ async fn test_named_brain_runner_attaches_its_scheduler() {
 }
 
 /// Production-boundary regression for the loop-detected TUI dump: a blocked
-/// bash result must update the labeled bash row and must not spawn a second
-/// WorkUnit titled with the raw provider tool id (`call_tyIrmyNxiUxYGF7QhOT1vslZ`).
+/// bash result must update the labeled bash row, put the full diagnostic in
+/// the expandable body, and must not spawn a second WorkUnit titled with the
+/// raw provider tool id (`call_tyIrmyNxiUxYGF7QhOT1vslZ`).
 #[tokio::test]
 async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            use crate::cli::messages::Message;
+            use crate::cli::messages::{Message, TranscriptRowKind};
 
             let (mut event_loop, output) = lifecycle_test_event_loop();
             output.disable_stdout();
@@ -954,8 +955,9 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
             );
 
             let error = anyhow::anyhow!(
-                "LOOP DETECTED: You have called bash with the same arguments 1 time(s) and received the same result each time.\n\
-                 Repeating this call will not produce different output."
+                "loop detected: bash called 3 times with the same arguments\n\
+                 Repeating this exact call is unlikely to produce new information. \
+                 Inspect the previous results or use a different command."
             );
             event_loop
                 .handle_tool_result(query_id, round_token, tool_id.clone(), Err(error))
@@ -987,9 +989,8 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
                 labels[0]
             );
             assert!(
-                labels[0].to_ascii_lowercase().contains("loop detected")
-                    || labels[0].contains("failed"),
-                "Tools header must name the loop failure; got {}",
+                labels[0].contains("loop detected"),
+                "Tools header must name the loop; got {}",
                 labels[0]
             );
 
@@ -1011,6 +1012,20 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
                 call.label.contains("failed"),
                 "labeled bash row must be Error; got {}",
                 call.label
+            );
+            let output_row = call
+                .children
+                .iter()
+                .find(|child| child.kind == TranscriptRowKind::ToolOutput)
+                .unwrap_or_else(|| {
+                    panic!("long loop diagnostic must be expandable output; call={call:?}")
+                });
+            assert!(
+                output_row
+                    .body
+                    .iter()
+                    .any(|line| line.contains("unlikely to produce new information")),
+                "expanding the failed bash row must show the full loop diagnostic; output={output_row:?}"
             );
         })
         .await;
@@ -3822,6 +3837,7 @@ fn modes_under_test() -> Vec<(&'static str, crate::cli::repl::ReplMode)> {
 
     vec![
         ("Normal", ReplMode::Normal),
+        ("AutoAccept", ReplMode::AutoAccept),
         (
             "Planning",
             ReplMode::Planning {
@@ -3852,19 +3868,9 @@ fn host_effect_tools() -> [(&'static str, serde_json::Value); 3] {
     ]
 }
 
-/// No mode's status-bar label may advertise that approvals are waived,
-/// because no mode waives one.
-///
-/// `ReplMode::Normal` shipped labelled `accept edits on` while
-/// `crate::tools::PermissionManager::check_tool_use` still returns `AskUser`
-/// for write/edit/bash. A maintainer read the label, believed approvals had
-/// been waived, and then hit `$EDITOR` on every write. The status bar is the
-/// only surface reporting mode, and it reported a mode that does not exist.
-///
-/// This asserts the property rather than the wording, so a later rewrite of
-/// the labels cannot drift back the way a hardcoded expected string would.
-/// Should an auto-accept mode ever be implemented, this test is the thing
-/// that must change in the same commit that makes the claim true.
+/// Labels that claim waived approval are allowed only on `AutoAccept`,
+/// which actually skips the REPL approval dialog. Other modes must not
+/// advertise a waiver (`PermissionManager` still returns AskUser).
 #[test]
 fn test_mode_indicator_never_claims_edits_are_accepted_automatically() {
     let permissions = crate::tools::PermissionManager::new();
@@ -3874,12 +3880,12 @@ fn test_mode_indicator_never_claims_edits_are_accepted_automatically() {
             matches!(outcome, crate::tools::PermissionCheck::AskUser(_)),
             "invariant: host-effect tool {tool} must ask via \
              crate::tools::PermissionManager::check_tool_use; that function \
-             never takes a ReplMode, so no mode can waive this approval. \
-             outcome={outcome:?} input={input}"
+             never takes a ReplMode. AutoAccept waives at the REPL dialog, \
+             not inside check_tool_use. outcome={outcome:?} input={input}"
         );
     }
 
-    const CLAIMS_OF_WAIVED_APPROVAL: [&str; 12] = [
+    const CLAIMS_OF_WAIVED_APPROVAL: [&str; 13] = [
         "accept edits",
         "accepts edits",
         "auto-accept",
@@ -3890,6 +3896,7 @@ fn test_mode_indicator_never_claims_edits_are_accepted_automatically() {
         "no confirmation",
         "without confirmation",
         "without approval",
+        "without prompts",
         "skip confirmation",
         "skips confirmation",
     ];
@@ -3897,16 +3904,19 @@ fn test_mode_indicator_never_claims_edits_are_accepted_automatically() {
     for (mode_name, mode) in modes_under_test() {
         let indicator = super::plan_mode_indicator(&mode);
         let lowered = indicator.to_lowercase();
-
-        for claim in CLAIMS_OF_WAIVED_APPROVAL {
+        let claims = CLAIMS_OF_WAIVED_APPROVAL
+            .iter()
+            .any(|claim| lowered.contains(claim));
+        if mode.auto_accepts_host_effects() {
             assert!(
-                !lowered.contains(claim),
-                "invariant: a REPL mode indicator must never advertise waived \
-                 approvals, because crate::tools::PermissionManager::check_tool_use \
-                 never reads ReplMode and still returns AskUser for write/edit/bash, \
-                 and the executor's only mode branch restricts Planning rather than \
-                 widening anything. mode={mode_name} mode_value={mode:?} \
-                 indicator={indicator:?} forbidden_claim={claim:?}"
+                claims,
+                "AutoAccept must advertise that prompts are skipped: {indicator:?}"
+            );
+        } else {
+            assert!(
+                !claims,
+                "mode={mode_name} must not advertise waived approvals; \
+                 indicator={indicator:?}"
             );
         }
     }
@@ -3922,19 +3932,25 @@ fn test_mode_indicator_never_claims_edits_are_accepted_automatically() {
 ///   has been approved, not in what a tool call costs the user.
 /// - `Planning` is restricted to inspection tools — `ToolExecutor::execute_tool`
 ///   rejects anything outside read/glob/grep/web_fetch plus the plan tools.
-/// - Shift+tab is live in every mode. `KeyCode::BackTab` maps to `/plan`
-///   unconditionally (`src/cli/tui/async_input.rs`), and the handler returns
-///   both `Planning` and `Executing` to `Normal`.
+/// - Shift+tab is live in every mode. `KeyCode::BackTab` maps to `/cycle-mode`
+///   (`src/cli/tui/async_input.rs`). Normal enters AutoAccept; AutoAccept
+///   enters Planning; Planning/Executing return to Normal. `/plan` is a
+///   separate PlanModeToggle and still enters Planning from Normal.
 #[test]
 fn test_mode_indicator_describes_each_modes_actual_behavior() {
     use crate::cli::status_bar::{StatusBar, StatusLineType};
 
-    let required: [(&str, &str, &str); 3] = [
+    let required: [(&str, &str, &str); 4] = [
         (
             "Normal",
             "confirm",
             "Normal is subject to check_tool_use like every other mode; \
              write/edit/bash return AskUser",
+        ),
+        (
+            "AutoAccept",
+            "without prompts",
+            "AutoAccept skips the REPL approval dialog for tools and VM programs",
         ),
         (
             "Planning",
@@ -3975,9 +3991,8 @@ fn test_mode_indicator_describes_each_modes_actual_behavior() {
         assert!(
             !lowered.contains("disabled"),
             "invariant: no mode may report shift+tab as disabled — \
-             KeyCode::BackTab maps to /plan unconditionally \
-             (src/cli/tui/async_input.rs) and the handler returns both \
-             Planning and Executing to Normal. \
+             KeyCode::BackTab maps to /cycle-mode \
+             (src/cli/tui/async_input.rs). \
              mode={mode_name} mode_value={mode:?} indicator={indicator:?}"
         );
 
@@ -5035,6 +5050,415 @@ async fn typed_program_complete_keeps_failures_as_program_output() {
             assert!(
                 !row.label.contains('\u{23fa}'),
                 "invariant: a failure must not wear the completed-prose glyph; row={row:?}"
+            );
+        })
+        .await;
+}
+
+fn file_read_approval_prompt() -> crate::vm::ApprovalPrompt {
+    crate::vm::ApprovalPrompt::for_request(crate::vm::CapabilityRequest {
+        id: uuid::Uuid::nil(),
+        execution_id: uuid::Uuid::nil(),
+        effect_sequence: None,
+        requirement: crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("Cargo.toml").expect("Cargo.toml is a valid selector"),
+        ),
+        arguments: Vec::new(),
+        reason: "auto-accept program capability".to_string(),
+        origin: crate::vm::SourceOrigin::generated("auto-accept-test"),
+        agent_ancestry: Vec::new(),
+        program_hash: "auto-accept-test".to_string(),
+    })
+}
+
+fn auto_accept_event_loop() -> (super::EventLoop, tempfile::TempDir) {
+    let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+    let tempdir = tempfile::tempdir().expect("isolated tool state for auto-accept");
+    let executor = crate::tools::ToolExecutor::new(
+        crate::tools::ToolRegistry::new(),
+        crate::tools::PermissionManager::new(),
+        tempdir.path().join("patterns.json"),
+    )
+    .expect("construct inert tool executor");
+    let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+    let event_loop = super::EventLoop::new_named_brain_test_runner(
+        generator,
+        Vec::new(),
+        Arc::new(tokio::sync::Mutex::new(executor)),
+        Arc::clone(&runtime),
+    );
+    (event_loop, tempdir)
+}
+
+/// Auto-accept must answer a VM/program capability prompt with AllowSession
+/// and must not open the capability dialog. That is the production boundary
+/// that was still prompting for every Forth/Lisp program.
+#[tokio::test]
+async fn test_auto_accept_allows_vm_capability_without_dialog() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::AutoAccept;
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_vm_approval_request(file_read_approval_prompt(), response_tx)
+                .await
+                .expect("auto-accept VM approval must succeed");
+            let choice = response_rx
+                .await
+                .expect("auto-accept must send AllowOnce without a dialog");
+            assert_eq!(
+                choice,
+                crate::vm::ApprovalChoice::AllowOnce,
+                "AutoAccept must grant once so leaving the mode does not keep the capability; choice={choice:?}"
+            );
+            assert!(
+                event_loop.pending_vm_approval.is_none(),
+                "AutoAccept must not retain a pending VM dialog"
+            );
+            let tui = event_loop.tui_renderer.lock().await;
+            assert!(
+                tui.active_dialog.is_none(),
+                "AutoAccept must not open the VM capability dialog; dialog={:?}",
+                tui.active_dialog
+            );
+        })
+        .await;
+}
+
+/// Normal mode still presents the VM capability dialog. Pins that AutoAccept
+/// is the thing that skips, not a silent change to every mode.
+#[tokio::test]
+async fn test_normal_mode_still_opens_vm_capability_dialog() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_vm_approval_request(file_read_approval_prompt(), response_tx)
+                .await
+                .expect("normal VM approval dialog must present");
+            assert!(
+                event_loop.pending_vm_approval.is_some(),
+                "Normal must retain the pending VM dialog"
+            );
+            let tui = event_loop.tui_renderer.lock().await;
+            assert!(
+                tui.active_dialog.is_some(),
+                "Normal must open the VM capability dialog"
+            );
+        })
+        .await;
+}
+
+/// Cancelling a query with Ctrl+C must keep AutoAccept so dogfood does not
+/// fall back to per-tool prompts mid-session.
+#[tokio::test]
+async fn test_ctrl_c_during_query_preserves_auto_accept() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::AutoAccept;
+            let query_id = event_loop.query_states.create_query(Vec::new()).await;
+            *event_loop.active_query_id.write().await = Some(query_id);
+            event_loop
+                .handle_event(super::ReplEvent::CancelQuery)
+                .await
+                .expect("query cancel must dispatch");
+            let mode = event_loop.mode.read().await.clone();
+            assert!(
+                mode.auto_accepts_host_effects(),
+                "Ctrl+C on a query must keep AutoAccept; mode={mode:?}"
+            );
+        })
+        .await;
+}
+
+/// Idle Ctrl+C in AutoAccept exits Finch, like Normal. It must not be treated
+/// as a plan overlay that silently drops back to confirmation mode.
+#[tokio::test]
+async fn test_idle_ctrl_c_in_auto_accept_exits_finch() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::AutoAccept;
+            event_loop
+                .handle_event(super::ReplEvent::CancelQuery)
+                .await
+                .expect("idle cancel must dispatch");
+            let mode = event_loop.mode.read().await.clone();
+            assert!(
+                mode.auto_accepts_host_effects(),
+                "idle Ctrl+C must not drop AutoAccept into Normal; mode={mode:?}"
+            );
+            let mut found_shutdown = false;
+            while let Ok(event) = event_loop.event_rx.try_recv() {
+                if matches!(event, super::ReplEvent::Shutdown) {
+                    found_shutdown = true;
+                }
+            }
+            assert!(
+                found_shutdown,
+                "idle Ctrl+C in AutoAccept must exit Finch by sending Shutdown"
+            );
+        })
+        .await;
+}
+
+/// AutoAccept does not inherit Planning's write restriction. The executor
+/// still runs write; the skipped dialog is the only change.
+#[tokio::test]
+async fn test_auto_accept_executor_allows_write() {
+    use crate::cli::repl::ReplMode;
+    use crate::tools::{PermissionManager, ToolExecutor, ToolRegistry, ToolUse};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(PlanningWriteProbe));
+    let tempdir = tempfile::tempdir().expect("isolated tool-pattern store for auto-accept write");
+    let executor = ToolExecutor::new(
+        registry,
+        PermissionManager::new(),
+        tempdir.path().join("patterns.json"),
+    )
+    .expect("construct executor for auto-accept write");
+    let auto_accept = Arc::new(RwLock::new(ReplMode::AutoAccept));
+    let tool_use = ToolUse::new(
+        "write".to_string(),
+        serde_json::json!({"path": "src/lib.rs", "content": "allowed in auto-accept"}),
+    );
+    let result = executor
+        .execute_tool(
+            &tool_use,
+            None,
+            None::<fn() -> anyhow::Result<()>>,
+            None,
+            None,
+            None,
+            Some(auto_accept),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("auto-accept write returns ToolResult");
+    assert!(
+        !result.is_error,
+        "AutoAccept must not apply the Planning write restriction; content={:?}",
+        result.content
+    );
+    assert_eq!(
+        result.content, "must-not-execute-in-planning",
+        "the write probe body must run under AutoAccept; content={:?}",
+        result.content
+    );
+}
+
+#[test]
+fn test_auto_accept_remote_tool_decision_is_approve_once() {
+    let tool_use = crate::tools::ToolUse::new(
+        "write".to_string(),
+        serde_json::json!({"path": "src/lib.rs"}),
+    );
+    let decision =
+        super::auto_accept_remote_decision(&super::RemoteBrainApprovalKind::Tool(tool_use.clone()));
+    assert_eq!(
+        decision,
+        serde_json::json!({"choice": "approve_once"}),
+        "remote AutoAccept must send a choice confirmation_from_audit_value accepts; decision={decision}"
+    );
+    let confirmation = super::confirmation_from_audit_value(&decision, &tool_use)
+        .expect("approve_once must decode; approve_session becomes Deny");
+    assert!(
+        matches!(
+            confirmation,
+            crate::cli::repl_event::events::ConfirmationResult::ApproveOnce
+        ),
+        "decoded remote auto-accept must be ApproveOnce, not Deny; confirmation={confirmation:?}"
+    );
+}
+
+#[test]
+fn test_cycle_mode_is_not_plan_toggle() {
+    use crate::cli::commands::Command;
+    assert!(
+        matches!(Command::parse("/plan"), Some(Command::PlanModeToggle)),
+        "/plan with no args must stay PlanModeToggle so it still enters Planning"
+    );
+    assert!(
+        matches!(Command::parse("/cycle-mode"), Some(Command::CycleMode)),
+        "Shift+Tab submits /cycle-mode, not /plan"
+    );
+}
+
+fn named_brain_turn_fixture(
+    response_tx: tokio::sync::oneshot::Sender<
+        std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
+    >,
+) -> super::PendingNamedBrainTurn {
+    super::PendingNamedBrainTurn {
+        brain: "home".into(),
+        run_id: crate::brain::RunId(uuid::Uuid::nil()),
+        response_tx,
+        turn_events: Vec::new(),
+        effect_journal: Vec::new(),
+        cancellation_requested: false,
+        active_tool_ids: Default::default(),
+        approval_audience: crate::brain::BrainApprovalAudience {
+            brain_id: crate::brain::BrainId(uuid::Uuid::nil()),
+            brain: "home".into(),
+            attachment_id: crate::brain::AttachmentId(uuid::Uuid::nil()),
+            subject: "driver@box.local".into(),
+            role: crate::brain::AttachmentRole::Driver,
+            environment_generation: 1,
+        },
+        approval_tx: None,
+        effect_audit: None,
+        restart: None,
+    }
+}
+
+/// AutoAccept skips the local tool dialog at the presenter, after named-Brain
+/// audit events are recorded.
+#[tokio::test]
+async fn test_auto_accept_tool_presenter_approves_once_without_dialog() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            *event_loop.mode.write().await = crate::cli::repl::ReplMode::AutoAccept;
+            let query_id = uuid::Uuid::new_v4();
+            let (turn_tx, _turn_rx) = tokio::sync::oneshot::channel();
+            event_loop
+                .pending_named_brain_turns
+                .insert(query_id, named_brain_turn_fixture(turn_tx));
+            let tool_use = crate::tools::ToolUse::new(
+                "write".to_string(),
+                serde_json::json!({"path": "src/lib.rs", "content": "x"}),
+            );
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_tool_approval_request(query_id, tool_use, response_tx)
+                .await
+                .expect("auto-accept tool presenter must succeed");
+            let confirmation = response_rx
+                .await
+                .expect("auto-accept must send ApproveOnce without a dialog");
+            assert!(
+                matches!(
+                    confirmation,
+                    crate::cli::repl_event::events::ConfirmationResult::ApproveOnce
+                ),
+                "tool presenter must approve once; confirmation={confirmation:?}"
+            );
+            let tui = event_loop.tui_renderer.lock().await;
+            assert!(
+                tui.active_dialog.is_none(),
+                "AutoAccept must not open the tool dialog"
+            );
+            drop(tui);
+            let turn = event_loop
+                .pending_named_brain_turns
+                .get(&query_id)
+                .expect("named-Brain turn must remain");
+            let kinds: Vec<&str> = turn
+                .turn_events
+                .iter()
+                .map(|event| match event {
+                    crate::server::RunnerTurnEvent::ApprovalRequested { .. } => "requested",
+                    crate::server::RunnerTurnEvent::ApprovalDecided { decision, .. } => {
+                        assert_eq!(
+                            decision.get("choice").and_then(serde_json::Value::as_str),
+                            Some("approve_once"),
+                            "named-Brain auto-accept must record approve_once; decision={decision}"
+                        );
+                        "decided"
+                    }
+                    _ => "other",
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                ["requested", "decided"],
+                "named-Brain AutoAccept must audit request then decision; events={kinds:?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_auto_accept_does_not_waive_permission_deny() {
+    use crate::cli::repl::ReplMode;
+    use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry, ToolUse};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(PlanningWriteProbe));
+    let tempdir = tempfile::tempdir().expect("isolated deny store");
+    let executor = ToolExecutor::new(
+        registry,
+        PermissionManager::new().with_default_rule(PermissionRule::Deny),
+        tempdir.path().join("patterns.json"),
+    )
+    .expect("construct executor with deny default");
+    let auto_accept = Arc::new(RwLock::new(ReplMode::AutoAccept));
+    let tool_use = ToolUse::new(
+        "write".to_string(),
+        serde_json::json!({"path": "src/lib.rs", "content": "denied"}),
+    );
+    let result = executor
+        .execute_tool(
+            &tool_use,
+            None,
+            None::<fn() -> anyhow::Result<()>>,
+            None,
+            None,
+            None,
+            Some(auto_accept),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("deny returns ToolResult");
+    assert!(
+        result.is_error,
+        "AutoAccept must not waive PermissionManager Deny; content={:?}",
+        result.content
+    );
+    assert!(
+        result.content.contains("not allowed"),
+        "deny must name the refusal; content={:?}",
+        result.content
+    );
+}
+
+#[tokio::test]
+async fn test_shift_tab_enters_auto_accept_and_plan_stays_planning() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            event_loop
+                .handle_user_input("/cycle-mode".to_string())
+                .await
+                .expect("cycle-mode must dispatch");
+            assert!(
+                event_loop.mode.read().await.auto_accepts_host_effects(),
+                "Shift+Tab from Normal must enter AutoAccept"
+            );
+            event_loop
+                .handle_user_input("/plan".to_string())
+                .await
+                .expect("/plan must dispatch");
+            assert!(
+                matches!(
+                    *event_loop.mode.read().await,
+                    crate::cli::repl::ReplMode::Planning { .. }
+                ),
+                "/plan from AutoAccept must enter Planning, not stay in AutoAccept; mode={:?}",
+                event_loop.mode.read().await.clone()
             );
         })
         .await;

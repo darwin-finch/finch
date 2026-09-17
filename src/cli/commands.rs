@@ -31,7 +31,9 @@ pub enum Command {
     PatternsClear,
     PatternsAdd,
     // Plan mode commands
-    PlanModeToggle, // Toggle plan mode on/off (Shift+Tab or /plan without args)
+    PlanModeToggle, // /plan without args: enter or exit planning
+    /// Shift+Tab: Normal → AutoAccept → Planning → Normal
+    CycleMode,
     Plan(String),
     // Private feedback commands with historical weight metadata
     FeedbackCritical(Option<String>), // 10x stored weight - critical strategy errors
@@ -412,6 +414,10 @@ impl Command {
             }
         }
 
+        if trimmed == "/cycle-mode" {
+            return Some(Command::CycleMode);
+        }
+
         // Handle /plan command
         if trimmed == "/plan" {
             // Without arguments: toggle plan mode
@@ -587,9 +593,9 @@ pub fn handle_command(
             "Pattern management commands should be handled in REPL.".to_string(),
         )),
         // Plan mode commands are handled directly in REPL
-        Command::PlanModeToggle | Command::Plan(_) => Ok(CommandOutput::Status(
-            "Plan mode commands should be handled in REPL.".to_string(),
-        )),
+        Command::PlanModeToggle | Command::CycleMode | Command::Plan(_) => Ok(
+            CommandOutput::Status("Plan mode commands should be handled in REPL.".to_string()),
+        ),
         // Feedback commands are handled directly in REPL
         Command::FeedbackCritical(_) | Command::FeedbackMedium(_) | Command::FeedbackGood(_) => Ok(
             CommandOutput::Status("Feedback commands should be handled in REPL.".to_string()),
@@ -779,7 +785,7 @@ pub fn format_help() -> String {
          {cyan}  Ctrl+B{reset}             Mark last response as {red}bad{reset} (10x stored weight)\n\
          {cyan}  Ctrl+P{reset}             Pop top word off vocabulary stack (/pop)\n\
          {cyan}  Tab{reset}                Complete /command (accepts ghost text)\n\
-         {cyan}  Shift+Tab{reset}          Toggle plan mode on/off\n\
+         {cyan}  Shift+Tab{reset}          Cycle confirmation → auto-accept → plan mode\n\
          {cyan}  Shift+Enter{reset}        Multi-line input (insert newline)\n\
          {cyan}  Shift+PgUp{reset}         Scroll up in history\n\
          {cyan}  Shift+PgDown{reset}       Scroll down in history\n\
