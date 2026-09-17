@@ -294,11 +294,13 @@ async fn boundary_01_dispatch_scenario() {
     let messages = event_loop.output_manager.get_messages();
     assert_eq!(messages.len(), 1, "TEST-BOUNDARY-01: one unbound child terminal must append one structured activity unit; message_count={} messages={:?}", messages.len(), messages.iter().map(|message| message.format(&crate::theme::ColorScheme::default())).collect::<Vec<_>>());
     assert_eq!(
-        messages[0]
-            .transcript_row(&crate::theme::ColorScheme::default())
-            .expect("TEST-BOUNDARY-01: terminal child activity must be structured")
-            .kind,
-        crate::cli::messages::TranscriptRowKind::Activity,
+        crate::cli::tui::view_model::try_project_for_test(
+            messages[0].as_ref(),
+            &crate::theme::ColorScheme::default()
+        )
+        .expect("projected row")
+        .role,
+        crate::cli::tui::view_model::NodeRole::Activity,
         "TEST-BOUNDARY-01: the terminal child summary must not regress to a loose information line"
     );
     assert_eq!(
@@ -871,6 +873,7 @@ fn remote_tool_approval_round_trips_edited_input() {
 }
 
 use super::*;
+use crate::cli::messages::Message;
 
 fn lifecycle_test_event_loop() -> (EventLoop, Arc<crate::cli::output_manager::OutputManager>) {
     let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
@@ -912,7 +915,6 @@ async fn test_named_brain_runner_attaches_its_scheduler() {
 async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            use crate::cli::messages::{Message, TranscriptRowKind};
 
             let (mut event_loop, output) = lifecycle_test_event_loop();
             output.disable_stdout();
@@ -968,8 +970,7 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
                 .get_messages()
                 .iter()
                 .filter_map(|message| {
-                    message
-                        .transcript_row(&crate::theme::ColorScheme::default())
+                    crate::cli::tui::view_model::try_project_for_test(message.as_ref(), &crate::theme::ColorScheme::default())
                         .map(|row| row.label)
                 })
                 .collect();
@@ -994,9 +995,7 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
                 labels[0]
             );
 
-            let projected = work_unit
-                .transcript_row(&crate::theme::ColorScheme::default())
-                .expect("registered bash row still projects");
+            let projected = crate::cli::tui::view_model::try_project_for_test(work_unit.as_ref(), &crate::theme::ColorScheme::default()).expect("projected row");
             let call = &projected.children[0];
             assert!(
                 call.label.contains("bash"),
@@ -1016,7 +1015,7 @@ async fn test_loop_detected_tool_result_updates_labeled_row_not_raw_id_fallback(
             let output_row = call
                 .children
                 .iter()
-                .find(|child| child.kind == TranscriptRowKind::ToolOutput)
+                .find(|child| child.role == crate::cli::tui::view_model::NodeRole::ToolOutput)
                 .unwrap_or_else(|| {
                     panic!("long loop diagnostic must be expandable output; call={call:?}")
                 });
@@ -1081,9 +1080,11 @@ async fn test_untracked_tool_result_attaches_to_query_tools_unit() {
                 .get_messages()
                 .iter()
                 .filter_map(|message| {
-                    message
-                        .transcript_row(&crate::theme::ColorScheme::default())
-                        .map(|row| row.label)
+                    crate::cli::tui::view_model::try_project_for_test(
+                        message.as_ref(),
+                        &crate::theme::ColorScheme::default(),
+                    )
+                    .map(|row| row.label)
                 })
                 .collect();
             assert_eq!(
@@ -1320,7 +1321,7 @@ fn test_issue_652_lifecycle_nested_interleaved_roots_keep_ownership() {
         .build()
         .unwrap()
         .block_on(tokio::task::LocalSet::new().run_until(async {
-            use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
+            use crate::cli::messages::{Message, MessageStatus, };
 
             let (mut event_loop, output) = lifecycle_test_event_loop();
             let query_id = event_loop.query_states.create_query(Vec::new()).await;
@@ -1540,10 +1541,8 @@ fn test_issue_652_lifecycle_nested_interleaved_roots_keep_ownership() {
 
             assert_eq!(unit.status(), MessageStatus::Complete);
             assert_eq!(output.get_messages().len(), 1);
-            let projected = unit
-                .transcript_row(&crate::theme::ColorScheme::default())
-                .unwrap();
-            assert_eq!(projected.kind, TranscriptRowKind::ToolGroup);
+            let projected = crate::cli::tui::view_model::try_project_for_test(unit.as_ref(), &crate::theme::ColorScheme::default()).unwrap();
+            assert_eq!(projected.role, crate::cli::tui::view_model::NodeRole::ToolGroup);
             assert_eq!(projected.children.len(), 2);
             let first_agent_row = projected.children[first_spawn]
                 .children
@@ -1618,7 +1617,6 @@ fn test_spawn_agent_task_finished_failed_attaches_to_spawn_parent_not_new_root()
         .build()
         .unwrap()
         .block_on(tokio::task::LocalSet::new().run_until(async {
-            use crate::cli::messages::Message;
 
             let (mut event_loop, output) = lifecycle_test_event_loop();
             output.disable_stdout();
@@ -1646,8 +1644,7 @@ fn test_spawn_agent_task_finished_failed_attaches_to_spawn_parent_not_new_root()
             let labels: Vec<String> = messages
                 .iter()
                 .filter_map(|message| {
-                    message
-                        .transcript_row(&crate::theme::ColorScheme::default())
+                    crate::cli::tui::view_model::try_project_for_test(message.as_ref(), &crate::theme::ColorScheme::default())
                         .map(|row| row.label)
                 })
                 .collect();
@@ -1685,7 +1682,6 @@ fn test_issue_652_lifecycle_unbound_events_form_one_structured_activity_unit() {
         .build()
         .unwrap()
         .block_on(tokio::task::LocalSet::new().run_until(async {
-            use crate::cli::messages::TranscriptRowKind;
             let (mut event_loop, output) = lifecycle_test_event_loop();
             let agent_id = uuid::Uuid::new_v4();
             let identity = lifecycle_identity(agent_id, uuid::Uuid::new_v4(), None, agent_id, 0);
@@ -1723,10 +1719,15 @@ fn test_issue_652_lifecycle_unbound_events_form_one_structured_activity_unit() {
 
             let messages = output.get_messages();
             assert_eq!(messages.len(), 1);
-            let projected = messages[0]
-                .transcript_row(&crate::theme::ColorScheme::default())
-                .unwrap();
-            assert_eq!(projected.kind, TranscriptRowKind::Activity);
+            let projected = crate::cli::tui::view_model::try_project_for_test(
+                messages[0].as_ref(),
+                &crate::theme::ColorScheme::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                projected.role,
+                crate::cli::tui::view_model::NodeRole::Activity
+            );
             assert_eq!(projected.children.len(), 1);
             assert!(projected.children[0].label.contains("typed-program child"));
             let rendered = messages[0].complete_transcript(&crate::theme::ColorScheme::default());
@@ -2119,7 +2120,6 @@ fn snapshot_groups_speculative_lifecycle_program_and_result_by_exact_run_id() {
 #[test]
 fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
     use crate::brain::{BrainEventKind, BrainRunKind, BrainRunStatus, RunId};
-    use crate::cli::messages::{Message, TranscriptRowKind};
 
     let output =
         crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
@@ -2170,10 +2170,15 @@ fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
     ));
 
     let unit = projections.get(&run_id).unwrap().unit.clone();
-    let projected = unit
-        .transcript_row(&crate::theme::ColorScheme::default())
-        .unwrap();
-    assert_eq!(projected.kind, TranscriptRowKind::Activity);
+    let projected = crate::cli::tui::view_model::try_project_for_test(
+        unit.as_ref(),
+        &crate::theme::ColorScheme::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        projected.role,
+        crate::cli::tui::view_model::NodeRole::Activity
+    );
     assert!(projected.label.contains("Speculative run"));
     assert!(projected
         .label
@@ -2184,7 +2189,7 @@ fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
     assert!(projected
         .children
         .iter()
-        .all(|row| row.kind == TranscriptRowKind::Activity));
+        .all(|row| row.role == crate::cli::tui::view_model::NodeRole::Activity));
     assert!(projected.children[0].label.contains("status"));
     assert!(projected.children[1].label.starts_with("result"));
 
@@ -2199,7 +2204,6 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     use crate::brain::{
         AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
     };
-    use crate::cli::messages::{Message, TranscriptRowKind};
 
     let output =
         crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
@@ -2249,27 +2253,38 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     }
 
     let unit = projections.get(&run_id).unwrap().unit.clone();
-    let projected = unit
-        .transcript_row(&crate::theme::ColorScheme::default())
-        .unwrap();
-    assert_eq!(projected.kind, TranscriptRowKind::Activity);
-    assert!(!projected.default_expanded);
+    let projected = crate::cli::tui::view_model::try_project_for_test(
+        unit.as_ref(),
+        &crate::theme::ColorScheme::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        projected.role,
+        crate::cli::tui::view_model::NodeRole::Activity
+    );
+    assert!(!projected.default_open);
     assert!(!projected.label.contains("Tools"));
     assert_eq!(projected.children.len(), 2);
 
     let status = &projected.children[0];
-    assert_eq!(status.kind, TranscriptRowKind::Activity);
+    assert_eq!(status.role, crate::cli::tui::view_model::NodeRole::Activity);
     assert_eq!(status.id.message_id, unit.id());
     assert_eq!(status.id.path, vec![1, 0]);
 
     let tool = &projected.children[1];
-    assert_eq!(tool.kind, TranscriptRowKind::ToolCall);
+    assert_eq!(tool.role, crate::cli::tui::view_model::NodeRole::ToolCall);
     assert_eq!(tool.id.message_id, unit.id());
     assert_eq!(tool.id.path, vec![1, 1]);
     assert_eq!(tool.children.len(), 2);
-    assert_eq!(tool.children[0].kind, TranscriptRowKind::Input);
+    assert_eq!(
+        tool.children[0].role,
+        crate::cli::tui::view_model::NodeRole::Input
+    );
     assert_eq!(tool.children[0].id.path, vec![1, 1, 0]);
-    assert_eq!(tool.children[1].kind, TranscriptRowKind::ToolOutput);
+    assert_eq!(
+        tool.children[1].role,
+        crate::cli::tui::view_model::NodeRole::ToolOutput
+    );
     assert_eq!(tool.children[1].id.path, vec![1, 1, 1]);
     assert!(tool.children[1].body.iter().any(|line| line == "value=7"));
 
@@ -2289,7 +2304,6 @@ fn todo_write_transcript_shows_the_task_list_not_the_raw_json() {
     use crate::brain::{
         AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
     };
-    use crate::cli::messages::{Message, TranscriptRowKind};
 
     // The payload reported in the issue: a four-task todo_write input.
     let todos = serde_json::json!({"todos": [
@@ -2365,16 +2379,18 @@ fn todo_write_transcript_shows_the_task_list_not_the_raw_json() {
     }
 
     let unit = projections.get(&run_id).unwrap().unit.clone();
-    let projected = unit
-        .transcript_row(&crate::theme::ColorScheme::default())
-        .unwrap();
+    let projected = crate::cli::tui::view_model::try_project_for_test(
+        unit.as_ref(),
+        &crate::theme::ColorScheme::default(),
+    )
+    .unwrap();
 
     // The todo_write call is one tool row labelled by the task list, not by raw
     // JSON; its output body carries the list lines durably.
     let tool = projected
         .children
         .iter()
-        .find(|row| row.kind == TranscriptRowKind::ToolCall)
+        .find(|row| row.role == crate::cli::tui::view_model::NodeRole::ToolCall)
         .expect("the todo_write call must project as a tool row");
     let tool_dump = format!("label={:?} children={:?}", tool.label, tool.children);
     assert!(
@@ -2803,7 +2819,6 @@ fn named_brain_live_result_keeps_assistant_prose_say() {
     // collapsed `result` child because live Result delivery deleted the
     // assistant-prose output unit (#820).
     use crate::brain::{BrainEventKind, BrainRunKind, BrainRunStatus, ProgramLanguage, RunId};
-    use crate::cli::messages::Message;
 
     let greeting = "Hi, Shammah! What would you like to work on?";
     let source = format!("(say \"{greeting}\")");
@@ -5107,10 +5122,12 @@ fn completed_execution_outcome(output: &str) -> crate::runtime::ExecutionOutcome
 
 fn projected_work_unit(
     unit: &std::sync::Arc<crate::cli::messages::WorkUnit>,
-) -> crate::cli::messages::TranscriptRow {
-    use crate::cli::messages::Message;
-    unit.transcript_row(&crate::theme::ColorScheme::default())
-        .expect("typed program output must project")
+) -> crate::cli::tui::view_model::TranscriptNode {
+    crate::cli::tui::view_model::try_project_for_test(
+        unit.as_ref(),
+        &crate::theme::ColorScheme::default(),
+    )
+    .expect("projected row")
 }
 
 #[tokio::test]
@@ -5165,7 +5182,7 @@ async fn typed_program_complete_presents_successful_say_as_prose() {
         .await;
 }
 
-fn brain_run_status_child_labels(row: &crate::cli::messages::TranscriptRow) -> Vec<String> {
+fn brain_run_status_child_labels(row: &crate::cli::tui::view_model::TranscriptNode) -> Vec<String> {
     row.children
         .iter()
         .filter(|child| child.label.contains("status"))
@@ -5329,7 +5346,7 @@ async fn typed_program_complete_keeps_failures_as_program_output() {
                 "invariant: TypedProgramComplete Err stays ordinary Program output; row={row:?}"
             );
             assert!(
-                row.default_expanded,
+                row.default_open,
                 "invariant: failures remain expanded; row={row:?}"
             );
             assert_eq!(
@@ -5863,7 +5880,6 @@ async fn workspace_mismatch_outer_err_is_visible_and_not_protocol_mismatch() {
 #[test]
 fn queued_run_projection_uses_human_labels_not_debug_enum() {
     use crate::brain::{BrainRunKind, BrainRunStatus, RunId};
-    use crate::cli::messages::Message;
     let output =
         crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
     output.disable_stdout();
@@ -5883,9 +5899,11 @@ fn queued_run_projection_uses_human_labels_not_debug_enum() {
         Some(&recovery),
     );
     let unit = projections.get(&run_id).unwrap().unit.clone();
-    let projected = unit
-        .transcript_row(&crate::theme::ColorScheme::default())
-        .unwrap();
+    let projected = crate::cli::tui::view_model::try_project_for_test(
+        unit.as_ref(),
+        &crate::theme::ColorScheme::default(),
+    )
+    .unwrap();
     let haystack = format!("{} {:?}", projected.label, projected.children);
     assert!(
         !haystack.to_lowercase().contains("queuedforenvironment"),

@@ -746,9 +746,11 @@ mod tests {
         projection.append_default("\nProposal awaiting review: intent [run 1, effect 0]");
         response.set_complete();
 
-        let row = response
-            .transcript_row(&crate::theme::ColorScheme::default())
-            .expect("host-lifecycle row");
+        let row = crate::cli::tui::view_model::try_project_for_test(
+            response.as_ref(),
+            &crate::theme::ColorScheme::default(),
+        )
+        .expect("host-lifecycle row");
         assert_eq!(
             row.label, "Program output",
             "invariant: append_default is host lifecycle, never assistant prose; row={row:?}"

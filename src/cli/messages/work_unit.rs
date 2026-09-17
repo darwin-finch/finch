@@ -10,7 +10,6 @@
 // The throb animation is TIME-DRIVEN — no external counter required.
 
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -55,7 +54,7 @@ pub fn random_spinner_verb() -> &'static str {
     SPINNER_WORDS[idx]
 }
 
-use super::{Message, MessageId, MessageStatus, TranscriptRow, TranscriptRowId, TranscriptRowKind};
+use super::{Message, MessageId, MessageStatus};
 use crate::cli::diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 use crate::config::{ColorScheme, MessageBand};
 
@@ -97,8 +96,10 @@ pub enum WorkRowStatus {
     Error(String),
 }
 
+/// Whether a run row presents as a model tool call or as internal lifecycle
+/// activity. Domain classification the ViewModel reads at projection time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkRowPresentation {
+pub enum WorkRowPresentation {
     Tool,
     Activity,
 }
@@ -193,11 +194,6 @@ struct WorkUnitInner {
     progress: Option<(u64, Option<u64>)>,
     /// Child-agent lifecycle rows, optionally owned by one spawn tool row.
     agent_activity: Vec<AgentActivityRow>,
-    /// User disclosure overrides keyed by transcript `path`.
-    ///
-    /// This is presentation state on the widget. Completing a row must not
-    /// lose an expand/collapse choice stored in a renderer-global map.
-    disclosure: HashMap<Vec<u32>, bool>,
     /// Producer-owned: this untitled default-port output succeeded as user-facing
     /// `say` and should project as assistant prose rather than `Program output`.
     /// Content sniffing is forbidden; only the producer sets this (#350).
@@ -262,7 +258,6 @@ impl WorkUnit {
                 transient_status: None,
                 progress: None,
                 agent_activity: Vec::new(),
-                disclosure: HashMap::new(),
                 as_assistant_prose: false,
                 host_lifecycle: false,
             })),
@@ -402,15 +397,6 @@ impl WorkUnit {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .transient_status = status;
-    }
-
-    /// Persist accordion disclosure on this unit's semantic row `path`.
-    pub fn set_disclosure(&self, path: &[u32], expanded: bool) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .disclosure
-            .insert(path.to_vec(), expanded);
     }
 
     /// Update an explicit output handle's progress independently from its
@@ -1004,98 +990,12 @@ impl Message for WorkUnit {
         out
     }
 
-    fn transcript_row(&self, colors: &ColorScheme) -> Option<TranscriptRow> {
-        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
-        let mut children = inner
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let mut projected = match row.presentation {
-                    WorkRowPresentation::Activity => {
-                        transcript_activity_row(&inner, self.id, index, row, colors)
-                    }
-                    WorkRowPresentation::Tool => {
-                        transcript_tool_row(&inner, self.id, index, row, colors)
-                    }
-                };
-                projected.children.extend(agent_activity_transcript_roots(
-                    self.id,
-                    &inner.agent_activity,
-                    Some(index),
-                ));
-                projected
-            })
-            .collect::<Vec<_>>();
-        children.extend(agent_activity_transcript_roots(
-            self.id,
-            &inner.agent_activity,
-            None,
-        ));
-        let (kind, label, body, default_expanded) = match &inner.presentation {
-            WorkUnitPresentation::Assistant if !inner.rows.is_empty() => {
-                let actionable = inner.rows.iter().any(tool_row_requires_default_expansion);
-                (
-                    TranscriptRowKind::ToolGroup,
-                    compact_tool_group_label(&inner.rows),
-                    lines(&inner.response_text),
-                    inner.status == MessageStatus::InProgress || actionable,
-                )
-            }
-            WorkUnitPresentation::Assistant => (
-                TranscriptRowKind::Response,
-                assistant_prose_label(&self.verb, &inner),
-                lines(&inner.response_text),
-                true,
-            ),
-            WorkUnitPresentation::Activity { title } => (
-                TranscriptRowKind::Activity,
-                compact_activity_group_label(title, &inner.rows),
-                Vec::new(),
-                inner.status == MessageStatus::InProgress,
-            ),
-            WorkUnitPresentation::ProgramSource { language } => (
-                TranscriptRowKind::Program,
-                format!("Program source ({language})"),
-                lines(&inner.response_text),
-                inner.status == MessageStatus::InProgress,
-            ),
-            WorkUnitPresentation::ProgramOutput { title } => {
-                // Kind stays Output so the live list can still swap completed
-                // IR for this row. Only the label changes: successful untitled
-                // say uses the assistant glyph instead of `Program output`.
-                let label = if projects_as_assistant_prose(&inner) {
-                    assistant_prose_label(&self.verb, &inner)
-                } else {
-                    title
-                        .clone()
-                        .unwrap_or_else(|| "Program output".to_string())
-                };
-                (
-                    TranscriptRowKind::Output,
-                    label,
-                    program_output_lines(&inner),
-                    true,
-                )
-            }
-        };
-
-        Some(TranscriptRow {
-            id: TranscriptRowId {
-                message_id: self.id,
-                path: vec![0],
-            },
-            kind,
-            label,
-            body,
-            children,
-            default_expanded: resolve_disclosure(&inner, &[0], default_expanded),
-        })
+    fn work_unit_head(&self) -> Option<WorkUnitHead> {
+        Some(self.domain_head())
     }
 
-    fn set_disclosure(&self, path: &[u32], expanded: bool) -> bool {
-        WorkUnit::set_disclosure(self, path, expanded);
-        true
+    fn work_unit_view(&self, colors: &ColorScheme) -> Option<WorkUnitView> {
+        Some(self.domain_view(colors))
     }
 
     fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
@@ -1147,6 +1047,172 @@ impl Message for WorkUnit {
             message_band_for_inner(&inner)
         };
         Some(colors.message_band_style(band))
+    }
+}
+
+// ============================================================================
+// Domain snapshots for the blit-time projection (#805)
+// ============================================================================
+//
+// A WorkUnit is domain data — one run, its tool rows, its program — never a
+// widget kind. These snapshots expose that data plainly; the renderer's
+// ViewModel (`cli::tui::view_model`) is the one place that converts it into
+// widget props, once per frame.
+
+/// Lightweight domain snapshot for consumers that classify or filter WorkUnit
+/// messages without projecting their full presentation.
+#[derive(Clone, Debug)]
+pub struct WorkUnitHead {
+    pub message_id: MessageId,
+    pub status: MessageStatus,
+    pub presentation: WorkUnitPresentation,
+    /// True when this untitled successful `say` output projects as assistant
+    /// prose rather than `Program output` chrome.
+    pub projects_as_prose: bool,
+    pub response_text: String,
+    pub transient_status: Option<String>,
+    pub progress: Option<(u64, Option<u64>)>,
+}
+
+impl WorkUnitHead {
+    /// The unit's visible output body: response text plus transient status and
+    /// progress lines an output handle appends.
+    pub fn output_body_lines(&self) -> Vec<String> {
+        let mut body = self
+            .response_text
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if let Some(status) = &self.transient_status {
+            body.push(status.clone());
+        }
+        if let Some((completed, total)) = self.progress {
+            body.push(format_progress(completed, total));
+        }
+        body
+    }
+}
+
+/// One tool or activity row of a [`WorkUnitView`], with diffs already rendered
+/// to display lines.
+#[derive(Clone, Debug)]
+pub struct WorkRowView {
+    pub label: String,
+    pub status: WorkRowStatus,
+    pub presentation: WorkRowPresentation,
+    pub body_lines: Vec<String>,
+    pub rendered_diffs: Option<Vec<String>>,
+}
+
+impl WorkRowView {
+    /// True when the row carries any inspectable output.
+    pub fn has_output(&self) -> bool {
+        !self.body_lines.is_empty()
+            || self
+                .rendered_diffs
+                .as_ref()
+                .is_some_and(|diffs| !diffs.is_empty())
+    }
+}
+
+/// One child-agent lifecycle row of a [`WorkUnitView`].
+#[derive(Clone, Debug)]
+pub struct AgentActivityView {
+    pub owner_row: Option<usize>,
+    pub agent_id: uuid::Uuid,
+    pub parent_agent_id: Option<uuid::Uuid>,
+    pub label: String,
+    pub status: WorkRowStatus,
+    pub body_lines: Vec<String>,
+    pub tools: Vec<AgentToolView>,
+}
+
+/// One tool run inside an agent lifecycle row.
+#[derive(Clone, Debug)]
+pub struct AgentToolView {
+    pub name: String,
+    pub status: WorkRowStatus,
+}
+
+/// Full blit-time domain snapshot of one WorkUnit run.
+#[derive(Clone, Debug)]
+pub struct WorkUnitView {
+    pub head: WorkUnitHead,
+    /// Verb shown in the animated header ("Channeling", "Building", …).
+    pub verb: String,
+    pub rows: Vec<WorkRowView>,
+    pub agent_activity: Vec<AgentActivityView>,
+}
+
+impl WorkUnit {
+    /// The lightweight domain snapshot (see [`WorkUnitHead`]).
+    pub fn domain_head(&self) -> WorkUnitHead {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        WorkUnitHead {
+            message_id: self.id,
+            status: inner.status,
+            presentation: inner.presentation.clone(),
+            projects_as_prose: projects_as_assistant_prose(&inner),
+            response_text: inner.response_text.clone(),
+            transient_status: inner.transient_status.clone(),
+            progress: inner.progress,
+        }
+    }
+
+    /// The full domain snapshot the renderer's ViewModel projects per blit.
+    pub fn domain_view(&self, colors: &ColorScheme) -> WorkUnitView {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let render_diffs = |diffs: &Option<Vec<FileDiff>>| {
+            diffs.as_ref().map(|diffs| {
+                render_files(diffs, colors, DiffColorMode::production())
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        };
+        WorkUnitView {
+            head: WorkUnitHead {
+                message_id: self.id,
+                status: inner.status,
+                presentation: inner.presentation.clone(),
+                projects_as_prose: projects_as_assistant_prose(&inner),
+                response_text: inner.response_text.clone(),
+                transient_status: inner.transient_status.clone(),
+                progress: inner.progress,
+            },
+            verb: self.verb.clone(),
+            rows: inner
+                .rows
+                .iter()
+                .map(|row| WorkRowView {
+                    label: row.label.clone(),
+                    status: row.status.clone(),
+                    presentation: row.presentation,
+                    body_lines: row.body_lines.clone(),
+                    rendered_diffs: render_diffs(&row.diffs),
+                })
+                .collect(),
+            agent_activity: inner
+                .agent_activity
+                .iter()
+                .map(|row| AgentActivityView {
+                    owner_row: row.owner_row,
+                    agent_id: row.agent_id,
+                    parent_agent_id: row.parent_agent_id,
+                    label: row.label.clone(),
+                    status: row.status.clone(),
+                    body_lines: row.body_lines.clone(),
+                    tools: row
+                        .tools
+                        .iter()
+                        .map(|tool| AgentToolView {
+                            name: tool.name.clone(),
+                            status: tool.status.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -1261,322 +1327,7 @@ fn append_agent_activity_row_text(
     }
 }
 
-fn agent_activity_transcript_roots(
-    message_id: MessageId,
-    activities: &[AgentActivityRow],
-    owner_row: Option<usize>,
-) -> Vec<TranscriptRow> {
-    activities
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| {
-            row.owner_row == owner_row
-                && row.parent_agent_id.is_none_or(|parent| {
-                    !activities.iter().any(|candidate| {
-                        candidate.owner_row == owner_row && candidate.agent_id == parent
-                    })
-                })
-        })
-        .map(|(index, _)| agent_activity_transcript_row(message_id, activities, owner_row, index))
-        .collect()
-}
-
-fn agent_activity_transcript_row(
-    message_id: MessageId,
-    activities: &[AgentActivityRow],
-    owner_row: Option<usize>,
-    index: usize,
-) -> TranscriptRow {
-    let row = &activities[index];
-    let summary = match &row.status {
-        WorkRowStatus::Running => "running".to_string(),
-        WorkRowStatus::Complete(summary) => summary.clone(),
-        WorkRowStatus::Error(error) => format!("failed: {error}"),
-    };
-    let owner_segment = owner_row.map_or(u32::MAX, |owner| owner as u32);
-    let mut children = row
-        .tools
-        .iter()
-        .enumerate()
-        .map(|(tool_index, tool)| {
-            let tool_summary = match &tool.status {
-                WorkRowStatus::Running => "running".to_string(),
-                WorkRowStatus::Complete(summary) => summary.clone(),
-                WorkRowStatus::Error(error) => format!("failed: {error}"),
-            };
-            TranscriptRow {
-                id: TranscriptRowId {
-                    message_id,
-                    path: vec![2, owner_segment, index as u32, 0, tool_index as u32],
-                },
-                kind: TranscriptRowKind::Activity,
-                label: format!("tool {} — {tool_summary}", tool.name),
-                body: Vec::new(),
-                children: Vec::new(),
-                default_expanded: matches!(tool.status, WorkRowStatus::Running),
-            }
-        })
-        .collect::<Vec<_>>();
-    children.extend(
-        activities
-            .iter()
-            .enumerate()
-            .filter(|(_, child)| {
-                child.owner_row == owner_row && child.parent_agent_id == Some(row.agent_id)
-            })
-            .map(|(child_index, _)| {
-                agent_activity_transcript_row(message_id, activities, owner_row, child_index)
-            }),
-    );
-    TranscriptRow {
-        id: TranscriptRowId {
-            message_id,
-            path: vec![2, owner_segment, index as u32],
-        },
-        kind: TranscriptRowKind::Activity,
-        label: format!("{} — {summary}", row.label),
-        body: row.body_lines.clone(),
-        children,
-        default_expanded: matches!(row.status, WorkRowStatus::Running),
-    }
-}
-
-/// Compact activity glyph standing in for a plain assistant prose row.
-///
-/// The row's own words are the content; a literal `Assistant response` label
-/// named Finch's message plumbing rather than anything the assistant said, so
-/// a simple turn read as program internals instead of prose (#350). Hollow
-/// while the turn is still arriving, filled once it completed, struck through
-/// when it failed — a turn that died must never look identical to one that
-/// answered. Enumerated with no wildcard so a new `MessageStatus` is a compile
-/// error here rather than a silently wrong glyph.
-fn assistant_prose_glyph(status: MessageStatus) -> &'static str {
-    match status {
-        MessageStatus::InProgress => "\u{25cb}",
-        MessageStatus::Complete => "\u{23fa}",
-        MessageStatus::Failed => "\u{2298}",
-    }
-}
-
-/// Label for a plain assistant prose row.
-///
-/// When the row carries the assistant's own words, the glyph alone is the
-/// label: the words follow immediately on the next line and are the row's real
-/// identity (#350). When it carries nothing, a bare glyph would leave the row
-/// with no readable text at all — and the wordless shapes are exactly the ones
-/// a user actually sees: the freshly created query unit that is on screen for
-/// the whole provider round trip, and a turn that failed before its first
-/// token. Those name their state in words as well as in a glyph, because a row
-/// that cannot be read aloud is not an accessible interface (Key Principle 5).
-fn assistant_prose_label(verb: &str, inner: &WorkUnitInner) -> String {
-    let glyph = assistant_prose_glyph(inner.status);
-    if !inner.response_text.is_empty() {
-        return glyph.to_string();
-    }
-    match inner.status {
-        MessageStatus::InProgress if !verb.trim().is_empty() => format!("{glyph} {verb}\u{2026}"),
-        MessageStatus::InProgress => format!("{glyph} Working\u{2026}"),
-        MessageStatus::Complete => format!("{glyph} No assistant text"),
-        MessageStatus::Failed => format!("{glyph} Assistant turn failed"),
-    }
-}
-
-fn lines(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        Vec::new()
-    } else {
-        text.split('\n').map(str::to_owned).collect()
-    }
-}
-
-fn program_output_lines(inner: &WorkUnitInner) -> Vec<String> {
-    let mut body = lines(&inner.response_text);
-    if let Some(status) = &inner.transient_status {
-        body.push(status.clone());
-    }
-    if let Some((completed, total)) = inner.progress {
-        body.push(format_progress(completed, total));
-    }
-    body
-}
-
-fn resolve_disclosure(inner: &WorkUnitInner, path: &[u32], default: bool) -> bool {
-    inner.disclosure.get(path).copied().unwrap_or(default)
-}
-
-fn transcript_tool_row(
-    inner: &WorkUnitInner,
-    message_id: MessageId,
-    index: usize,
-    row: &WorkRow,
-    colors: &ColorScheme,
-) -> TranscriptRow {
-    let summary = match &row.status {
-        WorkRowStatus::Running => "running".to_string(),
-        WorkRowStatus::Complete(summary) if summary.is_empty() => "complete".to_string(),
-        WorkRowStatus::Complete(summary) => summary.clone(),
-        WorkRowStatus::Error(error) => format!("failed: {error}"),
-    };
-    let input_path = vec![1, index as u32, 0];
-    let input = TranscriptRow {
-        id: TranscriptRowId {
-            message_id,
-            path: input_path.clone(),
-        },
-        kind: TranscriptRowKind::Input,
-        label: "Input".to_string(),
-        body: vec![row.label.clone()],
-        children: Vec::new(),
-        default_expanded: resolve_disclosure(inner, &input_path, false),
-    };
-    let output_body = if let Some(diffs) = &row.diffs {
-        let mut body = row.body_lines.clone();
-        body.extend(
-            render_files(diffs, colors, DiffColorMode::production())
-                .lines()
-                .map(str::to_owned),
-        );
-        body
-    } else {
-        row.body_lines.clone()
-    };
-    let actionable = tool_row_requires_default_expansion(row);
-    let mut children = vec![input];
-    if !output_body.is_empty() {
-        let output_path = vec![1, index as u32, 1];
-        let output_default = matches!(row.status, WorkRowStatus::Running) || actionable;
-        children.push(TranscriptRow {
-            id: TranscriptRowId {
-                message_id,
-                path: output_path.clone(),
-            },
-            kind: TranscriptRowKind::ToolOutput,
-            label: format!("Output ({})", output_body.len()),
-            body: output_body,
-            children: Vec::new(),
-            default_expanded: resolve_disclosure(inner, &output_path, output_default),
-        });
-    }
-    let call_path = vec![1, index as u32];
-    let call_default = matches!(row.status, WorkRowStatus::Running) || actionable;
-    TranscriptRow {
-        id: TranscriptRowId {
-            message_id,
-            path: call_path.clone(),
-        },
-        kind: TranscriptRowKind::ToolCall,
-        label: format!("{} — {summary}", row.label),
-        body: Vec::new(),
-        children,
-        default_expanded: resolve_disclosure(inner, &call_path, call_default),
-    }
-}
-
-fn transcript_activity_row(
-    inner: &WorkUnitInner,
-    message_id: MessageId,
-    index: usize,
-    row: &WorkRow,
-    colors: &ColorScheme,
-) -> TranscriptRow {
-    let summary = match &row.status {
-        WorkRowStatus::Running => "running".to_string(),
-        WorkRowStatus::Complete(summary) if summary.is_empty() => "complete".to_string(),
-        WorkRowStatus::Complete(summary) => summary.clone(),
-        WorkRowStatus::Error(error) => format!("failed: {error}"),
-    };
-    let body = if let Some(diffs) = &row.diffs {
-        let mut body = row.body_lines.clone();
-        body.extend(
-            render_files(diffs, colors, DiffColorMode::production())
-                .lines()
-                .map(str::to_owned),
-        );
-        body
-    } else {
-        row.body_lines.clone()
-    };
-    let path = vec![1, index as u32];
-    TranscriptRow {
-        id: TranscriptRowId {
-            message_id,
-            path: path.clone(),
-        },
-        kind: TranscriptRowKind::Activity,
-        label: format!("{} — {summary}", row.label),
-        body,
-        children: Vec::new(),
-        default_expanded: resolve_disclosure(
-            inner,
-            &path,
-            activity_row_requires_default_expansion(row),
-        ),
-    }
-}
-
-fn activity_row_requires_default_expansion(row: &WorkRow) -> bool {
-    match &row.status {
-        WorkRowStatus::Running => true,
-        WorkRowStatus::Error(_) | WorkRowStatus::Complete(_) => {
-            !row.body_lines.is_empty() || row.diffs.as_ref().is_some_and(|diffs| !diffs.is_empty())
-        }
-    }
-}
-
-fn tool_row_requires_default_expansion(row: &WorkRow) -> bool {
-    matches!(row.status, WorkRowStatus::Running)
-        || (matches!(&row.status, WorkRowStatus::Complete(summary) if summary.trim().is_empty())
-            && (row.diffs.as_ref().is_some_and(|diffs| !diffs.is_empty())
-                || !row.body_lines.is_empty()))
-}
-
-fn compact_tool_group_label(rows: &[WorkRow]) -> String {
-    let noun = if rows.len() == 1 { "call" } else { "calls" };
-    let mut label = format!("Tools ({} {noun})", rows.len());
-    let Some((call, error)) = rows.iter().find_map(|row| match &row.status {
-        WorkRowStatus::Error(error) => Some((
-            compact_summary_text(&row.label, 60),
-            compact_summary_text(error, 120),
-        )),
-        _ => None,
-    }) else {
-        return label;
-    };
-    label.push_str(" — ");
-    label.push_str(&call);
-    label.push_str(" failed: ");
-    label.push_str(&error);
-    label
-}
-
-fn compact_activity_group_label(title: &str, rows: &[WorkRow]) -> String {
-    let mut label = title.to_string();
-    let Some((activity, error)) = rows.iter().find_map(|row| match &row.status {
-        WorkRowStatus::Error(error) => {
-            let activity = row
-                .label
-                .strip_prefix(title)
-                .map(|suffix| suffix.trim_start_matches(|c| c == ' ' || c == '·'))
-                .filter(|suffix| !suffix.is_empty())
-                .unwrap_or(&row.label);
-            let error = error.strip_prefix("failed: ").unwrap_or(error);
-            Some((
-                compact_summary_text(activity, 60),
-                compact_summary_text(error, 120),
-            ))
-        }
-        _ => None,
-    }) else {
-        return label;
-    };
-    label.push_str(" — ");
-    label.push_str(&activity);
-    label.push_str(" failed: ");
-    label.push_str(&error);
-    label
-}
-
-fn compact_summary_text(text: &str, max_chars: usize) -> String {
+pub(crate) fn compact_summary_text(text: &str, max_chars: usize) -> String {
     let first_line = text.lines().next().unwrap_or_default().trim();
     let mut compact = first_line.chars().take(max_chars).collect::<String>();
     if first_line.chars().count() > max_chars {
@@ -1632,7 +1383,7 @@ fn is_diff_start(line: &str) -> bool {
     line.starts_with("--- ") || line.starts_with("diff --git ") || line.starts_with("Binary files ")
 }
 
-fn format_progress(completed: u64, total: Option<u64>) -> String {
+pub(crate) fn format_progress(completed: u64, total: Option<u64>) -> String {
     const WIDTH: usize = 20;
     match total {
         Some(total) if total > 0 => {
@@ -1862,7 +1613,8 @@ mod tests {
         unit.finish_agent_activity(root_task, "duplicate", vec!["duplicate".into()], false);
         assert_eq!(unit.status(), MessageStatus::Complete);
 
-        let projected = unit.transcript_row(&colors()).unwrap();
+        let projected =
+            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
         let root = projected.children[spawn]
             .children
             .iter()
@@ -2181,15 +1933,16 @@ mod tests {
             vec!["Test received successfully.".into()],
         );
         unit.set_complete();
-        let projected = unit.transcript_row(&colors()).unwrap();
+        let projected =
+            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
         assert_eq!(projected.children.len(), 2);
         assert!(
-            !projected.children[0].default_expanded,
+            !projected.children[0].default_open,
             "a status-only row may stay collapsed; got {:?}",
             projected.children[0]
         );
         assert!(
-            projected.children[1].default_expanded,
+            projected.children[1].default_open,
             "program/result body must stay visible after complete, not auto-collapse; row={:?}",
             projected.children[1]
         );
@@ -2200,46 +1953,24 @@ mod tests {
     }
 
     #[test]
-    fn disclosure_override_lives_on_the_work_unit_not_a_global_map() {
-        let unit = WorkUnit::new("Brain");
-        unit.set_activity_presentation("Interactive run");
-        let result = unit.add_activity_row("result");
-        unit.complete_row_with_body(result, "completed", vec!["visible".into()]);
-        unit.set_complete();
-        let path = unit.transcript_row(&colors()).unwrap().children[0]
-            .id
-            .path
-            .clone();
-        unit.set_disclosure(&path, false);
-        let projected = unit.transcript_row(&colors()).unwrap();
-        assert!(
-            !projected.children[0].default_expanded,
-            "collapsing the result must stick on the widget after re-projection"
-        );
-        unit.set_disclosure(&path, true);
-        let opened = unit.transcript_row(&colors()).unwrap();
-        assert!(opened.children[0].default_expanded);
-    }
-
-    #[test]
     fn terminal_tool_projection_collapses_after_running_and_omits_zero_output() {
         let unit = WorkUnit::new("Tools");
         let row = unit.add_row("catalog.validate provider=chatgpt");
 
-        let running = unit.transcript_row(&colors()).unwrap();
-        assert!(running.default_expanded);
-        assert!(running.children[0].default_expanded);
+        let running = crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        assert!(running.default_open);
+        assert!(running.children[0].default_open);
         assert_eq!(running.children[0].children.len(), 1);
         assert_eq!(
-            running.children[0].children[0].kind,
-            TranscriptRowKind::Input
+            running.children[0].children[0].role,
+            crate::cli::tui::view_model::NodeRole::Input
         );
 
         unit.fail_row(row, "catalog unavailable");
         unit.set_failed();
-        let failed = unit.transcript_row(&colors()).unwrap();
-        assert!(!failed.default_expanded);
-        assert!(!failed.children[0].default_expanded);
+        let failed = crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        assert!(!failed.default_open);
+        assert!(!failed.children[0].default_open);
         assert!(failed
             .label
             .contains("catalog.validate provider=chatgpt failed: catalog unavailable"));
@@ -2249,9 +1980,10 @@ mod tests {
         let row = completed.add_row("read config");
         completed.complete_row_with_body(row, "3 lines", vec!["one".into(), "two".into()]);
         completed.set_complete();
-        let projected = completed.transcript_row(&colors()).unwrap();
-        assert!(!projected.default_expanded);
-        assert!(!projected.children[0].default_expanded);
+        let projected =
+            crate::cli::tui::view_model::try_project_for_test(&completed, &colors()).unwrap();
+        assert!(!projected.default_open);
+        assert!(!projected.children[0].default_open);
         assert_eq!(projected.children[0].children.len(), 2);
     }
 
@@ -2266,9 +1998,10 @@ mod tests {
                 MessageStatus::InProgress => unreachable!(),
             }
 
-            let projected = unit.transcript_row(&colors()).unwrap();
-            assert!(projected.default_expanded);
-            assert!(projected.children[0].default_expanded);
+            let projected =
+                crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+            assert!(projected.default_open);
+            assert!(projected.children[0].default_open);
             assert!(projected.children[0].label.contains("running"));
         }
     }
@@ -2285,9 +2018,13 @@ mod tests {
         let canonical_before_activity_projection = unit.complete_transcript(&colors());
         unit.set_activity_presentation("Speculative run 1234");
 
-        let projected = unit.transcript_row(&colors()).unwrap();
-        assert!(!projected.default_expanded);
-        assert_eq!(projected.kind, TranscriptRowKind::Activity);
+        let projected =
+            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        assert!(!projected.default_open);
+        assert_eq!(
+            projected.role,
+            crate::cli::tui::view_model::NodeRole::Activity
+        );
         assert!(!projected.label.contains("Tools"));
         assert!(!projected.label.contains("calls"));
         assert_eq!(
@@ -2311,10 +2048,10 @@ mod tests {
         let unit = WorkUnit::new("Channeling");
         unit.append_response("partial prose");
 
-        let pending = unit.transcript_row(&colors()).unwrap();
+        let pending = crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
         assert_eq!(
-            pending.kind,
-            TranscriptRowKind::Response,
+            pending.role,
+            crate::cli::tui::view_model::NodeRole::Response,
             "invariant: a plain assistant turn projects as a Response row; \
              projected row: {pending:?}"
         );
@@ -2326,7 +2063,8 @@ mod tests {
         );
 
         unit.set_complete();
-        let completed = unit.transcript_row(&colors()).unwrap();
+        let completed =
+            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
         assert_eq!(
             completed.label, "\u{23fa}",
             "invariant: a completed assistant prose row is labelled with the \
@@ -2358,7 +2096,8 @@ mod tests {
     fn test_a_wordless_row_with_a_useless_verb_still_names_its_state() {
         for verb in ["", "   ", "\t"] {
             let pending = WorkUnit::new(verb);
-            let row = pending.transcript_row(&colors()).unwrap();
+            let row =
+                crate::cli::tui::view_model::try_project_for_test(&pending, &colors()).unwrap();
             assert_eq!(
                 row.label, "\u{25cb} Working\u{2026}",
                 "invariant: a verb that carries no words falls back to words, never \
@@ -2372,7 +2111,7 @@ mod tests {
     #[test]
     fn test_wordless_assistant_row_still_names_its_state_in_words() {
         let pending = WorkUnit::new("Channeling");
-        let row = pending.transcript_row(&colors()).unwrap();
+        let row = crate::cli::tui::view_model::try_project_for_test(&pending, &colors()).unwrap();
         assert_eq!(
             row.label, "\u{25cb} Channeling\u{2026}",
             "invariant: an assistant row with no words of its own yet keeps readable \
@@ -2387,7 +2126,8 @@ mod tests {
 
         let failed = WorkUnit::new("Channeling");
         failed.set_failed();
-        let failed_row = failed.transcript_row(&colors()).unwrap();
+        let failed_row =
+            crate::cli::tui::view_model::try_project_for_test(&failed, &colors()).unwrap();
         assert_eq!(
             failed_row.label, "\u{2298} Assistant turn failed",
             "invariant: a turn that died before producing any words says so in words; \
@@ -2402,7 +2142,8 @@ mod tests {
         // never happened. A review mutant did exactly that and survived.
         let completed = WorkUnit::new("Channeling");
         completed.set_complete();
-        let completed_row = completed.transcript_row(&colors()).unwrap();
+        let completed_row =
+            crate::cli::tui::view_model::try_project_for_test(&completed, &colors()).unwrap();
         assert_eq!(
             completed_row.label, "\u{23fa} No assistant text",
             "invariant: a completed turn that produced no words says exactly that, \
@@ -2432,8 +2173,12 @@ mod tests {
         unit.complete_row(row, "3 lines");
         unit.set_complete();
 
-        let projected = unit.transcript_row(&colors()).unwrap();
-        assert_eq!(projected.kind, TranscriptRowKind::ToolGroup);
+        let projected =
+            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        assert_eq!(
+            projected.role,
+            crate::cli::tui::view_model::NodeRole::ToolGroup
+        );
         assert_eq!(projected.label, "Tools (1 call)");
     }
 
@@ -2448,15 +2193,16 @@ mod tests {
         );
         unit.set_complete();
 
-        let projected = unit.transcript_row(&colors()).unwrap();
-        assert!(projected.default_expanded);
-        assert!(projected.children[0].default_expanded);
+        let projected =
+            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        assert!(projected.default_open);
+        assert!(projected.children[0].default_open);
         let output = projected.children[0]
             .children
             .iter()
-            .find(|child| child.kind == TranscriptRowKind::ToolOutput)
+            .find(|child| child.role == crate::cli::tui::view_model::NodeRole::ToolOutput)
             .unwrap();
-        assert!(output.default_expanded);
+        assert!(output.default_open);
     }
 
     #[test]
@@ -2499,10 +2245,15 @@ mod tests {
         let streaming = WorkUnit::new("ignored");
         streaming.set_program_source("lisp");
         streaming.set_response("(say \"hi\")");
-        let streaming_row = streaming.transcript_row(&colors()).expect("program row");
-        assert_eq!(streaming_row.kind, super::TranscriptRowKind::Program);
+        let streaming_row =
+            crate::cli::tui::view_model::try_project_for_test(&streaming, &colors())
+                .expect("projected row");
+        assert_eq!(
+            streaming_row.role,
+            crate::cli::tui::view_model::NodeRole::Program
+        );
         assert!(
-            streaming_row.default_expanded,
+            streaming_row.default_open,
             "IR must stay expanded while the program is still arriving"
         );
 
@@ -2510,10 +2261,11 @@ mod tests {
         source.set_program_source("lisp");
         source.set_response("(say \"hi\")");
         source.set_complete();
-        let row = source.transcript_row(&colors()).expect("program row");
-        assert_eq!(row.kind, super::TranscriptRowKind::Program);
+        let row = crate::cli::tui::view_model::try_project_for_test(&source, &colors())
+            .expect("projected row");
+        assert_eq!(row.role, crate::cli::tui::view_model::NodeRole::Program);
         assert!(
-            !row.default_expanded,
+            !row.default_open,
             "completed IR must not stay expanded beside program output"
         );
     }
@@ -2524,15 +2276,16 @@ mod tests {
         source.set_program_source("lisp");
         source.set_response("(say \"Hello\")");
         source.set_complete();
-        let source_row = source.transcript_row(&colors()).expect("source row");
+        let source_row = crate::cli::tui::view_model::try_project_for_test(&source, &colors())
+            .expect("projected row");
         let source_diag = format!("{source_row:?}");
         assert_eq!(
-            source_row.kind,
-            super::TranscriptRowKind::Program,
+            source_row.role,
+            crate::cli::tui::view_model::NodeRole::Program,
             "invariant: generated source stays a Program row inspectable through disclosure; {source_diag}"
         );
         assert!(
-            !source_row.default_expanded,
+            !source_row.default_open,
             "invariant: successful generated program source, including one-line (say …), defaults collapsed; {source_diag}"
         );
         assert!(
@@ -2545,11 +2298,12 @@ mod tests {
         output.set_response("Hello");
         output.present_as_assistant_prose();
         output.set_complete();
-        let row = output.transcript_row(&colors()).expect("output row");
+        let row = crate::cli::tui::view_model::try_project_for_test(&output, &colors())
+            .expect("projected row");
         let diag = format!("{row:?}");
         assert_eq!(
-            row.kind,
-            super::TranscriptRowKind::Output,
+            row.role,
+            crate::cli::tui::view_model::NodeRole::Output,
             "invariant: kind stays Output so the live IR-swap still finds this row; {diag}"
         );
         assert_eq!(
@@ -2566,7 +2320,7 @@ mod tests {
             "invariant: the user-facing say bytes remain the row body; {diag}"
         );
         assert!(
-            row.default_expanded,
+            row.default_open,
             "invariant: successful say body stays visible by default; {diag}"
         );
         assert_eq!(
@@ -2586,7 +2340,8 @@ mod tests {
         output.set_response("VM error: maintenance scheduled");
         output.present_as_assistant_prose();
         output.set_complete();
-        let row = output.transcript_row(&colors()).expect("output row");
+        let row = crate::cli::tui::view_model::try_project_for_test(&output, &colors())
+            .expect("projected row");
         assert_eq!(
             row.label, "\u{23fa}",
             "invariant: producer-owned success is prose even when the say bytes look like a diagnostic; row={row:?}"
@@ -2603,14 +2358,15 @@ mod tests {
         failed.set_program_output();
         failed.set_response("visible first\nVM error: type error");
         failed.set_complete();
-        let failed_row = failed.transcript_row(&colors()).expect("failed row");
+        let failed_row = crate::cli::tui::view_model::try_project_for_test(&failed, &colors())
+            .expect("projected row");
         let failed_diag = format!("{failed_row:?}");
         assert_eq!(
             failed_row.label, "Program output",
             "invariant: a failure that never received the producer prose mark stays ordinary Program output; {failed_diag}"
         );
         assert!(
-            failed_row.default_expanded,
+            failed_row.default_open,
             "invariant: failures remain expanded and actionable; {failed_diag}"
         );
         assert_eq!(
@@ -2626,7 +2382,8 @@ mod tests {
         empty.set_program_output();
         empty.present_as_assistant_prose();
         empty.set_complete();
-        let empty_row = empty.transcript_row(&colors()).expect("empty row");
+        let empty_row = crate::cli::tui::view_model::try_project_for_test(&empty, &colors())
+            .expect("projected row");
         assert_eq!(
             empty_row.label, "Program output",
             "invariant: empty successful output (MissingOutputEffect) is not assistant prose; row={empty_row:?}"
@@ -2637,7 +2394,8 @@ mod tests {
         handle.set_response("bytes");
         handle.present_as_assistant_prose();
         handle.set_complete();
-        let handle_row = handle.transcript_row(&colors()).expect("handle row");
+        let handle_row = crate::cli::tui::view_model::try_project_for_test(&handle, &colors())
+            .expect("projected row");
         assert_eq!(
             handle_row.label, "Download",
             "invariant: titled output handles refuse the prose mark; row={handle_row:?}"
@@ -2650,7 +2408,8 @@ mod tests {
         host.mark_host_lifecycle();
         host.append_response("\nProposal awaiting review: intent [run 1, effect 0]");
         host.set_complete();
-        let host_row = host.transcript_row(&colors()).expect("host row");
+        let host_row = crate::cli::tui::view_model::try_project_for_test(&host, &colors())
+            .expect("projected row");
         let host_diag = format!("{host_row:?}");
         assert_eq!(
             host_row.label, "Program output",
@@ -2669,9 +2428,9 @@ mod tests {
         marked_then_titled.set_response("rejected");
         marked_then_titled.present_as_assistant_prose();
         marked_then_titled.set_output_handle("VM program rejected");
-        let rejected = marked_then_titled
-            .transcript_row(&colors())
-            .expect("rejected row");
+        let rejected =
+            crate::cli::tui::view_model::try_project_for_test(&marked_then_titled, &colors())
+                .expect("projected row");
         assert_eq!(
             rejected.label, "VM program rejected",
             "invariant: retitling as a handle clears the prose mark; row={rejected:?}"
@@ -2727,7 +2486,7 @@ mod tests {
             vec!["Repeating this call produced no new information.".into()],
         );
         wu.set_complete();
-        let projected = wu.transcript_row(&colors()).unwrap();
+        let projected = crate::cli::tui::view_model::try_project_for_test(&wu, &colors()).unwrap();
         assert!(
             projected.label.contains("bash(git status)"),
             "group label must keep the tool row, not a raw provider id; got {}",
@@ -2747,7 +2506,7 @@ mod tests {
         let output = call
             .children
             .iter()
-            .find(|child| child.kind == TranscriptRowKind::ToolOutput)
+            .find(|child| child.role == crate::cli::tui::view_model::NodeRole::ToolOutput)
             .unwrap_or_else(|| {
                 panic!("loop body must be an expandable output child; call={call:?}")
             });

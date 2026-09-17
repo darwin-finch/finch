@@ -2399,7 +2399,7 @@ pub(crate) fn apply_sliding_window(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind, WorkUnit};
+    use crate::cli::messages::{Message, MessageStatus, WorkUnit};
     use crate::cli::status_bar::StatusLineType;
     use crate::generators::GeneratorCapabilities;
     use crate::tools::PermissionManager;
@@ -2722,11 +2722,12 @@ mod tests {
         );
         assert_eq!(harness.canonical.id(), harness.canonical_id);
         assert_eq!(harness.canonical.status(), MessageStatus::InProgress);
-        let partial = harness
-            .canonical
-            .transcript_row(&harness.colors)
-            .expect("canonical Brain unit must remain a transcript row while streaming");
-        assert_eq!(partial.kind, TranscriptRowKind::Program);
+        let partial = crate::cli::tui::view_model::try_project_for_test(
+            harness.canonical.as_ref(),
+            &harness.colors,
+        )
+        .expect("projected row");
+        assert_eq!(partial.role, crate::cli::tui::view_model::NodeRole::Program);
         assert_eq!(partial.body, vec!["(say \"".to_string()]);
         assert!(
             partial
@@ -2801,11 +2802,12 @@ mod tests {
             1,
             "named-Brain continuation created a duplicate activity unit"
         );
-        let row = harness
-            .canonical
-            .transcript_row(&harness.colors)
-            .expect("canonical Brain activity row disappeared");
-        assert_eq!(row.kind, TranscriptRowKind::Activity);
+        let row = crate::cli::tui::view_model::try_project_for_test(
+            harness.canonical.as_ref(),
+            &harness.colors,
+        )
+        .expect("projected row");
+        assert_eq!(row.role, crate::cli::tui::view_model::NodeRole::Activity);
         assert!(
             row.children
                 .iter()
@@ -3158,10 +3160,11 @@ mod tests {
             1,
             "failed partial stream produced another WorkUnit instead of retaining the canonical one"
         );
-        let failed = harness
-            .canonical
-            .transcript_row(&harness.colors)
-            .expect("failed canonical Brain unit disappeared");
+        let failed = crate::cli::tui::view_model::try_project_for_test(
+            harness.canonical.as_ref(),
+            &harness.colors,
+        )
+        .expect("projected row");
         assert!(
             failed
                 .children
@@ -4004,9 +4007,12 @@ mod tests {
         }
     }
 
-    fn transcript_of(unit: &Arc<WorkUnit>) -> crate::cli::messages::TranscriptRow {
-        unit.transcript_row(&crate::theme::ColorScheme::default())
-            .expect("output unit must project a transcript row")
+    fn transcript_of(unit: &Arc<WorkUnit>) -> crate::cli::tui::view_model::TranscriptNode {
+        crate::cli::tui::view_model::try_project_for_test(
+            unit.as_ref(),
+            &crate::theme::ColorScheme::default(),
+        )
+        .expect("projected row")
     }
 
     #[tokio::test]
@@ -4041,13 +4047,13 @@ mod tests {
         assert_eq!(execution.response, "Hello");
         let source_row = transcript_of(&source_unit);
         assert!(
-            !source_row.default_expanded,
+            !source_row.default_open,
             "invariant: successful generated (say …) source defaults collapsed; row={source_row:?}"
         );
         let row = transcript_of(&execution.output_unit);
         assert_eq!(
-            row.kind,
-            TranscriptRowKind::Output,
+            row.role,
+            crate::cli::tui::view_model::NodeRole::Output,
             "invariant: kind stays Output so IR-swap still matches; row={row:?}"
         );
         assert_eq!(
@@ -4099,7 +4105,7 @@ mod tests {
             "invariant: a failed program stays ordinary Program output, never assistant prose; row={row:?}"
         );
         assert!(
-            row.default_expanded,
+            row.default_open,
             "invariant: failures remain expanded and actionable; row={row:?}"
         );
         assert!(
@@ -4804,9 +4810,11 @@ mod tests {
         );
         let (name, _, unit, row_idx) = active.get(tool_id).expect("blocked id registered");
         assert_eq!(name, expected_name);
-        let projected = unit
-            .transcript_row(&crate::theme::ColorScheme::default())
-            .expect("blocked call still belongs to the query WorkUnit");
+        let projected = crate::cli::tui::view_model::try_project_for_test(
+            unit.as_ref(),
+            &crate::theme::ColorScheme::default(),
+        )
+        .expect("projected row");
         let call = projected.children.get(*row_idx).unwrap_or_else(|| {
             panic!(
                 "blocked row {row_idx} missing from transcript children; labels={:?}",

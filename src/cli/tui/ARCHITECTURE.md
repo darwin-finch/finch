@@ -21,21 +21,32 @@ the row into native history twice. Test:
 `canonical_commit_marks_only_after_success_and_follows_resize_clear` in
 `src/cli/tui/mod.rs`.
 
-**Retained transcript accordions** (`accordion.rs`):
-- WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).
-- Expand/collapse is stored on the WorkUnit (`set_disclosure`). AccordionState
-  owns focus and hit regions only; it must not be the source of truth for
-  whether a result is open. Completing a run must not collapse a result that
-  still has body text.
+**Retained transcript disclosure** (`accordion.rs`, `view_model.rs`):
+- The ViewModel projects a WorkUnit's `domain_view()` into `TranscriptNode` widget props with
+  append-stable semantic row identity (`message id + semantic path`).
+- Disclosure and focus are renderer state: `AccordionState` owns the open set keyed by row
+  identity; a row's default is a projection-time prop, never state on domain data. Completing a
+  run must not collapse a result that still has body text.
 - Native scrollback always receives the fully expanded semantic projection;
   disclosure state only changes later reconstructed/live viewport projections.
 - `F6`/`Shift+F6` moves semantic focus, Left/Right collapses or expands,
   Enter/Space toggles, and Escape returns focus to the draft. Left-click has the
   same toggle behavior when terminal mouse reporting is available.
-- Disclosure labels include `expanded`/`collapsed`; neither color nor triangle
-  shape is the sole carrier of state.
-- Hit regions are rebuilt from Unicode physical-row geometry after every frame
-  and resize. Never persist terminal coordinates as row identity.
+- Disclosure state rides `row_expanded` metadata, never a visible `[expanded]`/`[collapsed]`
+  token; neither color nor triangle shape is the sole carrier of state.
+- Leaf lines render the ViewModel's label alone (the label already carries any status glyph);
+  the disclosure never invents a `•` bullet (#821).
+- Hit regions are the rects the layout pass claimed inside the transcript viewport, offset into
+  terminal rows; the retained-transcript region above is recounted from physical-row geometry
+  after every frame and resize. Never persist terminal coordinates as row identity.
+
+**Claiming widget tree** (`widgets.rs`, `view_model.rs`): the live frame is a ViewModel
+snapshot projected into a tree of standard widgets laid out by depth-first frame claiming. The
+root column allocates chrome from the bottom (status, hr, input, hr, completions 0–N) and the
+transcript viewport claims the leftover; an empty completions pane claims zero rows so the
+composer and status never move (#232). Resize is a full layout pass — no widget keeps a cell
+count from the previous frame. `Row` parents place children side by side, and `Side` tracks are
+the width-conditional rails (#810).
 
 **Dialog system** (`src/cli/tui/dialog.rs`):
 - `Select` — Enter submits immediately; `o`/`O` or typing on Other row activates custom input
@@ -51,7 +62,7 @@ the row into native history twice. Test:
   plain-text status row names the visible range, the total, and the
   scroll/expand affordances (`… lines 1–3 of 40 — ↑/↓ scroll · Enter expand`).
 - Per-row scroll offsets live in `ToolViewportState`, keyed by the append-stable
-  `TranscriptRowId` — interleaved tool updates never reset them. Hit regions are
+  `view_model::RowId` — interleaved tool updates never reset them. Hit regions are
   rebuilt from physical-row geometry after every frame and resize, mirroring the
   accordion; a wheel whose X/Y lands inside a control scrolls that result only
   and keeps mouse tracking (native scrollback stays reachable for wheels off the
@@ -72,8 +83,10 @@ Virtual row helpers:
 ## Key files
 
 - `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
+- `src/cli/tui/view_model.rs` — the blit-time `LiveViewModel`, the domain → widget projection, and the root claiming tree
+- `src/cli/tui/widgets.rs` — claiming layout: rects, tracks, hitboxes, resize
 - `src/cli/tui/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`
-- `src/cli/tui/accordion.rs` — retained semantic projection, focus, and hit regions
+- `src/cli/tui/accordion.rs` — renderer-owned disclosure: open set, focus, hit regions
 - `src/cli/tui/tool_viewport.rs` — bounded tool-result controls: child viewport state, wheel hit regions, expanded surface
 - `src/cli/tui/scrollback.rs` — `ScrollbackBuffer`
 - `src/cli/tui/dialog.rs` — Dialog state machine and approval control pin
