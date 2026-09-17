@@ -2574,10 +2574,11 @@ name user form, pretty-printed expansion, and fault span (SDC mixin style). Ther
 `defmacro` and no user `eval`.
 
 The intended **power level is D CTFE**, not Common Lisp macros. `foreach` over a compile-time
-tuple and `switch` / `if` on compile-time strings or types **unroll**: each iteration or arm is
-a specialized copy, type-checked, able to “jump to” handling for that type without a runtime
-type switch. That is enough for binders, serializers, and most “I would have used a macro”
-code. Syntax CTFE (`syntax -> syntax` then `splice`) is the hatch D lacked: **manipulate an AST
+tuple and `switch` / `if` on compile-time strings or types **unroll in the residual IR**: the
+compiler emits specialized copies of the body (one per field, token, or type), type-checked,
+not a runtime loop over types. That is the same trick as a high-speed D parser: generated
+straight-line or jump-to-handler code, not an interpreter of the schema at parse time. That is
+enough for binders, serializers, parsers, and most “I would have used a macro” code. Syntax CTFE (`syntax -> syntax` then `splice`) is the hatch D lacked: **manipulate an AST
 and feed it back to the same compiler**, not `mixin(string)`. It is slightly less general than
 `defmacro` (no running host effects while expanding; no `eval`). That is acceptable: the usual
 need is typed, cached, inspectable generation, not an untyped expander.
