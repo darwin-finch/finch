@@ -1664,7 +1664,7 @@ the same nodes without source-to-source CoLisp generation.
 | fibers/tasks | `defer`, `spawn`, `join`, `race`, `next` | same typed words applied to quotations/handles | scheduled-execution operations |
 | range iteration | range operations / `foreach` | range words and quotation `foreach` | concept calls and structured loop |
 | named tests/suites | `(test ...)`, `(test-suite ...)` | `test: ... {}`, `test-suite: ... {}` | test-profile declarations, no production instruction |
-| macro/syntax | `define-syntax`, syntax constructors | `macro:`, `syntax[ ... ]`, explicit splice/fresh/context words | `Syntax` CTFE, then ordinary nodes |
+| macro/syntax | `define-syntax`, syntax constructors | `macro:`, `syntax[ ... ]`, explicit mixin/fresh/context words | `Syntax` CTFE, then ordinary nodes |
 | unsafe/FFI | `(unsafe ...)`, `(extern "C" ...)` | `unsafe[ ... ]`, `extern(C): ... ;` | marked unsafe/foreign call; unhosted only |
 
 Structured delimiters such as `Foo{...}`, `args{...}`, `match...endmatch`, and `unsafe[...]` are
@@ -2432,7 +2432,7 @@ versioned specification must state:
 
 Initially exclude general continuations. There is no user-facing `eval` that runs an arbitrary
 tree in the current environment. Mix-back of generated syntax into a **module** is compile-time
-only (CTFE, ordinary `if` when the condition is a compile-time constant, generics, `splice`).
+only (CTFE, ordinary `if` when the condition is a compile-time constant, generics, `mixin`).
 Shipping a program to a node is compiling a **compilation unit** with a granted capability set.
 The escape hatch below (`interned` compiled callables) is not `eval`: it returns a **function**,
 does not interpret trees per call, and still runs expand/check/verify. Add continuations only
@@ -2540,10 +2540,10 @@ and is not residual IR. There is no `static-if` keyword.
 early): a pure, bounded CTFE function `syntax -> syntax` (or a richer typed syntax record). Fuel,
 recursion, and allocation limits apply. Host effects in the transformer are forbidden; quasiquote
 and list surgery only **construct** forms. The expander **returns data**; later phases
-(check, lower, verify) make it executable. This is the hatch D lacked: feed an AST back to the
-**same** compiler, not `mixin(string)`. It is slightly less general than `defmacro`; that is
-acceptable. Wrapping two ordinary calls is **not** a reason to use syntax CTFE — that is a
-function.
+(check, lower, verify) make it executable. This is the hatch D lacked: feed an AST back via
+`mixin` to the **same** compiler, not D `mixin(string)`. It is slightly less general than
+`defmacro`; that is acceptable. Wrapping two ordinary calls is **not** a reason to use syntax
+CTFE — that is a function.
 
 **Quote and quasiquote.** `'form` produces `syntax` (data, not evaluated). `` ` `` is a template;
 `,` fills **one** hole with a value (if that value is a list, it stays one nested list); `,@`
@@ -2552,14 +2552,16 @@ quasiquote (the module is code-first, not an implicit template). These operation
 expansion ancestry. They never parse source bytes. The current symbol-only `quote` restriction is
 transitional.
 
-**`splice` vs `,@`.** `,@` is list surgery inside `` ` ``. `splice` is a compile-time word: this
-`syntax` **value** is the next form in the **module being compiled** (conceptually `,@` onto the
-module’s form list, then compile each form). `splice` is not runtime `eval` and is not valid as
-the body of a `define` that is supposed to return a function.
+**`mixin` vs `,@`.** `,@` is **array-style splice**: it is legal only inside quasiquote and
+spreads list elements into the quoted list. `mixin` is the compile-time word that **places
+syntax back into the program**: this `syntax` value is the next form(s) in the **module being
+compiled** (the compiler treats that tree as source). `mixin` is not runtime `eval`, not `,@`,
+and not D `mixin(string)`. It is not valid as the body of a `define` that is supposed to return
+a function.
 
 **`define` vs `define-syntax`.** `define` / `lambda` bind a **value** (a function is a value).
 `define-syntax` **registers** a `syntax -> syntax` CTFE function in the expander: arguments are
-not evaluated; `(when test body)` compiles as `(splice (expand-when '(when test body)))`. Without
+not evaluated; `(when test body)` compiles as `(mixin (expand-when '(when test body)))`. Without
 `define-syntax`, the transformer is an ordinary function and the caller must quote. `let` in a
 transformer is an expression: bindings, then a body whose **value** is the result (typically a
 quasiquoted list).
@@ -2586,7 +2588,7 @@ syntax.” `(second ,form)` would **generate** a future call to `second`. `#f` i
 (the `if` else). `expand-when` does not run `pkg.ensure`. After expansion, `maybe-install` is
 ordinary bytecode with an `if`.
 
-Without `define-syntax`, one-shot mix-back is explicit quote plus `splice` of a **`define` or
+Without `define-syntax`, one-shot mix-back is explicit quote plus `mixin` of a **`define` or
 other module form**, not `eval` of a tree when the function is later called.
 
 **Diagnostics** follow SDC mixin reporting, not DMD’s “blame the mixin line”: (1) user form and
@@ -2609,16 +2611,16 @@ marks, and stable module/symbol identity. Public syntax constructors and project
 properties so ordinary structural Finch code can be hygienic without receiving ambient host access.
 A syntax transformer cannot hide effects: the expanded IR is what the verifier analyzes.
 
-Finch has no string mixin or `compile(text)` facility. Compile-time code cannot manufacture source
-bytes and ask a frontend to parse them inside the current module. The useful declaration-composition
-behavior sometimes called a mixin is expressed by a structured `syntax -> syntax` function that
-returns declaration nodes (fields, callables, nested declarations, attributes, or explicit concept
-evidence), all of which retain expansion provenance. Optional `mixin` surface sugar may only invoke
-that protocol. Runtime composition remains record embedding, delegation, and concept evidence.
+Finch has no **string** mixin or `compile(text)` facility. Compile-time code cannot manufacture
+source bytes and ask a frontend to parse them. The word `mixin` always takes **`syntax`** (an
+already-built tree with spans) and places it in the compilation unit. Declaration composition is
+the same word: a `syntax -> syntax` function returns declaration nodes (fields, callables, nested
+declarations, attributes, or explicit concept evidence); `mixin` of that result is how they enter
+the module. Runtime composition remains record embedding, delegation, and concept evidence.
 
 Until that kernel exists, `define-syntax` remains a capture-free **template**: substitution
 before type checking, no CTFE body, no capabilities, and no introducing `let` or other binding
-forms. That path is deleted after migration fixtures prove `syntax -> syntax` CTFE plus `splice`
+forms. That path is deleted after migration fixtures prove `syntax -> syntax` CTFE plus `mixin`
 preserve hygiene, spans, and IR.
 
 The S-expression is the visible structural notation, while `Syntax` is the compiler-facing value.
