@@ -783,7 +783,7 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
             "os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu",
             "feature_name": "default",
             "cache_family": "debug-default_all-features-clippy_release-default",
-            "cargo_args": "", "timeout_minutes": 45,
+            "cargo_args": "", "timeout_minutes": 90,
         },
         {
             "os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu",
