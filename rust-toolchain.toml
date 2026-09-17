@@ -1,7 +1,7 @@
 [toolchain]
 channel = "1.98.0"
 profile = "minimal"
-components = ["clippy", "rustfmt"]
+components = ["clippy", "rustfmt", "rust-analyzer"]
 targets = [
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
