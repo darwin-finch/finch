@@ -146,7 +146,7 @@ mod disabled_training_tests {
     use crate::providers::ContentBlock;
     use crate::providers::{
         CapabilitySupport, ModelCapabilities, ProviderBackend, ProviderResponse,
-        ReasoningCapability, StreamChunk, ValidatedProviderRequest,
+        ReasoningCapability, StreamChunk, ValidatedProviderRequest, WireProtocol,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -217,6 +217,11 @@ mod disabled_training_tests {
                 Some(4_096),
                 Some(128_000),
                 None,
+            )
+            .with_wire_protocol(
+                WireProtocol::AnthropicMessages,
+                "2026-08-26",
+                "hermetic fallback fixture",
             )
         }
     }

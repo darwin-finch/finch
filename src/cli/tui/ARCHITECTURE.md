@@ -39,7 +39,7 @@ the row into native history twice. Test:
 
 **Dialog system** (`src/cli/tui/dialog.rs`):
 - `Select` — Enter submits immediately; `o`/`O` or typing on Other row activates custom input
-- `MultiSelect` — Space toggles; Enter on virtual Submit row emits `DialogResult::Selected`
+- `MultiSelect` — live prompts render the complete `↑/↓`, Space, Enter, and Esc keyboard hint; Space toggles, and Enter on the virtual Submit row emits `DialogResult::MultiSelected`
 - `TextInput` — Enter submits
 - `Confirm` — `y`/`n` or Enter/Esc
 - Approval payload is a bounded, scrollable region. `dialog_lines` pins Yes/No/Cancel so a long write never moves the controls off-screen. Write approvals summarise path, size, and create-vs-overwrite; the full preview stays behind body scroll.

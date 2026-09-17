@@ -955,18 +955,12 @@ impl Message for WorkUnit {
                 lines(&inner.response_text),
                 true,
             ),
-            WorkUnitPresentation::Activity { title } => {
-                let actionable = inner
-                    .rows
-                    .iter()
-                    .any(activity_row_requires_default_expansion);
-                (
-                    TranscriptRowKind::Activity,
-                    compact_activity_group_label(title, &inner.rows),
-                    Vec::new(),
-                    inner.status == MessageStatus::InProgress || actionable,
-                )
-            }
+            WorkUnitPresentation::Activity { title } => (
+                TranscriptRowKind::Activity,
+                compact_activity_group_label(title, &inner.rows),
+                Vec::new(),
+                inner.status == MessageStatus::InProgress,
+            ),
             WorkUnitPresentation::ProgramSource { language } => (
                 TranscriptRowKind::Program,
                 format!("Program source ({language})"),
