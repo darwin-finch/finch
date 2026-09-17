@@ -246,4 +246,4 @@ pub(crate) mod view_model;
 
 ## Referenced but not exported
 
-These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `ActivityUpdate`, `ShadowBuffer`, `SharedActivityRows`, `TabState`
+These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `ActivityUpdate`, `LiveViewModel`, `ShadowBuffer`, `SharedActivityRows`, `TabState`
