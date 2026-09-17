@@ -51,6 +51,7 @@ BREAKAGE_PERMISSIONS = {"actions": "read", "issues": "write"}
 BREAKAGE_WORKFLOW_RUN = {"workflows": ["CI"], "types": ["completed"]}
 BREAKAGE_STEP = "Update the main breakage issue"
 BREAKAGE_TOKEN = "${{ github.token }}"
+BREAKAGE_API_DEFAULT = "def api(method, path, expected=(200, 201), payload=None):"
 BREAKAGE_ISSUE_TITLE = 'ISSUE_TITLE = "CI failed on main"'
 BREAKAGE_LABEL = 'LABEL = "ci-main-breakage"'
 
@@ -1375,6 +1376,7 @@ def breakage_controller_errors(documents: dict[str, dict[str, Any]]) -> list[str
         errors.append(f"{display}: trusted step must run one literal PYTHON heredoc")
     else:
         for pinned, what in (
+            (BREAKAGE_API_DEFAULT, "API default accepted-status set"),
             (BREAKAGE_ISSUE_TITLE, "breakage issue title"),
             (BREAKAGE_LABEL, "breakage issue label"),
         ):

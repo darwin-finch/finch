@@ -51,7 +51,7 @@ jobs:
                   fail(f"{label} must be a positive integer; found {value!r}")
               return value
 
-          def api(method, path, expected=(200,), payload=None):
+          def api(method, path, expected=(200, 201), payload=None):
               global request_count
               request_count += 1
               if request_count > MAX_API_REQUESTS:
