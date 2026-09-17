@@ -561,6 +561,13 @@ impl EventLoop {
 
             ReplEvent::VmOutputComplete { output_unit } => {
                 output_unit.set_complete();
+                if let Some(run_id) = self.pending_named_brain_run_id() {
+                    self.apply_named_brain_run_status(
+                        run_id,
+                        crate::brain::BrainRunStatus::Completed,
+                        None,
+                    );
+                }
                 self.render_tui().await?;
             }
 
@@ -577,6 +584,13 @@ impl EventLoop {
                 match result {
                     Ok(outcome) if outcome.status == crate::runtime::ExecutionStatus::Completed => {
                         output_unit.present_as_assistant_prose();
+                        if let Some(run_id) = self.pending_named_brain_run_id() {
+                            self.apply_named_brain_run_status(
+                                run_id,
+                                crate::brain::BrainRunStatus::Completed,
+                                None,
+                            );
+                        }
                     }
                     Ok(outcome) => {
                         let detail =
