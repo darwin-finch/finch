@@ -2544,10 +2544,13 @@ and list surgery only **construct** forms. The expander **returns data**; later 
 `mixin` to the **same** compiler, not D `mixin(string)`. It is slightly less general than
 `defmacro`; that is acceptable.
 
-Do **not** add `when` as syntax sugar for `if`. Runtime `if` already skips the else; CTFE `if`
-already drops a constant-false arm. Wrapping two ordinary calls is a **function**, not syntax
-CTFE. Reach for `syntax -> syntax` for things like `timed` around a call (no extra `lambda`),
-`with-lock` introducing bindings around a body, or a converge `require` that yields.
+`when` / `unless` may exist as **the same kind of form as `if`**: the frontend desugars
+`(when test body)` to `(if test body #f)` before type checking. Users write `when` anywhere
+`if` is legal. There is no user-visible `expand-when` and no `define-syntax` in the stdlib for
+this. Runtime `if` already skips the else; CTFE `if` already drops a constant-false arm.
+Wrapping two ordinary calls is a **function**, not syntax CTFE. Reach for `syntax -> syntax`
+for things like `timed` around a call (no extra `lambda`), `with-lock` introducing bindings
+around a body, or a converge `require` that yields.
 
 **Quote and quasiquote.** `'form` produces `syntax` (data, not evaluated). `` ` `` is a template;
 `,` fills **one** hole with a value (if that value is a list, it stays one nested list); `,@`
