@@ -1,6 +1,8 @@
-//! Native terminal scrollback must remain reachable while mouse capture stays
-//! on for clicks (#441, "Regression: enabling mouse capture broke the
-//! crossterm renderer's scrollback path").
+//! Native terminal scrollback and click-drag selection must remain reachable
+//! while Finch is running (#221). Mouse capture is off by default so the host
+//! terminal owns drags and the wheel. Accordion expand/collapse stays on the
+//! keyboard. When an opt-in path later holds capture, #441's wheel-release
+//! still applies (covered in `src/cli/tui/mouse_capture.rs`).
 //!
 //! # What actually breaks
 //!
@@ -9,16 +11,15 @@
 //!
 //! 1. **Commit-into-scrollback.** Completed rows never leave the live region.
 //!    A 2026-09-07 PTY replay of the production byte stream ruled this out:
-//!    with `EnableMouseCapture` on, committed text is already above the
-//!    visible screen. Mouse tracking sequences (`CSI ? 1000/1002/1003/1015/1006
-//!    h`) are input-reporting modes; they do not erase or withhold screen
-//!    content. This file still locks that path so it cannot regress.
+//!    committed text is already above the visible screen even with
+//!    `EnableMouseCapture` on. Mouse tracking sequences (`CSI ? 1000/1002/1003/
+//!    1015/1006 h`) are input-reporting modes; they do not erase or withhold
+//!    screen content. This file still locks that path so it cannot regress.
 //!
-//! 2. **Wheel capture.** `EnableMouseCapture` makes the terminal deliver wheel
-//!    ticks to Finch instead of scrolling its own buffer. Finch then ignores
-//!    those events (`handle_accordion_mouse` only accepts left-click). The
-//!    transcript is in native history; the user cannot reach it. That is the
-//!    remaining user-visible failure on current main.
+//! 2. **Wheel / drag capture.** `EnableMouseCapture` makes the terminal
+//!    deliver wheel ticks and drags to Finch instead of native scroll and
+//!    selection. Default-off is the #221 fix; these cases lock that the
+//!    production binary never enables capture on startup, wheel, or keypress.
 //!
 //! # Production boundary
 //!
@@ -59,6 +60,7 @@ const READY_DEADLINE: Duration = Duration::from_secs(90);
 const ECHO_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Failure deadline for mouse-tracking mode changes after a wheel or key.
+#[allow(dead_code)]
 const TRACKING_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Failure deadline for a clean exit after `/exit`.
@@ -551,6 +553,7 @@ impl Session {
     }
 
     /// Wait until `needle` appears in the raw byte stream at or after `from`.
+    #[allow(dead_code)]
     fn wait_for_raw_from(
         &mut self,
         needle: &[u8],
@@ -703,122 +706,77 @@ fn test_committed_messages_reach_terminal_scrollback_under_mouse_capture() {
     );
 }
 
-/// A wheel tick must release mouse tracking so the terminal can scroll its
-/// own buffer.
-///
-/// This is the remaining user-visible failure on current main: capture stays
-/// on, the wheel is delivered to Finch, Finch ignores it, and native
-/// scrollback is unreachable. The first tick is consumed as the release; later
-/// ticks belong to the terminal. Click-to-toggle is restored on the next key
-/// (covered separately).
+/// Default TUI startup must not enable mouse capture, so click-drag copy
+/// stays with the host terminal (#221).
 #[test]
-fn test_wheel_releases_mouse_tracking_so_native_scrollback_is_reachable() {
+fn test_tui_startup_does_not_enable_mouse_capture() {
     let fixture = Fixture::new();
     let mut session = Session::spawn(&fixture);
     session.wait_for("finch v", READY_DEADLINE, "the startup header was drawn");
 
-    let tracking_on_at = session.wait_for_raw_from(
-        MOUSE_TRACKING_ON,
-        0,
-        TRACKING_DEADLINE,
-        "mouse tracking is enabled at TUI start, which is what keeps \
-         click-to-toggle and is the mode that steals the wheel (#441)",
-    );
-
-    let off_before = find_subslice(&session.transcript_bytes(), MOUSE_TRACKING_OFF);
+    let on_at = find_subslice(&session.transcript_bytes(), MOUSE_TRACKING_ON);
     assert!(
-        off_before.is_none(),
-        "INVARIANT: mouse tracking must still be on when the wheel arrives; \
-         a disable before the wheel would make this test pass without proving \
-         that the wheel released capture (#441). First disable was at byte \
-         {off_before:?}. Readable terminal:\n{}",
+        on_at.is_none(),
+        "INVARIANT: the default TUI must not emit EnableMouseCapture at startup, \
+         so click-drag selection stays with the host terminal (#221). First \
+         enable was at byte {on_at:?}. Readable terminal:\n{}",
         session.readable_transcript()
     );
 
-    session.send_bytes(SGR_WHEEL_UP);
+    session.send_line("/exit");
+    let status = session.wait_for_exit();
+    let bytes = session.transcript_bytes();
+    assert!(
+        find_subslice(&bytes, MOUSE_TRACKING_ON).is_none(),
+        "INVARIANT: EnableMouseCapture must not appear across the whole session, \
+         including shutdown (#221). finch exited with {status:?}. Readable \
+         terminal:\n{}",
+        session.readable_transcript()
+    );
+    assert!(
+        find_subslice(&bytes, MOUSE_TRACKING_OFF).is_some(),
+        "INVARIANT: shutdown still emits DisableMouseCapture so a session that \
+         had held tracking cannot leak reporting into the shell (#221). \
+         finch exited with {status:?}. Readable terminal:\n{}",
+        session.readable_transcript()
+    );
+}
 
-    let tracking_off_at = session.wait_for_raw_from(
-        MOUSE_TRACKING_OFF,
-        tracking_on_at,
-        TRACKING_DEADLINE,
-        "a wheel tick releases mouse tracking so the terminal owns subsequent \
-         wheel events and the user can reach native scrollback (#441)",
+/// A wheel tick or later keypress must not turn mouse capture on when the
+/// default is off. Native scroll and selection stay with the terminal.
+#[test]
+fn test_wheel_and_keypress_do_not_enable_mouse_capture() {
+    let fixture = Fixture::new();
+    let mut session = Session::spawn(&fixture);
+    session.wait_for("finch v", READY_DEADLINE, "the startup header was drawn");
+
+    session.send_bytes(SGR_WHEEL_UP);
+    // A printable key is the production trigger that used to restore capture
+    // after a wheel (#441). Backspace afterwards so `/exit` is not submitted
+    // as `x/exit`.
+    session.send_bytes(b"x");
+    session.send_bytes(b"\x7f");
+
+    let on_at = find_subslice(&session.transcript_bytes(), MOUSE_TRACKING_ON);
+    assert!(
+        on_at.is_none(),
+        "INVARIANT: a wheel or keypress must not emit EnableMouseCapture when \
+         tracking is default-off (#221). First enable was at byte {on_at:?}. \
+         Readable terminal:\n{}",
+        session.readable_transcript()
     );
 
     match session.child.try_wait() {
         Ok(None) => {}
         Ok(Some(status)) => panic!(
-            "INVARIANT: the disable after the wheel must come from the live \
-             session, not from shutdown (#441). finch exited with {status:?} \
-             after the wheel. Readable terminal:\n{}",
+            "INVARIANT: the session must still be live after the wheel and \
+             keypress (#221). finch exited with {status:?}. Readable \
+             terminal:\n{}",
             session.readable_transcript()
         ),
         Err(error) => panic!("could not poll finch after the wheel: {error}"),
     }
 
-    assert!(
-        tracking_off_at > tracking_on_at,
-        "INVARIANT: tracking goes off after it was on, so the wheel released \
-         a session that had been capturing the wheel (#441). on={tracking_on_at} \
-         off={tracking_off_at}"
-    );
-
-    session.send_line("/exit");
-    let _ = session.wait_for_exit();
-}
-
-/// After a wheel has released tracking, the next keypress restores it so
-/// accordion click-to-toggle (and input-box clicks) work again.
-#[test]
-fn test_keypress_after_wheel_restores_mouse_tracking_for_clicks() {
-    let fixture = Fixture::new();
-    let mut session = Session::spawn(&fixture);
-    session.wait_for("finch v", READY_DEADLINE, "the startup header was drawn");
-
-    let first_on = session.wait_for_raw_from(
-        MOUSE_TRACKING_ON,
-        0,
-        TRACKING_DEADLINE,
-        "mouse tracking is enabled at TUI start (#441)",
-    );
-    session.send_bytes(SGR_WHEEL_UP);
-    let off_at = session.wait_for_raw_from(
-        MOUSE_TRACKING_OFF,
-        first_on,
-        TRACKING_DEADLINE,
-        "the wheel released mouse tracking (#441)",
-    );
-
-    // A printable key is the production trigger: the user starts typing after
-    // scrolling. Backspace afterwards so `/exit` is not submitted as `x/exit`.
-    session.send_bytes(b"x");
-
-    let restored_at = session.wait_for_raw_from(
-        MOUSE_TRACKING_ON,
-        off_at,
-        TRACKING_DEADLINE,
-        "the next keypress restores mouse tracking so clicks work again after \
-         the user has finished scrolling native scrollback (#441)",
-    );
-
-    match session.child.try_wait() {
-        Ok(None) => {}
-        Ok(Some(status)) => panic!(
-            "INVARIANT: the restore must come from the live session, not from \
-             a restart (#441). finch exited with {status:?} after the key. \
-             Readable terminal:\n{}",
-            session.readable_transcript()
-        ),
-        Err(error) => panic!("could not poll finch after the key: {error}"),
-    }
-
-    assert!(
-        restored_at > off_at,
-        "INVARIANT: tracking is restored after the wheel-release disable \
-         (#441). off={off_at} on={restored_at}"
-    );
-
-    session.send_bytes(b"\x7f");
     session.send_line("/exit");
     let _ = session.wait_for_exit();
 }
