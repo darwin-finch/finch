@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parent.parent
 CHECKER = ROOT / "scripts/check_ci_workflow_manifest.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 from check_ci_workflow_manifest import (  # noqa: E402
+    BREAKAGE_JOB_IF,
+    BREAKAGE_PERMISSIONS,
+    BREAKAGE_WORKFLOW,
     CANCELLATION_JOB_IF,
     CANCELLATION_WORKFLOW,
     ESCAPE_API_ALLOWLIST,
@@ -803,6 +806,96 @@ class WorkflowContractTests(unittest.TestCase):
             "    if: false\n",
         )
         self.assert_fails("condition changed", CANCELLATION_JOB_IF, "actual=False")
+
+    def test_main_breakage_controller_is_not_pull_request_active(self) -> None:
+        self.assertNotIn(
+            BREAKAGE_WORKFLOW,
+            EXPECTED_PATHS,
+            "the trusted controller must keep the empty fixture-membership set",
+        )
+        document = load_yaml(ROOT / ".github/workflows" / BREAKAGE_WORKFLOW)
+        self.assertIs(
+            event_contract(document, BREAKAGE_WORKFLOW, "pull_request"),
+            False,
+            "the trusted controller must not activate on pull_request",
+        )
+        self.assertIs(
+            event_contract(document, BREAKAGE_WORKFLOW, "push"),
+            False,
+            "the trusted controller must not activate directly on push",
+        )
+
+    def test_main_breakage_controller_envelope_is_bound(self) -> None:
+        mutations = (
+            ("  issues: write\n", "  issues: read\n", "effective permissions changed"),
+            ("  actions: read\n", "  actions: write\n", "effective permissions changed"),
+            ("    types: [completed]\n", "", "workflow_run trigger changed"),
+            (
+                "workflows: [CI]\n    types:",
+                "workflows: [CI, Release]\n    types:",
+                "workflow_run trigger changed",
+            ),
+            (
+                "  report-main-breakage:\n",
+                "  report-main-breakage:\n    if: true\n",
+                'duplicate YAML key "if"',
+            ),
+            ("    timeout-minutes: 5\n", "    timeout-minutes: 30\n", "timeout-minutes must be 5"),
+            (
+                "          TOKEN: ${{ github.token }}\n",
+                "          TOKEN: ${{ secrets.BREAKAGE_BOT_TOKEN }}\n",
+                "trusted step token binding changed",
+            ),
+            (
+                '          ISSUE_TITLE = "CI failed on main"\n',
+                '          ISSUE_TITLE = "Main CI is red"\n',
+                "breakage issue title changed",
+            ),
+            (
+                '          LABEL = "ci-main-breakage"\n',
+                '          LABEL = "ci-broken"\n',
+                "breakage issue label changed",
+            ),
+            (
+                "        run: |\n          python3 - <<'PYTHON'\n",
+                "        run: |\n          cat event.json\n",
+                "trusted step must run one literal PYTHON heredoc",
+            ),
+        )
+        for old, new, *diagnostics in mutations:
+            with self.subTest(diagnostics=diagnostics):
+                repository = Repository()
+                try:
+                    repository.replace(BREAKAGE_WORKFLOW, old, new)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, f"breakage-controller mutant passed: {diagnostics}")
+                    for diagnostic in diagnostics:
+                        self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+    def test_main_breakage_controller_rejects_checkout_and_extra_jobs(self) -> None:
+        self.repository.replace(
+            BREAKAGE_WORKFLOW,
+            "      - name: Update the main breakage issue\n",
+            "      - uses: actions/checkout@v4\n      - name: Update the main breakage issue\n",
+        )
+        self.assert_fails("trusted controller must not checkout or run an action")
+
+        repository = Repository()
+        try:
+            repository.replace(
+                BREAKAGE_WORKFLOW,
+                "permissions:\n",
+                "defaults:\n  run:\n    shell: bash\n\npermissions:\n",
+            )
+            result = repository.check()
+            self.assertNotEqual(0, result.returncode, "workflow-level defaults passed")
+            self.assertIn(
+                "workflow-level defaults would rewrite the trusted step", result.stderr, result.stderr
+            )
+        finally:
+            repository.close()
 
 
 if __name__ == "__main__":
