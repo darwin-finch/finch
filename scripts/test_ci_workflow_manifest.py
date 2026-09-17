@@ -847,6 +847,11 @@ class WorkflowContractTests(unittest.TestCase):
                 "trusted step token binding changed",
             ),
             (
+                "def api(method, path, expected=(200, 201), payload=None):",
+                "def api(method, path, expected=(200,), payload=None):",
+                "API default accepted-status set changed",
+            ),
+            (
                 '          ISSUE_TITLE = "CI failed on main"\n',
                 '          ISSUE_TITLE = "Main CI is red"\n',
                 "breakage issue title changed",
