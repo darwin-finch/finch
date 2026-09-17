@@ -2548,9 +2548,9 @@ A CTFE function on numbers is not a macro: `(+ 1 2)` at compile time is the inte
 function whose contract is `syntax -> syntax` **is** a macro. The only remaining difference from
 an ordinary function is **call convention**, not a second evaluator:
 
-- function: arguments are evaluated first; the caller writes `(expand '(pkg.ensure nginx))`;
-- `define-syntax`: arguments are not evaluated; `(require-pkg nginx)` is compiled as
-  `(splice (expand-require-pkg '(require-pkg nginx)))`.
+- function: arguments are evaluated first; the caller writes `(expand-when '(when ready? (pkg.ensure nginx)))`;
+- `define-syntax`: arguments are not evaluated; `(when ready? (pkg.ensure nginx))` is compiled as
+  `(splice (expand-when '(when ready? (pkg.ensure nginx))))`.
 
 `splice` is an ordinary word (Co-Forth: the explicit splice word already listed with
 `macro:` / `syntax[ ... ]`). Its meaning is: this `syntax` **value** is the next form in the
@@ -2563,21 +2563,40 @@ forbidden; list surgery and quasiquote only **construct** forms.
 result (typically a quasiquoted list). Nothing further is bound unless the caller `define`s a
 name or `splice`s the value into the module.
 
-Example without `define-syntax` sugar:
+A transformer that only wraps two calls is not a reason to use syntax CTFE. That is an ordinary
+function:
 
 ```
-(define (expand-require-pkg form)
-  (let ((name (second form)))
-    `(begin
-       (pkg.ensure ,name)
-       (svc.enable ,name))))
+(define (require-pkg name)
+  (pkg.ensure name)
+  (svc.enable name))
 
-(splice (expand-require-pkg '(require-pkg nginx)))
+(require-pkg "nginx")
 ```
 
-After CTFE, the spliced form is `(begin (pkg.ensure nginx) (svc.enable nginx))`. Type and effect
-checking apply to **that** tree. `define-syntax` is only registration that implicit-quotes the
-call and splices the result.
+Syntax CTFE is for forms a function cannot implement because it would **evaluate** arguments.
+`when` must not run `pkg.ensure` unless `ready?` is true:
+
+```
+(define (expand-when form)
+  (let ((test (second form))
+        (body (third form)))
+    `(if ,test ,body #f)))
+```
+
+`expand-when` only **builds a list**. It does not run `if` or `pkg.ensure`. `splice` pastes that
+list **once** into the module as source — it does not define a word named `when`:
+
+```
+(splice (expand-when '(when ready? (pkg.ensure nginx))))
+;; the next form in the file is:
+;; (if ready? (pkg.ensure nginx) #f)
+```
+
+`define-syntax` **registers** the transformer so every later `(when …)` is implicit-quote plus
+splice. Without it, `when` is not a callable; you would write `splice` at each use. Type and
+effect checking apply to the **expanded** `if` tree. A converge `require` that yields until
+another form is Done is the same shape: syntax, not “two host calls with a wrapper name.”
 
 Diagnostics for syntax CTFE follow SDC mixin reporting, not DMD’s “blame the mixin line.” A
 failure names (1) the **user form** and its span, (2) a pretty-printed **expansion** the
