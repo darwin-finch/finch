@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::propose::{
     build_review_artifact, open_review_artifact, parse_proposal_decision, proposal_chat_context,
-    verify_render_is_faithful, ProposalDecision,
+    reconstruct_reviewed_text, verify_render_is_faithful, ProposalDecision,
 };
 
 /// Run `~/.finch/hooks/post-save <file_path>` if that script exists.
@@ -526,10 +526,10 @@ where
 {
     let target = open_review_target(file_path)?;
     let original = match &target {
-        ReviewTarget::Missing(_) => "",
-        ReviewTarget::Existing { original, .. } => original,
+        ReviewTarget::Missing(_) => String::new(),
+        ReviewTarget::Existing { original, .. } => original.clone(),
     };
-    ensure_review_is_faithful(file_path, original, content)?;
+    ensure_review_is_faithful(file_path, &original, content)?;
     let file_diff = match &target {
         ReviewTarget::Missing(_) => crate::cli::diff::FileDiff::from_created(file_path, content),
         ReviewTarget::Existing { original, .. } => {
@@ -537,7 +537,7 @@ where
         }
     };
     let diff = file_diff.to_unified();
-    verify_render_is_faithful("write", &file_diff, &diff, original, content)?;
+    verify_render_is_faithful("write", &file_diff, &diff, &original, content)?;
     let description = format!("Write {} ({} lines)", file_path, content.lines().count());
     let artifact = build_review_artifact(&description, &diff);
     let Some(returned) = open_editor(artifact.clone()).await? else {
@@ -552,13 +552,32 @@ where
                 "Write not applied. The user asked for a different change instead of approving:\n{context}"
             ))
         }
-        ProposalDecision::Execute { source } if source != diff => Ok(format!(
-            "Write not applied: the proposed diff for {file_path} was edited during review.\n\
-             Re-issue the write with the content you want, or set `# finch: action=chat` to describe it."
-        )),
-        ProposalDecision::Execute { .. } => {
-            commit_reviewed_write(file_path, content, target)?;
-            Ok(diff)
+        ProposalDecision::Execute { source } => {
+            let reconstructed = match reconstruct_reviewed_text(
+                "write",
+                &file_diff.old_path,
+                &file_diff.new_path,
+                &original,
+                &source,
+            ) {
+                Ok(text) => text,
+                Err(error) => return Ok(error.to_string()),
+            };
+            let created = matches!(&target, ReviewTarget::Missing(_));
+            let result_diff = if created {
+                crate::cli::diff::FileDiff::from_created(file_path, &reconstructed).to_unified()
+            } else {
+                crate::cli::diff::FileDiff::from_texts(file_path, &original, &reconstructed)
+                    .to_unified()
+            };
+            commit_reviewed_write(file_path, &reconstructed, target)?;
+            if reconstructed == original {
+                Ok(format!(
+                    "Write not applied: the reviewed patch leaves {file_path} unchanged."
+                ))
+            } else {
+                Ok(result_diff)
+            }
         }
     }
 }
@@ -848,5 +867,167 @@ mod tests {
         assert_eq!(diff.old_path, "/dev/null");
         assert!(diff.is_created());
         assert_eq!((diff.added(), diff.removed()), (3, 0));
+    }
+
+    fn reply_with(
+        edit: impl Fn(String) -> Option<String> + Send + 'static,
+    ) -> impl FnOnce(
+        String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>,
+    > {
+        move |artifact: String| {
+            let answer = edit(artifact);
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    fn seed_review_target(contents: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("write review temp dir");
+        let path = dir.path().join("target.txt");
+        fs::write(&path, contents).expect("seed write review target");
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    /// Fail-before for #517: editing the saved unified diff with action=execute
+    /// must apply the reconstructed saved patch, not the model's planned bytes
+    /// and not refuse merely because the body changed.
+    #[tokio::test]
+    async fn test_review_and_apply_write_uses_saved_diff_not_planned() {
+        let (_dir, path) = seed_review_target("alpha\nkeep\n");
+        let result = review_and_apply_write(
+            &path,
+            "planned-bytes\nkeep\n",
+            reply_with(|artifact| Some(artifact.replace("+planned-bytes", "+reviewed-edit"))),
+        )
+        .await
+        .expect("interactive write");
+
+        let final_bytes = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            final_bytes, "reviewed-edit\nkeep\n",
+            "saving an edited review diff with action=execute must apply the saved patch; \
+             the independently reconstructed result is reviewed-edit\\nkeep\\n; tool said: {result}"
+        );
+        assert!(
+            !final_bytes.contains("planned-bytes"),
+            "planned-only bytes must not appear after a reviewed edit; tool said: {result}"
+        );
+        assert!(
+            result.contains("+reviewed-edit") || final_bytes.contains("reviewed-edit"),
+            "the tool result must report the reviewed patch that was applied; tool said: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_and_apply_write_cancel_leaves_file_unchanged() {
+        let (_dir, path) = seed_review_target("original content\n");
+        let result = review_and_apply_write(
+            &path,
+            "model content\n",
+            reply_with(|artifact| {
+                Some(artifact.replace("# finch: action=execute", "# finch: action=cancel"))
+            }),
+        )
+        .await
+        .expect("cancelled write");
+
+        assert!(
+            result.contains("aborted by user"),
+            "cancel must explain itself; tool said: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "original content\n",
+            "cancel must leave the target byte-for-byte unchanged; tool said: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_and_apply_write_malformed_hunk_does_not_write() {
+        let (_dir, path) = seed_review_target("original content\n");
+        let result = review_and_apply_write(
+            &path,
+            "model content\n",
+            reply_with(|artifact| Some(format!("{artifact}\n+not-a-complete-hunk\n"))),
+        )
+        .await
+        .expect("malformed write review");
+
+        assert!(
+            result.contains("left unchanged")
+                && (result.contains("malformed") || result.contains("hunk")),
+            "a malformed saved hunk must explain the refusal; tool said: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "original content\n",
+            "a malformed saved hunk must leave the target unchanged; tool said: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_and_apply_write_extra_file_is_rejected() {
+        let (_dir, path) = seed_review_target("original content\n");
+        let result = review_and_apply_write(
+            &path,
+            "model content\n",
+            reply_with(|artifact| {
+                Some(format!(
+                    "{artifact}--- /dev/null\n+++ b/other.txt\n@@ -0,0 +1,1 @@\n+pwned\n"
+                ))
+            }),
+        )
+        .await
+        .expect("extra-file write review");
+
+        assert!(
+            result.contains("left unchanged") && result.contains("additional file"),
+            "an extra file in the saved diff must be rejected; tool said: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "original content\n",
+            "rejecting an extra file must leave the target unchanged; tool said: {result}"
+        );
+        assert!(
+            !path.contains("other.txt"),
+            "the extra-file header must never become a write destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_and_apply_write_path_change_is_rejected() {
+        let (_dir, path) = seed_review_target("original content\n");
+        let result = review_and_apply_write(
+            &path,
+            "model content\n",
+            reply_with(|artifact| {
+                let edited = artifact
+                    .lines()
+                    .map(|line| {
+                        if let Some(rest) = line.strip_prefix("+++ ") {
+                            format!("+++ b/etc/passwd{rest}")
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(format!("{edited}\n"))
+            }),
+        )
+        .await
+        .expect("path-change write review");
+
+        assert!(
+            result.contains("left unchanged") && result.contains("target path"),
+            "a changed +++ header must be rejected; tool said: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "original content\n",
+            "rejecting a path/header change must leave the target unchanged; tool said: {result}"
+        );
     }
 }

@@ -186,7 +186,8 @@ fn editor_boundary_case(case: &str) -> (&'static str, &'static str, &'static str
             "PROMPT='\u{1b}]0;old\u{7}'",
             "PROMPT='\u{1b}]0;new\u{7}'",
         ),
-        "cancel" | "body-change" | "nonzero" | "editor-fallback" => ("before\n", "before", "after"),
+        "cancel" | "body-change" | "nonzero" | "editor-fallback" | "malformed-hunk"
+        | "extra-file" | "path-change" => ("before\n", "before", "after"),
         "changed-whitespace" => ("before\n", "before", "after "),
         other => panic!("unknown editor-boundary case {other:?}"),
     }
@@ -251,7 +252,10 @@ fn write_fake_editor(path: &std::path::Path, identity: &str) {
          case \"$FINCH_EDITOR_ACTION\" in\n\
            accept) : ;;\n\
            cancel) sed 's/# finch: action=execute/# finch: action=cancel/' \"$1\" > \"$1.next\"; cp \"$1.next\" \"$1\" ;;\n\
-           body-change) printf '\\n+not-reviewed\\n' >> \"$1\" ;;\n\
+           body-change) sed 's/^+after$/+reviewed-edit/' \"$1\" > \"$1.next\"; cp \"$1.next\" \"$1\" ;;\n\
+           malformed-hunk) printf '\\n+not-reviewed\\n' >> \"$1\" ;;\n\
+           extra-file) printf '\\n--- /dev/null\\n+++ b/other.txt\\n@@ -0,0 +1,1 @@\\n+pwned\\n' >> \"$1\" ;;\n\
+           path-change) sed 's|^+++ .*|+++ b/etc/passwd|' \"$1\" > \"$1.next\"; cp \"$1.next\" \"$1\" ;;\n\
            changed-whitespace) sed 's/[[:space:]]*$//' \"$1\" > \"$1.next\"; cp \"$1.next\" \"$1\" ;;\n\
            nonzero) printf '%s' '37' > \"$FINCH_EDITOR_EXIT\"; exit 37 ;;\n\
            *) exit 92 ;;\n\
@@ -315,7 +319,10 @@ case \"$FINCH_WRITE_ACTION\" in\n\
   accept) : ;;\n\
   cancel|ambiguous-header-line) sed 's/# finch: action=execute/# finch: action=cancel/' \"$1\" > \"$1.next\"; cp \"$1.next\" \"$1\" ;;\n\
   chat) printf '# finch: action=chat\\n# ---- Finch proposal body ----\\nprintf owned > %s\\n' \"$FINCH_WRITE_CANARY\" > \"$1\" ;;\n\
-  body-change) printf '\\n+not-reviewed\\n' >> \"$1\" ;;\n\
+  body-change) sed 's/^+model content$/+reviewed content/' \"$1\" > \"$1.next\"; cp \"$1.next\" \"$1\" ;;\n\
+  malformed-hunk) printf '\\n+not-reviewed\\n' >> \"$1\" ;;\n\
+  extra-file) printf '\\n--- /dev/null\\n+++ b/other.txt\\n@@ -0,0 +1,1 @@\\n+pwned\\n' >> \"$1\" ;;\n\
+  path-change) sed 's|^+++ .*|+++ b/etc/passwd|' \"$1\" > \"$1.next\"; cp \"$1.next\" \"$1\" ;;\n\
   concurrent-change) printf 'somebody else changed it\\n' > \"$FINCH_WRITE_TARGET\" ;;\n\
   concurrent-create) printf 'somebody else created it\\n' > \"$FINCH_WRITE_TARGET\" ;;\n\
   intermediate-replacement) ln -s \"$FINCH_WRITE_ATTACKER\" \"$FINCH_WRITE_INTERMEDIATE\" ;;\n\
@@ -481,6 +488,9 @@ fn test_write_tool_reviews_plaintext_and_never_executes_editor_text() {
         "cancel",
         "chat",
         "body-change",
+        "malformed-hunk",
+        "extra-file",
+        "path-change",
         "concurrent-change",
         "concurrent-create",
         "ancestor-swap",
@@ -647,10 +657,38 @@ fn test_write_tool_reviews_plaintext_and_never_executes_editor_text() {
             "body-change" => {
                 assert_eq!(
                     result["ok"], true,
-                    "{case}: body refusal should return normally: {result}"
+                    "{case}: edited review diff should apply: {result}"
                 );
-                assert!(detail.contains("edited during review"), "{case}: {detail}");
-                assert_eq!(fs::read_to_string(&target).unwrap(), "original content\n");
+                let final_bytes = fs::read_to_string(&target).unwrap();
+                assert_eq!(
+                    final_bytes, "reviewed content\n# finch: action=cancel\n",
+                    "{case}: the independently reconstructed saved patch must be written; \
+                     detail: {detail}"
+                );
+                assert!(
+                    !final_bytes.contains("model content"),
+                    "{case}: planned-only bytes must not appear after a reviewed edit; \
+                     detail: {detail}"
+                );
+            }
+            "malformed-hunk" | "extra-file" | "path-change" => {
+                assert_eq!(
+                    result["ok"], true,
+                    "{case}: invalid saved diff should return normally: {result}"
+                );
+                assert!(
+                    detail.contains("not applied")
+                        || detail.contains("Refusing to write")
+                        || detail.contains("malformed")
+                        || detail.contains("additional file")
+                        || detail.contains("target path"),
+                    "{case}: refusal must explain the invalid saved patch; detail: {detail}"
+                );
+                assert_eq!(
+                    fs::read_to_string(&target).unwrap(),
+                    "original content\n",
+                    "{case}: an invalid saved patch must leave the target unchanged"
+                );
             }
             "concurrent-change" => {
                 assert_eq!(
@@ -781,6 +819,9 @@ fn test_edit_tool_uses_real_editor_process_boundary_and_fails_closed() {
         "control",
         "cancel",
         "body-change",
+        "malformed-hunk",
+        "extra-file",
+        "path-change",
         "changed-whitespace",
         "nonzero",
         "editor-fallback",
@@ -874,13 +915,18 @@ fn test_edit_tool_uses_real_editor_process_boundary_and_fails_closed() {
             "{case}: interactive diff approval must not execute the undisclosed HOME post-save hook"
         );
 
-        let applies = matches!(case, "blank-context" | "editor-fallback");
-        let (expected_ok, diagnostic) = match case {
-            "tab" => (false, Some("TAB")),
-            "control" => (false, Some("ESCAPE")),
-            "cancel" | "nonzero" => (true, Some("aborted by user")),
-            "body-change" | "changed-whitespace" => (true, Some("was edited during review")),
-            "blank-context" | "editor-fallback" => (true, None),
+        let (expected_ok, diagnostic, expected_bytes) = match case {
+            "tab" => (false, Some("TAB"), original.to_string()),
+            "control" => (false, Some("ESCAPE"), original.to_string()),
+            "cancel" | "nonzero" => (true, Some("aborted by user"), original.to_string()),
+            "malformed-hunk" | "extra-file" | "path-change" => {
+                (true, Some("not applied"), original.to_string())
+            }
+            "body-change" => (true, None, "reviewed-edit\n".to_string()),
+            "changed-whitespace" => (true, None, "after\n".to_string()),
+            "blank-context" | "editor-fallback" => {
+                (true, None, original.replacen("before", new_string, 1))
+            }
             _ => unreachable!(),
         };
         assert_eq!(
@@ -889,15 +935,20 @@ fn test_edit_tool_uses_real_editor_process_boundary_and_fails_closed() {
         );
         if let Some(expected) = diagnostic {
             assert!(
-                detail.contains(expected),
+                detail.contains(expected)
+                    || detail.contains("malformed")
+                    || detail.contains("additional file")
+                    || detail.contains("target path")
+                    || detail.contains("Refusing to edit"),
                 "{case}: refusal must explain itself with {expected:?}; detail: {detail}"
             );
         }
-        let expected_bytes = if applies {
-            original.replacen("before", new_string, 1)
-        } else {
-            original.to_string()
-        };
+        if case == "body-change" {
+            assert!(
+                !String::from_utf8_lossy(&final_bytes).contains("after"),
+                "{case}: planned-only bytes must not appear after a reviewed edit; detail: {detail}"
+            );
+        }
         assert_eq!(
             final_bytes,
             expected_bytes.as_bytes(),
