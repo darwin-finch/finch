@@ -2743,6 +2743,118 @@ fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
 }
 
 #[test]
+fn named_brain_live_result_keeps_assistant_prose_say() {
+    // Production dump: local `(say "Hi, …")` became Program source with a
+    // collapsed `result` child because live Result delivery deleted the
+    // assistant-prose output unit (#820).
+    use crate::brain::{BrainEventKind, BrainRunKind, BrainRunStatus, ProgramLanguage, RunId};
+    use crate::cli::messages::Message;
+
+    let greeting = "Hi, Shammah! What would you like to work on?";
+    let source = format!("(say \"{greeting}\")");
+    let output =
+        crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
+    output.disable_stdout();
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let mut projections = std::collections::HashMap::new();
+    let run_unit = super::ensure_remote_brain_run_projection(
+        &output,
+        &mut projections,
+        run_id,
+        Some(BrainRunKind::Interactive),
+        BrainRunStatus::Running,
+        None,
+    )
+    .unit
+    .clone();
+    run_unit.set_program_source("lisp");
+    run_unit.set_response(&source);
+    run_unit.set_complete();
+
+    let say = output.start_work_unit("VM program output");
+    say.set_program_output();
+    say.append_response(greeting);
+    say.present_as_assistant_prose();
+    say.set_complete();
+    assert_eq!(
+        output.get_messages().len(),
+        2,
+        "fixture is the dump's two-row turn: Program source plus say output"
+    );
+    assert!(
+        say.is_assistant_prose(),
+        "fixture must be the 804 prose mark; otherwise this test cannot prove #820"
+    );
+
+    let mut local_projections = std::collections::VecDeque::from([LocalBrainProjection {
+        run_id,
+        source: source.clone(),
+        output: greeting.to_string(),
+        tool_ids: std::collections::HashSet::new(),
+        approval_ids: std::collections::HashSet::new(),
+        program_seq: None,
+        transient_output_unit: Some(say.clone()),
+        failed: false,
+    }]);
+
+    let mut program = brain_event(
+        12,
+        "provider",
+        BrainEventKind::Program {
+            language: ProgramLanguage::Lisp,
+            source: source.clone(),
+        },
+    );
+    program.run_id = Some(run_id);
+    assert!(super::project_remote_brain_live_run_event(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &program,
+    ));
+
+    let mut result = brain_event(
+        14,
+        "daemon",
+        BrainEventKind::Result {
+            request_seq: 12,
+            output: greeting.to_string(),
+            error: None,
+            continuation_messages: Vec::new(),
+            invocation_metadata: None,
+        },
+    );
+    result.run_id = Some(run_id);
+    assert!(super::project_remote_brain_live_run_event(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &result,
+    ));
+
+    let messages = output.get_messages();
+    let ids: Vec<_> = messages.iter().map(|message| message.id()).collect();
+    let haystack = messages
+        .iter()
+        .map(|message| message.format(&crate::theme::ColorScheme::default()))
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    assert!(
+        ids.contains(&say.id()),
+        "invariant: a matching daemon Result must not delete untitled say prose; \
+         that is the dump where Program source stayed and the greeting hid under \
+         collapsed result (#820); ids={ids:?}; haystack={haystack}"
+    );
+    assert!(
+        say.is_assistant_prose() && haystack.contains(greeting),
+        "invariant: the surviving row is still the greeting, not an empty husk; \
+         haystack={haystack}"
+    );
+}
+
+#[test]
 fn local_runner_projection_suppresses_matching_canonical_program_and_result() {
     let mut projection = LocalBrainProjection {
         run_id: crate::brain::RunId(uuid::Uuid::nil()),
@@ -4993,6 +5105,129 @@ async fn typed_program_complete_presents_successful_say_as_prose() {
                 row.body,
                 vec!["Hello".to_string()],
                 "invariant: say bytes remain the row body; row={row:?}"
+            );
+        })
+        .await;
+}
+
+fn brain_run_status_child_labels(row: &crate::cli::messages::TranscriptRow) -> Vec<String> {
+    row.children
+        .iter()
+        .filter(|child| child.label.contains("status"))
+        .map(|child| child.label.clone())
+        .collect()
+}
+
+/// Production-boundary regression for #820: after a successful named-Brain
+/// `(say …)` the Brain run line must not keep saying `running`.
+#[tokio::test]
+async fn named_brain_say_complete_does_not_leave_run_status_running() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::cli::messages::{Message, MessageStatus};
+
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let tempdir =
+                tempfile::tempdir().expect("named-brain say fixture: isolated tool state");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("named-brain say fixture: construct inert tool executor");
+            let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&runtime),
+            );
+            event_loop.output_manager.disable_stdout();
+            event_loop.runner_brain = Some("home".into());
+            event_loop.home_runner_lease_active = true;
+
+            let run_id = crate::brain::RunId(Uuid::new_v4());
+            let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_event(super::ReplEvent::NamedBrainTurnRequested(
+                    crate::server::RunnerTurnRequest {
+                        brain: "home".into(),
+                        run_id,
+                        request_seq: 1,
+                        prompt: "hello".into(),
+                        context: vec![crate::providers::Message::user("hello")],
+                        approval_audience: crate::brain::BrainApprovalAudience {
+                            brain_id: crate::brain::BrainId(Uuid::new_v4()),
+                            brain: "home".into(),
+                            attachment_id: crate::brain::AttachmentId(Uuid::new_v4()),
+                            subject: "runner".into(),
+                            role: crate::brain::AttachmentRole::Runner,
+                            environment_generation: 1,
+                        },
+                        approval_connection_id: None,
+                        approval_tx: None,
+                        effect_audit: None,
+                        response_tx,
+                    },
+                ))
+                .await
+                .expect("named-Brain turn must dispatch");
+
+            let run_unit = event_loop
+                .remote_brain_run_units
+                .get(&run_id)
+                .expect("dispatch_named_brain_turn must project the Brain run unit")
+                .unit
+                .clone();
+            let before = projected_work_unit(&run_unit);
+            let before_status = brain_run_status_child_labels(&before);
+            assert!(
+                before_status
+                    .iter()
+                    .any(|label| label.to_lowercase().contains("running")),
+                "fixture must start from the dump's running status line; labels={before_status:?}; row={before:?}"
+            );
+            assert_eq!(
+                run_unit.status(),
+                MessageStatus::InProgress,
+                "fixture run unit must still be InProgress before say completes; row={before:?}"
+            );
+
+            let output_unit = event_loop
+                .output_manager
+                .start_work_unit("VM program output");
+            output_unit.set_program_output();
+            output_unit.append_response("Hello");
+            event_loop
+                .handle_event(super::ReplEvent::TypedProgramComplete {
+                    output_unit: Arc::clone(&output_unit),
+                    result: Ok(completed_execution_outcome("Hello")),
+                })
+                .await
+                .expect("successful typed-program completion must dispatch");
+
+            let after = projected_work_unit(&run_unit);
+            let after_status = brain_run_status_child_labels(&after);
+            let diag = format!(
+                "status_labels={after_status:?}; unit_status={:?}; row={after:?}",
+                run_unit.status()
+            );
+            assert!(
+                !after_status
+                    .iter()
+                    .any(|label| label.to_lowercase().contains("running")),
+                "invariant: after TypedProgramComplete of untitled say, the Brain run line is not running; {diag}"
+            );
+            assert_ne!(
+                run_unit.status(),
+                MessageStatus::InProgress,
+                "invariant: the Brain run unit is not InProgress after successful say; {diag}"
+            );
+            assert!(
+                after_status
+                    .iter()
+                    .any(|label| label.to_lowercase().contains("completed")),
+                "invariant: Brain run status is completed once say output is shown; {diag}"
             );
         })
         .await;

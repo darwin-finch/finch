@@ -374,6 +374,18 @@ impl WorkUnit {
         inner.as_assistant_prose = true;
     }
 
+    /// True after [`Self::present_as_assistant_prose`] succeeded.
+    ///
+    /// Named-Brain live Result delivery used this to decide whether the local
+    /// `say` row is the user-visible greeting. Removing it folded the bytes
+    /// into a collapsed `result` child of Program source (#820).
+    pub fn is_assistant_prose(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_assistant_prose
+    }
+
     /// Record that host-rendered lifecycle text belongs on this port.
     ///
     /// Clears any prior prose mark. A proposal notice that follows `say`
