@@ -37,7 +37,11 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.feature_name }})
-    runs-on: ${{ matrix.os }}
+    # Blacksmith pilot (#518): the canonical Linux PR test lane runs on a
+    # 4 vCPU / 16 GB Blacksmith runner — the same spec and image as GitHub's
+    # ubuntu-24.04, so any duration delta is attributable to the runner.
+    # CARGO_BUILD_JOBS stays 2 for the same reason. Rollback is this line.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false

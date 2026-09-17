@@ -444,6 +444,18 @@ class WorkflowContractTests(unittest.TestCase):
         )
         self.assert_fails("ci.yml: expanded check allocation changed", "Test (windows-2025, default)")
 
+    def test_blacksmith_pilot_runner_label_is_pinned(self) -> None:
+        self.repository.replace(
+            "ci.yml",
+            "    runs-on: blacksmith-4vcpu-ubuntu-2404\n",
+            "    runs-on: blacksmith-4vcpu-ubuntu-2405\n",
+        )
+        self.assert_fails(
+            "ci.yml: runner label inventory changed",
+            "blacksmith-4vcpu-ubuntu-2404",
+            "owner job 'test' must run actively on blacksmith-4vcpu-ubuntu-2404",
+        )
+
     def test_macos_test_job_is_not_a_pull_request_gate(self) -> None:
         self.repository.replace(
             "ci.yml",
