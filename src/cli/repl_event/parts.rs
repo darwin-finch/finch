@@ -27,7 +27,6 @@ pub struct SessionParts {
     pub active_persona: Arc<RwLock<crate::config::Persona>>,
     pub mode: Arc<RwLock<ReplMode>>,
     pub label: String,
-    pub uuid: Uuid,
 }
 
 /// What produces tokens, and which provider is currently chosen.

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use finch::claude::ClaudeClient;
 use finch::cli::output_layer::OutputManagerLayer;
-use finch::cli::{ConversationHistory, Repl};
+use finch::cli::Repl;
 use finch::config::{load_config, Config};
 use finch::metrics::MetricsLogger;
 use finch::models::ThresholdRouter;
@@ -28,13 +28,15 @@ struct Args {
     #[arg(long = "initial-prompt")]
     initial_prompt: Option<String>,
 
-    /// Path to session state file to restore (REPL mode)
-    #[arg(long = "restore-session")]
+    /// Retired UUID session restore. Hidden so help advertises `finch attach`.
+    /// The flag is still parsed so old invocations get a migration error
+    /// instead of "unexpected argument". Existing `~/.finch/sessions` files
+    /// are not deleted.
+    #[arg(long = "restore-session", hide = true)]
     restore_session: Option<PathBuf>,
 
-    /// Resume a previous session by UUID (printed on exit).
-    /// Shorthand for --restore-session ~/.finch/sessions/<uuid>.json
-    #[arg(long = "resume")]
+    /// Retired UUID resume flag. Hidden; see `--restore-session`.
+    #[arg(long = "resume", hide = true)]
     resume: Option<String>,
 
     /// Use raw terminal mode instead of TUI (enables rustyline)
@@ -76,9 +78,8 @@ struct Args {
     #[arg(long)]
     json: bool,
 
-    /// Use this named Brain as the console's durable home environment.
-    /// Example: finch --brain "battleground"
-    #[arg(long = "brain")]
+    /// Compatibility alias for `finch attach <name>`. Hidden from help.
+    #[arg(long = "brain", hide = true)]
     brain: Option<String>,
 }
 
@@ -171,7 +172,12 @@ enum Command {
     },
     /// Generate sample spreadsheets into ~/.finch/samples/xlsx/
     Samples,
-    /// Manage saved sessions
+    /// Attach to a named Brain through its canonical snapshot/event stream
+    Attach {
+        /// Brain name (`1-64` letters, numbers, `-` or `_`)
+        name: String,
+    },
+    /// List leftover legacy UUID session files
     Sessions {
         #[command(subcommand)]
         sessions_command: SessionsCommand,
@@ -258,7 +264,7 @@ fn parse_credential_reference(value: &str) -> std::result::Result<String, String
 
 #[derive(Parser, Debug)]
 enum SessionsCommand {
-    /// List saved sessions
+    /// List leftover legacy UUID session files
     List,
 }
 
@@ -871,9 +877,21 @@ async fn main() -> Result<()> {
     install_panic_handler();
 
     // Parse command-line arguments
-    let args = {
+    let mut args = {
         let _phase = finch::startup::phase(finch::startup::PHASE_ARGS);
         Args::parse()
+    };
+    reject_retired_session_flags(&args)?;
+    // `finch attach NAME` is the canonical REPL entry; take it so the
+    // subcommand match below falls through to interactive mode.
+    let attach_brain = match args.command.take() {
+        Some(Command::Attach { name }) => {
+            Some(finch::brain::BrainStore::validate_name(&name)?.to_string())
+        }
+        other => {
+            args.command = other;
+            None
+        }
     };
     // `Command::Query` is dispatched before the REPL setup below, so preserve
     // this global flag explicitly rather than accidentally dropping it on the
@@ -943,8 +961,9 @@ async fn main() -> Result<()> {
         Some(Command::Brain { brain_command }) => {
             return run_brain_command(brain_command);
         }
-        None => {
-            // Fall through to REPL mode (check for piped input first)
+        Some(Command::Attach { .. }) | None => {
+            // `finch attach NAME` is applied above via `attach_brain`.
+            // Fall through to REPL mode (check for piped input first).
         }
     }
 
@@ -1224,7 +1243,7 @@ async fn main() -> Result<()> {
     // One name identifies the actual home Brain. Explicit names attach by name;
     // generated names include a short uniqueness suffix so a new console cannot
     // silently inherit an old Brain's memory and event history.
-    let brain_name = args.brain.clone().unwrap_or_else(finch::brain::generate);
+    let brain_name = resolve_brain_name(attach_brain, args.brain.clone())?;
 
     let mut repl = {
         let _phase = finch::startup::phase(finch::startup::PHASE_REPL_NEW);
@@ -1238,37 +1257,6 @@ async fn main() -> Result<()> {
         )
         .await
     };
-
-    // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
-    let restore_session = args.restore_session.or_else(|| {
-        args.resume.as_deref().and_then(|uuid| {
-            dirs::home_dir().map(|h| {
-                h.join(".finch")
-                    .join("sessions")
-                    .join(format!("{uuid}.json"))
-            })
-        })
-    });
-
-    // Restore session if requested
-    if let Some(session_path) = restore_session {
-        if session_path.exists() {
-            let _phase = finch::startup::phase(finch::startup::PHASE_SESSION_RESTORE);
-            match ConversationHistory::load(&session_path) {
-                Ok(history) => {
-                    repl.restore_conversation_from(history, &session_path);
-                    if std::env::var("SHAMMAH_DEBUG").is_ok() {
-                        eprintln!("✓ Restored conversation from session");
-                    }
-                }
-                Err(e) => {
-                    if std::env::var("SHAMMAH_DEBUG").is_ok() {
-                        eprintln!("⚠️  Failed to restore session: {}", e);
-                    }
-                }
-            }
-        }
-    }
 
     // Run REPL (with full TUI event loop)
     if std::env::var("SHAMMAH_DEBUG").is_ok() {
@@ -3360,10 +3348,33 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
                 println!("{uuid:<38}  {mtime}");
             }
             println!();
-            println!("Resume with: finch --resume <uuid>");
+            println!(
+                "These are leftover UUID session files, not the current resume model.\n\
+                 Resume a named Brain with: finch attach <brain-name>\n\
+                 Leftover files stay on disk until an explicit import."
+            );
         }
     }
     Ok(())
+}
+
+fn reject_retired_session_flags(args: &Args) -> Result<()> {
+    if args.resume.is_none() && args.restore_session.is_none() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "`--resume` and `--restore-session` are retired. Resume a named Brain with:\n  \
+         finch attach <brain-name>\n\
+         Leftover UUID session files remain in ~/.finch/sessions/ until an explicit import.\n\
+         List them with: finch sessions list"
+    )
+}
+
+fn resolve_brain_name(attach: Option<String>, flag: Option<String>) -> Result<String> {
+    match attach.or(flag) {
+        Some(name) => Ok(finch::brain::BrainStore::validate_name(&name)?.to_string()),
+        None => Ok(finch::brain::generate()),
+    }
 }
 
 /// Handle `finch brain` subcommands against the default on-disk store.
@@ -3464,10 +3475,10 @@ fn remove_named_brain(
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_brain_command, finish_first_run_setup, register_query_vm_tools, Args, AuthCommand,
-        BrainCommand, Command,
+        execute_brain_command, finish_first_run_setup, register_query_vm_tools,
+        reject_retired_session_flags, resolve_brain_name, Args, AuthCommand, BrainCommand, Command,
     };
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::sync::Arc;
 
     #[test]
@@ -4239,6 +4250,111 @@ mod tests {
             error.to_string(),
             "brain name must use 1-64 letters, numbers, '-' or '_'",
             "invalid-name error must use the store's validate_name message"
+        );
+    }
+
+    #[test]
+    fn attach_subcommand_parses_a_brain_name() {
+        let args = Args::try_parse_from(["finch", "attach", "golden-ridge-0771a6"]).unwrap();
+        match args.command {
+            Some(Command::Attach { name }) => assert_eq!(
+                name, "golden-ridge-0771a6",
+                "finch attach NAME must parse the Brain name"
+            ),
+            other => panic!("finch attach NAME must parse as the attach subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn brain_flag_remains_a_hidden_compatibility_alias() {
+        let args = Args::try_parse_from(["finch", "--brain", "golden-ridge-0771a6"]).unwrap();
+        assert_eq!(
+            args.brain.as_deref(),
+            Some("golden-ridge-0771a6"),
+            "--brain NAME must still parse as the compatibility alias"
+        );
+        assert!(
+            args.command.is_none(),
+            "--brain must not be a subcommand, got {:?}",
+            args.command
+        );
+    }
+
+    #[test]
+    fn attach_and_brain_flag_resolve_to_the_same_validated_name() {
+        assert_eq!(
+            resolve_brain_name(Some("golden-ridge-0771a6".into()), None).unwrap(),
+            "golden-ridge-0771a6"
+        );
+        assert_eq!(
+            resolve_brain_name(None, Some("golden-ridge-0771a6".into())).unwrap(),
+            "golden-ridge-0771a6"
+        );
+        assert_eq!(
+            resolve_brain_name(Some("canonical".into()), Some("alias".into())).unwrap(),
+            "canonical",
+            "the attach subcommand is canonical when both are supplied"
+        );
+    }
+
+    #[test]
+    fn hostile_brain_names_are_rejected_before_repl() {
+        for name in ["foo;rm", "foo`id`", "foo\nbar", "\u{1b}[31mred", "foo bar"] {
+            let error = resolve_brain_name(Some(name.into()), None)
+                .expect_err("hostile names must not become resume arguments");
+            assert_eq!(
+                error.to_string(),
+                "brain name must use 1-64 letters, numbers, '-' or '_'",
+                "hostile name {name:?} must fail closed with validate_name's message"
+            );
+        }
+    }
+
+    #[test]
+    fn help_advertises_attach_not_uuid_resume() {
+        let help = Args::command().render_long_help().to_string();
+        assert!(
+            help.contains("attach"),
+            "top-level help must list `attach`, got:\n{help}"
+        );
+        assert!(
+            !help.contains("--resume"),
+            "top-level help must not advertise retired --resume, got:\n{help}"
+        );
+        assert!(
+            !help.contains("--restore-session"),
+            "top-level help must not advertise retired --restore-session, got:\n{help}"
+        );
+        assert!(
+            !help.contains("--brain"),
+            "top-level help must not advertise the hidden --brain alias, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn retired_resume_flags_fail_with_attach_guidance() {
+        let mut args =
+            Args::try_parse_from(["finch", "--resume", "2fdae496-60c2-41b1-a901-857af8f0ed82"])
+                .unwrap();
+        let error = reject_retired_session_flags(&args)
+            .expect_err("retired --resume must not enter the REPL");
+        let message = error.to_string();
+        assert!(
+            message.contains("finch attach"),
+            "the retirement error must name the replacement command, got {message}"
+        );
+        assert!(
+            !message.contains("sessions/<uuid>"),
+            "the retirement error must not teach UUID resume, got {message}"
+        );
+
+        args = Args::try_parse_from(["finch", "--restore-session", "/tmp/old.json"]).unwrap();
+        let error = reject_retired_session_flags(&args)
+            .expect_err("retired --restore-session must not enter the REPL");
+        assert!(
+            error.to_string().contains("finch attach"),
+            "the retirement error must name the replacement command, got {}",
+            error
         );
     }
 }

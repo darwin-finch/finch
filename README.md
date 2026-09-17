@@ -92,6 +92,7 @@ These commands are defined by the current CLI:
 
 ```text
 finch                         interactive terminal UI
+finch attach <name>           resume a named Brain by its canonical event stream
 finch --raw                   interactive line-oriented UI
 finch --cloud-only            skip local-model loading and the daemon
 finch query "explain this"    run one provider-backed query
@@ -127,7 +128,7 @@ The wrapper deletes the temporary store on success or failure and fails if the
 real `~/.finch/brains` manifest changes.
 
 A named Brain keeps one ordered conversation and one persistent typed Lisp/Co-Forth VM across
-multiple terminals and daemon restarts.
+multiple terminals and daemon restarts. Resume it with `finch attach <name>`.
 
 ### Tools and approval
 

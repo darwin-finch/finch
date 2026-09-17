@@ -76,6 +76,21 @@ fn pending_user_texts(pending: &[(String, bool, bool)]) -> Vec<String> {
     pending.iter().map(|(text, _, _)| text.clone()).collect()
 }
 
+/// One labeled resume instruction, or a visible persistence failure.
+///
+/// The Brain argument is the store's validated charset (`1-64` ASCII
+/// letters, numbers, `-`, `_`), so the copyable command cannot inject a
+/// second shell command or a terminal control sequence.
+pub(super) fn interactive_resume_instruction(brain_name: &str, durable: bool) -> String {
+    if !durable {
+        return "This run was not saved as a named Brain and cannot be resumed.".to_string();
+    }
+    match crate::brain::BrainStore::validate_name(brain_name) {
+        Ok(name) => format!("To resume, run: finch attach {name}"),
+        Err(_) => "Brain identity is not a safe resume argument and cannot be printed.".to_string(),
+    }
+}
+
 async fn commit_tool_round_and_continue(
     conversation: &Arc<RwLock<ConversationHistory>>,
     query_id: Uuid,
@@ -394,9 +409,6 @@ pub struct EventLoop {
     /// participant identity is not precise enough for an addressed handoff
     /// between two consoles owned by the same user.
     runner_subject: String,
-
-    /// Stable UUID for this session — assigned at startup, printed on exit.
-    session_uuid: Uuid,
 
     /// Session-cumulative token burn for this Brain. Accumulated from the
     /// usage counts generators already report (`ReplEvent::StatsUpdate`),
@@ -1846,7 +1858,6 @@ impl EventLoop {
             active_persona,
             mode,
             label: session_label,
-            uuid: session_uuid,
         } = session;
         let crate::cli::repl_event::parts::GenerationParts {
             generator: qwen_gen,
@@ -2071,7 +2082,6 @@ impl EventLoop {
             session_label,
             participant_subject,
             runner_subject,
-            session_uuid,
             session_usage,
             session_usage_path,
             session_usage_pricing: crate::cli::usage::ModelPricingTable::empty(),
@@ -2821,6 +2831,12 @@ impl EventLoop {
             }
         }
 
+        // Capture durability before detaching: the resume line must not claim
+        // a Brain that was never attached, and must not use identity after
+        // presence has been released.
+        let resume_line =
+            interactive_resume_instruction(&self.session_label, self.home_brain.is_some());
+
         // Release durable Brain presence before the TUI shuts down. `/quit`
         // reaches this path rather than bypassing cleanup with process::exit.
         self.release_home_brain_presence().await;
@@ -2837,22 +2853,8 @@ impl EventLoop {
             let _ = tui.shutdown();
         }
 
-        // Save conversation to ~/.finch/sessions/<uuid>.json and print the UUID.
-        // The user can resume with: finch --resume <uuid>
         self.checkpoint_session_usage();
-        if let Some(home) = dirs::home_dir() {
-            let sessions_dir = home.join(".finch").join("sessions");
-            if std::fs::create_dir_all(&sessions_dir).is_ok() {
-                let id = self.session_uuid;
-                let path = sessions_dir.join(format!("{id}.json"));
-                let history = self.conversation.read().await.clone();
-                if !history.is_empty() {
-                    if history.save(&path).is_ok() {
-                        println!("\n{id}");
-                    }
-                }
-            }
-        }
+        println!("\n{resume_line}");
 
         Ok(())
     }
@@ -4103,16 +4105,16 @@ impl EventLoop {
     }
 
     fn conversation_checkpoint_path(&self) -> Option<std::path::PathBuf> {
+        // Named Brains are the durable store. ConversationHistory is an
+        // in-memory projection; tests may still point a fixture file here.
         #[cfg(test)]
         {
-            return self.test_conversation_checkpoint.clone();
+            self.test_conversation_checkpoint.clone()
         }
         #[cfg(not(test))]
-        dirs::home_dir().map(|home| {
-            home.join(".finch")
-                .join("sessions")
-                .join(format!("{}.json", self.session_uuid))
-        })
+        {
+            None
+        }
     }
 
     /// Persist the latest committed history after each publication boundary.

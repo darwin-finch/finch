@@ -6053,3 +6053,39 @@ async fn peer_ipc_diagnostics_after_completed_turn_stay_off_transcript_scenario(
         "header/status must still show a compact runner/home recovery hint; header={header:?} status={status:?} haystack={haystack:?}"
     );
 }
+
+#[test]
+fn test_resume_instruction_uses_validated_brain_name() {
+    assert_eq!(
+        super::interactive_resume_instruction("golden-ridge-0771a6", true),
+        "To resume, run: finch attach golden-ridge-0771a6"
+    );
+}
+
+#[test]
+fn test_resume_instruction_fails_closed_without_durable_brain() {
+    let line = super::interactive_resume_instruction("golden-ridge-0771a6", false);
+    assert!(
+        line.contains("cannot be resumed"),
+        "unavailable persistence must not claim resume, got {line}"
+    );
+    assert!(
+        !line.contains("finch attach"),
+        "unavailable persistence must not print an attach command, got {line}"
+    );
+}
+
+#[test]
+fn test_resume_instruction_rejects_hostile_brain_names() {
+    for name in ["evil; rm -rf /", "x`id`", "\u{1b}[31mred", "two words"] {
+        let line = super::interactive_resume_instruction(name, true);
+        assert!(
+            !line.contains("finch attach"),
+            "hostile name {name:?} must not become a copyable command, got {line}"
+        );
+        assert!(
+            !line.contains(';') && !line.contains('`') && !line.contains('\u{1b}'),
+            "hostile name {name:?} must not leak shell or control characters, got {line}"
+        );
+    }
+}

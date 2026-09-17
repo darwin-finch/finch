@@ -101,6 +101,14 @@ hand every process they are responsible for to a launcher that is isolated.
   it stays in the supervisor's owned group; `Session::drop` kills and reaps only
   that child and signals no pid it did not create. The pty is deliberately not
   made a controlling terminal.
+- `tests/named_brain_attach.rs` is the #314 production-boundary attach/resume
+  regression. Help, hostile-name, query-silence, and PTY cases use a
+  disposable tempfile HOME with `use_daemon = false` and
+  `FINCH_BRAIN_TEST_NO_AUTO_SPAWN=1`, close inherited supervisor descriptors,
+  and spawn one plain `Command` child per session so the supervisor still owns
+  the process group. `Session::drop` kills and reaps only that child. The pty
+  is deliberately not made a controlling terminal. Durable Brain
+  reconstruction through a live daemon/IPC attach remains a follow-up.
 - `tests/live.rs` and `tests/live/{impcpd,parity,providers}.rs` are ignored,
   credentialed live-provider tests. They do not construct Brains, and their
   documented invocation still uses `scripts/test_brains.sh` so config/cache
