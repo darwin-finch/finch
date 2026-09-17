@@ -102,6 +102,12 @@ impl Tool for ExcelReadTool {
         "excel_read"
     }
 
+    fn aliases(&self) -> &'static [&'static str] {
+        // GUI accessibility invariant: hyphenated names a blind user can
+        // invoke. `excel-cell` is the single-cell read the invariant names.
+        &["excel-read", "excel-cell"]
+    }
+
     fn effect(&self) -> ExecutionEffect {
         ExecutionEffect::WorkspaceRead
     }
@@ -168,6 +174,10 @@ pub struct ExcelWriteTool;
 impl Tool for ExcelWriteTool {
     fn name(&self) -> &str {
         "excel_write"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["excel-write"]
     }
 
     fn effect(&self) -> ExecutionEffect {
@@ -238,6 +248,10 @@ pub struct ExcelRangeTool;
 impl Tool for ExcelRangeTool {
     fn name(&self) -> &str {
         "excel_range"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["excel-range"]
     }
 
     fn effect(&self) -> ExecutionEffect {
@@ -324,6 +338,10 @@ impl Tool for ExcelFormulaTool {
         "excel_formula"
     }
 
+    fn aliases(&self) -> &'static [&'static str] {
+        &["excel-formula"]
+    }
+
     fn effect(&self) -> ExecutionEffect {
         ExecutionEffect::WorkspaceWrite
     }
@@ -389,6 +407,10 @@ impl Tool for ExcelSheetsTool {
         "excel_sheets"
     }
 
+    fn aliases(&self) -> &'static [&'static str] {
+        &["excel-sheets"]
+    }
+
     fn effect(&self) -> ExecutionEffect {
         ExecutionEffect::WorkspaceRead
     }
@@ -435,6 +457,10 @@ pub struct ExcelActivateTool;
 impl Tool for ExcelActivateTool {
     fn name(&self) -> &str {
         "excel_activate"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["excel-activate"]
     }
 
     fn effect(&self) -> ExecutionEffect {
@@ -521,5 +547,168 @@ mod tests {
     fn test_validate_range_rejects_bad_endpoints() {
         assert!(validate_range("1A:C5").is_err());
         assert!(validate_range("A1:bad").is_err());
+    }
+
+    /// GUI Accessibility invariant (#454): `excel-read`, `excel-write`, and
+    /// `excel-cell` must be names a user/model can invoke on the real registry.
+    /// Address in (`B3`), speakable text out; no pixel coordinates.
+    fn excel_registry() -> crate::tools::ToolRegistry {
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.register(Box::new(ExcelReadTool));
+        registry.register(Box::new(ExcelWriteTool));
+        registry.register(Box::new(ExcelRangeTool));
+        registry.register(Box::new(ExcelFormulaTool));
+        registry.register(Box::new(ExcelSheetsTool));
+        registry.register(Box::new(ExcelActivateTool));
+        registry
+    }
+
+    #[test]
+    fn test_accessibility_invariant_hyphen_names_resolve_on_registry() {
+        let registry = excel_registry();
+        let missing: Vec<&str> = ["excel-read", "excel-write", "excel-cell"]
+            .into_iter()
+            .filter(|name| !registry.has_tool(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "GUI accessibility invariant: hyphenated Excel names must be \
+             registered tool names a user can invoke (address in, speakable \
+             text out). Missing from the real registry: {missing:?}. \
+             Canonical names: {:?}; alias keys: {:?}.",
+            registry.tool_names(),
+            registry.alias_names()
+        );
+    }
+
+    #[test]
+    fn test_excel_read_hyphen_alias_is_single_cell_plain_text_read() {
+        let registry = excel_registry();
+        for name in ["excel-read", "excel-cell"] {
+            let tool = registry.get(name).unwrap_or_else(|| {
+                panic!(
+                    "GUI accessibility invariant: '{name}' must resolve to the \
+                     existing Excel single-cell read; registry names {:?}, \
+                     aliases {:?}",
+                    registry.tool_names(),
+                    registry.alias_names()
+                )
+            });
+            assert_eq!(
+                tool.name(),
+                "excel_read",
+                "'{name}' must alias the existing excel_read tool, not a second \
+                 implementation; resolved name={}",
+                tool.name()
+            );
+            assert_eq!(
+                tool.effect(),
+                ExecutionEffect::WorkspaceRead,
+                "'{name}' must declare WorkspaceRead (cell address in, text out); \
+                 declared {:?}",
+                tool.effect()
+            );
+            assert!(
+                tool.input_schema()
+                    .required
+                    .iter()
+                    .any(|field| field == "cell"),
+                "'{name}' schema must require a cell address (e.g. B3), not \
+                 pixel coordinates; required={:?} properties={}",
+                tool.input_schema().required,
+                tool.input_schema().properties
+            );
+            let properties = &tool.input_schema().properties;
+            assert!(
+                properties.get("x").is_none() && properties.get("y").is_none(),
+                "'{name}' must not accept pixel coordinates; properties={properties}"
+            );
+            let description = tool.description();
+            assert!(
+                description.contains("B3") && description.contains("text"),
+                "'{name}' description must tell a blind user that a cell \
+                 address returns speakable text; description={description:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_excel_write_hyphen_alias_is_single_cell_write() {
+        let registry = excel_registry();
+        let tool = registry.get("excel-write").unwrap_or_else(|| {
+            panic!(
+                "GUI accessibility invariant: 'excel-write' must resolve to the \
+                 existing Excel single-cell write; registry names {:?}, aliases {:?}",
+                registry.tool_names(),
+                registry.alias_names()
+            )
+        });
+        assert_eq!(
+            tool.name(),
+            "excel_write",
+            "excel-write must alias the existing excel_write tool; resolved name={}",
+            tool.name()
+        );
+        assert_eq!(
+            tool.effect(),
+            ExecutionEffect::WorkspaceWrite,
+            "excel-write must declare WorkspaceWrite; declared {:?}",
+            tool.effect()
+        );
+        assert!(
+            tool.input_schema()
+                .required
+                .iter()
+                .any(|field| field == "cell"),
+            "excel-write schema must require a cell address (e.g. B3); \
+             required={:?} properties={}",
+            tool.input_schema().required,
+            tool.input_schema().properties
+        );
+    }
+
+    #[test]
+    fn test_excel_family_hyphen_aliases_stay_consistent() {
+        let registry = excel_registry();
+        for (alias, canonical, effect) in [
+            ("excel-range", "excel_range", ExecutionEffect::WorkspaceRead),
+            (
+                "excel-formula",
+                "excel_formula",
+                ExecutionEffect::WorkspaceWrite,
+            ),
+            (
+                "excel-sheets",
+                "excel_sheets",
+                ExecutionEffect::WorkspaceRead,
+            ),
+            (
+                "excel-activate",
+                "excel_activate",
+                ExecutionEffect::ExternalWrite,
+            ),
+        ] {
+            let tool = registry.get(alias).unwrap_or_else(|| {
+                panic!(
+                    "hyphenated Excel family name '{alias}' must resolve like \
+                     the invariant names; registry names {:?}, aliases {:?}",
+                    registry.tool_names(),
+                    registry.alias_names()
+                )
+            });
+            assert_eq!(
+                tool.name(),
+                canonical,
+                "'{alias}' must alias existing '{canonical}', not a second \
+                 implementation; resolved name={}",
+                tool.name()
+            );
+            assert_eq!(
+                tool.effect(),
+                effect,
+                "'{alias}' declared {:?}, expected {effect:?}",
+                tool.effect()
+            );
+        }
     }
 }

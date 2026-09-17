@@ -501,6 +501,7 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn input_schema(&self) -> ToolInputSchema;
     async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String>;
+    fn aliases(&self) -> &'static [&'static str];
     fn definition(&self) -> ToolDefinition;
 }
 ```
