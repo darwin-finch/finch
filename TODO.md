@@ -160,11 +160,12 @@ still blocks the corresponding Brain phase until it is unified.
   calls execute, and that a `syntax -> syntax` CTFE function plus explicit quote/`splice` matches
   `define-syntax` sugar. Preserve spans and hygiene through every nested quoted form. Diagnostics
   must report user form, pretty-printed expansion, and fault span (SDC mixin style), not blame
-  only the transformer call. No user-facing `eval` or `compile(syntax)` in the language. Mix-back
-  is compile-time `splice` into the module being compiled; loading a payload on a Brain or node
-  invokes the compiler on a compilation unit with granted capabilities. Staging is D-like: CTFE,
-  ordinary `if` when the condition is CTFE-constant (no `static if` keyword), generics instantiated then type-checked, syntax CTFE only where a function would
-  evaluate too early. Add
+  only the transformer call. No user-facing `eval`. Mix-back into a module is compile-time `splice`.
+  Loading a payload invokes the compiler on a compilation unit. Staging is D-like: CTFE, ordinary
+  `if` when the condition is CTFE-constant, generics instantiated then type-checked, syntax CTFE
+  only where a function would evaluate too early. Allow an interned compiler-as-library hatch
+  (LINQ `Expression.Compile` + cache): `syntax`/`type` in, typed callable out, interned by
+  fingerprint×type, first use compiles, later uses call; not per-row tree walking. Add
   normalization conformance fixtures proving that each sugared program and its canonical
   S-expression produce structurally identical `syntax` modulo spelling-specific source origins,
   then identical elaborated HIR/IR. Do not brand or implement the notation as a third language.

@@ -2430,12 +2430,13 @@ versioned specification must state:
 - supported macro phase and hygiene rules;
 - absence or presence of continuations, dynamic scope, multiple values, and reader extensions.
 
-Initially exclude general continuations. There is no user-facing `eval` or `compile(syntax)` that
-runs an arbitrary tree in the current environment. Mix-back of generated syntax is **compile-time
-only** (CTFE, ordinary `if` when the condition is a compile-time constant, generics, `splice` into
-the module being compiled). Shipping a program
-to a node is compiling a **compilation unit** with a granted capability set, not `(eval form)` in
-the language. Add continuations only with a clear typed/effect model.
+Initially exclude general continuations. There is no user-facing `eval` that runs an arbitrary
+tree in the current environment. Mix-back of generated syntax into a **module** is compile-time
+only (CTFE, ordinary `if` when the condition is a compile-time constant, generics, `splice`).
+Shipping a program to a node is compiling a **compilation unit** with a granted capability set.
+The escape hatch below (`interned` compiled callables) is not `eval`: it returns a **function**,
+does not interpret trees per call, and still runs expand/check/verify. Add continuations only
+with a clear typed/effect model.
 
 ### Functions and annotations
 
@@ -2619,8 +2620,25 @@ spanless lists is a string mixin. Fuel, recursion, and allocation limits still a
 
 A Brain or node that **loads** a CoLisp payload compiles it as a compilation unit (expand, check,
 lower, verify) with a granted capability set. That is the compiler invoked by the host, not a
-language `eval`. Generating syntax as data is always allowed; executing it is never ambient and
-never a runtime interpreter of trees in user code.
+language `eval`. Generating syntax as data is always allowed; executing it is never ambient.
+
+**Interned compiled callables (LINQ-style compile cache).** When a mapping or binder is not known
+until runtime (DB row → record, query shape × type), user code may ask the **compiler as a
+library** for a function:
+
+- Input: `syntax` and/or a `type` (and a stable fingerprint of the query/schema), not a string of
+  source.
+- The compiler runs the same expand → check → lower → verify pipeline and returns a **typed
+  callable** (bytecode or JIT).
+- The host **interns** that callable under `(fingerprint, type-id, capability set)`. The first
+  use compiles; later uses are an ordinary call. Per-row work must not re-expand or re-verify.
+- Diagnostics are SDC-style on that compilation (user form / expansion / fault), not a runtime
+  interpreter stack.
+- This is C# `Expression.Compile` plus a cache, not Lisp `eval`. Prefer CTFE/generics when the
+  record type is known at module compile (zero runtime compile). Use the interned hatch when the
+  shape is only known then (ad-hoc query, reflected schema).
+- Capability and fuel apply to **compilation** as well as to the resulting function’s effects.
+  An LLM does not get this hatch unless that Brain is granted it.
 
 Until that kernel exists, `define-syntax` remains a capture-free **template**: substitution
 before type checking, no CTFE body, no capabilities, and no introducing `let` or other binding
