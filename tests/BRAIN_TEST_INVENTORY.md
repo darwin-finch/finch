@@ -102,13 +102,18 @@ hand every process they are responsible for to a launcher that is isolated.
   that child and signals no pid it did not create. The pty is deliberately not
   made a controlling terminal.
 - `tests/named_brain_attach.rs` is the #314 production-boundary attach/resume
-  regression. Help, hostile-name, query-silence, and PTY cases use a
-  disposable tempfile HOME with `use_daemon = false` and
+  regression. Help, hostile-name, retired-flag, query-silence, no-daemon PTY,
+  and durable attach/reattach cases all use a disposable tempfile HOME,
   `FINCH_BRAIN_TEST_NO_AUTO_SPAWN=1`, close inherited supervisor descriptors,
-  and spawn one plain `Command` child per session so the supervisor still owns
-  the process group. `Session::drop` kills and reaps only that child. The pty
-  is deliberately not made a controlling terminal. Durable Brain
-  reconstruction through a live daemon/IPC attach remains a follow-up.
+  and spawn plain `Command` children so the supervisor still owns the process
+  group. `Session::drop` and `IsolatedDaemon::drop` kill and reap only the
+  children they started. The pty is deliberately not made a controlling
+  terminal. No-daemon cases set `use_daemon = false`. The durable case uses a
+  short `/tmp/fa.*` HOME so `~/.finch/daemon.sock` fits `sockaddr_un`, starts
+  one `finch daemon --bind 127.0.0.1:0`, waits for the log to publish the
+  loopback address and for the socket to exist, then runs two isolated PTY
+  `finch attach` children against the same HOME with `auto_spawn = false` and
+  `auto_discover = false`. No child creates a session or process group.
 - `tests/live.rs` and `tests/live/{impcpd,parity,providers}.rs` are ignored,
   credentialed live-provider tests. They do not construct Brains, and their
   documented invocation still uses `scripts/test_brains.sh` so config/cache

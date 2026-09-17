@@ -11,7 +11,6 @@
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
-use uuid::Uuid;
 
 use crate::cli::conversation::ConversationHistory;
 use crate::cli::output_manager::OutputManager;
