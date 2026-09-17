@@ -1785,18 +1785,15 @@ impl Repl {
                 // approval). bash declares its worst case; the read-only
                 // refinement is applied here, at the approval site that
                 // consumes the effect.
-                let declared_effect = self
-                    .tool_executor
-                    .lock()
-                    .await
-                    .registry()
-                    .declared_effect(&tool_use.name);
-                let is_auto_approved = crate::tools::refined_effect_for_approval(
-                    declared_effect,
-                    &tool_use.name,
-                    &tool_use.input,
-                )
-                .runs_autonomously();
+                let is_auto_approved = {
+                    let executor = self.tool_executor.lock().await;
+                    crate::tools::invocation_runs_autonomously(
+                        executor.registry().declared_effect(&tool_use.name),
+                        &tool_use.name,
+                        &tool_use.input,
+                        executor.permissions(),
+                    )
+                };
 
                 // Check if pre-approved in cache
                 let approval_source = self.tool_executor.lock().await.is_approved(&signature);
@@ -3326,6 +3323,7 @@ impl Repl {
                 command: None,
                 args: None,
                 directory: None,
+                ..Default::default()
             };
 
             if pattern.matches(&test_sig) {

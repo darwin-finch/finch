@@ -36,6 +36,16 @@ hard-deny and allow tables are keyed on registered tool names (`PEER_HARD_DENY_T
 tests in this subtree and in `src/cli/repl/always_allow_tests.rs` fail if a policy table names
 anything no `Tool` registers or alias key covers.
 
+**Workspace containment is authority (issue #429).** Path arguments are canonicalised
+(symlinks and `..`) against the workspace root — git root when present, else cwd —
+before Allow, peer silent-allow, or pattern match. Escape is one-shot AskUser; a
+pattern can never satisfy it. `invocation_runs_autonomously` is the auto-approve
+predicate so WorkspaceRead cannot skip the escape dialog. `PathSlot::WorkspaceContained`
+means “any path under the workspace root”, not “any string”. Bash has no path slot.
+`test_dotdot_escape_is_ask_user_not_allow`, `test_symlink_escape_is_ask_user_live_and_dangling`,
+`test_escaped_path_is_not_pattern_admissible_through_approval_path`, and
+`test_star_pattern_does_not_match_escaped_path` pin this.
+
 **Effects are declared, not guessed (issue #466).** Every `Tool` implements `fn effect(&self) ->
 ExecutionEffect` with no default, so a new tool cannot exist without stating its authority and a
 rename carries the declaration with it. There is no string-keyed effect table left in this

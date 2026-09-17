@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 
 use super::executor::ToolSignature;
+use super::permissions::{bash_command_is_constitutionally_denied, resolve_canonical_path};
 
 /// Type of pattern matching to use
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +20,22 @@ pub enum PatternType {
     Regex,
     /// Structured pattern matching (matches command, args, dir separately)
     Structured,
+}
+
+/// Kind of path argument a structured pattern admits.
+///
+/// `WorkspaceContained` is “any path under the workspace root”, not “any
+/// string”. Legacy wildcard/regex patterns default to `Any`; the never-widen
+/// gate still refuses escaped paths at match time for every kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum PathSlot {
+    /// No structured path constraint. Never-widen still applies.
+    #[default]
+    Any,
+    /// Any path under the workspace root.
+    WorkspaceContained,
 }
 
 /// A pattern that can match multiple tool signatures using wildcards or regex
@@ -50,6 +67,9 @@ pub struct ToolPattern {
     /// Pattern to match working directory (e.g., "/home/*/projects", "*")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir_pattern: Option<String>,
+    /// Structured path-argument kind. Defaults to `Any` for stored JSON.
+    #[serde(default)]
+    pub path_slot: PathSlot,
 }
 
 impl ToolPattern {
@@ -85,6 +105,7 @@ impl ToolPattern {
             command_pattern: None,
             args_pattern: None,
             dir_pattern: None,
+            path_slot: PathSlot::Any,
         }
     }
 
@@ -118,6 +139,7 @@ impl ToolPattern {
             command_pattern,
             args_pattern,
             dir_pattern,
+            path_slot: PathSlot::WorkspaceContained,
         }
     }
 
@@ -151,6 +173,17 @@ impl ToolPattern {
     pub fn matches(&self, signature: &ToolSignature) -> bool {
         // Tool name must match
         if self.tool_name != signature.tool_name {
+            return false;
+        }
+
+        // Never widen authority: a pattern cannot admit a command the
+        // one-shot path would Deny, or an escaped path the one-shot path
+        // would AskUser.
+        if !pattern_may_admit(signature) {
+            return false;
+        }
+
+        if self.path_slot == PathSlot::WorkspaceContained && !signature.path_in_workspace {
             return false;
         }
 
@@ -216,10 +249,11 @@ impl ToolPattern {
             }
         }
 
-        // Match directory pattern (if specified)
+        // Match directory pattern (if specified) against a canonicalised path
         if let Some(dir_pattern) = &self.dir_pattern {
             if let Some(dir) = &signature.directory {
-                if !pattern_matches(dir_pattern, dir) {
+                let canonical = canonical_directory(dir);
+                if !pattern_matches(dir_pattern, &canonical) {
                     return false;
                 }
             } else {
@@ -451,6 +485,31 @@ impl PersistentPatternStore {
     }
 }
 
+/// A pattern must not admit anything the one-shot path would Deny or would
+/// AskUser solely because the path escaped the workspace.
+fn pattern_may_admit(signature: &ToolSignature) -> bool {
+    if signature.constitutionally_denied {
+        return false;
+    }
+    if signature.path.is_some() && !signature.path_in_workspace {
+        return false;
+    }
+    if let Some(command) = signature.full_command() {
+        if bash_command_is_constitutionally_denied(&command) {
+            return false;
+        }
+    }
+    true
+}
+
+fn canonical_directory(dir: &str) -> String {
+    let path = Path::new(dir);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    resolve_canonical_path(path, &cwd)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.to_string())
+}
+
 /// Match a pattern against a string using wildcards
 /// Supports:
 /// - `*` for single component wildcard
@@ -601,6 +660,7 @@ mod tests {
             command: Some("cargo".to_string()),
             args: Some("test".to_string()),
             directory: Some("/project".to_string()),
+            ..Default::default()
         };
 
         let sig2 = ToolSignature {
@@ -609,6 +669,7 @@ mod tests {
             command: Some("cargo".to_string()),
             args: Some("build".to_string()),
             directory: Some("/project".to_string()),
+            ..Default::default()
         };
 
         let sig3 = ToolSignature {
@@ -617,6 +678,7 @@ mod tests {
             command: Some("npm".to_string()),
             args: Some("test".to_string()),
             directory: Some("/project".to_string()),
+            ..Default::default()
         };
 
         assert!(pattern.matches(&sig1));
@@ -632,6 +694,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         let approval = ExactApproval::new(sig.clone());
@@ -644,6 +707,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         assert!(!approval.matches(&different_sig));
@@ -659,6 +723,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         // Add pattern
@@ -722,6 +787,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         // Should match specific pattern (0 wildcards) over general (2 wildcards)
@@ -748,6 +814,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         let sig2 = ToolSignature {
@@ -756,6 +823,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         let sig3 = ToolSignature {
@@ -764,6 +832,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         assert!(pattern.matches(&sig1));
@@ -786,6 +855,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         let sig2 = ToolSignature {
@@ -794,6 +864,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         let sig3 = ToolSignature {
@@ -802,6 +873,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         assert!(pattern.matches(&sig1));
@@ -976,6 +1048,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         let sig2 = ToolSignature {
@@ -984,6 +1057,7 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
 
         // Should match test123 but not testABC
@@ -1033,6 +1107,7 @@ mod tests {
             command: Some("cargo".to_string()),
             args: Some("test".to_string()),
             directory: Some("/Users/user/repos/finch".to_string()),
+            ..Default::default()
         };
         assert!(
             pattern.matches(&sig),
@@ -1054,6 +1129,7 @@ mod tests {
             command: None,
             args: None,
             directory: Some("/Users/user/repos/finch".to_string()),
+            ..Default::default()
         };
         assert!(
             pattern.matches(&sig),
@@ -1076,6 +1152,7 @@ mod tests {
             command: Some("cargo".to_string()),
             args: Some("test".to_string()),
             directory: Some("/project".to_string()),
+            ..Default::default()
         };
         assert!(
             !pattern.matches(&sig),
@@ -1097,6 +1174,7 @@ mod tests {
             command: None,
             args: None,
             directory: Some("/Users/user/repos/finch".to_string()),
+            ..Default::default()
         };
         assert!(
             !pattern.matches(&sig),
@@ -1115,10 +1193,127 @@ mod tests {
             command: None,
             args: None,
             directory: None,
+            ..Default::default()
         };
         assert!(
             !pattern.matches(&sig),
             "\"*\" on bash must NOT match a read call"
         );
+    }
+
+    #[test]
+    fn test_star_pattern_does_not_match_escaped_path() {
+        let pattern = ToolPattern::new(
+            "*".to_string(),
+            "read".to_string(),
+            "Allow all reads".to_string(),
+        );
+        let escaped = ToolSignature {
+            tool_name: "read".to_string(),
+            context_key: "reading /etc/passwd".to_string(),
+            path: Some("/etc/passwd".to_string()),
+            path_in_workspace: false,
+            ..Default::default()
+        };
+        assert!(
+            !pattern.matches(&escaped),
+            "invariant: a * grant must not admit an escaped path; pattern would \
+             otherwise widen authority past the one-shot AskUser"
+        );
+
+        let contained = ToolSignature {
+            tool_name: "read".to_string(),
+            context_key: "reading src/main.rs".to_string(),
+            path: Some("src/main.rs".to_string()),
+            path_in_workspace: true,
+            ..Default::default()
+        };
+        assert!(
+            pattern.matches(&contained),
+            "control: workspace-contained paths still match *"
+        );
+    }
+
+    #[test]
+    fn test_structured_path_slot_is_workspace_contained() {
+        let pattern = ToolPattern::new_structured(
+            "read".to_string(),
+            "any workspace path".to_string(),
+            None,
+            None,
+            Some("*".to_string()),
+        );
+        assert_eq!(pattern.path_slot, PathSlot::WorkspaceContained);
+        assert_eq!(pattern.pattern_type, PatternType::Structured);
+
+        let contained = ToolSignature {
+            tool_name: "read".to_string(),
+            context_key: "reading src/lib.rs".to_string(),
+            directory: Some("/project".to_string()),
+            path: Some("src/lib.rs".to_string()),
+            path_in_workspace: true,
+            ..Default::default()
+        };
+        assert!(
+            pattern.matches(&contained),
+            "structured WorkspaceContained admits a workspace path"
+        );
+
+        let escaped = ToolSignature {
+            tool_name: "read".to_string(),
+            context_key: "reading /etc/passwd".to_string(),
+            directory: Some("/project".to_string()),
+            path: Some("/etc/passwd".to_string()),
+            path_in_workspace: false,
+            ..Default::default()
+        };
+        assert!(
+            !pattern.matches(&escaped),
+            "structured WorkspaceContained must not admit an escaped path"
+        );
+    }
+
+    #[test]
+    fn test_pattern_does_not_admit_constitutionally_denied_bash() {
+        let pattern = ToolPattern::new(
+            "*".to_string(),
+            "bash".to_string(),
+            "allow all bash".to_string(),
+        );
+        let denied = ToolSignature {
+            tool_name: "bash".to_string(),
+            context_key: "rm -rf / in /project".to_string(),
+            command: Some("rm".to_string()),
+            args: Some("-rf /".to_string()),
+            directory: Some("/project".to_string()),
+            constitutionally_denied: true,
+            ..Default::default()
+        };
+        assert!(
+            !pattern.matches(&denied),
+            "invariant: a pattern must not admit a constitutionally Denied bash command"
+        );
+    }
+
+    #[test]
+    fn test_path_slot_defaults_on_legacy_json() {
+        let v2 = r#"{
+            "version": 2,
+            "patterns": [
+                {
+                    "id": "legacy",
+                    "pattern": "*",
+                    "tool_name": "read",
+                    "description": "old",
+                    "created_at": "2026-01-30T12:00:00Z",
+                    "match_count": 0
+                }
+            ],
+            "exact_approvals": []
+        }"#;
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), v2).unwrap();
+        let store = PersistentPatternStore::load(temp_file.path()).unwrap();
+        assert_eq!(store.patterns[0].path_slot, PathSlot::Any);
     }
 }

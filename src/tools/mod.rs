@@ -38,10 +38,12 @@ pub use implementations::{
 };
 pub use mcp::{McpClient, McpConnection, McpServerConfig, McpToolDescriptor, TransportType};
 pub use pattern_matcher::ToolPatternMatcher;
-pub use patterns::{ExactApproval, MatchType, PatternType, PersistentPatternStore, ToolPattern};
+pub use patterns::{
+    ExactApproval, MatchType, PathSlot, PatternType, PersistentPatternStore, ToolPattern,
+};
 pub use permissions::{
-    refined_effect_for_approval, PermissionCheck, PermissionManager, PermissionRule,
-    ToolPermissionConfig, PEER_HARD_DENY_TOOLS, PEER_REVIEWED_CHANGESET_TOOLS,
+    invocation_runs_autonomously, refined_effect_for_approval, PermissionCheck, PermissionManager,
+    PermissionRule, ToolPermissionConfig, PEER_HARD_DENY_TOOLS, PEER_REVIEWED_CHANGESET_TOOLS,
     PEER_SILENT_ALLOW_TOOLS, VM_DISCOVERY_TOOLS,
 };
 pub use registry::{Tool, ToolRegistry};
