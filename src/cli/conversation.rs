@@ -118,9 +118,16 @@ impl ConversationHistory {
 
     /// Add a user message to the conversation
     pub fn add_user_message(&mut self, content: String) {
+        self.add_user_message_with_content(vec![ContentBlock::Text { text: content }]);
+    }
+
+    /// Add a user message from already-assembled content blocks.
+    ///
+    /// Mention attachments are extra text blocks after the visible prompt.
+    pub fn add_user_message_with_content(&mut self, content: Vec<ContentBlock>) {
         self.messages.push(Message {
             role: "user".to_string(),
-            content: vec![ContentBlock::Text { text: content }],
+            content,
         });
         self.trim_if_needed();
     }

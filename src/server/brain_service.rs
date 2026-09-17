@@ -1624,6 +1624,7 @@ mod tests {
                         connection_id,
                         BrainEventKind::Prompt {
                             text: "second".into(),
+                            attached_mentions: Vec::new(),
                         },
                     )
                     .await
@@ -1907,6 +1908,7 @@ mod tests {
                 "alice",
                 BrainEventKind::Prompt {
                     text: "hold one effect".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();
@@ -2021,6 +2023,7 @@ mod tests {
                 "alice",
                 BrainEventKind::Prompt {
                     text: "keep working".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();
@@ -2115,6 +2118,7 @@ mod tests {
                 "alice",
                 BrainEventKind::Prompt {
                     text: "delegate this".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();
@@ -2561,6 +2565,7 @@ mod tests {
                 connection_id,
                 BrainEventKind::Prompt {
                     text: "inspect the queue".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .await

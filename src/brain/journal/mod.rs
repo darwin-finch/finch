@@ -71,6 +71,29 @@ pub struct BrainApprovalDecisionReservation {
     pub replayed: bool,
 }
 
+/// Path + digest + payload for one `@` mention attached to a Prompt.
+///
+/// Replay and named-Brain restart must use `content` and `sha256` from this
+/// record. They must not reread the project file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptAttachment {
+    /// Project-relative path using `/` separators.
+    pub path: String,
+    /// `"file"` or `"directory"`.
+    pub kind: String,
+    /// Hex SHA-256 of `content`.
+    pub sha256: String,
+    /// Attached payload size in bytes.
+    pub byte_len: u64,
+    /// True when a directory expansion named a budget truncation.
+    pub truncated: bool,
+    /// Speakable truncation or skip note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_note: Option<String>,
+    /// Exact attached UTF-8 contents.
+    pub content: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrainEventKind {
@@ -118,6 +141,10 @@ pub enum BrainEventKind {
     },
     Prompt {
         text: String,
+        /// File/directory mention snapshots supplied with this turn. Empty on
+        /// legacy events; replay must use these bytes, not a later disk read.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attached_mentions: Vec<PromptAttachment>,
     },
     /// An explicitly requested helper turn. Its transcript is durable and
     /// inspectable, but is never injected into later interactive context.

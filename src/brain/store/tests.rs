@@ -188,6 +188,7 @@ fn test_list_summaries_unhydrated_reports_turns_attachments_agents_and_size() {
             "alice",
             BrainEventKind::Prompt {
                 text: "hello".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -197,6 +198,7 @@ fn test_list_summaries_unhydrated_reports_turns_attachments_agents_and_size() {
             "alice",
             BrainEventKind::Prompt {
                 text: "again".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -602,7 +604,10 @@ fn journal_event(brain_id: BrainId, seq: u64, text: &str) -> BrainEvent {
         created_ms: seq,
         run_id: None,
         mutation: None,
-        kind: BrainEventKind::Prompt { text: text.into() },
+        kind: BrainEventKind::Prompt {
+            text: text.into(),
+            attached_mentions: Vec::new(),
+        },
     }
 }
 
@@ -660,6 +665,7 @@ fn restart_ignores_torn_batch_tail() {
             "alice",
             BrainEventKind::Prompt {
                 text: "after recovery".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -705,6 +711,7 @@ fn mutation_receipt_replays_from_the_canonical_log_after_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "once".into(),
+                attached_mentions: Vec::new(),
             },
             receipt.clone(),
         )
@@ -719,6 +726,7 @@ fn mutation_receipt_replays_from_the_canonical_log_after_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "once".into(),
+                attached_mentions: Vec::new(),
             },
             receipt,
         )
@@ -740,6 +748,7 @@ fn executable_mutation_and_run_replay_from_one_record_after_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "once".into(),
+                attached_mentions: Vec::new(),
             },
             receipt.clone(),
             attachment,
@@ -761,6 +770,7 @@ fn executable_mutation_and_run_replay_from_one_record_after_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "once".into(),
+                attached_mentions: Vec::new(),
             },
             receipt,
             attachment,
@@ -786,6 +796,7 @@ fn mutation_receipt_rejects_stale_revision_and_fingerprint_reuse() {
             "alice",
             BrainEventKind::Prompt {
                 text: "once".into(),
+                attached_mentions: Vec::new(),
             },
             mutation_receipt(
                 &store,
@@ -802,6 +813,7 @@ fn mutation_receipt_rejects_stale_revision_and_fingerprint_reuse() {
         "alice",
         BrainEventKind::Prompt {
             text: "forged".into(),
+            attached_mentions: Vec::new(),
         },
         mutation_receipt(
             &store,
@@ -821,6 +833,7 @@ fn mutation_receipt_rejects_stale_revision_and_fingerprint_reuse() {
         "alice",
         BrainEventKind::Prompt {
             text: "once".into(),
+            attached_mentions: Vec::new(),
         },
         mutation_receipt(
             &store,
@@ -847,7 +860,8 @@ fn mutation_receipt_rejects_stale_revision_and_fingerprint_reuse() {
             "shared",
             "alice",
             BrainEventKind::Prompt {
-                text: "once".into()
+                text: "once".into(),
+                attached_mentions: Vec::new(),
             },
             changed_environment,
         )
@@ -860,6 +874,7 @@ fn mutation_receipt_rejects_stale_revision_and_fingerprint_reuse() {
         "alice",
         BrainEventKind::Prompt {
             text: "stale".into(),
+            attached_mentions: Vec::new(),
         },
         mutation_receipt(
             &store,
@@ -2507,6 +2522,7 @@ fn run_lifecycle_is_event_sourced_and_terminal_state_is_final() {
             "alice",
             BrainEventKind::Prompt {
                 text: "inspect".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -2569,6 +2585,7 @@ fn explicit_cancel_racing_disconnect_never_publishes_result_after_terminal() {
             "alice",
             BrainEventKind::Prompt {
                 text: "race".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -2656,6 +2673,7 @@ fn disconnect_terminal_batch_is_all_or_nothing_across_failure_and_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "crash".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -2746,6 +2764,7 @@ async fn disconnect_terminal_retry_owner_survives_extended_transient_failure() {
             "alice",
             BrainEventKind::Prompt {
                 text: "retry".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -2846,6 +2865,7 @@ fn restart_ignores_newline_terminated_batch_with_invalid_checksum() {
             "alice",
             BrainEventKind::Prompt {
                 text: "committed".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -2954,6 +2974,7 @@ fn run_ancestry_is_validated_and_survives_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "parent".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -2973,6 +2994,7 @@ fn run_ancestry_is_validated_and_survives_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "child".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -3059,6 +3081,7 @@ fn restart_interrupts_started_runs_without_replaying_queued_runs() {
             "alice",
             BrainEventKind::Prompt {
                 text: "started".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -3078,6 +3101,7 @@ fn restart_interrupts_started_runs_without_replaying_queued_runs() {
             "alice",
             BrainEventKind::Prompt {
                 text: "queued".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -3145,6 +3169,7 @@ fn program_stack_is_rebuilt_from_the_event_log() {
             "bob",
             BrainEventKind::Prompt {
                 text: "explain that".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -3309,7 +3334,10 @@ fn subscribers_receive_the_authoritative_sequence() {
         .push(
             "brain",
             "alice",
-            BrainEventKind::Prompt { text: "hi".into() },
+            BrainEventKind::Prompt {
+                text: "hi".into(),
+                attached_mentions: Vec::new(),
+            },
         )
         .unwrap();
     assert_eq!(first.try_recv().unwrap(), event);
@@ -4059,6 +4087,7 @@ fn substantive_brain_survives_after_every_participant_leaves() {
             "alice",
             BrainEventKind::Prompt {
                 text: "remember this".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -4082,7 +4111,7 @@ fn substantive_brain_survives_after_every_participant_leaves() {
         .events
         .iter()
         .any(|event| {
-            matches!(&event.kind, BrainEventKind::Prompt { text } if text == "remember this")
+            matches!(&event.kind, BrainEventKind::Prompt { text, .. } if text == "remember this")
         }));
 }
 
@@ -4144,6 +4173,7 @@ fn legacy_events_are_projected_into_the_persisted_brain_identity() {
             "bob",
             BrainEventKind::Prompt {
                 text: "again".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -4878,6 +4908,7 @@ async fn accepted_noop_mutations_consume_their_uuid_with_typed_outcomes() {
             "alice",
             BrainEventKind::Prompt {
                 text: "queued".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -4980,6 +5011,7 @@ async fn run_cancellation_recovers_each_persisted_crash_boundary() {
                 "alice",
                 BrainEventKind::Prompt {
                     text: "cancel me".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();
@@ -5093,6 +5125,7 @@ async fn reserved_cancellation_restart_retries_until_durable_terminal() {
             "alice",
             BrainEventKind::Prompt {
                 text: "cancel me".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -5200,7 +5233,14 @@ fn archive_removes_a_brain_but_preserves_its_log() {
     let root = temp.path().join("brains");
     let store = BrainStore::with_root("box.local", Some(root.clone()));
     store
-        .push("old", "alice", BrainEventKind::Prompt { text: "hi".into() })
+        .push(
+            "old",
+            "alice",
+            BrainEventKind::Prompt {
+                text: "hi".into(),
+                attached_mentions: Vec::new(),
+            },
+        )
         .unwrap();
     let retained_runtime = store.program_runtime("old").unwrap();
     retained_runtime
@@ -5459,6 +5499,7 @@ async fn frontend_replacement_reacquires_the_same_durable_brain() {
             "developer",
             BrainEventKind::Prompt {
                 text: "continue the self-upgrade goal".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -5507,7 +5548,7 @@ async fn frontend_replacement_reacquires_the_same_durable_brain() {
     assert!(snapshot.events.iter().any(|event| {
         matches!(
             &event.kind,
-            BrainEventKind::Prompt { text }
+            BrainEventKind::Prompt { text, .. }
                 if text == "continue the self-upgrade goal"
         )
     }));
@@ -5993,7 +6034,10 @@ fn environment_binds_machine_and_workspace_as_one_revision() {
         .push(
             "project",
             "laptop.local",
-            BrainEventKind::Prompt { text: "go".into() },
+            BrainEventKind::Prompt {
+                text: "go".into(),
+                attached_mentions: Vec::new(),
+            },
         )
         .unwrap();
     let snapshot = store.snapshot("project").unwrap();
@@ -6042,6 +6086,7 @@ fn audit_run_fixture(
             "alice",
             BrainEventKind::Prompt {
                 text: "effect".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -6568,6 +6613,7 @@ fn test_effect_audit_batch_past_byte_bound_commits_nothing_and_holds_the_sequenc
             "alice",
             BrainEventKind::Prompt {
                 text: "after refusal".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -6647,6 +6693,7 @@ fn test_effect_audit_bound_refusal_does_not_reuse_a_seq_across_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "after refusal".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -6831,6 +6878,7 @@ fn test_effect_audit_single_append_past_byte_bound_commits_nothing_and_holds_the
             "alice",
             BrainEventKind::Prompt {
                 text: "after refusal".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -6911,6 +6959,7 @@ fn test_effect_audit_late_pre_commit_failure_holds_sequence_across_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "after late failure".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -7161,7 +7210,10 @@ fn future_effect_audit_schema_fails_closed() {
         .push(
             "future-audit",
             "alice",
-            BrainEventKind::Prompt { text: "hi".into() },
+            BrainEventKind::Prompt {
+                text: "hi".into(),
+                attached_mentions: Vec::new(),
+            },
         )
         .unwrap();
     drop(store);
@@ -7257,6 +7309,7 @@ fn test_late_completion_after_cancel_leaves_run_cancelled() {
             "alice",
             BrainEventKind::Prompt {
                 text: "late".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -7316,6 +7369,7 @@ fn test_late_completion_after_cancel_survives_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "persist".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -7435,6 +7489,7 @@ fn test_replay_mutation_is_stable_across_store_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "hello".into(),
+                attached_mentions: Vec::new(),
             },
             receipt.clone(),
         )
@@ -7445,6 +7500,7 @@ fn test_replay_mutation_is_stable_across_store_restart() {
             "alice",
             BrainEventKind::Prompt {
                 text: "hello".into(),
+                attached_mentions: Vec::new(),
             },
             receipt.clone(),
         )

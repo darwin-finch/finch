@@ -113,7 +113,7 @@ pub fn uptime_seconds_from_health_json(value: &serde_json::Value) -> u64 { … }
 /// Default path for the IPC Unix domain socket.
 pub const DAEMON_SOCK_PATH: &str = "~/.finch/daemon.sock";
 /// Compatibility generation for the frontend/daemon Cap'n Proto contract.
-pub const IPC_PROTOCOL_VERSION: u32 = 9;
+pub const IPC_PROTOCOL_VERSION: u32 = 10;
 ```
 
 ## Modules

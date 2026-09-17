@@ -35,6 +35,8 @@ impl EventJournal {
     pub fn root(&self) -> Option<&Path>;
 }
 pub struct JournalProjection { … }
+/// Path + digest + payload for one `@` mention attached to a Prompt.
+pub struct PromptAttachment { … }
 ```
 
 ## Functions

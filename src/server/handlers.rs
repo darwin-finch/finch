@@ -776,7 +776,7 @@ fn committed_named_brain_memory_pair(
             (event.seq == run.request_seq)
                 .then_some(&event.kind)
                 .and_then(|kind| match kind {
-                    BrainEventKind::Prompt { text } => Some(text.clone()),
+                    BrainEventKind::Prompt { text, .. } => Some(text.clone()),
                     _ => None,
                 })
         })
@@ -1458,15 +1458,46 @@ fn named_brain_provider_messages_at(
         .rev()
         .flat_map(|event| match &event.kind {
             BrainEventKind::SpeculativePrompt { .. } => Vec::new(),
-            BrainEventKind::Prompt { text } => {
+            BrainEventKind::Prompt {
+                text,
+                attached_mentions,
+            } => {
                 let prompt = format!("[{}]\n{text}", event.sender);
-                vec![Message::user(
-                    task_context
-                        .as_ref()
-                        .filter(|_| event.seq == request_seq)
-                        .map(|context| format!("{context}\n\n{prompt}"))
-                        .unwrap_or(prompt),
-                )]
+                let prompt = task_context
+                    .as_ref()
+                    .filter(|_| event.seq == request_seq)
+                    .map(|context| format!("{context}\n\n{prompt}"))
+                    .unwrap_or(prompt);
+                if attached_mentions.is_empty() {
+                    vec![Message::user(prompt)]
+                } else {
+                    let bodies: Vec<crate::context::mention::AttachmentBody<'_>> =
+                        attached_mentions
+                            .iter()
+                            .map(|attachment| crate::context::mention::AttachmentBody {
+                                relative_path: &attachment.path,
+                                kind: if attachment.kind == "directory" {
+                                    crate::context::mention::MentionKind::Directory
+                                } else {
+                                    crate::context::mention::MentionKind::File
+                                },
+                                sha256: &attachment.sha256,
+                                byte_len: attachment.byte_len,
+                                truncated: attachment.truncated,
+                                truncation_note: attachment.truncation_note.as_deref(),
+                                content: &attachment.content,
+                            })
+                            .collect();
+                    vec![crate::providers::Message {
+                        role: "user".to_string(),
+                        content: vec![
+                            crate::providers::ContentBlock::text(prompt),
+                            crate::providers::ContentBlock::text(
+                                crate::context::mention::format_attachment_document(&bodies),
+                            ),
+                        ],
+                    }]
+                }
             }
             BrainEventKind::ParticipantMessage { text } => {
                 vec![Message::user(format!(

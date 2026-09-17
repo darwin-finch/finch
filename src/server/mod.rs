@@ -1885,6 +1885,7 @@ mod tests {
                 "isolation-test",
                 crate::brain::BrainEventKind::Prompt {
                     text: "boundary proof".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();
@@ -1988,6 +1989,7 @@ mod tests {
                 "containment-test",
                 crate::brain::BrainEventKind::Prompt {
                     text: "descriptor-pinned write".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();

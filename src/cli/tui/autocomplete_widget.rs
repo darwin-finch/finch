@@ -1,15 +1,25 @@
-//! Slash-command completion state and raw-mode pane rendering.
+//! Slash-command and `@`-mention completion state and raw-mode pane rendering.
 
 use crate::cli::command_autocomplete::CommandSpec;
+use crate::context::mention::MentionCandidate;
 
 /// Maximum number of autocomplete suggestions to show at once
 pub(crate) const MAX_VISIBLE_SUGGESTIONS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CompletionMode {
+    #[default]
+    Commands,
+    Mentions,
+}
 
 /// Autocomplete state for TUI rendering
 #[derive(Debug, Clone, Default)]
 pub struct AutocompleteState {
     /// Matched commands from registry
     pub matches: Vec<CommandSpec>,
+    mention_matches: Vec<MentionCandidate>,
+    mode: CompletionMode,
     /// Currently selected index (for up/down navigation)
     pub selected_index: usize,
     /// First match shown in the viewport. Kept in sync with selection.
@@ -18,6 +28,8 @@ pub struct AutocompleteState {
     pub visible: bool,
     /// Rows emitted by the most recent production raw-frame draw.
     rendered_rows: usize,
+    /// Last speakable mention-resolution error, if any.
+    mention_error: Option<String>,
 }
 
 impl AutocompleteState {
@@ -30,6 +42,9 @@ impl AutocompleteState {
         let selected = self
             .get_selected()
             .map(|command| (command.name, command.params));
+        self.mode = CompletionMode::Commands;
+        self.mention_matches.clear();
+        self.mention_error = None;
         self.matches = matches;
         self.visible = !self.matches.is_empty();
         self.rendered_rows = 0;
@@ -43,19 +58,68 @@ impl AutocompleteState {
         self.ensure_selection_visible(MAX_VISIBLE_SUGGESTIONS);
     }
 
+    /// Show project-file mention candidates. Selection identity is the relative path.
+    pub fn show_mentions(&mut self, matches: Vec<MentionCandidate>) {
+        let selected = self
+            .get_selected_mention()
+            .map(|candidate| candidate.relative_path.clone());
+        self.mode = CompletionMode::Mentions;
+        self.matches.clear();
+        self.mention_matches = matches;
+        self.visible = !self.mention_matches.is_empty();
+        self.rendered_rows = 0;
+        self.selected_index = selected
+            .and_then(|path| {
+                self.mention_matches
+                    .iter()
+                    .position(|candidate| candidate.relative_path == path)
+            })
+            .unwrap_or(0);
+        self.ensure_selection_visible(MAX_VISIBLE_SUGGESTIONS);
+    }
+
+    /// Record a speakable mention-resolution failure for the next pane draw.
+    pub(crate) fn set_mention_error(&mut self, message: impl Into<String>) {
+        self.mention_error = Some(message.into());
+        self.visible = true;
+    }
+
     /// Hide the dropdown
     pub fn hide(&mut self) {
         self.visible = false;
         self.matches.clear();
+        self.mention_matches.clear();
+        self.mention_error = None;
+        self.mode = CompletionMode::Commands;
         self.selected_index = 0;
         self.first_visible = 0;
         self.rendered_rows = 0;
     }
 
+    /// Whether the painted pane is offering `@` mention rows.
+    pub(crate) fn is_mention_mode(&self) -> bool {
+        self.mode == CompletionMode::Mentions
+    }
+
     /// Get the currently selected command (if any)
     pub fn get_selected(&self) -> Option<&CommandSpec> {
-        if self.visible && self.selected_index < self.matches.len() {
+        if self.mode == CompletionMode::Commands
+            && self.visible
+            && self.selected_index < self.matches.len()
+        {
             Some(&self.matches[self.selected_index])
+        } else {
+            None
+        }
+    }
+
+    /// Selected mention row, when the mention pane is showing.
+    pub fn get_selected_mention(&self) -> Option<&MentionCandidate> {
+        if self.mode == CompletionMode::Mentions
+            && self.visible
+            && self.selected_index < self.mention_matches.len()
+        {
+            Some(&self.mention_matches[self.selected_index])
         } else {
             None
         }
@@ -75,9 +139,10 @@ impl AutocompleteState {
 
     /// Move selection up (wraps around)
     pub fn select_previous(&mut self) {
-        if !self.matches.is_empty() {
+        let len = self.row_count();
+        if len > 0 {
             if self.selected_index == 0 {
-                self.selected_index = self.matches.len() - 1;
+                self.selected_index = len - 1;
             } else {
                 self.selected_index -= 1;
             }
@@ -87,15 +152,17 @@ impl AutocompleteState {
 
     /// Move selection down (wraps around)
     pub fn select_next(&mut self) {
-        if !self.matches.is_empty() {
-            self.selected_index = (self.selected_index + 1) % self.matches.len();
+        let len = self.row_count();
+        if len > 0 {
+            self.selected_index = (self.selected_index + 1) % len;
         }
         self.ensure_selection_visible(MAX_VISIBLE_SUGGESTIONS);
     }
 
     /// Keep the selected row inside a viewport of `visible_rows` suggestions.
     pub fn ensure_selection_visible(&mut self, visible_rows: usize) {
-        if visible_rows == 0 || self.matches.is_empty() {
+        let len = self.row_count();
+        if visible_rows == 0 || len == 0 {
             self.first_visible = 0;
             return;
         }
@@ -104,9 +171,14 @@ impl AutocompleteState {
         } else if self.selected_index >= self.first_visible + visible_rows {
             self.first_visible = self.selected_index + 1 - visible_rows;
         }
-        self.first_visible = self
-            .first_visible
-            .min(self.matches.len().saturating_sub(visible_rows));
+        self.first_visible = self.first_visible.min(len.saturating_sub(visible_rows));
+    }
+
+    fn row_count(&self) -> usize {
+        match self.mode {
+            CompletionMode::Commands => self.matches.len(),
+            CompletionMode::Mentions => self.mention_matches.len(),
+        }
     }
 }
 
@@ -120,9 +192,18 @@ pub(crate) fn completion_pane_lines(
     width: usize,
     row_budget: usize,
 ) -> Vec<String> {
-    if !state.visible || state.matches.is_empty() || width == 0 || row_budget == 0 {
+    let row_count = state.row_count();
+    if !state.visible
+        || (row_count == 0 && state.mention_error.is_none())
+        || width == 0
+        || row_budget == 0
+    {
         state.rendered_rows = 0;
         return Vec::new();
+    }
+
+    if state.mode == CompletionMode::Mentions {
+        return mention_pane_lines(state, width, row_budget);
     }
 
     let suggestion_rows = if row_budget == 1 {
@@ -155,6 +236,56 @@ pub(crate) fn completion_pane_lines(
             command.full_syntax(),
             command.description
         );
+        lines.push(fit_line(&line, width));
+    }
+    state.rendered_rows = lines.len();
+    lines
+}
+
+fn mention_pane_lines(
+    state: &mut AutocompleteState,
+    width: usize,
+    row_budget: usize,
+) -> Vec<String> {
+    let suggestion_rows = if row_budget == 1 {
+        1
+    } else {
+        (row_budget - 1).min(MAX_VISIBLE_SUGGESTIONS)
+    };
+    state.ensure_selection_visible(suggestion_rows);
+    let end = (state.first_visible + suggestion_rows).min(state.mention_matches.len());
+    let mut lines = Vec::new();
+    if row_budget > 1 {
+        let remaining = state.mention_matches.len().saturating_sub(end);
+        let heading = if let Some(error) = state.mention_error.as_deref() {
+            error.to_string()
+        } else if state.mention_matches.is_empty() {
+            "No project files match this @ mention  Esc cancel".to_string()
+        } else {
+            format!(
+                "Files {}-{} of {} ({remaining} more)  Up/Down select, Tab or Enter insert, Esc cancel",
+                state.first_visible + 1,
+                end.max(state.first_visible),
+                state.mention_matches.len()
+            )
+        };
+        lines.push(fit_line(&heading, width));
+        if lines.len() >= row_budget {
+            state.rendered_rows = lines.len();
+            return lines;
+        }
+    }
+    for index in state.first_visible..end {
+        if lines.len() >= row_budget {
+            break;
+        }
+        let candidate = &state.mention_matches[index];
+        let marker = if index == state.selected_index {
+            ">"
+        } else {
+            " "
+        };
+        let line = format!("{marker} {}", candidate.speakable_row());
         lines.push(fit_line(&line, width));
     }
     state.rendered_rows = lines.len();
@@ -198,6 +329,23 @@ pub(crate) fn replace_command_prefix(
     let suffix = first.chars().skip(cursor_col).collect::<String>();
     *first = format!("{command_name}{suffix}");
     Some((replaced, (0, command_name.chars().count())))
+}
+
+pub(crate) fn replace_mention_prefix(
+    lines: &[String],
+    cursor: (usize, usize),
+    token: &str,
+) -> Option<(Vec<String>, (usize, usize))> {
+    let (cursor_row, cursor_col) = cursor;
+    let line = lines.get(cursor_row)?;
+    let (at_offset, _) = crate::context::mention::mention_query_at(line, cursor_col)?;
+    let at_chars = line[..at_offset].chars().count();
+    let prefix: String = line.chars().take(at_chars).collect();
+    let suffix: String = line.chars().skip(cursor_col).collect();
+    let mut replaced = lines.to_vec();
+    replaced[cursor_row] = format!("{prefix}{token}{suffix}");
+    let new_col = prefix.chars().count() + token.chars().count();
+    Some((replaced, (cursor_row, new_col)))
 }
 
 #[cfg(test)]

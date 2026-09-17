@@ -2006,7 +2006,7 @@ mod tests {
 
     #[test]
     fn mixed_ipc_generations_reject_before_query_or_stream_use() {
-        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 9);
+        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 10);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2025,7 +2025,7 @@ mod tests {
                 "ping must name the leftover daemon generation; error={error}"
             );
             assert!(
-                error.contains("protocol 9"),
+                error.contains("protocol 10"),
                 "ping must name this Finch generation; error={error}"
             );
             assert!(
@@ -2457,6 +2457,7 @@ mod tests {
                     &attachment,
                     crate::brain::BrainEventKind::Prompt {
                         text: "queue this smoke-test turn".into(),
+                        attached_mentions: Vec::new(),
                     },
                 )
                 .await

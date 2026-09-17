@@ -29,6 +29,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
                 "alice",
                 crate::brain::BrainEventKind::Prompt {
                     text: "effect".into(),
+                    attached_mentions: Vec::new(),
                 },
             )
             .unwrap();
@@ -710,6 +711,7 @@ async fn raw_effect_eof_states(
             "alice",
             crate::brain::BrainEventKind::Prompt {
                 text: "effect eof".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -802,6 +804,7 @@ async fn partial_frame_connection_teardown_fixture(
             "alice",
             crate::brain::BrainEventKind::Prompt {
                 text: "partial frame".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -1005,6 +1008,7 @@ async fn effect_audit_connection_teardown_closes_admission_and_drains_pre_snapsh
                     "alice",
                     crate::brain::BrainEventKind::Prompt {
                         text: "queued teardown race".into(),
+                        attached_mentions: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -1188,6 +1192,7 @@ async fn raw_normal_effect_state(
             "alice",
             crate::brain::BrainEventKind::Prompt {
                 text: "normal effect".into(),
+                attached_mentions: Vec::new(),
             },
         )
         .unwrap();
@@ -1465,6 +1470,7 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                             &submit_attachment,
                             crate::brain::BrainEventKind::Prompt {
                                 text: "apply one provider effect".into(),
+                                attached_mentions: Vec::new(),
                             },
                         )
                         .await

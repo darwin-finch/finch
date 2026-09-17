@@ -47,8 +47,10 @@ read is still reported as too large.
 
 ## Not yet supported
 
-- `@path` imports are not expanded. Because `AGENTS.md` is read directly, a `CLAUDE.md` that
-  contains `@AGENTS.md` still gets the rules once, plus a literal line.
+- `@path` imports inside instruction files are not expanded. Because `AGENTS.md` is read
+  directly, a `CLAUDE.md` that contains `@AGENTS.md` still gets the rules once, plus a
+  literal line. Composer `@` mentions are a separate path (`mention.rs`) and do not change
+  this instruction-file contract.
 - Local override files (`CLAUDE.local.md`, `AGENTS.override.md`, and similar) are not read.
 - Only the working directory's ancestor chain is read; files in other subdirectories are not
   discovered on demand. Start Finch inside a subdirectory to load its instructions.

@@ -141,7 +141,7 @@ pub(super) async fn dispatch_named_brain_run(
                 Err(error) => Err(error),
             }
         }
-        BrainEventKind::Prompt { text } | BrainEventKind::SpeculativePrompt { text } => {
+        BrainEventKind::Prompt { text, .. } | BrainEventKind::SpeculativePrompt { text } => {
             match snapshot
                 .attachments
                 .iter()

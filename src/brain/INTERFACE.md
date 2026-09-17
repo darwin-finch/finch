@@ -244,6 +244,8 @@ impl IsolatedTestProof {
 pub(crate) struct IsolatedTestSocketIdentity { … }
 /// Re-exported from `brain::schedule`.
 pub enum ProgramLanguage { Forth, Lisp }
+/// Path + digest + payload for one `@` mention attached to a Prompt. Re-exported from `brain::journal`.
+pub struct PromptAttachment { … }
 /// Dynamic node information returned only after Brain-scoped authentication.
 pub struct RemoteBrainCapabilities { … }
 pub struct RemoteBrainClient { … }

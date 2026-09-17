@@ -1014,6 +1014,7 @@ impl BrainStore {
                     mutation: None,
                     kind: BrainEventKind::Prompt {
                         text: "seed".into(),
+                        attached_mentions: Vec::new(),
                     },
                 },
             )?;
