@@ -5,5 +5,7 @@
 //! modules except through independent verification.
 
 mod compiler;
+mod lexicon;
 
-pub use compiler::{compile_forth, compile_forth_with_functions};
+pub use compiler::{compile_forth, compile_forth_with_functions, read_forth_source};
+pub use lexicon::{forth_lexicon, forth_word_terminator, ForthLexicon, ForthStringOpener};

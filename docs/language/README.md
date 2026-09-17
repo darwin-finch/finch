@@ -16,6 +16,9 @@ Documentation follows the same semantic waist as the workspace:
   submits the shared construction protocol. It does not own typed-stack-IR lowering.
 - `crates/finch-coforth/docs/` owns implemented Co-Forth reader grammar and the same
   construction-protocol submission. It does not own typed-stack-IR lowering.
+- `vocabulary/language/wire.gbnf` is the published compact-wire complete-response
+  grammar, generated from those reader lexicons. It is not the submission envelope
+  (`schema.json`) and is not a proof of semantic safety.
 - `crates/finch-vm-core/docs/` owns implemented typed-IR schema, verifier contracts, diagnostics,
   and versioning details.
 - `crates/finch-vm/docs/` owns implemented interpreter, fiber, checkpoint, and execution semantics.

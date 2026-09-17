@@ -2,14 +2,17 @@
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `crates/finch-coforth/src/`: the Co-Forth source parser, syntax tree, and
-translation into the shared semantic-construction protocol. It owns no verifier,
-interpreter, runtime, fiber scheduler, checkpoint codec, or CoLisp behavior. It does
-not mint `ModuleVerified` certificates except by calling the shared certify pipeline.
+**Owns** `crates/finch-coforth/src/`: the Co-Forth source parser, syntax tree, the
+reader lexicon used by the published compact-wire grammar, syntactic completeness
+(`read_forth_source`), and translation into the shared semantic-construction protocol.
+It owns no verifier, interpreter, runtime, fiber scheduler, checkpoint codec, or
+CoLisp behavior. It does not mint `ModuleVerified` certificates except by calling the
+shared certify pipeline.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`. The facade exports
-only the two source-compilation entry points. Application callers continue to use the compatible
-`finch-vm` facade rather than depending on this unpublished crate directly.
+the two source-compilation entry points, `read_forth_source` (syntactic completeness), and the
+reader lexicon used by the published compact-wire grammar. Application callers continue to use the
+compatible `finch-vm` facade rather than depending on this unpublished crate directly.
 
 **Documentation:** [`docs/README.md`](docs/README.md) owns implemented Co-Forth syntax and lowering
 reference material. Cross-frontend planned semantics remain in the shared

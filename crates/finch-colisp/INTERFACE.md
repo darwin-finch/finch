@@ -10,6 +10,8 @@ Everything below is what callers outside this module can reach. Implementation m
 ## Types
 
 ```rust
+/// Surface-syntax facts consumed by the CoLisp tokenizer and the wire GBNF.
+pub struct LispLexicon { … }
 /// A reader value paired with the exact byte range that produced it.
 pub struct SpannedVal { … }
 pub enum Val { Nil, Bool, Int, Float, Str, Symbol, Bytes, List }
@@ -32,6 +34,10 @@ impl Val {
 /// Parse and compile Finch Lisp directly into the common typed stack IR.
 pub fn compile_lisp(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary) -> Result<ModuleVerified, Vec<VmDiagnostic>> { … }
 pub fn compile_lisp_with_functions(source_id: &str, source: &str, initial_stack: Vec<Type>, vocabulary: &Vocabulary, linked_functions: &BTreeMap<String, Function>) -> Result<ModuleVerified, Vec<VmDiagnostic>> { … }
+/// True when `ch` ends a CoLisp atom outside a `<...>` type argument list.
+pub fn lisp_atom_delimiter(ch: char, angle_depth: usize) -> bool { … }
+/// Production CoLisp lexical facts.
+pub fn lisp_lexicon() -> LispLexicon { … }
 /// Parse a full math expression from `src` into a Lisp Val tree.
 pub fn parse_math(src: &str) -> Result<Val> { … }
 /// Parse all top-level expressions from `src`.
