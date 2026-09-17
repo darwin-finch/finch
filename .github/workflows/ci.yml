@@ -99,10 +99,7 @@ jobs:
         cache-workspace-crates: false
         cache-all-crates: false
         cache-on-failure: false
-        # TEMPORARY (#518 pilot measurement): allow the branch-scoped save so
-        # the next commit on this PR restores a warm Blacksmith-backend cache.
-        # Reverted in the following commit; the contract pin re-asserts main.
-        save-if: true
+        save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
     - name: Compile all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} --no-run
