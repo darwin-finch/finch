@@ -211,13 +211,79 @@ impl DaemonLifecycle {
         &self.pid_file
     }
 
-    /// True when a pid file or IPC socket remains but no daemon process is alive.
+    /// True when crash leftovers remain that [`Self::stop_daemon`] would reap.
+    ///
+    /// A live IPC listener is not stale: stop refuses to unlink it
+    /// ([`DaemonStopOutcome::StalePidLiveSocket`]), so advertising it as
+    /// crashed-daemon leftovers would point operators at a cleanup that can
+    /// never clear the warning. The socket is classified with the same
+    /// connect-based probe as the reap path, never by existence alone.
     pub fn has_stale_files(&self) -> bool {
-        !self.is_running() && (self.pid_file.exists() || self.socket_path().exists())
+        if self.is_running() {
+            return false;
+        }
+        match self.probe_socket() {
+            Ok(StaleSocketProbe::Live) => false,
+            Ok(StaleSocketProbe::Stale) => true,
+            Ok(StaleSocketProbe::Absent) => self.pid_file.exists(),
+            // An undecidable socket is still surfaced the old way rather than
+            // hiding possible leftovers behind a probe failure.
+            Err(_) => self.pid_file.exists() || self.socket_path().exists(),
+        }
+    }
+
+    /// True when something is listening on the daemon IPC socket right now.
+    ///
+    /// Probed by connecting, so a leftover pathname with no listener is false
+    /// even though the file exists.
+    pub fn ipc_listener_alive(&self) -> bool {
+        matches!(self.probe_socket(), Ok(StaleSocketProbe::Live))
     }
 
     fn socket_path(&self) -> PathBuf {
         self.pid_file.with_extension("sock")
+    }
+
+    /// Classify the IPC socket path without mutating anything.
+    ///
+    /// Connecting is the only reliable live-vs-stale test: existence alone
+    /// cannot tell a crashed daemon's leftover from a socket that is being
+    /// served right now. Shared by [`Self::has_stale_files`],
+    /// [`Self::ipc_listener_alive`], and [`Self::reap_stale_socket`].
+    fn probe_socket(&self) -> Result<StaleSocketProbe> {
+        #[cfg(not(unix))]
+        {
+            // No connectable socket type here: classify by existence, exactly
+            // as the pre-probe code did, and never report a live listener.
+            let _ = self;
+            if self.socket_path().exists() {
+                Ok(StaleSocketProbe::Stale)
+            } else {
+                Ok(StaleSocketProbe::Absent)
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::net::UnixStream;
+            let path = self.socket_path();
+            if !path.exists() {
+                return Ok(StaleSocketProbe::Absent);
+            }
+            match UnixStream::connect(&path) {
+                Ok(_) => Ok(StaleSocketProbe::Live),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    Ok(StaleSocketProbe::Stale)
+                }
+                Err(error) => Err(error).with_context(|| {
+                    format!("could not determine whether {} is stale", path.display())
+                }),
+            }
+        }
     }
 
     /// Remove the IPC socket only when nothing is listening on it.
@@ -226,35 +292,32 @@ impl DaemonLifecycle {
     /// while that process kept serving through its open file descriptor. The
     /// bind path in `src/ipc/server.rs` uses the same connect-then-unlink rule.
     fn reap_stale_socket(&self) -> Result<StaleSocketReap> {
-        #[cfg(not(unix))]
-        {
-            let _ = self;
-            Ok(StaleSocketReap::Absent)
+        match self.probe_socket()? {
+            StaleSocketProbe::Absent => Ok(StaleSocketReap::Absent),
+            StaleSocketProbe::Live => Ok(StaleSocketReap::Live),
+            #[cfg(unix)]
+            StaleSocketProbe::Stale => self.remove_stale_socket(),
+            // Non-unix never unlinked leftovers; keep that behavior.
+            #[cfg(not(unix))]
+            StaleSocketProbe::Stale => Ok(StaleSocketReap::Absent),
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::net::UnixStream;
-            let path = self.socket_path();
-            if !path.exists() {
-                return Ok(StaleSocketReap::Absent);
+    }
+
+    /// Unlink a socket pathname the probe already classified as stale.
+    ///
+    /// The pathname can vanish between the probe and this unlink (another
+    /// reaper won the race); `NotFound` then means the work is already done,
+    /// not a failure.
+    #[cfg(unix)]
+    fn remove_stale_socket(&self) -> Result<StaleSocketReap> {
+        let path = self.socket_path();
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(StaleSocketReap::Removed),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(StaleSocketReap::Absent)
             }
-            match UnixStream::connect(&path) {
-                Ok(_) => Ok(StaleSocketReap::Live),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                    ) =>
-                {
-                    fs::remove_file(&path).with_context(|| {
-                        format!("Failed to remove stale IPC socket: {}", path.display())
-                    })?;
-                    Ok(StaleSocketReap::Removed)
-                }
-                Err(error) => Err(error).with_context(|| {
-                    format!("could not determine whether {} is stale", path.display())
-                }),
-            }
+            Err(error) => Err(error)
+                .with_context(|| format!("Failed to remove stale IPC socket: {}", path.display())),
         }
     }
 
@@ -389,11 +452,26 @@ impl DaemonLifecycle {
     }
 }
 
+/// Live-vs-stale classification of the IPC socket pathname, decided by
+/// connecting to it rather than by mere existence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleSocketProbe {
+    /// No pathname at the socket location.
+    Absent,
+    /// Something is listening on the socket right now.
+    Live,
+    /// A pathname remains but nothing is listening on it.
+    Stale,
+}
+
 /// Whether [`DaemonLifecycle::reap_stale_socket`] removed a leftover socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StaleSocketReap {
+    /// Nothing to do: the pathname is gone (or never existed).
     Absent,
+    /// A stale pathname was unlinked.
     Removed,
+    /// A live listener owns the pathname; it was left in place.
     Live,
 }
 
@@ -659,5 +737,164 @@ mod tests {
             )
         });
         drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_status_ignores_live_listener_with_missing_or_dead_pid_file() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let temp_dir = short_unix_dir();
+        let pid_file = temp_dir.path().join("daemon.pid");
+        let socket = temp_dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let lifecycle = DaemonLifecycle {
+            pid_file: pid_file.clone(),
+        };
+
+        // Missing pid file: a live listener is still up, not crash leftovers.
+        assert!(
+            !lifecycle.is_running(),
+            "no pid file must not count as running; pid_file={}",
+            pid_file.display()
+        );
+        assert!(
+            lifecycle.ipc_listener_alive(),
+            "a bound listener at {} must probe as live (real connect), not as leftovers",
+            socket.display()
+        );
+        assert!(
+            !lifecycle.has_stale_files(),
+            "status must not advertise crash leftovers while a listener is live at {} — \
+             daemon-stop leaves live sockets in place (StalePidLiveSocket), so the hint \
+             could never clear; pid_exists={} socket_exists={}",
+            socket.display(),
+            pid_file.exists(),
+            socket.exists()
+        );
+
+        // Dead pid file: same live listener, still not crash leftovers.
+        fs::write(&pid_file, "999999999").unwrap();
+        assert!(
+            !lifecycle.is_running(),
+            "a pid file for a dead process must not count as running; pid_file={}",
+            pid_file.display()
+        );
+        assert!(
+            !lifecycle.has_stale_files(),
+            "a live listener at {} must override a dead pid file's leftover report; \
+             pid_exists={} socket_exists={}",
+            socket.display(),
+            pid_file.exists(),
+            socket.exists()
+        );
+        assert!(
+            socket.exists(),
+            "status probing must leave the socket pathname in place; path={}",
+            socket.display()
+        );
+        UnixStream::connect(&socket).unwrap_or_else(|error| {
+            panic!(
+                "the live listener at {} must still accept connects after probing: {error}",
+                socket.display()
+            )
+        });
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_stop_leaves_live_socket_when_pid_file_is_missing() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let temp_dir = short_unix_dir();
+        let pid_file = temp_dir.path().join("daemon.pid");
+        let socket = temp_dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let lifecycle = DaemonLifecycle { pid_file };
+        let outcome = lifecycle.stop_daemon().unwrap();
+        assert_eq!(
+            outcome,
+            DaemonStopOutcome::StalePidLiveSocket { pid: None },
+            "stop with no pid file but a live listener must report the live socket \
+             rather than claiming a clean state; socket_exists={}",
+            socket.exists()
+        );
+        assert!(
+            socket.exists(),
+            "the live IPC socket must remain at {}",
+            socket.display()
+        );
+        UnixStream::connect(&socket).unwrap_or_else(|error| {
+            panic!(
+                "the live listener at {} must still accept connects after stop_daemon: {error}",
+                socket.display()
+            )
+        });
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_stop_treats_socket_vanished_after_stale_probe_as_already_gone() {
+        use std::os::unix::net::UnixListener;
+
+        let temp_dir = short_unix_dir();
+        let pid_file = temp_dir.path().join("daemon.pid");
+        let socket = temp_dir.path().join("daemon.sock");
+        fs::write(&pid_file, "999999999").unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        drop(listener);
+
+        let lifecycle = DaemonLifecycle {
+            pid_file: pid_file.clone(),
+        };
+        assert_eq!(
+            lifecycle.probe_socket().unwrap(),
+            StaleSocketProbe::Stale,
+            "a socket pathname with no listener must probe as stale; path={}",
+            socket.display()
+        );
+        assert!(
+            lifecycle.has_stale_files(),
+            "a dangling socket next to a dead pid file is real crash leftovers; path={}",
+            socket.display()
+        );
+
+        // The racing reaper's unlink: the pathname disappears between the
+        // stale probe above and this command's own remove_file. No single
+        // function call can observe both sides of that window, so the test
+        // stages the exact post-race state and drives the real removal step.
+        fs::remove_file(&socket).unwrap();
+
+        let reaped = lifecycle.remove_stale_socket().unwrap();
+        assert_eq!(
+            reaped,
+            StaleSocketReap::Absent,
+            "unlinking a socket pathname that vanished after the stale probe is \
+             already-done work, not a 'Failed to remove stale IPC socket' error; \
+             socket_exists={}",
+            socket.exists()
+        );
+
+        let outcome = lifecycle.stop_daemon().unwrap();
+        assert_eq!(
+            outcome,
+            DaemonStopOutcome::ReapedStale {
+                pid: Some(999_999_999),
+                removed_socket: false,
+            },
+            "stop after the mid-reap vanish must report a clean reap instead of \
+             surfacing the vanished pathname as an error; pid_exists={} socket_exists={}",
+            pid_file.exists(),
+            socket.exists()
+        );
+        assert!(
+            !pid_file.exists() && !socket.exists(),
+            "no leftovers may remain after the stop; pid_exists={} socket_exists={}",
+            pid_file.exists(),
+            socket.exists()
+        );
     }
 }

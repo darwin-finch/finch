@@ -25,6 +25,10 @@ child modules.
 - Detached children are the only processes that take over stdout/stderr via
   `DETACHED_DAEMON_ENV`.
 - The persistent log is size-bounded, owner-only, and never follows a symlink.
+- A live IPC listener is never reported or reaped as crash leftovers;
+  `has_stale_files`, `ipc_listener_alive`, and `stop_daemon` share one
+  connect-based live-vs-stale socket probe (`lifecycle.rs`), never existence
+  alone.
 
 ## Focused tests
 
