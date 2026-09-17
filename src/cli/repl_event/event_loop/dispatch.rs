@@ -774,6 +774,11 @@ impl EventLoop {
                     if !named_turn {
                         *self.active_query_id.write().await = None;
                         self.tool_call_history.write().await.remove(&qid);
+                        // Drop the queue rather than let it re-fire after a later
+                        // turn's StreamingComplete (#463, queued turn must not
+                        // execute out of order after cancel). Tool-round inject
+                        // already drained anything that belonged on the in-flight query.
+                        self.pending_queries.clear();
                     }
 
                     // If we were in plan/executing mode, cancel that too so the
