@@ -1,14 +1,19 @@
 //! Concurrent, approval-gated tool execution.
 //!
 //! `ToolExecutionCoordinator` spawns a Tokio task per tool call so multiple
-//! tools can run in parallel without blocking the event loop.  Each task:
+//! tools can run in parallel without blocking the event loop. Consecutive
+//! write/edit/patch calls from one round share one approval and then apply
+//! in order. Each task:
 //!
 //! 1. Checks whether the tool needs user approval (via `ToolExecutor::is_approved`).
 //! 2. If needed, sends a `ReplEvent::ToolApprovalNeeded` and waits on a oneshot
-//!    channel — only *this* task blocks; other tool tasks proceed independently.
+//!    channel — only *this* task blocks; other tool tasks proceed independently
+//!    unless they need the per-query approval gate (a changeset batch holds it
+//!    through apply so a later bash cannot race the writes).
 //! 3. Executes the tool (with a bounded subprocess timeout, but never timing a
 //!    human editor review) and sends the result back as `ReplEvent::ToolResult`.
 
+use anyhow::anyhow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -62,6 +67,10 @@ pub struct ToolExecutionCoordinator {
     /// Cancel/timeout/disconnect that wins the map lock first must still
     /// terminalize the loop that is attached afterwards.
     tool_loops: Arc<Mutex<ToolLoopTable>>,
+    /// Serializes approval presentation per query so consecutive write/edit/patch
+    /// reviews cannot overwrite each other, and a non-changeset tool waits for
+    /// the batch to flush.
+    approval_gates: Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
     #[cfg(test)]
     wait_before_attach: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
 }
@@ -142,9 +151,21 @@ impl ToolExecutionCoordinator {
                 attached: HashMap::new(),
                 pending_terminals: HashMap::new(),
             })),
+            approval_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             wait_before_attach: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn approval_gate(&self, query_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self
+            .approval_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates
+            .entry(query_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Wire the Co-Forth poset so every tool call auto-records a trace node.
@@ -207,6 +228,10 @@ impl ToolExecutionCoordinator {
         let mut table = self.tool_loops.lock().await;
         table.attached.remove(&query_id);
         table.pending_terminals.remove(&query_id);
+        self.approval_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&query_id);
     }
 
     /// Park `attach_loop` until the test resumes, so cancel can win the race.
@@ -249,6 +274,7 @@ impl ToolExecutionCoordinator {
         let output_manager = Arc::clone(&self.output_manager);
         let poset = self.poset.clone();
         let tool_loops = Arc::clone(&self.tool_loops);
+        let approval_gate = self.approval_gate(query_id);
 
         // Build a per-tool presentation binding. Ordinary streaming tools append
         // their lines to their row; a typed VM program's portable `say` events
@@ -313,6 +339,12 @@ impl ToolExecutionCoordinator {
             let needs_approval = !is_auto_approved
                 && matches!(approval_source, crate::tools::ApprovalSource::NotApproved);
 
+            let _approval_permit = if needs_approval {
+                Some(approval_gate.lock().await)
+            } else {
+                None
+            };
+
             if needs_approval {
                 // Request approval from user (non-blocking for other queries)
                 let (response_tx, response_rx) = oneshot::channel();
@@ -322,6 +354,7 @@ impl ToolExecutionCoordinator {
                     .send(ReplEvent::ToolApprovalNeeded {
                         query_id,
                         tool_use: tool_use.clone(),
+                        batch: Vec::new(),
                         response_tx,
                     })
                     .is_err()
@@ -401,95 +434,300 @@ impl ToolExecutionCoordinator {
                 }
             }
 
-            // Tool approved (or doesn't need approval), execute it
-            let conversation_snapshot = conversation.read().await.clone();
-
-            // Wire the poset into the executor so tool calls auto-record trace nodes.
-            tool_executor.lock().await.poset = poset.clone();
-
-            // Editor-backed proposal tools explicitly suspend on a human review;
-            // that wait is not a process timeout. Those adapters enforce their
-            // own timeout only after they have an accepted script to execute.
-            let timeout_duration = tool_executor.lock().await.execution_timeout(&tool_use.name);
-            let executor = tool_executor.lock().await;
-            let execute = executor.execute_tool::<fn() -> anyhow::Result<()>>(
+            execute_admitted_tool(
+                &event_tx,
+                &tool_executor,
+                &conversation,
+                &local_generator,
+                &tokenizer,
+                &repl_mode,
+                &plan_content,
+                &poset,
+                &tool_loop,
+                query_id,
+                round_token,
                 &tool_use,
-                Some(&conversation_snapshot),
-                None, // save_fn (not needed in event loop)
-                None, // router (for training)
-                Some(Arc::clone(&local_generator)),
-                Some(Arc::clone(&tokenizer)),
-                Some(Arc::clone(&repl_mode)),
-                Some(Arc::clone(&plan_content)),
-                Some(Arc::clone(&live_output)),
+                live_output,
                 effect_audit,
-            );
-            let result = match timeout_duration {
-                Some(timeout) => tokio::time::timeout(timeout, execute).await,
-                None => Ok(execute.await),
-            };
+            )
+            .await;
+        });
+    }
 
-            // Send result back to event loop
-            match result {
-                Ok(Ok(tool_result)) => {
-                    tracing::info!(
-                        "[tool_exec] Tool {} finished, sending result ({} chars, is_error={})",
-                        tool_use.name,
-                        tool_result.content.len(),
-                        tool_result.is_error
-                    );
-                    let published = if tool_result.is_error {
-                        Err(anyhow::anyhow!("{}", tool_result.content))
-                    } else {
-                        Ok(tool_result.content)
-                    };
-                    publish_tool_result(
-                        &event_tx,
-                        &tool_loop,
-                        query_id,
-                        round_token,
-                        tool_use.id.clone(),
-                        published,
-                    )
-                    .await;
+    /// Review consecutive write/edit/patch calls as one aggregate diff, then
+    /// apply them in order or apply none.
+    pub(crate) fn spawn_changeset_batch(
+        &self,
+        query_id: Uuid,
+        round_token: ToolRoundToken,
+        calls: Vec<(ToolUse, Arc<WorkUnit>, usize)>,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    ) {
+        if calls.len() <= 1 {
+            if let Some((tool_use, work_unit, row_idx)) = calls.into_iter().next() {
+                self.spawn_tool_execution(
+                    query_id,
+                    round_token,
+                    tool_use,
+                    work_unit,
+                    row_idx,
+                    effect_audit,
+                );
+            }
+            return;
+        }
+
+        let event_tx = self.event_tx.clone();
+        let tool_executor = Arc::clone(&self.tool_executor);
+        let conversation = Arc::clone(&self.conversation);
+        let local_generator = Arc::clone(&self.local_generator);
+        let tokenizer = Arc::clone(&self.tokenizer);
+        let repl_mode = Arc::clone(&self.repl_mode);
+        let plan_content = Arc::clone(&self.plan_content);
+        let poset = self.poset.clone();
+        let tool_loops = Arc::clone(&self.tool_loops);
+        let approval_gate = self.approval_gate(query_id);
+
+        tokio::spawn(async move {
+            let _approval_permit = approval_gate.lock().await;
+            let tool_loop = {
+                let table = tool_loops.lock().await;
+                if table.pending_terminals.contains_key(&query_id) {
+                    return;
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!("[tool_exec] Tool {} returned error: {}", tool_use.name, e);
-                    publish_tool_result(
-                        &event_tx,
-                        &tool_loop,
-                        query_id,
-                        round_token,
-                        tool_use.id.clone(),
-                        Err(e),
-                    )
-                    .await;
-                }
-                Err(_) => {
-                    let seconds = timeout_duration
-                        .map(|duration| duration.as_secs())
-                        .unwrap_or_default();
-                    tracing::error!(
-                        "[tool_exec] Tool {} timed out after {} seconds",
-                        tool_use.name,
-                        seconds
-                    );
-                    publish_tool_result(
-                        &event_tx,
-                        &tool_loop,
-                        query_id,
-                        round_token,
-                        tool_use.id.clone(),
-                        Err(anyhow::anyhow!(
-                            "Tool execution timed out after {} seconds. \
-                             Try restarting or check daemon logs for errors.",
-                            seconds
-                        )),
-                    )
-                    .await;
+                table.attached.get(&query_id).cloned()
+            };
+            if let Some(tool_loop) = &tool_loop {
+                let mut loop_guard = tool_loop.lock().await;
+                for (tool_use, _, _) in &calls {
+                    if loop_guard.admit_execution(&tool_use.id).is_err() {
+                        return;
+                    }
                 }
             }
+
+            let mut needs_approval = false;
+            for (tool_use, _, _) in &calls {
+                let signature = generate_tool_signature(tool_use, std::path::Path::new("."));
+                let approval_source = tool_executor.lock().await.is_approved(&signature);
+                let declared_effect = tool_executor
+                    .lock()
+                    .await
+                    .registry()
+                    .declared_effect(&tool_use.name);
+                let is_auto_approved = crate::tools::refined_effect_for_approval(
+                    declared_effect,
+                    &tool_use.name,
+                    &tool_use.input,
+                )
+                .runs_autonomously();
+                if !is_auto_approved
+                    && matches!(approval_source, crate::tools::ApprovalSource::NotApproved)
+                {
+                    needs_approval = true;
+                    break;
+                }
+            }
+
+            if needs_approval {
+                let (response_tx, response_rx) = oneshot::channel();
+                let first = calls[0].0.clone();
+                let batch: Vec<ToolUse> = calls.iter().map(|(tool, _, _)| tool.clone()).collect();
+                if event_tx
+                    .send(ReplEvent::ToolApprovalNeeded {
+                        query_id,
+                        tool_use: first,
+                        batch,
+                        response_tx,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                let confirmation = match response_rx.await {
+                    Ok(confirmation) => confirmation,
+                    Err(_) => {
+                        deny_changeset(
+                            &event_tx,
+                            &tool_loop,
+                            query_id,
+                            round_token,
+                            &calls,
+                            "Tool approval cancelled",
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                match confirmation {
+                    ConfirmationResult::Deny => {
+                        deny_changeset(
+                            &event_tx,
+                            &tool_loop,
+                            query_id,
+                            round_token,
+                            &calls,
+                            "Tool execution denied by user",
+                        )
+                        .await;
+                        return;
+                    }
+                    ConfirmationResult::ApproveExactSession(sig) => {
+                        tool_executor.lock().await.approve_exact_session(sig);
+                    }
+                    ConfirmationResult::ApprovePatternSession(pattern) => {
+                        tool_executor.lock().await.approve_pattern_session(pattern);
+                    }
+                    ConfirmationResult::ApproveExactPersistent(sig) => {
+                        let mut executor = tool_executor.lock().await;
+                        executor.approve_exact_persistent(sig);
+                        if let Err(e) = executor.save_patterns() {
+                            tracing::warn!("Failed to save persistent approval: {}", e);
+                        }
+                    }
+                    ConfirmationResult::ApprovePatternPersistent(pattern) => {
+                        let mut executor = tool_executor.lock().await;
+                        executor.approve_pattern_persistent(pattern);
+                        if let Err(e) = executor.save_patterns() {
+                            tracing::warn!("Failed to save persistent pattern: {}", e);
+                        }
+                    }
+                    ConfirmationResult::ApproveOnce | ConfirmationResult::ApproveWithInput(_) => {}
+                }
+            }
+
+            for (tool_use, work_unit, row_idx) in calls {
+                let live_output: LiveOutput = Arc::new(WorkUnitPresentation {
+                    work_unit: Arc::clone(&work_unit),
+                    row_idx,
+                    program: false,
+                    vm_output: None,
+                    event_tx: event_tx.clone(),
+                });
+                execute_admitted_tool(
+                    &event_tx,
+                    &tool_executor,
+                    &conversation,
+                    &local_generator,
+                    &tokenizer,
+                    &repl_mode,
+                    &plan_content,
+                    &poset,
+                    &tool_loop,
+                    query_id,
+                    round_token,
+                    &tool_use,
+                    live_output,
+                    effect_audit.clone(),
+                )
+                .await;
+            }
         });
+    }
+}
+
+async fn deny_changeset(
+    event_tx: &mpsc::UnboundedSender<ReplEvent>,
+    tool_loop: &Option<Arc<Mutex<ToolLoop>>>,
+    query_id: Uuid,
+    round_token: ToolRoundToken,
+    calls: &[(ToolUse, Arc<WorkUnit>, usize)],
+    reason: &str,
+) {
+    for (tool_use, _, _) in calls {
+        publish_tool_result(
+            event_tx,
+            tool_loop,
+            query_id,
+            round_token,
+            tool_use.id.clone(),
+            Err(anyhow!("{reason}")),
+        )
+        .await;
+    }
+}
+
+async fn execute_admitted_tool(
+    event_tx: &mpsc::UnboundedSender<ReplEvent>,
+    tool_executor: &Arc<tokio::sync::Mutex<crate::tools::ToolExecutor>>,
+    conversation: &Arc<RwLock<ConversationHistory>>,
+    local_generator: &Arc<RwLock<LocalGenerator>>,
+    tokenizer: &Arc<TextTokenizer>,
+    repl_mode: &Arc<RwLock<ReplMode>>,
+    plan_content: &Arc<RwLock<Option<String>>>,
+    poset: &Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
+    tool_loop: &Option<Arc<Mutex<ToolLoop>>>,
+    query_id: Uuid,
+    round_token: ToolRoundToken,
+    tool_use: &ToolUse,
+    live_output: LiveOutput,
+    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+) {
+    let conversation_snapshot = conversation.read().await.clone();
+    tool_executor.lock().await.poset = poset.clone();
+    let timeout_duration = tool_executor.lock().await.execution_timeout(&tool_use.name);
+    let executor = tool_executor.lock().await;
+    let execute = executor.execute_tool::<fn() -> anyhow::Result<()>>(
+        tool_use,
+        Some(&conversation_snapshot),
+        None,
+        None,
+        Some(Arc::clone(local_generator)),
+        Some(Arc::clone(tokenizer)),
+        Some(Arc::clone(repl_mode)),
+        Some(Arc::clone(plan_content)),
+        Some(live_output),
+        effect_audit,
+    );
+    let result = match timeout_duration {
+        Some(timeout) => tokio::time::timeout(timeout, execute).await,
+        None => Ok(execute.await),
+    };
+    match result {
+        Ok(Ok(tool_result)) => {
+            let published = if tool_result.is_error {
+                Err(anyhow!("{}", tool_result.content))
+            } else {
+                Ok(tool_result.content)
+            };
+            publish_tool_result(
+                event_tx,
+                tool_loop,
+                query_id,
+                round_token,
+                tool_use.id.clone(),
+                published,
+            )
+            .await;
+        }
+        Ok(Err(error)) => {
+            publish_tool_result(
+                event_tx,
+                tool_loop,
+                query_id,
+                round_token,
+                tool_use.id.clone(),
+                Err(error),
+            )
+            .await;
+        }
+        Err(_) => {
+            let seconds = timeout_duration
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default();
+            publish_tool_result(
+                event_tx,
+                tool_loop,
+                query_id,
+                round_token,
+                tool_use.id.clone(),
+                Err(anyhow!(
+                    "Tool execution timed out after {seconds} seconds. \
+                     Try restarting or check daemon logs for errors."
+                )),
+            )
+            .await;
+        }
     }
 }
 

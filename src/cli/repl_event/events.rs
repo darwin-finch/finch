@@ -75,10 +75,15 @@ pub enum ReplEvent {
         tool_uses: Vec<ToolUse>,
     },
 
-    /// Tool approval is needed (blocking for that query only)
+    /// Tool approval is needed (blocking for that query only).
+    ///
+    /// Consecutive write/edit/patch calls from one tool round set `batch` to
+    /// the whole group so the presenter can show one aggregate diff. An empty
+    /// `batch` means this request is only `tool_use`.
     ToolApprovalNeeded {
         query_id: Uuid,
         tool_use: ToolUse,
+        batch: Vec<ToolUse>,
         response_tx: oneshot::Sender<ConfirmationResult>,
     },
 
@@ -423,6 +428,7 @@ mod tests {
         let event = ReplEvent::ToolApprovalNeeded {
             query_id: id,
             tool_use,
+            batch: Vec::new(),
             response_tx: tx,
         };
         match event {

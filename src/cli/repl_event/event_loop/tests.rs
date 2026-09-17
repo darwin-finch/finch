@@ -5632,7 +5632,7 @@ async fn test_auto_accept_tool_presenter_approves_once_without_dialog() {
             );
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             event_loop
-                .handle_tool_approval_request(query_id, tool_use, response_tx)
+                .handle_tool_approval_request(query_id, tool_use, Vec::new(), response_tx)
                 .await
                 .expect("auto-accept tool presenter must succeed");
             let confirmation = response_rx

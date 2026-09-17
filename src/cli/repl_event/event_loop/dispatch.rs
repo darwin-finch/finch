@@ -505,9 +505,10 @@ impl EventLoop {
             ReplEvent::ToolApprovalNeeded {
                 query_id,
                 tool_use,
+                batch,
                 response_tx,
             } => {
-                self.handle_tool_approval_request(query_id, tool_use, response_tx)
+                self.handle_tool_approval_request(query_id, tool_use, batch, response_tx)
                     .await?;
             }
 
@@ -776,6 +777,9 @@ impl EventLoop {
                     self.tool_coordinator
                         .terminalize(qid, crate::tools::ToolLoopTerminal::Cancelled)
                         .await;
+                    // Drop the oneshot so a pending changeset is denied as a unit
+                    // instead of applying after the user has cancelled.
+                    self.pending_approvals.write().await.remove(&qid);
                     self.conversation.write().await.abort_staged(qid);
                     self.close_active_tool_rows(qid, "cancelled").await;
                     let named_turn =

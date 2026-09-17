@@ -371,11 +371,17 @@ impl EventLoop {
         &mut self,
         query_id: Uuid,
         tool_use: crate::tools::ToolUse,
+        batch: Vec<crate::tools::ToolUse>,
         response_tx: tokio::sync::oneshot::Sender<
             crate::cli::repl_event::events::ConfirmationResult,
         >,
     ) -> Result<()> {
         tracing::debug!("[EVENT_LOOP] Requesting tool approval: {}", tool_use.name);
+        let batch = if batch.is_empty() {
+            vec![tool_use.clone()]
+        } else {
+            batch
+        };
 
         let approval_audience = self
             .pending_named_brain_turns
@@ -386,12 +392,28 @@ impl EventLoop {
             .get(&query_id)
             .and_then(|turn| turn.approval_tx.clone());
         if let (Some(approval_tx), Some(audience)) = (approval_tx, approval_audience.as_ref()) {
+            let subject = if batch.len() > 1 {
+                batch
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                tool_use.name.clone()
+            };
             let event = crate::server::RunnerTurnEvent::ApprovalRequested {
                 approval_id: tool_use.id.clone(),
                 approval_kind: "tool".to_string(),
-                subject: tool_use.name.clone(),
+                subject,
                 audience: audience.clone(),
-                detail: serde_json::json!({"input": tool_use.input.clone()}),
+                detail: serde_json::json!({
+                    "input": tool_use.input.clone(),
+                    "batch": batch.iter().map(|tool| serde_json::json!({
+                        "id": tool.id,
+                        "name": tool.name,
+                        "input": tool.input,
+                    })).collect::<Vec<_>>(),
+                }),
             };
             let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
             if approval_tx
@@ -442,14 +464,23 @@ impl EventLoop {
             return Ok(());
         }
 
-        // Create approval dialog — compact 3-option style matching Claude Code UX
-        let mut summary = tool_approval_summary(&tool_use);
+        // Create approval dialog — compact 3-option style matching Claude Code UX.
+        // Consecutive write/edit/patch calls share one Yes/No changeset dialog.
+        let mut summary = if batch.len() > 1 {
+            super::super::changeset::changeset_approval_summary(&batch)
+        } else {
+            tool_approval_summary(&tool_use)
+        };
         if let Some(audience) = approval_audience {
             summary.push_str("\n\n");
             summary.push_str(&approval_audience_summary(&audience));
         }
 
-        let dialog = super::super::tool_display::assemble_tool_approval(&tool_use, &summary);
+        let dialog = if batch.len() > 1 {
+            super::super::tool_display::assemble_changeset_approval(&batch, &summary)
+        } else {
+            super::super::tool_display::assemble_tool_approval(&tool_use, &summary)
+        };
 
         // Set dialog in TUI (non-blocking - will be handled by async_input task)
         let mut tui = self.tui_renderer.lock().await;
@@ -463,10 +494,14 @@ impl EventLoop {
 
         // Store the response channel and tool_use for when dialog completes
         // We'll check pending_dialog_result in the event loop and send the response then
-        self.pending_approvals
-            .write()
-            .await
-            .insert(query_id, (tool_use, response_tx));
+        self.pending_approvals.write().await.insert(
+            query_id,
+            super::PendingToolApproval {
+                tool_use,
+                batch,
+                response_tx,
+            },
+        );
 
         tracing::debug!("[EVENT_LOOP] Tool approval dialog shown, waiting for user response");
 

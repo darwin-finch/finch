@@ -58,6 +58,7 @@ pub use types::{
     ToolResult, ToolUse,
 };
 
+pub(crate) use implementations::patch::preview_patched_text;
 pub(crate) use implementations::propose::{
     resume_terminal_after_editor, run_editor, suspend_terminal_for_editor,
 };

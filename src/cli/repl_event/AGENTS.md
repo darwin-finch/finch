@@ -17,6 +17,7 @@ them:
 |------|---------|
 | `event_loop/dispatch.rs` | the `match event` over every `ReplEvent` variant |
 | `event_loop/input.rs` | a submitted line: commands, typed programs, or a query |
+| `changeset.rs` | consecutive write/edit/patch grouping and aggregate diff preview |
 | `event_loop/tools.rs` | tool results, tool and VM approval prompts |
 | `event_loop/brain.rs` | remote and named Brain traffic, invitations, reconnection |
 | `event_loop/plan.rs` | plan mode, plan tasks, poset confirmation |
