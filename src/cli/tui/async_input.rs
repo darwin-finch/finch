@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
-use super::TuiRenderer;
+use super::{ComposerDispatch, TuiRenderer};
 
 // ---------------------------------------------------------------------------
 // InputEvent — discriminated input events sent to the event loop
@@ -204,252 +204,158 @@ pub fn spawn_input_task(
                                 first_event_modified_input = true;
 
                                 Ok(None) // Don't submit input while dialog is active
-                            } else if key.code == KeyCode::Tab
-                                && key.modifiers == KeyModifiers::NONE
-                            {
-                                if tui.handle_tab_key(key) {
-                                    first_event_modified_input = true;
-                                } else {
-                                    first_event_needs_render = true;
-                                }
-                                Ok(None)
-                            } else if key.modifiers == KeyModifiers::NONE
-                                && tui.handle_completion_key(key.code)
-                            {
-                                first_event_needs_render = true;
-                                Ok(None)
-                            } else if key.code == KeyCode::Enter {
-                                // Check if Shift or Alt is held (inserts newline, Enter submits).
-                                // Standard VT100 raw mode never sets SHIFT for Enter on macOS
-                                // Terminal/iTerm2 — Option+Enter sends \x1b\r, reported as
-                                // KeyCode::Enter + KeyModifiers::ALT, which is what we check.
-                                // SHIFT is also accepted for terminals that implement it.
-                                if key
-                                    .modifiers
-                                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-                                {
-                                    // Shift+Enter / Alt(Option)+Enter: Insert newline (pass to textarea)
-                                    tui.input_textarea.input(Event::Key(key));
-                                    first_event_modified_input = true; // Mark for render
-                                    Ok(None)
-                                } else {
-                                    // Enter without Shift: Submit input.
-                                    // If a brain-question dialog is still active, dismiss it
-                                    // with Cancelled so the brain gets "[no answer]" and the
-                                    // user's query goes through unblocked.
-                                    if tui.active_dialog.is_some() {
-                                        tui.active_dialog = None;
-                                        tui.pending_dialog_result =
-                                            Some(crate::cli::tui::DialogResult::Cancelled);
-                                    }
-                                    let input = tui.input_textarea.lines().join("\n");
-                                    if !input.trim().is_empty() {
-                                        // Add to command history
-                                        tui.command_history.push(input.clone());
-                                        tui.history_index = None;
-                                        tui.history_draft = None; // Clear any saved draft
-
-                                        // Clear textarea for next input and render immediately
-                                        // so the input area visually clears on Enter (like Claude Code).
-                                        tui.input_textarea = TuiRenderer::create_clean_textarea();
-                                        first_event_modified_input = true; // triggers render below
-                                        Ok(Some(input))
-                                    } else {
-                                        Ok(None) // Empty input, ignore
-                                    }
-                                }
                             } else {
-                                // Priority 3: Handle other keys (feedback shortcuts, history, input)
-                                // Check for feedback shortcuts when input is empty
-                                let _input_empty =
-                                    tui.input_textarea.lines().join("").trim().is_empty();
-
-                                // Check for special shortcuts and navigation (Ctrl+C, Ctrl+G, Ctrl+B, Up/Down)
-                                match (key.code, key.modifiers) {
-                                    (KeyCode::Char('c'), m)
-                                        if m.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        // Ctrl+C: Clear input if non-empty, otherwise cancel query
-                                        let content = tui.input_textarea.lines().join("");
-                                        if content.trim().is_empty() {
-                                            tui.pending_cancellation = true;
-                                        } else {
-                                            tui.input_textarea =
-                                                TuiRenderer::create_clean_textarea();
+                                // Enter without Shift/Alt still submits when a brain-question
+                                // dialog is up; cancel it so the query is not blocked.
+                                if key.code == KeyCode::Enter
+                                    && !key
+                                        .modifiers
+                                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                                    && tui.active_dialog.is_some()
+                                {
+                                    tui.active_dialog = None;
+                                    tui.pending_dialog_result =
+                                        Some(crate::cli::tui::DialogResult::Cancelled);
+                                }
+                                match tui.dispatch_composer_key(key) {
+                                    ComposerDispatch::Submit(input) => {
+                                        first_event_modified_input = true;
+                                        Ok(Some(input))
+                                    }
+                                    ComposerDispatch::Handled { input_changed } => {
+                                        if input_changed {
                                             first_event_modified_input = true;
+                                        } else {
+                                            first_event_needs_render = true;
                                         }
                                         Ok(None)
                                     }
-                                    (KeyCode::Esc, _) => {
-                                        // Escape: Clear input if non-empty, otherwise cancel query
-                                        let content = tui.input_textarea.lines().join("");
-                                        if content.trim().is_empty() {
-                                            tui.pending_cancellation = true;
-                                        } else {
-                                            tui.input_textarea =
-                                                TuiRenderer::create_clean_textarea();
-                                            first_event_modified_input = true;
-                                        }
-                                        Ok(None)
-                                    }
-                                    // Cmd+V on macOS / Ctrl+V: check clipboard for images
-                                    (KeyCode::Char('v'), m)
-                                        if m.contains(KeyModifiers::SUPER)
-                                            || m.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        // Try to grab image from clipboard first
-                                        if let Some((b64, media_type)) = try_grab_clipboard_image()
-                                        {
-                                            tui.image_counter += 1;
-                                            let idx = tui.image_counter;
-                                            tui.pending_images.push((idx, b64, media_type));
+                                    ComposerDispatch::Unhandled => {
+                                        // Priority 3: Handle other keys (feedback shortcuts, input)
+                                        let _input_empty =
+                                            tui.input_textarea.lines().join("").trim().is_empty();
 
-                                            // Insert marker into textarea
-                                            let marker = format!("[Image #{}]", idx);
-                                            let current = tui.input_textarea.lines().join("\n");
-                                            let new_text = if current.trim().is_empty() {
-                                                marker
-                                            } else {
-                                                format!("{}\n{}", current, marker)
-                                            };
-                                            tui.input_textarea =
+                                        match (key.code, key.modifiers) {
+                                            (KeyCode::Char('c'), m)
+                                                if m.contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                // Ctrl+C: Clear input if non-empty, otherwise cancel query
+                                                let content = tui.input_textarea.lines().join("");
+                                                if content.trim().is_empty() {
+                                                    tui.pending_cancellation = true;
+                                                } else {
+                                                    tui.input_textarea =
+                                                        TuiRenderer::create_clean_textarea();
+                                                    first_event_modified_input = true;
+                                                }
+                                                Ok(None)
+                                            }
+                                            (KeyCode::Esc, _) => {
+                                                // Escape: Clear input if non-empty, otherwise cancel query
+                                                let content = tui.input_textarea.lines().join("");
+                                                if content.trim().is_empty() {
+                                                    tui.pending_cancellation = true;
+                                                } else {
+                                                    tui.input_textarea =
+                                                        TuiRenderer::create_clean_textarea();
+                                                    first_event_modified_input = true;
+                                                }
+                                                Ok(None)
+                                            }
+                                            // Cmd+V on macOS / Ctrl+V: check clipboard for images
+                                            (KeyCode::Char('v'), m)
+                                                if m.contains(KeyModifiers::SUPER)
+                                                    || m.contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                // Try to grab image from clipboard first
+                                                if let Some((b64, media_type)) =
+                                                    try_grab_clipboard_image()
+                                                {
+                                                    tui.image_counter += 1;
+                                                    let idx = tui.image_counter;
+                                                    tui.pending_images.push((idx, b64, media_type));
+
+                                                    // Insert marker into textarea
+                                                    let marker = format!("[Image #{}]", idx);
+                                                    let current =
+                                                        tui.input_textarea.lines().join("\n");
+                                                    let new_text = if current.trim().is_empty() {
+                                                        marker
+                                                    } else {
+                                                        format!("{}\n{}", current, marker)
+                                                    };
+                                                    tui.input_textarea =
                                                 TuiRenderer::create_clean_textarea_with_text(
                                                     &new_text,
                                                 );
-                                            first_event_modified_input = true;
-                                        } else {
-                                            // No image - pass V to textarea for text paste
-                                            tui.input_textarea.input(Event::Key(key));
-                                            first_event_modified_input = true;
-                                        }
-                                        Ok(None)
-                                    }
-                                    (KeyCode::Char('g'), m)
-                                        if m.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        // Ctrl+G: Good feedback
-                                        tui.pending_feedback =
-                                            Some(crate::cli::tui::activity::Verdict::Approve);
-                                        Ok(None)
-                                    }
-                                    (KeyCode::Char('b'), m)
-                                        if m.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        // Ctrl+B: Bad feedback
-                                        tui.pending_feedback =
-                                            Some(crate::cli::tui::activity::Verdict::Reject);
-                                        Ok(None)
-                                    }
-                                    (KeyCode::Char('z'), m)
-                                        if m.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        // Typed VM definitions are revisioned; do not route
-                                        // Ctrl+Z into the removed legacy-Forth undo path.
-                                        Ok(None)
-                                    }
-                                    (KeyCode::Char('p'), m)
-                                        if m.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        // Ctrl+P: Pop top word off vocabulary stack
-                                        Ok(Some("/pop".to_string()))
-                                    }
-                                    (KeyCode::Char('d'), m)
-                                        if m.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        // Readline/Emacs semantics: delete the character under
-                                        // the cursor. On an empty buffer this is a no-op; Finch
-                                        // exits only through the explicit `/quit` command.
-                                        tui.input_textarea.delete_next_char();
-                                        first_event_modified_input = true;
-                                        Ok(None)
-                                    }
-                                    (KeyCode::Char('/'), m)
-                                        if m.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        // Ctrl+/: Show help (send as command)
-                                        Ok(Some("/help".to_string()))
-                                    }
-                                    (KeyCode::BackTab, _) => {
-                                        // Shift+Tab: cycle Normal → AutoAccept → Planning
-                                        Ok(Some("/cycle-mode".to_string()))
-                                    }
-                                    (KeyCode::Up, KeyModifiers::NONE) => {
-                                        // Check cursor position - only navigate history if at top line
-                                        let (cursor_row, _cursor_col) = tui.input_textarea.cursor();
-
-                                        if cursor_row == 0 {
-                                            // At top line - navigate history backwards (older commands)
-                                            if let Some(idx) = tui.history_index {
-                                                if idx > 0 {
-                                                    tui.history_index = Some(idx - 1);
-                                                    let cmd = &tui.command_history[idx - 1];
-                                                    tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
+                                                    first_event_modified_input = true;
+                                                } else {
+                                                    // No image - pass V to textarea for text paste
+                                                    tui.input_textarea.input(Event::Key(key));
                                                     first_event_modified_input = true;
                                                 }
-                                            } else if !tui.command_history.is_empty() {
-                                                // Save current input as draft before entering history
-                                                let current_text =
-                                                    tui.input_textarea.lines().join("\n");
-                                                if !current_text.trim().is_empty() {
-                                                    tui.history_draft = Some(current_text);
-                                                }
-
-                                                tui.history_index =
-                                                    Some(tui.command_history.len() - 1);
-                                                let cmd = &tui.command_history
-                                                    [tui.command_history.len() - 1];
-                                                tui.input_textarea =
-                                                    TuiRenderer::create_clean_textarea_with_text(
-                                                        cmd,
-                                                    );
-                                                first_event_modified_input = true;
+                                                Ok(None)
                                             }
-                                        } else {
-                                            // Not at top - move cursor up within textarea
-                                            tui.input_textarea.input(Event::Key(key));
-                                            first_event_modified_input = true;
-                                        }
-                                        Ok(None)
-                                    }
-                                    (KeyCode::Down, KeyModifiers::NONE) => {
-                                        // Check cursor position - only navigate history if at bottom line
-                                        let (cursor_row, _cursor_col) = tui.input_textarea.cursor();
-                                        let num_lines = tui.input_textarea.lines().len();
-                                        let last_line = num_lines.saturating_sub(1);
-
-                                        if cursor_row >= last_line {
-                                            // At bottom line - navigate history forwards (newer commands)
-                                            if let Some(idx) = tui.history_index {
-                                                if idx < tui.command_history.len() - 1 {
-                                                    tui.history_index = Some(idx + 1);
-                                                    let cmd = &tui.command_history[idx + 1];
-                                                    tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
-                                                } else {
-                                                    // At newest entry - restore draft or clear
-                                                    tui.history_index = None;
-                                                    if let Some(draft) = tui.history_draft.take() {
-                                                        tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&draft);
-                                                    } else {
-                                                        tui.input_textarea =
-                                                            TuiRenderer::create_clean_textarea();
-                                                    }
-                                                }
-                                                first_event_modified_input = true;
+                                            (KeyCode::Char('g'), m)
+                                                if m.contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                // Ctrl+G: Good feedback
+                                                tui.pending_feedback = Some(
+                                                    crate::cli::tui::activity::Verdict::Approve,
+                                                );
+                                                Ok(None)
                                             }
-                                        } else {
-                                            // Not at bottom - move cursor down within textarea
-                                            tui.input_textarea.input(Event::Key(key));
-                                            first_event_modified_input = true;
+                                            (KeyCode::Char('b'), m)
+                                                if m.contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                // Ctrl+B: Bad feedback
+                                                tui.pending_feedback = Some(
+                                                    crate::cli::tui::activity::Verdict::Reject,
+                                                );
+                                                Ok(None)
+                                            }
+                                            (KeyCode::Char('z'), m)
+                                                if m.contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                // Typed VM definitions are revisioned; do not route
+                                                // Ctrl+Z into the removed legacy-Forth undo path.
+                                                Ok(None)
+                                            }
+                                            (KeyCode::Char('p'), m)
+                                                if m.contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                // Ctrl+P: Pop top word off vocabulary stack
+                                                Ok(Some("/pop".to_string()))
+                                            }
+                                            (KeyCode::Char('d'), m)
+                                                if m.contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                // Readline/Emacs semantics: delete the character under
+                                                // the cursor. On an empty buffer this is a no-op; Finch
+                                                // exits only through the explicit `/quit` command.
+                                                tui.input_textarea.delete_next_char();
+                                                first_event_modified_input = true;
+                                                Ok(None)
+                                            }
+                                            (KeyCode::Char('/'), m)
+                                                if m.contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                // Ctrl+/: Show help (send as command)
+                                                Ok(Some("/help".to_string()))
+                                            }
+                                            (KeyCode::BackTab, _) => {
+                                                // Shift+Tab: cycle Normal → AutoAccept → Planning
+                                                Ok(Some("/cycle-mode".to_string()))
+                                            }
+                                            _ => {
+                                                // Pass key event to textarea (with sanitization)
+                                                if should_accept_key_event(&key) {
+                                                    tui.input_textarea.input(Event::Key(key));
+                                                    first_event_modified_input = true;
+                                                }
+                                                Ok(None)
+                                            }
                                         }
-                                        Ok(None)
-                                    }
-                                    _ => {
-                                        // Pass key event to textarea (with sanitization)
-                                        if should_accept_key_event(&key) {
-                                            tui.input_textarea.input(Event::Key(key));
-                                            first_event_modified_input = true; // Mark for render
-                                        }
-                                        Ok(None)
                                     }
                                 }
                             }
@@ -562,13 +468,7 @@ pub fn spawn_input_task(
                                         tui.update_ghost_text();
                                     } else {
                                         // Plain Enter: collect submission and stop draining.
-                                        let input = tui.input_textarea.lines().join("\n");
-                                        if !input.trim().is_empty() {
-                                            tui.command_history.push(input.clone());
-                                            tui.history_index = None;
-                                            tui.history_draft = None;
-                                            tui.input_textarea =
-                                                TuiRenderer::create_clean_textarea();
+                                        if let Some(input) = tui.take_submitted_input() {
                                             had_input = true; // render the cleared input
                                             batch_submit = Some(input);
                                         }
