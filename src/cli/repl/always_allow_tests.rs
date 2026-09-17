@@ -4,13 +4,13 @@ use crate::programs::ExecutionEffect;
 use crate::runtime::ProgramRuntime;
 use crate::scheduler::{AgentScheduler, ProviderResolver};
 use crate::tools::{
-    refined_effect_for_approval, AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool,
-    AnsibleTool, AskUserQuestionTool, BashTool, CreateMemoryTool, EditTool, EnterPlanModeTool,
-    GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, HashCompareTool,
-    InspectMemoryTool, InspectWordTool, ListRecentTool, PatchTool, PermissionCheck,
-    PermissionManager, PermissionRule, PresentPlanTool, ReadTool, RestartTool, SearchMemoryTool,
-    SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool, Tool, ToolRegistry,
-    WebFetchTool, WriteTool,
+    invocation_runs_autonomously, refined_effect_for_approval, AgentAwaitTool, AgentCancelTool,
+    AgentPollTool, AgentSpawnTool, AnsibleTool, AskUserQuestionTool, BashTool, CreateMemoryTool,
+    EditTool, EnterPlanModeTool, GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool,
+    HashCompareTool, InspectMemoryTool, InspectWordTool, ListRecentTool, PatchTool,
+    PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool, ReadTool, RestartTool,
+    SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool, Tool,
+    ToolRegistry, WebFetchTool, WriteTool,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -322,16 +322,21 @@ fn test_declared_effect_is_independent_of_dispatch_spelling() {
 }
 
 /// The production approval predicate in
-/// `ToolExecutionCoordinator::spawn_tool_execution` and the sync REPL path:
-/// a tool prompts only when the refined effect does not run autonomously
-/// and there is no cached approval. Unclassified never runs autonomously,
-/// so it is AskUser at that boundary.
+/// `ToolExecutionCoordinator::spawn_tool_execution`,
+/// `spawn_changeset_batch`, and the sync REPL path: a tool prompts only
+/// when the invocation does not run autonomously and there is no cached
+/// approval. Escape is never autonomous.
 fn spawn_site_runs_autonomously(
     registry: &ToolRegistry,
     name: &str,
     input: &serde_json::Value,
 ) -> bool {
-    refined_effect_for_approval(registry.declared_effect(name), name, input).runs_autonomously()
+    invocation_runs_autonomously(
+        registry.declared_effect(name),
+        name,
+        input,
+        &PermissionManager::new(),
+    )
 }
 
 #[test]
@@ -412,6 +417,13 @@ fn test_session_local_tools_do_not_hit_unclassified_approval() {
             "write",
             &write_input
         )
+    );
+
+    let escaped_read = json!({"file_path": "/etc/../etc/passwd"});
+    assert!(
+        !spawn_site_runs_autonomously(&catalog.registry, "read", &escaped_read),
+        "invariant: an escaped WorkspaceRead must not auto-approve at \
+         spawn_tool_execution; execute_tool treats AskUser as already confirmed"
     );
 }
 

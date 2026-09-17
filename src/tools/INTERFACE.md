@@ -148,6 +148,8 @@ pub struct McpToolDescriptor { … }
 /// Outcome of observing a delta or complete event.
 pub enum ObserveOutcome { Accumulating, Settled, Late }
 pub struct PatchTool;
+/// Kind of path argument a structured pattern admits.
+pub enum PathSlot { Any, WorkspaceContained }
 /// Type of pattern matching to use
 pub enum PatternType { Wildcard, Regex, Structured }
 /// Permission decision for a tool execution
@@ -159,6 +161,8 @@ impl PermissionManager {
     pub fn allows_advertising(&self, tool_name: &str) -> bool;
     /// Check if tool execution is permitted
     pub fn check_tool_use(&self, tool_name: &str, input: &Value) -> PermissionCheck;
+    /// Directory relative path arguments resolve against.
+    pub fn cwd(&self) -> &Path;
     /// Create a permission manager for an AI peer (asymmetric rules).
     pub fn for_peer() -> Self;
     /// Load from configuration
@@ -171,6 +175,10 @@ impl PermissionManager {
     pub fn with_default_rule(mut self, rule: PermissionRule) -> Self;
     /// Set maximum tool turns
     pub fn with_max_turns(mut self, max_turns: usize) -> Self;
+    /// Pin path resolution to an explicit workspace (tests: pass a temp dir that contains `.git`; do not `chdir`).
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self;
+    /// Canonical workspace root used for containment.
+    pub fn workspace_root(&self) -> &Path;
 }
 /// Permission rule configuration
 pub enum PermissionRule { Allow, Ask, Deny }
@@ -471,6 +479,10 @@ impl ToolResult {
 }
 /// Signature for a tool execution, used for caching approval decisions
 pub struct ToolSignature { … }
+impl ToolSignature {
+    /// Reconstruct the bash command string from structured parts.
+    pub fn full_command(&self) -> Option<String>;
+}
 /// Tool use request after adapter-level validation. Re-exported from `finch-providers`.
 pub struct ToolUse { … }
 /// Transport type for MCP servers Re-exported from `tools::mcp`.
@@ -518,6 +530,8 @@ pub(crate) fn deferred_frontend_restart_from_tool_result(result: &std::result::R
 pub(crate) fn frontend_replacement_args<I>(current: I, brain: &str) -> Vec<OsString> where I: IntoIterator<Item = OsString>, { … }
 /// Generate a context-specific signature for a tool use
 pub fn generate_tool_signature(tool_use: &ToolUse, working_dir: &std::path::Path) -> ToolSignature { … }
+/// Production auto-approve predicate: refined-effect autonomy, but never for a path that escapes the workspace.
+pub fn invocation_runs_autonomously(declared: ExecutionEffect, tool_name: &str, input: &Value, permissions: &PermissionManager) -> bool { … }
 /// Apply a unified diff in memory so a batch review can show the resulting file.
 pub(crate) fn preview_patched_text(original: &str, patch: &str) -> Result<String> { … }
 /// Open a proposal artifact in the user editor and preserve the explicit `execute`/`chat`/`cancel` decision.

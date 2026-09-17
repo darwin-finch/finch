@@ -320,17 +320,15 @@ impl ToolExecutionCoordinator {
             // classify as Unclassified and keep requiring approval). bash
             // declares its worst case; the read-only refinement is applied
             // here, at the approval site that consumes the effect.
-            let declared_effect = tool_executor
-                .lock()
-                .await
-                .registry()
-                .declared_effect(&tool_use.name);
-            let is_auto_approved = crate::tools::refined_effect_for_approval(
-                declared_effect,
-                &tool_use.name,
-                &tool_use.input,
-            )
-            .runs_autonomously();
+            let is_auto_approved = {
+                let executor = tool_executor.lock().await;
+                crate::tools::invocation_runs_autonomously(
+                    executor.registry().declared_effect(&tool_use.name),
+                    &tool_use.name,
+                    &tool_use.input,
+                    executor.permissions(),
+                )
+            };
 
             // AutoAccept does not skip here. Named-Brain turns must still
             // emit ToolApprovalNeeded so the event-loop presenter can record
@@ -510,17 +508,15 @@ impl ToolExecutionCoordinator {
             for (tool_use, _, _) in &calls {
                 let signature = generate_tool_signature(tool_use, std::path::Path::new("."));
                 let approval_source = tool_executor.lock().await.is_approved(&signature);
-                let declared_effect = tool_executor
-                    .lock()
-                    .await
-                    .registry()
-                    .declared_effect(&tool_use.name);
-                let is_auto_approved = crate::tools::refined_effect_for_approval(
-                    declared_effect,
-                    &tool_use.name,
-                    &tool_use.input,
-                )
-                .runs_autonomously();
+                let is_auto_approved = {
+                    let executor = tool_executor.lock().await;
+                    crate::tools::invocation_runs_autonomously(
+                        executor.registry().declared_effect(&tool_use.name),
+                        &tool_use.name,
+                        &tool_use.input,
+                        executor.permissions(),
+                    )
+                };
                 if !is_auto_approved
                     && matches!(approval_source, crate::tools::ApprovalSource::NotApproved)
                 {

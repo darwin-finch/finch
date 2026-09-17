@@ -6,9 +6,254 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
 
 use crate::programs::ExecutionEffect;
+
+/// Constitutional bash denials. A pattern must not admit any of these
+/// commands: the one-shot path Denies them, and a generalised approval
+/// cannot widen that.
+const BASH_DENIED_SUBSTRINGS: &[(&str, &str)] = &[
+    ("rm -rf", "Recursive deletion is dangerous"),
+    ("dd if=", "Disk operations are dangerous"),
+    (":(){ :|:& };:", "Fork bombs are blocked"),
+    ("sudo", "Privilege escalation requires manual execution"),
+    ("chmod 777", "Unsafe permission changes are blocked"),
+    ("> /dev/", "Direct device access is dangerous"),
+    ("mkfs", "Filesystem operations are dangerous"),
+    ("fdisk", "Disk partitioning is dangerous"),
+];
+
+/// Tools whose discrete path argument is `file_path`.
+const FILE_PATH_TOOLS: &[&str] = &["read", "write", "edit", "patch"];
+
+/// True when a bash command is constitutionally Denied on the one-shot path.
+///
+/// Patterns consult this at match time so a stored `*` grant cannot admit
+/// `rm -rf` (or the rest of the denylist) after seeing a harmless command.
+pub fn bash_command_is_constitutionally_denied(command: &str) -> bool {
+    BASH_DENIED_SUBSTRINGS
+        .iter()
+        .any(|(pattern, _)| command.contains(pattern))
+}
+
+/// Workspace root used for path-argument containment.
+///
+/// Walking up from `start`, the first directory that contains `.git`
+/// (directory or file — git worktrees count) is the root; otherwise `start`.
+/// The result is canonicalised when that directory exists.
+pub fn resolve_workspace_root(start: &Path) -> PathBuf {
+    let start_abs = make_absolute(start);
+    let mut dir = start_abs.as_path();
+    loop {
+        let git = dir.join(".git");
+        if git.is_dir() || git.is_file() {
+            return dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+    start_abs
+        .canonicalize()
+        .unwrap_or_else(|_| start_abs.clone())
+}
+
+/// Resolve `path` against `cwd`, following symlinks on existing prefixes.
+///
+/// `.` and `..` are collapsed. A non-existent path canonicalises the longest
+/// existing ancestor and joins the lexically normalised remainder. A symlink
+/// whose target cannot be resolved returns `None` (fail closed: treat as
+/// outside the workspace).
+pub fn resolve_canonical_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        make_absolute(cwd).join(path)
+    };
+
+    let mut resolved = PathBuf::new();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut past_existing = false;
+
+    for component in abs.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                if past_existing {
+                    missing.push(prefix.as_os_str().to_os_string());
+                } else {
+                    resolved.push(prefix.as_os_str());
+                }
+            }
+            Component::RootDir => {
+                if past_existing {
+                    missing.push(component.as_os_str().to_os_string());
+                } else {
+                    resolved.push(component);
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if past_existing {
+                    if missing.last().is_some_and(|part| part != "..") {
+                        missing.pop();
+                    } else {
+                        missing.push(std::ffi::OsString::from(".."));
+                    }
+                } else {
+                    resolved.pop();
+                }
+            }
+            Component::Normal(name) => {
+                if past_existing {
+                    missing.push(name.to_os_string());
+                    continue;
+                }
+                resolved.push(name);
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(meta) if meta.file_type().is_symlink() => match resolved.canonicalize() {
+                        Ok(canonical) => resolved = canonical,
+                        Err(_) => return None,
+                    },
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        resolved.pop();
+                        past_existing = true;
+                        missing.push(name.to_os_string());
+                    }
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+
+    if resolved.as_os_str().is_empty() {
+        resolved = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
+    }
+
+    if !past_existing {
+        return if resolved.exists() {
+            resolved.canonicalize().ok()
+        } else {
+            Some(resolved)
+        };
+    }
+
+    if resolved.exists() {
+        resolved = resolved.canonicalize().ok()?;
+    }
+    for part in missing {
+        if part == ".." {
+            resolved.pop();
+        } else if part != "." {
+            resolved.push(part);
+        }
+    }
+    Some(resolved)
+}
+
+/// True when `canonical` is the workspace root or a descendant of it.
+pub fn path_is_inside_workspace(canonical: &Path, root: &Path) -> bool {
+    let path_parts: Vec<_> = canonical.components().collect();
+    let root_parts: Vec<_> = root.components().collect();
+    path_parts.starts_with(&root_parts)
+}
+
+/// Discrete path argument for tools that have one. Bash has no path slot.
+pub fn path_argument_for_tool(tool_name: &str, input: &Value) -> Option<String> {
+    let raw = if FILE_PATH_TOOLS.contains(&tool_name) {
+        input.get("file_path").and_then(Value::as_str)?
+    } else if tool_name == "grep" {
+        input.get("path").and_then(Value::as_str).unwrap_or(".")
+    } else if tool_name == "glob" {
+        let pattern = input.get("pattern").and_then(Value::as_str)?;
+        glob_path_argument(pattern)?
+    } else {
+        return None;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Relative globs stay workspace-relative. Absolute globs and those containing
+/// `..` contribute a path slot (the literal prefix before glob metacharacters).
+fn glob_path_argument(pattern: &str) -> Option<&str> {
+    let path = Path::new(pattern);
+    let needs_check = path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir));
+    if !needs_check {
+        return None;
+    }
+    let end = pattern
+        .find(|c| matches!(c, '*' | '?' | '['))
+        .unwrap_or(pattern.len());
+    let prefix = pattern[..end].trim_end_matches(['/', '\\']);
+    if prefix.is_empty() {
+        Some(pattern)
+    } else {
+        Some(prefix)
+    }
+}
+
+fn expand_user(path: &str) -> PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn make_absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => path.to_path_buf(),
+        }
+    }
+}
+
+/// True when the tool's path argument resolves outside the workspace, or
+/// cannot be resolved (fail closed). Tools without a path slot never escape.
+pub fn path_argument_escapes_workspace(
+    tool_name: &str,
+    input: &Value,
+    workspace_root: &Path,
+    cwd: &Path,
+) -> bool {
+    let Some(raw) = path_argument_for_tool(tool_name, input) else {
+        return false;
+    };
+    raw_path_escapes_workspace(&raw, workspace_root, cwd)
+}
+
+/// True when `raw` resolves outside `workspace_root` (or cannot be resolved).
+pub fn raw_path_escapes_workspace(raw: &str, workspace_root: &Path, cwd: &Path) -> bool {
+    match resolve_canonical_path(&expand_user(raw), cwd) {
+        Some(canonical) => !path_is_inside_workspace(&canonical, workspace_root),
+        None => true,
+    }
+}
+
+fn escape_ask_reason(tool_name: &str) -> String {
+    format!(
+        "Path is outside the workspace — approve this one {tool_name} path? \
+         A stored pattern cannot authorise paths outside the workspace."
+    )
+}
 
 /// Registered tools that only inspect Finch's own typed runtime metadata.
 /// They neither access the workspace nor cross a host-effect boundary, so a
@@ -149,37 +394,79 @@ pub struct PermissionManager {
 
     /// Role of the executor — Owner gets configured rules, Peer gets asymmetric rules.
     pub role: ExecutorRole,
+
+    /// Directory relative path arguments resolve against.
+    cwd: PathBuf,
+
+    /// Canonical workspace root (git root if present, else `cwd`).
+    workspace_root: PathBuf,
+}
+
+fn default_workspace_context() -> (PathBuf, PathBuf) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let workspace_root = resolve_workspace_root(&cwd);
+    (cwd, workspace_root)
 }
 
 impl PermissionManager {
     /// Create new permission manager with default settings (Owner role).
     pub fn new() -> Self {
+        let (cwd, workspace_root) = default_workspace_context();
         Self {
             configs: HashMap::new(),
             default_rule: PermissionRule::Ask,
             max_tool_turns: 25,
             role: ExecutorRole::Owner,
+            cwd,
+            workspace_root,
         }
     }
 
     /// Create a permission manager for an AI peer (asymmetric rules).
     pub fn for_peer() -> Self {
+        let (cwd, workspace_root) = default_workspace_context();
         Self {
             configs: HashMap::new(),
             default_rule: PermissionRule::Ask,
             max_tool_turns: 25,
             role: ExecutorRole::Peer,
+            cwd,
+            workspace_root,
         }
     }
 
     /// Load from configuration
     pub fn from_config(configs: HashMap<String, ToolPermissionConfig>) -> Self {
+        let (cwd, workspace_root) = default_workspace_context();
         Self {
             configs,
             default_rule: PermissionRule::Ask,
             max_tool_turns: 25,
             role: ExecutorRole::Owner,
+            cwd,
+            workspace_root,
         }
+    }
+
+    /// Pin path resolution to an explicit workspace (tests: pass a temp dir
+    /// that contains `.git`; do not `chdir`).
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        let cwd = make_absolute(&root);
+        let cwd = cwd.canonicalize().unwrap_or(cwd);
+        self.cwd = cwd.clone();
+        self.workspace_root = resolve_workspace_root(&cwd);
+        self
+    }
+
+    /// Canonical workspace root used for containment.
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    /// Directory relative path arguments resolve against.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
     }
 
     /// Set default rule for unconfigured tools
@@ -238,6 +525,12 @@ impl PermissionManager {
             return PermissionCheck::Deny(reason);
         }
 
+        // Escape is one-shot AskUser. A pattern can never satisfy it, and
+        // WorkspaceRead autonomy must not skip the dialog.
+        if self.path_escapes(tool_name, input) {
+            return PermissionCheck::AskUser(escape_ask_reason(tool_name));
+        }
+
         // These tools inspect Finch's own typed runtime metadata only. They
         // neither access the workspace nor cross a host-effect boundary, so a
         // provider must be able to use them to discover the VM protocol
@@ -286,6 +579,13 @@ impl PermissionManager {
             return PermissionCheck::Deny(reason);
         }
 
+        // Containment before silent-allow: a peer cannot read an escaped
+        // path without a one-shot AskUser. Scheduler children already bail
+        // on AskUser.
+        if self.path_escapes(tool_name, input) {
+            return PermissionCheck::AskUser(escape_ask_reason(tool_name));
+        }
+
         // Silent allow: read-only examination and scheduler-local control.
         // Agent tools enforce task-tree ownership themselves.
         if PEER_SILENT_ALLOW_TOOLS.contains(&tool_name) {
@@ -323,59 +623,23 @@ impl PermissionManager {
     fn check_constitutional_constraints(&self, tool_name: &str, input: &Value) -> Option<String> {
         match tool_name {
             "bash" => self.check_bash_safety(input),
-            "read" => self.check_read_safety(input),
             "web_fetch" => self.check_web_fetch_safety(input),
             _ => None,
         }
+    }
+
+    fn path_escapes(&self, tool_name: &str, input: &Value) -> bool {
+        path_argument_escapes_workspace(tool_name, input, &self.workspace_root, &self.cwd)
     }
 
     /// Check if bash command is safe
     fn check_bash_safety(&self, input: &Value) -> Option<String> {
         let command = input.get("command")?.as_str()?;
 
-        // Blocked patterns (always deny)
-        let dangerous_patterns = vec![
-            ("rm -rf", "Recursive deletion is dangerous"),
-            ("dd if=", "Disk operations are dangerous"),
-            (":(){ :|:& };:", "Fork bombs are blocked"),
-            ("sudo", "Privilege escalation requires manual execution"),
-            ("chmod 777", "Unsafe permission changes are blocked"),
-            ("> /dev/", "Direct device access is dangerous"),
-            ("mkfs", "Filesystem operations are dangerous"),
-            ("fdisk", "Disk partitioning is dangerous"),
-        ];
-
-        for (pattern, reason) in dangerous_patterns {
+        for (pattern, reason) in BASH_DENIED_SUBSTRINGS {
             if command.contains(pattern) {
                 warn!("Blocked dangerous bash command: {}", command);
                 return Some(format!("Blocked: {}", reason));
-            }
-        }
-
-        None
-    }
-
-    /// Check if file read is safe
-    fn check_read_safety(&self, input: &Value) -> Option<String> {
-        let file_path = input.get("file_path")?.as_str()?;
-
-        // Block system files
-        let system_paths = vec![
-            "/etc/passwd",
-            "/etc/shadow",
-            "/etc/sudoers",
-            "/dev/",
-            "/proc/",
-            "/sys/",
-        ];
-
-        for blocked_path in system_paths {
-            if file_path.starts_with(blocked_path) {
-                warn!("Blocked system file access: {}", file_path);
-                return Some(format!(
-                    "Blocked: Access to system files ({}) is not allowed",
-                    blocked_path
-                ));
             }
         }
 
@@ -547,6 +811,25 @@ pub fn refined_effect_for_approval(
     declared
 }
 
+/// Production auto-approve predicate: refined-effect autonomy, but never
+/// for a path that escapes the workspace.
+///
+/// `execute_tool` treats AskUser as already confirmed, so replacing the
+/// denylist Deny with escape AskUser would *execute* escaped reads unless
+/// this gate is false. Do not overload [`refined_effect_for_approval`] by
+/// widening a read into `Unclassified`.
+pub fn invocation_runs_autonomously(
+    declared: ExecutionEffect,
+    tool_name: &str,
+    input: &Value,
+    permissions: &PermissionManager,
+) -> bool {
+    if permissions.path_escapes(tool_name, input) {
+        return false;
+    }
+    refined_effect_for_approval(declared, tool_name, input).runs_autonomously()
+}
+
 impl Default for PermissionManager {
     fn default() -> Self {
         Self::new()
@@ -583,6 +866,8 @@ mod tests {
 
     #[test]
     fn test_system_files_blocked() {
+        // Escape is one-shot AskUser, not Deny: the user may authorise that
+        // specific path. A pattern can never satisfy it.
         let manager = PermissionManager::new();
 
         let system_files = vec!["/etc/passwd", "/etc/shadow", "/dev/null"];
@@ -591,9 +876,9 @@ mod tests {
             let input = serde_json::json!({"file_path": file});
             let check = manager.check_tool_use("read", &input);
             assert!(
-                matches!(check, PermissionCheck::Deny(_)),
-                "Failed to block: {}",
-                file
+                matches!(check, PermissionCheck::AskUser(_)),
+                "invariant: escaped system path {file} must be one-shot AskUser, \
+                 not Deny or Allow; got {check:?}"
             );
         }
     }
@@ -809,24 +1094,47 @@ mod tests {
         }
     }
 
+    fn isolated_workspace() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("isolated workspace");
+        std::fs::create_dir(dir.path().join(".git")).expect("git root marker");
+        let root = dir.path().canonicalize().expect("canonical workspace");
+        (dir, root)
+    }
+
     #[test]
     fn test_peer_read_glob_grep_silently_allowed() {
-        let mgr = PermissionManager::for_peer();
-        for tool in &["read", "glob", "grep"] {
-            let input = serde_json::json!({"file_path": "/tmp/safe.txt"});
-            assert!(
-                matches!(mgr.check_tool_use(tool, &input), PermissionCheck::Allow),
-                "Peer should silently allow {}",
-                tool
-            );
-        }
+        let (workspace, root) = isolated_workspace();
+        let inside = root.join("safe.txt");
+        std::fs::write(&inside, "ok").expect("seed workspace file");
+        let mgr = PermissionManager::for_peer().with_workspace_root(root.clone());
+        let read = serde_json::json!({"file_path": inside.to_string_lossy()});
+        let glob = serde_json::json!({"pattern": "*.txt"});
+        let grep = serde_json::json!({"pattern": "ok", "path": inside.to_string_lossy()});
+        assert!(
+            matches!(mgr.check_tool_use("read", &read), PermissionCheck::Allow),
+            "Peer should silently allow workspace read; got {:?}",
+            mgr.check_tool_use("read", &read)
+        );
+        assert!(
+            matches!(mgr.check_tool_use("glob", &glob), PermissionCheck::Allow),
+            "Peer should silently allow relative glob; got {:?}",
+            mgr.check_tool_use("glob", &glob)
+        );
+        assert!(
+            matches!(mgr.check_tool_use("grep", &grep), PermissionCheck::Allow),
+            "Peer should silently allow workspace grep; got {:?}",
+            mgr.check_tool_use("grep", &grep)
+        );
+        let _keep = workspace;
     }
 
     #[test]
     fn test_peer_write_edit_patch_surfaces_as_ask() {
-        let mgr = PermissionManager::for_peer();
+        let (workspace, root) = isolated_workspace();
+        let inside = root.join("file.txt");
+        let mgr = PermissionManager::for_peer().with_workspace_root(root);
         for tool in &["write", "edit", "patch"] {
-            let input = serde_json::json!({"file_path": "/tmp/file.txt", "content": "x"});
+            let input = serde_json::json!({"file_path": inside.to_string_lossy(), "content": "x"});
             assert!(
                 matches!(
                     mgr.check_tool_use(tool, &input),
@@ -836,6 +1144,7 @@ mod tests {
                 tool
             );
         }
+        let _keep = workspace;
     }
 
     #[test]
@@ -1329,5 +1638,200 @@ mod tests {
             ),
             "invariant: constitutional constraints still deny dangerous bash"
         );
+    }
+
+    // ── Workspace containment (issue #429) ──────────────────────────────────
+
+    #[test]
+    fn test_workspace_root_is_git_root_when_present() {
+        let (workspace, root) = isolated_workspace();
+        let nested = root.join("src");
+        std::fs::create_dir(&nested).expect("nested dir");
+        let resolved = resolve_workspace_root(&nested);
+        assert_eq!(
+            resolved, root,
+            "invariant: walking up from a nested dir must stop at the directory \
+             that contains .git; resolved={resolved:?} root={root:?}"
+        );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_workspace_root_falls_back_to_cwd_without_git() {
+        let dir = tempfile::tempdir().expect("cwd without git");
+        let cwd = dir.path().canonicalize().expect("canonical cwd");
+        let resolved = resolve_workspace_root(&cwd);
+        assert_eq!(
+            resolved, cwd,
+            "invariant: without .git the workspace root is cwd; \
+             resolved={resolved:?} cwd={cwd:?}"
+        );
+    }
+
+    #[test]
+    fn test_dotdot_escape_is_ask_user_not_allow() {
+        let (workspace, root) = isolated_workspace();
+        let manager = PermissionManager::new().with_workspace_root(root.clone());
+        let input = serde_json::json!({"file_path": "/etc/../etc/passwd"});
+        let check = manager.check_tool_use("read", &input);
+        assert!(
+            matches!(check, PermissionCheck::AskUser(_)),
+            "invariant: /etc/../etc/passwd must canonicalise to an escaped path \
+             and AskUser; got {check:?} workspace={root:?}"
+        );
+        assert!(
+            !invocation_runs_autonomously(ExecutionEffect::WorkspaceRead, "read", &input, &manager),
+            "invariant: escaped read must not auto-approve via WorkspaceRead"
+        );
+        let _keep = workspace;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_escape_is_ask_user_live_and_dangling() {
+        let (workspace, root) = isolated_workspace();
+        let manager = PermissionManager::new().with_workspace_root(root.clone());
+
+        let live = root.join("link-out");
+        std::os::unix::fs::symlink("/etc/passwd", &live).expect("live symlink");
+        let live_input = serde_json::json!({"file_path": live.to_string_lossy()});
+        let live_check = manager.check_tool_use("read", &live_input);
+        assert!(
+            matches!(live_check, PermissionCheck::AskUser(_)),
+            "invariant: a workspace symlink to a path outside the root must \
+             AskUser after canonicalisation; got {live_check:?} link={live:?}"
+        );
+        assert!(
+            !invocation_runs_autonomously(
+                ExecutionEffect::WorkspaceRead,
+                "read",
+                &live_input,
+                &manager
+            ),
+            "invariant: live symlink escape must not auto-approve"
+        );
+
+        let dangling = root.join("dangling-out");
+        std::os::unix::fs::symlink("/no/such/finch-escape-target", &dangling)
+            .expect("dangling symlink");
+        let dangling_input = serde_json::json!({"file_path": dangling.to_string_lossy()});
+        let dangling_check = manager.check_tool_use("read", &dangling_input);
+        assert!(
+            matches!(dangling_check, PermissionCheck::AskUser(_)),
+            "invariant: unresolvable symlink fail-closed as outside; \
+             got {dangling_check:?} link={dangling:?}"
+        );
+        assert!(
+            !invocation_runs_autonomously(
+                ExecutionEffect::WorkspaceRead,
+                "read",
+                &dangling_input,
+                &manager
+            ),
+            "invariant: dangling symlink must not auto-approve via ancestor fallback"
+        );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_denylist_bypass_home_path_is_ask_user() {
+        let (workspace, root) = isolated_workspace();
+        let manager = PermissionManager::new().with_workspace_root(root);
+        let home = dirs::home_dir().expect("home dir");
+        let ssh = home.join(".ssh/id_rsa");
+        let input = serde_json::json!({"file_path": ssh.to_string_lossy()});
+        let check = manager.check_tool_use("read", &input);
+        assert!(
+            matches!(check, PermissionCheck::AskUser(_)),
+            "invariant: ~/.ssh is outside the workspace and must AskUser even \
+             though it is not on the old denylist; got {check:?} path={ssh:?}"
+        );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_workspace_contained_read_still_autonomous() {
+        let (workspace, root) = isolated_workspace();
+        let inside = root.join("src.txt");
+        std::fs::write(&inside, "ok").expect("seed");
+        let manager = PermissionManager::new().with_workspace_root(root);
+        let input = serde_json::json!({"file_path": inside.to_string_lossy()});
+        assert!(
+            matches!(
+                manager.check_tool_use("read", &input),
+                PermissionCheck::AskUser(_)
+            ) || matches!(
+                manager.check_tool_use("read", &input),
+                PermissionCheck::Allow
+            ),
+            "contained read follows existing owner rules, not Deny; got {:?}",
+            manager.check_tool_use("read", &input)
+        );
+        assert!(
+            invocation_runs_autonomously(ExecutionEffect::WorkspaceRead, "read", &input, &manager),
+            "invariant: a workspace-contained WorkspaceRead still runs autonomously; \
+             path={inside:?}"
+        );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_peer_escaped_read_asks_before_silent_allow() {
+        let (workspace, root) = isolated_workspace();
+        let mgr = PermissionManager::for_peer().with_workspace_root(root);
+        let input = serde_json::json!({"file_path": "/etc/passwd"});
+        let check = mgr.check_tool_use("read", &input);
+        assert!(
+            matches!(check, PermissionCheck::AskUser(_)),
+            "invariant: containment applies before peer silent-allow; got {check:?}"
+        );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_relative_glob_does_not_count_as_path_slot() {
+        let (workspace, root) = isolated_workspace();
+        let manager = PermissionManager::new().with_workspace_root(root);
+        let input = serde_json::json!({"pattern": "**/*.rs"});
+        assert!(
+            !path_argument_escapes_workspace(
+                "glob",
+                &input,
+                manager.workspace_root(),
+                manager.cwd()
+            ),
+            "invariant: relative globs stay workspace-relative and have no path slot"
+        );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_absolute_glob_escape_is_ask_user() {
+        let (workspace, root) = isolated_workspace();
+        let manager = PermissionManager::new().with_workspace_root(root);
+        let input = serde_json::json!({"pattern": "/etc/*.conf"});
+        let check = manager.check_tool_use("glob", &input);
+        assert!(
+            matches!(check, PermissionCheck::AskUser(_)),
+            "invariant: absolute glob prefix /etc is an escaped path slot; got {check:?}"
+        );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_nonexistent_inside_path_stays_contained() {
+        let (workspace, root) = isolated_workspace();
+        let manager = PermissionManager::new().with_workspace_root(root.clone());
+        let missing = root.join("does-not-exist.txt");
+        assert!(
+            !raw_path_escapes_workspace(
+                &missing.to_string_lossy(),
+                manager.workspace_root(),
+                manager.cwd()
+            ),
+            "invariant: a missing path under the workspace is still contained; \
+             path={missing:?} root={root:?}"
+        );
+        let _keep = workspace;
     }
 }

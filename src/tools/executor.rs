@@ -5,7 +5,10 @@
 use crate::cli::ConversationHistory;
 use crate::programs::ExecutionEffect;
 use crate::tools::patterns::{ExactApproval, MatchType, PersistentPatternStore, ToolPattern};
-use crate::tools::permissions::{PermissionCheck, PermissionManager};
+use crate::tools::permissions::{
+    bash_command_is_constitutionally_denied, path_argument_for_tool, raw_path_escapes_workspace,
+    resolve_workspace_root, PermissionCheck, PermissionManager,
+};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::types::{ToolResult, ToolUse};
 use anyhow::{Context, Result};
@@ -64,6 +67,42 @@ pub struct ToolSignature {
     pub args: Option<String>,
     /// Working directory for the execution
     pub directory: Option<String>,
+    /// Discrete path argument when the tool has one (`file_path`, grep `path`,
+    /// escapable glob prefix). `None` for bash and other non-path tools.
+    pub path: Option<String>,
+    /// Whether [`Self::path`] resolved inside the workspace root. `true` when
+    /// there is no path slot (not an escape).
+    pub path_in_workspace: bool,
+    /// True when the one-shot path would constitutionally Deny this command.
+    /// Patterns must not match; [`ToolExecutor::is_approved`] returns
+    /// [`ApprovalSource::NotApproved`].
+    pub constitutionally_denied: bool,
+}
+
+impl ToolSignature {
+    /// Reconstruct the bash command string from structured parts.
+    pub fn full_command(&self) -> Option<String> {
+        match (&self.command, &self.args) {
+            (Some(cmd), Some(args)) if !args.is_empty() => Some(format!("{cmd} {args}")),
+            (Some(cmd), _) => Some(cmd.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ToolSignature {
+    fn default() -> Self {
+        Self {
+            tool_name: String::new(),
+            context_key: String::new(),
+            command: None,
+            args: None,
+            directory: None,
+            path: None,
+            path_in_workspace: true,
+            constitutionally_denied: false,
+        }
+    }
 }
 
 /// Source of approval for a tool execution
@@ -122,6 +161,10 @@ impl ToolConfirmationCache {
 
     /// Check if a signature is approved, returning the approval source
     pub fn is_approved(&mut self, sig: &ToolSignature) -> ApprovalSource {
+        if sig.constitutionally_denied {
+            return ApprovalSource::NotApproved;
+        }
+
         // 1. Check persistent exact (highest priority)
         if self.persistent.has_exact(sig) {
             // Increment match count (this makes it dirty)
@@ -134,6 +177,11 @@ impl ToolConfirmationCache {
         // 2. Check session exact
         if self.session_exact.contains(sig) {
             return ApprovalSource::SessionExact;
+        }
+
+        // Escaped paths: exact-only. A pattern can never satisfy an escape.
+        if sig.path.is_some() && !sig.path_in_workspace {
+            return ApprovalSource::NotApproved;
         }
 
         // 3. Check persistent patterns
@@ -620,8 +668,59 @@ impl ToolExecutor {
     }
 }
 
+fn path_slot_for_tool(
+    tool_name: &str,
+    input: &serde_json::Value,
+    cwd: &std::path::Path,
+    workspace_root: &std::path::Path,
+) -> (Option<String>, bool) {
+    match path_argument_for_tool(tool_name, input) {
+        Some(raw) => {
+            let in_workspace = !raw_path_escapes_workspace(&raw, workspace_root, cwd);
+            (Some(raw), in_workspace)
+        }
+        None => (None, true),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signature(
+    tool_name: impl Into<String>,
+    context_key: String,
+    command: Option<String>,
+    args: Option<String>,
+    directory: Option<String>,
+    path: Option<String>,
+    path_in_workspace: bool,
+    constitutionally_denied: bool,
+) -> ToolSignature {
+    ToolSignature {
+        tool_name: tool_name.into(),
+        context_key,
+        command,
+        args,
+        directory,
+        path,
+        path_in_workspace,
+        constitutionally_denied,
+    }
+}
+
 /// Generate a context-specific signature for a tool use
 pub fn generate_tool_signature(tool_use: &ToolUse, working_dir: &std::path::Path) -> ToolSignature {
+    let cwd = if working_dir.is_absolute() {
+        working_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|d| d.join(working_dir))
+            .unwrap_or_else(|_| working_dir.to_path_buf())
+    };
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let workspace_root = resolve_workspace_root(&cwd);
+    let (path, path_in_workspace) =
+        path_slot_for_tool(&tool_use.name, &tool_use.input, &cwd, &workspace_root);
+    let directory = Some(cwd.display().to_string());
+
     match tool_use.name.as_str() {
         "bash" => {
             let command = tool_use.input["command"].as_str().unwrap_or("");
@@ -634,88 +733,129 @@ pub fn generate_tool_signature(tool_use: &ToolUse, working_dir: &std::path::Path
                 (command.to_string(), None)
             };
 
-            ToolSignature {
-                tool_name: "bash".to_string(),
-                context_key: format!("{} in {}", command, working_dir.display()),
-                command: Some(base_cmd),
+            signature(
+                "bash",
+                format!("{} in {}", command, cwd.display()),
+                Some(base_cmd),
                 args,
-                directory: Some(working_dir.display().to_string()),
-            }
+                directory,
+                None,
+                true,
+                bash_command_is_constitutionally_denied(command),
+            )
         }
-        "read" => {
-            let file_path = tool_use.input["file_path"].as_str().unwrap_or("");
-            ToolSignature {
-                tool_name: "read".to_string(),
-                context_key: format!("reading {}", file_path),
-                command: None,
-                args: None,
-                directory: Some(working_dir.display().to_string()),
-            }
-        }
+        "read" => signature(
+            "read",
+            format!("reading {}", path.as_deref().unwrap_or("")),
+            None,
+            None,
+            directory,
+            path,
+            path_in_workspace,
+            false,
+        ),
+        "write" => signature(
+            "write",
+            format!("writing {}", path.as_deref().unwrap_or("")),
+            None,
+            None,
+            directory,
+            path,
+            path_in_workspace,
+            false,
+        ),
+        "edit" => signature(
+            "edit",
+            format!("editing {}", path.as_deref().unwrap_or("")),
+            None,
+            None,
+            directory,
+            path,
+            path_in_workspace,
+            false,
+        ),
+        "patch" => signature(
+            "patch",
+            format!("patching {}", path.as_deref().unwrap_or("")),
+            None,
+            None,
+            directory,
+            path,
+            path_in_workspace,
+            false,
+        ),
         "glob" => {
             let pattern = tool_use.input["pattern"].as_str().unwrap_or("");
-            ToolSignature {
-                tool_name: "glob".to_string(),
-                context_key: format!("pattern {}", pattern),
-                command: None,
-                args: None,
-                directory: Some(working_dir.display().to_string()),
-            }
+            signature(
+                "glob",
+                format!("pattern {}", pattern),
+                None,
+                None,
+                directory,
+                path,
+                path_in_workspace,
+                false,
+            )
         }
         "grep" => {
-            let pattern = tool_use.input["pattern"].as_str().unwrap_or("");
-            let path = tool_use
-                .input
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            ToolSignature {
-                tool_name: "grep".to_string(),
-                context_key: format!("pattern '{}' in {}", pattern, path),
-                command: None,
-                args: None,
-                directory: Some(working_dir.display().to_string()),
-            }
+            let grep_pattern = tool_use.input["pattern"].as_str().unwrap_or("");
+            let grep_path = path.as_deref().unwrap_or(".");
+            signature(
+                "grep",
+                format!("pattern '{grep_pattern}' in {grep_path}"),
+                None,
+                None,
+                directory,
+                path,
+                path_in_workspace,
+                false,
+            )
         }
         "web_fetch" => {
             let url = tool_use.input["url"].as_str().unwrap_or("");
-            ToolSignature {
-                tool_name: "web_fetch".to_string(),
-                context_key: format!("fetching {}", url),
-                command: None,
-                args: None,
-                directory: None,
-            }
+            signature(
+                "web_fetch",
+                format!("fetching {url}"),
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+            )
         }
         "train" => {
-            // Extract wait parameter if present
             let wait = tool_use.input["wait"].as_bool().unwrap_or(false);
-            ToolSignature {
-                tool_name: tool_use.name.clone(),
-                context_key: format!("train wait={}", wait),
-                command: None,
-                args: None,
-                directory: None,
-            }
+            signature(
+                tool_use.name.clone(),
+                format!("train wait={wait}"),
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+            )
         }
         "query_local_model" => {
-            // Extract query if present
             let query = tool_use.input["query"].as_str().unwrap_or("");
             let truncated_query = if query.len() > 50 {
                 format!("{}...", query.chars().take(50).collect::<String>())
             } else {
                 query.to_string()
             };
-            ToolSignature {
-                tool_name: tool_use.name.clone(),
-                context_key: format!("query_local_model: {}", truncated_query),
-                command: None,
-                args: None,
-                directory: None,
-            }
+            signature(
+                tool_use.name.clone(),
+                format!("query_local_model: {truncated_query}"),
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+            )
         }
         "analyze_model" => {
-            // Extract categories if present
             let categories = if let Some(cats) = tool_use.input["categories"].as_array() {
                 cats.iter()
                     .filter_map(|v| v.as_str())
@@ -724,46 +864,54 @@ pub fn generate_tool_signature(tool_use: &ToolUse, working_dir: &std::path::Path
             } else {
                 "all".to_string()
             };
-            ToolSignature {
-                tool_name: tool_use.name.clone(),
-                context_key: format!("analyze_model categories={}", categories),
-                command: None,
-                args: None,
-                directory: None,
-            }
+            signature(
+                tool_use.name.clone(),
+                format!("analyze_model categories={categories}"),
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+            )
         }
         "generate_training_data" => {
-            // Extract count of examples
             let examples_count = if let Some(examples) = tool_use.input["examples"].as_array() {
                 examples.len()
             } else {
                 0
             };
-            ToolSignature {
-                tool_name: tool_use.name.clone(),
-                context_key: format!("generate_training_data count={}", examples_count),
-                command: None,
-                args: None,
-                directory: None,
-            }
+            signature(
+                tool_use.name.clone(),
+                format!("generate_training_data count={examples_count}"),
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+            )
         }
-        "compare_responses" => ToolSignature {
-            tool_name: tool_use.name.clone(),
-            context_key: "compare_responses".to_string(),
-            command: None,
-            args: None,
-            directory: None,
-        },
-        _ => {
-            // Generic signature for unknown tools
-            ToolSignature {
-                tool_name: tool_use.name.clone(),
-                context_key: format!("in {}", working_dir.display()),
-                command: None,
-                args: None,
-                directory: Some(working_dir.display().to_string()),
-            }
-        }
+        "compare_responses" => signature(
+            tool_use.name.clone(),
+            "compare_responses".to_string(),
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+        ),
+        _ => signature(
+            tool_use.name.clone(),
+            format!("in {}", cwd.display()),
+            None,
+            None,
+            directory,
+            path,
+            path_in_workspace,
+            false,
+        ),
     }
 }
 
@@ -1107,6 +1255,7 @@ mod tests {
             command: Some("cargo".to_string()),
             args: Some("test".to_string()),
             directory: None,
+            ..Default::default()
         };
 
         let sig2 = ToolSignature {
@@ -1115,6 +1264,7 @@ mod tests {
             command: Some("cargo".to_string()),
             args: Some("build".to_string()),
             directory: None,
+            ..Default::default()
         };
 
         // Initially, nothing is approved
@@ -1147,6 +1297,7 @@ mod tests {
             command: Some("cargo".to_string()),
             args: Some("fmt".to_string()),
             directory: None,
+            ..Default::default()
         };
 
         // Initially not approved
@@ -1306,14 +1457,22 @@ mod tests {
         assert_eq!(sig.context_key, "compare_responses");
     }
 
+    fn isolated_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("isolated workspace");
+        std::fs::create_dir(dir.path().join(".git")).expect("git root marker");
+        let root = dir.path().canonicalize().expect("canonical workspace");
+        (dir, root)
+    }
+
     #[tokio::test]
     async fn test_persistent_edit_star_applies_without_editor_review() {
         let mut registry = crate::tools::ToolRegistry::new();
         registry.register(Box::new(crate::tools::EditTool));
+        let (workspace, root) = isolated_workspace();
         let tempdir = tempfile::tempdir().expect("isolated pattern store");
         let mut executor = ToolExecutor::new(
             registry,
-            crate::tools::PermissionManager::new(),
+            crate::tools::PermissionManager::new().with_workspace_root(root.clone()),
             tempdir.path().join("patterns.json"),
         )
         .expect("construct executor for edit:* grant");
@@ -1323,8 +1482,7 @@ mod tests {
             "Yes, and don't ask again for: edit:*".to_string(),
         ));
 
-        let workspace = tempfile::tempdir().expect("edit target");
-        let path = workspace.path().join("file.txt");
+        let path = root.join("file.txt");
         std::fs::write(&path, "before\n").expect("seed file");
         let tool_use = ToolUse::new(
             "edit".to_string(),
@@ -1334,7 +1492,12 @@ mod tests {
                 "new_string": "after",
             }),
         );
-        let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
+        let signature = generate_tool_signature(&tool_use, &root);
+        assert!(
+            signature.path_in_workspace,
+            "edit target must sit inside the fixture workspace so * remains a narrowing grant; \
+             path={path:?} root={root:?}"
+        );
         assert!(
             !matches!(
                 executor.is_approved(&signature),
@@ -1369,5 +1532,192 @@ mod tests {
             written, "after\n",
             "granted edit must write the replacement; written={written:?}"
         );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_escaped_path_is_not_pattern_admissible_through_approval_path() {
+        let (workspace, root) = isolated_workspace();
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.register(Box::new(crate::tools::ReadTool));
+        let tempdir = tempfile::tempdir().expect("pattern store");
+        let permissions = crate::tools::PermissionManager::new().with_workspace_root(root.clone());
+        let mut executor =
+            ToolExecutor::new(registry, permissions, tempdir.path().join("patterns.json"))
+                .expect("executor");
+        executor.approve_pattern_persistent(crate::tools::ToolPattern::new(
+            "*".to_string(),
+            "read".to_string(),
+            "allow all reads".to_string(),
+        ));
+
+        let escaped = ToolUse::new(
+            "read".to_string(),
+            json!({"file_path": "/etc/../etc/passwd"}),
+        );
+        let escaped_sig = generate_tool_signature(&escaped, &root);
+        assert!(
+            !escaped_sig.path_in_workspace,
+            "invariant: /etc/../etc/passwd must resolve outside the workspace; \
+             path={:?} root={root:?}",
+            escaped_sig.path
+        );
+        assert_eq!(
+            executor.is_approved(&escaped_sig),
+            ApprovalSource::NotApproved,
+            "invariant: a * grant must not admit an escaped path; \
+             signature={escaped_sig:?}"
+        );
+        assert!(
+            !crate::tools::invocation_runs_autonomously(
+                crate::programs::ExecutionEffect::WorkspaceRead,
+                "read",
+                &escaped.input,
+                executor.permissions(),
+            ),
+            "invariant: escaped read must not auto-approve at the production spawn site"
+        );
+
+        let inside = root.join("ok.txt");
+        std::fs::write(&inside, "ok").expect("seed");
+        let contained = ToolUse::new(
+            "read".to_string(),
+            json!({"file_path": inside.to_string_lossy()}),
+        );
+        let contained_sig = generate_tool_signature(&contained, &root);
+        assert!(
+            contained_sig.path_in_workspace,
+            "control: workspace file must be contained; path={inside:?}"
+        );
+        assert!(
+            matches!(
+                executor.is_approved(&contained_sig),
+                ApprovalSource::PersistentPattern(_)
+            ),
+            "control: workspace-contained path still matches *; got {:?}",
+            executor.is_approved(&contained_sig)
+        );
+        assert!(
+            crate::tools::invocation_runs_autonomously(
+                crate::programs::ExecutionEffect::WorkspaceRead,
+                "read",
+                &contained.input,
+                executor.permissions(),
+            ),
+            "control: contained WorkspaceRead still runs autonomously"
+        );
+        let _keep = workspace;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_escape_is_not_pattern_admissible_through_approval_path() {
+        let (workspace, root) = isolated_workspace();
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.register(Box::new(crate::tools::ReadTool));
+        let tempdir = tempfile::tempdir().expect("pattern store");
+        let mut executor = ToolExecutor::new(
+            registry,
+            crate::tools::PermissionManager::new().with_workspace_root(root.clone()),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("executor");
+        executor.approve_pattern_persistent(crate::tools::ToolPattern::new(
+            "*".to_string(),
+            "read".to_string(),
+            "allow all reads".to_string(),
+        ));
+
+        let live = root.join("link-out");
+        std::os::unix::fs::symlink("/etc/passwd", &live).expect("live symlink");
+        let live_use = ToolUse::new(
+            "read".to_string(),
+            json!({"file_path": live.to_string_lossy()}),
+        );
+        let live_sig = generate_tool_signature(&live_use, &root);
+        assert!(
+            !live_sig.path_in_workspace,
+            "invariant: live symlink to /etc/passwd escapes; link={live:?}"
+        );
+        assert_eq!(
+            executor.is_approved(&live_sig),
+            ApprovalSource::NotApproved,
+            "invariant: * must not admit a live symlink escape; got {:?}",
+            executor.is_approved(&live_sig)
+        );
+
+        let dangling = root.join("dangling-out");
+        std::os::unix::fs::symlink("/no/such/finch-escape-target", &dangling)
+            .expect("dangling symlink");
+        let dangling_use = ToolUse::new(
+            "read".to_string(),
+            json!({"file_path": dangling.to_string_lossy()}),
+        );
+        let dangling_sig = generate_tool_signature(&dangling_use, &root);
+        assert!(
+            !dangling_sig.path_in_workspace,
+            "invariant: dangling symlink fail-closed as outside; link={dangling:?}"
+        );
+        assert_eq!(
+            executor.is_approved(&dangling_sig),
+            ApprovalSource::NotApproved,
+            "invariant: * must not admit a dangling symlink; got {:?}",
+            executor.is_approved(&dangling_sig)
+        );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_constitutional_bash_is_not_pattern_admissible() {
+        let (workspace, root) = isolated_workspace();
+        let mut executor = create_test_executor(true, false);
+        executor.approve_pattern_persistent(crate::tools::ToolPattern::new(
+            "*".to_string(),
+            "bash".to_string(),
+            "allow all bash".to_string(),
+        ));
+        let denied = ToolUse::new("bash".to_string(), json!({"command": "rm -rf /"}));
+        let sig = generate_tool_signature(&denied, &root);
+        assert!(
+            sig.constitutionally_denied,
+            "invariant: rm -rf is constitutionally denied"
+        );
+        assert_eq!(
+            executor.is_approved(&sig),
+            ApprovalSource::NotApproved,
+            "invariant: a pattern must not admit a constitutionally Denied bash command; \
+             got {:?}",
+            executor.is_approved(&sig)
+        );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_write_edit_patch_signatures_carry_file_path() {
+        let (workspace, root) = isolated_workspace();
+        let path = root.join("file.txt");
+        for (name, prefix) in [
+            ("write", "writing"),
+            ("edit", "editing"),
+            ("patch", "patching"),
+        ] {
+            let tool_use = ToolUse::new(
+                name.to_string(),
+                json!({"file_path": path.to_string_lossy(), "content": "x", "patch": ""}),
+            );
+            let sig = generate_tool_signature(&tool_use, &root);
+            assert_eq!(sig.tool_name, name);
+            assert_eq!(sig.path.as_deref(), Some(path.to_string_lossy().as_ref()));
+            assert!(
+                sig.path_in_workspace,
+                "{name} path must be contained; sig={sig:?}"
+            );
+            assert!(
+                sig.context_key.starts_with(prefix),
+                "{name} context_key must include the path, not drop it; got {:?}",
+                sig.context_key
+            );
+        }
+        let _keep = workspace;
     }
 }
