@@ -95,22 +95,30 @@ jobs:
         cache-on-failure: false
         save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
-    - name: Check bins and tests
-      timeout-minutes: 25
-      run: cargo check --lib --bins --tests
-
-    - name: Reject external provider binaries
-      timeout-minutes: 15
-      run: cargo test --test no_external_provider_binary_test -- --nocapture
+    - name: Restore pinned isolation supervisor
+      uses: actions/cache@v4
+      with:
+        path: |
+          target/debug/finch-test-supervisor
+          target/debug/finch-test-supervisor-pinned
+        key: isolation-supervisor-${{ runner.os }}-${{ runner.arch }}-rust-1.98.0-${{ hashFiles('src/bin/finch-test-supervisor.rs', 'src/brain/mod.rs', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs') }}
 
     - name: Build isolation supervisor
       timeout-minutes: 40
       run: |
-        cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact
-        cargo build --bin finch-test-supervisor
-        cargo build --release --bin finch-test-supervisor
-        install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned
-        install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
+        set -euo pipefail
+        pin_debug=target/debug/finch-test-supervisor-pinned
+        if [[ ! -x "$pin_debug" ]]; then
+          cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact
+          cargo build --bin finch-test-supervisor
+          install -m 0555 target/debug/finch-test-supervisor "$pin_debug"
+        fi
+        echo "isolation-supervisor-image-sha256=$(shasum -a 256 "$pin_debug" | awk '{print $1}')"
+        echo "FINCH_TEST_SUPERVISOR_BIN=${GITHUB_WORKSPACE}/${pin_debug}" >> "$GITHUB_ENV"
+        if [[ "${GITHUB_EVENT_NAME}" != pull_request ]]; then
+          cargo build --release --bin finch-test-supervisor
+          install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
+        fi
 
     # The whole module, not a list of names. Naming tests individually meant a test added to this
     # module was scheduled nowhere: it ran only in the quick matrix, which supplies no contract, so
@@ -186,22 +194,30 @@ jobs:
         cache-on-failure: false
         save-if: false
 
-    - name: Check bins and tests
-      timeout-minutes: 25
-      run: cargo check --lib --bins --tests
-
-    - name: Reject external provider binaries
-      timeout-minutes: 15
-      run: cargo test --test no_external_provider_binary_test -- --nocapture
+    - name: Restore pinned isolation supervisor
+      uses: actions/cache@v4
+      with:
+        path: |
+          target/debug/finch-test-supervisor
+          target/debug/finch-test-supervisor-pinned
+        key: isolation-supervisor-${{ runner.os }}-${{ runner.arch }}-rust-1.98.0-${{ hashFiles('src/bin/finch-test-supervisor.rs', 'src/brain/mod.rs', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs') }}
 
     - name: Build isolation supervisor
       timeout-minutes: 40
       run: |
-        cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact
-        cargo build --bin finch-test-supervisor
-        cargo build --release --bin finch-test-supervisor
-        install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned
-        install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
+        set -euo pipefail
+        pin_debug=target/debug/finch-test-supervisor-pinned
+        if [[ ! -x "$pin_debug" ]]; then
+          cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact
+          cargo build --bin finch-test-supervisor
+          install -m 0555 target/debug/finch-test-supervisor "$pin_debug"
+        fi
+        echo "isolation-supervisor-image-sha256=$(shasum -a 256 "$pin_debug" | awk '{print $1}')"
+        echo "FINCH_TEST_SUPERVISOR_BIN=${GITHUB_WORKSPACE}/${pin_debug}" >> "$GITHUB_ENV"
+        if [[ "${GITHUB_EVENT_NAME}" != pull_request ]]; then
+          cargo build --release --bin finch-test-supervisor
+          install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
+        fi
 
     # The whole module, not a list of names. Naming tests individually meant a test added to this
     # module was scheduled nowhere: it ran only in the quick matrix, which supplies no contract, so

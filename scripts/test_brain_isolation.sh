@@ -1122,9 +1122,9 @@ FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
   "$supervisor" "$repo_root/scripts/test_server.sh" >/dev/null 2>&1 || profile_status=$?
 test "$profile_status" -eq 64
 
-# CI builds the release supervisor before this harness, making this a real
-# matched release-profile proof. Developer runs without that artifact retain
-# the debug and mismatch coverage above.
+# Main/schedule/dispatch CI builds the release supervisor before this harness,
+# making this a real matched release-profile proof. Pull requests and developer
+# runs without that artifact retain the debug and mismatch coverage above.
 release_supervisor="$repo_root/target/release/finch-test-supervisor-pinned"
 [[ -x "$release_supervisor" ]] || release_supervisor="$repo_root/target/release/finch-test-supervisor"
 if [[ -x "$release_supervisor" ]]; then

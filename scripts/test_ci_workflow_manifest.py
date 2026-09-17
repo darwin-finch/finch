@@ -250,7 +250,7 @@ class WorkflowContractTests(unittest.TestCase):
         start = source.index("    - name: Exercise the complete synthetic isolation harness\n", macos)
         harness = source[start:]
         source = source[:start]
-        insertion = source.index("    - name: Check bins and tests\n", macos)
+        insertion = source.index("    - name: Build isolation supervisor\n", macos)
         path.write_text(source[:insertion] + harness + "\n" + source[insertion:])
         self.assert_fails("'isolation-boundaries-macos' (macos-14) fatal steps are out of order")
 
@@ -696,7 +696,12 @@ class WorkflowContractTests(unittest.TestCase):
                     )
                     result = repository.check()
                     self.assertNotEqual(0, result.returncode, "alternate cache action passed")
-                    self.assertIn("Cargo cache allocation changed", result.stderr, result.stderr)
+                    self.assertTrue(
+                        "Cargo cache allocation changed" in result.stderr
+                        or "isolation supervisor image cache allocation changed" in result.stderr
+                        or "unreviewed cache action" in result.stderr,
+                        result.stderr,
+                    )
                     self.assertIn("windows-verifier-compile", result.stderr, result.stderr)
                 finally:
                     repository.close()
