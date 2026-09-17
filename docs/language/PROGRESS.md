@@ -120,6 +120,9 @@ Not exhaustive — flag anything found later here rather than assuming this list
    `crates/finch-vm/`. Cheap fix, no decision needed — just wrong and should be corrected or marked
    historical.
 3. **CoLisp per-parameter ownership syntax has no worked example** — see M1/#674 row above.
+   **Drafted 2026-09-17** (`FINCH_LANGUAGE_DESIGN.md`, end of "Co-Forth parity and IR
+   verification"), clearly marked as a draft, not a decision — Shammah still needs to accept,
+   amend, or reject it before #674 can treat it as settled.
 
 ## Plan: spec fixes first, then M1 by dependency order
 

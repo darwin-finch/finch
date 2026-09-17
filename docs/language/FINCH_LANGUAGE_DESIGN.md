@@ -2406,6 +2406,32 @@ and its handler and closure syntax lower to the same exceptional edges, match de
 capture records, and ownership transitions, so its direct operation mapping to typed IR loses no
 source-level guarantee. CoLisp lowers the same semantics rather than routing through Co-Forth text.
 
+**CoLisp per-parameter ownership spelling (draft — not yet frozen; flagged as missing during #674
+scoping, 2026-09-17).** CoLisp states the same mode as an explicit keyword before the binding,
+reusing the vocabulary already established for lambda `:captures` entries (`(borrow config)`,
+`(take socket)`) and parameter-pack element modes (`(borrow Ts)` in "Parameter packs, runtime rest
+arguments, and C varargs"), rather than introducing a second notation:
+
+```lisp
+(define (square (consume-value x : int)) : int
+  guarantees pure
+  (* x x))
+```
+
+An unannotated parameter defaults to `borrow`, matching the general rule in "Typed stack
+signatures" above — the same default Co-Forth uses. This is the CoLisp counterpart the Co-Forth
+`square` example under "Definitions and signatures" was missing; a shared conformance fixture can
+now check both against the same expected IR.
+
+One asymmetry to note rather than paper over: Co-Forth's `save-report` example restates its
+borrowed `path<...>` parameter in the output row (`-- S path<...> unit`) because a borrowed stack
+cell that isn't consumed still occupies the stack and the signature must say so explicitly (see
+"the surface transform therefore also shows the borrowed owner in its output row" above). CoLisp
+has no shared operand stack to preserve, so a borrowed parameter never appears in its return type —
+`(define (save-report (borrow path : path<...>) (value string)) : unit ...)` returns only `unit`,
+not the path. A literal field-for-field transliteration of the Co-Forth output row into CoLisp's
+return type would be wrong; the parity is in the ownership semantics, not the surface shape.
+
 The common IR records moves, owner/evidence erasure, borrows where relevant to verification, and
 cleanup edges. Its verifier rejects use-after-move, double drop, leaked required ownership, escaping
 borrows, mutable aliasing, and borrows live across suspension. The interpreter and future Cranelift
