@@ -107,52 +107,13 @@ impl AdapterRegistry {
             Box::new(QwenAdapter)
         }
     }
-
-    /// Get adapter from model family enum
-    pub fn from_family(family: ModelFamily) -> Box<dyn LocalModelAdapter> {
-        match family {
-            ModelFamily::Qwen => Box::new(QwenAdapter),
-            ModelFamily::Llama => Box::new(LlamaAdapter),
-            ModelFamily::Mistral => Box::new(MistralAdapter),
-            ModelFamily::Gemma => Box::new(LlamaAdapter),
-            ModelFamily::Phi => Box::new(PhiAdapter),
-            ModelFamily::DeepSeek => Box::new(DeepSeekAdapter),
-        }
-    }
 }
 
-/// Supported model families
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelFamily {
-    Qwen,
-    Llama,
-    Mistral,
-    Gemma,
-    Phi,
-    DeepSeek,
-}
-
-impl ModelFamily {
-    pub fn from_name(name: &str) -> Option<Self> {
-        let name_lower = name.to_lowercase();
-
-        if name_lower.contains("qwen") {
-            Some(ModelFamily::Qwen)
-        } else if name_lower.contains("llama") {
-            Some(ModelFamily::Llama)
-        } else if name_lower.contains("mistral") {
-            Some(ModelFamily::Mistral)
-        } else if name_lower.contains("phi") {
-            Some(ModelFamily::Phi)
-        } else if name_lower.contains("deepseek") {
-            Some(ModelFamily::DeepSeek)
-        } else if name_lower.contains("gemma") {
-            Some(ModelFamily::Gemma)
-        } else {
-            None
-        }
-    }
-}
+// #781: this module previously declared a second `ModelFamily` enum (with
+// `from_name` and `AdapterRegistry::from_family`) competing with
+// `unified_loader::ModelFamily`. Both had no production caller and drifted
+// from the loader's family table; the loader enum is now the single
+// declaration and adapters are selected by model name via `get_adapter`.
 
 #[cfg(test)]
 mod tests {
@@ -179,27 +140,5 @@ mod tests {
         // Should match DeepSeek, not Qwen
         let deepseek_qwen = AdapterRegistry::get_adapter("DeepSeek-R1-Distill-Qwen-1.5B-ONNX");
         assert_eq!(deepseek_qwen.family_name(), "DeepSeek");
-    }
-
-    #[test]
-    fn test_model_family_detection() {
-        assert_eq!(
-            ModelFamily::from_name("Qwen2.5-1.5B"),
-            Some(ModelFamily::Qwen)
-        );
-        assert_eq!(
-            ModelFamily::from_name("Llama-3-8B"),
-            Some(ModelFamily::Llama)
-        );
-        assert_eq!(
-            ModelFamily::from_name("Mistral-7B"),
-            Some(ModelFamily::Mistral)
-        );
-        assert_eq!(ModelFamily::from_name("Phi-3-mini"), Some(ModelFamily::Phi));
-        assert_eq!(
-            ModelFamily::from_name("deepseek-coder-7b"),
-            Some(ModelFamily::DeepSeek)
-        );
-        assert_eq!(ModelFamily::from_name("unknown-model"), None);
     }
 }

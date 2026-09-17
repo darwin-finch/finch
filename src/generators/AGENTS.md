@@ -28,6 +28,15 @@ needs.
 `tool_uses` / `ToolCall` events. The event loop owns execution via
 [`crate::tools::ToolLoop`] (REPL and scheduler).
 
+**Generator names are family-truthful.** `QwenGenerator::name()` reports the
+served family path (`QWEN_LOCAL_GENERATOR_NAME`, "qwen2.5-onnx"), never a bare
+"Local"; capability claims derive from the models family catalog
+(`ModelFamily::local_engine_capabilities`) instead of hardcoded prose. The
+adapter buffers complete turns — engine streaming is served through the daemon
+SSE path and recorded in the catalog, not claimed here. `DaemonLocalGenerator`
+keeps the local profile's name (family-derived for local entries); the exact
+model arrives per turn in `ResponseMetadata.model`.
+
 This facade re-exports `translate_provider_chunk` so
 `ContentBlockComplete(ToolUse)` becomes `ToolCallComplete` at the generation
 layer. Native OpenAI/Claude deltas pass through the same ToolLoop.

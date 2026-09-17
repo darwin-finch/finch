@@ -15,8 +15,6 @@ pub struct GenerationConfig { … }
 /// Registry for looking up adapters by model name
 pub struct AdapterRegistry;
 impl AdapterRegistry {
-    /// Get adapter from model family enum
-    pub fn from_family(family: ModelFamily) -> Box<dyn LocalModelAdapter>;
     /// Get appropriate adapter for a model by name
     pub fn get_adapter(model_name: &str) -> Box<dyn LocalModelAdapter>;
 }
@@ -61,6 +59,8 @@ impl ExampleBuffer {
     pub fn new(_capacity: usize) -> Self;
     pub fn total_weight(&self) -> f64;
 }
+/// Capability claims for a model family's local runtime path.
+pub struct FamilyEngineCapabilities { … }
 /// Generator configuration - supports both custom and pre-trained models
 pub enum GeneratorConfig { RandomInit, Pretrained }
 /// Unified generator model supporting multiple backends
@@ -96,8 +96,6 @@ impl GeneratorState {
 /// Inference provider selection
 pub enum InferenceProvider { Onnx, Candle }
 impl InferenceProvider {
-    /// Get description for users
-    pub fn description(&self) -> &'static str;
     /// Get human-readable name
     pub fn name(&self) -> &'static str;
 }
@@ -182,12 +180,11 @@ impl ModelDownloader {
 }
 /// Expected output for training
 pub enum ModelExpectation { RouteDecision, PatternLabel, ResponseTarget, QualityTarget }
-/// Supported model families
+/// Supported model families  This is the single `ModelFamily` declaration in the codebase.
 pub enum ModelFamily { Qwen2, Gemma2, Llama3, Mistral, Phi, DeepSeek }
 impl ModelFamily {
-    /// Get description for users
-    pub fn description(&self) -> &'static str;
-    pub fn from_name(name: &str) -> Option<Self>;
+    /// Capability claims for this family's local runtime path.
+    pub fn local_engine_capabilities(&self) -> FamilyEngineCapabilities;
     /// Get human-readable name
     pub fn name(&self) -> &'static str;
 }
@@ -501,22 +498,14 @@ pub trait TextGeneration: Send + Sync {
 ```rust
 /// Stub: Device info removed (Phase 4)
 pub fn device_info() -> String { … }
-/// Get available sizes for a model family
-pub fn get_available_sizes(family: ModelFamily) -> Vec<ModelSize> { … }
-/// Get all model families compatible with a given execution target
-pub fn get_compatible_families(target: ExecutionTarget) -> Vec<ModelFamily> { … }
 /// Stub: Device selection removed (Phase 4)
 pub fn get_device_with_preference(_preference: DevicePreference) -> Result<()> { … }
 /// Get repository ID for a specific provider, family, and size
 pub fn get_repository(provider: InferenceProvider, family: ModelFamily, size: ModelSize) -> Option<String> { … }
-/// Get supported execution targets for a model family
-pub fn get_supported_targets(family: ModelFamily) -> Vec<ExecutionTarget> { … }
 /// Install the process-wide download progress sink at a composition root.
 pub fn install_model_progress(progress: Arc<dyn ModelProgress>) { … }
 /// Currently installed host sink, if any.
 pub fn installed_model_progress() -> Option<Arc<dyn ModelProgress>> { … }
-/// Check if a model family is compatible with an execution target
-pub fn is_compatible(family: ModelFamily, target: ExecutionTarget) -> bool { … }
 /// Stub: Metal availability check removed (Phase 4)
 pub fn is_metal_available() -> bool { … }
 /// Load model metadata

@@ -6,13 +6,19 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::local::LocalGenerator;
-use crate::models::{ToolCallParser, ToolPromptFormatter};
+use crate::models::{ModelFamily, ToolCallParser, ToolPromptFormatter};
 use crate::providers::{ContentBlock, Message};
 use crate::tools::ToolDefinition;
 
 use super::{
     Generator, GeneratorCapabilities, GeneratorResponse, ResponseMetadata, StreamChunk, ToolUse,
 };
+
+/// Family-truthful identity of this generator: the compatibility adapter for
+/// the Qwen2.5-ONNX local path. Status lines, metrics, and provenance record
+/// this instead of a bare "Local", so a reader can tell which family path
+/// produced a turn.
+pub const QWEN_LOCAL_GENERATOR_NAME: &str = "qwen2.5-onnx";
 
 /// Qwen local generator implementation.
 ///
@@ -25,11 +31,17 @@ pub struct QwenGenerator {
 
 impl QwenGenerator {
     pub fn new(local_generator: Arc<RwLock<LocalGenerator>>) -> Self {
+        // Capability claims come from the family catalog, which records only
+        // engine-proven paths (see `ModelFamily::local_engine_capabilities`).
+        // This adapter always buffers complete turns, so it does not offer
+        // `generate_stream` even though the engine itself streams; the daemon
+        // SSE endpoint is the streaming surface for local generation.
+        let family_capabilities = ModelFamily::Qwen2.local_engine_capabilities();
         Self {
             local_generator,
             capabilities: GeneratorCapabilities {
                 supports_streaming: false,
-                supports_tools: true,
+                supports_tools: family_capabilities.tool_markup_proposals,
                 supports_conversation: true,
                 max_context_messages: Some(5),
             },
@@ -55,7 +67,11 @@ impl Generator for QwenGenerator {
         _messages: Vec<Message>,
         _tools: Option<Vec<ToolDefinition>>,
     ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
-        // Qwen doesn't support streaming
+        // The compatibility adapter delivers complete turns; per
+        // `capabilities()` it does not offer streaming. This is an adapter
+        // limitation, not a family claim: the engine streams this family
+        // through the per-token callback (`FamilyEngineCapabilities::
+        // engine_streaming`), and the daemon's SSE endpoint serves it.
         Ok(None)
     }
 
@@ -64,7 +80,7 @@ impl Generator for QwenGenerator {
     }
 
     fn name(&self) -> &str {
-        "Local"
+        QWEN_LOCAL_GENERATOR_NAME
     }
 }
 
@@ -124,7 +140,7 @@ impl QwenGenerator {
             }],
             tool_uses: vec![],
             metadata: ResponseMetadata {
-                generator: "local".to_string(),
+                generator: QWEN_LOCAL_GENERATOR_NAME.to_string(),
                 model: model_display_name,
                 confidence: Some(generated.confidence),
                 stop_reason: None,
@@ -255,7 +271,7 @@ fn proposal_from_output(output: &str, model: &str) -> Result<GeneratorResponse> 
             content_blocks: vec![ContentBlock::Text { text: text.clone() }],
             tool_uses: vec![],
             metadata: ResponseMetadata {
-                generator: "local".to_string(),
+                generator: QWEN_LOCAL_GENERATOR_NAME.to_string(),
                 model: model.to_string(),
                 confidence: Some(0.8),
                 stop_reason: Some("end_turn".to_string()),
@@ -296,7 +312,7 @@ fn proposal_from_output(output: &str, model: &str) -> Result<GeneratorResponse> 
         content_blocks,
         tool_uses,
         metadata: ResponseMetadata {
-            generator: "local".to_string(),
+            generator: QWEN_LOCAL_GENERATOR_NAME.to_string(),
             model: model.to_string(),
             confidence: Some(0.8),
             stop_reason: Some("tool_use".to_string()),
@@ -340,6 +356,62 @@ mod tests {
             !response.tool_uses[0].id.is_empty(),
             "proposed tool call must carry an id for the event loop: {:?}",
             response.tool_uses[0]
+        );
+    }
+
+    /// #781: the qwen path must report the family it serves, never a bare
+    /// "Local". Identity surfaces (metrics, ToolLoopIdentity, provenance) read
+    /// these strings, so a reader can tell which family path produced a turn.
+    #[test]
+    fn test_qwen_generator_name_reports_served_family() {
+        let generator = QwenGenerator::new(Arc::new(RwLock::new(LocalGenerator::new())));
+        assert_eq!(
+            generator.name(),
+            QWEN_LOCAL_GENERATOR_NAME,
+            "QwenGenerator must identify the family path it serves; got {:?}",
+            generator.name()
+        );
+        assert!(
+            !generator.name().eq_ignore_ascii_case("local"),
+            "generator name must not be the bare 'Local' placeholder; got {:?}",
+            generator.name()
+        );
+        assert_eq!(
+            generator.model_name(),
+            generator.name(),
+            "before generation the exact model is unknown, so model_name falls back to \
+             the family-truthful id; got {:?}",
+            generator.model_name()
+        );
+    }
+
+    /// #781: capability claims must come from the family catalog, not from
+    /// hardcoded prose. The adapter buffers complete turns (no generate_stream
+    /// receiver) while the engine itself streams the family.
+    #[tokio::test]
+    async fn test_qwen_generator_capabilities_match_family_catalog() {
+        let generator = QwenGenerator::new(Arc::new(RwLock::new(LocalGenerator::new())));
+        let catalog = ModelFamily::Qwen2.local_engine_capabilities();
+        assert_eq!(
+            generator.capabilities().supports_tools,
+            catalog.tool_markup_proposals,
+            "tool capability must derive from the family catalog; capabilities said \
+             supports_tools={} but catalog said {catalog:?}",
+            generator.capabilities().supports_tools
+        );
+        assert!(
+            !generator.capabilities().supports_streaming,
+            "this compatibility adapter buffers complete turns and offers no stream; \
+             capabilities said {:?}",
+            generator.capabilities()
+        );
+        let streamed = generator
+            .generate_stream(Vec::new(), None)
+            .await
+            .expect("generate_stream should not error");
+        assert!(
+            streamed.is_none(),
+            "generate_stream must decline with None (adapter buffers turns), got a receiver"
         );
     }
 }

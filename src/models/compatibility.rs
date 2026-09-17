@@ -295,51 +295,12 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
     },
 ];
 
-/// Get all model families compatible with a given execution target
-pub fn get_compatible_families(target: ExecutionTarget) -> Vec<ModelFamily> {
-    COMPATIBILITY_MATRIX
-        .iter()
-        .filter(|c| c.supported_targets.contains(&target))
-        .map(|c| c.family)
-        .collect()
-}
-
-/// Get all model families compatible with a given provider and execution target
-pub fn get_compatible_families_for_provider(
-    provider: InferenceProvider,
-    target: ExecutionTarget,
-) -> Vec<ModelFamily> {
-    COMPATIBILITY_MATRIX
-        .iter()
-        .filter(|c| {
-            // Must support the execution target
-            if !c.supported_targets.contains(&target) {
-                return false;
-            }
-
-            // Must have a repository for this provider
-            match provider {
-                InferenceProvider::Onnx => {
-                    c.onnx_size_repos.is_some() || !c.onnx_repo_template.is_empty()
-                }
-                #[cfg(feature = "candle")]
-                InferenceProvider::Candle => {
-                    c.candle_size_repos.is_some() || !c.candle_repo_template.is_empty()
-                }
-            }
-        })
-        .map(|c| c.family)
-        .collect()
-}
-
-/// Check if a model family is compatible with an execution target
-pub fn is_compatible(family: ModelFamily, target: ExecutionTarget) -> bool {
-    COMPATIBILITY_MATRIX
-        .iter()
-        .find(|c| c.family == family)
-        .map(|c| c.supported_targets.contains(&target))
-        .unwrap_or(false)
-}
+// #781: the family query functions that had no production caller
+// (`get_compatible_families`, `get_compatible_families_for_provider`,
+// `is_compatible`, `get_supported_targets`, `get_available_sizes`,
+// `get_notes`) were deleted rather than wired. The matrix keeps its one
+// wired job: resolving repositories (`get_repository`) for the loader and
+// the backend configuration.
 
 /// Get repository ID for a specific provider, family, and size
 pub fn get_repository(
@@ -351,32 +312,6 @@ pub fn get_repository(
         .iter()
         .find(|c| c.family == family)
         .and_then(|c| c.get_repository(provider, size))
-}
-
-/// Get supported execution targets for a model family
-pub fn get_supported_targets(family: ModelFamily) -> Vec<ExecutionTarget> {
-    COMPATIBILITY_MATRIX
-        .iter()
-        .find(|c| c.family == family)
-        .map(|c| c.supported_targets.to_vec())
-        .unwrap_or_default()
-}
-
-/// Get available sizes for a model family
-pub fn get_available_sizes(family: ModelFamily) -> Vec<ModelSize> {
-    COMPATIBILITY_MATRIX
-        .iter()
-        .find(|c| c.family == family)
-        .map(|c| c.sizes.to_vec())
-        .unwrap_or_default()
-}
-
-/// Get notes about a model family
-pub fn get_notes(family: ModelFamily) -> Option<&'static str> {
-    COMPATIBILITY_MATRIX
-        .iter()
-        .find(|c| c.family == family)
-        .map(|c| c.notes)
 }
 
 #[cfg(test)]
@@ -518,40 +453,6 @@ mod tests {
                 get_repository(InferenceProvider::Onnx, ModelFamily::DeepSeek, size),
                 Some("onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX".to_string())
             );
-        }
-    }
-
-    #[test]
-    fn test_is_compatible() {
-        // All families should be compatible with CPU
-        assert!(is_compatible(ModelFamily::Qwen2, ExecutionTarget::Cpu));
-        assert!(is_compatible(ModelFamily::Mistral, ExecutionTarget::Cpu));
-        assert!(is_compatible(ModelFamily::DeepSeek, ExecutionTarget::Cpu));
-
-        #[cfg(target_os = "macos")]
-        {
-            assert!(is_compatible(ModelFamily::Qwen2, ExecutionTarget::CoreML));
-            assert!(is_compatible(ModelFamily::Mistral, ExecutionTarget::CoreML));
-            assert!(is_compatible(
-                ModelFamily::DeepSeek,
-                ExecutionTarget::CoreML
-            ));
-        }
-    }
-
-    #[test]
-    fn test_get_compatible_families() {
-        let cpu_families = get_compatible_families(ExecutionTarget::Cpu);
-        assert!(cpu_families.contains(&ModelFamily::Qwen2));
-        assert!(cpu_families.contains(&ModelFamily::Mistral));
-        assert!(cpu_families.contains(&ModelFamily::DeepSeek));
-
-        #[cfg(target_os = "macos")]
-        {
-            let coreml_families = get_compatible_families(ExecutionTarget::CoreML);
-            assert!(coreml_families.contains(&ModelFamily::Qwen2));
-            assert!(coreml_families.contains(&ModelFamily::Mistral));
-            assert!(coreml_families.contains(&ModelFamily::DeepSeek));
         }
     }
 

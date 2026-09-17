@@ -33,10 +33,10 @@ pub use common::{
     device_info, get_device_with_preference, is_metal_available, DevicePreference, GeneratorConfig,
     ModelConfig, Saveable,
 };
-pub use compatibility::{
-    get_available_sizes, get_compatible_families, get_repository, get_supported_targets,
-    is_compatible, ModelCompatibility,
-};
+// #781: only `get_repository` and `ModelCompatibility` remain from the
+// compatibility matrix — every other family function there had no production
+// caller and has been deleted rather than wired.
+pub use compatibility::{get_repository, ModelCompatibility};
 pub use download::{DownloadProgress, ModelDownloader};
 pub use generator_new::{GeneratorModel, TextGeneration, TokenCallback};
 pub use learning::{LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData};
@@ -63,12 +63,45 @@ pub use tokenizer::TextTokenizer; // Phase 4: Stub for compatibility
 pub use tool_parser::ToolCallParser; // Phase 6: Parse tool calls from model output
 pub use tool_prompt::ToolPromptFormatter; // Phase 6: Format tool definitions for prompts
 pub use unified_loader::{
-    InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader,
+    FamilyEngineCapabilities, InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize,
+    UnifiedModelLoader,
 };
 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    /// #781: family description surfaces must not carry capability or quality
+    /// claims the local engine cannot honor ("Best overall quality",
+    /// "good for chat", ...). The claim-carrying `ModelFamily::description`
+    /// was deleted with this ticket; the scan pins its absence from the loader
+    /// module, which now states identity and engine-proven claims only.
+    #[test]
+    fn test_family_claim_surface_carries_no_capability_claims() {
+        let source = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/models/unified_loader.rs"),
+        )
+        .expect("read unified_loader.rs");
+        let forbidden = [
+            "Recommended",
+            "Best overall",
+            "good for chat",
+            "popular choice",
+            "Efficient",
+            "Specialized for coding",
+            "fn description",
+        ];
+        let hits: Vec<&str> = forbidden
+            .iter()
+            .filter(|phrase| source.contains(*phrase))
+            .copied()
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "model family surfaces must state identity, not capability or quality \
+             claims the local engine has not proven; found {hits:?} in unified_loader.rs"
+        );
+    }
 
     #[test]
     fn models_facade_keeps_child_modules_private() {
