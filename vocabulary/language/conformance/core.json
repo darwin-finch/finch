@@ -290,6 +290,60 @@
       "forth": "s\"\"\"The user said \"hello\".\nSecond line.\"\"\" say",
       "lisp": "(say \"The user said \\\"hello\\\".\\nSecond line.\")",
       "expected_output": "The user said \"hello\".\nSecond line."
+    },
+    {
+      "name": "composition-closure-over-record-field",
+      "level": "core",
+      "stresses": ["closure", "record"],
+      "forth": ": add-ten ( S int -- S int ! pure ) 10 + ; { name: \"Ada\" age: 37 } \"age\" record-get unwrap ['] add-ten execute",
+      "lisp": "(let ((r { :name \"Ada\" :age 37 })) ((lambda ((n : int)) (+ n 10)) (unwrap (record-get r \"age\"))))",
+      "expected_values": [{ "type": "int", "value": 47 }],
+      "expected_output": ""
+    },
+    {
+      "name": "composition-list-append-of-record-field",
+      "level": "core",
+      "stresses": ["list", "record"],
+      "forth": "[ 1 2 ] { name: \"Ada\" age: 37 } \"age\" record-get unwrap list-append 2 list-get",
+      "lisp": "(list-get (list-append (list 1 2) (unwrap (record-get { :name \"Ada\" :age 37 } \"age\"))) 2)",
+      "expected_values": [{ "type": "int", "value": 37 }],
+      "expected_output": ""
+    },
+    {
+      "name": "composition-option-wrap-of-record-field",
+      "level": "core",
+      "stresses": ["option", "record"],
+      "forth": "{ name: \"Ada\" age: 37 } \"age\" record-get unwrap some if-some 1 + else 0 then",
+      "lisp": "(match-option (some (unwrap (record-get { :name \"Ada\" :age 37 } \"age\"))) (some value (+ value 1)) (none 0))",
+      "expected_values": [{ "type": "int", "value": 38 }],
+      "expected_output": ""
+    },
+    {
+      "name": "composition-closure-over-variant-payload",
+      "level": "core",
+      "stresses": ["closure", "variant"],
+      "forth": ": add-ten ( S int -- S int ! pure ) 10 + ; 42 variant<variant{none|some(int)},some> variant-get<some> unwrap ['] add-ten execute",
+      "lisp": "((lambda ((n : int)) (+ n 10)) (unwrap (variant-get (variant variant{none|some(int)} :some 42) :some)))",
+      "expected_values": [{ "type": "int", "value": 52 }],
+      "expected_output": ""
+    },
+    {
+      "name": "composition-closure-over-result-ok-value",
+      "level": "core",
+      "stresses": ["closure", "result"],
+      "forth": ": double ( S int -- S int ! pure ) 2 * ; 5 ok if-ok ['] double execute else drop 0 then",
+      "lisp": "(match-result (ok 5) (ok value ((lambda ((n : int)) (* n 2)) value)) (err problem (begin problem 0)))",
+      "expected_values": [{ "type": "int", "value": 10 }],
+      "expected_output": ""
+    },
+    {
+      "name": "composition-option-wrap-of-list-head",
+      "level": "core",
+      "stresses": ["option", "list", "record"],
+      "forth": "[ 4 8 ] list-uncons unwrap \"head\" record-get unwrap some if-some 1 + else 0 then",
+      "lisp": "(match-option (some (unwrap (record-get (unwrap (list-uncons (list 4 8))) \"head\"))) (some value (+ value 1)) (none 0))",
+      "expected_values": [{ "type": "int", "value": 5 }],
+      "expected_output": ""
     }
   ]
 }

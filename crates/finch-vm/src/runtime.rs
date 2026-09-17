@@ -2516,7 +2516,27 @@ mod tests {
         #[serde(default)]
         expected_values: Option<Vec<TypedValue>>,
         expected_output: String,
+        /// Readiness tier this case requires. A case whose level is not in
+        /// `ACTIVE_CONFORMANCE_LEVELS` is skipped rather than asserted, so
+        /// fixtures for not-yet-implemented spec features can be authored
+        /// ahead of the implementation without failing the suite.
+        #[serde(default = "default_conformance_level")]
+        level: String,
+        /// Which spec features/fixtures this case composes, for diagnosing
+        /// a failure at scale. Not asserted on; documentation only.
+        #[serde(default)]
+        #[allow(dead_code)]
+        stresses: Vec<String>,
     }
+
+    fn default_conformance_level() -> String {
+        "core".to_string()
+    }
+
+    /// Levels the current implementation is expected to satisfy. Add a level
+    /// here only once the feature it names is actually implemented; a case
+    /// at an unlisted level is authored but intentionally not yet enforced.
+    const ACTIVE_CONFORMANCE_LEVELS: &[&str] = &["core"];
 
     #[derive(Default)]
     struct RecordingHost {
@@ -2729,7 +2749,14 @@ mod tests {
             "conformance suite must exercise at least one program"
         );
 
+        let mut ran = 0usize;
+        let mut skipped = 0usize;
         for case in suite.cases {
+            if !ACTIVE_CONFORMANCE_LEVELS.contains(&case.level.as_str()) {
+                skipped += 1;
+                continue;
+            }
+            ran += 1;
             let mut forth = TypedRuntime::new();
             let forth_result = forth.execute_source(
                 ProgramLanguage::Forth,
@@ -2778,6 +2805,11 @@ mod tests {
                 assert_eq!(forth_result.values, expected_values, "case '{}'", case.name);
             }
         }
+        assert!(
+            ran > 0,
+            "ACTIVE_CONFORMANCE_LEVELS excluded every fixture (skipped {skipped}); \
+             check for a typo against the levels authored in core.json"
+        );
     }
 
     #[test]
