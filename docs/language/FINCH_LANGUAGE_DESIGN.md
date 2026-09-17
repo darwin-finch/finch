@@ -2578,8 +2578,7 @@ touch `syntax`**. A compile-time tuple (fields, tags, type names) is an ordinary
 passed as a const generic/template parameter. `foreach` over that tuple and `if` / `switch` on
 compile-time strings or types **unroll in the residual IR**: the compiler emits specialized
 copies of the body (one per field, token, or type) for **that instantiation**, type-checked,
-not a runtime loop over types. Later calls of that generic are just that already-unrolled
-function. That is the same trick as a high-speed D parser: generated straight-line or
+not a runtime loop over types. Later calls of that generic are just that already-unrolled function. The author writes ordinary `foreach` / `if` / `switch` over values; they do not construct, quote, or inspect `syntax`. It just works because those values are compile-time constants. That is the same trick as a high-speed D parser: generated straight-line or
 jump-to-handler code, not an interpreter of the schema, and not an AST API. Syntax CTFE
 (`syntax -> syntax` then `splice`) is the optional hatch D lacked (manipulate an AST and feed
 it back to the same compiler, not `mixin(string)`). Most Finch metaprogramming should stay on
