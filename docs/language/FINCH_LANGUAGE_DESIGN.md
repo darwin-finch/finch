@@ -2118,6 +2118,24 @@ Raw pointers follow the same rule taken to its edge: they carry none of this che
 exist only inside an explicit `unsafe` boundary ("Dynamic and unsafe boundaries") and never by
 default.
 
+**Why intraprocedural checking is sufficient, and what it costs.** D, Rust, Swift, and C++ were
+studied for the difficulties they each accept: C++ has no compiler-enforced borrow lifetime at all
+(dangling references are a runtime bug, not a compile error); Rust's general lifetime system
+(explicit lifetime parameters, variance, elision rules, higher-ranked bounds) is precisely
+the source of most of the "why won't this compile" friction reported against it, in exchange for
+soundly expressing relationships a purely local analysis cannot. Finch's stance — borrow lifetime
+never outlives the call, checked without lifetime parameters — is closer to the approach the Val/
+Hylo language calls "mutable value semantics": comparable safety to Rust's borrow checker without
+its annotation surface, at a real, explicit cost, not a free lunch.
+
+The cost: a function cannot soundly return a borrow that is conditionally one of *several*
+different-lifetime input borrows (Rust's canonical `fn longest<'a>(x: &'a str, y: &'a str) -> &'a
+str` has no equivalent here). Returning a borrow only typechecks when the verifier can trace it to
+exactly one input owner — an ordinary getter returning a borrowed field, for example. A function
+that must pick between multiple borrowed inputs at runtime takes ownership (or an explicit
+`Shared<T>`) instead of borrowing; it is not a corner case the design forgot, it is the boundary
+being deliberately traded for never needing a lifetime parameter anywhere in source.
+
 ### Library ownership carriers and the compiler lifecycle kernel
 
 Unique ownership is the default for ordinary resource-bearing values. Copyability is an explicit
