@@ -2090,6 +2090,34 @@ input receiver. Their origin remains in HIR, their use is checked within the cal
 be erased, generalized, or exported as an unconstrained reference. Such an escaping boundary must
 receive ownership instead.
 
+### Design rationale: optimize for the common case, not completeness
+
+**Captured 2026-09-17 from design discussion that predates this document; the mechanism below was
+already specified, but the reasoning behind it was not written down anywhere.** Finch's memory
+model deliberately trades ceiling for velocity. `Unique<T>` and `Shared<T>` cover the large
+majority of ownership patterns and are cheap to implement, verify, and reason about; a general
+tracing collector would cover more patterns but costs far more to build and to verify. Reference
+cycles are the known gap this leaves, and general cycle collection is not built to close it: cycles
+are rare in practice, so they are handled explicitly instead — an edge marked `Weak`, the program
+breaking the cycle itself, or, rarely, an explicitly selected tracing arena (below). This is a
+scoping decision, not an oversight: a general collector is deferred because the common case does
+not need it, not because cyclic programs do not matter.
+
+The same stance extends to borrowing, and is already normative below, not new: a value defaults to
+borrow — passed like a reference, no copy, no refcount traffic — for exactly as long as the
+compiler can prove it stays within the callee's invocation ("Borrowing and taking"). At the moment
+it can't prove that, the compiler does not guess or insert a hidden allocation; it requires the
+parameter to be explicitly declared `take` (or, for a closure, an explicit capture policy —
+"Closure conversion and capture ownership"), and the caller loses use of that binding unless the
+value is a `Shared<T>`, in which case passing it retains another strong handle instead of
+invalidating the source. The default therefore never corrupts a running program when it's wrong:
+it either works silently, or fails to compile with one specific, actionable fix — never a
+use-after-free or a data race discovered at runtime.
+
+Raw pointers follow the same rule taken to its edge: they carry none of this checking, so they
+exist only inside an explicit `unsafe` boundary ("Dynamic and unsafe boundaries") and never by
+default.
+
 ### Library ownership carriers and the compiler lifecycle kernel
 
 Unique ownership is the default for ordinary resource-bearing values. Copyability is an explicit
