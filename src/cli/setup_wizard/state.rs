@@ -164,6 +164,8 @@ pub(super) struct WizardState {
     /// wizard loop; hermetic constructors leave it absent so tests and degraded
     /// environments never touch a real credential store.
     pub(super) chatgpt_authenticator: Option<std::sync::Arc<dyn ChatGptCredentialAuthenticator>>,
+    pub(super) grok_authenticator:
+        Option<std::sync::Arc<dyn crate::cli::grok_auth::GrokCredentialAuthenticator>>,
 }
 
 impl WizardState {
@@ -411,6 +413,7 @@ impl WizardState {
                 .map(|config| config.credentials().to_vec())
                 .unwrap_or_default(),
             chatgpt_authenticator: None,
+            grok_authenticator: None,
         }
     }
 

@@ -8,6 +8,28 @@ endpoint, issuer, audience, scope, token shape, account claim, and error mapping
 Tokens never become generic bearer credentials.
 
 The first production-shaped adapter is ChatGPT subscription OAuth. It is
+strictly separate from the OpenAI Platform API-key provider. SuperGrok / Grok
+subscription OAuth is the second dialect, strictly separate from the xAI
+Console API-key provider (`api.x.ai`):
+
+- OAuth authorization uses the versioned grok-build public-client compatibility
+  dialect and client identity pinned by `GROK_OAUTH_PROTOCOL_REVISION`.
+- The client identity and consumer contract are derived from
+  [grok-build commit `482711333c7195dc16a272777f86086d615e2afb`](https://github.com/xai-org/grok-build/commit/482711333c7195dc16a272777f86086d615e2afb)
+  plus xAI OIDC discovery at `https://auth.x.ai/.well-known/openid-configuration`.
+  They remain explicit compatibility risks rather than an xAI-supported
+  independent-client registration.
+- Device authorization is RFC 8628 against `https://auth.x.ai/oauth2/device/code`
+  with user verification at `https://accounts.x.ai`.
+- Subscription inference is bound only to `https://cli-chat-proxy.grok.com/v1`
+  and the `xai-grok-cli` session header.
+- `api.x.ai`, Console API keys, compatible endpoints, and silent account
+  fallback are rejected by this adapter.
+- If xAI returns `invalid_client` or HTTP 404 for device authorization, Finch
+  fails closed and saves no credential. Console API keys are a separate
+  provider with different billing; they are never an automatic fallback.
+
+The ChatGPT adapter is
 strictly separate from the OpenAI Platform API-key provider:
 
 - OAuth authorization uses the versioned OpenAI public-client compatibility

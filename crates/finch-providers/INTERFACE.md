@@ -85,12 +85,12 @@ pub enum CredentialKind { ApiKey, Bearer, OauthDevice, OauthBrowserPkce, CloudId
 /// Persisted lifecycle metadata.
 pub enum CredentialLifecycle { Active, Revoked, LegacyAmbiguous }
 /// Provider/account namespace.
-pub enum CredentialProvider { Anthropic, OpenaiPlatform, ChatgptSubscription, Xai, GeminiAiStudio, GoogleVertex, Mistral, Groq, Openrouter }
+pub enum CredentialProvider { Anthropic, OpenaiPlatform, ChatgptSubscription, Xai, GrokSubscription, GeminiAiStudio, GoogleVertex, Mistral, Groq, Openrouter }
 impl CredentialProvider {
     pub fn as_str(self) -> &'static str;
 }
 /// Normalized service family.
-pub enum EndpointFamily { AnthropicApi, OpenaiPlatform, ChatgptSubscription, XaiApi, GeminiAiStudio, GoogleVertex, MistralApi, GroqApi, OpenrouterApi, Custom }
+pub enum EndpointFamily { AnthropicApi, OpenaiPlatform, ChatgptSubscription, XaiApi, GrokSubscription, GeminiAiStudio, GoogleVertex, MistralApi, GroqApi, OpenrouterApi, Custom }
 /// Production resolver for explicit `env:VARIABLE_NAME` opaque references.
 pub struct EnvironmentCredentialResolver;
 /// Provider/model/event provenance retained with a stream event.
@@ -125,6 +125,30 @@ impl GeminiProvider {
     pub fn new(api_key: String) -> Result<Self>;
     /// Create with custom default model
     pub fn with_model(mut self, model: impl Into<String>) -> Self;
+}
+/// Secret-free stage markers for actionable device-login diagnostics.
+pub enum GrokAuthStageError { PollContract, TokenExchangeRejected, TokenExchangeContract, IdentityVerification, ClientBinding, AccountEntitlement }
+/// Status-only xAI device endpoint failures.
+pub enum GrokDeviceEndpointError { StartDisabledOrUnsupported, ClientRejected, StartRejected, PollRejected }
+/// Bounded, single-flight verifier for the exact pinned xAI issuer.
+pub struct GrokJwksVerifier { … }
+impl GrokJwksVerifier {
+    pub fn for_test(authority_origin: &str, expected_issuer: &str, client_id: &str) -> Result<Self>;
+    /// Construct the production verifier for the exact pinned xAI authority.
+    pub fn production() -> Result<Self>;
+}
+/// Finch-native SuperGrok subscription transport.
+pub struct GrokSubscriptionProvider { … }
+impl GrokSubscriptionProvider {
+    /// Construct the production SuperGrok lane from a named credential.
+    pub fn production(credential: &ProviderCredential, model: Option<&str>, reasoning_effort: Option<ReasoningEffort>) -> Result<Self>;
+}
+/// Secret-free subscription service authority used by transport wiring.
+pub struct GrokSubscriptionService { … }
+impl GrokSubscriptionService {
+    pub fn validate_account_header(&self, record: &OAuthTokenRecord, account: &str) -> Result<()>;
+    /// Reject Console API and custom origin substitution before a session token is available to the transport.
+    pub fn validate_endpoint(&self, endpoint: &str) -> Result<()>;
 }
 /// Source for an image content block
 pub struct ImageSource { … }
@@ -220,6 +244,8 @@ pub struct OpenAIProvider { … }
 impl OpenAIProvider {
     /// Create an OpenAI-compatible provider with explicit endpoint paths.
     pub fn new_compatible(api_key: String, base_url: String, chat_path: impl AsRef<str>, models_path: impl AsRef<str>, default_model: String, provider_name: String) -> Result<Self>;
+    /// OpenAI-compatible transport that sends the secret as a named header instead of `Authorization: Bearer`.
+    pub fn new_compatible_named_header(api_key: String, base_url: String, chat_path: impl AsRef<str>, models_path: impl AsRef<str>, default_model: String, provider_name: String, header_name: &'static str) -> Result<Self>;
     /// Create a new Grok provider (uses OpenAI-compatible API)
     pub fn new_grok(api_key: String) -> Result<Self>;
     /// Create a new Groq provider (fast inference, uses OpenAI-compatible API) Note: This is Groq (by Groq Inc), not Grok (by X.AI)
@@ -465,6 +491,8 @@ impl ValidatedProviderRequest {
     pub fn tool_bindings(&self) -> &Arc<ToolBindingTable>;
 }
 /// Signature-verified provider claims.
+pub struct VerifiedGrokClaims { … }
+/// Signature-verified provider claims.
 pub struct VerifiedOpenAiClaims { … }
 /// Request/response protocol used by the provider adapter for this model.
 pub enum WireProtocol { AnthropicMessages, OpenAiChatCompletions, OpenAiChatGptResponsesLite, GeminiGenerateContent }
@@ -474,6 +502,12 @@ pub struct WireProtocolCapability { … }
 pub struct WireToolIdentity { … }
 /// Wire-level kind advertised to the provider.
 pub enum WireToolKind { Function, ProviderNative }
+/// Strict xAI-specific dialect; reusable OAuth state remains in `oauth`.
+pub struct XaiGrokOAuthDialect<V> { … }
+impl XaiGrokOAuthDialect {
+    pub fn for_test(auth_origin: &str, verifier: Arc<V>) -> Result<Self>;
+    pub fn production() -> Result<Self>;
+}
 ```
 
 ## Traits
@@ -495,6 +529,11 @@ pub trait Clock: Send + Sync {
 /// Injected secret store boundary.
 pub trait CredentialResolver: Send + Sync {
     fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential>;
+}
+/// Injected JWS/JWKS verification boundary.
+pub trait GrokTokenVerifier: Send + Sync {
+    fn preflight(&self) -> Result<()>;
+    async fn verify(&self, id_token: Option<&str>, access_token: &str, cancel: &CancellationToken) -> Result<VerifiedGrokClaims>;
 }
 /// Bounded HTTP POST used by OAuth and catalog transports.
 pub trait HttpTransport: Send + Sync {
@@ -550,6 +589,8 @@ pub fn credential_dependencies<'a>(credential_name: &str, profiles: impl IntoIte
 pub fn credential_index(credentials: &[ProviderCredential]) -> Result<BTreeMap<&str, &ProviderCredential>> { … }
 pub fn default_cache_dir() -> Result<PathBuf> { … }
 pub fn fallback_catalog(provider: &str, models_url: &str) -> ModelCatalog { … }
+/// Finch-local capability attached to a verified Grok subscription credential.
+pub fn grok_required_scopes() -> BTreeSet<String> { … }
 /// Normalize a configured base URL to its lowercase scheme/host/port origin.
 pub fn normalize_origin(endpoint: &str) -> Result<String> { … }
 /// Opaque full-width cache/request identity.
@@ -583,6 +624,10 @@ pub const CHATGPT_OAUTH_PROTOCOL_REVISION: &str = "openai-codex-public-client@94
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5";
 /// Default completion budget used by Anthropic request envelopes.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8000;
+pub const GROK_OAUTH_PROTOCOL_REVISION: &str = "xai-grok-build-public-client@482711333c7195dc16a272777f86086d615e2afb+finch-binding-v1";
+pub const GROK_REQUIRED_TOKEN_ISSUER: &str = "https://auth.x.ai";
+pub const GROK_SESSION_TOKEN_HEADER: &str = "xai-grok-cli";
+pub const GROK_SUBSCRIPTION_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 /// Upper bound on advertised tools for every current wire protocol.
 pub const MAX_ADVERTISED_TOOLS: usize = 256;
 pub const OPENAI_PUBLIC_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -591,6 +636,7 @@ pub const REQUIRED_TOKEN_ISSUER: &str = "https://auth.openai.com";
 pub const STATIC_FALLBACK_AS_OF: &str = "2026-08-26";
 /// Prompt that normalizes output discipline across all LLM providers.
 pub const UNIVERSAL_ALIGNMENT_PROMPT: &str = "\ ## Output Discipline These rules override any stylistic defaults: 1. When asked for JSON, return ONLY the JSON. No markdown code fences. No prose before \ or after. The first character of your response must be `[` or `{`. 2. When given a numbered format (1. Step one\n2. Step two), follow it exactly. 3. When given field names or schema, use them verbatim — no renaming, no extras. 4. Do not add unsolicited caveats, disclaimers, or explanations unless the instruction \ explicitly requests them. 5. Treat every instruction as binding, not advisory."; /// Inject the alignment prompt into an existing system prompt, or return it standalone. /// /// The alignment instructions are prepended so they take priority over any other /// stylistic context in the system prompt. pub fn with_alignment(system: Option<&str>) -> String { match system { Some(existing) if !existing.trim().is_empty() => { format!("{}\n\n{}", UNIVERSAL_ALIGNMENT_PROMPT.trim(), existing) } _ => UNIVERSAL_ALIGNMENT_PROMPT.trim().to_string(), } } #[cfg(test)] mod tests { use super::*; #[test] fn test_with_alignment_no_system() { let result = with_alignment(None); assert!(result.contains("Output Discipline")); assert!(result.starts_with("## Output Discipline")); } #[test] fn test_with_alignment_empty_system() { let result = with_alignment(Some("")); // Empty system treated same as None — just the alignment prompt, no extra suffix assert!(result.contains("Output Discipline")); assert_eq!(result, UNIVERSAL_ALIGNMENT_PROMPT.trim()); } #[test] fn test_with_alignment_prepends_to_existing() { let result = with_alignment(Some("Be a helpful assistant.")); assert!(result.starts_with("## Output Discipline")); assert!(result.contains("Be a helpful assistant.")); // Alignment comes first let align_pos = result.find("Output Discipline").unwrap(); let system_pos = result.find("Be a helpful").unwrap(); assert!(align_pos < system_pos); } #[test] fn test_with_alignment_whitespace_only_system() { let result = with_alignment(Some(" \n ")); // Whitespace-only treated same as None assert!(result.starts_with("## Output Discipline")); } #[test] fn test_universal_alignment_prompt_has_json_rule() { assert!(UNIVERSAL_ALIGNMENT_PROMPT.contains("JSON")); assert!(UNIVERSAL_ALIGNMENT_PROMPT.contains("code fences")); } #[test] fn test_universal_alignment_prompt_has_numbered_format_rule() { assert!(UNIVERSAL_ALIGNMENT_PROMPT.contains("numbered format")); } }
+pub const XAI_PUBLIC_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 ```
 
 ## Modules

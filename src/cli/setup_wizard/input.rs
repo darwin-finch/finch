@@ -7,7 +7,19 @@
 use super::chatgpt_recovery::{
     chatgpt_setup_failure_cause, chatgpt_setup_failure_summary, spawn_add_time_chatgpt_device_flow,
 };
+use super::grok_recovery::{
+    grok_persisted_reference, grok_setup_failure_cause, grok_setup_failure_summary,
+    spawn_add_time_grok_device_flow,
+};
 use super::*;
+
+fn device_setup_failure_summary(provider_id: &str, failure: &anyhow::Error) -> String {
+    if provider_id.eq_ignore_ascii_case("grok-sub") {
+        grok_setup_failure_summary(grok_setup_failure_cause(failure))
+    } else {
+        chatgpt_setup_failure_summary(chatgpt_setup_failure_cause(failure))
+    }
+}
 
 /// Handle input for Themes section
 pub(super) fn handle_themes_input(
@@ -137,6 +149,7 @@ pub(super) fn handle_models_input(
     let catalog_cache_dir = state.catalog_cache_dir.clone();
     let credentials = state.credentials.clone();
     let chatgpt_authenticator = state.chatgpt_authenticator.clone();
+    let grok_authenticator = state.grok_authenticator.clone();
     // Credential published by a completed add-time device ceremony (#424),
     // recorded into wizard state once the section borrow ends.
     let mut record_named_credential: Option<crate::config::ProviderCredential> = None;
@@ -233,8 +246,9 @@ pub(super) fn handle_models_input(
                         // wizard; a terminal failure's cause stays visible.
                         cancel.cancel();
                         if let Some(Err(failure)) = outcome.lock().unwrap().as_ref() {
-                            let cause = chatgpt_setup_failure_cause(failure);
-                            *error = Some(chatgpt_setup_failure_summary(cause));
+                            let provider_id =
+                                CLOUD_PROVIDERS[(*provider_idx).min(CLOUD_PROVIDERS.len() - 1)].0;
+                            *error = Some(device_setup_failure_summary(provider_id, failure));
                         }
                         *adding_provider = Some(AddProviderStep::ConfigureRemote {
                             provider_idx: *provider_idx,
@@ -723,7 +737,10 @@ pub(super) fn handle_models_input(
                                     name: CLOUD_PROVIDERS[selected].0.to_string(),
                                     model: default_model,
                                     api_key: remote_api_key_input(CLOUD_PROVIDERS[selected].0),
-                                    focused_field: if CLOUD_PROVIDERS[selected].0 == "chatgpt" {
+                                    focused_field: if matches!(
+                                        CLOUD_PROVIDERS[selected].0,
+                                        "chatgpt" | "grok-sub"
+                                    ) {
                                         1
                                     } else {
                                         3
@@ -795,7 +812,8 @@ pub(super) fn handle_models_input(
                                     editing_idx,
                                     provider_id,
                                 );
-                                if provider_id.eq_ignore_ascii_case("chatgpt")
+                                if (provider_id.eq_ignore_ascii_case("chatgpt")
+                                    || provider_id.eq_ignore_ascii_case("grok-sub"))
                                     && editing_idx.is_none()
                                 {
                                     // #424: run the device exchange here, in
@@ -805,13 +823,54 @@ pub(super) fn handle_models_input(
                                     // sitting. Editing an existing profile
                                     // keeps its credential untouched; the
                                     // save-time ceremony still validates it.
-                                    if let Some(authenticator) = chatgpt_authenticator.as_ref() {
+                                    if provider_id.eq_ignore_ascii_case("chatgpt") {
+                                        if let Some(authenticator) = chatgpt_authenticator.as_ref()
+                                        {
+                                            let reference =
+                                                chatgpt_persisted_reference(persisted.as_ref());
+                                            let pending = Arc::new(Mutex::new(None));
+                                            let outcome: DeviceAuthOutcome =
+                                                Arc::new(Mutex::new(None));
+                                            let cancel = tokio_util::sync::CancellationToken::new();
+                                            spawn_add_time_chatgpt_device_flow(
+                                                authenticator.clone(),
+                                                reference.clone(),
+                                                pending.clone(),
+                                                outcome.clone(),
+                                                cancel.clone(),
+                                            );
+                                            Some(AddProviderStep::DeviceAuth {
+                                                provider_idx,
+                                                name,
+                                                model: resolved_model,
+                                                reference,
+                                                editing_idx,
+                                                pending,
+                                                outcome,
+                                                cancel,
+                                            })
+                                        } else {
+                                            commit_remote_provider(
+                                                primary_model,
+                                                tool_models,
+                                                selected_idx,
+                                                provider_id,
+                                                &name,
+                                                &resolved_model,
+                                                api_key,
+                                                editing_idx,
+                                                persisted,
+                                            );
+                                            None
+                                        }
+                                    } else if let Some(authenticator) = grok_authenticator.as_ref()
+                                    {
                                         let reference =
-                                            chatgpt_persisted_reference(persisted.as_ref());
+                                            grok_persisted_reference(persisted.as_ref());
                                         let pending = Arc::new(Mutex::new(None));
                                         let outcome: DeviceAuthOutcome = Arc::new(Mutex::new(None));
                                         let cancel = tokio_util::sync::CancellationToken::new();
-                                        spawn_add_time_chatgpt_device_flow(
+                                        spawn_add_time_grok_device_flow(
                                             authenticator.clone(),
                                             reference.clone(),
                                             pending.clone(),
@@ -890,7 +949,7 @@ pub(super) fn handle_models_input(
                                         editing_idx,
                                         provider_id,
                                     );
-                                    record_named_credential = Some(ensured.credential);
+                                    record_named_credential = Some(ensured);
                                     commit_remote_provider(
                                         primary_model,
                                         tool_models,
@@ -907,13 +966,28 @@ pub(super) fn handle_models_input(
                                 // Terminal failure: surface the cause and restart
                                 // the ceremony for this one provider on Enter.
                                 Some(Err(failure)) => {
-                                    let cause = chatgpt_setup_failure_cause(&failure);
-                                    *error = Some(chatgpt_setup_failure_summary(cause));
+                                    let provider_id = CLOUD_PROVIDERS
+                                        [provider_idx.min(CLOUD_PROVIDERS.len() - 1)]
+                                    .0;
+                                    *error =
+                                        Some(device_setup_failure_summary(provider_id, &failure));
                                     let retry_pending = Arc::new(Mutex::new(None));
                                     let retry_outcome: DeviceAuthOutcome =
                                         Arc::new(Mutex::new(None));
                                     let retry_cancel = tokio_util::sync::CancellationToken::new();
-                                    if let Some(authenticator) = chatgpt_authenticator.as_ref() {
+                                    if provider_id.eq_ignore_ascii_case("grok-sub") {
+                                        if let Some(authenticator) = grok_authenticator.as_ref() {
+                                            spawn_add_time_grok_device_flow(
+                                                authenticator.clone(),
+                                                reference.clone(),
+                                                retry_pending.clone(),
+                                                retry_outcome.clone(),
+                                                retry_cancel.clone(),
+                                            );
+                                        }
+                                    } else if let Some(authenticator) =
+                                        chatgpt_authenticator.as_ref()
+                                    {
                                         spawn_add_time_chatgpt_device_flow(
                                             authenticator.clone(),
                                             reference.clone(),
@@ -1061,7 +1135,7 @@ pub(super) fn handle_models_input(
             if !accepts_api_key {
                 *editing_mode = false;
                 *error = Some(
-                    "ChatGPT subscription uses a named Finch device credential, not an API key"
+                    "This provider uses a named subscription credential, not an API key. Console API keys bill separately and are a different provider."
                         .into(),
                 );
                 return Ok(false);
@@ -1177,10 +1251,10 @@ pub(super) fn handle_models_input(
                             provider_idx,
                             name: name.clone(),
                             model: model.clone(),
-                            api_key: if provider.eq_ignore_ascii_case("chatgpt") {
-                                None
-                            } else {
+                            api_key: if provider_requires_inline_api_key(provider) {
                                 Some(api_key.clone())
+                            } else {
+                                None
                             },
                             focused_field: 1,
                             editing_idx: Some(*selected_idx),

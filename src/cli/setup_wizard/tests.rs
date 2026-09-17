@@ -1455,6 +1455,18 @@ fn chatgpt_configuration_has_no_api_key_input_buffer_or_render_path() {
     handle_models_input(&mut state, key(KeyCode::Up)).unwrap();
     handle_models_input(&mut state, key(KeyCode::Up)).unwrap();
     handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+    assert!(
+        matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote {
+                api_key: Some(_),
+                ..
+            })
+        ),
+        "the Console Grok API row after ChatGPT and SuperGrok must expose an API-key buffer; step={:?}",
+        get_step(&state)
+    );
     for character in "sk-platform-must-not-cross".chars() {
         handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
         handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
@@ -1471,6 +1483,7 @@ fn chatgpt_configuration_has_no_api_key_input_buffer_or_render_path() {
             ..
         }) if key == "sk-platform-must-not-cross"
     ));
+    handle_models_input(&mut state, key(KeyCode::Left)).unwrap();
     handle_models_input(&mut state, key(KeyCode::Left)).unwrap();
     let step = get_step(&state).unwrap();
     assert!(matches!(
@@ -3876,12 +3889,36 @@ fn test_provider_editor_identity_table_matches_catalog() {
             crate::config::CredentialProvider::ChatgptSubscription,
             "chatgpt",
         ),
+        (
+            crate::config::CredentialProvider::GrokSubscription,
+            "grok-sub",
+        ),
         (crate::config::CredentialProvider::Xai, "grok"),
         (crate::config::CredentialProvider::GeminiAiStudio, "gemini"),
         (crate::config::CredentialProvider::Mistral, "mistral"),
         (crate::config::CredentialProvider::Groq, "groq"),
         (crate::config::CredentialProvider::Openrouter, "openrouter"),
     ];
+
+    assert!(
+        !provider_requires_inline_api_key("grok-sub") && provider_requires_inline_api_key("grok"),
+        "SuperGrok subscription and xAI Console API-key auth must remain separate wizard choices"
+    );
+    let sub = CLOUD_PROVIDERS
+        .iter()
+        .find(|(id, _, _, _)| *id == "grok-sub")
+        .expect("grok-sub wizard choice");
+    let api = CLOUD_PROVIDERS
+        .iter()
+        .find(|(id, _, _, _)| *id == "grok")
+        .expect("grok API-key wizard choice");
+    assert!(
+        sub.1.contains("subscription")
+            && sub.3.contains("not an xAI API key")
+            && api.1.contains("API")
+            && api.3.contains("billed separately"),
+        "wizard copy must name SuperGrok entitlement versus Console billing: sub={sub:?} api={api:?}"
+    );
 
     for (credential_provider, expected_editor) in cases {
         let provider = ProviderEntry::Credentialed {
@@ -5998,5 +6035,352 @@ fn add_time_device_dialog_presents_code_and_verification_url_as_text() {
     assert!(
         rendered.contains("Esc: Cancel"),
         "the dialog must advertise its cancellation key; rendered={rendered}"
+    );
+}
+
+struct ScriptedGrokAddTimeAuthenticator {
+    begin: std::sync::Mutex<
+        std::collections::VecDeque<
+            Result<crate::cli::grok_auth::GrokNamedCredentialStart, anyhow::Error>,
+        >,
+    >,
+    finish: std::sync::Mutex<
+        std::collections::VecDeque<
+            Result<crate::cli::grok_auth::EnsuredGrokCredential, anyhow::Error>,
+        >,
+    >,
+    begins: std::sync::atomic::AtomicUsize,
+    finishes: std::sync::atomic::AtomicUsize,
+}
+
+impl ScriptedGrokAddTimeAuthenticator {
+    fn new(
+        begin: impl IntoIterator<
+            Item = Result<crate::cli::grok_auth::GrokNamedCredentialStart, anyhow::Error>,
+        >,
+        finish: impl IntoIterator<
+            Item = Result<crate::cli::grok_auth::EnsuredGrokCredential, anyhow::Error>,
+        >,
+    ) -> Self {
+        Self {
+            begin: std::sync::Mutex::new(begin.into_iter().collect()),
+            finish: std::sync::Mutex::new(finish.into_iter().collect()),
+            begins: std::sync::atomic::AtomicUsize::new(0),
+            finishes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::cli::grok_auth::GrokCredentialAuthenticator for ScriptedGrokAddTimeAuthenticator {
+    async fn ensure_named_credential(
+        &self,
+        _reference: &str,
+        _presentation: crate::cli::grok_auth::DeviceLoginPresentation,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::cli::grok_auth::EnsuredGrokCredential> {
+        anyhow::bail!("the add-time dialog must drive the phased ceremony, not the combined one")
+    }
+
+    async fn begin_named_credential(
+        &self,
+        _reference: &str,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::cli::grok_auth::GrokNamedCredentialStart> {
+        self.begins
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.begin.lock().unwrap().pop_front() {
+            Some(outcome) => outcome,
+            None => anyhow::bail!("scripted grok add-time begin missing"),
+        }
+    }
+
+    async fn finish_named_credential(
+        &self,
+        _reference: &str,
+        _pending: &crate::oauth::DeviceAuthorization,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::cli::grok_auth::EnsuredGrokCredential> {
+        self.finishes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.finish.lock().unwrap().pop_front() {
+            Some(outcome) => outcome,
+            None => anyhow::bail!("scripted grok add-time finish missing"),
+        }
+    }
+}
+
+fn grok_sub_provider_idx() -> usize {
+    CLOUD_PROVIDERS
+        .iter()
+        .position(|(id, ..)| *id == "grok-sub")
+        .unwrap()
+}
+
+fn grok_setup_credential(reference: &str, account: &str) -> crate::config::ProviderCredential {
+    crate::config::ProviderCredential {
+        name: reference.into(),
+        kind: crate::config::CredentialKind::OauthDevice,
+        provider: crate::config::CredentialProvider::GrokSubscription,
+        issuer: "xai-grok".into(),
+        audience: crate::config::AudienceBinding::standard(
+            crate::config::EndpointFamily::GrokSubscription,
+        ),
+        tenant: None,
+        project: None,
+        account: Some(account.into()),
+        scopes: crate::providers::grok_required_scopes(),
+        secret_ref: format!("oauth-store:{reference}"),
+        lifecycle: crate::config::CredentialLifecycle::Active {
+            expires_at: Some(Utc::now() + chrono::TimeDelta::hours(1)),
+            refreshable: true,
+        },
+        revocation: Default::default(),
+    }
+}
+
+fn grok_ensured_for(
+    reference: &str,
+    account: &str,
+) -> crate::cli::grok_auth::EnsuredGrokCredential {
+    crate::cli::grok_auth::EnsuredGrokCredential {
+        credential: grok_setup_credential(reference, account),
+        compensation: Some(crate::cli::grok_auth::GrokCompensationHandle::issued(
+            reference,
+            "generation-1".into(),
+        )),
+    }
+}
+
+fn grok_add_time_device_authorization(user_code: &str) -> crate::oauth::DeviceAuthorization {
+    crate::oauth::DeviceAuthorization::issued(
+        "device-code-secret".into(),
+        user_code.into(),
+        "https://accounts.x.ai/sign-in/device".into(),
+        None,
+        Duration::from_secs(600),
+        Duration::from_secs(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn confirming_a_grok_sub_provider_runs_the_device_exchange_in_the_dialog() {
+    let fake = Arc::new(ScriptedGrokAddTimeAuthenticator::new(
+        [Ok(
+            crate::cli::grok_auth::GrokNamedCredentialStart::AuthorizationRequired(
+                grok_add_time_device_authorization("GROK-1234"),
+            ),
+        )],
+        [Ok(grok_ensured_for("grok-sub:default", "acct-work"))],
+    ));
+    let mut state = state_with_step(AddProviderStep::SelectAddType {
+        selected: grok_sub_provider_idx(),
+    });
+    state.current_section = WizardSection::Models;
+    state.grok_authenticator = Some(fake);
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(
+        matches!(get_step(&state), Some(AddProviderStep::DeviceAuth { .. })),
+        "confirming SuperGrok must open the device dialog instead of adding the row silently; step={:?}",
+        get_step(&state)
+    );
+
+    let presented = wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { pending, .. }) => pending.lock().unwrap().clone(),
+            _ => None,
+        },
+        "the SuperGrok one-time code",
+    );
+    assert_eq!(presented.user_code, "GROK-1234");
+    assert_eq!(
+        presented.verification_uri,
+        "https://accounts.x.ai/sign-in/device"
+    );
+    wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { outcome, .. }) => {
+                outcome.lock().unwrap().is_some().then_some(())
+            }
+            _ => None,
+        },
+        "the SuperGrok terminal outcome",
+    );
+
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("Grok subscription device sign-in")
+            && rendered.contains("Signed in as acct-work"),
+        "the dialog must name SuperGrok, not ChatGPT; rendered={rendered}"
+    );
+    assert!(
+        !rendered.contains("ChatGPT device sign-in"),
+        "SuperGrok overlay must not reuse ChatGPT copy; rendered={rendered}"
+    );
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    let primary =
+        get_primary(&state).expect("the models section must survive the SuperGrok ceremony");
+    assert!(
+        matches!(primary, ModelConfig::Remote { provider, .. } if provider == "grok-sub"),
+        "the grok-sub lane must be added after a successful exchange; got {primary:?}"
+    );
+    assert_eq!(state.credentials.len(), 1);
+    assert_eq!(state.credentials[0].name, "grok-sub:default");
+    assert_eq!(
+        state.credentials[0].provider,
+        crate::config::CredentialProvider::GrokSubscription
+    );
+}
+
+#[test]
+fn grok_sub_device_404_fails_closed_without_api_key_fallback() {
+    let fake = Arc::new(ScriptedGrokAddTimeAuthenticator::new(
+        [Err(
+            crate::providers::GrokDeviceEndpointError::StartDisabledOrUnsupported.into(),
+        )],
+        [],
+    ));
+    let mut state = state_with_step(AddProviderStep::SelectAddType {
+        selected: grok_sub_provider_idx(),
+    });
+    state.current_section = WizardSection::Models;
+    state.grok_authenticator = Some(fake);
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { outcome, .. }) => {
+                outcome.lock().unwrap().is_some().then_some(())
+            }
+            _ => None,
+        },
+        "the SuperGrok 404 outcome",
+    );
+
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("disabled or unsupported") && rendered.contains("No credential was"),
+        "a missing public device flow must fail closed with no credential; rendered={rendered}"
+    );
+    assert!(
+        rendered.contains("will not invent")
+            && rendered.contains("Console API-key billing"),
+        "404 copy must refuse a fake OAuth button and Console billing fallback; rendered={rendered}"
+    );
+    assert!(
+        !rendered.to_lowercase().contains("use an xai api key"),
+        "API keys bill separately and must not be an automatic fallback; rendered={rendered}"
+    );
+    assert!(state.credentials.is_empty());
+}
+
+#[test]
+fn grok_sub_invalid_client_fails_closed_without_api_key_fallback() {
+    let fake = Arc::new(ScriptedGrokAddTimeAuthenticator::new(
+        [Err(
+            crate::providers::GrokDeviceEndpointError::ClientRejected.into(),
+        )],
+        [],
+    ));
+    let mut state = state_with_step(AddProviderStep::SelectAddType {
+        selected: grok_sub_provider_idx(),
+    });
+    state.current_section = WizardSection::Models;
+    state.grok_authenticator = Some(fake);
+
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    wait_for(
+        || match get_step(&state) {
+            Some(AddProviderStep::DeviceAuth { outcome, .. }) => {
+                outcome.lock().unwrap().is_some().then_some(())
+            }
+            _ => None,
+        },
+        "the SuperGrok invalid_client outcome",
+    );
+
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("invalid_client") && rendered.contains("No credential was saved"),
+        "independent-client rejection must fail closed with no credential; rendered={rendered}"
+    );
+    assert!(
+        rendered.contains("will not switch to Console API-key billing"),
+        "invalid_client copy must refuse Console billing fallback; rendered={rendered}"
+    );
+    assert!(
+        !rendered.to_lowercase().contains("use an xai api key"),
+        "API keys bill separately and must not be an automatic fallback; rendered={rendered}"
+    );
+    assert!(state.credentials.is_empty());
+}
+
+#[test]
+fn grok_sub_does_not_accept_console_api_key_edits() {
+    let grok_sub = ModelConfig::Remote {
+        provider: "grok-sub".into(),
+        name: "Grok subscription (SuperGrok)".into(),
+        api_key: String::new(),
+        model: "grok-4.6".into(),
+        enabled: true,
+        persisted: None,
+    };
+    let grok_api = ModelConfig::Remote {
+        provider: "grok".into(),
+        name: "Grok API (xAI Console)".into(),
+        api_key: String::new(),
+        model: String::new(),
+        enabled: true,
+        persisted: None,
+    };
+    assert!(
+        !grok_sub.accepts_api_key(),
+        "SuperGrok must not take a Console API key; that lane bills separately"
+    );
+    assert!(
+        grok_api.accepts_api_key(),
+        "the explicit xAI Console provider still takes an API key"
+    );
+
+    let mut state = WizardState::new_with_catalog_cache_dir(None, None);
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models {
+        primary_model,
+        editing_mode,
+        selected_idx,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        *primary_model = grok_sub;
+        *editing_mode = true;
+        *selected_idx = 0;
+    }
+    handle_models_input(&mut state, key(KeyCode::Char('x'))).unwrap();
+    assert!(
+        matches!(
+            get_primary(&state),
+            Some(ModelConfig::Remote {
+                provider,
+                api_key,
+                ..
+            }) if provider == "grok-sub" && api_key.is_empty()
+        ),
+        "typing into SuperGrok must not store a Console key; primary={:?}",
+        get_primary(&state)
+    );
+    let rendered = render_wizard_text(&state);
+    assert!(
+        rendered.contains("not an API key") || rendered.contains("bill separately"),
+        "the editor must refuse Console billing on grok-sub; rendered={rendered}"
+    );
+    assert!(
+        !rendered.contains("Edit API Key"),
+        "SuperGrok must not open the API-key editor; rendered={rendered}"
     );
 }

@@ -5,7 +5,7 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 **Owns** `crates/finch-providers/src/`: the `LlmProvider` / `ProviderBackend` dispatch
 boundary, provider-neutral wire types and stream events, model catalog, capabilities,
 usage/allowance, OAuth lifecycle (`oauth` module), provider-specific OAuth dialects,
-and the Claude / OpenAI-compatible / Gemini / ChatGPT adapters.
+and the Claude / OpenAI-compatible / Gemini / ChatGPT / SuperGrok adapters.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`. Child
 modules are private; the `pub use` list is the whole public surface. Finch consumes
@@ -51,8 +51,8 @@ effects are injected through [`ProviderPorts`](src/ports.rs).
 ```
 
 Feature-disabled builds: `cargo check -p finch-providers --no-default-features`.
-Default features enable the current Claude, OpenAI-compatible, Gemini, and ChatGPT
-adapters.
+Default features enable the current Claude, OpenAI-compatible, Gemini, ChatGPT,
+and SuperGrok subscription adapters.
 
 **Agent-context audit:** a worker can understand, implement against, and test this
 crate from this capsule plus `INTERFACE.md` without opening Finch application

@@ -9,13 +9,14 @@ description = "Provider-neutral LLM transports, OAuth, catalogs, and credential 
 repository = "https://github.com/darwin-finch/finch"
 
 [features]
-default = ["claude", "openai", "gemini", "chatgpt"]
+default = ["claude", "openai", "gemini", "chatgpt", "grok_subscription"]
 # Adapter features gate optional transports. They currently share HTTP/crypto
 # dependencies; disabling a feature excludes that adapter's module.
 claude = []
 openai = []
 gemini = []
 chatgpt = ["openai"]
+grok_subscription = ["openai"]
 
 [dependencies]
 anyhow = "1.0"

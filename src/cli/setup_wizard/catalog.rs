@@ -65,7 +65,8 @@ pub(super) struct DeviceAuthPresentation {
 
 /// Terminal result of the add-time device ceremony, published by the
 /// background flow and read by the dialog's input and render paths.
-pub(super) type DeviceAuthOutcome = Arc<Mutex<Option<anyhow::Result<EnsuredChatGptCredential>>>>;
+pub(super) type DeviceAuthOutcome =
+    Arc<Mutex<Option<anyhow::Result<crate::config::ProviderCredential>>>>;
 
 /// Cloud provider options shown in the add-provider overlay
 pub(super) const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
@@ -76,10 +77,16 @@ pub(super) const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "Finch-native device sign-in starts after the wizard; not an OpenAI API key",
     ),
     (
+        "grok-sub",
+        "Grok subscription (SuperGrok)",
+        "grok-4.6",
+        "device sign-in uses SuperGrok entitlement; not an xAI API key and not Console billing",
+    ),
+    (
         "grok",
-        "Grok (xAI)",
+        "Grok API (xAI Console)",
         "",
-        "get key at console.x.ai (X Premium+ included)",
+        "API key from console.x.ai; billed separately from SuperGrok",
     ),
     (
         "claude",
@@ -132,6 +139,10 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
             ..
         } => Some("chatgpt"),
         ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::GrokSubscription,
+            ..
+        } => Some("grok-sub"),
+        ProviderEntry::Credentialed {
             provider: crate::config::CredentialProvider::Xai,
             ..
         }
@@ -170,7 +181,7 @@ pub(super) fn registered_editor_id(provider: &ProviderEntry) -> Option<&'static 
 pub(super) fn provider_requires_inline_api_key(provider: &str) -> bool {
     !matches!(
         provider.to_ascii_lowercase().as_str(),
-        "chatgpt" | "ollama" | "finch"
+        "chatgpt" | "grok-sub" | "ollama" | "finch"
     )
 }
 
@@ -464,7 +475,10 @@ impl ModelConfig {
     }
 
     pub(super) fn accepts_api_key(&self) -> bool {
-        matches!(self, Self::Remote { provider, .. } if !provider.eq_ignore_ascii_case("chatgpt"))
+        match self {
+            Self::Remote { provider, .. } => provider_requires_inline_api_key(provider),
+            Self::Local { .. } => false,
+        }
     }
 
     #[allow(dead_code)]
@@ -743,6 +757,25 @@ pub(super) fn provider_entry_from_remote_model(
             models_path: None,
             name,
             reasoning_effort: None,
+        },
+        _ if provider.eq_ignore_ascii_case("grok-sub") => ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::GrokSubscription,
+            credential: crate::config::CredentialBinding {
+                credential_ref: "grok-sub:default".into(),
+                audience: Some(crate::config::AudienceBinding::standard(
+                    crate::config::EndpointFamily::GrokSubscription,
+                )),
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: crate::providers::grok_required_scopes(),
+            },
+            model,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name,
+            reasoning_effort: Some(crate::config::ReasoningEffort::Medium),
         },
         _ => ProviderEntry::from_teacher_entry(&TeacherEntry {
             provider: provider.to_string(),

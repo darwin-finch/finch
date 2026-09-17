@@ -1021,6 +1021,12 @@ fn finalize_tool_calls(
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthHeader {
+    Bearer,
+    Named(&'static str),
+}
+
 /// OpenAI API provider
 ///
 /// Supports both OpenAI and Grok APIs (they use the same format).
@@ -1033,6 +1039,7 @@ pub struct OpenAIProvider {
     provider_name: String,
     reasoning_effort: Option<ReasoningEffort>,
     canonical_openai_endpoint: bool,
+    auth_header: AuthHeader,
 }
 
 impl OpenAIProvider {
@@ -1181,7 +1188,44 @@ impl OpenAIProvider {
             provider_name,
             reasoning_effort: None,
             canonical_openai_endpoint,
+            auth_header: AuthHeader::Bearer,
         })
+    }
+
+    /// OpenAI-compatible transport that sends the secret as a named header
+    /// instead of `Authorization: Bearer`. Used by the SuperGrok subscription
+    /// lane (`xai-grok-cli`); never by Console API-key profiles.
+    pub fn new_compatible_named_header(
+        api_key: String,
+        base_url: String,
+        chat_path: impl AsRef<str>,
+        models_path: impl AsRef<str>,
+        default_model: String,
+        provider_name: String,
+        header_name: &'static str,
+    ) -> Result<Self> {
+        if header_name.trim().is_empty() || header_name.chars().any(char::is_control) {
+            anyhow::bail!("OpenAI-compatible named auth header is invalid");
+        }
+        let mut provider = Self::new(
+            api_key,
+            base_url,
+            chat_path.as_ref(),
+            models_path.as_ref(),
+            default_model,
+            provider_name,
+        )?;
+        provider.auth_header = AuthHeader::Named(header_name);
+        Ok(provider)
+    }
+
+    fn authorize(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.auth_header {
+            AuthHeader::Bearer => {
+                builder.header("Authorization", format!("Bearer {}", self.api_key))
+            }
+            AuthHeader::Named(name) => builder.header(name, &self.api_key),
+        }
     }
 
     fn transport_rule(&self, model: &str) -> TransportRule {
@@ -1610,9 +1654,7 @@ impl OpenAIProvider {
         );
 
         let response = self
-            .client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .authorize(self.client.post(url))
             .header("content-type", "application/json")
             .json(&openai_request)
             .send()
@@ -1681,9 +1723,7 @@ impl OpenAIProvider {
         tracing::debug!("Sending streaming request to OpenAI API");
 
         let response = self
-            .client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .authorize(self.client.post(url))
             .header("content-type", "application/json")
             .json(&openai_request)
             .send()
