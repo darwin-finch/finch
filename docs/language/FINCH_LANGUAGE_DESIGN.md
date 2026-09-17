@@ -2430,8 +2430,11 @@ versioned specification must state:
 - supported macro phase and hygiene rules;
 - absence or presence of continuations, dynamic scope, multiple values, and reader extensions.
 
-Initially exclude general continuations and unrestricted reader/runtime `eval`. Add them only with a
-clear typed/effect model.
+Initially exclude general continuations. There is no user-facing `eval` or `compile(syntax)` that
+runs an arbitrary tree in the current environment. Mix-back of generated syntax is **compile-time
+only** (CTFE, `static if`, generics, `splice` into the module being compiled). Shipping a program
+to a node is compiling a **compilation unit** with a granted capability set, not `(eval form)` in
+the language. Add continuations only with a clear typed/effect model.
 
 ### Functions and annotations
 
@@ -2552,12 +2555,19 @@ an ordinary function is **call convention**, not a second evaluator:
 - `define-syntax`: arguments are not evaluated; `(when ready? (pkg.ensure nginx))` is compiled as
   `(splice (expand-when '(when ready? (pkg.ensure nginx))))`.
 
-`splice` is an ordinary word (Co-Forth: the explicit splice word already listed with
-`macro:` / `syntax[ ... ]`). Its meaning is: this `syntax` **value** is the next form in the
-current module. It does not `eval`. The compiler’s following phases (check, lower, verify) treat
-that tree as source. The expander **returns data**; later phases make it executable. Calling
-`pkg.ensure` inside a `syntax -> syntax` function would be a compile-time host effect and is
+`splice` is an ordinary **compile-time** word (Co-Forth: the explicit splice word already listed
+with `macro:` / `syntax[ ... ]`). Its meaning is: this `syntax` **value** is the next form in the
+**module being compiled**. It is not runtime `eval`. The compiler’s following phases (check, lower,
+verify) treat that tree as source. The expander **returns data**; later phases make it executable.
+Calling `pkg.ensure` inside a `syntax -> syntax` function would be a compile-time host effect and is
 forbidden; list surgery and quasiquote only **construct** forms.
+
+Staging follows D more than Lisp-with-eval: **CTFE** on values (including `static if` / compile-time
+`if` when the condition is a compile-time constant), **generics** instantiated then type-checked
+(the instantiated IR is what the verifier sees), and **syntax CTFE** only where evaluation order or
+bindings cannot be a function. Every generated form is checked with the same rules as handwritten
+code. Diagnostics name user form, pretty-printed expansion, and fault span (SDC mixin style). There
+is no untyped `defmacro` and no user `eval`.
 
 `let` in such a function is the usual expression: bindings, then a body whose **value** is the
 result (typically a quasiquoted list). Nothing further is bound unless the caller `define`s a
@@ -2604,10 +2614,10 @@ transformer actually returned, (3) the **fault** in that expansion with a span, 
 to the transforming function. Dropping spans on quote/quasiquote is a defect: CTFE over
 spanless lists is a string mixin. Fuel, recursion, and allocation limits still apply.
 
-Runtime compilation of a `syntax` value (a Brain receiving a quoted program, a node converging
-a payload, an explicit compile API) uses **this same pipeline**: expand, check, lower, verify,
-then run with the granted capability set. There is no `eval` that skips the verifier. Generating
-syntax is always allowed as data; executing it is never ambient.
+A Brain or node that **loads** a CoLisp payload compiles it as a compilation unit (expand, check,
+lower, verify) with a granted capability set. That is the compiler invoked by the host, not a
+language `eval`. Generating syntax as data is always allowed; executing it is never ambient and
+never a runtime interpreter of trees in user code.
 
 Until that kernel exists, `define-syntax` remains a capture-free **template**: substitution
 before type checking, no CTFE body, no capabilities, and no introducing `let` or other binding
