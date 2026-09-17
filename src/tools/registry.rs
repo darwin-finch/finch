@@ -41,6 +41,17 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with given input and context
     async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String>;
 
+    /// Dispatch-only spellings for this tool.
+    ///
+    /// [`ToolRegistry::register`] records each alias so
+    /// [`ToolRegistry::has_tool`] / [`ToolRegistry::get`] accept it, but
+    /// aliases never appear in [`ToolRegistry::definitions`]. A provider
+    /// therefore sees one canonical name. Override for hyphenated or
+    /// legacy spellings that must remain invocable.
+    fn aliases(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Get full tool definition (for Claude API)
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -72,6 +83,11 @@ impl ToolRegistry {
     /// Register a tool
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let name = tool.name().to_string();
+        for alias in tool.aliases() {
+            if *alias != name {
+                self.register_alias(*alias, name.clone());
+            }
+        }
         self.tools.insert(name, tool);
     }
 
@@ -166,6 +182,16 @@ mod tests {
     // Mock tool for testing
     struct MockTool {
         name: String,
+        aliases: &'static [&'static str],
+    }
+
+    impl MockTool {
+        fn named(name: impl Into<String>) -> Self {
+            Self {
+                name: name.into(),
+                aliases: &[],
+            }
+        }
     }
 
     #[async_trait]
@@ -186,6 +212,10 @@ mod tests {
             ToolInputSchema::simple(vec![("param", "A test parameter")])
         }
 
+        fn aliases(&self) -> &'static [&'static str] {
+            self.aliases
+        }
+
         async fn execute(&self, _input: Value, _context: &ToolContext<'_>) -> Result<String> {
             Ok("Mock result".to_string())
         }
@@ -194,9 +224,7 @@ mod tests {
     #[test]
     fn test_registry_registration() {
         let mut registry = ToolRegistry::new();
-        let tool = MockTool {
-            name: "test".to_string(),
-        };
+        let tool = MockTool::named("test");
         registry.register(Box::new(tool));
 
         assert!(registry.has_tool("test"));
@@ -207,9 +235,7 @@ mod tests {
     #[test]
     fn test_registry_get_tool() {
         let mut registry = ToolRegistry::new();
-        let tool = MockTool {
-            name: "test".to_string(),
-        };
+        let tool = MockTool::named("test");
         registry.register(Box::new(tool));
 
         let retrieved = registry.get("test");
@@ -220,9 +246,7 @@ mod tests {
     #[test]
     fn aliases_dispatch_without_duplicating_provider_definitions() {
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool {
-            name: "todo_read".to_string(),
-        }));
+        registry.register(Box::new(MockTool::named("todo_read")));
         registry.register_alias("TodoRead", "todo_read");
 
         assert!(registry.has_tool("TodoRead"));
@@ -234,12 +258,8 @@ mod tests {
     #[test]
     fn test_registry_tool_names() {
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool {
-            name: "tool1".to_string(),
-        }));
-        registry.register(Box::new(MockTool {
-            name: "tool2".to_string(),
-        }));
+        registry.register(Box::new(MockTool::named("tool1")));
+        registry.register(Box::new(MockTool::named("tool2")));
 
         let names = registry.tool_names();
         assert_eq!(names.len(), 2);
@@ -266,12 +286,8 @@ mod tests {
     #[test]
     fn test_dispatch_names_include_canonical_and_alias_spellings() {
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool {
-            name: "todo_read".to_string(),
-        }));
-        registry.register(Box::new(MockTool {
-            name: "read".to_string(),
-        }));
+        registry.register(Box::new(MockTool::named("todo_read")));
+        registry.register(Box::new(MockTool::named("read")));
         registry.register_alias("TodoRead", "todo_read");
 
         let names = registry.dispatch_names();
@@ -292,9 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_execution() {
-        let tool = MockTool {
-            name: "test".to_string(),
-        };
+        let tool = MockTool::named("test");
 
         // Create empty context for test
         let context = ToolContext {
@@ -316,5 +330,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "Mock result");
+    }
+
+    #[test]
+    fn test_register_applies_tool_declared_aliases() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool {
+            name: "excel_read".to_string(),
+            aliases: &["excel-read", "excel-cell"],
+        }));
+
+        for alias in ["excel-read", "excel-cell"] {
+            assert!(
+                registry.has_tool(alias),
+                "register() must accept Tool::aliases() at dispatch; '{alias}' \
+                 missing. names={:?} aliases={:?}",
+                registry.tool_names(),
+                registry.alias_names()
+            );
+            assert_eq!(
+                registry.get(alias).map(Tool::name),
+                Some("excel_read"),
+                "'{alias}' must resolve to the canonical tool, not a second \
+                 implementation"
+            );
+        }
+        let advertised: Vec<String> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(
+            advertised,
+            vec!["excel_read".to_string()],
+            "declared aliases must stay dispatch-only and omitted from \
+             provider definitions; advertised={advertised:?}"
+        );
     }
 }
