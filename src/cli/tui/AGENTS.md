@@ -3,8 +3,8 @@
 Supplements the root [`AGENTS.md`](../../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/cli/tui/`: the interactive terminal renderer (`TuiRenderer`), dialogs, the live
-area, scrollback, the ViewModel projection, the claiming widget tree, disclosure (accordion),
-activity rows, and graph *view types*.
+area, scrollback, the ViewModel projection, the claiming widget tree, the conversation
+ScrollView, disclosure (accordion), activity rows, and graph *view types*.
 This is not a published crate. The test is whether production code here can draw without naming
 Finch's poset, tool, or runtime vocabularies.
 
@@ -39,6 +39,21 @@ Every blit converts domain state into one owned ViewModel snapshot, then lays it
    width-conditional rails (#805, #809, #810).
 4. Painting stays line-based on the claimed rects; native `canonical_commit` remains the
    separate once-per-id pipeline.
+
+## The conversation ScrollView owns reading (#806)
+
+The transcript region — the root column's `Flex` `TRANSCRIPT` claim, the leftover frame
+under the bottom chrome — is an in-app scroll view (`scroll_view.rs`). Renderer state is one
+offset from the bottom of the retained transcript (0 = follow mode); the window is derived
+at paint time by `scroll_window_split`, shared by the full-viewport repaint and the
+retained hit-region rebuild. Wheel ticks land on the ScrollView inside the claim, on a
+nested tool-result control inside its rect, and on nothing over the bottom chrome; the
+claim is the wheel hitbox, stored from `frame.rects` by the same rebuild that rebuilds the
+accordion regions. PageUp/PageDown scroll it from the keyboard, independent of mouse
+tracking. Mouse tracking is held by default (`mouse_capture.rs`) — the #441
+release-on-first-wheel hybrid is retired, native history stays the copyable record via
+`canonical_commit`, and while scrolled up a commit anchors the window instead of dragging
+the reader.
 
 ## View types the renderer owns
 

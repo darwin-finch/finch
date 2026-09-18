@@ -50,6 +50,7 @@ mod input_widget; // kept, used by wizard helpers
 #[cfg(test)]
 mod isolation;
 mod mouse_capture;
+mod scroll_view;
 mod scrollback; // kept for future use
 mod shadow_buffer; // kept – good architecture for future diffing
 mod status_widget;
@@ -66,6 +67,7 @@ mod widgets;
 use accordion::{
     AccordionState, ClaimedDisclosureRect, RenderedTranscriptLine, TranscriptHitRegion,
 };
+use scroll_view::{scroll_window_split, TranscriptScrollView};
 use tool_viewport::{
     is_left_click, wheel_delta, ExpandedToolView, ToolViewportState, DEFAULT_TOOL_OUTPUT_ROWS,
     PAGE_STEP_LINES,
@@ -1532,6 +1534,12 @@ pub struct TuiRenderer {
     tool_viewports: ToolViewportState,
     pub(crate) expanded_tool: Option<ExpandedToolView>,
 
+    // The conversation ScrollView (#806): how far the retained transcript is
+    // scrolled up from the newest row, plus the transcript claim of the last
+    // painted frame. Presentation-only, like the accordion state; follow mode
+    // (offset 0) paints the newest content.
+    transcript_scroll: TranscriptScrollView,
+
     // Dialog state — tool-approval dialogs shown in the live area.
     pub active_dialog: Option<Dialog>,
     pub active_tabbed_dialog: Option<TabbedDialog>,
@@ -1603,9 +1611,9 @@ pub struct TuiRenderer {
     /// unconditional erase+draw every 33 ms tick when nothing changed.
     live_area_dirty: bool,
 
-    /// Whether this renderer currently holds mouse tracking. Default is off so
-    /// native click-drag selection works (#221). When held, a wheel releases
-    /// tracking so native scrollback is reachable (#441).
+    /// Whether this renderer currently holds mouse tracking. Default is held
+    /// so wheels scroll the conversation ScrollView (#806); native history
+    /// stays the copyable record, not the reader.
     mouse_tracking: mouse_capture::MouseTracking,
 }
 
@@ -1635,6 +1643,7 @@ impl TuiRenderer {
             accordion: AccordionState::default(),
             tool_viewports: ToolViewportState::default(),
             expanded_tool: None,
+            transcript_scroll: TranscriptScrollView::new(),
             active_dialog: None,
             active_tabbed_dialog: None,
             attention_dialog_live: false,
@@ -1680,8 +1689,9 @@ impl TuiRenderer {
 
         // Bracketed paste so the terminal wraps pasted content in
         // \x1b[200~ ... \x1b[201~ markers, plus kitty DISAMBIGUATE_ESCAPE_CODES
-        // so Shift+Enter is distinct from bare Enter. Mouse capture is omitted:
-        // click-drag selection stays with the host terminal (#221).
+        // so Shift+Enter is distinct from bare Enter. Mouse capture is held:
+        // wheels scroll the conversation ScrollView and clicks hit the widget
+        // hitboxes (#806); native history stays the copyable record.
         //
         // Terminals that don't support the kitty protocol silently ignore the
         // push. Cleanup: Drop and the panic hook both pop the flags, so normal
@@ -1718,6 +1728,7 @@ impl TuiRenderer {
             accordion: AccordionState::default(),
             tool_viewports: ToolViewportState::default(),
             expanded_tool: None,
+            transcript_scroll: TranscriptScrollView::new(),
 
             active_dialog: None,
             active_tabbed_dialog: None,
@@ -1893,6 +1904,12 @@ impl TuiRenderer {
 
 // ─── Raw-mode canonical transcript commit ───────────────────────────────────
 
+/// Commit completed messages to native scrollback, exactly once per id.
+///
+/// Returns the number of physical terminal rows the committed content
+/// occupies (message lines plus one blank separator row per message, at
+/// `width`), so a scrolled conversation window can stay anchored while new
+/// content commits (#806). The trailing viewport spool is not content.
 fn commit_complete_messages(
     stdout: &mut impl Write,
     messages: &[MessageRef],
@@ -1900,9 +1917,11 @@ fn commit_complete_messages(
     colors: &ColorScheme,
     printed_ids: &mut HashSet<MessageId>,
     terminal_height: usize,
-) -> Result<()> {
+    width: usize,
+) -> Result<usize> {
     let mut accepted = Vec::new();
     let mut staged = Vec::new();
+    let mut content_rows = 0usize;
     for message in messages {
         if printed_ids.contains(&message.id()) {
             continue;
@@ -1918,13 +1937,16 @@ fn commit_complete_messages(
         .collect::<Vec<_>>()
         .join("\n");
         for line in complete.split('\n') {
-            execute!(staged, Print(line.trim_end_matches('\r')), Print("\r\n"))?;
+            let line = line.trim_end_matches('\r');
+            content_rows += shadow_buffer::physical_rows(line, width.max(1));
+            execute!(staged, Print(line), Print("\r\n"))?;
         }
         execute!(staged, Print("\r\n"))?;
+        content_rows += 1;
         accepted.push(message.id());
     }
     if accepted.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     // A viewport of linefeeds moves every newly inserted canonical row above
     // row zero. The preceding visible rows scroll first, followed by exactly
@@ -1938,7 +1960,7 @@ fn commit_complete_messages(
     // duplicates if a later flush reports an ambiguous error.
     printed_ids.extend(accepted);
     stdout.flush()?;
-    Ok(())
+    Ok(content_rows)
 }
 
 fn prepare_canonical_commit(stdout: &mut impl Write) -> Result<()> {
@@ -2033,6 +2055,7 @@ impl TuiRenderer {
             self.accordion
                 .rebuild_retained_hit_regions(&[], 0, term_width);
             self.tool_viewports.rebuild_hit_regions(&[], 0, term_width);
+            self.transcript_scroll.set_claim(widgets::Rect::default());
             return Ok(());
         }
 
@@ -2623,19 +2646,28 @@ impl TuiRenderer {
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
             self.printed_ids.extend(plan.consume_without_emit);
-            let commit_result = commit_complete_messages(
+            let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
+            let committed_rows = match commit_complete_messages(
                 &mut stdout,
                 &plan.emit,
                 &mut self.accordion,
                 &self.colors,
                 &mut self.printed_ids,
-                usize::from(crossterm::terminal::size().unwrap_or((80, 24)).1),
-            );
-            if let Err(error) = commit_result {
-                let _ = execute!(stdout, EndSynchronizedUpdate);
-                return Err(error);
-            }
-            self.pending_viewport_size = Some(crossterm::terminal::size().unwrap_or((80, 24)));
+                usize::from(term_height),
+                usize::from(term_width),
+            ) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    let _ = execute!(stdout, EndSynchronizedUpdate);
+                    return Err(error);
+                }
+            };
+            // A reader scrolled into history must not be dragged by content
+            // arriving at the bottom (#806): the committed rows are hidden
+            // below the window now, so the offset grows by the same amount.
+            // Follow mode (offset 0) keeps tracking the newest content.
+            self.transcript_scroll.anchor_committed_rows(committed_rows);
+            self.pending_viewport_size = Some((term_width, term_height));
             self.viewport_invalidated = true;
             self.redraw_full_viewport_inner(true)?;
             self.live_area_dirty = false;
@@ -2834,9 +2866,6 @@ impl TuiRenderer {
 
             if event::poll(Duration::from_millis(100))? {
                 let event = event::read()?;
-                if matches!(event, Event::Key(_)) {
-                    self.restore_mouse_tracking_after_interaction();
-                }
                 match event {
                     Event::Key(key)
                         if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE =>
@@ -2935,14 +2964,23 @@ impl TuiRenderer {
         width: usize,
         height: usize,
     ) {
+        // The transcript claim of the last painted frame is the conversation
+        // ScrollView's wheel hitbox: the leftover frame under the bottom
+        // chrome (#806). A dialog or tiny frame claims nothing.
+        self.transcript_scroll.set_claim(frame.rects.transcript);
         let transcript_budget = height.saturating_sub(live_rows);
         let messages = self.output_manager.get_messages();
         let printed = visible_printed_messages(&messages, &self.printed_ids);
-        let transcript = viewport_tail_rendered_lines(
-            &self.projected_lines(printed, width),
-            width,
-            transcript_budget,
-        );
+        let projected = self.projected_lines(printed, width);
+        // The scroll window is derived at paint time (#806): the same split
+        // the full repaint paints, so hit regions stay aligned with the
+        // visible rows while the conversation is scrolled. The quantised
+        // skip also bounds the offset when content shrank.
+        let (prefix, skipped) =
+            scroll_window_split(&projected, width, self.transcript_scroll.offset());
+        self.transcript_scroll.set_offset(skipped);
+        let transcript =
+            viewport_tail_rendered_lines(&projected[..prefix], width, transcript_budget);
         let transcript_rows = transcript
             .iter()
             .map(|line| shadow_buffer::physical_rows(&line.text, width.max(1)))
@@ -2987,6 +3025,12 @@ impl TuiRenderer {
             return self.handle_expanded_tool_key(key);
         }
         if self.handle_tool_viewport_key(key) {
+            return true;
+        }
+        // PageUp/PageDown scroll the conversation when no dialog, no expanded
+        // surface, and no focused tool-output row claims them first (#806).
+        // Mouse tracking is irrelevant on the keyboard path.
+        if self.handle_transcript_scroll_key(key) {
             return true;
         }
         if !self.accordion.handle_key(key) {
@@ -3058,64 +3102,83 @@ impl TuiRenderer {
         true
     }
 
-    /// Wheel ticks release mouse tracking so native scrollback is reachable —
-    /// unless the wheel is over a bounded tool-result control, which scrolls
-    /// that result in place and keeps tracking held (#656). Other mouse events
-    /// keep the existing accordion click-to-toggle path.
+    /// Wheel ticks scroll what the pointer is over (#806): the focused
+    /// expanded tool surface, a bounded tool-result control whose cells the
+    /// pointer is inside, or the conversation ScrollView — the transcript
+    /// claim of the 805 layout, the leftover frame under the bottom chrome.
+    /// Mouse tracking stays held; native history is the copyable record, not
+    /// the reader. Other mouse events keep the accordion click-to-toggle path.
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         let mut stdout = io::stdout();
         self.handle_mouse_to(mouse, &mut stdout)
     }
 
-    fn handle_mouse_to(&mut self, mouse: MouseEvent, out: &mut impl Write) -> bool {
+    fn handle_mouse_to(&mut self, mouse: MouseEvent, _out: &mut impl Write) -> bool {
         if mouse_capture::is_wheel(mouse.kind) {
             // A dialog owns the live area: native scroll would move Yes/No
-            // off-screen, and the restoring keypress would be dialog input.
-            // Leave the wheel for the dialog (ignored today; body scroll later).
-            if self.active_dialog.is_none() && self.active_tabbed_dialog.is_none() {
-                if let Some(delta) = wheel_delta(mouse.kind) {
-                    if self.expanded_tool.is_some() {
-                        self.scroll_expanded_tool(delta);
-                        return true;
-                    }
-                    if let Some(region) = self
-                        .tool_viewports
-                        .region_at(mouse.column, mouse.row)
-                        .cloned()
-                    {
-                        // The child viewport owns this wheel: scroll that tool
-                        // result and keep mouse tracking so the next tick keeps
-                        // scrolling it instead of falling to native scrollback.
-                        if self.tool_viewports.scroll_child(&region.row_id, delta) {
-                            self.live_area_dirty = true;
-                        }
-                        return true;
-                    }
-                }
-                self.release_mouse_tracking_to(out);
+            // off-screen. Leave the wheel for the dialog (ignored today; body
+            // scroll later).
+            if self.active_dialog.is_some() || self.active_tabbed_dialog.is_some() {
+                return false;
             }
+            // A horizontal wheel has no vertical scroll owner; it stays
+            // unclaimed.
+            let Some(delta) = wheel_delta(mouse.kind) else {
+                return false;
+            };
+            if self.expanded_tool.is_some() {
+                self.scroll_expanded_tool(delta);
+                return true;
+            }
+            if let Some(region) = self
+                .tool_viewports
+                .region_at(mouse.column, mouse.row)
+                .cloned()
+            {
+                // The child viewport owns this wheel: scroll that tool
+                // result and keep mouse tracking so the next tick keeps
+                // scrolling it.
+                if self.tool_viewports.scroll_child(&region.row_id, delta) {
+                    self.live_area_dirty = true;
+                }
+                return true;
+            }
+            // The conversation ScrollView owns everything above the bottom
+            // chrome (#806). Chrome rows below the transcript claim belong to
+            // nobody, so a wheel there is claimed by neither the ScrollView
+            // nor a tool viewport.
+            if !self.transcript_scroll.owns(mouse.column, mouse.row) {
+                return false;
+            }
+            self.scroll_transcript_view(delta)
+        } else {
+            self.handle_accordion_mouse(mouse)
+        }
+    }
+
+    /// Page keys scroll the conversation ScrollView when nothing more
+    /// specific claims them (#806): no dialog, no expanded tool surface, and
+    /// no focused tool-output row — those callers return earlier. Up/Down stay
+    /// with history navigation and the composer.
+    fn handle_transcript_scroll_key(&mut self, key: KeyEvent) -> bool {
+        let delta = match key.code {
+            KeyCode::PageUp => -(PAGE_STEP_LINES as isize),
+            KeyCode::PageDown => PAGE_STEP_LINES as isize,
+            _ => return false,
+        };
+        self.scroll_transcript_view(delta)
+    }
+
+    /// Scroll the conversation ScrollView by `delta` physical rows (negative
+    /// toward older content). The repaint is a full-viewport rebuild, so the
+    /// retained transcript, its hit regions, and the live area stay aligned.
+    fn scroll_transcript_view(&mut self, delta: isize) -> bool {
+        if !self.transcript_scroll.scroll(delta) {
             return false;
         }
-        self.handle_accordion_mouse(mouse)
-    }
-
-    /// Restore mouse tracking after a keypress or paste so clicks work again.
-    pub(crate) fn restore_mouse_tracking_after_interaction(&mut self) {
-        if !self.is_active {
-            return;
-        }
-        let mut stdout = io::stdout();
-        self.mouse_tracking =
-            mouse_capture::restore_after_interaction(&mut stdout, self.mouse_tracking);
-        let _ = stdout.flush();
-    }
-
-    fn release_mouse_tracking_to(&mut self, out: &mut impl Write) {
-        if !self.is_active {
-            return;
-        }
-        self.mouse_tracking = mouse_capture::release_for_native_scroll(out, self.mouse_tracking);
-        let _ = out.flush();
+        self.viewport_invalidated = true;
+        self.live_area_dirty = true;
+        true
     }
 
     // ─── Expanded tool-result surface (#656) ────────────────────────────────
@@ -3382,13 +3445,19 @@ impl TuiRenderer {
         let transcript_budget = term_height.saturating_sub(live_rows);
 
         let messages = self.output_manager.get_messages();
-        let transcript = self
-            .projected_lines(
-                visible_printed_messages(&messages, &self.printed_ids),
-                term_width,
-            )
-            .into_iter()
-            .map(|line| line.text)
+        let projected = self.projected_lines(
+            visible_printed_messages(&messages, &self.printed_ids),
+            term_width,
+        );
+        // The conversation ScrollView's window (#806): derive the split at
+        // paint time from the same projection the hit regions use, and keep
+        // the quantised offset honest.
+        let (prefix, skipped) =
+            scroll_window_split(&projected, term_width, self.transcript_scroll.offset());
+        self.transcript_scroll.set_offset(skipped);
+        let transcript = projected[..prefix]
+            .iter()
+            .map(|line| line.text.clone())
             .collect::<Vec<_>>();
         let transcript = viewport_tail_lines(&transcript, term_width, transcript_budget);
         let transcript_rows = transcript
@@ -4869,10 +4938,11 @@ mod tests {
         renderer
     }
 
-    /// Accordion expand/collapse stays on the keyboard when mouse capture is
-    /// off, which is the default so native click-drag copy works (#221).
+    /// Accordion expand/collapse stays on the keyboard: it never depends on
+    /// mouse reporting at all. The default session holds capture (#806) so
+    /// wheels scroll the conversation; disclosure remains keyboard-complete.
     #[test]
-    fn test_accordion_keyboard_toggles_without_mouse_capture() {
+    fn test_accordion_keyboard_toggles_without_mouse() {
         let colors = ColorScheme::default();
         let work = Arc::new(WorkUnit::new("Tools"));
         let call = work.add_row("bash(echo hi)");
@@ -4898,8 +4968,8 @@ mod tests {
         assert_eq!(
             renderer.mouse_tracking,
             mouse_capture::MouseTracking::DEFAULT,
-            "INVARIANT: the default TUI does not hold mouse tracking, so the host \
-             terminal owns click-drag selection (#221). tracking was {:?}",
+            "INVARIANT (#806): the default TUI holds mouse tracking so wheels hit \
+             the conversation ScrollView; tracking was {:?}",
             renderer.mouse_tracking
         );
         assert!(
@@ -4945,35 +5015,59 @@ mod tests {
         }
     }
 
-    fn disable_mouse_capture_bytes() -> Vec<u8> {
-        let mut bytes = Vec::new();
-        execute!(&mut bytes, event::DisableMouseCapture).expect("encode DisableMouseCapture");
-        bytes
+    /// Plan one live frame from a synthetic ViewModel, exactly as the blit
+    /// would, so tests can assert against the real 805 claims without a
+    /// terminal. `live` supplies the rendered live transcript lines.
+    fn plan_frame_for_test(
+        width: usize,
+        height: usize,
+        live: &[RenderedTranscriptLine],
+    ) -> LiveFrame {
+        let draft = vec![String::new()];
+        let vm = view_model::LiveViewModel {
+            terminal_width: width,
+            terminal_height: height,
+            input_lines: &draft,
+            input_cursor: (0, 0),
+            ghost_text: None,
+            effective_status: "ready",
+            cwd_label: "~/repos/finch",
+            session_label: "jade-river",
+            dialog: None,
+            expanded_lines: None,
+            render_error: false,
+            task_rows: &[],
+            tracked_rows: &[],
+            live_rendered: live,
+        };
+        plan_live_frame(&vm, &mut AutocompleteState::new())
     }
 
-    /// A Confirm dialog owns the live area, so a wheel must not release
-    /// tracking. Native scroll would move Yes/No off-screen (#435 at a
-    /// different layer), and the restoring keypress would be dialog input.
+    /// INVARIANT: a Confirm dialog owns the live area, so a wheel is left for
+    /// the dialog (unclaimed) and mouse tracking stays held — Yes/No can never
+    /// be scrolled off-screen (#435 at a different layer, #806).
     #[test]
     fn test_handle_mouse_scroll_up_with_confirm_dialog_does_not_release_mouse_tracking_for_native_scrollback(
     ) {
         let mut renderer = renderer_owning_mouse_capture();
         renderer.active_dialog = Some(Dialog::confirm("Approve this tool?", true));
         let mut bytes = Vec::new();
-        renderer.handle_mouse_to(wheel_up(), &mut bytes);
+        assert!(
+            !renderer.handle_mouse_to(wheel_up(), &mut bytes),
+            "a wheel over a dialog is unclaimed by the scroll dispatch"
+        );
         assert_eq!(
             renderer.mouse_tracking,
             mouse_capture::MouseTracking::Held,
-            "INVARIANT: mouse tracking is released for native scrollback only \
-             when the live area is the transcript/input, not when a dialog owns \
-             it (#441 / F1). A Confirm dialog was open; tracking was {:?}. \
+            "INVARIANT: mouse tracking stays held when a dialog owns the live area; \
+             a wheel never releases it (#806). tracking was {:?}. \
              terminal received {bytes:?}",
             renderer.mouse_tracking
         );
         assert!(
             bytes.is_empty(),
             "INVARIANT: a wheel over a Confirm dialog must not emit \
-             DisableMouseCapture, so Yes/No stay on-screen (#441 / F1). \
+             DisableMouseCapture, so Yes/No stay on-screen (#806). \
              terminal received {bytes:?}"
         );
         renderer.is_active = false;
@@ -5005,43 +5099,61 @@ mod tests {
             None,
         ));
         let mut bytes = Vec::new();
-        renderer.handle_mouse_to(wheel_up(), &mut bytes);
+        assert!(
+            !renderer.handle_mouse_to(wheel_up(), &mut bytes),
+            "a wheel over a tabbed dialog is unclaimed by the scroll dispatch"
+        );
         assert_eq!(
             renderer.mouse_tracking,
             mouse_capture::MouseTracking::Held,
             "INVARIANT: a tabbed dialog owns the live area, so a wheel must \
-             not release mouse tracking (#441 / F1). tracking was {:?}. \
+             not release mouse tracking (#806). tracking was {:?}. \
              terminal received {bytes:?}",
             renderer.mouse_tracking
         );
         assert!(
             bytes.is_empty(),
             "INVARIANT: a wheel over a tabbed dialog must not emit \
-             DisableMouseCapture (#441 / F1). terminal received {bytes:?}"
+             DisableMouseCapture (#806). terminal received {bytes:?}"
         );
         renderer.is_active = false;
     }
 
-    /// The no-dialog path still releases, so F1 cannot be satisfied by
-    /// disabling native scroll altogether.
+    /// The no-dialog path scrolls the conversation ScrollView and keeps mouse
+    /// tracking held: native scrollback is not the reader (#806 replaces the
+    /// #441 release-on-first-wheel hybrid).
     #[test]
-    fn test_handle_mouse_scroll_up_without_dialog_releases_mouse_tracking_for_native_scrollback() {
+    fn test_handle_mouse_scroll_up_without_dialog_scrolls_conversation_and_keeps_capture() {
         let mut renderer = renderer_owning_mouse_capture();
+        // A painted transcript claim so the wheel lands on the ScrollView.
+        let frame = plan_frame_for_test(80, 24, &[]);
+        renderer.transcript_scroll.set_claim(frame.rects.transcript);
         let mut bytes = Vec::new();
-        renderer.handle_mouse_to(wheel_up(), &mut bytes);
-        assert_eq!(
-            renderer.mouse_tracking,
-            mouse_capture::MouseTracking::ReleasedForNativeScroll,
-            "INVARIANT: with no dialog, a wheel still releases mouse tracking \
-             so native scrollback is reachable (#441). tracking was {:?}. \
-             terminal received {bytes:?}",
-            renderer.mouse_tracking
+        assert!(
+            renderer.handle_mouse_to(wheel_up(), &mut bytes),
+            "INVARIANT: a wheel over the transcript claim is consumed by the \
+             conversation ScrollView (#806)"
         );
         assert_eq!(
-            bytes,
-            disable_mouse_capture_bytes(),
-            "INVARIANT: the no-dialog release is DisableMouseCapture (#441). \
-             terminal received {bytes:?}"
+            renderer.transcript_scroll.offset(),
+            tool_viewport::WHEEL_STEP_LINES,
+            "INVARIANT: the wheel moved the conversation window up by one row; \
+             offset was {:?}",
+            renderer.transcript_scroll.offset()
+        );
+        assert_eq!(
+            renderer.mouse_tracking,
+            mouse_capture::MouseTracking::Held,
+            "INVARIANT: mouse tracking stays held during ordinary review — no \
+             release-on-first-wheel (#806). tracking was {:?}. terminal received \
+             {bytes:?}",
+            renderer.mouse_tracking
+        );
+        assert!(
+            bytes.is_empty(),
+            "INVARIANT: a wheel over the transcript must not emit \
+             DisableMouseCapture; native history stays reachable only through \
+             the terminal's own bypass (#806). terminal received {bytes:?}"
         );
         renderer.is_active = false;
     }
@@ -5242,39 +5354,239 @@ mod tests {
         renderer.is_active = false;
     }
 
-    /// A wheel whose row is not on a tool-result control still releases mouse
-    /// tracking for native scrollback — the #441 behavior is preserved for the
-    /// rest of the console.
+    /// A wheel whose row is not on a tool-result control scrolls the
+    /// conversation ScrollView and keeps tracking held — exact X/Y dispatch:
+    /// the tool viewport consumes the wheels whose pointer is inside its rect
+    /// and nothing else (#806).
     #[test]
-    fn test_wheel_outside_tool_result_still_releases_mouse_tracking() {
+    fn test_wheel_outside_tool_result_scrolls_conversation_instead() {
         let (mut renderer, _) = committed_tool_result_renderer(40);
         renderer.mouse_tracking = mouse_capture::MouseTracking::Held;
-        let region = renderer
-            .tool_viewports
-            .regions()
-            .first()
-            .cloned()
-            .expect("a painted region exists");
+        // A transcript claim wide enough to own rows below the tool result.
+        let frame = plan_frame_for_test(80, 24, &[]);
+        renderer.transcript_scroll.set_claim(frame.rects.transcript);
+        // The highest transcript row that no tool-result control owns.
+        let claim = renderer.transcript_scroll.claim();
+        let wheel_row = (claim.y as u16..claim.bottom() as u16)
+            .rev()
+            .find(|&row| renderer.tool_viewports.region_at(0, row).is_none())
+            .expect("the transcript claim has rows outside every tool-result control");
+        let wheel = MouseEvent {
+            kind: event::MouseEventKind::ScrollUp,
+            column: 0,
+            row: wheel_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut bytes = Vec::new();
+        assert!(
+            renderer.handle_mouse_to(wheel, &mut bytes),
+            "INVARIANT: a wheel inside the transcript claim but outside every tool \
+             result scrolls the conversation ScrollView (#806)"
+        );
+        assert!(
+            renderer.transcript_scroll.offset() > 0,
+            "INVARIANT: the conversation window moved; offset was {:?}",
+            renderer.transcript_scroll.offset()
+        );
+        assert_eq!(
+            renderer.mouse_tracking,
+            mouse_capture::MouseTracking::Held,
+            "INVARIANT: tracking is never released on a wheel tick anymore (#806); \
+             tracking was {:?}; terminal received {bytes:?}",
+            renderer.mouse_tracking
+        );
+        assert!(
+            bytes.is_empty(),
+            "INVARIANT: no wheel path may emit DisableMouseCapture; native history \
+             is not the reader (#806). terminal received {bytes:?}"
+        );
+        renderer.is_active = false;
+    }
+
+    /// A wheel over the bottom chrome — composer, status, or separator — is
+    /// claimed by neither the conversation ScrollView nor a tool viewport
+    /// (#806).
+    #[test]
+    fn test_wheel_over_chrome_is_claimed_by_neither_transcript_nor_tools() {
+        let (mut renderer, _) = committed_tool_result_renderer(40);
+        let frame = plan_frame_for_test(80, 24, &[]);
+        renderer.transcript_scroll.set_claim(frame.rects.transcript);
+        // The status bar's own claim is the deepest chrome; wheel there.
+        let status_row = frame.rects.status.y as u16;
+        assert!(
+            !renderer.transcript_scroll.owns(0, status_row),
+            "precondition: the status row is not transcript; claim was {:?}, status {:?}",
+            renderer.transcript_scroll.claim(),
+            frame.rects.status
+        );
         let wheel = MouseEvent {
             kind: event::MouseEventKind::ScrollDown,
             column: 0,
-            row: region.bottom.saturating_add(5),
+            row: status_row,
             modifiers: KeyModifiers::NONE,
         };
         let mut bytes = Vec::new();
         assert!(
             !renderer.handle_mouse_to(wheel, &mut bytes),
-            "a wheel off the control is not claimed by it"
+            "INVARIANT: a wheel over the bottom chrome is claimed by nobody — the \
+             conversation does not move and no tool viewport answers (#806)"
         );
         assert_eq!(
-            renderer.mouse_tracking,
-            mouse_capture::MouseTracking::ReleasedForNativeScroll,
-            "INVARIANT: a wheel outside any tool result releases mouse tracking for \
-             native scrollback (#441 preserved); tracking was {:?}; terminal received \
-             {bytes:?}",
-            renderer.mouse_tracking
+            renderer.transcript_scroll.offset(),
+            0,
+            "INVARIANT: chrome wheels never move the conversation window"
         );
         renderer.is_active = false;
+    }
+
+    /// INVARIANT (#806): the conversation ScrollView owns exactly the 805
+    /// transcript claim — the leftover frame under the bottom chrome. The
+    /// claim the production rebuild path stores must be the frame plan's
+    /// `TRANSCRIPT` rect: top of the frame, down to the top of the composer
+    /// chrome, full width. A dispatch hitbox that is not this claim fails
+    /// here, as does a claim that eats chrome rows or leaves frame rows out.
+    #[test]
+    fn test_transcript_scrollview_is_the_leftover_frame_under_the_bottom_chrome() {
+        let (mut renderer, _) = committed_tool_result_renderer(40);
+        // Paint-shaped plumbing: plan the frame the draw would paint and feed
+        // it through the same rebuild that stores the wheel hitbox.
+        let frame = plan_frame_for_test(80, 24, &[]);
+        let live_rows = frame.physical_rows(80);
+        renderer.rebuild_transcript_hit_regions(&frame, live_rows, 80, 24);
+
+        let claim = renderer.transcript_scroll.claim();
+        let rects = frame.rects;
+        assert_eq!(
+            claim, rects.transcript,
+            "the stored wheel hitbox must be the frame plan's transcript claim; \
+             claim was {claim:?}, plan was {:?}",
+            rects.transcript
+        );
+        assert_eq!(
+            (claim.x, claim.y, claim.width),
+            (0, 0, 80),
+            "the scroll view starts at the top of the frame and spans the full width"
+        );
+        let chrome_top = rects
+            .completions
+            .map(|rect| rect.y)
+            .unwrap_or(rects.separator.y);
+        assert_eq!(
+            claim.bottom(),
+            chrome_top.min(rects.separator.y).min(rects.composer.y),
+            "the scroll view ends exactly where the bottom chrome begins; claim \
+             was {claim:?}, chrome was {:?}",
+            rects
+        );
+        assert!(
+            renderer
+                .transcript_scroll
+                .owns(0, claim.bottom() as u16 - 1),
+            "the last row above the chrome is transcript"
+        );
+        assert!(
+            !renderer.transcript_scroll.owns(0, rects.composer.y as u16),
+            "the composer row is chrome, never transcript"
+        );
+        renderer.is_active = false;
+    }
+
+    /// INVARIANT (#806): while the reader is scrolled into history, content
+    /// committing at the bottom must not drag the window — the anchor grows
+    /// the offset by exactly the committed rows, so the same older content
+    /// stays in view. Follow mode keeps tracking the newest content.
+    #[test]
+    fn test_commit_anchor_keeps_the_scrolled_window_on_the_same_content() {
+        let (mut renderer, _) = committed_tool_result_renderer(40);
+        let width = 80;
+        let projected = |renderer: &mut TuiRenderer| {
+            renderer.projected_lines(
+                visible_printed_messages(
+                    &renderer.output_manager.get_messages(),
+                    &renderer.printed_ids,
+                ),
+                width,
+            )
+        };
+        renderer.transcript_scroll.scroll(-6);
+        let before = projected(&mut renderer);
+        let (prefix_before, _) =
+            scroll_window_split(&before, width, renderer.transcript_scroll.offset());
+
+        let second = Arc::new(WorkUnit::new("response"));
+        second.set_response("a brand new completed turn");
+        second.set_complete();
+        // The commit plan always reads from the OutputManager, so the new
+        // turn is resident there exactly as the event loop would leave it.
+        renderer.add_trait_message(second.clone());
+        let second_message: MessageRef = second.clone();
+        let mut sink = Vec::new();
+        let rows = commit_complete_messages(
+            &mut sink,
+            std::slice::from_ref(&second_message),
+            &mut renderer.accordion,
+            &renderer.colors,
+            &mut renderer.printed_ids,
+            24,
+            width,
+        )
+        .expect("canonical commit succeeds");
+        assert!(
+            rows > 0,
+            "precondition: committing a turn reports its physical row count"
+        );
+        renderer.transcript_scroll.anchor_committed_rows(rows);
+
+        let after = projected(&mut renderer);
+        let (prefix_after, _) =
+            scroll_window_split(&after, width, renderer.transcript_scroll.offset());
+        assert_eq!(
+            before[prefix_before - 1].text,
+            after[prefix_after - 1].text,
+            "INVARIANT: the newest window row is the same content before and after \
+             the commit — the scrolled reader was not dragged by new content; \
+             before window ended at {:?}, after at {:?}",
+            before[..prefix_before].last().map(|line| line.text.clone()),
+            after[..prefix_after].last().map(|line| line.text.clone())
+        );
+        renderer.is_active = false;
+    }
+
+    /// PageUp/PageDown scroll the conversation without any mouse involvement:
+    /// the keyboard path never consults mouse tracking (#806).
+    #[test]
+    fn test_page_keys_scroll_the_conversation_irrespective_of_mouse_tracking() {
+        for tracking in [
+            mouse_capture::MouseTracking::Held,
+            mouse_capture::MouseTracking::Off,
+        ] {
+            let mut renderer = renderer_owning_mouse_capture();
+            renderer.mouse_tracking = tracking;
+            let frame = plan_frame_for_test(80, 24, &[]);
+            renderer.transcript_scroll.set_claim(frame.rects.transcript);
+            assert!(
+                renderer.handle_accordion_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+                "PageUp must scroll the conversation when nothing more specific claims it"
+            );
+            assert_eq!(
+                renderer.transcript_scroll.offset(),
+                tool_viewport::PAGE_STEP_LINES,
+                "INVARIANT: PageUp moved the conversation up by one page from follow \
+                 mode; offset was {:?}, tracking {tracking:?}",
+                renderer.transcript_scroll.offset()
+            );
+            assert!(
+                renderer.handle_accordion_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+                "PageDown must scroll back toward the bottom"
+            );
+            assert_eq!(
+                renderer.transcript_scroll.offset(),
+                0,
+                "INVARIANT: one page down from a one-page offset returns to follow \
+                 mode; tracking was {tracking:?}"
+            );
+            renderer.is_active = false;
+        }
     }
 
     /// INVARIANT: clicking a tool result's compact window opens the focused
@@ -5455,6 +5767,7 @@ mod tests {
             &ColorScheme::default(),
             &mut printed,
             24,
+            80,
         )
         .expect("canonical commit succeeds");
         let canonical = String::from_utf8_lossy(&sink);
@@ -5956,6 +6269,7 @@ mod tests {
             &colors,
             &mut printed,
             6,
+            80,
         )
         .is_err());
         assert_eq!(printed.len(), 1, "accepted bytes must not be retried");
@@ -5967,6 +6281,7 @@ mod tests {
             &colors,
             &mut printed,
             6,
+            80,
         )
         .expect("already accepted message skips ambiguous flush retry");
         assert_eq!(failure.0.len(), accepted_len);
@@ -5989,6 +6304,7 @@ mod tests {
             &colors,
             &mut resize_printed,
             8,
+            80,
         )
         .unwrap();
         continue_full_viewport_paint(
@@ -6031,6 +6347,7 @@ mod tests {
             &colors,
             &mut canonical_printed,
             6,
+            80,
         )
         .unwrap();
         let mut terminal = TerminalHistory {
@@ -6074,6 +6391,7 @@ mod tests {
             &colors,
             &mut second_printed,
             6,
+            80,
         )
         .unwrap();
         for line in String::from_utf8(second_bytes)
@@ -6306,6 +6624,7 @@ mod tests {
                 &colors,
                 &mut renderer.printed_ids,
                 8,
+                80,
             )
             .expect("commit replaced-turn prefix");
         }
@@ -6327,6 +6646,7 @@ mod tests {
             &colors,
             &mut renderer.printed_ids,
             8,
+            80,
         )
         .expect("commit program output");
         let staged_text = String::from_utf8(staged).unwrap();
