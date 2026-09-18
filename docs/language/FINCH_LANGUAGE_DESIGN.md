@@ -2610,6 +2610,31 @@ other stack borrow is a compile error; promotion consumes the stack value and in
 binding. A raw pointer is a non-owning unsafe/FFI primitive and never acquires cleanup behavior by
 accident.
 
+**Added 2026-09-17: standard construction and conversion, explicit invocation only.** This document
+otherwise leaves "constructor" to mean record/variant construction syntax or an ad hoc named factory
+function (`try-as-unitary`, `new-state`); there was no general, standard construction or conversion
+concept. Two distinct needs were bundled under that gap and get different answers:
+
+- **Validated construction** needs no new mechanism: an ordinary function plus the field visibility
+  a record already owns ("Records, layout, placement, and member access") gives the standard shape —
+  private fields, a checked associated function as the only public way to build one, returning
+  `Self` or `result<Self, E>`. This is already fully expressible; it only needed naming as the
+  recommended pattern instead of being left to convention.
+- **Standard, generic-integrable conversion between types** is the real gap, and the fix is a
+  `From<T>`/`Into<T>` concept pair — the same explicit-evidence mechanism as every other concept in
+  this document, so generic code can bound on it (`fn f<T>(x : impl Into<T>)`-shaped) the same way it
+  bounds on `Owner<T>` or `Equal<L,R>`. Conversion is always an explicit call (`Foo::from(x)` or
+  `x.into()`); it is never invoked because a parameter's declared type happens to match, the way a
+  C++ converting constructor fires. An automatic-invocation form was considered and rejected for the
+  reasons already established elsewhere in this section: it would hide a real, possibly-failing,
+  possibly-allocating operation behind no syntax at the call site (the same hidden-cost pattern
+  "Scripting ergonomics with a systems cost model" forbids everywhere else), and if more than one
+  `From<T>` could apply, "which one fires" needs a resolution algorithm — the same speculative
+  overload-resolution shape already rejected for the `borrow`/`steal` shorthand, `match-type`, and
+  general function overloads. `Unique<T>` → `Shared<T>` above is the concrete instance of this rule:
+  `share(...)` is an ordinary explicit call, not an implicit conversion fired by a `Shared<T>`-typed
+  parameter, for exactly the same reason.
+
 Core safe memory management requires no tracing garbage collector. Frame ownership, moves,
 explicit unique/shared carriers, deterministic drop, and bounded borrow analysis provide the
 default storage model; reference counting is paid only by a chosen shared carrier. A host or
