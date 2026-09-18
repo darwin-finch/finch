@@ -3611,6 +3611,25 @@ This closes the gap directly: a `define`'s or `lambda`'s signature is introspect
 captures already are, with the same before/after-resolution promise, rather than only captures
 getting real structure and parameters being left as something a macro re-parses by hand.
 
+**Added 2026-09-18: `FunctionSpec` — the whole function, body included, for CTFE that needs to
+transform a function rather than just call or introspect its signature.** `ParameterSpec` stops at
+the signature deliberately (that's all a capture list needed), but a CTFE function that means to
+inspect or rewrite a function's actual behavior — not just forward calls to it unchanged, which
+ordinary generics over a compile-time-bound function parameter already handle with no CTFE at all —
+needs the body too, and nothing exposed it. `FunctionSpec` is `ParameterSpec` plus `body : syntax`
+(the function's body, itself an ordinary sequence of forms — the same structural destructuring
+already available for any `syntax` value, so "walk the body and insert something between every
+statement" needs no new primitive beyond `.body` itself) plus source span and origin.
+`CaptureSpec` becomes `FunctionSpec` plus the capture-specific fields (`CaptureEntry` list, default
+capture policy) — a lambda's body and parameters are the same concept a plain `define`'s are; only
+the capture list is genuinely lambda-specific.
+
+Resolving *someone else's* function to a `FunctionSpec` — the case a transform like "add code
+coverage to `require-pkg`" actually needs — goes through the same two-step resolution already
+established for CTFE receiving a symbol reference: the syntax-carried identifier resolves against
+its own attached scope marks to a concrete identity, then that identity is `require`d to whatever
+stage exposes `FunctionSpec` (`BodyTyped` or later).
+
 An expansion may emit ordinary type, callable, and concept-implementation declarations. This is
 how a derive macro can generate serialization code *and* publish the explicit evidence that the
 record satisfies `JsonSerializable`; generating methods with familiar names is never sufficient.
@@ -3623,6 +3642,23 @@ Each generated implementation/evidence binding also receives a stable module-qua
 Two expansions that publish the same evidence identity are a duplicate-definition error; differently
 named implementations for the same concept and concrete type remain distinct and make unqualified
 ambient resolution ambiguous. Expansion or import order never replaces or selects evidence.
+
+**Added 2026-09-18: no CTFE-emitted declaration may replace one someone else already published —
+extending the rule just stated for evidence to declarations generally, not a new carve-out.**
+Considered directly against a concrete case: a code-coverage or instrumentation tool that wants
+every existing caller of some function to transparently get new behavior, with nothing at the call
+sites changed. The dangerous version of that is a separate tool reaching in from elsewhere and
+swapping out a declaration someone else already published — reading that function's own definition
+would no longer tell you what it does, since behavior could depend on unrelated code deciding to
+rewrite it later, and an imported dependency could silently alter another module's behavior with no
+visible sign at either the call sites or the original declaration. Rejected for exactly that reason.
+What remains legal is the same shape already established for evidence: only the original author, at
+the one place a name is declared, can opt a declaration into a CTFE transformation — illustratively,
+something like `@covered (define (require-pkg ...) ...)`, applying a `syntax -> syntax` function to
+the declaration as it is written, not to something already published elsewhere. The precise
+mechanism for invoking a named CTFE transform this way — what `@name` resolves to, how it differs
+from the record-scoped attributes retired earlier this session — is not yet specified; the
+illustration above shows the *shape* the safe answer takes, not a ratified spelling.
 
 Classic S-expressions remain one exact, canonical structural reader, not a requirement that every
 human-facing Lisp spelling pay the full parenthesis cost. Later expression/indentation/call sugar

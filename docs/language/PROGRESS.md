@@ -484,5 +484,36 @@ actually matters). Only axis 1 had been fixed; axis 2 hadn't been touched.
   between existing statements — not just wrap calls to it as an opaque black box. Confirmed directly:
   Shammah's actual "advanced case" is "introspecting `require-pkg` and doing arbitrary things to it,
   splicing in code every other line" — genuinely requires the function's body as inspectable
-  `syntax`, which `ParameterSpec` (signature-only) doesn't carry. `FunctionSpec` (below) is the
-  direct answer to this, not a hypothetical.
+  `syntax`, which `ParameterSpec` (signature-only) doesn't carry.
+
+**Continued 2026-09-18 — `FunctionSpec` actually written into the spec** (the previous entry named
+it as the answer but the edit hadn't landed yet — fixed rather than left as a dangling promise):
+`ParameterSpec` plus `body : syntax` plus span/origin; `CaptureSpec` becomes `FunctionSpec` plus the
+genuinely capture-specific fields, not a separate parallel shape. Resolving *another* function's
+`FunctionSpec` reuses the same two-step resolution from the hygiene discussion (scope-mark
+resolution to a concrete identity, then `require(identity, stage)`), rather than inventing a second
+lookup path.
+
+**Also settled the same day: no CTFE-emitted declaration may replace one someone else already
+published.** Raised directly by asking whether "add coverage to `require-pkg`" should mean every
+existing caller is transparently instrumented — Shammah rejected that as "too dangerous," correctly:
+it would mean `require-pkg`'s own definition no longer tells you what it does, since an unrelated
+piece of code (possibly in a dependency) could silently rewrite it later. Written in as an explicit
+invariant extending the duplicate-definition rule already stated for concept evidence to
+declarations generally, with the safe shape illustrated (`@covered` applied at the function's own
+declaration, by its own author) explicitly flagged as showing the *shape*, not a ratified `@name`
+attribute-invocation mechanism — that part is still unspecified.
+
+**A further, larger direction floated but not yet written in, worth resuming:** a GC-write-barrier
+insertion example (real, Go does this) surfaced that some CTFE needs *type-resolved* information the
+architecture deliberately keeps compiler-private (`syntax` is pre-resolution, for hygiene). Rather
+than accept that as a hard wall, Shammah proposed exposing curated compiler-internal queries through
+named, distinctly-typed "compile-time hook" functions — explicitly modeled on D's `__traits`, but
+fixing what makes `__traits` unpleasant: one mega-keyword dispatching on a string tag with
+inconsistent argument shapes per tag, versus separate, properly-typed functions per hook (the same
+"distinct keywords over one stringly-dispatched form" fix already applied to `get`/`set`/
+`constructor` earlier this session). The other half of the idea: calling such a hook taints the
+caller as compile-time-only, and that's not a new mechanism either — it composes directly with the
+existing effect-row system as one more effect (something like `! comptime`), propagated by rules
+already in place, the same way `! throws E` already propagates. Not written into the spec yet —
+the general mechanism was agreed on in conversation but the actual edit hasn't landed. Do that next.
