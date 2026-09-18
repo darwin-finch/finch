@@ -2128,6 +2128,18 @@ never outlives the call, checked without lifetime parameters — is closer to th
 Hylo language calls "mutable value semantics": comparable safety to Rust's borrow checker without
 its annotation surface, at a real, explicit cost, not a free lunch.
 
+D independently reached the same design and shipped it as its own ownership/borrowing (OB) system
+([Walter Bright, "Ownership and Borrowing in D,"
+2019](https://blog.dlang.org/archive/2019/07/15/ownership-and-borrowing-in-d/)): compile-time,
+*intraprocedural* data-flow analysis reusing existing `ref`/`scope` syntax rather than a lifetime-
+parameter system, on the same principle Finch states above — "there is only one pointer to it, so
+that pointer must be the owner," with borrowing as a temporary, automatically-restored transfer of
+usage rights. Where a pattern doesn't fit — D names reference-counted objects specifically — OB is
+not extended to cover it; the pattern instead lives in `@system` code the checker treats as already
+satisfying the rules, the same shape as Finch's `unsafe` boundary and the `Shared<T>` fallback
+above. This is independent confirmation the DFA-not-lifetime-parameters shape is a real, shipped
+design, not only a hopeful simplification.
+
 The cost: a function cannot soundly return a borrow that is conditionally one of *several*
 different-lifetime input borrows (Rust's canonical `fn longest<'a>(x: &'a str, y: &'a str) -> &'a
 str` has no equivalent here). Returning a borrow only typechecks when the verifier can trace it to
