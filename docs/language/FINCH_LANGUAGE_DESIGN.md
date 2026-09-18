@@ -2094,6 +2094,18 @@ invalidated. It copies only if the type is declared `Copy` — the same rule `co
 uses for scalars above. Silently copying an arbitrary, possibly large record on every `take` call
 would itself be the hidden-cost violation "Scripting ergonomics with a systems cost model" forbids.
 
+For a record with no internal indirection, moving and copying are the identical physical operation
+— both are a bytewise copy; there is no buffer to steal, so "move" saves no runtime work for such a
+type specifically. What move-invalidation still adds is a compile-time-only restriction, and it
+earns its keep for two reasons even then: a type's move-vs-copy contract must stay decoupled from
+its current field layout (adding an indirectly-owned field to a previously-all-inline record must
+not silently change every existing caller's aliasing assumptions with nothing at the call site to
+explain why), and a record with no pointers can still have a non-trivial `drop` hook (logging, a
+counter, an assertion) that the exactly-once-drop invariant (above) must not run twice. Neither
+reason depends on the type actually owning a heap resource today. A record with no drop hook and no
+non-`Copy` field is exactly the type that should be declared `Copy`, at which point both bindings
+staying valid is correct and intentional, not a special case.
+
 **Moving a stack-owned value through or up the call stack never requires heap promotion.** This is a
 static, calling-convention concern, not a runtime or GC-like decision: the destination frame's slot
 is known from the call graph at compile time, so a moved value is constructed or relocated directly
@@ -2103,7 +2115,16 @@ nothing needs promoting. A value that genuinely needs indefinite (heap-like) lif
 collection, captured by an escaping closure, placed in persistent state — is a different case,
 already covered above and in "Closure conversion and capture ownership": escaping without already
 being behind `Unique<T>`/`Shared<T>` is a compile error suggesting the fix, never a silent
-promotion, for the same cost-visibility reason.
+promotion. Three separate reasons converge here, not only cost-visibility: the two carriers are not
+interchangeable (`Unique<T>` for one destination, `Shared<T>` for more than one, with a real
+refcounting cost difference), so the compiler cannot know which one is meant without being told;
+unlike the `borrow`/`take` shorthand above, which only selects among existing carriers for an
+operation already fully specified, promoting an escape inserts an allocation that was not in the
+source at all — a `new`/`share` the programmer never wrote, not merely a dispatch choice; and
+generalized, "the compiler keeps anything alive as long as it needs to be, choosing the right
+strategy automatically" is what a tracing collector or an ARC-insertion pass *is* — exactly the
+ceiling "Design rationale: optimize for the common case, not completeness" above trades away for
+velocity, on the same grounds D's OB system and Val/Hylo already chose.
 
 **`borrow-mut` does not get the `borrow`/`take` shorthand above, and should not.** `Shared<T>`
 cannot unconditionally provide `&mut T` — only conditionally, through the fallible `get-mut` above,
