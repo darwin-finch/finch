@@ -80,6 +80,25 @@ event semantics (`ToolApprovalNeeded` routing, `pending_dialog_result` consumers
 untouched. `TabbedDialog` (2+ question cards) is still the ratatui alternate-screen
 wizard and is a follow-up.
 
+## The setup wizard rides the same tree (#812)
+
+`wizard_host.rs` hosts the setup wizard on the claiming widget tree and the shadow
+buffer, so there is no second terminal app: `setup_wizard` converts its state into one
+owned `WizardView` snapshot (tab titles, section lines, help, one optional overlay card)
+and `plan_wizard_frame` projects it into the standard `widgets` tree — a column whose
+3-row tab block and 1-row help claim natural extents and whose section claims the
+leftover, exactly like the conversation root allocates chrome. Device-code, add-provider,
+and cancel-confirmation overlays are `Widget::DialogCard` children (#807 contract:
+claimed rect, title and controls pinned inside the card, the help line yields while the
+card owns keys). `WizardHost::paint` renders the frame into a `ShadowBuffer`, diffs rows
+against the previous frame, and rewrites only the logical lines whose visible rows
+changed — the buffer is the authority on what a reader sees. The wizard keeps its own
+terminal lifecycle (raw mode, alternate screen, mouse capture) so the #265 editor/PTY
+handoff is untouched, and its view props are the speakable canonical form a GUI setup
+surface (#808) can consume. `WizardColor` is the view's own colour vocabulary, not the
+renderer's. The general z-compositor (#793) stays a follow-up; this is the inline
+dialog-card mechanism only.
+
 ## View types the renderer owns
 
 The same inversion the todo list and child-agent rows already use (`activity.rs`): the renderer

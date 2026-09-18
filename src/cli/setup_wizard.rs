@@ -11,10 +11,15 @@
 //! | [`state`] | the wizard's own state: sections, selections, and the `SetupResult` it produces |
 //! | [`driver`] | the run loop: tick polling, overlay state, top-level key dispatch |
 //! | [`input`] | key handling, one function per wizard section |
-//! | [`render`] | drawing, one function per wizard section and overlay |
+//! | [`render`] | view props for the widget host: styled lines and overlay cards, one function per section |
 //! | [`apply`] | from wizard state to a saved `crate::config::Config` |
 //! | [`chatgpt_recovery`] | the ChatGPT credential ceremony, its recovery loop, and the add-time device dialog flow (#424) |
 //! | [`grok_recovery`] | SuperGrok add-time device dialog; OAuth failure is fail-closed |
+//!
+//! Since #812 the wizard is not a second ratatui app: it keeps the terminal
+//! lifecycle it always had (raw mode, alternate screen, mouse capture) but
+//! paints through `crate::cli::tui`'s wizard widget host — the claiming
+//! widget tree, a shadow buffer, and the #807 dialog-card contract.
 
 mod apply;
 mod catalog;
@@ -43,13 +48,6 @@ use crate::service::discovery_client::{DiscoveredService, ServiceDiscoveryClient
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
-    Frame,
-};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -80,16 +78,17 @@ pub use chatgpt_recovery::validate_and_apply_for;
 pub use state::SetupResult;
 
 /// Restore the terminal to normal state after the wizard exits.
-fn cleanup_terminal(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-) -> Result<()> {
+///
+/// The exact lifecycle the wizard has always had (#265 handoff contract):
+/// raw mode off, alternate screen left, mouse capture released, cursor shown.
+fn cleanup_terminal() -> Result<()> {
     let raw_result = crossterm::terminal::disable_raw_mode();
     let screen_result = crossterm::execute!(
-        terminal.backend_mut(),
+        io::stdout(),
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture
     );
-    let cursor_result = terminal.show_cursor();
+    let cursor_result = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
     raw_result?;
     screen_result?;
     cursor_result?;
@@ -111,24 +110,21 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
         );
     }
 
-    // Set up terminal
+    // Set up terminal: the same contract the wizard has always had — the
+    // widget host paints, it does not own terminal modes.
     crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
     crossterm::execute!(
-        stdout,
+        io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableMouseCapture
     )?;
 
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = ratatui::Terminal::new(backend)?;
-
-    // Run the NEW tabbed wizard
-    let result = run_tabbed_wizard(&mut terminal, existing_config.as_ref());
+    // Run the tabbed wizard on the widget tree + shadow buffer host (#812).
+    let result = run_tabbed_wizard(existing_config.as_ref());
 
     // ALWAYS restore terminal, even if wizard was cancelled or errored
     // Prioritize cleanup to ensure terminal is always restored
-    cleanup_terminal(&mut terminal)?;
+    cleanup_terminal()?;
 
     // Return the wizard result after cleanup is guaranteed
     result

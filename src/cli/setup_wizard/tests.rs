@@ -486,8 +486,6 @@ fn gui_permission_required_status_includes_non_authoritative_process_diagnostics
 #[cfg(target_os = "macos")]
 #[test]
 fn test_gui_accessibility_o_outcomes_visible_at_80x24() {
-    use ratatui::backend::TestBackend;
-
     for (feedback, needle) in [
         (GuiSettingsFeedback::OpenRequested, "Open requested"),
         (GuiSettingsFeedback::Suppressed, "Not opened (SSH/headless)"),
@@ -515,18 +513,12 @@ fn test_gui_accessibility_o_outcomes_visible_at_80x24() {
         }
 
         for (width, height) in [(80, 24), (40, 18)] {
-            let backend = TestBackend::new(width, height);
-            let mut terminal = ratatui::Terminal::new(backend).unwrap();
-            terminal
-                    .draw(|frame| {
-                        render_tabbed_wizard_with_permission_target(
-                            frame,
-                            &state,
-                            "current Finch process: PID 42\nexecutable: /tmp/finch\nlauncher hint: Terminal",
-                        );
-                    })
-                    .unwrap();
-            let rendered = test_buffer_text(terminal.backend().buffer());
+            let rendered = wizard_text_with_permission_target(
+                &state,
+                "current Finch process: PID 42\nexecutable: /tmp/finch\nlauncher hint: Terminal",
+                width,
+                height,
+            );
             assert!(rendered.contains("GUI automation"));
             assert!(rendered.contains(needle), "missing {needle}: {rendered}");
             assert!(rendered.contains("D: Full"));
@@ -549,8 +541,6 @@ fn test_gui_accessibility_o_outcomes_visible_at_80x24() {
 #[cfg(target_os = "macos")]
 #[test]
 fn test_gui_accessibility_fresh_40x18_shows_exact_recovery_keys_and_path() {
-    use ratatui::backend::TestBackend;
-
     let mut state = WizardState::new(None);
     state.current_section = WizardSection::Features;
     if let Some(SectionState::Features {
@@ -564,18 +554,15 @@ fn test_gui_accessibility_fresh_40x18_shows_exact_recovery_keys_and_path() {
         gui_automation_availability.state = AutomationState::PermissionRequired;
         *selected_idx = 3;
     }
-    let backend = TestBackend::new(40, 18);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            render_tabbed_wizard_with_permission_target(
-                frame,
-                &state,
-                "current Finch process: PID 42\nexecutable: /tmp/finch\nlauncher hint: Terminal",
-            );
-        })
-        .unwrap();
-    let rendered = test_buffer_text(terminal.backend().buffer());
+    let rendered = wizard_text_with_permission_target(
+        &state,
+        "current Finch process: PID 42\nexecutable: /tmp/finch\nlauncher hint: Terminal",
+        40,
+        18,
+    );
+    let _ = &rendered;
+
+    assert!(rendered.contains("Current Finch process"));
 
     assert!(rendered.contains("Current Finch process"));
     assert!(rendered.contains("R: Passive check"));
@@ -590,8 +577,6 @@ fn test_gui_accessibility_fresh_40x18_shows_exact_recovery_keys_and_path() {
 #[cfg(target_os = "macos")]
 #[test]
 fn test_gui_accessibility_expanded_details_preserve_long_identity_hints() {
-    use ratatui::backend::TestBackend;
-
     let long_path = format!(
         "/private/tmp/{}/finch-ad-hoc-build",
         "long-development-directory/".repeat(4)
@@ -630,14 +615,7 @@ fn test_gui_accessibility_expanded_details_preserve_long_identity_hints() {
         {
             *gui_automation_details_scroll = scroll;
         }
-        let backend = TestBackend::new(width, height);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                render_tabbed_wizard_with_permission_target(frame, &state, &target);
-            })
-            .unwrap();
-        test_buffer_text(terminal.backend().buffer())
+        wizard_text_with_permission_target(&state, &target, width, height)
     };
 
     let full_status = gui_automation_status_lines(
@@ -698,20 +676,13 @@ fn test_gui_accessibility_expanded_details_preserve_long_identity_hints() {
 #[cfg(target_os = "macos")]
 #[test]
 fn test_gui_accessibility_navigation_and_resize_keep_selected_row_visible() {
-    use ratatui::backend::TestBackend;
-
     let mut state = WizardState::new(None);
     state.current_section = WizardSection::Features;
     for _ in 0..SETTINGS_CONTEXT_IDX {
         handle_features_input(&mut state, key(KeyCode::Down)).unwrap();
     }
     for (width, height) in [(80, 24), (40, 18)] {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| render_tabbed_wizard(frame, &state))
-            .unwrap();
-        let rendered = test_buffer_text(terminal.backend().buffer());
+        let rendered = wizard_text_with_permission_target(&state, "", width, height);
         assert!(
             rendered.contains("Context lines: 4"),
             "selected row clipped after resize to {width}x{height}: {rendered}"
@@ -833,20 +804,6 @@ fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, modifiers)
 }
 
-fn test_buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
-    (0..buffer.area.height)
-        .map(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer.cell((x, y)).unwrap().symbol())
-                .fold(String::new(), |mut line, symbol| {
-                    line.push_str(symbol);
-                    line
-                })
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn state_with_step(step: AddProviderStep) -> WizardState {
     let hermetic_config = crate::config::Config::with_providers_and_paths(
         vec![ProviderEntry::Claude {
@@ -936,15 +893,46 @@ fn install_completed_catalog_refresh_result(
     }
 }
 
-fn render_wizard_text(state: &WizardState) -> String {
-    use ratatui::backend::TestBackend;
+/// Render the wizard through the widget host and return the visible rows the
+/// shadow buffer would hold — the production path, not a TestBackend painter.
+fn wizard_text_with_permission_target(
+    state: &WizardState,
+    permission_target: &str,
+    width: usize,
+    height: usize,
+) -> String {
+    let view = wizard_view_with_permission_target(state, permission_target, width, height);
+    let frame = crate::cli::tui::plan_wizard_frame(&view, width, height);
+    frame
+        .to_shadow_buffer(width, height)
+        .rows_as_text()
+        .join("\n")
+}
 
-    let backend = TestBackend::new(180, 50);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render_tabbed_wizard(frame, state))
-        .unwrap();
-    test_buffer_text(terminal.backend().buffer())
+fn render_wizard_text(state: &WizardState) -> String {
+    render_wizard_text_at(state, 180, 50)
+}
+
+fn render_wizard_text_at(state: &WizardState, width: usize, height: usize) -> String {
+    wizard_text_with_permission_target(state, "", width, height)
+}
+
+/// One overlay card alone in a frame, the way the device-code and add-provider
+/// dialogs occupy the claimed card region (#807).
+fn render_card_text(card: crate::cli::tui::WizardCard, width: usize, height: usize) -> String {
+    let view = crate::cli::tui::WizardView {
+        title: " Finch Setup ".to_string(),
+        tab_titles: vec![],
+        selected_tab: 0,
+        section: crate::cli::tui::WizardSectionContent::plain(Vec::new()),
+        help: None,
+        card: Some(card),
+    };
+    let frame = crate::cli::tui::plan_wizard_frame(&view, width, height);
+    frame
+        .to_shadow_buffer(width, height)
+        .rows_as_text()
+        .join("\n")
 }
 
 fn discovered_catalog(profile: &ModelCatalogProfile, models: &[&str]) -> ModelCatalog {
@@ -1031,6 +1019,124 @@ fn default_configure_remote(focused_field: usize) -> AddProviderStep {
         api_key: Some(String::new()),
         focused_field,
         editing_idx: None,
+    }
+}
+
+// ── the widget host (#812) ────────────────────────────────────────────────
+
+/// #812 structural pin: the wizard attaches to the tui widget host. No file
+/// in this module's production code may reference ratatui at all — a private
+/// terminal, a second painter, or a TestBackend painter would re-ship the
+/// fork this ticket removes.
+#[test]
+fn test_setup_wizard_production_does_not_construct_a_private_ratatui_terminal() {
+    let module_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli/setup_wizard");
+    let offenders: Vec<String> = std::fs::read_dir(&module_dir)
+        .expect("read setup_wizard directory")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .filter(|path| {
+            // The test module may still import ratatui types for input
+            // fixtures; production code may not.
+            path.file_name().is_none_or(|name| name != "tests.rs")
+        })
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            text.contains("ratatui").then(|| path.display().to_string())
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "INVARIANT (#812): the setup wizard must not be a second ratatui app — \
+         these production files still name ratatui: {offenders:?}"
+    );
+}
+
+/// The Models section (the provider list) drives through the widget host: the
+/// claiming pass records the section's rect, the lines land in the shadow
+/// buffer, and the provider rows are visible at a real terminal size.
+#[test]
+fn test_provider_list_drives_through_the_widget_host_and_blits_visible_text() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Models;
+
+    let view = wizard_view_with_permission_target(&state, "", 100, 24);
+    let frame = crate::cli::tui::plan_wizard_frame(&view, 100, 24);
+    let rows = frame.to_shadow_buffer(100, 24).rows_as_text();
+
+    assert_eq!(
+        (frame.rects.tab_row.height, frame.rects.section.height),
+        (3, 20),
+        "the claiming pass gives the provider list the leftover rows; rects={rect:?}",
+        rect = frame.rects
+    );
+    let rendered = rows.join("\n");
+    assert!(
+        rendered.contains("AI Providers") && rendered.contains("★ Primary:"),
+        "the provider list must blit through the shadow buffer with visible text; rows:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[Not configured]"),
+        "the unconfigured primary provider must be visible on the real path; rows:\n{rendered}"
+    );
+}
+
+/// The Finish/confirm screen drives through the widget host at the default
+/// terminal size and names its save action in visible text.
+#[test]
+fn test_confirm_screen_drives_through_the_widget_host_with_visible_text() {
+    let mut state = WizardState::new(None);
+    state.current_section = WizardSection::Review;
+
+    let rendered = render_wizard_text_at(&state, 100, 24);
+    assert!(
+        rendered.contains("Ready to go!") && rendered.contains("save & start chatting"),
+        "the confirm screen must be speakable through the widget host; rendered:\n{rendered}"
+    );
+}
+
+/// The device-code overlay blits as a claimed card whose chrome — title and
+/// controls — stays inside the claimed rect, the #807 contract.
+#[test]
+fn test_device_code_overlay_claims_a_card_with_chrome_inside_it() {
+    let mut state = state_with_step(device_auth_step(Arc::new(Mutex::new(None))));
+    state.current_section = WizardSection::Models;
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    {
+        if let Some(AddProviderStep::DeviceAuth { pending, .. }) = adding_provider.as_mut() {
+            *pending.lock().unwrap() = Some(DeviceAuthPresentation {
+                verification_uri: "https://auth.openai.com/activate".into(),
+                user_code: "CODE-5678".into(),
+                expires_in: std::time::Duration::from_secs(600),
+            });
+        }
+    }
+
+    let view = wizard_view_with_permission_target(&state, "", 80, 24);
+    let frame = crate::cli::tui::plan_wizard_frame(&view, 80, 24);
+    let card = frame.rects.card;
+    assert!(
+        card.height >= 5 && card.width == 80,
+        "the device-code card must claim real rows at full width; got {card:?}"
+    );
+    let rows = frame.to_shadow_buffer(80, 24).rows_as_text();
+    let card_text = rows[card.y..card.y + card.height].join("\n");
+    assert!(
+        card_text.contains("One-time code: CODE-5678")
+            && card_text.contains("Open: https://auth.openai.com/activate"),
+        "the device code and verification URL must blit through the shadow buffer; card:\n{card_text}"
+    );
+    assert!(
+        card_text.contains("Esc: Cancel"),
+        "the controls must stay pinned inside the card; card:\n{card_text}"
+    );
+    for row in &rows[card.y..card.y + card.height] {
+        assert!(
+            row.starts_with('┌') || row.starts_with('│') || row.starts_with('└') || row.is_empty(),
+            "no chrome may escape the claimed card rect: {row:?}"
+        );
     }
 }
 
@@ -1378,8 +1484,6 @@ fn catalog_refresh_time_displays_timestamp_and_age() {
 
 #[test]
 fn chooser_keeps_chatgpt_subscription_distinct_from_openai_platform() {
-    use ratatui::backend::TestBackend;
-
     let openai = CLOUD_PROVIDERS
         .iter()
         .find(|(id, ..)| *id == "openai")
@@ -1396,24 +1500,18 @@ fn chooser_keeps_chatgpt_subscription_distinct_from_openai_platform() {
         .all(|(id, ..)| *id != "chatgpt_subscription"));
 
     let step = AddProviderStep::SelectAddType { selected: 0 };
-    let backend = TestBackend::new(160, 50);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            render_add_provider_overlay(
-                frame,
-                area,
-                CoreMlConfig::default(),
-                &step,
-                &CatalogSource::StaticFallback,
-                false,
-                None,
-                None,
-            );
-        })
-        .unwrap();
-    let rendered = test_buffer_text(terminal.backend().buffer());
+    let rendered = render_card_text(
+        add_provider_card(
+            CoreMlConfig::default(),
+            &step,
+            &CatalogSource::StaticFallback,
+            false,
+            None,
+            None,
+        ),
+        160,
+        50,
+    );
     assert!(rendered.contains("OpenAI API"), "{rendered}");
     assert!(rendered.contains("ChatGPT subscription"), "{rendered}");
     assert!(
@@ -1427,8 +1525,6 @@ fn chooser_keeps_chatgpt_subscription_distinct_from_openai_platform() {
 
 #[test]
 fn chatgpt_configuration_has_no_api_key_input_buffer_or_render_path() {
-    use ratatui::backend::TestBackend;
-
     let mut state = state_with_step(AddProviderStep::SelectAddType { selected: 0 });
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
     assert!(matches!(
@@ -1495,23 +1591,18 @@ fn chatgpt_configuration_has_no_api_key_input_buffer_or_render_path() {
         }
     ));
 
-    let backend = TestBackend::new(180, 50);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            render_add_provider_overlay(
-                frame,
-                frame.area(),
-                CoreMlConfig::default(),
-                step,
-                &CatalogSource::StaticFallback,
-                false,
-                None,
-                None,
-            );
-        })
-        .unwrap();
-    let rendered = test_buffer_text(terminal.backend().buffer());
+    let rendered = render_card_text(
+        add_provider_card(
+            CoreMlConfig::default(),
+            step,
+            &CatalogSource::StaticFallback,
+            false,
+            None,
+            None,
+        ),
+        180,
+        50,
+    );
     assert!(rendered.contains("Finch-native device sign-in after save"));
     assert!(!rendered.contains("API Key"), "{rendered}");
     assert!(
@@ -1558,8 +1649,6 @@ fn chatgpt_configuration_has_no_api_key_input_buffer_or_render_path() {
 
 #[test]
 fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
-    use ratatui::backend::TestBackend;
-
     let misleading_runtime_time = Utc::now();
     let label = format_catalog_label(
         &CatalogSource::StaticFallback,
@@ -1591,24 +1680,18 @@ fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
         focused_field: 2,
         editing_idx: None,
     };
-    let backend = TestBackend::new(180, 50);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            render_add_provider_overlay(
-                frame,
-                area,
-                CoreMlConfig::default(),
-                &step,
-                &CatalogSource::StaticFallback,
-                false,
-                Some(&misleading_runtime_time),
-                None,
-            );
-        })
-        .unwrap();
-    let rendered = test_buffer_text(terminal.backend().buffer());
+    let rendered = render_card_text(
+        add_provider_card(
+            CoreMlConfig::default(),
+            &step,
+            &CatalogSource::StaticFallback,
+            false,
+            Some(&misleading_runtime_time),
+            None,
+        ),
+        180,
+        50,
+    );
     assert!(rendered.contains("bundled fallback snapshot"), "{rendered}");
     assert!(rendered.contains(STATIC_FALLBACK_AS_OF), "{rendered}");
     assert!(rendered.contains("incomplete"), "{rendered}");
@@ -3223,8 +3306,6 @@ async fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_
         ReasoningEffort,
     };
     use chrono::{DateTime, Utc};
-    use ratatui::backend::TestBackend;
-
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("config.toml");
     let reopened_path = directory.path().join("reopened.toml");
@@ -3320,12 +3401,7 @@ async fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_
 
     let mut state = WizardState::new(Some(&opened));
     state.current_section = WizardSection::Models;
-    let backend = TestBackend::new(120, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render_tabbed_wizard(frame, &state))
-        .unwrap();
-    let rendered = test_buffer_text(terminal.backend().buffer());
+    let rendered = render_wizard_text_at(&state, 120, 30);
     assert!(rendered.contains("ChatGPT Personal"), "{rendered}");
     assert!(rendered.contains("Grok Build"), "{rendered}");
     assert!(rendered.contains("Local Qwen"), "{rendered}");
@@ -4142,16 +4218,9 @@ fn test_provider_editor_refuses_unsupported_rows_without_mutation() {
 
 #[test]
 fn test_genuinely_empty_setup_alone_renders_unconfigured_claude_default() {
-    use ratatui::backend::TestBackend;
-
     let mut state = WizardState::new(None);
     state.current_section = WizardSection::Models;
-    let backend = TestBackend::new(100, 24);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render_tabbed_wizard(frame, &state))
-        .unwrap();
-    let rendered = test_buffer_text(terminal.backend().buffer());
+    let rendered = render_wizard_text_at(&state, 100, 24);
     assert!(rendered.contains("claude"), "{rendered}");
     assert!(rendered.contains("[Not configured]"), "{rendered}");
 }

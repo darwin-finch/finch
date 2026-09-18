@@ -1,372 +1,50 @@
-//! Drawing, one function per wizard section and overlay.
+//! Wizard view props: what the widget host paints, one function per section.
 //!
-//! The wizard's largest region and its least coupled: it references no subsystem outside
-//! `cli` except `crate::theme`.
+//! #812: this file no longer paints. The second painter is gone — each
+//! function converts `WizardState` into plain styled lines and overlay-card
+//! props ([`WizardView`], [`WizardCard`]), and `crate::cli::tui::wizard_host`
+//! claims the frame, records the shadow buffer, and blits. The lines are the
+//! speakable canonical form, so a GUI host (#808) can consume the same props.
+//!
+//! The windowing helpers here count physical rows with the same shadow-buffer
+//! arithmetic the host's claiming pass uses, so the one list that must keep a
+//! selected row visible (the old painter's `ListState` guarantee) is windowed
+//! with the same budget the tree will claim.
 
 use super::chatgpt_recovery::{chatgpt_setup_failure_cause, chatgpt_setup_failure_summary};
 use super::grok_recovery::{grok_setup_failure_cause, grok_setup_failure_summary};
 use super::*;
+use crate::cli::tui::WizardColor as Color;
+use crate::cli::tui::{
+    physical_rows, wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint,
+    wizard_plain, WizardCard, WizardSectionContent, WizardView,
+};
 
-/// Render the tabbed wizard UI
-pub(super) fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
-    #[cfg(target_os = "macos")]
-    let permission_target = permission_target_description();
-    #[cfg(not(target_os = "macos"))]
-    let permission_target = String::new();
-    render_tabbed_wizard_with_permission_target(f, state, &permission_target);
-}
+// ─── Small shared helpers ────────────────────────────────────────────────────
 
-pub(super) fn render_tabbed_wizard_with_permission_target(
-    f: &mut Frame,
-    state: &WizardState,
-    permission_target: &str,
-) {
-    let size = f.area();
-
-    // Main layout: [Tab bar | Content | Help]
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Tab bar
-            Constraint::Min(10),   // Content area
-            Constraint::Length(2), // Help text
-        ])
-        .split(size);
-
-    // Render tab bar
-    let tab_titles: Vec<Line> = WizardSection::all()
-        .iter()
-        .map(|section| {
-            let name = section.name();
-            let indicator = if state.is_completed(*section) {
-                " ✓"
-            } else {
-                ""
-            };
-            Line::from(format!("{}{}", name, indicator))
-        })
+/// `sk-abcdef...wxyz` — the only part of a secret a screen needs to show.
+pub(super) fn mask_secret(value: &str, keep_start: usize, keep_end: usize) -> String {
+    let tail: String = value
+        .chars()
+        .rev()
+        .take(keep_end)
+        .collect::<String>()
+        .chars()
+        .rev()
         .collect();
-
-    let selected_idx = WizardSection::all()
-        .iter()
-        .position(|s| *s == state.current_section)
-        .unwrap_or(0);
-
-    let tabs = Tabs::new(tab_titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Finch Setup "),
-        )
-        .select(selected_idx)
-        .style(Style::default().fg(Color::Blue))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        );
-    f.render_widget(tabs, chunks[0]);
-
-    // Render current section content
-    render_section_content(f, chunks[1], state, permission_target);
-
-    // Render help text
-    let section_help = match state.current_section {
-        WizardSection::Themes => "↑/↓: Choose theme | Enter: Next",
-        WizardSection::Models => "Enter: Edit provider | A: Add | D: Remove",
-        WizardSection::Personas => "↑/↓: Choose style | E: Edit prompt | Enter: Next",
-        WizardSection::Features => "↑/↓: Navigate | Space: Toggle | Enter: Next",
-        WizardSection::Review => "Enter: Save & start",
-    };
-    let help_text =
-        format!("{section_help} | Ctrl+S: Save | Esc: Back | Tab: Next | Ctrl+C: Cancel");
-
-    let help = Paragraph::new(help_text)
-        .style(
-            Style::default()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center);
-    f.render_widget(help, chunks[2]);
-
-    if state.confirming_cancel {
-        render_cancel_confirmation(f, size);
-    }
+    format!(
+        "{}...{}",
+        value.chars().take(keep_start).collect::<String>(),
+        tail
+    )
 }
 
-pub(super) fn render_cancel_confirmation(f: &mut Frame, area: Rect) {
-    let width = 56.min(area.width);
-    let height = 7.min(area.height);
-    let popup = Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
-    let dialog = Paragraph::new(
-        "Discard all setup changes and cancel?\n\nY / Enter: Discard    N / Esc: Keep editing",
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(" Cancel setup? "),
-    )
-    .style(Style::default().bg(Color::Black).fg(Color::White))
-    .alignment(Alignment::Center)
-    .wrap(Wrap { trim: false });
-    f.render_widget(dialog, popup);
+/// Wrapped rows one logical line occupies at `width`.
+fn rows_of(line: &str, width: usize) -> usize {
+    physical_rows(line, width)
 }
 
-/// Render the content area for the current section
-pub(super) fn render_section_content(
-    f: &mut Frame,
-    area: Rect,
-    state: &WizardState,
-    permission_target: &str,
-) {
-    let section_state = state.sections.get(&state.current_section);
-
-    match section_state {
-        Some(SectionState::Themes { selected_theme }) => {
-            render_themes_section(f, area, *selected_theme)
-        }
-        Some(SectionState::Models {
-            primary_model,
-            tool_models,
-            selected_idx,
-            editing_mode,
-            editing_model_mode,
-            model_input,
-            adding_provider,
-            catalog_source,
-            catalog_refresh,
-            catalog_refreshed_at,
-            catalog_error,
-            error,
-            ..
-        }) => render_models_section(
-            f,
-            area,
-            state.coreml,
-            primary_model,
-            tool_models,
-            *selected_idx,
-            *editing_mode,
-            *editing_model_mode,
-            model_input,
-            adding_provider.as_ref(),
-            catalog_source,
-            catalog_refresh.is_some(),
-            catalog_refreshed_at.as_ref(),
-            catalog_error.as_deref(),
-            error.as_deref(),
-        ),
-        Some(SectionState::Personas {
-            available_personas,
-            selected_idx,
-            default_persona,
-            editing_prompt,
-            prompt_input,
-            cursor_pos,
-        }) => render_personas_section(
-            f,
-            area,
-            available_personas,
-            *selected_idx,
-            default_persona,
-            *editing_prompt,
-            prompt_input,
-            *cursor_pos,
-        ),
-        Some(SectionState::Features {
-            auto_approve,
-            streaming,
-            debug,
-            hf_token,
-            editing_hf_token,
-            finch_api_key,
-            editing_finch_api_key,
-            #[cfg(target_os = "macos")]
-            gui_automation,
-            #[cfg(target_os = "macos")]
-            gui_automation_availability,
-            #[cfg(target_os = "macos")]
-            gui_automation_prompt,
-            #[cfg(target_os = "macos")]
-            gui_automation_prompted,
-            #[cfg(target_os = "macos")]
-            gui_automation_last_known_available,
-            #[cfg(target_os = "macos")]
-                gui_automation_permission_context: _,
-            #[cfg(target_os = "macos")]
-            gui_automation_settings_feedback,
-            #[cfg(target_os = "macos")]
-            gui_automation_details_expanded,
-            #[cfg(target_os = "macos")]
-            gui_automation_details_scroll,
-            daemon_only_mode,
-            mdns_discovery,
-            auto_discover,
-            memory_context_lines,
-            selected_idx,
-        }) => render_features_section(
-            f,
-            area,
-            *auto_approve,
-            *streaming,
-            *debug,
-            hf_token,
-            *editing_hf_token,
-            finch_api_key,
-            *editing_finch_api_key,
-            #[cfg(target_os = "macos")]
-            *gui_automation,
-            #[cfg(target_os = "macos")]
-            gui_automation_availability,
-            #[cfg(target_os = "macos")]
-            *gui_automation_prompt,
-            #[cfg(target_os = "macos")]
-            *gui_automation_prompted,
-            #[cfg(target_os = "macos")]
-            *gui_automation_last_known_available,
-            #[cfg(target_os = "macos")]
-            gui_automation_settings_feedback.as_ref(),
-            #[cfg(target_os = "macos")]
-            *gui_automation_details_expanded,
-            #[cfg(target_os = "macos")]
-            *gui_automation_details_scroll,
-            #[cfg(target_os = "macos")]
-            permission_target,
-            *daemon_only_mode,
-            *mdns_discovery,
-            *auto_discover,
-            *memory_context_lines,
-            *selected_idx,
-        ),
-        Some(SectionState::Review) => render_review_section(f, area, state),
-        None => {
-            let error = Paragraph::new("Error: Section state not found")
-                .style(Style::default().fg(Color::Red));
-            f.render_widget(error, area);
-        }
-    }
-}
-
-/// Render Themes section
-pub(super) fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
-    use crate::theme::ColorTheme;
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Min(8),    // Theme list
-            Constraint::Length(8), // Preview
-            Constraint::Length(3), // Instructions
-        ])
-        .split(area);
-
-    let title = Paragraph::new("Theme Selection")
-        .style(
-            Style::default()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center);
-    f.render_widget(title, chunks[0]);
-
-    // Render theme options with VERY obvious selection indicator
-    let themes = ColorTheme::all();
-    let items: Vec<ListItem> = themes
-        .iter()
-        .enumerate()
-        .map(|(i, theme)| {
-            let is_selected = i == selected_theme;
-            let (prefix, suffix, style) = if is_selected {
-                (
-                    ">>> ",
-                    " <<<",
-                    Style::default()
-                        .bg(Color::Black)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                ("    ", "", Style::default().fg(Color::Blue))
-            };
-
-            let text = format!(
-                "{}{} - {}{}",
-                prefix,
-                theme.name(),
-                theme.description(),
-                suffix
-            );
-            ListItem::new(text).style(style)
-        })
-        .collect();
-
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Available Themes"),
-    );
-    f.render_widget(list, chunks[1]);
-
-    // Render preview of selected theme
-    let preview_theme = themes[selected_theme].to_scheme();
-    let preview_lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "User: ",
-                Style::default().fg(preview_theme.messages.user.to_color()),
-            ),
-            Span::raw("What is 2+2?"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Assistant: ",
-                Style::default().fg(preview_theme.messages.assistant.to_color()),
-            ),
-            Span::raw("The answer is 4."),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "🔧 Tool: ",
-                Style::default().fg(preview_theme.messages.tool.to_color()),
-            ),
-            Span::raw("Reading file..."),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "❌ Error: ",
-                Style::default().fg(preview_theme.messages.error.to_color()),
-            ),
-            Span::raw("File not found"),
-        ]),
-    ];
-
-    let preview = Paragraph::new(preview_lines)
-        .block(Block::default().borders(Borders::ALL).title("Preview"))
-        .wrap(Wrap { trim: false });
-    f.render_widget(preview, chunks[2]);
-
-    let instructions = Paragraph::new(
-        "Use ↑/↓ arrow keys to move selection (>>> theme <<<)\n\
-         Selected theme shows with white background. Press Enter to confirm.",
-    )
-    .style(
-        Style::default()
-            .fg(Color::Blue)
-            .add_modifier(Modifier::BOLD),
-    )
-    .wrap(Wrap { trim: false });
-    f.render_widget(instructions, chunks[3]);
-}
-
-/// Render Models section (unified Backend + Teachers)
+/// `Auto`, `CPU`, or `CoreML (all)` — the execution-target display.
 pub(super) fn execution_target_display(execution: ExecutionTarget, coreml: CoreMlConfig) -> String {
     #[cfg(target_os = "macos")]
     if execution == ExecutionTarget::CoreML {
@@ -374,637 +52,6 @@ pub(super) fn execution_target_display(execution: ExecutionTarget, coreml: CoreM
     }
 
     execution.name().to_string()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn render_models_section(
-    f: &mut Frame,
-    area: Rect,
-    coreml: CoreMlConfig,
-    primary_model: &ModelConfig,
-    tool_models: &[ModelConfig],
-    selected_idx: usize,
-    editing_mode: bool,
-    editing_model_mode: bool,
-    model_input: &str,
-    adding_provider: Option<&AddProviderStep>,
-    catalog_source: &CatalogSource,
-    catalog_refreshing: bool,
-    catalog_refreshed_at: Option<&DateTime<Utc>>,
-    catalog_error: Option<&str>,
-    error: Option<&str>,
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Length(4), // Description
-            Constraint::Min(6),    // Primary model + tool models
-            Constraint::Length(3), // Input panel (edit mode) or dim hint
-            Constraint::Length(2), // Instructions
-            Constraint::Length(2), // Error (if present)
-        ])
-        .split(area);
-
-    let title = Paragraph::new("AI Providers")
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center);
-    f.render_widget(title, chunks[0]);
-
-    // Show helpful hint when no key is configured
-    let has_key = match primary_model {
-        ModelConfig::Remote {
-            provider,
-            api_key,
-            persisted,
-            ..
-        } if provider.eq_ignore_ascii_case("chatgpt")
-            || provider.eq_ignore_ascii_case("grok-sub") =>
-        {
-            matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
-        }
-        ModelConfig::Remote { api_key, .. } => !api_key.is_empty(),
-        ModelConfig::Local { .. } => true,
-    };
-
-    let description_text = match primary_model {
-        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("grok-sub") => {
-            "Grok subscription uses SuperGrok entitlement via device sign-in; xAI Console API keys are a separate provider and are never used automatically."
-                .to_string()
-        }
-        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("chatgpt") => {
-            "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate."
-                .to_string()
-        }
-        _ if has_key => format!(
-            "Primary provider configured. Press A to add more providers ({} total).",
-            1 + tool_models.len()
-        ),
-        _ => "Paste your API key below (E), or add a provider with A.\n\
-         No key yet? Get one at console.anthropic.com/keys"
-            .to_string(),
-    };
-    let description = Paragraph::new(description_text)
-        .style(Style::default().fg(Color::Blue))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
-    f.render_widget(description, chunks[1]);
-
-    // Build list items: primary model + tool models
-    let mut items = vec![];
-
-    // Primary model - make selection VERY obvious
-    let is_selected = selected_idx == 0;
-    let (prefix, suffix, primary_style) = if is_selected {
-        (
-            ">>> ",
-            " <<<",
-            Style::default()
-                .bg(Color::Black)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        ("    ", "", Style::default().fg(Color::Blue))
-    };
-
-    let primary_display = match primary_model {
-        ModelConfig::Local {
-            family,
-            size,
-            execution,
-            ..
-        } => {
-            format!(
-                "{}★ Primary: Local {} {} ({}){}",
-                prefix,
-                family.name(),
-                model_size_display(size),
-                execution_target_display(*execution, coreml),
-                suffix
-            )
-        }
-        ModelConfig::Remote {
-            provider,
-            name,
-            api_key,
-            model,
-            ..
-        } => {
-            let key_display = if provider.eq_ignore_ascii_case("chatgpt")
-                || provider.eq_ignore_ascii_case("grok-sub")
-            {
-                "Named device credential".to_string()
-            } else if api_key.is_empty() {
-                "[Not configured]".to_string()
-            } else {
-                format!(
-                    "{}...{}",
-                    &api_key.chars().take(10).collect::<String>(),
-                    api_key
-                        .chars()
-                        .rev()
-                        .take(4)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect::<String>()
-                )
-            };
-            let model_display = if !model.is_empty() {
-                format!(" - {}", model)
-            } else {
-                String::new()
-            };
-            format!(
-                "{}★ Primary: {}{} [{}]{}",
-                prefix, name, model_display, key_display, suffix
-            )
-        }
-    };
-
-    items.push(ListItem::new(primary_display).style(primary_style));
-
-    // Tool models - make selection VERY obvious
-    for (idx, tool_model) in tool_models.iter().enumerate() {
-        let tool_idx = idx + 1;
-        let is_tool_selected = selected_idx == tool_idx;
-
-        let (prefix, suffix, style) = if is_tool_selected {
-            (
-                ">>> ",
-                " <<<",
-                Style::default()
-                    .bg(Color::Black)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else if tool_model.enabled() {
-            ("    ", "", Style::default())
-        } else {
-            ("    ", "", Style::default().fg(Color::DarkGray))
-        };
-
-        let checkbox = if tool_model.enabled() { "☑" } else { "☐" };
-
-        let display = match tool_model {
-            ModelConfig::Local { family, size, .. } => {
-                format!(
-                    "{}{} Tool: Local {} {}{}",
-                    prefix,
-                    checkbox,
-                    family.name(),
-                    model_size_display(size),
-                    suffix
-                )
-            }
-            ModelConfig::Remote { name, model, .. } => {
-                let model_display = if !model.is_empty() {
-                    format!(" - {}", model)
-                } else {
-                    String::new()
-                };
-                format!(
-                    "{}{} Tool: {}{}{}",
-                    prefix, checkbox, name, model_display, suffix
-                )
-            }
-        };
-
-        items.push(ListItem::new(display).style(style));
-    }
-
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("AI Providers"));
-    f.render_widget(list, chunks[2]);
-
-    // Input panel (chunks[3]): bordered text box when in editing mode, dim hint otherwise
-    let selected_accepts_api_key = if selected_idx == 0 {
-        primary_model.accepts_api_key()
-    } else {
-        tool_models
-            .get(selected_idx - 1)
-            .is_some_and(ModelConfig::accepts_api_key)
-    };
-    if editing_mode && selected_accepts_api_key {
-        // Show current API key in a bordered box so the user sees what they're typing
-        let current_key = if selected_idx == 0 {
-            match primary_model {
-                ModelConfig::Remote { api_key, .. } => api_key.as_str(),
-                _ => "",
-            }
-        } else {
-            match tool_models.get(selected_idx - 1) {
-                Some(ModelConfig::Remote { api_key, .. }) => api_key.as_str(),
-                _ => "",
-            }
-        };
-        let panel = Paragraph::new(format!("{}█", current_key)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Edit API Key")
-                .border_style(Style::default().fg(Color::Yellow)),
-        );
-        f.render_widget(panel, chunks[3]);
-    } else if editing_mode {
-        let panel = Paragraph::new("Named Finch device credential; no API key input").block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Subscription authentication")
-                .border_style(Style::default().fg(Color::Yellow)),
-        );
-        f.render_widget(panel, chunks[3]);
-    } else if editing_model_mode {
-        let panel = Paragraph::new(format!("{}█", model_input)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Edit Model")
-                .border_style(Style::default().fg(Color::Yellow)),
-        );
-        f.render_widget(panel, chunks[3]);
-    } else {
-        let hint = Paragraph::new("Press Enter to edit the selected provider · P for primary")
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
-        f.render_widget(hint, chunks[3]);
-    }
-
-    // Instructions (chunks[4])
-    let instructions_text = if editing_mode || editing_model_mode {
-        "Type here | Enter/Esc: Save & return"
-    } else {
-        "Enter: Edit | P: Primary | A: Add | D: Remove | Tab: Next"
-    };
-    let instructions = Paragraph::new(instructions_text)
-        .style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center);
-    f.render_widget(instructions, chunks[4]);
-
-    // Error message (chunks[5], if present)
-    if let Some(err) = error {
-        let error_widget = Paragraph::new(err)
-            .style(Style::default().fg(Color::Red))
-            .alignment(Alignment::Center);
-        f.render_widget(error_widget, chunks[5]);
-    }
-
-    // Render add-provider overlay if active
-    if let Some(step) = adding_provider {
-        render_add_provider_overlay(
-            f,
-            area,
-            coreml,
-            step,
-            catalog_source,
-            catalog_refreshing,
-            catalog_refreshed_at,
-            catalog_error,
-        );
-    }
-}
-
-/// Render the add-time ChatGPT device sign-in dialog (#424). Every state is
-/// plain, speakable text: starting, the one-time code with its verification
-/// URL, the authenticated account, or the terminal failure cause with its
-/// recovery keys.
-pub(super) fn render_device_auth_overlay(
-    f: &mut Frame,
-    area: Rect,
-    provider_idx: usize,
-    provider_name: &str,
-    pending: &std::sync::Arc<std::sync::Mutex<Option<DeviceAuthPresentation>>>,
-    outcome: &DeviceAuthOutcome,
-) {
-    let provider_id = CLOUD_PROVIDERS[provider_idx.min(CLOUD_PROVIDERS.len() - 1)].0;
-    let title_text = if provider_id.eq_ignore_ascii_case("grok-sub") {
-        format!("Grok subscription device sign-in for {provider_name}")
-    } else {
-        format!("ChatGPT device sign-in for {provider_name}")
-    };
-    let title = Line::from(Span::styled(
-        title_text,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-    let lines: Vec<Line> = match outcome.lock().unwrap().as_ref() {
-        Some(Ok(ensured)) => {
-            let account = ensured
-                .account
-                .as_deref()
-                .unwrap_or("the authorized account");
-            vec![
-                title,
-                Line::from(""),
-                Line::from(format!("Signed in as {account}.")),
-                Line::from(format!(
-                    "{provider_name} is authenticated. Press Enter to return to the provider list."
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Enter: Continue",
-                    Style::default().fg(Color::Yellow),
-                )),
-            ]
-        }
-        Some(Err(failure)) => {
-            let summary = if provider_id.eq_ignore_ascii_case("grok-sub") {
-                grok_setup_failure_summary(grok_setup_failure_cause(failure))
-            } else {
-                chatgpt_setup_failure_summary(chatgpt_setup_failure_cause(failure))
-            };
-            vec![
-                title,
-                Line::from(""),
-                Line::from(summary),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Enter: Retry sign-in | Esc: Back to provider details",
-                    Style::default().fg(Color::Yellow),
-                )),
-            ]
-        }
-        None => match pending.lock().unwrap().as_ref() {
-            Some(presentation) => vec![
-                title,
-                Line::from(""),
-                Line::from(format!("Open: {}", presentation.verification_uri)),
-                Line::from(format!("One-time code: {}", presentation.user_code)),
-                Line::from(""),
-                Line::from("Approve the code in your browser; this dialog finishes automatically."),
-                Line::from(format!(
-                    "The code expires in {} minutes.",
-                    presentation.expires_in.as_secs().div_ceil(60)
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Esc: Cancel",
-                    Style::default().fg(Color::Yellow),
-                )),
-            ],
-            None => vec![
-                title,
-                Line::from(""),
-                Line::from("Starting the device sign-in…"),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Esc: Cancel",
-                    Style::default().fg(Color::Yellow),
-                )),
-            ],
-        },
-    };
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(para, area);
-}
-
-/// Render the add-provider overlay (centered box)
-pub(super) fn render_add_provider_overlay(
-    f: &mut Frame,
-    area: Rect,
-    coreml: CoreMlConfig,
-    step: &AddProviderStep,
-    catalog_source: &CatalogSource,
-    catalog_refreshing: bool,
-    catalog_refreshed_at: Option<&DateTime<Utc>>,
-    catalog_error: Option<&str>,
-) {
-    // Center a box that's 60% wide, 50% tall
-    let overlay_width = (area.width * 6 / 10).max(50).min(area.width);
-    let overlay_height = (area.height / 2).max(14).min(area.height);
-    let overlay_x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
-    let overlay_y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
-    let overlay = Rect::new(overlay_x, overlay_y, overlay_width, overlay_height);
-
-    // The wizard already knows which operation it is performing; say so rather
-    // than telling someone editing a working provider that they are adding one
-    // (#418). Only the remote and device-auth dialogs are ever reopened for an
-    // existing provider.
-    let editing_existing_provider = match step {
-        AddProviderStep::ConfigureRemote {
-            editing_idx: Some(_),
-            ..
-        }
-        | AddProviderStep::DeviceAuth {
-            editing_idx: Some(_),
-            ..
-        } => true,
-        _ => false,
-    };
-
-    // Clear the overlay area with a filled block
-    let background = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(if editing_existing_provider {
-            " Edit AI Provider "
-        } else {
-            " Add AI Provider "
-        })
-        .title_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .style(Style::default().bg(Color::Black));
-    f.render_widget(background, overlay);
-
-    let inner = Rect::new(
-        overlay.x + 1,
-        overlay.y + 1,
-        overlay.width.saturating_sub(2),
-        overlay.height.saturating_sub(2),
-    );
-
-    match step {
-        // ── type selection — shows all providers directly ────────────────────────────
-        AddProviderStep::SelectAddType { selected } => {
-            let n_cloud = CLOUD_PROVIDERS.len();
-            let mut items: Vec<ListItem> = CLOUD_PROVIDERS
-                .iter()
-                .enumerate()
-                .map(|(i, (_, display_name, _, hint))| {
-                    let is_sel = i == *selected;
-                    let (prefix, suffix, style) = if is_sel {
-                        (
-                            ">>> ",
-                            " <<<",
-                            Style::default()
-                                .fg(Color::White)
-                                .bg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        ("    ", "", Style::default().fg(Color::Cyan))
-                    };
-                    let lines = vec![
-                        Line::from(format!("{}{}{}", prefix, display_name, suffix)).style(style),
-                        Line::from(format!("        {}", hint))
-                            .style(Style::default().fg(Color::DarkGray)),
-                    ];
-                    ListItem::new(lines)
-                })
-                .collect();
-            {
-                let is_sel = *selected == n_cloud;
-                let (prefix, suffix, style) = if is_sel {
-                    (
-                        ">>> ",
-                        " <<<",
-                        Style::default()
-                            .fg(Color::White)
-                            .bg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    ("    ", "", Style::default().fg(Color::Cyan))
-                };
-                items.push(ListItem::new(vec![
-                    Line::from(format!("{}Local model{}", prefix, suffix)).style(style),
-                    Line::from("        Run a model on this machine (no internet after download)")
-                        .style(Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-            {
-                let is_sel = *selected == n_cloud + 1;
-                let (prefix, suffix, style) = if is_sel {
-                    (
-                        ">>> ",
-                        " <<<",
-                        Style::default()
-                            .fg(Color::White)
-                            .bg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    ("    ", "", Style::default().fg(Color::DarkGray))
-                };
-                items.push(ListItem::new(vec![
-                    Line::from(format!("{}Scan local network{}", prefix, suffix)).style(style),
-                    Line::from("        Discover other Finch instances running on your LAN")
-                        .style(Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-            let list = List::new(items).block(
-                Block::default().title("Add AI Provider  ↑/↓: Move | Enter: Select | Esc: Cancel"),
-            );
-            f.render_widget(list, inner);
-        }
-        // ── single-screen cloud provider dialog ──────────────────────────────────────
-        AddProviderStep::ConfigureRemote {
-            provider_idx,
-            name,
-            model,
-            api_key,
-            focused_field,
-            editing_idx,
-        } => {
-            render_configure_remote_overlay(
-                f,
-                inner,
-                *provider_idx,
-                name,
-                model,
-                api_key.as_deref(),
-                *focused_field,
-                editing_idx.is_some(),
-                catalog_source,
-                catalog_refreshing,
-                catalog_refreshed_at,
-                catalog_error,
-            );
-        }
-        // ── single-screen local model dialog ─────────────────────────────────────────
-        AddProviderStep::ConfigureLocal {
-            inference_provider,
-            family,
-            size,
-            execution,
-            focused_field,
-        } => {
-            render_configure_local_overlay(
-                f,
-                inner,
-                coreml,
-                *inference_provider,
-                *family,
-                *size,
-                *execution,
-                *focused_field,
-            );
-        }
-        // ── network scan path ─────────────────────────────────────────────────────────
-        AddProviderStep::Scanning { .. } => {
-            let lines = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Scanning for Finch agents on local network…",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "(this takes up to 5 seconds)",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Esc: Cancel",
-                    Style::default().fg(Color::Yellow),
-                )),
-            ];
-            let para = Paragraph::new(lines)
-                .alignment(Alignment::Center)
-                .wrap(Wrap { trim: false });
-            f.render_widget(para, inner);
-        }
-        AddProviderStep::SelectAgent { agents, selected } => {
-            let items: Vec<ListItem> = agents
-                .iter()
-                .enumerate()
-                .map(|(i, agent)| {
-                    let is_sel = i == *selected;
-                    let (prefix, suffix, style) = if is_sel {
-                        (
-                            ">>> ",
-                            " <<<",
-                            Style::default()
-                                .fg(Color::White)
-                                .bg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        ("    ", "", Style::default().fg(Color::Cyan))
-                    };
-                    let label = format!(
-                        "{}{} @ {}:{}{}",
-                        prefix, agent.name, agent.host, agent.port, suffix
-                    );
-                    ListItem::new(Line::from(label).style(style))
-                })
-                .collect();
-            let list = List::new(items).block(
-                Block::default().title("Discovered agents  ↑/↓: Move | Enter: Add | Esc: Cancel"),
-            );
-            f.render_widget(list, inner);
-        }
-        // ── add-time ChatGPT device ceremony (#424) ──────────────────────────────────
-        AddProviderStep::DeviceAuth {
-            provider_idx,
-            name,
-            pending,
-            outcome,
-            ..
-        } => render_device_auth_overlay(f, inner, *provider_idx, name, pending, outcome),
-    }
 }
 
 pub(super) fn format_catalog_refresh_time(
@@ -1055,349 +102,414 @@ pub(super) fn format_catalog_label(
     format!("Models: {source}{refreshed} · Ctrl+R refresh · model ID remains editable")
 }
 
-/// Render single-screen cloud provider configuration dialog
-pub(super) fn render_configure_remote_overlay(
-    f: &mut Frame,
-    area: Rect,
-    provider_idx: usize,
-    name: &str,
-    model: &str,
-    api_key: Option<&str>,
-    focused_field: usize,
-    editing: bool,
-    catalog_source: &CatalogSource,
-    catalog_refreshing: bool,
-    catalog_refreshed_at: Option<&DateTime<Utc>>,
-    catalog_error: Option<&str>,
-) {
-    let (provider_id, provider_name, _default_model, key_hint) =
-        CLOUD_PROVIDERS[provider_idx.min(CLOUD_PROVIDERS.len() - 1)];
-
-    // Row rendering helper: label + bracketed value, highlighted when focused
-    let make_row =
-        |label: &str, value: &str, focused: bool, is_text_input: bool| -> Line<'static> {
-            let label_str = format!("{:<10}", label);
-            let value_str = if is_text_input && focused {
-                format!("[ {}█ ]", value)
-            } else if focused {
-                format!("[◄ {:<34}►]", value)
-            } else {
-                format!("[  {:<34} ]", value)
-            };
-            let (label_style, value_style) = if focused {
-                (
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                (
-                    Style::default().fg(Color::DarkGray),
-                    Style::default().fg(Color::Cyan),
-                )
-            };
-            Line::from(vec![
-                Span::styled(label_str, label_style),
-                Span::styled(value_str, value_style),
-            ])
-        };
-
-    let provider_value = format!("{} ({})", provider_name, provider_id);
-    let model_display = if model.is_empty() { "(default)" } else { model };
-    let mut lines = vec![
-        Line::from(""),
-        make_row("Provider", &provider_value, focused_field == 0, false),
-        make_row("Name", name, focused_field == 1, true),
-        make_row("Model", model_display, focused_field == 2, true),
-    ];
-    if let Some(api_key) = api_key {
-        let key_display = if api_key.is_empty() {
-            String::new()
+/// Skip the first `skip` wrapped rows of `lines`, by whole logical lines.
+fn skip_wrapped_rows(lines: &[String], skip: usize, width: usize) -> Vec<String> {
+    let mut used = 0usize;
+    let mut start = 0usize;
+    for line in lines {
+        let rows = rows_of(line, width);
+        if used + rows <= skip {
+            used += rows;
+            start += 1;
         } else {
-            let visible: String = api_key.chars().take(12).collect();
-            format!("{}…", visible)
+            break;
+        }
+    }
+    lines[start.min(lines.len())..].to_vec()
+}
+
+/// Keep the head of `lines` that fits `budget` wrapped rows.
+fn head_fitting_rows(lines: &[String], budget: usize, width: usize) -> Vec<String> {
+    let mut used = 0usize;
+    let mut out = Vec::new();
+    for line in lines {
+        let rows = rows_of(line, width);
+        if used + rows > budget {
+            break;
+        }
+        used += rows;
+        out.push(line.clone());
+    }
+    out
+}
+
+// ─── Tab row and help ────────────────────────────────────────────────────────
+
+fn tab_titles(state: &WizardState) -> Vec<String> {
+    WizardSection::all()
+        .iter()
+        .map(|section| {
+            if state.is_completed(*section) {
+                format!("{} ✓", section.name())
+            } else {
+                section.name().to_string()
+            }
+        })
+        .collect()
+}
+
+fn help_line(state: &WizardState, width: usize) -> String {
+    let section_help = match state.current_section {
+        WizardSection::Themes => "↑/↓: Choose theme | Enter: Next",
+        WizardSection::Models => "Enter: Edit provider | A: Add | D: Remove",
+        WizardSection::Personas => "↑/↓: Choose style | E: Edit prompt | Enter: Next",
+        WizardSection::Features => "↑/↓: Navigate | Space: Toggle | Enter: Next",
+        WizardSection::Review => "Enter: Save & start",
+    };
+    let text = format!("{section_help} | Ctrl+S: Save | Esc: Back | Tab: Next | Ctrl+C: Cancel");
+    wizard_centered(&wizard_bold(&text, Color::Blue), width)
+}
+
+// ─── Section content ─────────────────────────────────────────────────────────
+
+/// Themes section: list, preview, instructions.
+fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<String> {
+    use crate::theme::ColorTheme;
+
+    let mut lines = vec![wizard_centered(
+        &wizard_bold("Theme Selection", Color::Blue),
+        width,
+    )];
+
+    let themes = ColorTheme::all();
+    let items: Vec<String> = themes
+        .iter()
+        .enumerate()
+        .map(|(index, theme)| {
+            if index == selected_theme {
+                wizard_bold(
+                    &format!(">>> {} - {} <<<", theme.name(), theme.description()),
+                    Color::White,
+                )
+            } else {
+                wizard_line(
+                    &format!("    {} - {}", theme.name(), theme.description()),
+                    Color::Blue,
+                )
+            }
+        })
+        .collect();
+    lines.extend(wizard_boxed("Available Themes", &items, Color::Blue, width));
+
+    // Preview of the selected theme, in the theme's own colours.
+    let preview_theme = themes[selected_theme].to_scheme();
+    let preview = vec![
+        format!(
+            "{}{}",
+            wizard_line("User: ", preview_theme.messages.user.to_color().into()),
+            wizard_plain("What is 2+2?")
+        ),
+        format!(
+            "{}{}",
+            wizard_line(
+                "Assistant: ",
+                preview_theme.messages.assistant.to_color().into()
+            ),
+            wizard_plain("The answer is 4.")
+        ),
+        format!(
+            "{}{}",
+            wizard_line("🔧 Tool: ", preview_theme.messages.tool.to_color().into()),
+            wizard_plain("Reading file...")
+        ),
+        format!(
+            "{}{}",
+            wizard_line("❌ Error: ", preview_theme.messages.error.to_color().into()),
+            wizard_plain("File not found")
+        ),
+    ];
+    lines.extend(wizard_boxed("Preview", &preview, Color::Blue, width));
+
+    lines.push(wizard_bold(
+        "Use ↑/↓ arrow keys to move selection (>>> theme <<<)",
+        Color::Blue,
+    ));
+    lines.push(wizard_bold(
+        "Selected theme shows with white background. Press Enter to confirm.",
+        Color::Blue,
+    ));
+    lines
+}
+
+/// The display text for one provider row: primary marker, tool checkbox, and
+/// masked key state — the exact shapes the old painter rendered.
+fn provider_row_display(model: &ModelConfig, coreml: CoreMlConfig, primary: bool) -> String {
+    if primary {
+        return match model {
+            ModelConfig::Local {
+                family,
+                size,
+                execution,
+                ..
+            } => format!(
+                "★ Primary: Local {} {} ({})",
+                family.name(),
+                model_size_display(size),
+                execution_target_display(*execution, coreml)
+            ),
+            ModelConfig::Remote {
+                provider,
+                name,
+                api_key,
+                model,
+                ..
+            } => {
+                let key_display = if provider.eq_ignore_ascii_case("chatgpt")
+                    || provider.eq_ignore_ascii_case("grok-sub")
+                {
+                    "Named device credential".to_string()
+                } else if api_key.is_empty() {
+                    "[Not configured]".to_string()
+                } else {
+                    mask_secret(api_key, 10, 4)
+                };
+                let model_display = if model.is_empty() {
+                    String::new()
+                } else {
+                    format!(" - {model}")
+                };
+                format!("★ Primary: {name}{model_display} [{key_display}]")
+            }
         };
-        lines.push(make_row("API Key", &key_display, focused_field == 3, true));
+    }
+    let checkbox = if model.enabled() { "☑" } else { "☐" };
+    match model {
+        ModelConfig::Local { family, size, .. } => format!(
+            "{checkbox} Tool: Local {} {}",
+            family.name(),
+            model_size_display(size)
+        ),
+        ModelConfig::Remote { name, model, .. } => {
+            let model_display = if model.is_empty() {
+                String::new()
+            } else {
+                format!(" - {model}")
+            };
+            format!("{checkbox} Tool: {name}{model_display}")
+        }
+    }
+}
+
+fn marked_row(display: &str, selected: bool, enabled: bool) -> String {
+    if selected {
+        wizard_bold(&format!(">>> {display} <<<"), Color::White)
+    } else if enabled {
+        wizard_plain(&format!("    {display}"))
     } else {
-        lines.push(make_row(
-            "Auth",
-            "Finch-native device sign-in after save",
-            false,
-            false,
+        wizard_line(&format!("    {display}"), Color::DarkGray)
+    }
+}
+
+/// Models section: description, provider list, edit panel, instructions, error.
+#[allow(clippy::too_many_arguments)]
+fn models_section_lines(
+    coreml: CoreMlConfig,
+    primary_model: &ModelConfig,
+    tool_models: &[ModelConfig],
+    selected_idx: usize,
+    editing_mode: bool,
+    editing_model_mode: bool,
+    model_input: &str,
+    error: Option<&str>,
+    width: usize,
+) -> Vec<String> {
+    let mut lines = vec![wizard_centered(
+        &wizard_bold("AI Providers", Color::Cyan),
+        width,
+    )];
+
+    let has_key = match primary_model {
+        ModelConfig::Remote {
+            provider,
+            api_key,
+            persisted,
+            ..
+        } if provider.eq_ignore_ascii_case("chatgpt")
+            || provider.eq_ignore_ascii_case("grok-sub") =>
+        {
+            matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
+        }
+        ModelConfig::Remote { api_key, .. } => !api_key.is_empty(),
+        ModelConfig::Local { .. } => true,
+    };
+    let description_text = match primary_model {
+        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("grok-sub") => {
+            "Grok subscription uses SuperGrok entitlement via device sign-in; xAI Console API keys are a separate provider and are never used automatically."
+                .to_string()
+        }
+        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("chatgpt") => {
+            "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate."
+                .to_string()
+        }
+        _ if has_key => format!(
+            "Primary provider configured. Press A to add more providers ({} total).",
+            1 + tool_models.len()
+        ),
+        _ => "Paste your API key below (E), or add a provider with A.\n\
+              No key yet? Get one at console.anthropic.com/keys"
+            .to_string(),
+    };
+    for text in description_text.split('\n') {
+        lines.push(wizard_centered(
+            &wizard_line(text.trim(), Color::Blue),
+            width,
         ));
     }
-    lines.extend([
-        Line::from(""),
-        Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]);
 
-    // Hint line
-    lines.push(Line::from(Span::styled(
-        key_hint,
-        Style::default().fg(Color::DarkGray),
-    )));
+    let mut list_rows = Vec::new();
+    for (index, model) in std::iter::once(primary_model)
+        .chain(tool_models.iter())
+        .enumerate()
+    {
+        let display = provider_row_display(model, coreml, index == 0);
+        list_rows.push(marked_row(&display, selected_idx == index, model.enabled()));
+    }
+    lines.extend(wizard_boxed("AI Providers", &list_rows, Color::Blue, width));
 
-    let catalog_label = format_catalog_label(
-        catalog_source,
-        catalog_refreshing,
-        catalog_refreshed_at,
-        Utc::now(),
-    );
-    lines.push(Line::from(Span::styled(
-        catalog_label,
-        Style::default().fg(Color::Cyan),
-    )));
-    if let Some(error) = catalog_error {
-        lines.push(Line::from(Span::styled(
-            format!("Refresh warning: {error}"),
-            Style::default().fg(Color::Yellow),
-        )));
+    let selected_accepts_api_key = if selected_idx == 0 {
+        primary_model.accepts_api_key()
+    } else {
+        tool_models
+            .get(selected_idx.saturating_sub(1))
+            .is_some_and(ModelConfig::accepts_api_key)
+    };
+    if editing_mode && selected_accepts_api_key {
+        let current_key = if selected_idx == 0 {
+            match primary_model {
+                ModelConfig::Remote { api_key, .. } => api_key.as_str(),
+                ModelConfig::Local { .. } => "",
+            }
+        } else {
+            match tool_models.get(selected_idx.saturating_sub(1)) {
+                Some(ModelConfig::Remote { api_key, .. }) => api_key.as_str(),
+                _ => "",
+            }
+        };
+        lines.extend(wizard_boxed(
+            "Edit API Key",
+            &[wizard_plain(&format!("{current_key}█"))],
+            Color::Yellow,
+            width,
+        ));
+    } else if editing_mode {
+        lines.extend(wizard_boxed(
+            "Subscription authentication",
+            &[wizard_plain(
+                "Named Finch device credential; no API key input",
+            )],
+            Color::Yellow,
+            width,
+        ));
+    } else if editing_model_mode {
+        lines.extend(wizard_boxed(
+            "Edit Model",
+            &[wizard_plain(&format!("{model_input}█"))],
+            Color::Yellow,
+            width,
+        ));
+    } else {
+        lines.push(wizard_centered(
+            &wizard_line(
+                "Press Enter to edit the selected provider · P for primary",
+                Color::DarkGray,
+            ),
+            width,
+        ));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        if editing {
-            "↑↓ navigate · type to edit · Ctrl+R refresh · Enter saves · Esc cancels"
-        } else {
-            "↑↓ navigate · ←→ change provider/model · Ctrl+R refresh · Enter adds · Esc back"
-        },
-        Style::default().fg(Color::Yellow),
-    )));
-
-    let para = Paragraph::new(lines)
-        .block(Block::default().title(if editing {
-            "Edit Provider"
-        } else {
-            "Add Cloud Provider"
-        }))
-        .wrap(Wrap { trim: false });
-    f.render_widget(para, area);
-}
-
-/// Render single-screen local model configuration dialog
-pub(super) fn render_configure_local_overlay(
-    f: &mut Frame,
-    area: Rect,
-    coreml: CoreMlConfig,
-    inference_provider: InferenceProvider,
-    family: ModelFamily,
-    size: ModelSize,
-    execution: ExecutionTarget,
-    focused_field: usize,
-) {
-    // Row rendering helper: label + bracketed value, highlighted when focused
-    let make_row = |label: &str, value: &str, focused: bool| -> Line<'static> {
-        let label_str = format!("{:<10}", label);
-        let value_str = if focused {
-            format!("[◄ {:<34}►]", value)
-        } else {
-            format!("[  {:<34} ]", value)
-        };
-        let (label_style, value_style) = if focused {
-            (
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            (
-                Style::default().fg(Color::DarkGray),
-                Style::default().fg(Color::Cyan),
-            )
-        };
-        Line::from(vec![
-            Span::styled(label_str, label_style),
-            Span::styled(value_str, value_style),
-        ])
+    let instructions_text = if editing_mode || editing_model_mode {
+        "Type here | Enter/Esc: Save & return"
+    } else {
+        "Enter: Edit | P: Primary | A: Add | D: Remove | Tab: Next"
     };
-
-    let backend_name = match inference_provider {
-        InferenceProvider::Onnx => "ONNX Runtime",
-        #[cfg(feature = "candle")]
-        InferenceProvider::Candle => "Candle",
-    };
-    // When Candle is selected, only Qwen 2.5 is supported — annotate the display
-    let mut family_name = family.name().to_string();
-    #[cfg(feature = "candle")]
-    if inference_provider == InferenceProvider::Candle {
-        family_name = format!("{} (only)", family.name());
+    lines.push(wizard_centered(
+        &wizard_bold(instructions_text, Color::Yellow),
+        width,
+    ));
+    if let Some(error) = error {
+        lines.push(wizard_centered(&wizard_line(error, Color::Red), width));
     }
-    let size_name = model_size_display(&size);
-    let device_name = execution_target_display(execution, coreml);
-
-    let mut lines = vec![
-        Line::from(""),
-        make_row("Backend", backend_name, focused_field == 0),
-        make_row("Family", &family_name, focused_field == 1),
-        make_row("Size", size_name, focused_field == 2),
-        make_row("Device", &device_name, focused_field == 3),
-        Line::from(""),
-        Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-
-    // Preview line: RAM estimate + resolved model repo
-    let repo_preview = get_repository(inference_provider, family, size)
-        .map(|r| format!("→ {}", r))
-        .unwrap_or_else(|| "(no model available for this combination)".to_string());
-
-    let ram_estimate = match size {
-        ModelSize::Small => "~2 GB RAM",
-        ModelSize::Medium => "~4 GB RAM",
-        ModelSize::Large => "~8 GB RAM",
-        ModelSize::XLarge => "~16 GB RAM",
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{}  ", ram_estimate),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(repo_preview, Style::default().fg(Color::DarkGray)),
-    ]));
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "↑↓ navigate · ←→ change · Enter to add · Esc back",
-        Style::default().fg(Color::Yellow),
-    )));
-
-    let para = Paragraph::new(lines)
-        .block(Block::default().title("Add Local Model"))
-        .wrap(Wrap { trim: false });
-    f.render_widget(para, area);
+    lines
 }
 
-/// Render Personas section
+/// Personas section: style list, then preview or the prompt editor. The old
+/// painter placed list and preview side by side; the claiming tree hosts one
+/// column, so the preview reads below the list — the same order a screen
+/// reader speaks them.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn render_personas_section(
-    f: &mut Frame,
-    area: Rect,
+fn personas_section_lines(
     personas: &[PersonaInfo],
     selected_idx: usize,
     default_persona: &str,
     editing_prompt: bool,
     prompt_input: &str,
     cursor_pos: usize,
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(area);
-
-    // Left: Persona list - make selection VERY obvious
-    let items: Vec<ListItem> = personas
+    width: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let rows: Vec<String> = personas
         .iter()
         .enumerate()
-        .map(|(i, persona)| {
+        .map(|(index, persona)| {
             let is_default = persona.name.to_lowercase() == default_persona.to_lowercase();
-            let is_selected = i == selected_idx;
-
-            let (prefix, suffix, style) = if is_selected {
-                (
-                    ">>> ",
-                    " <<<",
-                    Style::default()
-                        .bg(Color::Black)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )
+            if index == selected_idx {
+                wizard_bold(&format!(">>> {} <<<", persona.name), Color::White)
             } else if is_default {
-                ("★   ", "", Style::default().fg(Color::Yellow))
+                wizard_line(&format!("★   {}", persona.name), Color::Yellow)
             } else {
-                ("    ", "", Style::default())
-            };
-
-            ListItem::new(format!("{}{}{}", prefix, persona.name, suffix)).style(style)
+                wizard_plain(&format!("    {}", persona.name))
+            }
         })
         .collect();
+    lines.extend(wizard_boxed("Choose a Style", &rows, Color::Blue, width));
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Choose a Style"),
-    );
-
-    f.render_widget(list, chunks[0]);
-
-    // Right: Preview or edit
-    if let Some(persona) = personas.get(selected_idx) {
-        if editing_prompt {
-            // Edit mode: block cursor (█) at cursor_pos; char under cursor is replaced by block
-            let before: String = prompt_input.chars().take(cursor_pos).collect();
-            let after: String = prompt_input.chars().skip(cursor_pos + 1).collect();
-            let edit_text = format!("{}\u{2588}{}", before, after);
-            let mut lines = vec![
-                Line::from(Span::styled(
-                    "Editing system prompt  (Ctrl+S: Save | Esc: Cancel)",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-            ];
-            for line in edit_text.lines() {
-                lines.push(Line::from(line.to_string()));
-            }
-            let edit_area = Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Edit System Prompt")
-                        .border_style(Style::default().fg(Color::Yellow)),
-                )
-                .wrap(Wrap { trim: false });
-            f.render_widget(edit_area, chunks[1]);
-        } else {
-            let preview_lines = vec![
-                Line::from(vec![
-                    Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(&persona.name),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(
-                        "Description: ",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(&persona.description),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "System Prompt:",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(persona.system_prompt.as_str()),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "E: Edit system prompt",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ];
-
-            let preview = Paragraph::new(preview_lines)
-                .block(Block::default().borders(Borders::ALL).title("Preview"))
-                .wrap(Wrap { trim: false });
-            f.render_widget(preview, chunks[1]);
+    let Some(persona) = personas.get(selected_idx) else {
+        return lines;
+    };
+    if editing_prompt {
+        let before: String = prompt_input.chars().take(cursor_pos).collect();
+        let after: String = prompt_input.chars().skip(cursor_pos + 1).collect();
+        let mut body = vec![wizard_bold(
+            "Editing system prompt  (Ctrl+S: Save | Esc: Cancel)",
+            Color::Yellow,
+        )];
+        body.push(String::new());
+        for text in format!("{before}\u{2588}{after}").split('\n') {
+            body.push(wizard_plain(text));
         }
+        lines.extend(wizard_boxed(
+            "Edit System Prompt",
+            &body,
+            Color::Yellow,
+            width,
+        ));
+    } else {
+        let preview = vec![
+            format!(
+                "{}{}",
+                wizard_paint("Name: ", None, true),
+                wizard_plain(&persona.name)
+            ),
+            String::new(),
+            format!(
+                "{}{}",
+                wizard_paint("Description: ", None, true),
+                wizard_plain(&persona.description)
+            ),
+            String::new(),
+            wizard_paint("System Prompt:", None, true),
+            String::new(),
+            wizard_plain(&persona.system_prompt),
+            String::new(),
+            wizard_line("E: Edit system prompt", Color::DarkGray),
+        ];
+        lines.extend(wizard_boxed("Preview", &preview, Color::Blue, width));
     }
+    lines
 }
 
-/// Render Features section (all settings visible)
+/// The status lines the GUI-automation surfaces show. Speakable by contract
+/// (Key Principle 5): every outcome names the key that fixes it.
 #[cfg(target_os = "macos")]
 pub(super) fn gui_automation_status_lines(
     configured: bool,
@@ -1467,10 +579,37 @@ pub(super) fn gui_automation_status_lines(
     lines
 }
 
+/// One settings row group: the toggle/edit line and its dim description.
+fn feature_group(
+    selected: bool,
+    enabled: Option<bool>,
+    name: &str,
+    description: &str,
+) -> Vec<String> {
+    let checkbox = match enabled {
+        Some(true) => "✅ ",
+        Some(false) => "☐ ",
+        None => "",
+    };
+    let name_line = if selected {
+        wizard_bold(&format!(">>> {checkbox}{name} <<<"), Color::White)
+    } else {
+        match enabled {
+            Some(true) => wizard_line(&format!("    {checkbox}{name}"), Color::Blue),
+            Some(false) => wizard_line(&format!("    {checkbox}{name}"), Color::DarkGray),
+            None => wizard_line(&format!("    {name}"), Color::Cyan),
+        }
+    };
+    vec![
+        name_line,
+        wizard_line(&format!("        {description}"), Color::DarkGray),
+    ]
+}
+
+/// Features section: the settings list with the selected row kept visible,
+/// plus the macOS GUI-automation compact/expanded status surfaces.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn render_features_section(
-    f: &mut Frame,
-    area: Rect,
+fn features_section_content(
     auto_approve: bool,
     streaming: bool,
     debug: bool,
@@ -1492,11 +631,13 @@ pub(super) fn render_features_section(
     auto_discover: bool,
     memory_context_lines: usize,
     selected_idx: usize,
-) {
+    width: usize,
+    height: usize,
+) -> WizardSectionContent {
+    // macOS-only: the expanded-details early return below reads these, and
+    // the GUI-automation section itself is a macOS surface.
     #[cfg(target_os = "macos")]
     let show_gui_details = selected_idx == 3 && gui_automation;
-    #[cfg(not(target_os = "macos"))]
-    let show_gui_details = false;
 
     #[cfg(target_os = "macos")]
     let gui_automation_status = gui_automation_status_lines(
@@ -1511,70 +652,97 @@ pub(super) fn render_features_section(
 
     #[cfg(target_os = "macos")]
     let expanded_gui_details = show_gui_details && gui_automation_details_expanded;
-    #[cfg(not(target_os = "macos"))]
-    let expanded_gui_details = false;
 
-    let condensed_layout = area.height < 18;
-    let title_height = if condensed_layout { 1 } else { 3 };
-    let instructions_height = if condensed_layout { 1 } else { 3 };
-    let detail_height = if show_gui_details && !expanded_gui_details {
-        let preferred = if area.width < 60 { 10 } else { 7 };
-        let available = area
-            .height
-            .saturating_sub(title_height + instructions_height + 4);
-        preferred.min(available)
-    } else {
-        0
-    };
-    let mut constraints = vec![Constraint::Length(title_height), Constraint::Min(4)];
-    if detail_height > 0 {
-        constraints.push(Constraint::Length(detail_height));
-    }
-    constraints.push(Constraint::Length(instructions_height));
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
+    // Rows the frame reserves outside the section: the 3-row tab block and
+    // the 1-row help line — the same arithmetic the host's claiming pass runs.
+    let section_rows = height.saturating_sub(4);
 
-    let title = Paragraph::new("Settings")
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center);
-    f.render_widget(title, chunks[0]);
-
+    // The expanded status owns the section: its scroll offset skips whole
+    // wrapped rows, and the instructions stay visible beneath the box. The
+    // whole block is macOS-only: it reads the macOS-only automation status
+    // lines and scroll offset, and `expanded_gui_details` can only be true
+    // there. Compiling it on other platforms would name values that do not
+    // exist (E0425 on the Linux CI lane).
     #[cfg(target_os = "macos")]
     if expanded_gui_details {
-        let details = Paragraph::new(gui_automation_status.join("\n"))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Full GUI automation status (read/scroll only)"),
-            )
-            .wrap(Wrap { trim: false })
-            .scroll((gui_automation_details_scroll, 0));
-        f.render_widget(details, chunks[1]);
-        let instructions =
-            Paragraph::new("↑/↓ or PgUp/PgDn: Scroll | Home: Top | D/Esc: Back to settings")
-                .style(
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .alignment(Alignment::Center);
-        f.render_widget(instructions, chunks[chunks.len() - 1]);
-        return;
+        let inner_width = width.saturating_sub(4);
+        let body_budget = section_rows
+            .saturating_sub(1)
+            .saturating_sub(2)
+            .saturating_sub(1);
+        let scrolled = skip_wrapped_rows(
+            &gui_automation_status,
+            gui_automation_details_scroll as usize,
+            inner_width,
+        );
+        let body = head_fitting_rows(&scrolled, body_budget, inner_width);
+        let mut lines = vec![wizard_centered(
+            &wizard_bold("Settings", Color::Cyan),
+            width,
+        )];
+        lines.extend(wizard_boxed(
+            "Full GUI automation status (read/scroll only)",
+            &body,
+            Color::Blue,
+            width,
+        ));
+        lines.push(wizard_centered(
+            &wizard_bold(
+                "↑/↓ or PgUp/PgDn: Scroll | Home: Top | D/Esc: Back to settings",
+                Color::Yellow,
+            ),
+            width,
+        ));
+        return WizardSectionContent::plain(lines);
     }
 
-    // Build feature list: toggle-able booleans, editable credentials, and a spinner.
     #[cfg(target_os = "macos")]
     let gui_automation_description = gui_automation_status
         .iter()
         .find_map(|line| line.strip_prefix("Trust status: "))
-        .unwrap_or("GUI automation status unavailable");
+        .unwrap_or("GUI automation status unavailable")
+        .to_string();
+    #[cfg(not(target_os = "macos"))]
+    let gui_automation_description = String::new();
 
+    #[cfg(target_os = "macos")]
+    let bool_features: Vec<(&str, bool, &str)> = vec![
+        (
+            "Live responses",
+            streaming,
+            "See Finch's answer as it types, word by word",
+        ),
+        (
+            "Skip permission prompts",
+            auto_approve,
+            "Let Finch run tools without asking each time",
+        ),
+        (
+            "Debug logging",
+            debug,
+            "Write verbose logs to ~/.finch/debug.log",
+        ),
+        (
+            "GUI automation",
+            gui_automation,
+            &gui_automation_description,
+        ),
+        (
+            "Daemon-only mode",
+            daemon_only_mode,
+            "Run as background server, no interactive REPL",
+        ),
+        (
+            "Advertise on network",
+            mdns_discovery,
+            "Broadcast this Finch instance via mDNS so others can discover it",
+        ),
+        (
+            "Discover peers on LAN",
+            auto_discover,
+            "Find and connect to other Finch instances at startup",
+        ),
+    ];
     #[cfg(not(target_os = "macos"))]
     let bool_features: Vec<(&str, bool, &str)> = vec![
         (
@@ -1592,42 +760,6 @@ pub(super) fn render_features_section(
             debug,
             "Write verbose logs to ~/.finch/debug.log",
         ),
-        // index 3 = HF token (handled separately below)
-        (
-            "Daemon-only mode",
-            daemon_only_mode,
-            "Run as background server, no interactive REPL",
-        ),
-        (
-            "Advertise on network",
-            mdns_discovery,
-            "Broadcast this Finch instance via mDNS so others can discover it",
-        ),
-        (
-            "Discover peers on LAN",
-            auto_discover,
-            "Find and connect to other Finch instances at startup",
-        ),
-    ];
-    #[cfg(target_os = "macos")]
-    let bool_features: Vec<(&str, bool, &str)> = vec![
-        (
-            "Live responses",
-            streaming,
-            "See Finch's answer as it types, word by word",
-        ),
-        (
-            "Skip permission prompts",
-            auto_approve,
-            "Let Finch run tools without asking each time",
-        ),
-        (
-            "Debug logging",
-            debug,
-            "Write verbose logs to ~/.finch/debug.log",
-        ),
-        ("GUI automation", gui_automation, gui_automation_description),
-        // index 4 = HF token (handled separately)
         (
             "Daemon-only mode",
             daemon_only_mode,
@@ -1645,259 +777,218 @@ pub(super) fn render_features_section(
         ),
     ];
 
-    // Build list items interleaving bool features with editable credential rows.
-    let mut items: Vec<ListItem> = Vec::new();
-    let mut list_idx = 0usize; // tracks which visual row we're building
-
-    for (name, enabled, desc) in bool_features.iter() {
-        // Insert HF token row before the appropriate bool feature
-        if list_idx == SETTINGS_HF_TOKEN_IDX {
-            let is_hf_selected = selected_idx == SETTINGS_HF_TOKEN_IDX;
-            let (prefix, suffix, style) = if is_hf_selected {
-                (
-                    ">>> ",
-                    " <<<",
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Black)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                ("    ", "", Style::default().fg(Color::Cyan))
-            };
-            let token_display = if editing_hf_token {
-                format!("{}HF Token: {}|{}", prefix, hf_token, suffix)
-            } else if hf_token.is_empty() {
-                format!("{}HF Token: [not set — press E to enter]{}", prefix, suffix)
-            } else {
-                let masked = format!(
-                    "{}...{}",
-                    &hf_token.chars().take(4).collect::<String>(),
-                    hf_token
-                        .chars()
-                        .rev()
-                        .take(4)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect::<String>()
-                );
-                format!("{}HF Token: {}{}", prefix, masked, suffix)
-            };
-            let hf_lines = vec![
-                Line::from(Span::styled(token_display, style)),
-                Line::from(Span::styled(
-                    "        For model downloads from HuggingFace",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ];
-            items.push(ListItem::new(hf_lines));
-            list_idx += 1;
-        }
-
-        if list_idx == SETTINGS_FINCH_API_KEY_IDX {
-            let is_selected = selected_idx == SETTINGS_FINCH_API_KEY_IDX;
-            let (prefix, suffix, style) = if is_selected {
-                (
-                    ">>> ",
-                    " <<<",
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Black)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                ("    ", "", Style::default().fg(Color::Cyan))
-            };
-            let key_display = if editing_finch_api_key {
-                format!("{}Finch client key: {}|{}", prefix, finch_api_key, suffix)
-            } else if finch_api_key.is_empty() {
-                format!(
-                    "{}Finch client key: [not set — authentication disabled; press E to enter]{}",
-                    prefix, suffix
-                )
-            } else {
-                let masked = format!(
-                    "{}...{}",
-                    finch_api_key.chars().take(4).collect::<String>(),
-                    finch_api_key
-                        .chars()
-                        .rev()
-                        .take(4)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect::<String>()
-                );
-                format!("{}Finch client key: {}{}", prefix, masked, suffix)
-            };
-            items.push(ListItem::new(vec![
-                Line::from(Span::styled(key_display, style)),
-                Line::from(Span::styled(
-                    "        Key OpenAI-compatible clients use to connect to Finch",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ]));
-            list_idx += 1;
-        }
-
-        let is_selected = list_idx == selected_idx;
-        let checkbox = if *enabled { "✅" } else { "☐" };
-        let (prefix, suffix, name_style) = if is_selected {
-            (
-                ">>> ",
-                " <<<",
-                Style::default()
-                    .bg(Color::Black)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
+    let hf_group = |selected: bool| -> Vec<String> {
+        let (prefix, suffix) = if selected {
+            (">>> ", " <<<")
         } else {
-            (
-                "    ",
-                "",
-                if *enabled {
-                    Style::default().fg(Color::Blue)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                },
+            ("    ", "")
+        };
+        let line = if editing_hf_token {
+            format!("{prefix}HF Token: {hf_token}{suffix}")
+        } else if hf_token.is_empty() {
+            format!("{prefix}HF Token: [not set — press E to enter]{suffix}")
+        } else {
+            format!("{prefix}HF Token: {}{suffix}", mask_secret(hf_token, 4, 4))
+        };
+        vec![
+            wizard_line(&line, Color::Cyan),
+            wizard_line(
+                "        For model downloads from HuggingFace",
+                Color::DarkGray,
+            ),
+        ]
+    };
+    let finch_key_group = |selected: bool| -> Vec<String> {
+        let (prefix, suffix) = if selected {
+            (">>> ", " <<<")
+        } else {
+            ("    ", "")
+        };
+        let line = if editing_finch_api_key {
+            format!("{prefix}Finch client key: {finch_api_key}{suffix}")
+        } else if finch_api_key.is_empty() {
+            format!("{prefix}Finch client key: [not set — authentication disabled; press E to enter]{suffix}")
+        } else {
+            format!(
+                "{prefix}Finch client key: {}{suffix}",
+                mask_secret(finch_api_key, 4, 4)
             )
         };
+        vec![
+            wizard_line(&line, Color::Cyan),
+            wizard_line(
+                "        Key OpenAI-compatible clients use to connect to Finch",
+                Color::DarkGray,
+            ),
+        ]
+    };
 
-        let feat_lines = vec![
-            Line::from(vec![
-                Span::raw(prefix),
-                Span::raw(format!("{} ", checkbox)),
-                Span::styled(*name, name_style),
-                Span::styled(suffix, name_style),
-            ]),
-            Line::from(vec![
-                Span::raw("        "),
-                Span::styled(*desc, Style::default().fg(Color::DarkGray)),
-            ]),
-        ];
-        items.push(ListItem::new(feat_lines));
+    // Build the groups in the exact order the input handler indexes them.
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut list_idx = 0usize;
+    for (name, enabled, description) in bool_features.iter() {
+        if list_idx == SETTINGS_HF_TOKEN_IDX {
+            groups.push(hf_group(selected_idx == list_idx));
+            list_idx += 1;
+        }
+        if list_idx == SETTINGS_FINCH_API_KEY_IDX {
+            groups.push(finch_key_group(selected_idx == list_idx));
+            list_idx += 1;
+        }
+        groups.push(feature_group(
+            list_idx == selected_idx,
+            Some(*enabled),
+            name,
+            description,
+        ));
         list_idx += 1;
     }
-
-    // If hf_idx is after all bool features, append it at the end
     if SETTINGS_HF_TOKEN_IDX >= list_idx {
-        let is_hf_selected = selected_idx == list_idx;
-        let (prefix, suffix, style) = if is_hf_selected {
-            (
-                ">>> ",
-                " <<<",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            ("    ", "", Style::default().fg(Color::Cyan))
-        };
-        let token_display = if editing_hf_token {
-            format!("{}HF Token: {}|{}", prefix, hf_token, suffix)
-        } else if hf_token.is_empty() {
-            format!("{}HF Token: [not set — press E to enter]{}", prefix, suffix)
-        } else {
-            let masked = format!(
-                "{}...{}",
-                &hf_token.chars().take(4).collect::<String>(),
-                hf_token
-                    .chars()
-                    .rev()
-                    .take(4)
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>()
-            );
-            format!("{}HF Token: {}{}", prefix, masked, suffix)
-        };
-        let hf_lines = vec![
-            Line::from(Span::styled(token_display, style)),
-            Line::from(Span::styled(
-                "        For model downloads from HuggingFace",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
-        items.push(ListItem::new(hf_lines));
+        groups.push(hf_group(selected_idx == list_idx));
     }
-
-    // Context-lines spinner row (always last)
+    // Context-lines spinner row (always last).
     {
-        let is_selected = selected_idx == SETTINGS_CONTEXT_IDX;
-        let (prefix, suffix, label_style) = if is_selected {
-            (
-                ">>> ",
-                " <<<",
-                Style::default()
-                    .bg(Color::Black)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let selected = selected_idx == SETTINGS_CONTEXT_IDX;
+        let (prefix, suffix) = if selected {
+            (">>> ", " <<<")
         } else {
-            ("    ", "", Style::default().fg(Color::Blue))
+            ("    ", "")
         };
-        let ctx_lines = vec![
-            Line::from(vec![
-                Span::raw(prefix),
-                Span::styled(
-                    format!("◀ Context lines: {} ▶", memory_context_lines),
-                    label_style,
+        groups.push(vec![
+            format!(
+                "{}{}{}",
+                wizard_plain(prefix),
+                wizard_bold(
+                    &format!("◀ Context lines: {} ▶", memory_context_lines),
+                    if selected { Color::White } else { Color::Blue },
                 ),
-                Span::styled(suffix, label_style),
-            ]),
-            Line::from(vec![
-                Span::raw("        "),
-                Span::styled(
-                    "Status-strip summary lines shown below the prompt (1–8)",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-        ];
-        items.push(ListItem::new(ctx_lines));
+                if selected {
+                    wizard_bold(suffix, Color::White)
+                } else {
+                    String::new()
+                },
+            ),
+            wizard_line(
+                "        Status-strip summary lines shown below the prompt (1–8)",
+                Color::DarkGray,
+            ),
+        ]);
     }
 
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Options"));
-    let mut list_state = ListState::default().with_selected(Some(selected_idx));
-    f.render_stateful_widget(list, chunks[1], &mut list_state);
+    // Compact GUI status box claims rows under the list when its row is active.
+    #[cfg(target_os = "macos")]
+    let compact_rows: Vec<String> = if show_gui_details {
+        let mut rows = Vec::new();
+        if let Some(feedback) = gui_automation_settings_feedback {
+            rows.push(wizard_plain(feedback.compact_message()));
+        } else {
+            rows.push(wizard_plain(
+                if gui_automation_availability.state == AutomationState::Available {
+                    "Current Finch process: trusted."
+                } else {
+                    "Current Finch process: untrusted."
+                },
+            ));
+        }
+        rows.push(wizard_line(
+            "R: Passive check | P: Request prompt",
+            Color::Cyan,
+        ));
+        rows.push(wizard_line(
+            "O: System Settings → Privacy & Security → Accessibility",
+            Color::Cyan,
+        ));
+        rows.push(wizard_line("D: Full process/host/status", Color::Cyan));
+        rows
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let compact_rows: Vec<String> = Vec::new();
 
+    // Window the groups so the selected row stays visible with the same
+    // minimal-scroll guarantee the old painter's list state gave. The budget
+    // counts the compact status box's wrapped rows, so the status and the
+    // instructions the accessibility contract pins stay visible next to it.
+    // `start` only ever advances toward the selection, so a selected group
+    // taller than the whole budget converges (its name line shows at the
+    // window's head) instead of oscillating.
+    // macOS-only: `show_gui_details` and the compact status box exist only
+    // there; elsewhere the list budget simply keeps the extra rows.
+    #[cfg(target_os = "macos")]
+    let compact_extra: usize = if show_gui_details {
+        2 + compact_rows
+            .iter()
+            .map(|line| rows_of(line, width))
+            .sum::<usize>()
+    } else {
+        0
+    };
+    #[cfg(not(target_os = "macos"))]
+    let compact_extra: usize = 0;
+    let list_budget = section_rows
+        .saturating_sub(1) // title
+        .saturating_sub(2) // options box borders
+        .saturating_sub(1) // instructions
+        .saturating_sub(compact_extra);
+    let group_rows: Vec<usize> = groups
+        .iter()
+        .map(|group| group.iter().map(|line| rows_of(line, width)).sum())
+        .collect();
+    let mut start = 0usize;
+    while start < selected_idx && start < groups.len() {
+        let mut used = 0usize;
+        let mut end = start;
+        while end < groups.len() && used + group_rows[end] <= list_budget {
+            used += group_rows[end];
+            end += 1;
+        }
+        if selected_idx < end {
+            break;
+        }
+        start += 1;
+    }
+    let start = start.min(selected_idx);
+    let mut windowed: Vec<String> = Vec::new();
+    {
+        let mut used = 0usize;
+        for (index, group) in groups.iter().enumerate().skip(start) {
+            let rows = group_rows[index];
+            if used + rows <= list_budget {
+                used += rows;
+                windowed.extend(group.iter().cloned());
+                continue;
+            }
+            if index == selected_idx {
+                // The selected group alone overflows the budget: show its
+                // head lines (the toggle name first) and clip the rest.
+                for line in group {
+                    let line_rows = rows_of(line, width);
+                    if used + line_rows > list_budget {
+                        break;
+                    }
+                    used += line_rows;
+                    windowed.push(line.clone());
+                }
+            }
+            break;
+        }
+    }
+
+    let mut lines = vec![wizard_centered(
+        &wizard_bold("Settings", Color::Cyan),
+        width,
+    )];
+    lines.extend(wizard_boxed("Options", &windowed, Color::Blue, width));
     #[cfg(target_os = "macos")]
     if show_gui_details {
-        let mut compact_lines = Vec::new();
-        if let Some(feedback) = gui_automation_settings_feedback {
-            compact_lines.push(Line::from(feedback.compact_message()));
-        } else {
-            let compact_trust = if gui_automation_availability.state == AutomationState::Available {
-                "Current Finch process: trusted."
-            } else {
-                "Current Finch process: untrusted."
-            };
-            compact_lines.push(Line::from(compact_trust));
-        }
-        compact_lines.push(Line::from(Span::styled(
-            "R: Passive check | P: Request prompt",
-            Style::default().fg(Color::Cyan),
-        )));
-        compact_lines.push(Line::from(Span::styled(
-            "O: System Settings → Privacy & Security → Accessibility",
-            Style::default().fg(Color::Cyan),
-        )));
-        compact_lines.push(Line::from(Span::styled(
-            "D: Full process/host/status",
-            Style::default().fg(Color::Cyan),
-        )));
-        let status = Paragraph::new(compact_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("GUI automation status"),
-            )
-            .wrap(Wrap { trim: false });
-        f.render_widget(status, chunks[2]);
+        lines.extend(wizard_boxed(
+            "GUI automation status",
+            &compact_rows,
+            Color::Blue,
+            width,
+        ));
     }
-
     let instructions_text = if editing_hf_token {
         "Type HuggingFace token | Enter/Esc: Done"
     } else if editing_finch_api_key {
@@ -1916,53 +1007,34 @@ pub(super) fn render_features_section(
             "↑/↓: Move | Space: Toggle | ◀/▶: Context lines | E: Edit selected key/token | Enter: Continue"
         }
     };
-    let instructions = Paragraph::new(instructions_text)
-        .style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center);
-    f.render_widget(instructions, chunks[chunks.len() - 1]);
+    lines.push(wizard_centered(
+        &wizard_bold(instructions_text, Color::Yellow),
+        width,
+    ));
+    WizardSectionContent::plain(lines)
 }
 
-/// Render Review section
-pub(super) fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
+/// Review section: the summary the user confirms before saving.
+fn review_section_lines(state: &WizardState, width: usize) -> Vec<String> {
     use crate::theme::ColorTheme;
 
-    let title = Paragraph::new("Ready to go!")
-        .style(
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center);
-
-    // Build summary text
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Here's what you set up:",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
+    let mut body = vec![
+        wizard_centered(&wizard_bold("Ready to go!", Color::Green), width),
+        wizard_centered(&wizard_bold("Here's what you set up:", Color::Cyan), width),
     ];
 
-    // Theme
     if let Some(SectionState::Themes { selected_theme }) =
         state.sections.get(&WizardSection::Themes)
     {
         let themes = ColorTheme::all();
         let theme_name = themes[*selected_theme].name().to_string();
-        lines.push(Line::from(vec![
-            Span::styled("Theme: ", Style::default().fg(Color::Yellow)),
-            Span::raw(theme_name),
-        ]));
+        body.push(format!(
+            "{}{}",
+            wizard_line("Theme: ", Color::Yellow),
+            wizard_plain(&theme_name)
+        ));
     }
 
-    // Models
     if let Some(SectionState::Models { primary_model, .. }) =
         state.sections.get(&WizardSection::Models)
     {
@@ -1971,30 +1043,26 @@ pub(super) fn render_review_section(f: &mut Frame, area: Rect, state: &WizardSta
                 "Claude (API key configured)"
             }
             ModelConfig::Remote { .. } => "Claude (no API key — will prompt on first use)",
-            ModelConfig::Local { family, size, .. } => {
-                // Use a static fallback — dynamic format not possible here
-                let _ = (family, size);
-                "Local model"
-            }
+            ModelConfig::Local { .. } => "Local model",
         };
-        lines.push(Line::from(vec![
-            Span::styled("AI: ", Style::default().fg(Color::Yellow)),
-            Span::raw(ai_label),
-        ]));
+        body.push(format!(
+            "{}{}",
+            wizard_line("AI: ", Color::Yellow),
+            wizard_plain(ai_label)
+        ));
     }
 
-    // Persona
     if let Some(SectionState::Personas {
         default_persona, ..
     }) = state.sections.get(&WizardSection::Personas)
     {
-        lines.push(Line::from(vec![
-            Span::styled("Style: ", Style::default().fg(Color::Yellow)),
-            Span::raw(default_persona),
-        ]));
+        body.push(format!(
+            "{}{}",
+            wizard_line("Style: ", Color::Yellow),
+            wizard_plain(default_persona)
+        ));
     }
 
-    // Features (only show user-facing ones)
     if let Some(SectionState::Features {
         auto_approve,
         streaming,
@@ -2008,44 +1076,572 @@ pub(super) fn render_review_section(f: &mut Frame, area: Rect, state: &WizardSta
         if *auto_approve {
             settings.push("Skip permission prompts");
         }
-
-        lines.push(Line::from(vec![
-            Span::styled("Settings: ", Style::default().fg(Color::Yellow)),
-            Span::raw(if settings.is_empty() {
-                "Defaults".to_string()
-            } else {
-                settings.join(", ")
-            }),
-        ]));
+        let settings_text = if settings.is_empty() {
+            "Defaults".to_string()
+        } else {
+            settings.join(", ")
+        };
+        body.push(format!(
+            "{}{}",
+            wizard_line("Settings: ", Color::Yellow),
+            wizard_plain(&settings_text)
+        ));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
+    body.push(String::new());
+    body.push(wizard_bold(
         "Press Enter or Ctrl+S to save & start chatting",
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    lines.push(Line::from(vec![Span::styled(
+        Color::Green,
+    ));
+    body.push(wizard_line(
         "Esc: Back to settings · Ctrl+C: Cancel setup",
-        Style::default().fg(Color::Gray),
-    )]));
-
-    let block = Block::default().borders(Borders::ALL);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(inner);
-
-    f.render_widget(title, chunks[0]);
-
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(para, chunks[1]);
+        Color::Gray,
+    ));
+    wizard_boxed("Ready", &body, Color::Green, width)
 }
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Overlay cards (#807) ────────────────────────────────────────────────────
+
+/// The discard-confirmation card the user gets on Ctrl+C.
+pub(super) fn cancel_confirm_card() -> WizardCard {
+    WizardCard {
+        title: "Cancel setup?".to_string(),
+        body: vec![
+            wizard_plain("Discard all setup changes and cancel?"),
+            String::new(),
+        ],
+        controls: Some("Y / Enter: Discard    N / Esc: Keep editing".to_string()),
+        accent: Color::Yellow,
+    }
+}
+
+/// Split a failure summary at sentence boundaries so each line stays whole
+/// on the card — a wrap inside "Console API-key billing" would read as a
+/// different sentence to a screen reader.
+fn failure_summary_sentences(summary: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    for word in summary.split_whitespace() {
+        current.push_str(word);
+        current.push(' ');
+        if word.ends_with('.') && word.len() > 1 {
+            sentences.push(current.trim().to_string());
+            current.clear();
+        }
+    }
+    if !current.trim().is_empty() {
+        sentences.push(current.trim().to_string());
+    }
+    if sentences.is_empty() {
+        sentences.push(summary.to_string());
+    }
+    sentences
+}
+
+fn cloud_provider_id(provider_idx: usize) -> &'static str {
+    CLOUD_PROVIDERS[provider_idx.min(CLOUD_PROVIDERS.len() - 1)].0
+}
+
+/// The add-time device sign-in card (#424/#705). Every state is plain,
+/// speakable text: starting, the one-time code with its verification URL, the
+/// authenticated account, or the terminal failure cause with recovery keys.
+fn device_auth_card(
+    provider_idx: usize,
+    provider_name: &str,
+    pending: &std::sync::Arc<std::sync::Mutex<Option<DeviceAuthPresentation>>>,
+    outcome: &DeviceAuthOutcome,
+    editing_existing_provider: bool,
+) -> WizardCard {
+    let is_grok_sub = cloud_provider_id(provider_idx).eq_ignore_ascii_case("grok-sub");
+    let title_text = if is_grok_sub {
+        format!("Grok subscription device sign-in for {provider_name}")
+    } else {
+        format!("ChatGPT device sign-in for {provider_name}")
+    };
+    let mut body = vec![wizard_bold(&title_text, Color::Cyan), String::new()];
+    let controls;
+    match outcome.lock().unwrap().as_ref() {
+        Some(Ok(ensured)) => {
+            let account = ensured
+                .account
+                .as_deref()
+                .unwrap_or("the authorized account");
+            body.push(wizard_plain(&format!("Signed in as {account}.")));
+            body.push(wizard_plain(&format!(
+                "{provider_name} is authenticated. Press Enter to return to the provider list."
+            )));
+            controls = "Enter: Continue".to_string();
+        }
+        Some(Err(failure)) => {
+            let summary = if is_grok_sub {
+                grok_setup_failure_summary(grok_setup_failure_cause(failure))
+            } else {
+                chatgpt_setup_failure_summary(chatgpt_setup_failure_cause(failure))
+            };
+            for sentence in failure_summary_sentences(&summary) {
+                body.push(wizard_plain(&sentence));
+            }
+            controls = "Enter: Retry sign-in | Esc: Back to provider details".to_string();
+        }
+        None => match pending.lock().unwrap().as_ref() {
+            Some(presentation) => {
+                body.push(wizard_plain(&format!(
+                    "Open: {}",
+                    presentation.verification_uri
+                )));
+                body.push(wizard_line(
+                    &format!("One-time code: {}", presentation.user_code),
+                    Color::White,
+                ));
+                body.push(String::new());
+                body.push(wizard_plain(
+                    "Approve the code in your browser; this dialog finishes automatically.",
+                ));
+                body.push(wizard_plain(&format!(
+                    "The code expires in {} minutes.",
+                    presentation.expires_in.as_secs().div_ceil(60)
+                )));
+                controls = "Esc: Cancel".to_string();
+            }
+            None => {
+                body.push(wizard_plain("Starting the device sign-in…"));
+                controls = "Esc: Cancel".to_string();
+            }
+        },
+    }
+    let mut card = WizardCard::new(
+        if editing_existing_provider {
+            "Edit AI Provider"
+        } else {
+            "Add AI Provider"
+        },
+        body,
+        Some(controls),
+    );
+    card.accent = Color::Cyan;
+    card
+}
+
+/// One bracketed form row; the exact shapes the compact editors always showed.
+fn remote_form_row(label: &str, value: &str, focused: bool, is_text_input: bool) -> String {
+    let label_text = if focused {
+        wizard_bold(&format!("{:<10}", label), Color::White)
+    } else {
+        wizard_line(&format!("{:<10}", label), Color::DarkGray)
+    };
+    let value_text = if is_text_input && focused {
+        format!("[ {}█ ]", value)
+    } else if focused {
+        format!("[◄ {:<34}►]", value)
+    } else {
+        format!("[  {:<34} ]", value)
+    };
+    let value_painted = if focused {
+        wizard_bold(&value_text, Color::White)
+    } else {
+        wizard_line(&value_text, Color::Cyan)
+    };
+    format!("{label_text}{value_painted}")
+}
+
+/// The add-provider overlay as one claimed card: type selection, the
+/// single-screen remote/local forms, the network scan, and the device
+/// ceremony all render as body lines whose controls stay pinned inside the
+/// card (#807) — no floating second painter.
+pub(super) fn add_provider_card(
+    coreml: CoreMlConfig,
+    step: &AddProviderStep,
+    catalog_source: &CatalogSource,
+    catalog_refreshing: bool,
+    catalog_refreshed_at: Option<&DateTime<Utc>>,
+    catalog_error: Option<&str>,
+) -> WizardCard {
+    match step {
+        // ── type selection — shows all providers directly ────────────────────
+        AddProviderStep::SelectAddType { selected } => {
+            let n_cloud = CLOUD_PROVIDERS.len();
+            let mut body = Vec::new();
+            for (index, (_, display_name, _, hint)) in CLOUD_PROVIDERS.iter().enumerate() {
+                body.push(if index == *selected {
+                    wizard_bold(&format!(">>> {display_name} <<<"), Color::White)
+                } else {
+                    wizard_line(&format!("    {display_name}"), Color::Cyan)
+                });
+                body.push(wizard_line(&format!("        {hint}"), Color::DarkGray));
+            }
+            let (local_line, scan_line) = if *selected == n_cloud {
+                (
+                    wizard_bold(">>> Local model <<<", Color::White),
+                    wizard_line("    Scan local network", Color::DarkGray),
+                )
+            } else if *selected == n_cloud + 1 {
+                (
+                    wizard_line("    Local model", Color::Cyan),
+                    wizard_bold(">>> Scan local network <<<", Color::White),
+                )
+            } else {
+                (
+                    wizard_line("    Local model", Color::Cyan),
+                    wizard_line("    Scan local network", Color::DarkGray),
+                )
+            };
+            body.push(local_line);
+            body.push(wizard_line(
+                "        Run a model on this machine (no internet after download)",
+                Color::DarkGray,
+            ));
+            body.push(scan_line);
+            body.push(wizard_line(
+                "        Discover other Finch instances running on your LAN",
+                Color::DarkGray,
+            ));
+            WizardCard::new(
+                "Add AI Provider",
+                body,
+                Some("↑/↓: Move | Enter: Select | Esc: Cancel".to_string()),
+            )
+        }
+        // ── single-screen cloud provider form ────────────────────────────────
+        AddProviderStep::ConfigureRemote {
+            provider_idx,
+            name,
+            model,
+            api_key,
+            focused_field,
+            editing_idx,
+        } => {
+            let remote_idx = (*provider_idx).min(CLOUD_PROVIDERS.len() - 1);
+            let provider_name = CLOUD_PROVIDERS[remote_idx].1;
+            let key_hint = CLOUD_PROVIDERS[remote_idx].3;
+            let editing = editing_idx.is_some();
+            let provider_value =
+                format!("{} ({})", provider_name, cloud_provider_id(*provider_idx));
+            let model_display = if model.is_empty() { "(default)" } else { model };
+            let mut body = vec![
+                String::new(),
+                remote_form_row("Provider", &provider_value, *focused_field == 0, false),
+                remote_form_row("Name", name, *focused_field == 1, true),
+                remote_form_row("Model", model_display, *focused_field == 2, true),
+            ];
+            if let Some(api_key) = api_key {
+                let key_display = if api_key.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}…", api_key.chars().take(12).collect::<String>())
+                };
+                body.push(remote_form_row(
+                    "API Key",
+                    &key_display,
+                    *focused_field == 3,
+                    true,
+                ));
+            } else {
+                body.push(remote_form_row(
+                    "Auth",
+                    "Finch-native device sign-in after save",
+                    false,
+                    false,
+                ));
+            }
+            body.push(String::new());
+            body.push(wizard_line(key_hint, Color::DarkGray));
+            body.push(wizard_line(
+                &format_catalog_label(
+                    catalog_source,
+                    catalog_refreshing,
+                    catalog_refreshed_at,
+                    Utc::now(),
+                ),
+                Color::Cyan,
+            ));
+            if let Some(error) = catalog_error {
+                body.push(wizard_line(
+                    &format!("Refresh warning: {error}"),
+                    Color::Yellow,
+                ));
+            }
+            let controls = if editing {
+                "↑↓ navigate · type to edit · Ctrl+R refresh · Enter saves · Esc cancels"
+            } else {
+                "↑↓ navigate · ←→ change provider/model · Ctrl+R refresh · Enter adds · Esc back"
+            };
+            WizardCard::new(
+                if editing {
+                    "Edit AI Provider"
+                } else {
+                    "Add Cloud Provider"
+                },
+                body,
+                Some(controls.to_string()),
+            )
+        }
+        // ── single-screen local model form ───────────────────────────────────
+        AddProviderStep::ConfigureLocal {
+            inference_provider,
+            family,
+            size,
+            execution,
+            focused_field,
+        } => {
+            let backend_name = match inference_provider {
+                InferenceProvider::Onnx => "ONNX Runtime",
+                #[cfg(feature = "candle")]
+                InferenceProvider::Candle => "Candle",
+            };
+            let mut family_name = family.name().to_string();
+            #[cfg(feature = "candle")]
+            if *inference_provider == InferenceProvider::Candle {
+                family_name = format!("{} (only)", family.name());
+            }
+            let size_name = model_size_display(size);
+            let device_name = execution_target_display(*execution, coreml);
+            let row = |label: &str, value: &str, focused: bool| {
+                remote_form_row(label, value, focused, false)
+            };
+            let repo_preview = get_repository(*inference_provider, *family, *size)
+                .map(|repo| format!("→ {repo}"))
+                .unwrap_or_else(|| "(no model available for this combination)".to_string());
+            let ram_estimate = match size {
+                ModelSize::Small => "~2 GB RAM",
+                ModelSize::Medium => "~4 GB RAM",
+                ModelSize::Large => "~8 GB RAM",
+                ModelSize::XLarge => "~16 GB RAM",
+            };
+            let body = vec![
+                String::new(),
+                row("Backend", backend_name, *focused_field == 0),
+                row("Family", &family_name, *focused_field == 1),
+                row("Size", size_name, *focused_field == 2),
+                row("Device", &device_name, *focused_field == 3),
+                String::new(),
+                format!(
+                    "{}  {}",
+                    wizard_line(&format!("{ram_estimate}  "), Color::Cyan),
+                    wizard_line(&repo_preview, Color::DarkGray)
+                ),
+            ];
+            WizardCard::new(
+                "Add Local Model",
+                body,
+                Some("↑↓ navigate · ←→ change · Enter to add · Esc back".to_string()),
+            )
+        }
+        // ── network scan path ────────────────────────────────────────────────
+        AddProviderStep::Scanning { .. } => WizardCard::new(
+            "Add AI Provider",
+            vec![
+                String::new(),
+                wizard_bold("Scanning for Finch agents on local network…", Color::Cyan),
+                String::new(),
+                wizard_line("(this takes up to 5 seconds)", Color::DarkGray),
+            ],
+            Some("Esc: Cancel".to_string()),
+        ),
+        AddProviderStep::SelectAgent { agents, selected } => {
+            let body: Vec<String> = agents
+                .iter()
+                .enumerate()
+                .map(|(index, agent)| {
+                    let label = format!("{} @ {}:{}", agent.name, agent.host, agent.port);
+                    if index == *selected {
+                        wizard_bold(&format!(">>> {label} <<<"), Color::White)
+                    } else {
+                        wizard_line(&format!("    {label}"), Color::Cyan)
+                    }
+                })
+                .collect();
+            WizardCard::new(
+                "Discovered agents",
+                body,
+                Some("↑/↓: Move | Enter: Add | Esc: Cancel".to_string()),
+            )
+        }
+        // ── add-time device ceremony (#424) ──────────────────────────────────
+        AddProviderStep::DeviceAuth {
+            provider_idx,
+            name,
+            pending,
+            outcome,
+            editing_idx,
+            ..
+        } => device_auth_card(*provider_idx, name, pending, outcome, editing_idx.is_some()),
+    }
+}
+
+// ─── The view ────────────────────────────────────────────────────────────────
+
+/// Assemble the whole wizard view for one frame. This is the only conversion
+/// the widget host needs; `permission_target` feeds the macOS GUI-automation
+/// surfaces.
+pub(super) fn wizard_view_with_permission_target(
+    state: &WizardState,
+    permission_target: &str,
+    width: usize,
+    height: usize,
+) -> WizardView {
+    let section = match state.sections.get(&state.current_section) {
+        Some(SectionState::Themes { selected_theme }) => {
+            WizardSectionContent::plain(themes_section_lines(*selected_theme, width))
+        }
+        Some(SectionState::Models {
+            primary_model,
+            tool_models,
+            selected_idx,
+            editing_mode,
+            editing_model_mode,
+            model_input,
+            error,
+            ..
+        }) => WizardSectionContent::plain(models_section_lines(
+            state.coreml,
+            primary_model,
+            tool_models,
+            *selected_idx,
+            *editing_mode,
+            *editing_model_mode,
+            model_input,
+            error.as_deref(),
+            width,
+        )),
+        Some(SectionState::Personas {
+            available_personas,
+            selected_idx,
+            default_persona,
+            editing_prompt,
+            prompt_input,
+            cursor_pos,
+            ..
+        }) => WizardSectionContent::plain(personas_section_lines(
+            available_personas,
+            *selected_idx,
+            default_persona,
+            *editing_prompt,
+            prompt_input,
+            *cursor_pos,
+            width,
+        )),
+        Some(SectionState::Features {
+            auto_approve,
+            streaming,
+            debug,
+            hf_token,
+            editing_hf_token,
+            finch_api_key,
+            editing_finch_api_key,
+            #[cfg(target_os = "macos")]
+            gui_automation,
+            #[cfg(target_os = "macos")]
+            gui_automation_availability,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompt,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompted,
+            #[cfg(target_os = "macos")]
+            gui_automation_last_known_available,
+            #[cfg(target_os = "macos")]
+            gui_automation_settings_feedback,
+            #[cfg(target_os = "macos")]
+            gui_automation_details_expanded,
+            #[cfg(target_os = "macos")]
+            gui_automation_details_scroll,
+            daemon_only_mode,
+            mdns_discovery,
+            auto_discover,
+            memory_context_lines,
+            selected_idx,
+            ..
+        }) => features_section_content(
+            *auto_approve,
+            *streaming,
+            *debug,
+            hf_token,
+            *editing_hf_token,
+            finch_api_key,
+            *editing_finch_api_key,
+            #[cfg(target_os = "macos")]
+            *gui_automation,
+            #[cfg(target_os = "macos")]
+            gui_automation_availability,
+            #[cfg(target_os = "macos")]
+            *gui_automation_prompt,
+            #[cfg(target_os = "macos")]
+            *gui_automation_prompted,
+            #[cfg(target_os = "macos")]
+            *gui_automation_last_known_available,
+            #[cfg(target_os = "macos")]
+            gui_automation_settings_feedback.as_ref(),
+            #[cfg(target_os = "macos")]
+            *gui_automation_details_expanded,
+            #[cfg(target_os = "macos")]
+            *gui_automation_details_scroll,
+            #[cfg(target_os = "macos")]
+            permission_target,
+            *daemon_only_mode,
+            *mdns_discovery,
+            *auto_discover,
+            *memory_context_lines,
+            *selected_idx,
+            width,
+            height,
+        ),
+        Some(SectionState::Review) => {
+            WizardSectionContent::plain(review_section_lines(state, width))
+        }
+        None => WizardSectionContent::plain(vec![wizard_line(
+            "Error: Section state not found",
+            Color::Red,
+        )]),
+    };
+
+    // The open overlay is a claimed card; the help yields while it owns keys.
+    let card = if state.confirming_cancel {
+        Some(cancel_confirm_card())
+    } else {
+        match state.sections.get(&WizardSection::Models) {
+            Some(SectionState::Models {
+                adding_provider: Some(step),
+                catalog_source,
+                catalog_refresh,
+                catalog_refreshed_at,
+                catalog_error,
+                ..
+            }) => Some(add_provider_card(
+                state.coreml,
+                step,
+                catalog_source,
+                catalog_refresh.is_some(),
+                catalog_refreshed_at.as_ref(),
+                catalog_error.as_deref(),
+            )),
+            _ => None,
+        }
+    };
+
+    let selected_tab = WizardSection::all()
+        .iter()
+        .position(|section| *section == state.current_section)
+        .unwrap_or(0);
+
+    WizardView {
+        title: " Finch Setup ".to_string(),
+        tab_titles: tab_titles(state),
+        selected_tab,
+        section,
+        help: if card.is_none() {
+            Some(help_line(state, width))
+        } else {
+            None
+        },
+        card,
+    }
+}
+
+/// The frame's view, with the macOS permission target refreshed per frame the
+/// way the old painter refreshed it.
+pub(super) fn wizard_view(state: &WizardState, width: usize, height: usize) -> WizardView {
+    #[cfg(target_os = "macos")]
+    let permission_target = permission_target_description();
+    #[cfg(not(target_os = "macos"))]
+    let permission_target = String::new();
+    wizard_view_with_permission_target(state, &permission_target, width, height)
+}

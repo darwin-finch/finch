@@ -59,6 +59,7 @@ mod tabbed_dialog_widget; // kept for wizard helpers
 mod tool_viewport;
 #[cfg(test)]
 mod vt_oracle;
+mod wizard_host;
 // The ViewModel is crate-visible: projection-feeding consumers outside this
 // module (and its tests) project messages through it.
 pub(crate) mod view_model;
@@ -79,7 +80,7 @@ use autocomplete_widget::{completion_pane_lines, replace_command_prefix, replace
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use graph::{GraphNode, GraphNodeAuthor, GraphNodeKind, GraphNodeStatus, GraphView};
-pub use shadow_buffer::visible_length;
+pub use shadow_buffer::{physical_rows, visible_length};
 
 /// Best-effort terminal restoration for an exit path that cannot acquire the
 /// renderer lock.  This is intentionally independent of [`TuiRenderer`]:
@@ -95,6 +96,15 @@ pub fn emergency_restore_terminal() {
 }
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
+// The setup wizard's widget host (#812): its screens are views on the same
+// claiming tree and shadow buffer the conversation uses. Like `view_model`,
+// this is reachable crate-wide but not published facade surface — #808 (the
+// GUI setup surface) will decide what a GUI host consumes.
+pub(crate) use wizard_host::{
+    plan_wizard_frame, wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint,
+    wizard_plain, WizardCard, WizardColor, WizardFrame, WizardHost, WizardRects,
+    WizardSectionContent, WizardView,
+};
 // Re-export ColorScheme so callers can use `crate::cli::tui::ColorScheme`.
 pub use crate::theme::ColorScheme;
 
