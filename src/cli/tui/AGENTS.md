@@ -40,6 +40,26 @@ Every blit converts domain state into one owned ViewModel snapshot, then lays it
 4. Painting stays line-based on the claimed rects; native `canonical_commit` remains the
    separate once-per-id pipeline.
 
+## Assistant prose markdown renders in the viewport (#756)
+
+`markdown.rs` (private) is a deliberately bounded inline-subset parser — fenced code blocks,
+bold/italic emphasis, inline code, ordered/unordered lists — chosen over a markdown crate by
+the #756 contract: the acceptance surface is those constructs, everything else must degrade to
+literal text anyway, and the render target is a custom ANSI line model regardless. It is
+assistant prose only (`WorkUnitPresentation::Assistant`); program source/output, tool rows,
+activity rows, and user queries never reach it, and the dialog-option `markdown` preview keeps
+its own path.
+
+One representation, two render targets: `project_work_unit` parses the assistant head body once
+and puts the rendered lines in `TranscriptNode::body` (the viewport projection) and the raw
+source lines in `TranscriptNode::raw_body` (`None` when the text needed no rendering).
+`AccordionState::render_row` paints `body`; the canonical commit's fully-expanded rendering
+paints `raw_body`, so native scrollback keeps the RAW source byte-identical to the
+pre-markdown behavior — the copyable record is never the rendered form, and no markdown SGR
+enters it. Code-block bodies stay whitespace-exact in both targets; the fence lines remain
+visible text (dimmed in the viewport), so no-color reading relies on characters, not color.
+Malformed input and outside-the-subset constructs pass through literally without panicking.
+
 ## The conversation ScrollView owns reading (#806)
 
 The transcript region — the root column's `Flex` `TRANSCRIPT` claim, the leftover frame

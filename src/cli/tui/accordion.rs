@@ -99,7 +99,9 @@ impl AccordionState {
     }
 
     /// Render one node with every disclosure forced open, for the canonical
-    /// transcript commit.
+    /// transcript commit. The commit renders the node's RAW source body when
+    /// one exists (#756): native scrollback is the copyable record, so a
+    /// markdown-rendered viewport body never replaces it there.
     pub fn render_node_fully_expanded(&self, node: &TranscriptNode) -> Vec<RenderedTranscriptLine> {
         let mut lines = Vec::new();
         self.render_row(node, 0, true, &mut lines);
@@ -149,7 +151,15 @@ impl AccordionState {
         if !expanded {
             return;
         }
-        for body in &row.body {
+        // The canonical commit (force_expanded) renders the raw source body —
+        // the copyable record (#756). Every other projection renders the
+        // viewport body, which is a markdown rendering when the node carries
+        // a raw body, and the same text otherwise.
+        let body = match (force_expanded, &row.raw_body) {
+            (true, Some(raw)) => raw,
+            _ => &row.body,
+        };
+        for body in body {
             lines.push(RenderedTranscriptLine {
                 text: format!("{}  {}", "  ".repeat(depth), body),
                 row_id: None,

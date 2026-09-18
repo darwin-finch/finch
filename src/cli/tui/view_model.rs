@@ -59,6 +59,11 @@ pub(crate) struct TranscriptNode {
     /// The renderer's default disclosure for this row, derived from domain
     /// status at projection time. The user's open-set choice overrides it.
     pub default_open: bool,
+    /// The row's RAW source body, present only when `body` is a markdown
+    /// rendering of it (#756). The canonical scrollback commit renders this —
+    /// the raw text is the copyable record — while the viewport renders
+    /// `body`. `None` when `body` already is the raw text.
+    pub raw_body: Option<Vec<String>>,
 }
 
 /// A message projected for the transcript: a WorkUnit run becomes a
@@ -122,32 +127,40 @@ pub(crate) fn project_work_unit(view: &WorkUnitView) -> TranscriptNode {
         None,
     ));
     let head = &view.head;
-    let (role, label, body, default_open) = match &head.presentation {
+    let (role, label, body, raw_body, default_open) = match &head.presentation {
         WorkUnitPresentation::Assistant if !view.rows.is_empty() => {
             let actionable = view.rows.iter().any(tool_row_requires_default_expansion);
+            let (body, raw_body) = assistant_body(&head.response_text);
             (
                 NodeRole::ToolGroup,
                 compact_tool_group_label(&view.rows),
-                text_lines(&head.response_text),
+                body,
+                raw_body,
                 head.status == MessageStatus::InProgress || actionable,
             )
         }
-        WorkUnitPresentation::Assistant => (
-            NodeRole::Response,
-            assistant_prose_label(&view.verb, head),
-            text_lines(&head.response_text),
-            true,
-        ),
+        WorkUnitPresentation::Assistant => {
+            let (body, raw_body) = assistant_body(&head.response_text);
+            (
+                NodeRole::Response,
+                assistant_prose_label(&view.verb, head),
+                body,
+                raw_body,
+                true,
+            )
+        }
         WorkUnitPresentation::Activity { title } => (
             NodeRole::Activity,
             compact_activity_group_label(title, &view.rows),
             Vec::new(),
+            None,
             head.status == MessageStatus::InProgress,
         ),
         WorkUnitPresentation::ProgramSource { language } => (
             NodeRole::Program,
             format!("Program source ({language})"),
             text_lines(&head.response_text),
+            None,
             head.status == MessageStatus::InProgress,
         ),
         WorkUnitPresentation::ProgramOutput { title } => {
@@ -161,7 +174,16 @@ pub(crate) fn project_work_unit(view: &WorkUnitView) -> TranscriptNode {
                     .clone()
                     .unwrap_or_else(|| "Program output".to_string())
             };
-            (NodeRole::Output, label, head.output_body_lines(), true)
+            // VM output is a portable side effect, not assistant prose
+            // (`WorkUnitInner::as_assistant_prose` only chooses chrome): the
+            // body is never markdown-rendered.
+            (
+                NodeRole::Output,
+                label,
+                head.output_body_lines(),
+                None,
+                true,
+            )
         }
     };
 
@@ -175,6 +197,27 @@ pub(crate) fn project_work_unit(view: &WorkUnitView) -> TranscriptNode {
         body,
         children,
         default_open,
+        raw_body,
+    }
+}
+
+/// The assistant-prose body pair: markdown-rendered viewport lines plus the
+/// raw source lines the canonical scrollback commit writes (#756). Only
+/// assistant presentation reaches this; program source/output and tool rows
+/// never do.
+fn assistant_body(response_text: &str) -> (Vec<String>, Option<Vec<String>>) {
+    let raw = text_lines(response_text);
+    if raw.is_empty() {
+        // An empty turn gains no phantom blank row: an unparsed empty source
+        // and a parsed one must not disagree about the row's existence.
+        return (raw, None);
+    }
+    let rendered = super::markdown::render_viewport_body(response_text);
+    if rendered == raw {
+        // No construct changed the text: one representation, no extra state.
+        (raw, None)
+    } else {
+        (rendered, Some(raw))
     }
 }
 
@@ -192,6 +235,7 @@ fn project_tool_row(view: &WorkUnitView, index: usize, row: &WorkRowView) -> Tra
         body: vec![row.label.clone()],
         children: Vec::new(),
         default_open: false,
+        raw_body: None,
     };
     let mut output_body = row.body_lines.clone();
     if let Some(diffs) = &row.rendered_diffs {
@@ -209,6 +253,7 @@ fn project_tool_row(view: &WorkUnitView, index: usize, row: &WorkRowView) -> Tra
             body: output_body,
             children: Vec::new(),
             default_open: matches!(row.status, WorkRowStatus::Running) || actionable,
+            raw_body: None,
         });
     }
     TranscriptNode {
@@ -221,6 +266,7 @@ fn project_tool_row(view: &WorkUnitView, index: usize, row: &WorkRowView) -> Tra
         body: Vec::new(),
         children,
         default_open: matches!(row.status, WorkRowStatus::Running) || actionable,
+        raw_body: None,
     }
 }
 
@@ -240,6 +286,7 @@ fn project_activity_row(view: &WorkUnitView, index: usize, row: &WorkRowView) ->
         body,
         children: Vec::new(),
         default_open: matches!(row.status, WorkRowStatus::Running) || row.has_output(),
+        raw_body: None,
     }
 }
 
@@ -299,6 +346,7 @@ fn project_agent_activity_row(
                 body: Vec::new(),
                 children: Vec::new(),
                 default_open: matches!(tool.status, WorkRowStatus::Running),
+                raw_body: None,
             }
         })
         .collect::<Vec<_>>();
@@ -323,6 +371,7 @@ fn project_agent_activity_row(
         body: row.body_lines.clone(),
         children,
         default_open: matches!(row.status, WorkRowStatus::Running),
+        raw_body: None,
     }
 }
 
@@ -686,4 +735,315 @@ pub(crate) fn completion_pane_for_claim(
         return natural.to_vec();
     }
     completion_pane_lines(autocomplete, width, claimed_rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::messages::WorkUnit;
+    use std::sync::Arc;
+
+    fn colors() -> ColorScheme {
+        ColorScheme::default()
+    }
+
+    /// Visible text of one rendered line: SGR and OSC sequences removed.
+    fn strip_sgr(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                match chars.peek() {
+                    Some('[') => {
+                        chars.next();
+                        for nc in chars.by_ref() {
+                            if nc.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        chars.next();
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    fn assistant_unit(response: &str) -> WorkUnit {
+        let unit = WorkUnit::new("Channeling");
+        unit.set_response(response);
+        unit.set_complete();
+        unit
+    }
+
+    /// The rendered viewport body of one assistant response, through the real
+    /// projection and disclosure path the live console draws with.
+    fn rendered_viewport_body(response: &str) -> Vec<String> {
+        let unit = assistant_unit(response);
+        let node = try_project_for_test(&unit, &colors()).expect("assistant projects a node");
+        super::super::accordion::AccordionState::default()
+            .render_node(&node)
+            .into_iter()
+            .skip(1) // the disclosure header line
+            .map(|line| line.text)
+            .collect()
+    }
+
+    /// The viewport body line minus the row model's fixed two-space body
+    /// indent — the presentation chrome every body line carries — so the
+    /// remaining text can be compared byte-exact against the raw source.
+    fn without_body_indent(line: &str) -> String {
+        let plain = strip_sgr(line);
+        plain.strip_prefix("  ").unwrap_or(&plain).to_owned()
+    }
+
+    #[test]
+    fn test_assistant_fenced_code_block_renders_distinct_with_whitespace_exact_body() {
+        // INVARIANT (#756): a fenced code block in assistant prose renders
+        // visibly distinct in the viewport — dimmed fence bookends, body
+        // whitespace byte-exact after SGR stripping — while the node also
+        // carries the raw source lines for the canonical record.
+        let response = "Use this:\n```rust\nfn main() {\n    let deep =    1;\n}\n```\nDone.\n";
+        let unit = assistant_unit(response);
+        let node = try_project_for_test(&unit, &colors()).expect("assistant projects a node");
+        let raw = node.raw_body.as_ref().expect("markdown body carries raw");
+        assert_eq!(
+            raw,
+            &[
+                "Use this:",
+                "```rust",
+                "fn main() {",
+                "    let deep =    1;",
+                "}",
+                "```",
+                "Done.",
+                "",
+            ],
+            "the raw body is the exact source the canonical commit must write; got {raw:?}"
+        );
+        let body: Vec<String> = rendered_viewport_body(response);
+        let plain: Vec<String> = body.iter().map(|line| strip_sgr(line)).collect();
+        assert_eq!(
+            plain,
+            &[
+                "  Use this:",
+                "  ```rust",
+                "  fn main() {",
+                "      let deep =    1;",
+                "  }",
+                "  ```",
+                "  Done.",
+                "  ",
+            ],
+            "stripped of SGR the viewport keeps every source line, whitespace-exact \
+             (the row model's fixed two-space body indent included); got {body:?}"
+        );
+        assert_eq!(
+            body.iter().filter(|line| line.contains("\x1b[2m")).count(),
+            2,
+            "the fence bookends are styled (dim SGR), which is what makes the block \
+             visually distinct; got {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_assistant_emphasis_and_lists_render_in_the_viewport() {
+        let response = "**Important** run `finch test`:\n\n- first\n- second\n1. third\n";
+        let body = rendered_viewport_body(response);
+        let plain: Vec<String> = body.iter().map(|line| strip_sgr(line)).collect();
+        assert_eq!(
+            plain[0].trim(),
+            "Important run finch test:",
+            "emphasis markers are dropped and the words kept: {body:?}"
+        );
+        assert!(
+            body[0].contains("\x1b[1m") && body[0].contains("\x1b[36m"),
+            "bold and inline code carry their SGR attributes: {:?}",
+            body[0]
+        );
+        assert_eq!(
+            plain[2].trim(),
+            "• first",
+            "dash lists render as bullets: {body:?}"
+        );
+        assert_eq!(plain[3].trim(), "• second");
+        assert_eq!(
+            plain[4].trim(),
+            "1. third",
+            "ordered numbering is already semantic and stays: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_raw_and_no_color_see_the_same_text_semantics_as_the_rendered_viewport() {
+        // INVARIANT (#756, accessibility authoritative): neither mode relies
+        // on color to convey structure, and both are asserted on plain text,
+        // never on SGR alone. Code blocks are text-identical in both modes
+        // (fences kept, body whitespace-exact); emphasis is carried by SGR in
+        // the rendered viewport and by its markers in the raw/no-color body.
+        let response = "Before.\n```sh\necho one\n  echo two\n```\nAfter **bold**.\n";
+        let body = rendered_viewport_body(response);
+        let unit = assistant_unit(response);
+        let node = try_project_for_test(&unit, &colors()).expect("assistant projects a node");
+        let raw = node.raw_body.as_ref().expect("markdown body carries raw");
+        let viewport_plain: Vec<String> = body
+            .iter()
+            .map(|line| without_body_indent(line))
+            .filter(|line| !line.is_empty())
+            .collect();
+        // The code block is byte-identical text in both modes: fences kept,
+        // body whitespace-exact, so no-color reading loses nothing.
+        for source_line in ["```sh", "echo one", "  echo two", "```"] {
+            assert!(
+                raw.iter().any(|line| line == source_line),
+                "INVARIANT: the raw/no-color body must keep the code block line \
+                 {source_line:?} verbatim; raw was {raw:?}"
+            );
+            assert!(
+                viewport_plain.iter().any(|line| line == source_line),
+                "INVARIANT: the rendered viewport, stripped of SGR, must keep the code \
+                 block line {source_line:?} byte-exact; viewport plain text was \
+                 {viewport_plain:?}"
+            );
+        }
+        // Emphasis: the marker is the no-color carrier in the raw body; the
+        // rendered viewport carries it as SGR around the same words.
+        assert!(
+            raw.iter().any(|line| line.contains("**bold**")),
+            "the raw body keeps the emphasis markers — the no-color carrier of \
+             emphasis; raw was {raw:?}"
+        );
+        assert!(
+            body.iter()
+                .any(|line| line.contains("\x1b[1m") && strip_sgr(line).contains("After bold.")),
+            "the rendered viewport bolds the same words the raw body marks: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_program_source_and_output_are_never_markdown_rendered() {
+        // VM output and program source are portable side effects, not
+        // assistant prose: their bodies must stay raw text with no markdown
+        // rendering and no raw-body split.
+        let source = WorkUnit::new("typed program");
+        source.set_program_source("forth");
+        source.set_response("```forth\n: greet ( -- )\n  .\" hi\" ;\n```");
+        source.set_complete();
+        let node = try_project_for_test(&source, &colors()).expect("program projects a node");
+        assert_eq!(
+            node.raw_body, None,
+            "program source is not assistant prose and gains no markdown split"
+        );
+        assert!(
+            node.body.iter().all(|line| !line.contains('\x1b')),
+            "program source body carries no markdown SGR: {:?}",
+            node.body
+        );
+        assert_eq!(
+            node.body[0], "```forth",
+            "fences stay literal in program source"
+        );
+
+        let output = WorkUnit::new("typed program");
+        output.set_program_output();
+        output.set_response("```forth\n: greet ( -- )\n  .\" hi\" ;\n```");
+        output.set_complete();
+        let node = try_project_for_test(&output, &colors()).expect("output projects a node");
+        assert_eq!(
+            node.raw_body, None,
+            "VM output is never reflowed as markdown"
+        );
+        assert!(
+            node.body.iter().all(|line| !line.contains('\x1b')),
+            "program output body carries no markdown SGR: {:?}",
+            node.body
+        );
+    }
+
+    #[test]
+    fn test_user_input_and_tool_output_are_not_reflowed() {
+        // CONTROL (#756): markdown rendering is assistant prose only. A user
+        // query (the Plain projection path) and a tool output row must carry
+        // their text literally — no marker dropping, no bullet swaps, no SGR.
+        let user: MessageRef = Arc::new(crate::cli::messages::concrete::UserQueryMessage::new(
+            "show **bold** and - lists",
+        ));
+        assert!(
+            matches!(
+                project_message(&user, &colors()),
+                ProjectedMessage::Plain(_)
+            ),
+            "user queries project on the Plain path, outside the markdown renderer"
+        );
+        let plain = match project_message(&user, &colors()) {
+            ProjectedMessage::Plain(lines) => lines.join("\n"),
+            ProjectedMessage::Node(_) => unreachable!("checked above"),
+        };
+        assert!(
+            plain.contains("**bold**") && plain.contains("- lists"),
+            "user input text is never reflowed: {plain:?}"
+        );
+
+        let unit = WorkUnit::new("Tools");
+        let call = unit.add_row("bash(docs)");
+        unit.complete_row_with_body(
+            call,
+            "",
+            vec![
+                "```python".to_string(),
+                "print('x')".to_string(),
+                "```".to_string(),
+                "**literal**".to_string(),
+                "- stays".to_string(),
+            ],
+        );
+        unit.set_complete();
+        let node = try_project_for_test(&unit, &colors()).expect("tool group projects");
+        let output = &node.children[0].children[1];
+        assert_eq!(
+            output.role,
+            NodeRole::ToolOutput,
+            "the control must exercise a real tool output row; got {:?}",
+            node.children[0]
+        );
+        assert_eq!(
+            output.body,
+            &["```python", "print('x')", "```", "**literal**", "- stays",],
+            "tool output is byte-exact raw text, never markdown-rendered: {:?}",
+            output.body
+        );
+        assert_eq!(
+            output.raw_body, None,
+            "tool output gains no markdown raw-body split"
+        );
+    }
+
+    #[test]
+    fn test_malformed_assistant_markdown_degrades_to_plain_text_without_panic() {
+        let response = "dangling ** open * star\n```python\nprint('x')\n";
+        let body = rendered_viewport_body(response);
+        let plain: Vec<String> = body.iter().map(|line| strip_sgr(line)).collect();
+        assert_eq!(
+            plain[0].trim(),
+            "dangling ** open * star",
+            "unmatched delimiters stay literal text: {body:?}"
+        );
+        assert_eq!(plain[1].trim(), "```python");
+        assert_eq!(plain[2].trim(), "print('x')");
+        let unit = assistant_unit(response);
+        let node = try_project_for_test(&unit, &colors()).expect("assistant projects a node");
+        let raw = node
+            .raw_body
+            .as_ref()
+            .expect("degraded body still carries raw");
+        assert_eq!(
+            raw,
+            &["dangling ** open * star", "```python", "print('x')", "",],
+            "the canonical raw body is the exact malformed source; got {raw:?}"
+        );
+    }
 }
