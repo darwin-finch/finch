@@ -2209,9 +2209,14 @@ concept TryPinnableOwner<T> : Owner<T> {
     operation try-pin = take Self -> result<Pinned, PinFailure<Self>>
 }
 
-Unique<T> : Owner<T>                 # movable, not copyable
-Shared<T> : ShareableOwner<T>        # copying retains a strong handle
-Weak<T>                              # upgrade returns option<Shared<T>>
+concept TryUniqueRecoverable<T> : ShareableOwner<T> {
+    # Succeeds only when this is the sole strong handle; failure returns the still-shared original.
+    operation try-into-unique = take Self -> result<Unique<T>, Self>
+}
+
+Unique<T> : Owner<T>                          # movable, not copyable
+Shared<T> : ShareableOwner<T>, TryUniqueRecoverable<T>  # copying retains a strong handle
+Weak<T>                                       # upgrade returns option<Shared<T>>
 ```
 
 These mappings use the same explicit concept-evidence mechanism as ranges and other generic code;
@@ -2307,8 +2312,25 @@ layouts:
 (let local (Foo ...))
 (let unique-foo (new unique Foo ...))
 (let shared-foo (new shared Foo ...))
-(let promoted (share local)) ; allocates shared storage and moves local
+(let promoted (share local))       ; allocates shared storage and moves local
+(let promoted-unique (share unique-foo)) ; moves an existing Unique<Foo> into Shared<Foo>
 ```
+
+`share` therefore has two callers: a plain local (allocates new shared storage) and an existing
+`Unique<T>` (reuses its storage, no new allocation, still a move — `unique-foo` is invalidated
+after). The reverse direction is not a plain move: a `Shared<T>` may already have other live
+strong handles, so recovering unique ownership is a checked, fallible operation instead of a
+constructor —
+
+```lisp
+(match (try-into-unique shared-foo)
+  (ok solo (... solo is now Unique<Foo> ...))
+  (err still-shared (... still-shared is the same Shared<Foo>, refcount unchanged ...)))
+```
+
+— succeeding only when the strong count is 1, on the same shape as `TryPinnableOwner<T>` above
+("Library ownership carriers and the compiler lifecycle kernel"): failure returns the original,
+still-owned carrier rather than losing it.
 
 There is no safe unqualified owning heap pointer. Constructing `Shared<T>` from `&local` or any
 other stack borrow is a compile error; promotion consumes the stack value and invalidates its old
