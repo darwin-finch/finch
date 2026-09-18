@@ -986,6 +986,17 @@ that value into an exception.
 
 ### Closed variants, representation, and destructuring
 
+**Added 2026-09-17: a constructor's payload shape is unit, a positional tuple, or a record — the
+last of these is an ordinary record, not a second named-field mechanism invented to resemble one.**
+`some(int)` shows the positional case: `some` is the tag, `(int)` its tuple-shaped payload, and a
+multi-field positional constructor (`pair(int, string)`) works the same way. A constructor whose
+payload has named fields — matching Rust's mixed-shape `enum` arms — uses an ordinary `record{...}`
+as that payload type, built and validated exactly as a standalone record already is ("Records,
+layout, placement, and member access," including its own construction-invariant rules). The variant
+contributes only the tag; it never duplicates how its payload is constructed, whichever of the three
+shapes that payload takes. This was previously unstated and left it genuinely unclear whether a
+record-shaped arm was supported at all, let alone how one would be declared.
+
 Pattern matching narrows and destructures a value; it does not imply heap boxing. A closed variant
 logically has a discriminant and storage large/aligned enough for its largest payload. The matcher
 tests that discriminant, proves which constructor is active on the selected edge, and binds fields
