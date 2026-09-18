@@ -1054,7 +1054,33 @@ inference rather than asserting an empty row. `pure` is not itself a row member 
 emptiness: it is a verifier-derived predicate over the resolved row and body. Source may request
 that proof with a separate `guarantees pure` clause; `! pure` is invalid. A deterministic
 function may throw and remain pure but partial; a function may separately be total, `nothrow`,
-deterministic, and non-suspending. Generic constraints can require those predicates explicitly. A
+deterministic, and non-suspending. Generic constraints can require those predicates explicitly.
+
+**Added 2026-09-17: what a purity proof actually buys, consolidated from where it's used elsewhere
+in this document.** A `guarantees pure` request is not documentation sealed against later
+regression — that's real but the smallest of several payoffs, each of which requires the *proof*,
+not a trusted assertion, and is unavailable without it:
+- **Optimizer legality.** A pure call may be reordered, hoisted, memoized, or eliminated if unused;
+  none of that is sound for an effectful call, since dropping or reordering it changes what happens
+  ("Optimizations may rely on certified laws... only when the rewrite also preserves operand
+  evaluation, exceptions, ownership, and observable destruction" above).
+- **A hard precondition for specific features, not an optional annotation.** Constant-pattern
+  matching's hashed/jump-table dispatch requires "certified pure, total, deterministic,
+  non-suspending `PatternEqual` evidence" ("Typed values use a hybrid representation") — without the
+  proof that dispatch strategy is unavailable, not merely unoptimized.
+- **A security/audit property.** A function proven pure cannot request a capability, touch host
+  state, or trigger an approval dialog — the capability broker can be skipped for that call
+  *statically*, and a human or the runtime can know, not assume, that the call is incapable of
+  external action, matching this project's stance of independent verification over trusted claims.
+- **A parallelism/scheduling license.** A pure call has no shared-mutable-state access and no
+  ordering dependency, so it may run on any worker, reorder relative to other pure calls, or run
+  redundantly without a correctness concern — the same freedom the compiler's own semantic-job
+  scheduler already claims for itself ("single-threaded, shuffled, and parallel schedules must
+  produce byte-equivalent interfaces").
+
+Each of these is why `guarantees pure` is a request the *verifier* answers, never a label the author's
+word makes true — an unchecked claim would grant all four benefits to code that does not actually
+have them. A
 yielding callable remains a scheduling barrier even when it performs no mutation or host operation.
 Optimizers treat `yields<Y,Resume>` as a control barrier, while the scheduler uses its typed payload
 and resumption contract. Source spells row union with `|`, for example
