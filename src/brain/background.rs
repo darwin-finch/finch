@@ -25,6 +25,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -47,6 +48,14 @@ pub const DEFAULT_RING_BYTES_PER_STREAM: usize = 64 * 1024;
 /// Watcher poll interval while a task is running. Coarse liveness only; no
 /// correctness assertion depends on this granularity.
 const WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long a terminal transition waits for the stream readers to reach EOF
+/// before recording anyway. A grandchild holding the pipe's write end can
+/// delay EOF indefinitely, so the wait is a bounded grace, never a barrier.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Poll interval while waiting for the readers to finish draining.
+const DRAIN_POLL: Duration = Duration::from_millis(10);
 
 /// Stable identifier for one background task, returned immediately by
 /// [`BackgroundTaskManager::start`].
@@ -172,6 +181,10 @@ struct TaskEntry {
     child: Option<tokio::process::Child>,
     stdout_ring: OutputRing,
     stderr_ring: OutputRing,
+    /// Set by the stdout reader when its stream reaches EOF (or errors).
+    stdout_drained: Arc<AtomicBool>,
+    /// Set by the stderr reader when its stream reaches EOF (or errors).
+    stderr_drained: Arc<AtomicBool>,
 }
 
 impl TaskEntry {
@@ -407,6 +420,8 @@ impl BackgroundTaskManager {
             .ok_or_else(|| anyhow!("background task stderr was not piped"))?;
 
         let id = BackgroundTaskId::generate();
+        let stdout_drained = Arc::new(AtomicBool::new(false));
+        let stderr_drained = Arc::new(AtomicBool::new(false));
         let entry = Arc::new(Mutex::new(TaskEntry {
             id: id.clone(),
             command: command.to_string(),
@@ -416,6 +431,8 @@ impl BackgroundTaskManager {
             state: BackgroundTaskState::Running,
             stdout_ring: OutputRing::new(self.ring_bytes),
             stderr_ring: OutputRing::new(self.ring_bytes),
+            stdout_drained: Arc::clone(&stdout_drained),
+            stderr_drained: Arc::clone(&stderr_drained),
             child: Some(child),
         }));
 
@@ -428,12 +445,14 @@ impl BackgroundTaskManager {
             Arc::clone(&entry),
             id.clone(),
             StreamKind::Stdout,
+            stdout_drained,
         ));
         tokio::spawn(drain_stream(
             stderr,
             Arc::clone(&entry),
             id.clone(),
             StreamKind::Stderr,
+            stderr_drained,
         ));
         tokio::spawn(watch_task(Arc::clone(&entry), id.clone()));
         Ok(id)
@@ -472,6 +491,18 @@ impl BackgroundTaskManager {
             .wait()
             .await
             .with_context(|| format!("Failed to reap background task {id}"))?;
+
+        // The kill closed the child's pipe write ends, but the last buffered
+        // bytes may still be in flight to the readers: give them a bounded
+        // grace so the recorded snapshot is as complete as the kill allows.
+        let (stdout_drained, stderr_drained) = {
+            let entry = entry_arc.lock().expect("background task entry lock");
+            (
+                Arc::clone(&entry.stdout_drained),
+                Arc::clone(&entry.stderr_drained),
+            )
+        };
+        wait_for_drains(&stdout_drained, &stderr_drained).await;
 
         let mut entry = entry_arc.lock().expect("background task entry lock");
         // Exactly-once: record only if nothing transitioned meanwhile.
@@ -540,6 +571,7 @@ async fn drain_stream<S: tokio::io::AsyncRead + Unpin>(
     entry: Arc<Mutex<TaskEntry>>,
     id: BackgroundTaskId,
     kind: StreamKind,
+    drained: Arc<AtomicBool>,
 ) {
     let mut lines = BufReader::new(stream).lines();
     loop {
@@ -557,6 +589,26 @@ async fn drain_stream<S: tokio::io::AsyncRead + Unpin>(
             StreamKind::Stderr => guard.stderr_ring.push(line),
         }
     }
+    // EOF (or a read error): this stream will add nothing more to its ring.
+    // Terminal states wait on this flag so a snapshot cannot beat the tail.
+    drained.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Wait a bounded grace for both stream readers to reach EOF.
+///
+/// A grandchild holding the pipe's write end can delay EOF indefinitely, so
+/// this is a grace, never a barrier: after [`DRAIN_GRACE`] the caller records
+/// whatever has been captured.
+async fn wait_for_drains(stdout: &AtomicBool, stderr: &AtomicBool) {
+    let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
+    while !stdout.load(std::sync::atomic::Ordering::Acquire)
+        || !stderr.load(std::sync::atomic::Ordering::Acquire)
+    {
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
 }
 
 /// Await one task's exit and record the terminal state exactly once.
@@ -564,34 +616,55 @@ async fn drain_stream<S: tokio::io::AsyncRead + Unpin>(
 /// The watcher owns the `Completed` transition; [`BackgroundTaskManager::stop`]
 /// owns the `Stopped` one. Once the child is taken by a stop, this watcher
 /// exits without writing anything, so a late natural completion can never
-/// overwrite a recorded terminal state.
+/// overwrite a recorded terminal state. `Completed` is recorded only after the
+/// stream readers reached EOF (or [`DRAIN_GRACE`] passed), so the first poll
+/// that reports a completed task carries its complete captured output —
+/// without this ordering, a loaded runner could observe the exit before the
+/// pipe tail was drained.
 async fn watch_task(entry: Arc<Mutex<TaskEntry>>, id: BackgroundTaskId) {
     loop {
-        {
+        // Observe the exit without holding the entry lock across the drain
+        // wait: poll and stop must stay responsive while the readers finish.
+        let observed = {
             let mut guard = entry.lock().expect("background task entry lock");
             match guard.child.as_mut() {
-                None => break, // child taken by a stop; that path records state
+                // Child taken by a stop: that path owns the terminal record.
+                None => return,
                 Some(child) => match child.try_wait() {
-                    Ok(Some(status)) => {
-                        if guard.state.is_running() {
-                            guard.state = BackgroundTaskState::Completed(status.code());
-                        }
-                        guard.child = None;
-                        break;
-                    }
-                    Ok(None) => {}
+                    Ok(Some(status)) => Some((status.code(), true)),
+                    Ok(None) => None,
                     Err(error) => {
                         tracing::warn!(task = %id, %error, "background task wait failed");
-                        if guard.state.is_running() {
-                            guard.state = BackgroundTaskState::Completed(None);
-                        }
-                        guard.child = None;
-                        break;
+                        Some((None, true))
                     }
                 },
             }
+        };
+        let Some((exit_code, _)) = observed else {
+            tokio::time::sleep(WATCHER_POLL_INTERVAL).await;
+            continue;
+        };
+
+        // The child has exited, but its last pipe bytes may not be in the
+        // rings yet: wait for the readers to reach EOF (bounded) before
+        // recording, so the first Completed poll carries the full output.
+        let (stdout_drained, stderr_drained) = {
+            let guard = entry.lock().expect("background task entry lock");
+            (
+                Arc::clone(&guard.stdout_drained),
+                Arc::clone(&guard.stderr_drained),
+            )
+        };
+        wait_for_drains(&stdout_drained, &stderr_drained).await;
+
+        let mut guard = entry.lock().expect("background task entry lock");
+        // Exactly-once: a stop that raced the completion may have recorded
+        // `Stopped` while this watcher drained; its record wins.
+        if guard.state.is_running() {
+            guard.state = BackgroundTaskState::Completed(exit_code);
         }
-        tokio::time::sleep(WATCHER_POLL_INTERVAL).await;
+        guard.child = None;
+        break;
     }
 }
 
