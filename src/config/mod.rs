@@ -4,6 +4,7 @@
 mod atomic_write;
 mod backend;
 mod constants;
+mod diagnostics;
 mod loader;
 mod notice_state;
 
@@ -58,6 +59,7 @@ pub use constants::{
     DEFAULT_BRAIN_TLS_PORT, DEFAULT_DAEMON_ADDR, DEFAULT_HTTP_ADDR, DEFAULT_MAX_TOKENS,
     DEFAULT_WORKER_ADDR,
 };
+pub use diagnostics::{CheckCommandSource, DiagnosticsConfig};
 pub use finch_providers::{
     credential_dependencies, credential_index, normalize_origin, required_audience,
     validate_authenticated_endpoints, validate_binding, AudienceBinding, CredentialBinding,

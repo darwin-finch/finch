@@ -2112,7 +2112,10 @@ async fn build_query_tool_executor(
     let executor = ToolExecutor::new(registry, permissions, patterns_path)
         .context("Failed to create tool executor")?
         .with_mcp(config)
-        .await;
+        .await
+        // Declared post-edit diagnostics sources (issue #757). Inert without
+        // a [diagnostics] declaration.
+        .with_diagnostics(&config.diagnostics);
     let executor = Arc::new(tokio::sync::Mutex::new(executor));
 
     let tool_definitions = executor.lock().await.list_all_tools().await;

@@ -5,6 +5,9 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 **Owns** `src/config/` (settings, provider entries, personas, credentials and their resolvers,
 backend selection, colors, notice state, constants), `src/context/` (project instruction loading),
 `src/license/`, `src/metrics/`, `src/monitoring/`, `src/errors.rs`, and the `data/` personas.
+The declared post-edit diagnostics sources live in
+[`diagnostics.rs`](diagnostics.rs) and their user-facing contract is documented in
+[`CONFIGURATION.md`](CONFIGURATION.md).
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
 modules are private, so the `pub use` list in `src/config/mod.rs` is the whole public surface, and

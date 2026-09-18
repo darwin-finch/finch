@@ -34,6 +34,8 @@ impl BackendConfig {
 }
 /// Legacy alias for compatibility during migration
 pub type BackendDevice = ExecutionTarget;
+/// One declared check command and the file extensions it covers.
+pub struct CheckCommandSource { … }
 /// Client configuration for connecting to daemon
 pub struct ClientConfig { … }
 /// Color scheme for TUI elements Re-exported from `theme`.
@@ -86,6 +88,16 @@ pub enum CredentialKind { ApiKey, Bearer, OauthDevice, OauthBrowserPkce, CloudId
 pub enum CredentialLifecycle { Active, Revoked, LegacyAmbiguous }
 /// Provider/account namespace. Re-exported from `finch-providers`.
 pub enum CredentialProvider { Anthropic, OpenaiPlatform, ChatgptSubscription, Xai, GrokSubscription, GeminiAiStudio, GoogleVertex, Mistral, Groq, Openrouter }
+/// Declared post-edit diagnostics sources ([issue #757](https://github.com/darwin-finch/finch/issues/757)).
+pub struct DiagnosticsConfig { … }
+impl DiagnosticsConfig {
+    /// True when no source is declared, so the post-edit hook is inert.
+    pub fn is_inert(&self) -> bool;
+    /// Declared source whose extensions cover `path`, if any.
+    pub fn source_for_file(&self, path: &str) -> Option<&CheckCommandSource>;
+    /// Fail closed on declarations this build must not mis-execute.
+    pub fn validate(&self) -> anyhow::Result<()>;
+}
 /// Dialog color configuration Re-exported from `theme`.
 pub struct DialogColors { … }
 /// Normalized service family. Re-exported from `finch-providers`.

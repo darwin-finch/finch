@@ -88,9 +88,35 @@ store (for example an environment variable), then replace the old provider
 entry with `type = "credentialed"`. Ambiguous legacy named records fail with an
 actionable `finch setup` migration error.
 
+## Post-edit diagnostics — `[diagnostics]` (issue #757)
+
+Diagnostics after write/edit/patch run only from a source declared here;
+nothing is inferred from project files. Empty by default (the feature is
+inert and edit results are unchanged):
+
+```toml
+[diagnostics]
+timeout_secs = 10        # per-run bound; a hanging check is stopped, the edit is unaffected
+max_output_chars = 4000  # cap on the excerpt appended to the edit result
+
+[[diagnostics.check]]
+extensions = ["rs"]
+command = "cargo check --message-format=json"
+```
+
+Each `check` entry maps file extensions to a simple argv that is executed
+directly — no shell — in the workspace root after a successful write/edit/patch
+of a covered file. The result of that check is appended, bounded, to the same
+tool result. The command's authority is evaluated through the existing bash
+approval path: a command your bash policy would not allow (including a peer
+session) is skipped, and constitutionally denied commands are never executed.
+Shell operators and command substitution are rejected at load. LSP-server
+sources are not accepted yet; unknown keys fail closed at parse time.
+
 ## Key files
 
 - `src/config/mod.rs` — Config loading, validation, migration; re-exports credential types from `finch-providers`
 - `crates/finch-providers/src/credentials.rs` — named credential schema and binding validator
 - `src/config/provider.rs` — `ProviderEntry` tagged enum
 - `src/config/settings.rs` — `TeacherEntry` (legacy), `LicenseConfig`, `LicenseType`
+- `src/config/diagnostics.rs` — declared post-edit diagnostics sources (`DiagnosticsConfig`)

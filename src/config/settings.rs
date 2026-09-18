@@ -1,6 +1,7 @@
 // Configuration structs
 
 use super::backend::{BackendConfig, CoreMlConfig};
+use super::diagnostics::DiagnosticsConfig;
 use super::provider::ProviderEntry;
 use super::ProviderCredential;
 use crate::theme::ColorScheme;
@@ -183,6 +184,11 @@ pub struct Config {
 
     /// License configuration (Noncommercial by default; Commercial with a valid key)
     pub license: LicenseConfig,
+
+    /// Declared post-edit diagnostics sources (issue #757). Empty by default:
+    /// no source is declared, nothing is inferred, and edit results are
+    /// unchanged.
+    pub diagnostics: DiagnosticsConfig,
 }
 
 /// Server configuration for daemon mode
@@ -784,6 +790,12 @@ impl Config {
             }
         }
 
+        // Declared post-edit diagnostics sources (issue #757): fail closed on
+        // declarations this build must not mis-execute.
+        self.diagnostics
+            .validate()
+            .context("Invalid [diagnostics] configuration")?;
+
         Ok(())
     }
 
@@ -915,6 +927,7 @@ impl Config {
             mcp_servers: HashMap::new(),
             memory: crate::memory::MemoryConfig::default(),
             license: LicenseConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
         }
     }
 
@@ -1061,6 +1074,7 @@ impl Config {
             colors: Some(self.colors.clone()),
             features: Some(self.features.clone()),
             license: self.license.clone(),
+            diagnostics: Some(self.diagnostics.clone()),
         };
 
         let toml_string = toml::to_string_pretty(&toml_config)?;
@@ -1098,6 +1112,8 @@ struct TomlConfig {
     features: Option<FeaturesConfig>,
     #[serde(default)]
     license: LicenseConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<super::DiagnosticsConfig>,
 }
 
 #[cfg(test)]
@@ -1133,11 +1149,36 @@ mod tests {
             colors: None,
             features: None,
             license: LicenseConfig::default(),
+            diagnostics: None,
         })
         .unwrap();
         let decoded: TomlConfig = toml::from_str(&encoded).unwrap();
 
         assert_eq!(decoded.active_persona.as_deref(), Some("expert-coder"));
+    }
+
+    #[test]
+    fn test_serialized_config_persists_declared_diagnostics_sources() {
+        let mut config = Config::new(vec![]);
+        config.diagnostics = super::super::DiagnosticsConfig {
+            check: vec![super::super::CheckCommandSource {
+                extensions: vec!["rs".to_string()],
+                command: "cargo check --message-format=json".to_string(),
+            }],
+            timeout_secs: 42,
+            max_output_chars: 512,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        config.save_to(&path).unwrap();
+
+        let round = toml::from_str::<TomlConfig>(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let saved = round.diagnostics.expect("declared sources must persist");
+        assert_eq!(
+            saved, config.diagnostics,
+            "a saved [diagnostics] table must round-trip declared sources and bounds"
+        );
     }
 
     #[test]

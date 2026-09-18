@@ -155,6 +155,8 @@ where
         huggingface_token: Option<String>,
         #[serde(default)]
         license: super::settings::LicenseConfig,
+        #[serde(default)]
+        diagnostics: Option<super::DiagnosticsConfig>,
     }
 
     fn default_tui_enabled() -> bool {
@@ -232,6 +234,12 @@ where
 
     // Apply license config (default = Noncommercial when section is absent)
     config.license = toml_config.license;
+
+    // Apply declared post-edit diagnostics sources (issue #757). Absent
+    // section = no declared source = no behavior change.
+    if let Some(diagnostics) = toml_config.diagnostics {
+        config.diagnostics = diagnostics;
+    }
 
     // Validate configuration
     config

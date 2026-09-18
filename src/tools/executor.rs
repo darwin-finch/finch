@@ -276,6 +276,9 @@ pub struct ToolExecutor {
     permissions: PermissionManager,
     confirmation_cache: ToolConfirmationCache,
     mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
+    /// Declared post-edit diagnostics sources (issue #757). `None`/inert by
+    /// default: without a declared source, edit results are unchanged.
+    diagnostics: Option<Arc<super::diagnostics::DiagnosticsService>>,
     /// When set, every successful tool call auto-pushes a node into the poset.
     /// The execution trace becomes the Co-Forth vocabulary.
     pub poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
@@ -293,8 +296,26 @@ impl ToolExecutor {
             permissions,
             confirmation_cache: ToolConfirmationCache::new(patterns_path)?,
             mcp_client: None,
+            diagnostics: None,
             poset: None,
         })
+    }
+
+    /// Attach declared post-edit diagnostics sources (issue #757).
+    ///
+    /// After a successful write/edit/patch result, a check command the user
+    /// declared in `[diagnostics]` for the touched file's extension runs
+    /// bounded and its report is appended to that same tool result. The
+    /// command's authority verdict comes from the existing bash approval path;
+    /// with no declared source this executor behaves exactly as before.
+    pub fn with_diagnostics(mut self, config: &crate::config::DiagnosticsConfig) -> Self {
+        self.diagnostics = Some(Arc::new(
+            super::diagnostics::DiagnosticsService::from_config(
+                config,
+                self.permissions.cwd().to_path_buf(),
+            ),
+        ));
+        self
     }
 
     /// Save persistent tool patterns if modified during this session.
@@ -558,8 +579,14 @@ impl ToolExecutor {
         };
 
         match tool.execute(tool_use.input.clone(), &context).await {
-            Ok(output) => {
+            Ok(mut output) => {
                 info!("Tool executed successfully");
+                self.maybe_annotate_post_edit_diagnostics(
+                    tool.name(),
+                    &tool_use.input,
+                    &mut output,
+                )
+                .await;
                 // Auto-push a node into the poset so the execution trace
                 // becomes the Co-Forth vocabulary.
                 self.poset_record_tool(&tool_use.name, &tool_use.input)
@@ -573,6 +600,36 @@ impl ToolExecutor {
                     format!("Execution error: {}", e),
                 ))
             }
+        }
+    }
+
+    /// Append bounded post-edit diagnostics to a completed write/edit/patch
+    /// result when the user declared a source for the touched file (issue
+    /// #757). Never runs for failed edits, never changes `is_error`, and is
+    /// inert — no lookup, no spawn — without a declared source.
+    async fn maybe_annotate_post_edit_diagnostics(
+        &self,
+        canonical_tool_name: &str,
+        input: &serde_json::Value,
+        output: &mut String,
+    ) {
+        let Some(service) = &self.diagnostics else {
+            return;
+        };
+        if service.is_inert() {
+            return;
+        }
+        if !matches!(canonical_tool_name, "write" | "edit" | "patch") {
+            return;
+        }
+        let Some(file_path) = input.get("file_path").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        if let Some(annotation) = service
+            .annotation_for_edit_result(file_path, &self.permissions)
+            .await
+        {
+            output.push_str(&annotation);
         }
     }
 
@@ -920,6 +977,7 @@ mod tests {
     use super::*;
     use crate::tools::registry::Tool;
     use crate::tools::types::{ToolContext, ToolInputSchema};
+    use crate::tools::PermissionRule;
     use async_trait::async_trait;
     use serde_json::{json, Value};
     use std::path::Path;
@@ -1718,6 +1776,326 @@ mod tests {
                 sig.context_key
             );
         }
+        let _keep = workspace;
+    }
+
+    // ── Post-edit diagnostics (#757) production boundary ────────────────────
+    //
+    // These drive the real executor and the real write/edit/patch tools with
+    // tiny shell-script check fixtures (never cargo), asserting what reaches
+    // the model on the tool result in the same turn.
+
+    /// A tiny executable shell script (the declared check command fixture).
+    fn write_check_script(dir: &Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))
+            .unwrap_or_else(|e| panic!("write fixture {name}: {e}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|e| panic!("chmod fixture {name}: {e}"));
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    fn diagnostics_config(
+        command: &str,
+        timeout_secs: u64,
+        max_output_chars: usize,
+    ) -> crate::config::DiagnosticsConfig {
+        crate::config::DiagnosticsConfig {
+            check: vec![crate::config::CheckCommandSource {
+                extensions: vec!["txt".to_string()],
+                command: command.to_string(),
+            }],
+            timeout_secs,
+            max_output_chars,
+        }
+    }
+
+    fn executor_with_edit_tool(
+        permissions: PermissionManager,
+        diagnostics: &crate::config::DiagnosticsConfig,
+    ) -> ToolExecutor {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(crate::tools::EditTool));
+        let tempdir = tempfile::tempdir().expect("isolated pattern store");
+        ToolExecutor::new(registry, permissions, tempdir.path().join("patterns.json"))
+            .expect("construct executor")
+            .with_diagnostics(diagnostics)
+    }
+
+    async fn run_edit(executor: &ToolExecutor, path: &Path, old: &str, new: &str) -> ToolResult {
+        let tool_use = ToolUse::new(
+            "edit".to_string(),
+            json!({
+                "file_path": path.to_string_lossy(),
+                "old_string": old,
+                "new_string": new,
+            }),
+        );
+        executor
+            .execute_tool(
+                &tool_use,
+                None,
+                None::<fn() -> Result<()>>,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None, // live_output
+                None, // effect_audit
+            )
+            .await
+            .expect("edit execution must not error at the executor boundary")
+    }
+
+    #[tokio::test]
+    async fn test_edit_result_carries_bounded_diagnostics_from_declared_check_command() {
+        let (workspace, root) = isolated_workspace();
+        let script = write_check_script(
+            &root,
+            "check.sh",
+            "echo 'error[E0308]: mismatched types --> lib.txt:3:5'\nexit 1\n",
+        );
+        let declared = diagnostics_config(&script, 5, 2000);
+        let executor = executor_with_edit_tool(
+            PermissionManager::new()
+                .with_default_rule(PermissionRule::Allow)
+                .with_workspace_root(root.clone()),
+            &declared,
+        );
+
+        let path = root.join("lib.txt");
+        std::fs::write(&path, "before\n").expect("seed edit target");
+        let result = run_edit(&executor, &path, "before", "after").await;
+
+        assert!(
+            !result.is_error,
+            "the edit itself succeeded; diagnostics must never fail the edit; result: {result:?}"
+        );
+        assert!(
+            result.content.contains("+after"),
+            "the diff must still be present on the result; result: {result:?}"
+        );
+        assert!(
+            result
+                .content
+                .contains("[post-edit diagnostics — declared check command]"),
+            "the diagnostics annotation must be on the SAME tool result, same turn; \
+             result: {result:?}"
+        );
+        assert!(
+            result.content.contains("error[E0308]") && result.content.contains("exit 1"),
+            "the annotation must carry the bounded check output and status; result: {result:?}"
+        );
+        let _keep = workspace;
+    }
+
+    #[tokio::test]
+    async fn test_undeclared_source_leaves_edit_result_unchanged_and_executes_nothing() {
+        let (workspace, root) = isolated_workspace();
+        // The check fixture exists on disk but nothing declares it as a
+        // diagnostics source, so it must never run.
+        let _undeclared_script = write_check_script(&root, "check.sh", "touch marker; echo ran\n");
+        let marker = root.join("marker");
+        let inert = crate::config::DiagnosticsConfig::default();
+        let no_sources = executor_with_edit_tool(
+            PermissionManager::new()
+                .with_default_rule(PermissionRule::Allow)
+                .with_workspace_root(root.clone()),
+            &inert,
+        );
+
+        let path = root.join("lib.txt");
+        std::fs::write(&path, "before\n").expect("seed edit target");
+        let annotated = run_edit(&no_sources, &path, "before", "after").await;
+
+        // The same edit without any diagnostics service must be byte-identical.
+        let mut plain_registry = ToolRegistry::new();
+        plain_registry.register(Box::new(crate::tools::EditTool));
+        let tempdir = tempfile::tempdir().expect("isolated pattern store");
+        let plain = ToolExecutor::new(
+            plain_registry,
+            PermissionManager::new()
+                .with_default_rule(PermissionRule::Allow)
+                .with_workspace_root(root.clone()),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct plain executor");
+        std::fs::write(&path, "before\n").expect("reseed edit target");
+        let plain_result = run_edit(&plain, &path, "before", "after").await;
+
+        assert_eq!(
+            annotated.content, plain_result.content,
+            "an undeclared source must leave the edit result byte-identical to the \
+             pre-feature behavior; annotated: {:?}\nplain: {:?}",
+            annotated.content, plain_result.content
+        );
+        assert!(
+            !marker.exists(),
+            "an undeclared source must never execute the check command"
+        );
+        let _keep = workspace;
+    }
+
+    #[tokio::test]
+    async fn test_failed_edit_produces_no_diagnostics_annotation() {
+        let (workspace, root) = isolated_workspace();
+        let script = write_check_script(&root, "check.sh", "echo checked\n");
+        let declared = diagnostics_config(&script, 5, 2000);
+        let executor = executor_with_edit_tool(
+            PermissionManager::new()
+                .with_default_rule(PermissionRule::Allow)
+                .with_workspace_root(root.clone()),
+            &declared,
+        );
+
+        let path = root.join("lib.txt");
+        std::fs::write(&path, "before\n").expect("seed edit target");
+        let result = run_edit(&executor, &path, "missing-anchor", "after").await;
+
+        assert!(
+            result.is_error,
+            "an unapplicable edit must remain an error; result: {result:?}"
+        );
+        assert!(
+            !result.content.contains("post-edit diagnostics"),
+            "a failed edit must not run diagnostics; result: {result:?}"
+        );
+        let _keep = workspace;
+    }
+
+    #[tokio::test]
+    async fn test_write_result_also_carries_declared_diagnostics() {
+        let (workspace, root) = isolated_workspace();
+        let script = write_check_script(&root, "check.sh", "echo 'warning: unused' \nexit 0\n");
+        let declared = diagnostics_config(&script, 5, 2000);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(crate::tools::WriteTool));
+        let tempdir = tempfile::tempdir().expect("isolated pattern store");
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new()
+                .with_default_rule(PermissionRule::Allow)
+                .with_workspace_root(root.clone()),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct executor")
+        .with_diagnostics(&declared);
+
+        let path = root.join("notes.txt");
+        let tool_use = ToolUse::new(
+            "write".to_string(),
+            json!({"file_path": path.to_string_lossy(), "content": "written\n"}),
+        );
+        let result = executor
+            .execute_tool(
+                &tool_use,
+                None,
+                None::<fn() -> Result<()>>,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("write execution");
+
+        assert!(!result.is_error, "write must succeed; result: {result:?}");
+        assert!(
+            result.content.contains("post-edit diagnostics")
+                && result.content.contains("check passed (exit 0)")
+                && result.content.contains("warning: unused"),
+            "write results must carry the same bounded annotation; result: {result:?}"
+        );
+        let _keep = workspace;
+    }
+
+    #[tokio::test]
+    async fn test_patch_result_also_carries_declared_diagnostics() {
+        let (workspace, root) = isolated_workspace();
+        let script = write_check_script(&root, "check.sh", "echo 'error: bad token'\nexit 2\n");
+        let declared = diagnostics_config(&script, 5, 2000);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(crate::tools::PatchTool));
+        let tempdir = tempfile::tempdir().expect("isolated pattern store");
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new()
+                .with_default_rule(PermissionRule::Allow)
+                .with_workspace_root(root.clone()),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct executor")
+        .with_diagnostics(&declared);
+
+        let path = root.join("patched.txt");
+        std::fs::write(&path, "alpha\nbeta\n").expect("seed patch target");
+        let tool_use = ToolUse::new(
+            "patch".to_string(),
+            json!({
+                "file_path": path.to_string_lossy(),
+                "patch": "@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA\n",
+            }),
+        );
+        let result = executor
+            .execute_tool(
+                &tool_use,
+                None,
+                None::<fn() -> Result<()>>,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("patch execution");
+
+        assert!(
+            !result.is_error && result.content.contains("post-edit diagnostics"),
+            "patch results must carry the same bounded annotation; result: {result:?}"
+        );
+        let _keep = workspace;
+    }
+
+    #[tokio::test]
+    async fn test_peer_session_declared_check_command_is_ask_user_and_never_executes() {
+        let (workspace, root) = isolated_workspace();
+        let script = write_check_script(&root, "check.sh", "touch marker; echo ran\n");
+        let marker = root.join("marker");
+        let declared = diagnostics_config(&script, 5, 2000);
+        let executor = executor_with_edit_tool(
+            crate::tools::PermissionManager::for_peer().with_workspace_root(root.clone()),
+            &declared,
+        );
+
+        let path = root.join("lib.txt");
+        std::fs::write(&path, "before\n").expect("seed edit target");
+        let result = run_edit(&executor, &path, "before", "after").await;
+
+        assert!(
+            !result.is_error,
+            "the edit itself proceeds through its own authority path; result: {result:?}"
+        );
+        assert!(
+            result.content.contains("skipped:"),
+            "the peer result must declare the diagnostics skip, not silently omit \
+             them; result: {result:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a peer must never execute the declared check command without the \
+             approval bash would require"
+        );
         let _keep = workspace;
     }
 }
