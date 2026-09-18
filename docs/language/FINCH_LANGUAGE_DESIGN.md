@@ -1958,6 +1958,40 @@ version transition requires an explicit source migration rather than silently re
 `/1` programs. Target handlers follow the contract below and never catch authorization, replay,
 cancellation, or verifier diagnostics indiscriminately.
 
+**Added 2026-09-17: `?` propagates a `result<T,E>` without hand-written re-wrapping at every call
+site, as an ordinary hygienic macro over existing primitives — deliberately not a new compiler
+mechanism, to avoid fragmenting the error model into two unrelated systems.** `?value` (Co-Forth,
+postfix, retargeting the word `/1` used for the legacy `try` mechanism above — a clean reuse, not a
+collision, since `/1`'s meaning was already documented as implementation history) and `(? value)`
+(CoLisp) both expand, hygienically, to exactly what you would write by hand:
+
+```text
+(match value
+  (ok v v)
+  (err e (return (err (into e)))))
+```
+
+— evaluate `value`; on `ok v`, the whole `?` form evaluates to `v`; on `err e`, immediately return
+`err` from the *enclosing* function, converting `e` through the already-established explicit
+`Into<E2>` (above) to the enclosing function's declared error type. That conversion call is visible
+in the expansion — an auditable macro output, not implicit compiler-inserted coercion, so it does
+not reopen the implicit-conversion question already settled. `?` requires an enclosing function
+whose return type is `result<_, E2>` with `Into<E2>` available from the propagated error type; using
+it anywhere else is a compile error, the same as Rust's `?` outside a `Result`/`Option`-returning
+function. This is why it costs nothing structurally: it is sugar for a `match` and an `return` that
+already exist as primitives, expanded before the verifier ever sees it, so there is no second
+error-propagation runtime path to keep synchronized with exceptions — a library that prefers `throw`
+still propagates automatically for free, and a library returning `result<T,E>` now costs one
+character per call instead of a hand-written `match` arm at every level.
+
+For the narrower case that isn't about propagating at all — composing `result<T,E>`/`option<T>`
+values as data without an early return, inside a lambda, or across a collection — `map` and
+`and-then` (already named as ordinary concept-exposed operations above) remain the right tool:
+`and-then(self, f: T -> result<U,E>) -> result<U,E>` chains a further fallible step; `map(self, f: T
+-> U) -> result<U,E>` transforms the success value only. `?` and `and-then` are not competing
+mechanisms — `?` is what `and-then`-plus-early-return looks like when you don't want to write the
+continuation closure by hand.
+
 ### Typed failures and scope guards
 
 Finch separates a failure value from the mechanism used to transport it. `option<T>` represents
@@ -2187,6 +2221,32 @@ Co-Forth: O ct:type-case
             otherwise ... ct:endcase
 ```
 
+**Added 2026-09-17: `match-type`'s patterns are the same structural-`infer` grammar already used
+for concept bounds, not a second, narrower type-matching language invented for this one case.** Left
+unstated, `match-type` as shown only tests exact nominal types (`Unique<Foo>`, `Shared<Foo>`) — which
+would eventually need its own growing vocabulary of special forms to match structural shapes too
+("is this instantiation of `Map<K,V>`, and if so what are `K` and `V`"), the same way D's `is()`
+expression accumulated many distinct forms (`is(T)`, `is(T : U)`, `is(T U)`, `is(T == U)`...) for
+exactly this reason and is one of D's more criticized surfaces for it. This document already has a
+structural type-matching grammar with extraction, used for concept bounds: "`T : Map<K,V>, infer K,
+infer V` derives `K` and `V` from the selected `Map` implementation" ("Generic parameters marked
+`infer` are outputs of evidence resolution," above). `match-type`'s arms use that same grammar rather
+than a separate one — an arm may test a structural bound with `infer` output variables exactly as a
+constraint does, not only an exact nominal type:
+
+```text
+CoLisp:   (match-type O
+            (Map<K,V> infer K infer V ...)
+            (Unique<Foo> ...)
+            (_ ...))
+```
+
+This is a deliberate consolidation, not an extension: one pattern-matching grammar for "does this
+type have this shape, and what are its parts" everywhere it's needed — concept bounds, generic
+resolution, and `match-type` — rather than `match-type` growing its own vocabulary in parallel the
+way `is()` did. `match-type` is the multi-arm, branching use of that grammar; a bare `T : Concept,
+infer X` bound is the single-test use of the same grammar. Neither is a special case of the other.
+
 **Corrected 2026-09-17: `match-type` forces monomorphization, it does not merely permit it.** A
 shared/erased body — the sharing option just narrowed above — is compiled once against a fixed
 vtable shape, here `Owner<T>`'s one operation, `borrow`. It cannot call `get-mut`, because that
@@ -2205,6 +2265,25 @@ name need a resolution rule between them, exactly the speculative-body-compilati
 comparison evidence, and segmented text" already rules out for a different mechanism. `match-type`
 keeps that same deterministic-resolution property — one source body, no resolution search — even
 though it now costs monomorphization rather than being free the way plain `borrow`-only sharing is.
+
+**Added 2026-09-17: `match-type`'s arms are ordinary control-flow branches for ownership purposes,
+with type-narrowing layered on top rather than replacing that tracking — worked through explicitly
+after being asked to check, not merely asserted.** `match-type`'s own text above specifies only its
+*type*-resolution mechanics (which arm is selected, at CTFE or runtime); it did not separately state
+what happens to the *ownership state* of the value being matched, which is a real, distinct question
+— can one arm consume `x` while another only borrows from it, and what does the join point after the
+`match-type` know about `x` afterward? The answer requires no new mechanism: each arm of a
+`match-type` is, to the ownership verifier, an ordinary control-flow edge, exactly like an `if`
+branch or an ordinary value `match` arm. The already-established rule already covers exactly this
+case — "control-flow joins track `available`, `borrowed`, `exclusively borrowed`, and `moved`
+states; a value moved on only some incoming paths is not usable after the join unless every path
+reinitializes it" (above). So a `Unique<Foo>` arm that moves `x` and a `Shared<Foo>` arm that only
+calls `get-mut` (borrowing, not consuming) are both legal, independently, exactly as they would be
+in an ordinary `if`; `x` is simply unusable after the `match-type` unless every arm left it in a
+consistent state, per that same rule. Type-narrowing is additional, purely static information layered
+on top of the binding for the arm's duration — it does not change which ownership states are legal
+or how they merge, so nothing about the ownership model needed to change to add `match-type`; it
+inherits the existing verifier machinery rather than requiring its own.
 
 **Added 2026-09-17: `O` is an ordinary generic type parameter, not a second specialization system
 running alongside the real one.** `steal x: Foo` desugars to the same shape as an explicit `<O :
