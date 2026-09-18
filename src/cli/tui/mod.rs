@@ -49,6 +49,7 @@ mod graph;
 mod input_widget; // kept, used by wizard helpers
 #[cfg(test)]
 mod isolation;
+mod markdown;
 mod mouse_capture;
 mod scroll_view;
 mod scrollback; // kept for future use
@@ -5900,6 +5901,104 @@ mod tests {
                     .count()
             );
         }
+    }
+
+    /// Production-boundary regression for #756: the canonical commit of a
+    /// completed assistant WorkUnit containing markdown writes the RAW source
+    /// text — fences, emphasis markers, list markers, whitespace-exact code —
+    /// never the markdown rendering. The viewport keeps the rendered body;
+    /// native scrollback is the copyable record and must stay source-faithful.
+    #[test]
+    fn test_canonical_commit_writes_assistant_markdown_raw_source_byte_exact() {
+        use crate::cli::messages::{MessageRef, WorkUnit};
+
+        let source = "Plan:\n```rust\nfn main() {\n    let deep =    1;\n}\n```\n**Note** run:\n- first\n- second\n";
+        let unit = WorkUnit::new("Channeling");
+        unit.set_response(source);
+        unit.set_complete();
+        let message: MessageRef = Arc::new(unit);
+        let colors = ColorScheme::default();
+
+        // Precondition: the live viewport DOES render the markdown (this is
+        // what #756 adds), so the canonical path below is the same node family
+        // the viewport consumes.
+        let viewport = view_model::project_message(&message, &colors);
+        let viewport_node = match &viewport {
+            view_model::ProjectedMessage::Node(node) => node.clone(),
+            view_model::ProjectedMessage::Plain(_) => {
+                panic!("precondition: an assistant WorkUnit projects as a transcript node")
+            }
+        };
+        let viewport_rendered = AccordionState::default().render_node(&viewport_node);
+        assert!(
+            viewport_rendered
+                .iter()
+                .any(|line| line.text.contains("\x1b[2m")),
+            "precondition: the viewport renders fenced code blocks with styled fences; \
+             got {viewport_rendered:?}"
+        );
+        assert!(
+            viewport_rendered
+                .iter()
+                .any(|line| line.text.contains("• first")),
+            "precondition: the viewport renders list markers as bullets; got \
+             {viewport_rendered:?}"
+        );
+
+        let mut printed = HashSet::new();
+        let mut sink = Vec::new();
+        commit_complete_messages(
+            &mut sink,
+            std::slice::from_ref(&message),
+            &mut AccordionState::default(),
+            &colors,
+            &mut printed,
+            24,
+            80,
+        )
+        .expect("canonical commit succeeds");
+        let canonical = String::from_utf8_lossy(&sink);
+        let canonical_lines: Vec<&str> = canonical.split("\r\n").collect();
+
+        // Every raw source line is present byte-exact (plus the row model's
+        // fixed two-space body indent), exactly once.
+        for expected in [
+            "Plan:",
+            "```rust",
+            "fn main() {",
+            "    let deep =    1;",
+            "}",
+            "```",
+            "**Note** run:",
+            "- first",
+            "- second",
+        ] {
+            let expected_row = format!("  {expected}");
+            assert_eq!(
+                canonical_lines
+                    .iter()
+                    .filter(|line| **line == expected_row)
+                    .count(),
+                1,
+                "INVARIANT (#756): the canonical scrollback record must contain the raw \
+                 source line byte-exact exactly once, never a rendered form; expected row \
+                 {expected_row:?} in canonical lines {canonical_lines:?}"
+            );
+        }
+        // No markdown SGR rides into the permanent record: the rendering is a
+        // viewport concern only.
+        for code in ["\x1b[1m", "\x1b[3m", "\x1b[2m", "\x1b[36m"] {
+            assert!(
+                !canonical.contains(code),
+                "INVARIANT (#756): the canonical record carries no markdown SGR ({code:?}); \
+                 canonical bytes were:\n{canonical}"
+            );
+        }
+        assert_eq!(
+            canonical.matches("- first").count(),
+            1,
+            "the raw list marker (not a bullet) is what scrollback keeps"
+        );
     }
 
     /// Terminal-boundary check (#648 oracle): the expanded surface painted

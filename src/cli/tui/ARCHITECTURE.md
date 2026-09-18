@@ -96,6 +96,18 @@ settled record (question, options with the picked marker, `Answer:` line) throug
 standard canonical-commit pipeline; approval event semantics are unchanged.
 `TabbedDialog` remains the alternate-screen wizard as a follow-up.
 
+**Assistant prose markdown (#756)** (`markdown.rs`, `view_model.rs`): the one domain→widget
+projection parses assistant prose once into a bounded block model — fenced code blocks,
+emphasis, inline code, lists — and renders it to styled viewport body lines on
+`TranscriptNode::body`, keeping the raw source lines on `TranscriptNode::raw_body`. The
+viewport paints the rendered body; the canonical commit's fully-expanded projection paints the
+raw body, so native scrollback stays the raw, copyable record with no markdown SGR. Fences stay
+visible text (dimmed) and code bodies stay whitespace-exact in both targets, so raw/no-color
+reading gets the same text semantics from characters, not color. No new dependency: the parser
+covers exactly the prioritized constructs and degrades everything else (and malformed input) to
+literal text. Program source/output, tool rows, and user input are structurally outside this
+path; the dialog-option `markdown` preview keeps its own rendering.
+
 **Bounded tool-result controls** (`src/cli/tui/tool_viewport.rs`):
 - Every `ToolOutput` transcript row is a reusable semantic control with a bounded
   child viewport (`DEFAULT_TOOL_OUTPUT_ROWS`, currently 4): each body line is
@@ -125,6 +137,7 @@ Virtual row helpers:
 
 - `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
 - `src/cli/tui/view_model.rs` — the blit-time `LiveViewModel`, the domain → widget projection, and the root claiming tree
+- `src/cli/tui/markdown.rs` — bounded assistant-prose markdown parse/render for the viewport (#756); raw source stays the canonical record
 - `src/cli/tui/widgets.rs` — claiming layout: rects, tracks, hitboxes, resize
 - `src/cli/tui/scroll_view.rs` — the conversation ScrollView: scroll offset, wheel claim, window split
 - `src/cli/tui/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`
