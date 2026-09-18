@@ -16,6 +16,14 @@
 use crate::cli::messages::MessageRef;
 use ratatui::style::{Color, Style};
 
+// Line measurement moved to the widget vocabulary
+// (`cli::components::vocab`) so components can measure text without this
+// buffer; engine call sites keep their stable paths here.
+use crate::cli::components::vocab::char_display_width;
+pub use crate::cli::components::vocab::{
+    extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
+};
+
 /// A single cell in the shadow buffer (character + style)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cell {
@@ -309,146 +317,6 @@ impl ShadowBuffer {
     }
 }
 
-/// Return the terminal display width (in columns) of a single character.
-///
-/// CJK / fullwidth characters occupy 2 columns; everything else occupies 1.
-/// This covers the Unicode ranges that crossterm / terminal emulators treat as
-/// double-width without pulling in an extra crate.
-#[inline]
-fn char_display_width(c: char) -> usize {
-    match c as u32 {
-        // Hangul Jamo
-        0x1100..=0x115F |
-        // CJK Radicals Supplement … CJK Symbols and Punctuation
-        0x2E80..=0x303E |
-        // Hiragana … CJK Compatibility
-        0x3040..=0x33FF |
-        // CJK Unified Ideographs Extension A
-        0x3400..=0x4DBF |
-        // CJK Unified Ideographs (covers all common Chinese, Japanese, Korean)
-        0x4E00..=0xA4CF |
-        // Hangul Jamo Extended-A
-        0xA960..=0xA97F |
-        // Hangul Syllables … Hangul Jamo Extended-B
-        0xAC00..=0xD7FF |
-        // CJK Compatibility Ideographs
-        0xF900..=0xFAFF |
-        // Vertical forms
-        0xFE10..=0xFE19 |
-        // CJK Compatibility Forms … Small Form Variants
-        0xFE30..=0xFE6F |
-        // Fullwidth Latin and Halfwidth Katakana
-        0xFF01..=0xFF60 |
-        // Fullwidth Signs
-        0xFFE0..=0xFFE6 |
-        // CJK Unified Ideographs Extension B–F (supplementary planes)
-        0x20000..=0x2FFFD |
-        0x30000..=0x3FFFD => 2,
-        _ => 1,
-    }
-}
-
-/// Calculate visible display-column width of string (excluding ANSI escape codes).
-///
-/// CJK / fullwidth characters (Chinese, Japanese, Korean) occupy 2 terminal columns
-/// each.  All other printable characters occupy 1 column.
-pub fn visible_length(s: &str) -> usize {
-    let mut len = 0;
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => {
-                // Handle escape sequences
-                if chars.peek() == Some(&'[') {
-                    // CSI sequence: \x1b[...m (color codes, cursor movement)
-                    chars.next(); // consume '['
-                    for ch in chars.by_ref() {
-                        if ch.is_ascii_alphabetic() {
-                            break; // Sequence terminator
-                        }
-                    }
-                } else if chars.peek() == Some(&']') {
-                    // OSC sequence: \x1b]...\x07 or \x1b]...\x1b\\
-                    chars.next(); // consume ']'
-                    while let Some(ch) = chars.next() {
-                        if ch == '\x07' || (ch == '\x1b' && chars.peek() == Some(&'\\')) {
-                            if ch == '\x1b' {
-                                chars.next(); // consume '\\'
-                            }
-                            break;
-                        }
-                    }
-                } else {
-                    // Other escape sequences, skip 1 char
-                    chars.next();
-                }
-            }
-            '\r' | '\x08' | '\x7f' => {
-                // Control characters that don't add visible length
-            }
-            _ => {
-                len += char_display_width(c);
-            }
-        }
-    }
-
-    len
-}
-
-/// Truncate `s` to at most `columns` display columns.
-///
-/// Truncating with `chars().take(n)` is wrong wherever the result is then
-/// assumed to occupy one terminal row: a CJK or fullwidth character is one
-/// `char` and two columns, so `n` characters can be `2n` columns and wrap.
-/// A wide character straddling the boundary is dropped rather than split.
-/// ANSI escape sequences are copied through and cost no columns.
-pub fn truncate_to_columns(s: &str, columns: usize) -> String {
-    if columns == 0 {
-        return String::new();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut used = 0usize;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            out.push(c);
-            // Copy the sequence verbatim; it occupies no columns.
-            if chars.peek() == Some(&'[') {
-                out.push(chars.next().unwrap_or('['));
-                for ch in chars.by_ref() {
-                    out.push(ch);
-                    if ch.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else if let Some(next) = chars.next() {
-                out.push(next);
-            }
-            continue;
-        }
-        if matches!(c, '\r' | '\x08' | '\x7f') {
-            continue;
-        }
-        let width = char_display_width(c);
-        if used + width > columns {
-            break;
-        }
-        used += width;
-        out.push(c);
-    }
-    out
-}
-
-/// Number of physical terminal rows occupied by one logical line.
-///
-/// Live-area erasure depends on this value being identical for every producer.
-/// Counting logical lines as one leaves old spinner/tool rows behind whenever a
-/// WorkUnit wraps.
-pub fn physical_rows(s: &str, terminal_width: usize) -> usize {
-    visible_length(s).max(1).div_ceil(terminal_width.max(1))
-}
-
 /// Overlay SGR from a themed diff line onto the transcript band style.
 ///
 /// Diff paint emits 38;2 / 48;2 so add/remove/context fill the row. The
@@ -506,53 +374,6 @@ fn overlay_sgr_style(line: &str, band: Style) -> Style {
         index += 2 + end + 1;
     }
     style
-}
-
-/// Extract visible characters from string (strip ANSI codes)
-/// Returns (visible_chars, positions_of_ansi_codes)
-pub fn extract_visible_chars(s: &str) -> (Vec<char>, Vec<usize>) {
-    let mut visible_chars = Vec::new();
-    let mut ansi_positions = Vec::new();
-    let mut chars = s.chars().peekable();
-    let mut pos = 0;
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => {
-                ansi_positions.push(pos);
-                // Skip ANSI escape sequence
-                if chars.peek() == Some(&'[') {
-                    chars.next();
-                    for ch in chars.by_ref() {
-                        if ch.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                } else if chars.peek() == Some(&']') {
-                    chars.next();
-                    while let Some(ch) = chars.next() {
-                        if ch == '\x07' || (ch == '\x1b' && chars.peek() == Some(&'\\')) {
-                            if ch == '\x1b' {
-                                chars.next();
-                            }
-                            break;
-                        }
-                    }
-                } else {
-                    chars.next();
-                }
-            }
-            '\r' | '\x08' | '\x7f' => {
-                // Skip control characters
-            }
-            _ => {
-                visible_chars.push(c);
-                pos += 1;
-            }
-        }
-    }
-
-    (visible_chars, ansi_positions)
 }
 
 /// Diff two shadow buffers and return changed cells

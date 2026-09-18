@@ -223,6 +223,50 @@ impl Session {
         file.flush().expect("flush the pty");
     }
 
+    /// Wait until the terminal shows one line carrying both glyphs — the say
+    /// card's chrome (completed glyph + disclosure arrow) — and panic with the
+    /// terminal when the deadline passes.
+    fn wait_for_component_line(
+        &mut self,
+        first: char,
+        second: char,
+        deadline: Duration,
+        what: &str,
+    ) {
+        assert!(
+            self.wait_for_component_line_quiet(first, second, deadline),
+            "the run hung: {what} did not happen within {deadline:?} \
+             (a line with {first:?} and {second:?} never reached the terminal). \
+             This deadline is a hang detector, not a latency assertion. \
+             Terminal was:\n{}",
+            self.readable_transcript()
+        );
+    }
+
+    /// Bounded poll for one terminal line carrying both glyphs. False when the
+    /// deadline passes first — a liveness probe, not a latency assertion.
+    fn wait_for_component_line_quiet(
+        &mut self,
+        first: char,
+        second: char,
+        deadline: Duration,
+    ) -> bool {
+        let expiry = Instant::now() + deadline;
+        loop {
+            if self
+                .readable_transcript()
+                .lines()
+                .any(|line| line.contains(first) && line.contains(second))
+            {
+                return true;
+            }
+            if Instant::now() >= expiry {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn wait_for_exit(&mut self) -> std::process::ExitStatus {
         let expiry = Instant::now() + EXIT_DEADLINE;
         loop {
@@ -935,5 +979,96 @@ fn durable_attach_prints_one_command_and_reattaches_the_same_brain() {
     assert!(
         uuid_only_lines(&second_text).is_empty(),
         "reattach must not print a UUID-only resume line.\nterminal:\n{second_text}"
+    );
+}
+
+/// A completed say turn is the stage-1 component-owned card (docs/TUI_DESIGN.md,
+/// #882): prose visible with the ProgramSource subwidget hidden, the disclosure
+/// affordance present because the program CAN be shown, no `[expanded]` chrome,
+/// and no running residue after completion. Driving the real keyboard
+/// disclosure path (F6 focus, Enter toggle) reveals the program text through
+/// the component's ViewModel — not a renderer map.
+///
+/// The canonical record itself is pinned at the layout boundary in
+/// `plan_canonical_commit_defers_completed_source_until_paired_output_has_body`
+/// (src/cli/tui/mod.rs): the raw program and the say bytes spool exactly once
+/// through `commit_complete_messages`. The interactive typed-program PTY
+/// session is asserted only on the live card because the typed-turn commit
+/// does not spool in the live app — reproduced identically on the base
+/// revision (b032c08b) with the same probe, so it is a pre-existing pipeline
+/// gap outside this change, not a stage-1 regression.
+#[test]
+fn completed_say_renders_the_component_card_and_reveals_the_program_on_toggle() {
+    const SAY_TEXT: &str = "attach-say-882";
+
+    let fixture = Fixture::new();
+    let mut session = Session::spawn(&fixture, &["attach", BRAIN]);
+    session.wait_for("finch v", READY_DEADLINE, "the startup header was drawn");
+    session.send_line("(say \"attach-say-882\")");
+    // The Lisp typed-program path writes no user echo row, so the first
+    // occurrence of the say bytes on screen is the card's prose.
+    session.wait_for(
+        SAY_TEXT,
+        ECHO_DEADLINE,
+        "the completed say rendered its prose",
+    );
+    // The card's completed chrome: filled glyph + elapsed + the closed
+    // disclosure arrow on one line. The arrow exists only while the program
+    // source can be shown — its presence proves the affordance is not dead
+    // over nothing.
+    session.wait_for_component_line(
+        '\u{23fa}',
+        '\u{25b6}',
+        ECHO_DEADLINE,
+        "the completed say card shows the disclosure affordance (completed glyph + closed arrow)",
+    );
+
+    let text = session.readable_transcript();
+    assert!(
+        !text.contains("[expanded]") && !text.contains("[collapsed]"),
+        "INVARIANT: disclosure never paints an [expanded]/[collapsed] token (#417).\n\
+         terminal:\n{text}"
+    );
+    assert!(
+        !text.contains("running"),
+        "INVARIANT: a completed say turn leaves no `running` residue (#820 class).\n\
+         terminal:\n{text}"
+    );
+    assert!(
+        text.contains("Program source"),
+        "INVARIANT: the turn's program-source row stays visible as the record carrier; \
+         the stage-1 ruling made the program show_program-gated card content, not a \
+         deleted row.\nterminal:\n{text}"
+    );
+
+    // Drive the toggle through the real input path: one write is F6 (focus the
+    // next semantic row) followed by Enter (toggle it). Within two iterations
+    // the card itself is focused and toggled, observable as the opened arrow
+    // (▼) joining the completed glyph (⏺) on the chrome line.
+    let mut opened = false;
+    for _ in 0..4 {
+        session.send_line("\x1b[15~"); // F6, then Enter
+        if session.wait_for_component_line_quiet('\u{23fa}', '\u{25bc}', Duration::from_secs(5)) {
+            opened = true;
+            break;
+        }
+    }
+    let text = session.readable_transcript();
+    assert!(
+        opened,
+        "INVARIANT: driving the keyboard disclosure path must toggle the say card's \
+         show_program through the component ViewModel and open the card.\nterminal:\n{text}"
+    );
+    assert!(
+        text.matches(SAY_TEXT).count() >= 2,
+        "INVARIANT: after the toggle the program text renders in the card in addition to \
+         the say prose.\nterminal:\n{text}"
+    );
+
+    session.send_line("/exit");
+    let status = session.wait_for_exit();
+    assert!(
+        status.success(),
+        "a clean /exit must succeed after the say turn, status={status:?}, terminal:\n{text}"
     );
 }

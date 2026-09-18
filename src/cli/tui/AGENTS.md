@@ -40,6 +40,31 @@ Every blit converts domain state into one owned ViewModel snapshot, then lays it
 4. Painting stays line-based on the claimed rects; native `canonical_commit` remains the
    separate once-per-id pipeline.
 
+## The widget vocabulary lives in `cli::components::vocab` (#882)
+
+`Rect`, `Track`, `Axis`, `Widget`, `Layout`, `RenderedTranscriptLine`, `RowId`, `NodeRole`,
+and the pure line-metric functions moved to `crate::cli::components::vocab` (stage-1
+prerequisite of `docs/TUI_DESIGN.md`) so a component can build and claim a subtree without
+touching `crossterm` or the shadow buffer. The engine keeps its stable `widgets` /
+`shadow_buffer` paths as re-exports; new surface authors depend on the vocabulary directly.
+
+## Component-owned say turns (#882, stage 1)
+
+A successful untitled `say` turn renders through its **component**, not the ViewModel
+projection: `TuiRenderer::projected_message_lines` asks the `Message` trait for
+`say_turn_view()` and hands the snapshot to `cli::components::card_lines`, which builds the
+chrome (status glyph + elapsed + disclosure arrow) and the `ProgramSource`/`Output` subwidgets
+from the outer ViewModel each frame. The arrow renders **only while the program source can be
+shown** — the dead-▼ defect is impossible by construction. A click resolves the chrome hitbox
+to `(RowId, action)`; the engine routes the opaque action to the message's
+`handle_transcript_action`, which toggles `show_program` under the message's lock, and the
+next frame re-renders from the mutated ViewModel. The renderer's RowId-keyed open-set maps
+never hold component rows: they register in `AccordionState::component_regions` for routing
+only. Unmigrated rows keep the maps and the projection path. The card is the reader; the
+canonical record is untouched (`render_node_fully_expanded` still writes the settled turn),
+and the old say-turn suppression (deleting the program-source row once the output had body)
+is deleted — the program source is show_program-gated card content, never a deleted row.
+
 ## Assistant prose markdown renders in the viewport (#756)
 
 `markdown.rs` (private) is a deliberately bounded inline-subset parser — fenced code blocks,

@@ -12,24 +12,9 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use super::view_model::{NodeRole, RowId, TranscriptNode};
+use super::view_model::{RowId, TranscriptNode};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RenderedTranscriptLine {
-    pub text: String,
-    pub row_id: Option<RowId>,
-    /// Expand/collapse for assistive consumers. Set on expandable header
-    /// lines; never encoded as a second visible `[expanded]`/`[collapsed]`
-    /// token in `text`.
-    pub row_expanded: Option<bool>,
-    /// Role of the row that produced this line, when the line belongs to an
-    /// interactive row. Set on the row's header line and on its body lines.
-    pub role: Option<NodeRole>,
-    /// The tool result whose bounded child viewport this body line belongs to.
-    /// Only `ToolOutput` body lines carry it; the hit-region rebuild uses it to
-    /// give the control ownership of its own cells.
-    pub body_of: Option<RowId>,
-}
+pub use crate::cli::components::vocab::RenderedTranscriptLine;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptHitRegion {
@@ -47,17 +32,26 @@ pub struct TranscriptHitRegion {
 pub struct ClaimedDisclosureRect {
     pub region: TranscriptHitRegion,
     pub row_expanded: bool,
+    /// Component-owned rows (#882): disclosure lives on the component's
+    /// ViewModel, so the rect registers for component routing instead of the
+    /// RowId-keyed open-set maps.
+    pub component_owned: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct AccordionState {
     /// The single owner of open/closed. Completing a run re-projects the row
-    /// with the same stable id, so a recorded choice survives it.
+    /// with the same stable id, so a recorded choice survives it. Migrated
+    /// say-turn rows (#882) never enter this map — their disclosure state
+    /// lives on the component ViewModel.
     expanded: HashMap<RowId, bool>,
     pub focused: Option<RowId>,
     pub hit_regions: Vec<TranscriptHitRegion>,
     visible_order: Vec<RowId>,
     visible_expanded: HashMap<RowId, bool>,
+    /// Hit rects of component-owned rows. Clicks and keyboard toggles on
+    /// these route to the component's handle, not to the maps above.
+    component_regions: Vec<TranscriptHitRegion>,
 }
 
 impl AccordionState {
@@ -147,6 +141,7 @@ impl AccordionState {
             row_expanded: expandable.then_some(expanded),
             role: Some(row.role),
             body_of: None,
+            component_owned: false,
         });
         if !expanded {
             return;
@@ -166,6 +161,7 @@ impl AccordionState {
                 row_expanded: None,
                 role: Some(row.role),
                 body_of: expandable.then(|| row.id.clone()),
+                component_owned: false,
             });
         }
         for child in &row.children {
@@ -182,6 +178,7 @@ impl AccordionState {
         width: usize,
     ) {
         self.hit_regions.clear();
+        self.component_regions.clear();
         self.visible_order.clear();
         // `visible_expanded` is not cleared: it is the last resolved state per
         // row, and a row that is merely off-screen this frame has not changed.
@@ -203,6 +200,16 @@ impl AccordionState {
             let top = rect.region.top as usize + row_offset;
             let rows = rect.region.bottom as usize - rect.region.top as usize + 1;
             self.visible_order.push(rect.region.row_id.clone());
+            if rect.component_owned {
+                // Migrated say-turn rows: no open-set entry, component routing
+                // instead (#882).
+                self.component_regions.push(TranscriptHitRegion {
+                    top: top as u16,
+                    bottom: top.saturating_add(rows).saturating_sub(1) as u16,
+                    ..rect.region.clone()
+                });
+                continue;
+            }
             self.visible_expanded
                 .insert(rect.region.row_id.clone(), rect.row_expanded);
             self.hit_regions.push(TranscriptHitRegion {
@@ -226,18 +233,48 @@ impl AccordionState {
             let rows = super::shadow_buffer::physical_rows(&line.text, width.max(1));
             if let Some(row_id) = &line.row_id {
                 self.visible_order.push(row_id.clone());
-                self.visible_expanded
-                    .insert(row_id.clone(), line.row_expanded.unwrap_or(false));
-                self.hit_regions.push(TranscriptHitRegion {
+                let region = TranscriptHitRegion {
                     row_id: row_id.clone(),
                     top: y as u16,
                     bottom: y.saturating_add(rows).saturating_sub(1) as u16,
                     left: 0,
                     right: width.saturating_sub(1) as u16,
-                });
+                };
+                if line.component_owned {
+                    // Component-owned rows: disclosure state lives on the
+                    // component ViewModel, never in the maps (#882).
+                    self.component_regions.push(region);
+                } else {
+                    self.visible_expanded
+                        .insert(row_id.clone(), line.row_expanded.unwrap_or(false));
+                    self.hit_regions.push(region);
+                }
             }
             y = y.saturating_add(rows);
         }
+    }
+
+    /// The component-owned row whose hit rect contains this pointer position,
+    /// if any. The caller routes the click to the component's handle; the
+    /// open-set maps are never consulted for these rows.
+    pub fn component_region_at(&self, column: u16, row: u16) -> Option<RowId> {
+        self.component_regions
+            .iter()
+            .find(|region| {
+                row >= region.top
+                    && row <= region.bottom
+                    && column >= region.left
+                    && column <= region.right
+            })
+            .map(|region| region.row_id.clone())
+    }
+
+    /// Whether this focused row is component-owned, so keyboard disclosure
+    /// routes to the component's handle.
+    pub fn is_component_row(&self, row: &RowId) -> bool {
+        self.component_regions
+            .iter()
+            .any(|region| &region.row_id == row)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {

@@ -4,6 +4,7 @@
 pub mod chatgpt_auth;
 pub mod command_autocomplete;
 mod commands;
+mod components; // component-owned presentation (docs/TUI_DESIGN.md); vocabulary + say turn
 mod conversation;
 pub mod conversation_compactor; // Infinite context: summarise dropped messages
 pub mod diff;

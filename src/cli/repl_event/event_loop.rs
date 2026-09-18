@@ -2879,6 +2879,10 @@ impl EventLoop {
         source_unit.set_complete();
         let output_unit = self.output_manager.start_work_unit("VM program output");
         output_unit.set_program_output();
+        // The say card owns the turn from here (#882): the producer retains
+        // the typed source in the component ViewModel so the reader can
+        // reveal it on demand.
+        output_unit.begin_say_turn(language.as_str(), &source);
         let projection =
             VmOutputProjection::new(Arc::clone(&self.output_manager), Arc::clone(&output_unit));
         let event_tx = self.event_tx.clone();
