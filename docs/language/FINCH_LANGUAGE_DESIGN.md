@@ -2370,13 +2370,17 @@ classes and reports which operation or field prevented certification.
 
 An ownership-taking API should not need to name `Shared<T>` merely because one caller uses shared
 storage. If the callee only needs to hold and eventually release one owner, it accepts an ownership
-carrier. If it must manufacture additional owners, its signature honestly requires
-`ShareableOwner<T>`. Carrier dispatch is explicit just like behavioral concept dispatch:
+carrier — bare `take x: Foo` (the "Borrowing and taking" shorthand, revised 2026-09-17: this
+paragraph predates that revision and previously said carrier dispatch was always explicit, which is
+no longer accurate). If it must manufacture additional owners, its signature honestly requires the
+stronger `ShareableOwner<T>` bound — *that* choice is still explicit, because it changes what the
+function can do (call `retain`), not merely which carrier represents an unchanged operation:
 
 ```text
-store(take x: static Owner<Foo>)       # carrier remains statically known/specializable
-store-runtime(take x: dyn Owner<Foo>)  # erased owner for factories/open runtime sets
-duplicate(take x: ShareableOwner<Foo>) # operation genuinely needs another owner
+store(take x: Foo)                     # shorthand; carrier statically inferred, may specialize
+store(take x: static Owner<Foo>)       # equivalent, spelled out
+store-runtime(take x: dyn Owner<Foo>)  # erased owner for factories/open runtime sets — still explicit
+duplicate(take x: ShareableOwner<Foo>) # operation genuinely needs another owner — still explicit
 ```
 
 The static form retains checked parametric HIR and may specialize for `Unique<Foo>`, `Shared<Foo>`,
