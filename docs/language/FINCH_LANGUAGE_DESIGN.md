@@ -2694,6 +2694,25 @@ access to the pointee when the strong count is 1, without consuming or convertin
 `Shared<T>` handle is unchanged and remains shared afterward. Use `try-into-unique` to give up
 sharing entirely; use `get-mut` to mutate in place once while staying shared.
 
+**Added 2026-09-17: `Shared<T>`'s strong-count ordering, specified rather than left to the general
+default.** "Standard atomics default to sequential consistency for ordinary source" ("Concurrency
+memory model") is the wrong default for this specific structure — refcounting is correctness-
+critical internal machinery, not ordinary source, and the proven scheme (matching `Arc`) is weaker
+and deliberately so: `retain` increments the strong count with `relaxed` ordering — sufficient
+because retaining requires an already-live handle, so there is nothing about the pointee's state
+that ordering needs to publish or observe at that point. Dropping decrements with `release`
+ordering, and only when that decrement brings the count to zero does an `acquire` fence run before
+the destructor — this is what guarantees every other thread's writes to the pointee, made before
+their own handle was released, are visible before this thread destroys it. Both operations remain
+fully atomic regardless of ordering — `relaxed` weakens cross-thread memory visibility, never the
+indivisibility of the increment or decrement itself; a torn or lost update is not a smaller version
+of this bug, it is the exact bug atomicity exists to rule out, unconditionally. `Weak<T>`'s count and
+its interaction with `upgrade` need their own careful pass — not specified here, and not to be
+inferred from the strong-count scheme by analogy, since the real proven implementations of this
+(`Arc`'s) have genuine additional subtlety there (a compare-exchange loop on upgrade, and a weak
+count that does not simply mirror the strong count) that deserves dedicated attention rather than a
+guess made alongside this.
+
 There is no safe unqualified owning heap pointer. Constructing `Shared<T>` from `&local` or any
 other stack borrow is a compile error; promotion consumes the stack value and invalidates its old
 binding. A raw pointer is a non-owning unsafe/FFI primitive and never acquires cleanup behavior by
