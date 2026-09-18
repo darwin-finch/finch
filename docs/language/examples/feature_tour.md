@@ -100,21 +100,37 @@ reaches — same hazard Rust accepts for inherent-vs-trait methods, inherited de
     (Shared<Foo> (retain x) "shared, retained a handle")      ; only shows a *pack* header; `<O>` alone
     (_ "some other owner")))                                  ; for an ordinary bound is still a guess.
 
-(let [u (Unique.new (Foo.default)) s (Shared.new (Foo.default))]
+(let [u (new unique Foo :field 0) s (new shared Foo :field 0)]
   (describe u)                        ; borrow, non-escaping — u still owns after this call
   (log-carrier (steal u))             ; ownership transferred; u is dead from here on
   (log-carrier (steal s))             ; Shared's steal just moves the handle, not the payload
-  (let [w (Shared.downgrade s)]
-    (match (Weak.upgrade w)
-      (ok s2 (assert-eq (log-carrier (steal s2)) "shared, retained a handle"))
-      (err _ (panic "unreachable: s is still alive")))))
+  (let [w (weaken s)]                 ; GAP below — this call is a guess
+    (match (upgrade w)                ; `upgrade` returns `option<Shared<T>>`, NOT `result` —
+      (some s2 (assert-eq (log-carrier (steal s2)) "shared, retained a handle"))  ; `some`/`none`
+      (none (panic "unreachable: s is still alive")))))                          ; arms, not `ok`/`err`
 ```
 
-Composes cleanly: `match-type` narrowing, `steal` desugaring to `<O : Owner<Foo>>`, and
-`Weak::upgrade`'s CAS-loop-backed `result` all line up with what's specified. The generic-header
-*placement* question from the first draft is resolved (confirmed against `render-all` in §9, below);
-what's still an unconfirmed guess is only the narrower question of an ordinary bound's spelling
-inside it (`<O>` versus `<O : Owner<Foo>>` versus something else) for a hand-written, non-pack case.
+**Corrected while checking this section against real syntax rather than assuming the earlier draft
+was right:** the first pass invented `Unique.new (...)`/`Shared.new (...)`/`Shared.downgrade` — none
+of which exist. The real, established construction syntax is `(new unique Foo ...)`/
+`(new shared Foo ...)` ("Stack, heap, and deterministic destruction," `:2914-2916`). Worse than an
+invented spelling: the first pass also matched `upgrade`'s result with `(ok s2 ...)`/`(err _ ...)` —
+but the document states plainly that "`Weak<T>` ... upgrade returns `option<Shared<T>>`," not a
+`result` — `option` destructures as `some`/`none`, not `ok`/`err`. Fixed both.
+
+**Remaining, real GAP, not fixed because there's nothing to fix it to:** `weaken`'s and `upgrade`'s
+*call* syntax is still a guess. `weaken` is confirmed as a real word — but only shown as a
+*closure-capture* mode ("entries may explicitly borrow, mutably borrow, steal, retain, weaken,
+clone..."), never as an ordinary function called on an arbitrary `Shared<T>` value outside a
+capture clause. Whether the same word does both jobs, or whether converting a `Shared<T>` to
+`Weak<T>` in ordinary code has a different name entirely, isn't stated. `(weaken s)`/`(upgrade w)`
+above are the most natural guesses, not confirmed spellings.
+
+`match-type` narrowing and `steal` desugaring to `<O : Owner<Foo>>` do line up with what's specified,
+now that the construction/upgrade mistakes are fixed. The generic-header *placement* question from
+the first draft is resolved (confirmed against `render-all` in §9, below); what's still an
+unconfirmed guess is only the narrower question of an ordinary bound's spelling inside it (`<O>`
+versus `<O : Owner<Foo>>` versus something else) for a hand-written, non-pack case.
 
 ## 3. Effects (`!`), `?` propagation, concepts together
 

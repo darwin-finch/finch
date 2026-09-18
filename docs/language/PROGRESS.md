@@ -570,3 +570,14 @@ than by re-reading prose:**
   actual, complete program and hitting a wall partway through — never by auditing prose in isolation.
   The two newest gaps (`ParameterSpec -> syntax`, `function-spec-of`) are both direct, foreseeable
   consequences of `FunctionSpec` added earlier tonight — expected follow-on work, not new surprises.
+
+**Continued 2026-09-18 — re-auditing §2 against real syntax (not memory of it) found two actual
+mistakes, not just gaps, from earlier in tonight's pass.** `(Unique.new (Foo.default))`/
+`(Shared.new (Foo.default))`/`(Shared.downgrade s)` were invented — the real, established
+construction syntax is `(new unique Foo ...)`/`(new shared Foo ...)` ("Stack, heap, and
+deterministic destruction"). Worse: `upgrade` was matched with `(ok s2 ...)`/`(err _ ...)` —
+`result`'s destructuring shape — but the document states plainly `upgrade` returns
+`option<Shared<T>>`, which destructures as `some`/`none`. Both fixed. One real gap surfaced in the
+process of fixing it, left open rather than guessed past: `weaken` is confirmed as a real word, but
+only ever shown as a *closure-capture* mode, never as an ordinary function on an arbitrary
+`Shared<T>` outside a capture clause — whether the same word does both jobs is unstated.
