@@ -293,7 +293,7 @@ Canonical paired spellings are:
   json.encode
 ;
 
-: read-user ( S borrow string -- S User ) throws DecodeError
+: read-user ( S borrow string -- S User ! throws DecodeError )
   from: codec.json import{ decode JsonError as DecodeError } ;
   decode
 ;
@@ -788,13 +788,13 @@ Binary concepts name both operand positions and may produce an associated result
 ```text
 concept Equal<L,R> symmetric {
     operation equal(borrow left: L, borrow right: R) -> bool
-        guarantees pure total deterministic non-suspending
+        ! pure | total | deterministic | non-suspending | nothrow
 }
 
 concept Compare<L,R> {
     associated Ordering
     operation compare(borrow left: L, borrow right: R) -> Ordering
-        guarantees pure total deterministic non-suspending
+        ! pure | total | deterministic | non-suspending | nothrow
 }
 
 concept Add<L,R> {
@@ -1021,7 +1021,7 @@ beneath it:
 ```text
 dup          forall A: Copy, S. (S consume-value A -- S A A) ! CopyEffects<A>
 drop         forall A: Drop, S. (S steal A -- S) ! DropEffects<A>
-+            forall S.   (S consume-value int consume-value int -- S int) guarantees pure
++            forall S.   (S consume-value int consume-value int -- S int ! pure)
 file.read    forall R S. (S borrow path<R> -- S path<R> bytes) ! fs.read<R>
 agent.await  forall T S. (S steal task<T> -- S result<T,agent-error>) ! agent.await
 yield        forall Y Resume S. (S steal Y -- S Resume) ! yields<Y,Resume>
@@ -1090,7 +1090,7 @@ may throw and remain pure but partial. Generic constraints can require any of th
 explicitly.
 
 **Added 2026-09-17: what a purity proof actually buys, consolidated from where it's used elsewhere
-in this document.** A `guarantees pure` request is not documentation sealed against later
+in this document.** A `! pure` request is not documentation sealed against later
 regression — that's real but the smallest of several payoffs, each of which requires the *proof*,
 not a trusted assertion, and is unavailable without it:
 - **Optimizer legality.** A pure call may be reordered, hoisted, memoized, or eliminated if unused;
@@ -1111,7 +1111,7 @@ not a trusted assertion, and is unavailable without it:
   scheduler already claims for itself ("single-threaded, shuffled, and parallel schedules must
   produce byte-equivalent interfaces").
 
-Each of these is why `guarantees pure` is a request the *verifier* answers, never a label the author's
+Each of these is why `! pure` is a request the *verifier* answers, never a label the author's
 word makes true — an unchecked claim would grant all four benefits to code that does not actually
 have them. A
 yielding callable remains a scheduling barrier even when it performs no mutation or host operation.
@@ -1700,14 +1700,14 @@ following constructs.
 Illustrative syntax:
 
 ```forth
-: square ( S consume-value int -- S int ) guarantees pure
+: square ( S consume-value int -- S int ! pure )
   dup *
 ;
 
 : save-report
   ( S borrow path<workspace:"generated/**"> value string
     -- S path<workspace:"generated/**"> unit
-    ! {fs.write(workspace:"generated/**")} ) suspends
+    ! {fs.write(workspace:"generated/**")} | suspends )
   file.write
 ;
 ```
@@ -1778,7 +1778,7 @@ variant: ParseResult cases{
   endmatch
 ;
 
-: load-user ( S borrow path -- S Config ) throws ConfigError suspends
+: load-user ( S borrow path -- S Config ! throws ConfigError | suspends )
   try
     file.read parse-config
   catch { error }
@@ -1809,7 +1809,7 @@ Provide explicit locals for generated code and readable handwritten definitions:
 Quotations are typed callable values:
 
 ```forth
-[ consume-value int -- int guarantees pure | 1 + ]
+[ consume-value int -- int ! pure | 1 + ]
 ```
 
 An escaping quotation is closure-converted into an immutable code reference plus an owner-carrying
@@ -1891,9 +1891,9 @@ origins are omitted here):
 ```text
 main:
   const.int 10
-  make-closure lambda$0 captures=1 : (S consume-value int -- S int) guarantees pure
+  make-closure lambda$0 captures=1 : (S consume-value int -- S int ! pure)
   const.int 5
-  call-closure (S consume-value int -- S int) guarantees pure
+  call-closure (S consume-value int -- S int ! pure)
   return
 
 lambda$0 captures: [int], locals: [int] # n is capture[0], x is local[0]
@@ -2894,7 +2894,7 @@ arguments, and C varargs"), rather than introducing a second notation:
 
 ```lisp
 (define (square (consume-value x : int)) : int
-  guarantees pure
+  ! pure
   (* x x))
 ```
 
