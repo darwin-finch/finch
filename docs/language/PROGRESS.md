@@ -131,6 +131,21 @@ Not exhaustive — flag anything found later here rather than assuming this list
    found while filling #3. Blocked on naming an in-place mutation primitive and its effect-row
    spelling; every record operation currently in the spec is immutable/functional-update. Needs a
    decision from Shammah, not a drafted guess — logging it rather than inventing one.
+5. **`Shared<T>`'s atomic ordering is unspecified, and the stated general default is very likely
+   wrong for it specifically — found 2026-09-17 in a buildability-focused audit.** "Standard atomics
+   default to sequential consistency for ordinary source" (`:3642`-ish, "Concurrency memory model")
+   covers user-written atomics; `Shared<T>`'s refcounting is a correctness-critical internal data
+   structure, not ordinary source, and the real-world precedent (Rust's `Arc`) deliberately does
+   *not* use sequential consistency — `Relaxed` increment, `Release` decrement, `Acquire` fence
+   before the destructor. Implementing this from the spec as written would reasonably default to
+   sequential consistency (safe, matches the stated default) and ship correct-but-slow, or worse,
+   get "optimized" later by someone who doesn't know why the ordering matters, introducing a race
+   that passes every functional test and shows up as rare, unreproducible corruption under load —
+   exactly the class of bug this audit was asked to find. **Needs an explicit decision from
+   Shammah**, not a guess: either state the ordering scheme now (a draft matching `Arc`'s proven
+   scheme is offered, not yet written), or explicitly mark `Shared<T>`'s initial implementation as
+   deliberately correct-but-unoptimized (sequential consistency) until the ordering proof is worked
+   through with real care.
 
 ## Plan: spec fixes first, then M1 by dependency order
 
