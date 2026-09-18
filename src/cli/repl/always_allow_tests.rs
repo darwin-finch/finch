@@ -5,8 +5,9 @@ use crate::runtime::ProgramRuntime;
 use crate::scheduler::{AgentScheduler, ProviderResolver};
 use crate::tools::{
     invocation_runs_autonomously, refined_effect_for_approval, AgentAwaitTool, AgentCancelTool,
-    AgentPollTool, AgentSpawnTool, AnsibleTool, AskUserQuestionTool, BashTool, CreateMemoryTool,
-    EditTool, EnterPlanModeTool, GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool,
+    AgentPollTool, AgentSpawnTool, AnsibleTool, AskUserQuestionTool, BackgroundBashTool,
+    BackgroundPollTool, BackgroundStopTool, BashTool, CreateMemoryTool, EditTool,
+    EnterPlanModeTool, GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool,
     HashCompareTool, InspectMemoryTool, InspectWordTool, ListRecentTool, PatchTool,
     PermissionCheck, PermissionManager, PermissionRule, PresentPlanTool, ReadTool, RestartTool,
     SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool, Tool,
@@ -75,12 +76,20 @@ fn owner_repl_catalog() -> OwnerReplCatalog {
     let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
 
     let mut registry = ToolRegistry::new();
+    let background_tasks = std::sync::Arc::new(crate::brain::BackgroundTaskManager::new());
     for tool in [
         Box::new(ReadTool) as Box<dyn Tool>,
         Box::new(GlobTool),
         Box::new(GrepTool),
         Box::new(WebFetchTool::new()),
         Box::new(BashTool),
+        Box::new(BackgroundBashTool::new(std::sync::Arc::clone(
+            &background_tasks,
+        ))),
+        Box::new(BackgroundPollTool::new(std::sync::Arc::clone(
+            &background_tasks,
+        ))),
+        Box::new(BackgroundStopTool::new(background_tasks)),
         Box::new(EditTool),
         Box::new(PatchTool),
         Box::new(WriteTool),
@@ -250,6 +259,11 @@ fn pinned_declared_effect(tool_name: &str) -> ExecutionEffect {
     match tool_name {
         "todo_read" => ExecutionEffect::VmRead,
         "todo_write" | "present_plan" | "ask_user_question" => ExecutionEffect::VmWrite,
+        // Issue #754: the background bash sibling carries bash's worst-case
+        // authority, stop kills the recorded task process (the same envelope),
+        // and polling only reads this session's captured output.
+        "background_bash" | "background_stop" => ExecutionEffect::ExternalWrite,
+        "background_poll" => ExecutionEffect::ExternalRead,
         _ => pre_refactor_effect(tool_name),
     }
 }

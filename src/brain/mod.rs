@@ -5,6 +5,7 @@
 //! "Brain session" or hidden context-injection path here.
 
 mod attachment;
+mod background;
 mod credential;
 pub(crate) mod effect_audit_archive;
 mod journal;
@@ -16,6 +17,10 @@ mod schedule;
 // `crate::brain::Item` and never name a child module.
 pub use attachment::{
     AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, ConnectionId,
+};
+pub use background::{
+    BackgroundTaskId, BackgroundTaskManager, BackgroundTaskSnapshot, BackgroundTaskState,
+    ExitOutcome, DEFAULT_MAX_RUNNING_TASKS, DEFAULT_MAX_TOTAL_TASKS, DEFAULT_RING_BYTES_PER_STREAM,
 };
 pub use credential::{
     default_participant_scopes, permitted_participant_scopes, BrainCredentialAuthority,

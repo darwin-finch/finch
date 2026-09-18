@@ -18,6 +18,9 @@ pub mod web_fetch;
 // Command execution
 pub mod bash;
 
+// Long-lived background commands (issue #754)
+pub mod background;
+
 // Propose-before-execute
 pub mod propose;
 
@@ -68,6 +71,7 @@ pub mod spawn;
 
 // Re-exports for convenience
 pub use ask_user_question::AskUserQuestionTool;
+pub use background::{BackgroundBashTool, BackgroundPollTool, BackgroundStopTool};
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use enter_plan_mode::EnterPlanModeTool;

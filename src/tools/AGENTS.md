@@ -6,7 +6,10 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 approval patterns, session task list, the event-loop-owned [`ToolLoop`](tool_loop.rs)
 protocol, the semantic advertisement catalog (`semantic.rs`, issue #241), and the
 local tool implementations. Connecting to external Model Context Protocol servers
-is the nested [`mcp`](mcp/AGENTS.md) capsule.
+is the nested [`mcp`](mcp/AGENTS.md) capsule. The background command tools
+(`background_bash`, `background_poll`, `background_stop`, issue #754) are thin
+siblings of bash over the brain-owned `BackgroundTaskManager` lifecycle; the
+task records and process ownership live in `src/brain`, not here.
 
 **ToolLoop is the single execution lifecycle.** REPL and scheduler drive it.
 Generators and provider adapters never import or invoke `ToolExecutor`.

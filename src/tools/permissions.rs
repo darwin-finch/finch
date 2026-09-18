@@ -622,7 +622,9 @@ impl PermissionManager {
     /// Apply constitutional constraints (safety checks)
     fn check_constitutional_constraints(&self, tool_name: &str, input: &Value) -> Option<String> {
         match tool_name {
-            "bash" => self.check_bash_safety(input),
+            // The background bash sibling runs the same shell authority as
+            // `bash`, so the same denied substrings apply to it.
+            "bash" | "background_bash" => self.check_bash_safety(input),
             "web_fetch" => self.check_web_fetch_safety(input),
             _ => None,
         }
@@ -1157,6 +1159,37 @@ mod tests {
                 matches!(mgr.check_tool_use("bash", &input), PermissionCheck::Allow),
                 "Peer should silently allow readonly bash: {}",
                 cmd
+            );
+        }
+    }
+
+    #[test]
+    fn test_peer_background_bash_surfaces_as_ask() {
+        let mgr = PermissionManager::for_peer();
+        // Even a read-only foreground command spawns a long-lived process in
+        // the background, so the read-only refinement must not apply here: a
+        // peer's background command always asks the owner.
+        let input = serde_json::json!({"command": "ls -la"});
+        assert!(
+            matches!(
+                mgr.check_tool_use("background_bash", &input),
+                PermissionCheck::AskUser(_)
+            ),
+            "Peer background_bash must surface as AskUser, never silent-allow"
+        );
+    }
+
+    #[test]
+    fn test_background_bash_constitutional_deny_applies() {
+        let input = serde_json::json!({"command": "echo ok; rm -rf /"});
+        for role in [PermissionManager::new(), PermissionManager::for_peer()] {
+            assert!(
+                matches!(
+                    role.check_tool_use("background_bash", &input),
+                    PermissionCheck::Deny(_)
+                ),
+                "constitutional denied substrings must apply to \
+                 background_bash for owner and peer alike"
             );
         }
     }

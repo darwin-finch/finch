@@ -37,6 +37,44 @@ impl AttachedBrainClient {
 pub struct AttachmentId(pub uuid::Uuid);
 /// Re-exported from `brain::attachment`.
 pub enum AttachmentRole { Runner, Driver, Consultant, Observer }
+/// Stable identifier for one background task, returned immediately by [`BackgroundTaskManager::start`].
+pub struct BackgroundTaskId(String);
+impl BackgroundTaskId {
+    /// The identifier as presented in tool results.
+    pub fn as_str(&self) -> &str;
+}
+/// Bounded lifecycle owner for long-lived commands.
+pub struct BackgroundTaskManager { … }
+impl BackgroundTaskManager {
+    /// Poll one task: current state plus the retained stdout/stderr rings.
+    pub async fn poll(&self, id: &str) -> Result<BackgroundTaskSnapshot>;
+    /// Number of tasks currently in `Running` state.
+    pub async fn running_count(&self) -> usize;
+    /// Kill and reap every running task.
+    pub async fn shutdown_all(&self);
+    /// Start `command` under `bash -c` and return its task ID immediately.
+    pub async fn start(&self, command: &str, description: &str) -> Result<BackgroundTaskId>;
+    /// Stop a task: SIGKILL its recorded direct child and reap it.
+    pub async fn stop(&self, id: &str) -> Result<BackgroundTaskSnapshot>;
+    /// Total retained entries, running and finished.
+    pub async fn total_count(&self) -> usize;
+    /// Manager with the documented default bounds.
+    pub fn new() -> Self;
+    /// Manager with explicit bounds (used by tests to make bounds reachable).
+    pub fn with_limits(max_running: usize, max_total: usize, ring_bytes: usize) -> Self;
+}
+/// One poll result: identity, lifecycle state, and the bounded output rings.
+pub struct BackgroundTaskSnapshot { … }
+impl BackgroundTaskSnapshot {
+    /// Human-readable poll rendering used by tool results.
+    pub fn render(&self) -> String;
+}
+/// Lifecycle state of one background task.
+pub enum BackgroundTaskState { Running, Completed, Stopped }
+impl BackgroundTaskState {
+    /// True while the task still holds a slot a new task cannot take.
+    pub fn is_running(&self) -> bool;
+}
 /// Exact participant/environment boundary to which a Brain-owned approval request is addressed. Re-exported from `brain::attachment`.
 pub struct BrainApprovalAudience { … }
 /// Re-exported from `brain::attachment`.
@@ -230,6 +268,8 @@ pub enum BrainWireMessage { Snapshot, Event }
 pub struct ConnectionId(pub uuid::Uuid);
 /// Opaque daemon-side authority for one runner capability.
 pub(crate) struct EffectAuditAuthorityGrant { … }
+/// How a stopped process ended, recorded by the reaping stop path.
+pub enum ExitOutcome { Code, Signal }
 pub struct IsolatedTestProof { … }
 impl IsolatedTestProof {
     pub fn brain_address(&self) -> &str;
@@ -358,6 +398,17 @@ pub(crate) fn supervised_test_subprocess_command() -> std::process::Command { �
 pub(crate) fn unix_millis() -> u64 { … }
 #[cfg(all(test, unix))]
 pub(crate) fn validate_isolated_test_socket(proof: &IsolatedTestProof, path: &std::path::Path) -> anyhow::Result<IsolatedTestSocketIdentity> { … }
+```
+
+## Constants
+
+```rust
+/// Default bound on concurrently running background tasks.
+pub const DEFAULT_MAX_RUNNING_TASKS: usize = 16;
+/// Default bound on total retained task entries (running + finished).
+pub const DEFAULT_MAX_TOTAL_TASKS: usize = 64;
+/// Default per-stream ring-buffer retention budget in bytes.
+pub const DEFAULT_RING_BYTES_PER_STREAM: usize = 64 * 1024;
 ```
 
 ## Modules
