@@ -1,8 +1,8 @@
 // Restart tool - prepares a frontend replacement after its Brain turn commits.
 
 use crate::programs::ExecutionEffect;
-use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -216,16 +216,11 @@ mod tests {
     async fn test_restart_requires_reason() {
         let tool = RestartTool::default();
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let input = serde_json::json!({
@@ -241,16 +236,11 @@ mod tests {
     async fn test_restart_validates_binary_exists() {
         let tool = RestartTool::default();
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let input = serde_json::json!({
@@ -267,16 +257,11 @@ mod tests {
     async fn restart_tool_returns_a_hashed_deferred_intent() {
         let tool = RestartTool;
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let binary = std::env::current_exe().unwrap();

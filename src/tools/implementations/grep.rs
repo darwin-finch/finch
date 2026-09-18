@@ -1,8 +1,8 @@
 // Grep tool - searches for patterns in files
 
 use crate::programs::ExecutionEffect;
-use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use regex::Regex;
@@ -197,16 +197,11 @@ mod tests {
 
     fn ctx() -> ToolContext<'static> {
         ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         }
     }

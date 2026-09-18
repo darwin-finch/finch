@@ -2,8 +2,8 @@
 
 use crate::output_error;
 use crate::programs::ExecutionEffect;
-use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use glob::glob;
@@ -72,16 +72,11 @@ mod tests {
         });
 
         let context = crate::tools::types::ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
 
@@ -99,16 +94,11 @@ mod tests {
         });
 
         let context = crate::tools::types::ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
 

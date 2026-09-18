@@ -5,10 +5,10 @@
 //! declared authority, handler presence, and permission grants. Native
 //! provider tools are advertised only when both a handler and a grant exist.
 
-use crate::programs::ExecutionEffect;
-use crate::tools::permissions::PermissionManager;
-use crate::tools::registry::ToolRegistry;
-use crate::tools::types::ToolDefinition;
+use crate::effects::ExecutionEffect;
+use crate::permissions::PermissionManager;
+use crate::registry::ToolRegistry;
+use crate::types::ToolDefinition;
 use finch_providers::{NativeToolGrant, SemanticTool, ToolAuthority, ToolCompilePolicy};
 
 /// Map a declared execution effect onto the provider-neutral authority class.
@@ -107,9 +107,9 @@ pub fn semantic_tools_for_advertisement(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::permissions::{PermissionRule, ToolPermissionConfig};
-    use crate::tools::Tool;
-    use crate::tools::{ToolContext, ToolInputSchema};
+    use crate::permissions::{PermissionRule, ToolPermissionConfig};
+    use crate::Tool;
+    use crate::{ToolContext, ToolInputSchema};
     use anyhow::Result;
     use async_trait::async_trait;
     use finch_providers::{ToolOrigin, WireProtocol};

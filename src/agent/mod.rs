@@ -315,11 +315,7 @@ impl AgentLoop {
                     let guard = executor.lock().await;
                     guard
                         .execute_tool::<fn() -> anyhow::Result<()>>(
-                            &tool_use, None, // conversation
-                            None, // save_models_fn
-                            None, // batch_trainer
-                            None, // local_generator
-                            None, // tokenizer
+                            &tool_use, None, // save_models_fn
                             None, // repl_mode
                             None, // plan_content
                             None, // live_output

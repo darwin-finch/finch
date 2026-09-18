@@ -3,8 +3,8 @@
 use crate::memory::MemorySystem;
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramRef};
 use crate::runtime::{ProgramRuntime, ProgramSubmission, TypedEffectSink};
-use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::tools::Tool;
 use crate::vm::core_word_documentation as vm_core_word_documentation;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -874,6 +874,19 @@ impl Tool for SubmitProgramTool {
             });
             effect_sink
         });
+        let effect_audit = match context.effect_audit.as_ref() {
+            Some(authority) => {
+                let control = authority
+                    .as_any()
+                    .downcast_ref::<crate::server::RunnerEffectAuditControl>()
+                    .with_context(|| {
+                        "effect audit authority carrier type mismatch — the composition root \
+                         must inject the runtime's RunnerEffectAuditControl"
+                    })?;
+                Some(control.clone())
+            }
+            None => None,
+        };
         let outcome = self
             .runtime
             .submit_tool_program(
@@ -881,7 +894,7 @@ impl Tool for SubmitProgramTool {
                 self.caller.clone(),
                 effect_sink,
                 defer_program_effects,
-                context.effect_audit.clone(),
+                effect_audit,
             )
             .await?;
         Ok(serde_json::to_string(&outcome)?)
@@ -950,16 +963,11 @@ mod tests {
     async fn language_definition_advertises_program_response_contract() {
         let tool = GetLanguageDefinitionTool;
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let definition = tool
@@ -983,16 +991,11 @@ mod tests {
     async fn vm_state_is_compact_and_points_to_targeted_vocabulary_discovery() {
         let tool = GetVmStateTool::new(Arc::new(ProgramRuntime::new()));
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let result: Value =
@@ -1014,16 +1017,11 @@ mod tests {
     async fn built_in_vm_vocabulary_is_searchable_without_source_tree_access() {
         let tool = SearchVmVocabularyTool::new(Arc::new(ProgramRuntime::new()));
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
@@ -1046,16 +1044,11 @@ mod tests {
     async fn inspect_vm_word_returns_contract_not_source_tree_details() {
         let tool = InspectVmWordTool::new(Arc::new(ProgramRuntime::new()));
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
@@ -1084,16 +1077,11 @@ mod tests {
         let legacy = InspectVmWordTool::new(Arc::clone(&runtime));
         let canonical = InspectWordTool::new(runtime, None);
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
 
@@ -1125,16 +1113,11 @@ mod tests {
         let search = SearchWordTool::new(Arc::clone(&runtime), None);
         let inspect = InspectWordTool::new(runtime, None);
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let found: Value = serde_json::from_str(
@@ -1183,16 +1166,11 @@ mod tests {
     async fn source_syntax_is_discoverable_without_lying_about_callable_words() {
         let tool = SearchVmVocabularyTool::new(Arc::new(ProgramRuntime::new()));
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
@@ -1347,16 +1325,11 @@ mod tests {
             .contains_key("effect"));
         assert!(!schema.required.iter().any(|field| field == "effect"));
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let result = tool
@@ -1405,16 +1378,11 @@ mod tests {
         });
         let tool = SubmitProgramTool::new(Arc::clone(&runtime));
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
-            effect_audit: Some(effect_audit),
-            poset: None,
+            effect_audit: Some(Arc::new(effect_audit) as _),
             skip_interactive_review: false,
         };
         let result: Value = serde_json::from_str(
@@ -1450,16 +1418,11 @@ mod tests {
         let runtime = Arc::new(ProgramRuntime::new());
         let tool = SubmitProgramTool::new(runtime);
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
 
@@ -1506,16 +1469,11 @@ mod tests {
         let runtime = Arc::new(ProgramRuntime::new());
         let tool = SubmitProgramTool::new(runtime);
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
 
@@ -1549,19 +1507,14 @@ mod tests {
         let tool = SubmitProgramTool::new(runtime);
         let emitted = Arc::new(Mutex::new(Vec::new()));
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: Some({
                 let emitted = Arc::clone(&emitted);
                 Arc::new(move |text| emitted.lock().unwrap().push(text))
             }),
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
 

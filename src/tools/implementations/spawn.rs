@@ -16,8 +16,8 @@ use crate::tools::implementations::glob::GlobTool;
 use crate::tools::implementations::grep::GrepTool;
 use crate::tools::implementations::read::ReadTool;
 use crate::tools::implementations::web_fetch::WebFetchTool;
-use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolDefinition, ToolInputSchema, ToolUse};
+use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -343,16 +343,11 @@ async fn execute_subagent_tool(tools: &[Box<dyn Tool>], tool_use: &ToolUse) -> R
         })?;
 
     let context = ToolContext {
-        conversation: None,
         save_models: None,
-        batch_trainer: None,
-        local_generator: None,
-        tokenizer: None,
-        repl_mode: None,
+        host_mode_state: None,
         plan_content: None,
         live_output: None,
         effect_audit: None,
-        poset: None,
         skip_interactive_review: false,
     };
 

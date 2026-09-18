@@ -17,15 +17,10 @@ fn make_list() -> Arc<RwLock<TodoList>> {
 
 fn dummy_ctx() -> ToolContext<'static> {
     ToolContext {
-        conversation: None,
         save_models: None,
-        batch_trainer: None,
-        local_generator: None,
-        tokenizer: None,
-        repl_mode: None,
+        host_mode_state: None,
         plan_content: None,
         live_output: None,
-        poset: None,
         effect_audit: None,
         skip_interactive_review: false,
     }

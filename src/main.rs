@@ -847,16 +847,11 @@ mod script_tests {
         }
 
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
             plan_content: None,
             live_output: None,
+            host_mode_state: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let before = runtime.revision();
@@ -2609,11 +2604,7 @@ async fn run_query_teacher_only(
                 let guard = executor.lock().await;
                 guard
                     .execute_tool::<fn() -> anyhow::Result<()>>(
-                        &tool_use, None, // conversation
-                        None, // save_models_fn
-                        None, // batch_trainer
-                        None, // local_generator
-                        None, // tokenizer
+                        &tool_use, None, // save_models_fn
                         None, // repl_mode
                         None, // plan_content
                         None, // live_output

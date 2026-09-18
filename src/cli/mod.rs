@@ -38,7 +38,7 @@ pub use messages::{
     UserQueryMessage,
 };
 pub use output_manager::{OutputManager, VmOutputProjection};
-pub use repl::{Repl, ReplMode};
+pub use repl::{Repl, ReplMode, ReplModeState};
 pub use setup_wizard::show_setup_wizard;
 pub use status_bar::{StatusBar, StatusLine, StatusLineType};
 pub use suggestions::{Suggestion, SuggestionContext, SuggestionManager, SuggestionSource};

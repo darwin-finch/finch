@@ -7,19 +7,21 @@ mod diagnostics;
 mod executor;
 mod implementations;
 mod mcp;
-mod pattern_matcher;
-mod patterns;
 mod permissions;
-mod registry;
-mod semantic;
 mod todo;
-mod tool_loop;
 mod types;
 
 pub use crate::brain::{
     BrainTask as TodoItem, BrainTaskPriority as TodoPriority, BrainTaskStatus as TodoStatus,
 };
-pub use executor::{generate_tool_signature, ApprovalSource, ToolExecutor, ToolSignature};
+pub use executor::{generate_tool_signature, ApprovalSource, ToolExecutor};
+pub use finch_tools_api::{
+    compile_policy_from_registry, semantic_tools_for_advertisement, tool_authority_from_effect,
+    AdmitError, ExactApproval, MatchType, ObserveOutcome, PathSlot, PatternType,
+    PersistentPatternStore, PreparedCall, RejectReason, RejectedCall, Tool, ToolCatalog, ToolLoop,
+    ToolLoopIdentity, ToolLoopResult, ToolLoopTerminal, ToolPattern, ToolPatternMatcher,
+    ToolRegistry, ToolSignature, ValidatedCall,
+};
 pub use implementations::llm_tools::create_llm_tools;
 pub use implementations::propose::{propose_artifact_with_decision, ProposalDecision};
 pub use implementations::restart::DeferredFrontendRestart;
@@ -38,27 +40,15 @@ pub use implementations::{
     ExcelWriteTool, GuiClickTool, GuiInspectTool, GuiTypeTool,
 };
 pub use mcp::{McpClient, McpConnection, McpServerConfig, McpToolDescriptor, TransportType};
-pub use pattern_matcher::ToolPatternMatcher;
-pub use patterns::{
-    ExactApproval, MatchType, PathSlot, PatternType, PersistentPatternStore, ToolPattern,
-};
 pub use permissions::{
     invocation_runs_autonomously, refined_effect_for_approval, PermissionCheck, PermissionManager,
     PermissionRule, ToolPermissionConfig, PEER_HARD_DENY_TOOLS, PEER_REVIEWED_CHANGESET_TOOLS,
     PEER_SILENT_ALLOW_TOOLS, VM_DISCOVERY_TOOLS,
 };
-pub use registry::{Tool, ToolRegistry};
-pub use semantic::{
-    compile_policy_from_registry, semantic_tools_for_advertisement, tool_authority_from_effect,
-};
 pub use todo::{todo_journal, TodoJournalReceiver, TodoJournalTarget, TodoJournalWriter, TodoList};
-pub use tool_loop::{
-    AdmitError, ObserveOutcome, PreparedCall, RejectReason, RejectedCall, ToolCatalog, ToolLoop,
-    ToolLoopIdentity, ToolLoopResult, ToolLoopTerminal, ValidatedCall,
-};
 pub use types::{
-    ContentBlock, LiveOutput, LiveOutputSink, ToolContext, ToolDefinition, ToolInputSchema,
-    ToolResult, ToolUse,
+    ContentBlock, EffectAuditAuthority, HostModeState, LiveOutput, LiveOutputSink, ToolContext,
+    ToolDefinition, ToolInputSchema, ToolResult, ToolUse,
 };
 
 pub(crate) use implementations::patch::preview_patched_text;

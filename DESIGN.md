@@ -93,8 +93,9 @@ the MCP client should not have to load tool execution and permissions to get the
 | **`vm`** (0): execute verified modules, classify compiler-boundary wire failures, and preserve the execution compatibility facade | `crates/finch-vm`; `vocabulary/language/FINCH_VM.md`, `examples/finch/` | Capsule [`crates/finch-vm/AGENTS.md`](crates/finch-vm/AGENTS.md), interface [`crates/finch-vm/INTERFACE.md`](crates/finch-vm/INTERFACE.md); language contracts compiled into the binary and given to the model: [`FINCH_VM.md`](vocabulary/language/FINCH_VM.md), [`FINCH_FORTH.md`](vocabulary/language/FINCH_FORTH.md), [`FINCH_LISP.md`](vocabulary/language/FINCH_LISP.md); reference: [typed VM migration audit](docs/TYPED_VM_MIGRATION_AUDIT.md) |
 | **`programs`** (1): durable program identity, catalog, source-only compiler context, and corpus | `src/programs` | Capsule [`src/programs/AGENTS.md`](src/programs/AGENTS.md), interface [`src/programs/INTERFACE.md`](src/programs/INTERFACE.md) |
 | **`memory`** (1): MemTree storage and retrieval | `src/memory`, `memory_status.rs`, `workbook.rs` | Capsule [`src/memory/AGENTS.md`](src/memory/AGENTS.md), interface [`src/memory/INTERFACE.md`](src/memory/INTERFACE.md) |
+| **`tools-api`** (0): the dependency-free tool surface — `Tool` trait, registry, typed requests/results, permission and approval policy, declared effects, tool-round protocol | `crates/finch-tools-api` | Capsule [`crates/finch-tools-api/AGENTS.md`](crates/finch-tools-api/AGENTS.md), interface [`crates/finch-tools-api/INTERFACE.md`](crates/finch-tools-api/INTERFACE.md) |
 | **`tools-mcp`** (0): the client for external Model Context Protocol servers | `src/tools/mcp` | Capsule [`src/tools/mcp/AGENTS.md`](src/tools/mcp/AGENTS.md), interface [`src/tools/mcp/INTERFACE.md`](src/tools/mcp/INTERFACE.md), [user guide](docs/MCP_USER_GUIDE.md) |
-| **`tools`** (1): tool execution, permissions, GUI automation | `src/tools` except `mcp` | Capsule [`src/tools/AGENTS.md`](src/tools/AGENTS.md), interface [`src/tools/INTERFACE.md`](src/tools/INTERFACE.md); [Tool execution and permissions](src/tools/EXECUTION.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
+| **`tools`** (1): tool execution and GUI automation — the executor, concrete tool implementations, and MCP wiring over the `tools-api` surface | `src/tools` except `mcp`; re-export shims `src/tools/types.rs`, `src/tools/permissions.rs` | Capsule [`src/tools/AGENTS.md`](src/tools/AGENTS.md), interface [`src/tools/INTERFACE.md`](src/tools/INTERFACE.md); [Tool execution and permissions](src/tools/EXECUTION.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
 | **`runtime`** (2): the program runtime service and task-graph execution | `src/runtime`, `poset`; composition adapter [`src/program_registry.rs`](src/program_registry.rs) | Capsule [`src/runtime/AGENTS.md`](src/runtime/AGENTS.md), interface [`src/runtime/INTERFACE.md`](src/runtime/INTERFACE.md) |
 | **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | Capsule [`src/models/AGENTS.md`](src/models/AGENTS.md), interface [`src/models/INTERFACE.md`](src/models/INTERFACE.md); generators compatibility facade [`src/generators/AGENTS.md`](src/generators/AGENTS.md), interface [`src/generators/INTERFACE.md`](src/generators/INTERFACE.md); [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
 | **`finch-providers`** (0): reusable provider transports, OAuth, catalogs, and credential ports | `crates/finch-providers` | Capsule [`crates/finch-providers/AGENTS.md`](crates/finch-providers/AGENTS.md), interface [`crates/finch-providers/INTERFACE.md`](crates/finch-providers/INTERFACE.md); OAuth capsule [`crates/finch-providers/src/oauth/AGENTS.md`](crates/finch-providers/src/oauth/AGENTS.md); [crate docs](crates/finch-providers/docs/README.md) |
@@ -141,10 +142,15 @@ Memory has no two-way edge and no production `crate::` import. Callers inject
 `hf_hub` download/load. Program-definition mapping lives in the composition adapter
 [`src/program_registry.rs`](src/program_registry.rs).
 
-The application layer is knotted mostly through `tools`: `src/tools/types.rs` imports `cli`,
-`runtime`, `server`, `local`, and `models` types, and each of those imports `tools` back. `ipc`
-↔ `server` and `claude` ↔ `providers` add further loops. This is why the program forbids
-extracting Brain, runtime, server, and IPC as one change.
+The former `tools` knot is broken (issue #872): the tool surface the whole application layer
+shares lives in the dependency-free `crates/finch-tools-api` crate — `Tool`/`ToolRegistry`, typed
+requests and results, the permission/approval policy, `ExecutionEffect` (re-exported by
+`programs`), `VmEffectEnvelope` (re-exported by `runtime`), and the tool-round protocol — while the
+executor, concrete tools, MCP, todo, and diagnostics stay with the composition root.
+`src/tools/types.rs` and `src/tools/permissions.rs` are re-export shims with zero `crate::`
+imports; application-bound per-call state (session mode, daemon effect-audit authority) reaches
+tools through injected ports. `ipc` ↔ `server` and `claude` ↔ `providers` remain loops. Brain,
+runtime, server, and IPC extraction is no longer blocked by `tools`.
 
 ## Runtime reference
 
@@ -344,7 +350,6 @@ Related design documents, intent rather than evidence:
 - Where the provider graph should be built once; the REPL path builds it twice today.
 - Whether `poset` belongs with programs or with Brain planning.
 - Which subsystem owns `planning`, `agent`, and `review`, which sit between providers and Brain.
-- How `tools` splits into a dependency-free API and application-bound implementations.
 - Whether implement vs review vs `/plan` personas bind to named provider profiles now, or wait for a specialized review harness with a frozen cache prefix.
 
 ## Snapshot

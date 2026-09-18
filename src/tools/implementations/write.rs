@@ -5,8 +5,8 @@
 //   Updated src/bar.rs (Added 10 lines, removed 3 lines)
 
 use crate::programs::ExecutionEffect;
-use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -849,16 +849,11 @@ mod tests {
             "content": "line 1\nline 2\nline 3\n"
         });
         let context = crate::tools::types::ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
         let result = tool.execute(input, &context).await.unwrap();
