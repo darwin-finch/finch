@@ -57,8 +57,8 @@ pub use tool_loop::{
     ToolLoopIdentity, ToolLoopResult, ToolLoopTerminal, ValidatedCall,
 };
 pub use types::{
-    ContentBlock, LiveOutput, LiveOutputSink, ToolContext, ToolDefinition, ToolInputSchema,
-    ToolResult, ToolUse,
+    ContentBlock, EffectAuditAuthority, HostModeState, LiveOutput, LiveOutputSink, ToolContext,
+    ToolDefinition, ToolInputSchema, ToolResult, ToolUse,
 };
 
 pub(crate) use implementations::patch::preview_patched_text;

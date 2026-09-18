@@ -338,9 +338,9 @@ pub struct ToolDefinition { … }
 pub struct ToolExecutor { … }
 impl ToolExecutor {
     /// Execute a single tool use
-    pub async fn execute_tool<F>(&self, tool_use: &ToolUse, conversation: Option<&ConversationHistory>, save_models_fn: Option<F>, batch_trainer: Option< Arc<tokio::sync::RwLock<crate::training::batch_trainer::BatchTrainer>>, >, local_generator: Option<Arc<tokio::sync::RwLock<crate::local::LocalGenerator>>>, tokenizer: Option<Arc<crate::models::TextTokenizer>>, repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>, plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>, live_output: Option<crate::tools::types::LiveOutput>, effect_audit: Option<crate::server::RunnerEffectAuditControl>) -> Result<ToolResult> where F: Fn() -> Result<()> + Send + Sync,;
+    pub async fn execute_tool<F>(&self, tool_use: &ToolUse, save_models_fn: Option<F>, repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>, plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>, live_output: Option<crate::tools::types::LiveOutput>, effect_audit: Option<crate::server::RunnerEffectAuditControl>) -> Result<ToolResult> where F: Fn() -> Result<()> + Send + Sync,;
     /// Execute multiple tool uses in sequence
-    pub async fn execute_tool_loop<F>(&self, tool_uses: Vec<ToolUse>, conversation: Option<&ConversationHistory>, save_models_fn: Option<F>, batch_trainer: Option< Arc<tokio::sync::RwLock<crate::training::batch_trainer::BatchTrainer>>, >, local_generator: Option<Arc<tokio::sync::RwLock<crate::local::LocalGenerator>>>, tokenizer: Option<Arc<crate::models::TextTokenizer>>, repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>, plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>) -> Result<Vec<ToolResult>> where F: Fn() -> Result<()> + Send + Sync + Clone,;
+    pub async fn execute_tool_loop<F>(&self, tool_uses: Vec<ToolUse>, save_models_fn: Option<F>, repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>, plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>) -> Result<Vec<ToolResult>> where F: Fn() -> Result<()> + Send + Sync + Clone,;
     /// Get list of all available tools (built-in + MCP)
     pub async fn list_all_tools(&self) -> Vec<crate::tools::types::ToolDefinition>;
     /// Add MCP client to enable MCP tools  Always returns Self (never fails) - gracefully handles MCP connection errors
@@ -516,6 +516,14 @@ pub struct WriteTool;
 ## Traits
 
 ```rust
+/// Opaque daemon-issued authority for physical effects in one named-Brain provider/tool loop.
+pub trait EffectAuditAuthority: Send + Sync {
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+/// Handle to the host's live session mode state.
+pub trait HostModeState: Send + Sync {
+    fn as_any(&self) -> &dyn std::any::Any;
+}
 /// Per-tool presentation binding.
 pub trait LiveOutputSink: Send + Sync {
     fn line(&self, text: String);

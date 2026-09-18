@@ -570,6 +570,17 @@ impl ReplMode {
     }
 }
 
+/// Handle to the live session mode, injected where the tool API cannot name
+/// [`ReplMode`]. It wraps the same shared lock the REPL holds, so a carrier
+/// observes the live mode.
+pub struct ReplModeState(pub Arc<RwLock<ReplMode>>);
+
+impl crate::tools::HostModeState for ReplModeState {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[allow(dead_code)]
 pub struct Repl {
     _config: Config,
@@ -1964,18 +1975,13 @@ impl Repl {
                     Ok(())
                 };
 
-                let conversation_snapshot = self.conversation.read().await.clone();
                 let result = self
                     .tool_executor
                     .lock()
                     .await
                     .execute_tool(
                         tool_use,
-                        Some(&conversation_snapshot),
                         Some(save_fn),
-                        None, // TODO: Add training via BootstrapLoader's generator
-                        Some(Arc::clone(&self.local_generator)),
-                        Some(Arc::clone(&self.tokenizer)),
                         None, // repl_mode (not available in raw mode)
                         None, // plan_content
                         None, // live_output

@@ -4262,15 +4262,11 @@ async fn test_mode_indicator_planning_executor_restricts_write_instead_of_waivin
     let result = executor
         .execute_tool(
             &tool_use,
-            None,
             None::<fn() -> anyhow::Result<()>>,
-            None,
-            None,
-            None,
-            Some(planning),
-            None,
-            None,
-            None,
+            Some(planning), // repl_mode
+            None,           // plan_content
+            None,           // live_output
+            None,           // effect_audit
         )
         .await
         .expect("planning restriction returns ToolResult, not a transport error");
@@ -5542,15 +5538,11 @@ async fn test_auto_accept_executor_allows_write() {
     let result = executor
         .execute_tool(
             &tool_use,
-            None,
             None::<fn() -> anyhow::Result<()>>,
-            None,
-            None,
-            None,
-            Some(auto_accept),
-            None,
-            None,
-            None,
+            Some(auto_accept), // repl_mode
+            None,              // plan_content
+            None,              // live_output
+            None,              // effect_audit
         )
         .await
         .expect("auto-accept write returns ToolResult");
@@ -5721,15 +5713,11 @@ async fn test_auto_accept_does_not_waive_permission_deny() {
     let result = executor
         .execute_tool(
             &tool_use,
-            None,
             None::<fn() -> anyhow::Result<()>>,
-            None,
-            None,
-            None,
-            Some(auto_accept),
-            None,
-            None,
-            None,
+            Some(auto_accept), // repl_mode
+            None,              // plan_content
+            None,              // live_output
+            None,              // effect_audit
         )
         .await
         .expect("deny returns ToolResult");

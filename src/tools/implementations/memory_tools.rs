@@ -390,16 +390,11 @@ mod tests {
 
     fn test_context<'a>() -> ToolContext<'a> {
         ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
+            host_mode_state: None,
             plan_content: None,
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         }
     }

@@ -33,6 +33,14 @@ pub struct RunnerEffectAuditControl {
     tx: mpsc::UnboundedSender<RunnerEffectAuditControlRequest>,
 }
 
+/// The tool API carries this authority opaquely; only the runtime's concrete
+/// control can be injected, and construction stays `pub(crate)`.
+impl crate::tools::EffectAuditAuthority for RunnerEffectAuditControl {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl RunnerEffectAuditControl {
     pub(crate) fn new(tx: mpsc::UnboundedSender<RunnerEffectAuditControlRequest>) -> Self {
         Self { tx }

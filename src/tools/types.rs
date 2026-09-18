@@ -6,12 +6,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cli::ConversationHistory;
-use crate::cli::ReplMode;
-use crate::local::LocalGenerator;
-use crate::models::TextTokenizer;
 use crate::runtime::VmEffectEnvelope;
-use crate::training::batch_trainer::BatchTrainer;
 use crate::vm::VmSideEffect;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -58,25 +53,37 @@ where
 
 pub type LiveOutput = Arc<dyn LiveOutputSink>;
 
+/// Handle to the host's live session mode state.
+///
+/// The concrete state is the session's live REPL mode, which this API surface
+/// cannot name: approval flows read its autonomy policy, and plan-mode tools
+/// read and transition it. The composition root injects a handle wrapping the
+/// same shared lock the REPL holds, so carriers observe the live mode exactly
+/// as a direct field read did. Carriers downcast through [`Self::as_any`]
+/// into the concrete handle; a downcast failure is a wiring error, never a
+/// silently absent mode.
+pub trait HostModeState: Send + Sync {
+    /// Downcast support: the concrete mode state is application-bound.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Opaque daemon-issued authority for physical effects in one named-Brain
+/// provider/tool loop. Ordinary sessions and non-program tools receive
+/// `None`; provenance fields can never manufacture this capability.
+///
+/// The concrete authority type is application-bound (the runtime's
+/// `RunnerEffectAuditControl`, constructed only inside the runtime). Carriers
+/// reach it through [`Self::as_any`] and must treat a downcast failure as an
+/// error, never as an absent authority.
+pub trait EffectAuditAuthority: Send + Sync {
+    /// Downcast support: the concrete authority type is application-bound.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// Context passed to tools during execution
 pub struct ToolContext<'a> {
-    /// Optional conversation history (for tools that need to save/restore state)
-    pub conversation: Option<&'a ConversationHistory>,
-
     /// Optional function to save model weights (for restart tools)
     pub save_models: Option<&'a (dyn Fn() -> Result<()> + Send + Sync)>,
-
-    /// Optional batch trainer for active learning tools
-    pub batch_trainer: Option<Arc<RwLock<BatchTrainer>>>,
-
-    /// Optional local generator for query_local tool
-    pub local_generator: Option<Arc<RwLock<LocalGenerator>>>,
-
-    /// Optional tokenizer for encoding/decoding text
-    pub tokenizer: Option<Arc<TextTokenizer>>,
-
-    /// Optional REPL mode for plan mode state
-    pub repl_mode: Option<Arc<RwLock<ReplMode>>>,
 
     /// Optional plan content storage
     pub plan_content: Option<Arc<RwLock<Option<String>>>>,
@@ -86,13 +93,15 @@ pub struct ToolContext<'a> {
     /// Allows the WorkUnit row to show a live scrolling preview.
     pub live_output: Option<LiveOutput>,
 
+    /// Host session-mode state injected by the composition root (the live
+    /// REPL mode today). Approval flows consult it before opening an
+    /// interactive review; plan-mode tools read and transition it.
+    pub host_mode_state: Option<Arc<dyn HostModeState>>,
+
     /// Opaque daemon-issued authority for physical effects in one named-Brain
     /// provider/tool loop. Ordinary sessions and non-program tools receive
     /// `None`; provenance fields can never manufacture this capability.
-    pub effect_audit: Option<crate::server::RunnerEffectAuditControl>,
-
-    /// Co-Forth poset VM — partially-ordered task graph.
-    pub poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
+    pub effect_audit: Option<Arc<dyn EffectAuditAuthority>>,
 
     /// True when the REPL (or another caller) already obtained approval.
     ///
@@ -105,16 +114,11 @@ pub struct ToolContext<'a> {
 impl Default for ToolContext<'_> {
     fn default() -> Self {
         Self {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
             plan_content: None,
             live_output: None,
+            host_mode_state: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         }
     }

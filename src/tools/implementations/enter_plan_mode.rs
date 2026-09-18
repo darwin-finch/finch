@@ -6,6 +6,7 @@ use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 
 pub struct EnterPlanModeTool;
 
@@ -46,8 +47,10 @@ impl Tool for EnterPlanModeTool {
 
         // Check if repl_mode is available
         let mode = context
-            .repl_mode
+            .host_mode_state
             .as_ref()
+            .and_then(|state| state.as_any().downcast_ref::<crate::cli::ReplModeState>())
+            .map(|state| Arc::clone(&state.0))
             .ok_or_else(|| anyhow::anyhow!("Plan mode not available in this context"))?;
 
         // Check if already in plan mode
@@ -118,16 +121,11 @@ mod tests {
         let plan_content = Arc::new(RwLock::new(None));
 
         let context = ToolContext {
-            conversation: None,
             save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: Some(repl_mode),
+            host_mode_state: Some(Arc::new(crate::cli::ReplModeState(repl_mode)) as _),
             plan_content: Some(plan_content),
             live_output: None,
             effect_audit: None,
-            poset: None,
             skip_interactive_review: false,
         };
 

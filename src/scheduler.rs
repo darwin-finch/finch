@@ -1183,16 +1183,11 @@ async fn execute_child_tool(tools: &[Box<dyn Tool>], name: &str, input: Value) -
         PermissionCheck::Deny(reason) => bail!("permission denied: {reason}"),
     }
     let context = ToolContext {
-        conversation: None,
         save_models: None,
-        batch_trainer: None,
-        local_generator: None,
-        tokenizer: None,
-        repl_mode: None,
         plan_content: None,
         live_output: None,
+        host_mode_state: None,
         effect_audit: None,
-        poset: None,
         skip_interactive_review: true,
     };
     tool.execute(input, &context).await

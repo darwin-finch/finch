@@ -435,9 +435,6 @@ impl ToolExecutionCoordinator {
             execute_admitted_tool(
                 &event_tx,
                 &tool_executor,
-                &conversation,
-                &local_generator,
-                &tokenizer,
                 &repl_mode,
                 &plan_content,
                 &poset,
@@ -603,9 +600,6 @@ impl ToolExecutionCoordinator {
                 execute_admitted_tool(
                     &event_tx,
                     &tool_executor,
-                    &conversation,
-                    &local_generator,
-                    &tokenizer,
                     &repl_mode,
                     &plan_content,
                     &poset,
@@ -646,9 +640,6 @@ async fn deny_changeset(
 async fn execute_admitted_tool(
     event_tx: &mpsc::UnboundedSender<ReplEvent>,
     tool_executor: &Arc<tokio::sync::Mutex<crate::tools::ToolExecutor>>,
-    conversation: &Arc<RwLock<ConversationHistory>>,
-    local_generator: &Arc<RwLock<LocalGenerator>>,
-    tokenizer: &Arc<TextTokenizer>,
     repl_mode: &Arc<RwLock<ReplMode>>,
     plan_content: &Arc<RwLock<Option<String>>>,
     poset: &Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
@@ -659,17 +650,12 @@ async fn execute_admitted_tool(
     live_output: LiveOutput,
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
 ) {
-    let conversation_snapshot = conversation.read().await.clone();
     tool_executor.lock().await.poset = poset.clone();
     let timeout_duration = tool_executor.lock().await.execution_timeout(&tool_use.name);
     let executor = tool_executor.lock().await;
     let execute = executor.execute_tool::<fn() -> anyhow::Result<()>>(
         tool_use,
-        Some(&conversation_snapshot),
         None,
-        None,
-        Some(Arc::clone(local_generator)),
-        Some(Arc::clone(tokenizer)),
         Some(Arc::clone(repl_mode)),
         Some(Arc::clone(plan_content)),
         Some(live_output),

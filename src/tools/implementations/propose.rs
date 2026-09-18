@@ -48,8 +48,14 @@ pub fn should_open_interactive_review(
 pub async fn context_should_open_interactive_review(
     context: &crate::tools::types::ToolContext<'_>,
 ) -> bool {
-    let auto_accepts = match &context.repl_mode {
-        Some(mode) => mode.read().await.auto_accepts_host_effects(),
+    let auto_accepts = match &context.host_mode_state {
+        Some(state) => match state.as_any().downcast_ref::<crate::cli::ReplModeState>() {
+            // A carrier that is not the session mode is a wiring error, but
+            // the conservative reading — review required — is the safe
+            // fallback, so this only ever adds a dialog, never removes one.
+            Some(mode) => mode.0.read().await.auto_accepts_host_effects(),
+            None => false,
+        },
         None => false,
     };
     should_open_interactive_review(context.skip_interactive_review, auto_accepts)

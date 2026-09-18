@@ -2,7 +2,7 @@
 //
 // Executes tools with permission checks and multi-turn support
 
-use crate::cli::ConversationHistory;
+use crate::cli::ReplModeState;
 use crate::programs::ExecutionEffect;
 use crate::tools::patterns::{ExactApproval, MatchType, PersistentPatternStore, ToolPattern};
 use crate::tools::permissions::{
@@ -10,7 +10,7 @@ use crate::tools::permissions::{
     resolve_workspace_root, PermissionCheck, PermissionManager,
 };
 use crate::tools::registry::ToolRegistry;
-use crate::tools::types::{ToolResult, ToolUse};
+use crate::tools::types::{EffectAuditAuthority, ToolResult, ToolUse};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -450,17 +450,11 @@ impl ToolExecutor {
 
     /// Execute a single tool use
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, tool_use, conversation, save_models_fn, batch_trainer, local_generator, tokenizer, repl_mode, plan_content, live_output), fields(tool = %tool_use.name, id = %tool_use.id))]
+    #[instrument(skip(self, tool_use, save_models_fn, repl_mode, plan_content, live_output, effect_audit), fields(tool = %tool_use.name, id = %tool_use.id))]
     pub async fn execute_tool<F>(
         &self,
         tool_use: &ToolUse,
-        conversation: Option<&ConversationHistory>,
         save_models_fn: Option<F>,
-        batch_trainer: Option<
-            Arc<tokio::sync::RwLock<crate::training::batch_trainer::BatchTrainer>>,
-        >,
-        local_generator: Option<Arc<tokio::sync::RwLock<crate::local::LocalGenerator>>>,
-        tokenizer: Option<Arc<crate::models::TextTokenizer>>,
         repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
         live_output: Option<crate::tools::types::LiveOutput>,
@@ -561,18 +555,16 @@ impl ToolExecutor {
 
         // 4. Execute tool with context
         let context = crate::tools::types::ToolContext {
-            conversation,
             save_models: save_models_fn
                 .as_ref()
                 .map(|f| f as &(dyn Fn() -> Result<()> + Send + Sync)),
-            batch_trainer,
-            local_generator,
-            tokenizer,
-            repl_mode,
             plan_content,
             live_output,
-            effect_audit,
-            poset: None,
+            host_mode_state: repl_mode.map(|mode| {
+                Arc::new(ReplModeState(mode)) as Arc<dyn crate::tools::types::HostModeState>
+            }),
+            effect_audit: effect_audit
+                .map(|authority| Arc::new(authority) as Arc<dyn EffectAuditAuthority>),
             // The coordinator already showed the dialog, applied edit:*, or
             // AutoAccept. execute() must not open $EDITOR again.
             skip_interactive_review: true,
@@ -659,25 +651,11 @@ impl ToolExecutor {
 
     /// Execute multiple tool uses in sequence
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(
-        self,
-        tool_uses,
-        conversation,
-        save_models_fn,
-        batch_trainer,
-        local_generator,
-        tokenizer
-    ))]
+    #[instrument(skip(self, tool_uses, save_models_fn, repl_mode, plan_content))]
     pub async fn execute_tool_loop<F>(
         &self,
         tool_uses: Vec<ToolUse>,
-        conversation: Option<&ConversationHistory>,
         save_models_fn: Option<F>,
-        batch_trainer: Option<
-            Arc<tokio::sync::RwLock<crate::training::batch_trainer::BatchTrainer>>,
-        >,
-        local_generator: Option<Arc<tokio::sync::RwLock<crate::local::LocalGenerator>>>,
-        tokenizer: Option<Arc<crate::models::TextTokenizer>>,
         repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
     ) -> Result<Vec<ToolResult>>
@@ -692,11 +670,7 @@ impl ToolExecutor {
             let result = self
                 .execute_tool(
                     &tool_use,
-                    conversation,
                     save_models_fn.clone(),
-                    batch_trainer.clone(),
-                    local_generator.clone(),
-                    tokenizer.clone(),
                     repl_mode.clone(),
                     plan_content.clone(),
                     None, // live_output
@@ -1054,13 +1028,9 @@ mod tests {
         let result = executor
             .execute_tool(
                 &tool_use,
-                None,
                 None::<fn() -> Result<()>>,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, // repl_mode
+                None, // plan_content
                 None, // live_output
                 None, // effect_audit
             )
@@ -1083,13 +1053,9 @@ mod tests {
         let result = executor
             .execute_tool(
                 &tool_use,
-                None,
                 None::<fn() -> Result<()>>,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, // repl_mode
+                None, // plan_content
                 None, // live_output
                 None, // effect_audit
             )
@@ -1106,13 +1072,9 @@ mod tests {
         let result = executor
             .execute_tool(
                 &tool_use,
-                None,
                 None::<fn() -> Result<()>>,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, // repl_mode
+                None, // plan_content
                 None, // live_output
                 None, // effect_audit
             )
@@ -1215,15 +1177,11 @@ mod tests {
             let (live_allows, detail) = match executor
                 .execute_tool(
                     &tool_use,
-                    None,
                     None::<fn() -> Result<()>>,
-                    None,
-                    None,
-                    None,
-                    Some(Arc::clone(&mode)),
-                    None,
-                    None, // live_output
-                    None, // effect_audit
+                    Some(Arc::clone(&mode)), // repl_mode
+                    None,                    // plan_content
+                    None,                    // live_output
+                    None,                    // effect_audit
                 )
                 .await
             {
@@ -1257,13 +1215,9 @@ mod tests {
         let result = executor
             .execute_tool(
                 &tool_use,
-                None,
                 None::<fn() -> Result<()>>,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, // repl_mode
+                None, // plan_content
                 None, // live_output
                 None, // effect_audit
             )
@@ -1286,13 +1240,9 @@ mod tests {
         let results = executor
             .execute_tool_loop(
                 tool_uses,
-                None,
                 None::<fn() -> Result<()>>,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, // repl_mode,
+                None, // plan_content,
             )
             .await
             .unwrap();
@@ -1568,15 +1518,11 @@ mod tests {
         let result = executor
             .execute_tool(
                 &tool_use,
-                None,
                 None::<fn() -> anyhow::Result<()>>,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, // repl_mode,
+                None, // plan_content,
+                None, // live_output,
+                None, // effect_audit,
             )
             .await
             .expect("granted edit must return ToolResult");
@@ -1838,13 +1784,9 @@ mod tests {
         executor
             .execute_tool(
                 &tool_use,
-                None,
                 None::<fn() -> Result<()>>,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, // repl_mode
+                None, // plan_content
                 None, // live_output
                 None, // effect_audit
             )
@@ -1994,15 +1936,11 @@ mod tests {
         let result = executor
             .execute_tool(
                 &tool_use,
-                None,
                 None::<fn() -> Result<()>>,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, // repl_mode,
+                None, // plan_content,
+                None, // live_output,
+                None, // effect_audit,
             )
             .await
             .expect("write execution");
@@ -2047,15 +1985,11 @@ mod tests {
         let result = executor
             .execute_tool(
                 &tool_use,
-                None,
                 None::<fn() -> Result<()>>,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, // repl_mode,
+                None, // plan_content,
+                None, // live_output,
+                None, // effect_audit,
             )
             .await
             .expect("patch execution");
