@@ -439,3 +439,50 @@ entry was itself wrong, caught by Shammah asking a pointed enough question about
   symbol-only `quote` restriction is transitional" note no longer applies to `'`, since bare data
   needs no staged hygiene machinery to quote an arbitrary structure — flagged as reasoned inference,
   not re-confirmed against anything else.
+
+**Continued 2026-09-18 — `define-syntax` retired outright, at Shammah's repeated direction, after
+the earlier "macro is just CTFE" framing turned out to only be true about scheduling, not about
+call-site interpretation.** Full arc: Shammah pointed out `define-syntax` still "sounds like a
+macro to me vs. a function that happens to CTFE" — correct, and a real gap in the earlier framing.
+There are two separate axes: (1) execution architecture (separate global pass vs. per-symbol
+`require`-scheduled — already resolved, no separate pass) and (2) call-site interpretation (does a
+*name* get to change how its own calls are parsed, independent of ordinary evaluation — `define-
+syntax` does exactly this, registration-based, and that's what "macro" means in the sense that
+actually matters). Only axis 1 had been fixed; axis 2 hadn't been touched.
+- **Fix:** a parameter typed `syntax` now captures its argument unevaluated (as if quasiquoted)
+  automatically, for *any* ordinary function — no registration, no separate macro-name, extending
+  the same per-parameter-annotation rule `borrow`/`steal`/`consume-value` already use, rather than a
+  whole-function name-directed special case. `define-syntax`, `expand-timed`'s separate name (only
+  ever needed to give `define-syntax` something to register), and the "legacy template bridge
+  pending deletion" paragraph are all removed — there's no registration mechanism left to have a
+  transitional version of.
+- **Why it's safer than `define-syntax` or classic Lisp `fexprs`:** a statically typed language
+  already reads a callee's declared signature to type-check any call. "Does this parameter capture
+  syntax or evaluate normally" is one more fact read off that already-consulted signature, not a
+  separate registry a caller has to know about independently.
+- **A worked example caught two more real mistakes in the same rewrite, both from not checking
+  before writing:** first, `(define timed-require-pkg (mixin (timed (require-pkg "nginx"))))` was
+  wrong — `require-pkg` needs `name : string`, and `name` was never bound in that standalone
+  snippet (the original document's `name` only worked because it lived inside `require-package`'s
+  own body, where `name` is `require-package`'s parameter). Then Shammah corrected the deeper
+  mistake: `timed` shouldn't wrap a fully-applied call at all — it should receive the bare function
+  `require-pkg` itself, introspect its signature, and produce a same-signature wrapper, forwarding
+  through to the original with timing added.
+- **Then a further, important narrowing, also from Shammah correcting an overreach of mine:** for
+  the *simple* signature-forwarding case specifically (same signature, timing added around an
+  otherwise-unchanged call), no CTFE is needed at all — ordinary generics already force
+  monomorphization per instantiation (established early this session), so a compile-time-bound
+  function parameter is already fully known and directly callable, and returning a closure from a
+  generic function, bound to a top-level name via ordinary `define`, already gives a real,
+  independently-nameable, callable-elsewhere function — the same thing D's
+  `alias name = template!(fn);` gives you, with no separate `alias` keyword needed here because
+  Finch already treats functions as ordinary values. I incorrectly claimed generics could only give
+  "inline, per-call-site" specialization; that was wrong, and Shammah caught it with the direct D
+  counterexample.
+- **The actual, narrower boundary for where CTFE genuinely earns its keep:** anything that needs to
+  see or change a function's *internal structure* — its body, its effect row, splicing new code
+  between existing statements — not just wrap calls to it as an opaque black box. Confirmed directly:
+  Shammah's actual "advanced case" is "introspecting `require-pkg` and doing arbitrary things to it,
+  splicing in code every other line" — genuinely requires the function's body as inspectable
+  `syntax`, which `ParameterSpec` (signature-only) doesn't carry. `FunctionSpec` (below) is the
+  direct answer to this, not a hypothetical.

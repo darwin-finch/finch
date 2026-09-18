@@ -1898,7 +1898,7 @@ the same nodes without source-to-source CoLisp generation.
 | fibers/tasks | `defer`, `spawn`, `join`, `race`, `next` | same typed words applied to quotations/handles | scheduled-execution operations |
 | range iteration | range operations / `foreach` | range words and quotation `foreach` | concept calls and structured loop |
 | named tests/suites | `(test ...)`, `(test-suite ...)` | `test: ... {}`, `test-suite: ... {}` | test-profile declarations, no production instruction |
-| macro/syntax | `define-syntax`, syntax constructors | `macro:`, `syntax[ ... ]`, explicit mixin/fresh/context words | `Syntax` CTFE, then ordinary nodes |
+| macro/syntax | ordinary `define`, a `syntax`-typed parameter, syntax constructors | `macro:`, `syntax[ ... ]`, explicit mixin/fresh/context words — **GAP, flagged 2026-09-18**: CoLisp retired name-registered macros for parameter-typed capture (below); Co-Forth's `macro:` is the same name-registration shape and hasn't been reconciled to match, since that's a Co-Forth-side change nothing in this conversation verified | `Syntax` CTFE, then ordinary nodes |
 | unsafe/FFI | `(unsafe ...)`, `(extern "C" ...)` | `unsafe[ ... ]`, `extern(C): ... ;` | marked unsafe/foreign call; unhosted only |
 
 Structured delimiters such as `Foo{...}`, `args{...}`, `match...endmatch`, and `unsafe[...]` are
@@ -3467,7 +3467,7 @@ rather than adding a third (`^` or otherwise):
   already evaluated to, unchanged — quasiquote doesn't retroactively enrich a spliced-in value.
 
 Neither operator parses source bytes; both only ever operate on syntax already inside the one parse
-boundary. A CTFE function typed to receive `syntax` (like `expand-timed` below) must be handed a
+boundary. A CTFE function typed to receive `syntax` (like `timed` below) must be handed a
 `` ` ``-produced value, not a `'`-produced one — passing bare data where hygiene-aware syntax is
 required is a type error, the same as passing anything else of the wrong type.
 
@@ -3478,45 +3478,58 @@ is lists plus spans, not text to re-parse). Those forms are then compiled as if 
 written at that site. `mixin` is not runtime `eval`, not `,@`, and not D `mixin(string)`. It is
 not valid as the body of a `define` that is supposed to return a function.
 
-**`define` vs `define-syntax`.** `define` / `lambda` bind a **value** (a function is a value).
-`define-syntax` **registers** a `syntax -> syntax` CTFE function in the expander: arguments are
-not evaluated; `(timed (require-pkg name))` compiles as
-`` (mixin (expand-timed `(timed (require-pkg name)))) ``. Without `define-syntax`, the transformer
-is an ordinary function and the caller must quasiquote — `expand-timed` takes `syntax`, and plain
-`'` no longer produces that (see "quote and quasiquote," above); this is exactly the site the
-`'`/`` ` `` split above changes, caught by checking every existing use of plain quote in this
-document before writing the split in. `let` in a transformer is an expression:
-bindings, then a body whose **value** is the result (typically a quasiquoted list).
+**Revised 2026-09-18: `define-syntax` is retired. A parameter typed `syntax` captures its argument
+automatically — no separate macro-registration mechanism needed.** The previous design needed two
+names for one idea: an ordinary CTFE function (`expand-timed`) plus a `define-syntax` registration
+(`(define-syntax timed expand-timed)`) so that calling `timed` would look natural — no visible
+quasiquote at the call site. That registration is exactly what a "macro" means in the sense that
+matters: a name whose own call sites get reinterpreted specially (arguments captured instead of
+evaluated), decided by a separate registry rather than by the call site or the callee's own declared
+shape. Retired for a narrower reason than "we don't need a separate expansion pass" (already true,
+and already the case with `define-syntax`) — the actual problem is the whole-function, name-directed
+special-casing itself.
+
+The fix reuses a rule this document already has rather than adding a registry: a parameter's
+declared kind already governs how its argument is passed — `borrow`/`steal`/`consume-value` do this
+for ownership, uniformly, for any function, decided purely by the parameter's own annotation, with
+no separate table of "which functions are special." A parameter typed `syntax` extends the same
+rule one step further: its argument expression is captured unevaluated (as if quasiquoted) instead
+of evaluated normally, for *any* ordinary function that declares one, no registration required.
+`define`/`lambda` still just bind a value (a function is a value) — there is no second declaration
+form. This is safe in a way `define-syntax` and classic Lisp `fexprs` were not: a statically typed
+language already has to read a callee's declared signature to type-check any call at all; "does
+this parameter capture syntax or evaluate normally" is one more fact read off that same,
+already-consulted signature, not a separate registry a caller has to know about independently.
 
 ```
 (define (require-pkg (name : string)) : void
   (pkg.ensure name)
   (svc.enable name))
 
-(define (expand-timed (form : syntax)) : syntax
+(define (timed (form : syntax)) : syntax
   (let [body (second form)]
     `(let [t (now)]
        (let [r ,body]
          (log-elapsed t)
          r))))
 
-(define-syntax timed expand-timed)
-
 (define (require-package (name : string)) : void
   (timed (require-pkg name)))
 ```
 
-`,` before `(second form)` means “compute `second` **now** (in the expander) and insert that
-syntax into the template.” `(second ,form)` would **generate** a future call to `second`.
-`expand-timed` does not run `require-pkg`; it wraps the **form**. After mixin, `require-package`
-is ordinary bytecode: clocks around `(require-pkg name)`, and `name` is still the parameter.
-A function `timed` would need `(timed (lambda () (require-pkg name)))`.
+`,` before `(second form)` means "compute `second` **now** (inside `timed`) and insert that syntax
+into the template." `(second ,form)` would **generate** a future call to `second`. `timed` does not
+run `require-pkg`; it wraps the **form**, because `require-pkg`'s call is captured, not evaluated,
+the moment it's passed to `timed`'s `syntax`-typed parameter — no thunk needed to defer it, which is
+what the previous version of this paragraph wrongly said an ordinary function would require. After
+`mixin`, `require-package` is ordinary bytecode: clocks around `(require-pkg name)`, and `name` is
+still the parameter.
 
 `(if ready? (require-pkg "nginx") #f)` is enough for skip-the-body; do not add `when`. If
 `ready?` is a compile-time constant, that `if` is already CTFE.
 
-Without `define-syntax`, one-shot mix-back is explicit quote plus `mixin` of a **`define` or
-other module form**, not `eval` of a tree when the function is later called.
+One-shot mix-back is explicit quasiquote plus `mixin` of a **`define` or other module form**, not
+`eval` of a tree when the function is later called.
 
 **Diagnostics** follow SDC mixin reporting, not DMD’s “blame the mixin line”: (1) user form and
 span, (2) pretty-printed expansion the transformer returned, (3) fault in that expansion with
@@ -3545,10 +3558,12 @@ the same word: a `syntax -> syntax` function returns declaration nodes (fields, 
 declarations, attributes, or explicit concept evidence); `mixin` of that result is how they enter
 the module. Runtime composition remains record embedding, delegation, and concept evidence.
 
-Until that kernel exists, `define-syntax` remains a capture-free **template**: substitution
-before type checking, no CTFE body, no capabilities, and no introducing `let` or other binding
-forms. That path is deleted after migration fixtures prove `syntax -> syntax` CTFE plus `mixin`
-preserve hygiene, spans, and IR.
+**Removed 2026-09-18:** this section previously described a transitional, capture-free `define-syntax`
+template mechanism (substitution before type checking, no CTFE body) as a bridge to be deleted once
+migration fixtures proved `syntax -> syntax` CTFE plus `mixin` preserve hygiene, spans, and IR. That
+bridge is moot: `define-syntax` itself is retired (above), replaced by parameter-typed `syntax`
+capture on ordinary functions, so there is no registration mechanism left to have a transitional
+version of.
 
 The S-expression is the visible structural notation, while `Syntax` is the compiler-facing value.
 An identifier syntax object carries its spelling, scope marks, phase, source origin, and eventually
