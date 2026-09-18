@@ -947,6 +947,24 @@ versus heap placement, an ownership policy, or static versus dynamic behavioral 
 `Unique<Foo>` or `Shared<Foo>`, or borrowed through any of those carriers without becoming a
 different aggregate type.
 
+**Added 2026-09-17: "construction invariants" are enforced, not conventional.** Private fields plus
+an ordinary associated function is not, by itself, a real guarantee — anything with field visibility
+(everything in the declaring module, ordinarily) can still write the raw record literal directly,
+bypassing whatever validation or transformation that function was supposed to perform; this is
+Go's and Rust's actual situation today, not a solved problem to imitate. The fix reuses the existing
+declaration-attribute mechanism rather than adding new syntax: `@constructor` marks an associated
+function as a constructor of its record, and the moment a record has *any* `@constructor`-attributed
+function, the ordinary record-literal syntax becomes unavailable everywhere *outside* that
+function's own body — not a style guideline, a compile error on the bypass. A constructor takes
+whatever input parameters its author declares, with no obligation to match the record's own field
+set, and may validate, default, or derive fields with arbitrary logic (subject to its own declared
+effect row) before producing the value, returning `Self` or `result<Self, E>`; only `@constructor`
+functions retain the privilege to use the literal form internally. A record may declare several
+constructors, each under its own distinct name — never overloaded on one name, the same discipline
+already applied to rejecting classic overload resolution elsewhere in this document. A record with
+no `@constructor` declared is unchanged: plain literal construction remains available, so this is
+purely additive and opt-in.
+
 Named records have nominal identity. Matching field names do not make independently declared
 records interchangeable, because their invariants, constructors, lifecycle evidence, and layout
 contracts may differ. Structural width conversion is available only through an explicit readonly
