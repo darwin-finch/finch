@@ -81,7 +81,7 @@ async fn test_background_child_stays_in_supervisor_process_group() {
         child_group,
         nix::unistd::getpgrp(),
         "background child {pid} must stay in the owning process's group \
-         (no setsid/setpgid/process-group escape)"
+         (no job-control escape)"
     );
     manager.stop(id.as_str()).await.expect("cleanup stop");
 }

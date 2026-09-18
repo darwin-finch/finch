@@ -11,8 +11,8 @@
 //! daemon restart loses running tasks by construction. Durable restart-adoptable
 //! records are #88/#90 wire-format territory and deliberately out of scope.
 //!
-//! Process-group ownership stays with the supervisor: no `setsid`, `setpgid`,
-//! or `CommandExt::process_group` is used, so children remain in the owning
+//! Process-group ownership stays with the supervisor: no job-control escape
+//! API is used, so children remain in the owning
 //! process's group and stop signals only the recorded direct child. Grandchild
 //! processes of a `bash -c` invocation are not reaped by stop — a recorded
 //! limitation, not an oversight.
