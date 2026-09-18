@@ -976,6 +976,21 @@ encapsulated across a module boundary, not merely by convention — the same gua
 Rust's `pub`-field visibility give, composed from two small, separately-motivated rules rather than
 one bespoke "encapsulated record" feature.
 
+**Added 2026-09-17: `@property` getter/setter pairs, called with field syntax — modeled on C#'s
+proven shape, not D's, whose own documentation calls its version unsettled.** A getter (no explicit
+parameters beyond the receiver, returns `T`) and an optional setter (one parameter of type `T`,
+returns `unit`) sharing one name and marked `@property` are resolved through `foo.name` /
+`foo.name = value` the same way a plain field already is. The rule that keeps this unambiguous is
+narrower than avoiding D's specific trouble: **a record cannot declare both a plain field and a
+`@property` under the same name** — one name always resolves one way, so there is nothing to
+disambiguate between a field and a property in the first place, and Finch has no UFCS-style
+"search free functions by first-parameter type" mechanism for the comparison to D's actual problem
+to even apply to. A setter's effects are exactly its own declared or inferred effect row, checked
+and visible to the verifier the same as any ordinary function's — "looks like a field" is a surface
+syntax fact, never a reason the cost-visibility or effect-inference rules stop applying, so a setter
+that notifies observers, updates a dependency graph, or does other real work is fully checked and
+fully legible to the effect system, not a hidden side channel. This is exactly the reactive-property
+use case (a setter driving an observable/dependency graph) that motivated asking for the feature.
 Named records have nominal identity. Matching field names do not make independently declared
 records interchangeable, because their invariants, constructors, lifecycle evidence, and layout
 contracts may differ. Structural width conversion is available only through an explicit readonly
