@@ -14,6 +14,7 @@ import argparse
 import re
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -164,9 +165,19 @@ def scan_items(source: str) -> list[tuple[str, str, str, str]]:
     return items
 
 
+@lru_cache(maxsize=None)
 def without_comments(source: str) -> str:
     """Blank comments and attributes, keeping offsets, so their text cannot look like syntax."""
     blanked = re.sub(r"//[^\n]*", lambda match: " " * len(match.group(0)), source)
+    return blank_attributes(blanked)
+
+
+@lru_cache(maxsize=None)
+def without_comments_keeping_docs(source: str) -> str:
+    """Blank `//` comments and attributes but keep `///` docs, preserving offsets."""
+    blanked = re.sub(
+        r"(?<!/)//(?!/)[^\n]*", lambda match: " " * len(match.group(0)), source,
+    )
     return blank_attributes(blanked)
 
 
@@ -319,14 +330,6 @@ def inherent_methods(sources: dict[str, str], type_name: str) -> list[str]:
     return rendered
 
 
-def without_comments_keeping_docs(source: str) -> str:
-    """Blank `//` comments and attributes but keep `///` docs, preserving offsets."""
-    blanked = re.sub(
-        r"(?<!/)//(?!/)[^\n]*", lambda match: " " * len(match.group(0)), source,
-    )
-    return blank_attributes(blanked)
-
-
 def signature_at(source: str, start: int) -> str:
     """The item's signature: everything up to its body or terminating semicolon."""
     depth = 0
@@ -380,15 +383,6 @@ def doc_above(source: str, start: int) -> str:
 
 def render(signature: str, doc: str) -> str:
     return f"/// {doc}\n{signature}" if doc else signature
-
-
-def subsystem_sources(root: Path, files: list[str], record: dict) -> dict[str, str]:
-    prefixes = tuple(record.get("paths", []))
-    return {
-        path: (root / path).read_text(errors="replace")
-        for path in files
-        if path.endswith(".rs") and path.startswith(prefixes)
-    }
 
 
 def hint_matches(
@@ -514,32 +508,41 @@ def definitions_in(root: Path, sources: dict[str, str]) -> dict[str, list[tuple[
 
 
 def interface_text(
-    root: Path, files: list[str], directories: list[str], directory: str, problems: list[str],
+    root: Path,
+    files: list[str],
+    directories: list[str],
+    directory: str,
+    problems: list[str],
+    all_sources: dict[str, str] | None = None,
+    elsewhere: dict[str, list[tuple[str, str, str, str]]] | None = None,
 ) -> str:
+    # The tree-wide read and scan are shared across every subsystem; callers
+    # that generate the whole tree pass them in so each facade costs one pass.
+    if all_sources is None or elsewhere is None:
+        all_sources = {
+            path: (root / path).read_text(errors="replace") for path in files
+            if path.endswith(".rs") and (
+                path.startswith("src/") or (
+                    path.startswith("crates/") and "/src/" in path
+                )
+            )
+        }
+        elsewhere = definitions_in(root, all_sources)
     identifier = module_identifier(directory)
     facade = facade_path(files, directory)
     facade_source = (root / facade).read_text()
     source_prefix = f"{directory}src/" if facade.endswith(CRATE_FACADE) else directory
     # A nested module states its own interface, so its files belong to it, not to its parent.
     nested = [other for other in directories if other != directory and other.startswith(source_prefix)]
-    sources = {
-        path: (root / path).read_text(errors="replace")
-        for path in files
-        if path.startswith(source_prefix)
-        and path.endswith(".rs")
-        and not any(path.startswith(child) for child in nested)
-    }
+    sources: dict[str, str] = {}
+    for path in files:
+        if not path.startswith(source_prefix) or not path.endswith(".rs"):
+            continue
+        if any(path.startswith(child) for child in nested):
+            continue
+        text = all_sources.get(path)
+        sources[path] = text if text is not None else (root / path).read_text(errors="replace")
     definitions = definitions_in(root, sources)
-    # A facade may re-export another subsystem's type; resolve it and say where it comes from.
-    all_sources = {
-        path: (root / path).read_text(errors="replace") for path in files
-        if path.endswith(".rs") and (
-            path.startswith("src/") or (
-                path.startswith("crates/") and "/src/" in path
-            )
-        )
-    }
-    elsewhere = definitions_in(root, all_sources)
     root_facade = (root / "src/lib.rs").read_text() if (root / "src/lib.rs").is_file() else ""
     package_aliases = {
         alias: package
@@ -567,7 +570,8 @@ def interface_text(
 
     rendered: list[tuple[str, str, str]] = []
     missing: list[str] = []
-    for module, defined, name in exported_names(facade_source, problems):
+    facade_exports = exported_names(facade_source, problems)
+    for module, defined, name in facade_exports:
         local = definitions.get(defined) or []
         full = elsewhere.get(defined) or []
         # Honor an unambiguous use-path hint across the whole tree first so a
@@ -610,7 +614,7 @@ def interface_text(
 
     # Both names count: a renamed export is reachable, under the name the facade publishes.
     exported = {
-        item for _, defined, name in exported_names(facade_source) for item in (defined, name)
+        item for _, defined, name in facade_exports for item in (defined, name)
     } | {name for _, name, _ in local_items(facade_source)}
     problems.extend(f"{identifier}: no definition found for exported `{name}`" for name in missing)
     referenced = {
@@ -656,11 +660,22 @@ def interfaces(root: Path) -> tuple[list[tuple[Path, str]], list[str]]:
     """Generated (path, text) pairs, and anything the generator could not parse or resolve."""
     files = tracked_files(root)
     directories = module_directories(files)
+    # Read and scan every source once for the whole tree: each facade resolves
+    # its re-exports against the same definitions.
+    all_sources = {
+        path: (root / path).read_text(errors="replace") for path in files
+        if path.endswith(".rs") and (
+            path.startswith("src/") or (
+                path.startswith("crates/") and "/src/" in path
+            )
+        )
+    }
+    elsewhere = definitions_in(root, all_sources)
     generated, problems = [], []
     for directory in directories:
         generated.append((
             root / f"{directory}INTERFACE.md",
-            interface_text(root, files, directories, directory, problems),
+            interface_text(root, files, directories, directory, problems, all_sources, elsewhere),
         ))
     return generated, problems
 
