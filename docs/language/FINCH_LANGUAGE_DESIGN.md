@@ -2332,6 +2332,28 @@ constructor —
 ("Library ownership carriers and the compiler lifecycle kernel"): failure returns the original,
 still-owned carrier rather than losing it.
 
+`Shared<T>` additionally exposes two operations that must not be composed with each other as a
+manual "check, then act" substitute for `try-into-unique`:
+
+```text
+strong-count = &Self -> uint            # diagnostic only; see below
+get-mut      = &mut Self -> option<&mut T>   # exclusive access without consuming Self
+```
+
+`strong-count` is `pure` — it performs no effect and mutates nothing — but it is **not
+`deterministic`**: its result depends on concurrent activity on other workers holding the same
+`Shared<T>`, so a value read here can be stale before the next instruction runs. It exists for
+logging, assertions, and tests, never as the basis for a subsequent unchecked conversion; reading
+`strong-count` and then separately calling an unchecked "solo" operation would be exactly the
+TOCTOU race `try-into-unique` exists to avoid, since another worker can retain a strong handle
+between the read and the act. `try-into-unique` performs its check-and-convert as one atomic
+operation and never consults a previously observed `strong-count`.
+
+`get-mut` complements `try-into-unique` rather than duplicating it: it borrows exclusive mutable
+access to the pointee when the strong count is 1, without consuming or converting `Self` — the
+`Shared<T>` handle is unchanged and remains shared afterward. Use `try-into-unique` to give up
+sharing entirely; use `get-mut` to mutate in place once while staying shared.
+
 There is no safe unqualified owning heap pointer. Constructing `Shared<T>` from `&local` or any
 other stack borrow is a compile error; promotion consumes the stack value and invalidates its old
 binding. A raw pointer is a non-owning unsafe/FFI primitive and never acquires cleanup behavior by
