@@ -2709,9 +2709,22 @@ indivisibility of the increment or decrement itself; a torn or lost update is no
 of this bug, it is the exact bug atomicity exists to rule out, unconditionally. `Weak<T>`'s count and
 its interaction with `upgrade` need their own careful pass — not specified here, and not to be
 inferred from the strong-count scheme by analogy, since the real proven implementations of this
-(`Arc`'s) have genuine additional subtlety there (a compare-exchange loop on upgrade, and a weak
-count that does not simply mirror the strong count) that deserves dedicated attention rather than a
-guess made alongside this.
+(`Arc`'s) have genuine additional subtlety there (a weak count that does not simply mirror the strong
+count) that deserves dedicated attention rather than a guess made alongside this.
+
+**Added 2026-09-17: why `upgrade` specifically cannot be a plain increment, unlike `retain`.**
+`retain`'s `relaxed` increment above is sound because it can only be called on an already-live
+handle — that handle's own share of the strong count is guaranteed present for the whole call, so
+the count can never reach zero underneath it. `Weak<T>` breaks that precondition on purpose: it does
+not hold a strong reference and does not keep the count above zero, so `upgrade` can race with the
+drop that brings the strong count to zero on a completely different handle, with nothing already
+held to protect it. A plain `fetch_add` there could increment a count that has already reached zero
+— reviving a strong count on an object whose destructor has already run or is about to. `upgrade`
+must instead be a compare-exchange loop: atomically read the current strong count, fail immediately
+without modifying it if that read is already zero, otherwise attempt to swap it from the observed
+value to one more, retrying on a concurrent change. That loop, not a single instruction, is what
+makes "increment, but only if it is not already dead" one atomic decision instead of a read
+observably separated from the write that acts on it.
 
 There is no safe unqualified owning heap pointer. Constructing `Shared<T>` from `&local` or any
 other stack borrow is a compile error; promotion consumes the stack value and invalidates its old
