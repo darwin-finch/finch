@@ -1,6 +1,7 @@
 // Configuration module
 // Public interface for configuration loading
 
+mod atomic_write;
 mod backend;
 mod constants;
 mod loader;

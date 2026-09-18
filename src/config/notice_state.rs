@@ -41,38 +41,16 @@ impl NoticeState {
 
     /// Write the state file, creating its directory if needed.
     pub(crate) fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
-        }
         let text = toml::to_string_pretty(self).context("Failed to serialize notice state")?;
-        // Write-and-rename, not a plain write. Two Finch processes can start
-        // at the same moment and both land here, and a plain write to the
-        // target truncates it before the new bytes land — so a save that then
-        // fails destroys the previous record. Creating a temporary fails
-        // first, leaving the old file untouched.
-        //
-        // Not a durability guarantee: neither the file nor the directory is
-        // fsynced, so a crash or power loss can still expose a truncated file
-        // on some filesystems. `load_from`'s tolerance of unreadable state is
-        // what covers that, and it stays load-bearing. The process id keeps two
-        // *processes* off one temporary; two threads in one process would
-        // share it, which nothing here does.
-        let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-        std::fs::write(&temporary, text)
-            .with_context(|| format!("Failed to write {}", temporary.display()))?;
-        if let Err(error) = std::fs::rename(&temporary, path) {
-            // Do not leave `notice_state.toml.<pid>.tmp` littering ~/.finch.
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error).with_context(|| {
-                format!(
-                    "Failed to replace {} with {}",
-                    path.display(),
-                    temporary.display()
-                )
-            });
-        }
-        Ok(())
+        // Atomic replacement through the same helper as `Config::save_to`:
+        // write a private temporary beside the target, fsync it, rename. Two
+        // Finch processes can start at the same moment and both land here — a
+        // plain write to the target would truncate it before the new bytes
+        // land, so a save that then failed would destroy the previous record;
+        // creating a temporary fails first, leaving the old file untouched.
+        // The temporary is unique per call, so two processes cannot collide on
+        // one, and a failure removes it on drop.
+        super::atomic_write::atomic_write(path, text.as_bytes())
     }
 }
 

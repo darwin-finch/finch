@@ -19,6 +19,13 @@ credential/reasoning types from `finch-providers`. Three unwanted edges remain, 
 or error text; see the redaction rules in the root instructions before touching
 `credential.rs`.
 
+**Startup writes nothing; saves are atomic.** Ordinary start and attach perform no configuration
+save — notice bookkeeping lives in `notice_state.toml`, and the legacy `notice_suppress_until` is
+read but never written back (#76). Only intentional changes save, and every save goes through
+`atomic_write` in this module: symlink target refused, private same-directory temporary, fsync,
+mode preserved, atomic rename, temporary removed on failure. The production-boundary regressions
+that drive the real binary are `tests/startup_is_readonly_on_config.rs`.
+
 **Instruction loading is an invariant.** The load order and deduplication rules live in
 [context assembly](../context/ASSEMBLY.md) and are pinned by the root
 [Context invariant](../../CLAUDE.md#context).
