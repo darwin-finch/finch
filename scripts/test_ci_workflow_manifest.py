@@ -128,6 +128,7 @@ class WorkflowContractTests(unittest.TestCase):
             "ci.yml",
             "    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
             "    if: true\n",
+            after="    name: Test (macos-14, default)\n",
         )
         self.assert_fails(
             "ci.yml: expanded check allocation changed",
@@ -145,6 +146,29 @@ class WorkflowContractTests(unittest.TestCase):
             "ci.yml: job 'build' must stay main-only",
             "release preflight compiles are not pull-request merge gates",
             "expanded check allocation changed",
+        )
+
+    def test_no_default_suite_is_not_a_pull_request_gate(self) -> None:
+        self.repository.replace(
+            "ci.yml",
+            "  test-no-default:\n    name: Test (ubuntu-24.04, no-default-features)\n",
+            "  test-no-default:\n    if: true\n    name: Test (ubuntu-24.04, no-default-features)\n",
+        )
+        self.assert_fails(
+            "ci.yml: job 'test-no-default' must stay main-only",
+            "the no-default-features suite is not a pull-request merge gate",
+        )
+
+    def test_isolation_macos_job_stays_off_pull_requests(self) -> None:
+        self.repository.replace(
+            "issue-56-brain-isolation.yml",
+            "    if: github.event_name != 'pull_request'\n    runs-on: macos-14\n",
+            "    runs-on: macos-14\n",
+            after="  isolation-boundaries-macos:\n",
+        )
+        self.assert_fails(
+            "owner job 'isolation-boundaries-macos' must run on macos-14 with "
+            "if: \"github.event_name != 'pull_request'\"",
         )
 
     def test_blacksmith_pilot_runner_label_is_pinned(self) -> None:
@@ -364,9 +388,9 @@ class WorkflowContractTests(unittest.TestCase):
                 "API default accepted-status set changed",
             ),
             (
-                '          ISSUE_TITLE = "CI failed on main"\n',
-                '          ISSUE_TITLE = "Main CI is red"\n',
-                "breakage issue title changed",
+                '          ISSUE_TITLES = {"CI": "CI failed on main", "Brain isolation security": "Brain isolation failed on main"}\n',
+                '          ISSUE_TITLES = {"CI": "Main CI is red", "Brain isolation security": "Brain isolation failed on main"}\n',
+                "breakage issue titles changed",
             ),
         )
         for old, new, *diagnostics in mutations:

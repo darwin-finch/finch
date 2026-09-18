@@ -57,12 +57,6 @@ jobs:
             cache_family: debug-default_all-features-clippy_release-default
             cargo_args: ""
             timeout_minutes: 90
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            feature_name: no-default-features
-            cache_family: debug-no-default-features
-            cargo_args: --no-default-features
-            timeout_minutes: 45
 
     steps:
     - name: Checkout code
@@ -119,6 +113,48 @@ jobs:
       if: matrix.feature_name == 'default'
       run: cargo clippy --bin finch --all-features
       continue-on-error: true
+
+  # The minimal-feature-graph suite proves the core builds and tests without
+  # the default ONNX/Candle stacks. Feature rot is caught here on trusted
+  # main (with the main breakage filer reporting) rather than on every PR:
+  # the row is not the PR critical path, and the check costs billed minutes.
+  test-no-default:
+    name: Test (ubuntu-24.04, no-default-features)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    env:
+      CARGO_BUILD_JOBS: 6
+    timeout-minutes: 45
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install capnproto (Ubuntu)
+      run: sudo apt-get update && sudo apt-get install -y capnproto
+
+    - name: Install repository Rust toolchain
+      uses: dtolnay/rust-toolchain@1.98.0
+      with:
+        components: clippy
+
+    - name: Restore compatible Cargo dependencies and build artifacts
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      continue-on-error: true
+      with:
+        cache-provider: github
+        shared-key: finch-cargo-v5-ubuntu-24.04-${{ runner.arch }}-x86_64-unknown-linux-gnu-rust-1.98.0-debug-no-default-features-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
+        cache-targets: true
+        cache-bin: false
+        cache-workspace-crates: false
+        cache-all-crates: false
+        cache-on-failure: false
+        save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+    - name: Compile all targets
+      run: cargo test --all-targets --no-default-features --no-run
+
+    - name: Test all targets
+      run: cargo test --all-targets --no-default-features -- --nocapture
 
   # Apple Silicon and Windows remain future build surfaces (`rust-toolchain.toml`
   # still lists those targets). They are not pull-request merge gates: fixing a

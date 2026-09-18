@@ -10,7 +10,7 @@ name: CI main breakage
 
 on:
   workflow_run:
-    workflows: [CI]
+    workflows: [CI, Brain isolation security]
     types: [completed]
 
 permissions:
@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   report-main-breakage:
-    if: github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'
+    if: github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -36,7 +36,12 @@ jobs:
           import urllib.request
           from datetime import datetime, timezone
 
-          ISSUE_TITLE = "CI failed on main"
+          ISSUE_TITLES = {"CI": "CI failed on main", "Brain isolation security": "Brain isolation failed on main"}
+          CANONICAL_PATHS = {
+              "CI": ".github/workflows/ci.yml",
+              "Brain isolation security": ".github/workflows/issue-56-brain-isolation.yml",
+          }
+          ALLOWED_RUNS = {"CI": ("push",), "Brain isolation security": ("push", "schedule")}
           LABEL = "ci-main-breakage"
           PAGE_SIZE = 100
           MAX_API_REQUESTS = 12
@@ -93,7 +98,7 @@ jobs:
                   fail(f"{label} is not a 40-digit hexadecimal SHA")
               return value.lower()
 
-          def open_breakage_issues():
+          def open_breakage_issues(title):
               data = api(
                   "GET",
                   f"/repos/{repo}/issues?labels={LABEL}&state=open&per_page={PAGE_SIZE}",
@@ -104,7 +109,7 @@ jobs:
                   issue for issue in data
                   if isinstance(issue, dict)
                   and issue.get("pull_request") is None
-                  and issue.get("title") == ISSUE_TITLE
+                  and issue.get("title") == title
               ]
 
           def failed_job_names():
@@ -156,9 +161,20 @@ jobs:
               if conclusion not in ("failure", "success"):
                   print(f"conclusion {conclusion!r} needs no breakage report")
                   sys.exit(0)
-              if payload.get("event") != "push" or payload.get("head_branch") != "main":
-                  print("non-main-push canonical CI run is outside breakage reporting")
+              run_name = payload.get("name")
+              if run_name not in ALLOWED_RUNS:
+                  print(f"run {run_name!r} is outside breakage reporting")
                   sys.exit(0)
+              if payload.get("path") != CANONICAL_PATHS.get(run_name):
+                  print(f"run {run_name!r} does not match its canonical workflow path")
+                  sys.exit(0)
+              if payload.get("event") not in ALLOWED_RUNS[run_name]:
+                  print(f"{run_name} {payload.get('event')!r} runs are outside breakage reporting")
+                  sys.exit(0)
+              if payload.get("head_branch") != "main":
+                  print("non-main canonical runs are outside breakage reporting")
+                  sys.exit(0)
+              issue_title = ISSUE_TITLES[run_name]
               repository = event.get("repository")
               repo = repository.get("full_name") if isinstance(repository, dict) else None
               if not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
@@ -181,13 +197,13 @@ jobs:
                       },
                   )
 
-              issues = open_breakage_issues()
+              issues = open_breakage_issues(issue_title)
               if len(issues) > 1:
                   fail(f"expected at most one open breakage issue; found {len(issues)}")
 
               if conclusion == "success":
                   if not issues:
-                      print("CI on main passed; no open breakage issue to close")
+                      print("Main is green; no open breakage issue to close")
                       sys.exit(0)
                   number = integer(issues[0].get("number"), "breakage issue number")
                   api(
@@ -195,7 +211,7 @@ jobs:
                       f"/repos/{repo}/issues/{number}/comments",
                       payload={
                           "body": (
-                              "CI on main passed again.\n\n"
+                              "The run that failed this issue has since passed on main.\n\n"
                               f"Run: {run_url}\nCommit: {head_sha}\n\n"
                               "Closing this issue; it reopens if main breaks later."
                           )
@@ -209,7 +225,7 @@ jobs:
                   print(f"closed breakage issue {number}")
                   sys.exit(0)
 
-              report = failure_report("failed")
+              report = failure_report(f"{run_name} on main")
               if issues:
                   number = integer(issues[0].get("number"), "breakage issue number")
                   api(
@@ -231,7 +247,7 @@ jobs:
               created = api(
                   "POST",
                   f"/repos/{repo}/issues",
-                  payload={"title": ISSUE_TITLE, "body": body, "labels": [LABEL]},
+                  payload={"title": issue_title, "body": body, "labels": [LABEL]},
               )
               number = integer(created.get("number"), "created breakage issue number")
               print(f"filed breakage issue {number}")

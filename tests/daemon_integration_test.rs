@@ -62,7 +62,12 @@ impl TestDaemon {
         let child = command.spawn().context("spawn isolated Finch daemon")?;
         let mut child = OwnedChild(child);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Coarse liveness bound, not a latency assertion (#476): a full daemon
+        // startup on a loaded shared runner can exceed 30s (measured 0-byte
+        // log, alive-but-unbound at 30s); the security assertions below
+        // (address within supervisor authority, health responds) hold at any
+        // speed. 60s matches the hostile-mode startup convention.
+        let deadline = Instant::now() + Duration::from_secs(60);
         let address = loop {
             if let Ok(address) = std::fs::read_to_string(&address_file) {
                 break address.trim().to_owned();
@@ -110,7 +115,7 @@ impl TestDaemon {
                 );
                 anyhow::bail!(
                     "isolated daemon remained alive but did not publish its ephemeral address \
-                     within 10s; bounded stderr={stderr:?}; bounded daemon log={daemon_log:?}"
+                     within 60s; bounded stderr={stderr:?}; bounded daemon log={daemon_log:?}"
                 );
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -331,7 +336,10 @@ brain_password = {brain_password:?}
 }
 
 async fn wait_for_health(address: &str) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Same coarse bound as the address wait above: loaded runners start the
+    // daemon slower than a fixed 10s assumes, and health responding at all is
+    // the assertion.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let last_result = match request_health(address, Duration::from_millis(250)) {
             Ok(_) => return Ok(()),

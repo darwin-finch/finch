@@ -43,16 +43,19 @@ CANCELLATION_TOKEN = "${{ github.token }}"
 # release-mode atomic history regression, and the macOS suite.
 BREAKAGE_WORKFLOW = "ci-main-breakage.yml"
 BREAKAGE_JOB = "report-main-breakage"
-BREAKAGE_JOB_IF = (
-    "github.event.workflow_run.event == 'push' && "
-    "github.event.workflow_run.head_branch == 'main'"
-)
+BREAKAGE_JOB_IF = "github.event.workflow_run.head_branch == 'main'"
 BREAKAGE_PERMISSIONS = {"actions": "read", "issues": "write"}
-BREAKAGE_WORKFLOW_RUN = {"workflows": ["CI"], "types": ["completed"]}
+BREAKAGE_WORKFLOW_RUN = {"workflows": ["CI", "Brain isolation security"], "types": ["completed"]}
 BREAKAGE_STEP = "Update the main breakage issue"
 BREAKAGE_TOKEN = "${{ github.token }}"
 BREAKAGE_API_DEFAULT = "def api(method, path, expected=(200, 201), payload=None):"
-BREAKAGE_ISSUE_TITLE = 'ISSUE_TITLE = "CI failed on main"'
+BREAKAGE_ALLOWED_RUNS = (
+    'ALLOWED_RUNS = {"CI": ("push",), "Brain isolation security": ("push", "schedule")}'
+)
+BREAKAGE_ISSUE_TITLES = (
+    'ISSUE_TITLES = {"CI": "CI failed on main",'
+    ' "Brain isolation security": "Brain isolation failed on main"}'
+)
 BREAKAGE_LABEL = 'LABEL = "ci-main-breakage"'
 
 # Exact triggers are reviewed separately from fixture activation so a path change cannot hide
@@ -85,7 +88,9 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
         "build.rs", "schema/**", "src/bin/finch-test-supervisor.rs", "src/brain/**",
         "src/daemon/**", "src/ipc/**", "src/node/**", "src/server/**",
         "src/client/daemon_client.rs", "src/cli/repl_event/brain_handler.rs",
-        "scripts/**", "tests/**", "docs/AUTOMATIC_TRAINING.md", "docs/DEVELOPMENT.md",
+        "scripts/test_brains.sh", "scripts/test_brain_isolation.sh",
+        "scripts/with-cargo-slot", "scripts/test-with-cargo-slot",
+        "tests/**", "docs/AUTOMATIC_TRAINING.md", "docs/DEVELOPMENT.md",
         "tests/README.md",
     ),
     "repository-hygiene.yml": None,
@@ -198,18 +203,23 @@ MAIN_ONLY_IF = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
 MAIN_ONLY_JOBS = {
     ("ci.yml", "test-macos"): "the 120-minute macOS suite is not a pull-request merge gate",
     ("ci.yml", "build"): "release preflight compiles are not pull-request merge gates",
+    ("ci.yml", "test-no-default"): "the no-default-features suite is not a pull-request merge gate",
 }
+
+# Weekly-scheduled jobs that must skip pull requests but still run on main,
+# the weekly schedule, and manual dispatch. Equality is the contract.
+NON_PR_IF = "github.event_name != 'pull_request'"
 
 EXPECTED_CHECKS = {
     "ci.yml": (
         "Runtime Authority (Ubuntu)",
         "Security Audit",
-        "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
+        "Test (ubuntu-24.04, default)",
         "Toolchain and formatting contract",
     ),
     "docs.yml": ("Current docs links, claims, and shell syntax",),
     "issue-201-chatgpt-auth.yml": ("windows-verifier-compile",),
-    ISOLATION_WORKFLOW: ("Isolation boundaries (macos-14)", "Isolation boundaries (ubuntu-24.04)"),
+    ISOLATION_WORKFLOW: ("Isolation boundaries (ubuntu-24.04)",),
     "repository-hygiene.yml": ("Tracked tree (ubuntu-24.04)",),
 }
 
@@ -309,6 +319,15 @@ CACHE_SPECS = {
     ("ci.yml", "test"): {
         "name": "Restore compatible Cargo dependencies and build artifacts",
         "shared-key": MATRIX_CACHE_KEY,
+        "save-if": MAIN_SAVE_IF,
+        "before": "Compile all targets",
+        "env": TEST_JOB_ENV,
+    },
+    ("ci.yml", "test-no-default"): {
+        "name": "Restore compatible Cargo dependencies and build artifacts",
+        "shared-key": literal_cache_key(
+            "ubuntu-24.04", "x86_64-unknown-linux-gnu", "debug-no-default-features",
+        ),
         "save-if": MAIN_SAVE_IF,
         "before": "Compile all targets",
         "env": TEST_JOB_ENV,
@@ -485,7 +504,7 @@ def expanded_checks(document: dict[str, Any], display: str) -> tuple[str, ...]:
     for job_id, job in jobs.items():
         if not isinstance(job_id, str) or not isinstance(job, dict):
             raise ContractError(f"{display}: each job must have a string id and mapping body")
-        if job.get("if") == MAIN_ONLY_IF:
+        if job.get("if") in (MAIN_ONLY_IF, NON_PR_IF):
             continue
         explicit_name = job.get("name")
         if explicit_name is not None and not isinstance(explicit_name, str):
@@ -913,12 +932,6 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
             "cache_family": "debug-default_all-features-clippy_release-default",
             "cargo_args": "", "timeout_minutes": 90,
         },
-        {
-            "os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu",
-            "feature_name": "no-default-features",
-            "cache_family": "debug-no-default-features",
-            "cargo_args": "--no-default-features", "timeout_minutes": 45,
-        },
     ]
     actual_test_matrix = (
         documents.get("ci.yml", {}).get("jobs", {}).get("test", {})
@@ -1092,7 +1105,15 @@ def isolation_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
             f"expected={sorted(ISOLATION_JOBS)!r} actual={sorted(jobs)!r}"
         )
     for job_id, runner in ISOLATION_JOBS.items():
-        errors.extend(active_owner_job_errors(documents, ISOLATION_WORKFLOW, job_id, runner))
+        job = documents.get(ISOLATION_WORKFLOW, {}).get("jobs", {}).get(job_id)
+        expected_if = NON_PR_IF if job_id == "isolation-boundaries-macos" else None
+        if expected_if is None:
+            errors.extend(active_owner_job_errors(documents, ISOLATION_WORKFLOW, job_id, runner))
+        elif not isinstance(job, dict) or job.get("if") != expected_if or job.get("runs-on") != runner:
+            errors.append(
+                f"{ISOLATION_WORKFLOW}: owner job {job_id!r} must run on {runner} with "
+                f"if: {expected_if!r} (trusted main, weekly, dispatch — never pull requests)"
+            )
         job = jobs.get(job_id)
         steps = job.get("steps") if isinstance(job, dict) else None
         if not isinstance(steps, list):
@@ -1421,7 +1442,8 @@ def breakage_controller_errors(documents: dict[str, dict[str, Any]]) -> list[str
     else:
         for pinned, what in (
             (BREAKAGE_API_DEFAULT, "API default accepted-status set"),
-            (BREAKAGE_ISSUE_TITLE, "breakage issue title"),
+            (BREAKAGE_ALLOWED_RUNS, "run allowlist"),
+            (BREAKAGE_ISSUE_TITLES, "breakage issue titles"),
             (BREAKAGE_LABEL, "breakage issue label"),
         ):
             if pinned not in run:
