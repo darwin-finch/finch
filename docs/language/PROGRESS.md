@@ -374,3 +374,35 @@ real, shipped syntax change: `let`/binding lists now use `[...]`, not doubled `(
   full flattening would be ambiguous. The proposed fix instead re-brackets only the outer list to
   `[...]`, keeping each parameter's own `(...)` grouping: `(define (square [(x : int)]) : int ...)`.
   Proposed, not yet written into the spec or applied to existing examples — pending confirmation.
+
+**Continued 2026-09-17 — attempted the parameter-list `[...]` fix above, found the proposal itself
+was wrong, reverted before committing, and shipped a different, real addition instead
+(`ParameterSpec`/`ParamEntry`).**
+
+- **The revert:** a scripted conversion assumed `define` has a separate "params-only" wrapper list
+  distinct from the function name, the same way `lambda` genuinely does
+  (`(lambda ((x : int)) body)`). Checking `save-report`'s real multi-parameter shape —
+  `(define (save-report (path : ...) (contents : string)) : unit ...)` — disproves that: `define`'s
+  name and every parameter entry are flat siblings in one list, no separate params wrapper at all.
+  The script re-bracketed the first entry's own parens instead of a wrapper that doesn't exist,
+  corrupting multi-parameter signatures (mismatched `[`/`)`). Caught before commit
+  (`git diff --stat` showed only the one bad file; `git checkout --` discarded it cleanly). `define`
+  and `lambda` genuinely disagree with each other on this shape — real, still open, needs a
+  considered fix rather than a scripted one next time.
+- **`ParameterSpec`/`ParamEntry` added instead**, prompted by Shammah's point that CTFE functions
+  need real structure to inspect, not raw syntax they'd have to re-parse themselves ("otherwise they
+  have to re-invent the parser and a lot of other compiler machinery"). Checked first rather than
+  assumed unaddressed — the document already states the right principle ("syntax values are not bare
+  lists... public syntax constructors and projections") and already has one concrete instance,
+  `CaptureSpec`/`CaptureEntry` for lambda captures — but nothing analogous existed for an ordinary
+  parameter list. Added by reusing `CaptureEntry`'s existing before/after-name-resolution field split
+  directly (syntax identifier + written annotation, then binding ID + resolved type + resolved
+  ownership mode + origin) rather than inventing a second shape; `CaptureSpec.parameters` is now
+  `ParameterSpec`, not a parallel description of the same list.
+- **Corrected, same conversation, a related question about quote vs. quasiquote:** checked against
+  the actual text ("`'form` produces `syntax`... `` ` `` is a template") rather than accepting a
+  plausible-sounding "quote gives flat data, quasiquote gives the AST" hypothesis — both quote and
+  quasiquote (with no unquote holes) produce the same `syntax` value; the real difference is that
+  quasiquote allows `,`/`,@` holes and quote doesn't. Also corrected my own earlier answer in this
+  same conversation, which had described a quoted parameter form as "a flat list of symbols" — that
+  describes `syntax->datum`'s explicit, lossy output, not the default `syntax` value.

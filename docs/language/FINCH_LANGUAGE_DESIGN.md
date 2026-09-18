@@ -3536,6 +3536,33 @@ expansion participate in the completed capture set. Typed later-stage reflection
 resolved plan but cannot mutate compiler-private physical offsets. Co-Forth syntax construction
 exposes the same semantic capture nodes rather than requiring generation of CoLisp text.
 
+**Added 2026-09-17: `ParameterSpec`/`ParamEntry` — ordinary parameters get the same structured
+reflection captures already have, not a second, ad hoc shape.** Without this, a CTFE function
+inspecting a `define`'s or `lambda`'s signature would have to re-derive "which part is the name,
+which part is the type, was an ownership keyword present" itself, from raw syntax, the same parsing
+work the compiler's own front end already does once — exactly the "re-invent a chunk of the
+compiler" cost this document already rejected for captures. `CaptureEntry`'s own field split is
+reused directly rather than invented twice:
+
+- **`ParamEntry`** — one parameter. Before name resolution: the syntax identifier as written, the
+  ownership-mode annotation as written or its absence (unannotated means the existing `borrow`
+  default, not an unset field), and the type expression as written. After name resolution: a stable
+  binding ID, the resolved type, the resolved ownership mode with the default already applied, and
+  the source origin — the same before/after split `CaptureEntry` already has.
+- **`ParameterSpec`** — the ordered list of `ParamEntry` values for one signature, plus what a
+  signature has that a capture list doesn't: the declared or inferred return type and effect row,
+  source span, and origin.
+- **`CaptureSpec.parameters` is `ParameterSpec`, not a second, parallel description of the same
+  parameter list.** A lambda's ordinary parameters and its captures are different concepts (one
+  parameter is bound by the caller at each call; one capture is bound once, from the enclosing
+  scope, at creation) but they were already going to share one representation of "name, type,
+  ownership mode, origin" — `CaptureEntry` already had exactly that shape before this addition, it
+  was just never named as a reusable type in its own right.
+
+This closes the gap directly: a `define`'s or `lambda`'s signature is introspectable the same way its
+captures already are, with the same before/after-resolution promise, rather than only captures
+getting real structure and parameters being left as something a macro re-parses by hand.
+
 An expansion may emit ordinary type, callable, and concept-implementation declarations. This is
 how a derive macro can generate serialization code *and* publish the explicit evidence that the
 record satisfies `JsonSerializable`; generating methods with familiar names is never sufficient.
