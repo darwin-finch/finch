@@ -22,8 +22,9 @@ pub use concrete::{
     ToolExecutionMessage, UserQueryMessage,
 };
 pub use work_unit::{
-    random_spinner_verb, AgentActivityView, AgentToolView, WorkRow, WorkRowStatus, WorkRowView,
-    WorkUnit, WorkUnitHead, WorkUnitView,
+    random_spinner_verb, AgentActivityView, AgentToolView, ComponentAction, OutputVm,
+    ProgramSourceVm, SayTurnStatus, SayTurnView, ToggleProgram, WorkRow, WorkRowStatus,
+    WorkRowView, WorkUnit, WorkUnitHead, WorkUnitView, WorkUnitViewModel,
 };
 pub use work_unit::{WorkRowPresentation, WorkUnitPresentation};
 
@@ -102,6 +103,29 @@ pub trait Message: Send + Sync {
     /// domain data, never a widget kind (#805).
     fn work_unit_view(&self, _colors: &crate::theme::ColorScheme) -> Option<WorkUnitView> {
         None
+    }
+
+    /// The component-owned ViewModel snapshot of a migrated say turn (#882,
+    /// stage 1 of docs/TUI_DESIGN.md), read under the message's own lock.
+    /// `None` for rows that have not migrated to component-owned rendering;
+    /// those keep the renderer's RowId-keyed disclosure maps. The renderer
+    /// asks this instead of matching on the message type.
+    fn say_turn_view(&self) -> Option<SayTurnView> {
+        None
+    }
+
+    /// The component-defined action a click on the row at `path` produces.
+    /// The engine resolves it and routes it to [`Self::handle_transcript_action`]
+    /// without inspecting it — there is no central action enum.
+    fn transcript_action(&self, _path: &[u32]) -> Option<ComponentAction> {
+        None
+    }
+
+    /// Route a component action to the owning component's handle, which
+    /// mutates the component ViewModel under the message's lock. True when
+    /// handled.
+    fn handle_transcript_action(&self, _action: &ComponentAction) -> bool {
+        false
     }
 
     /// Get the background style for this message type (for TUI rendering)

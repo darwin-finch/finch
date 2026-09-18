@@ -36,6 +36,7 @@ use std::time::Duration;
 use tui_textarea::TextArea;
 
 use super::{OutputManager, StatusBar, StatusLineType};
+use crate::cli::components::vocab::input_line_physical_rows_with_ghost;
 use crate::cli::messages::{MessageId, MessageRef, MessageStatus, WorkUnitPresentation};
 // Sub-modules
 mod accordion;
@@ -81,7 +82,9 @@ use autocomplete_widget::{completion_pane_lines, replace_command_prefix, replace
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use graph::{GraphNode, GraphNodeAuthor, GraphNodeKind, GraphNodeStatus, GraphView};
-pub use shadow_buffer::{physical_rows, visible_length};
+pub use shadow_buffer::{
+    extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
+};
 
 /// Best-effort terminal restoration for an exit path that cannot acquire the
 /// renderer lock.  This is intentionally independent of [`TuiRenderer`]:
@@ -580,32 +583,6 @@ fn input_physical_rows(lines: &[String], terminal_width: usize) -> usize {
 
 fn input_line_physical_rows(lines: &[String], terminal_width: usize) -> Vec<usize> {
     input_line_physical_rows_with_ghost(lines, terminal_width, None)
-}
-
-fn input_line_physical_rows_with_ghost(
-    lines: &[String],
-    terminal_width: usize,
-    ghost_text: Option<&str>,
-) -> Vec<usize> {
-    let width = terminal_width.max(1);
-    if lines.is_empty() {
-        return vec![1];
-    }
-    lines
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let prefix_width = 2; // `❯ ` and continuation indentation are both two columns.
-            let ghost_width = if lines.len() == 1 && index == 0 {
-                ghost_text.map(shadow_buffer::visible_length).unwrap_or(0)
-            } else {
-                0
-            };
-            (prefix_width + shadow_buffer::visible_length(line) + ghost_width)
-                .max(1)
-                .div_ceil(width)
-        })
-        .collect()
 }
 
 fn ellipsize(text: &str, width: usize) -> String {
@@ -1473,6 +1450,7 @@ fn transcript_disclosure_hitboxes(
                 right: width.saturating_sub(1) as u16,
             },
             row_expanded: viewport_content[index].row_expanded.unwrap_or(false),
+            component_owned: viewport_content[index].component_owned,
         })
         .collect()
 }
@@ -2202,11 +2180,7 @@ impl TuiRenderer {
     /// Uncommitted suffix in order, minus completed program source once a
     /// later program-output row has body. Replaced IR stays in the manager.
     fn find_live_messages(&self) -> Vec<MessageRef> {
-        let messages = self.output_manager.get_messages();
-        without_replaced_program_source(
-            uncommitted_suffix(messages.clone(), &self.printed_ids),
-            &messages,
-        )
+        uncommitted_suffix(self.output_manager.get_messages(), &self.printed_ids)
     }
 }
 
@@ -2274,20 +2248,6 @@ fn is_completed_program_source(message: &MessageRef) -> bool {
         })
 }
 
-/// Completed program source whose nearest later program-output row has body.
-fn replaced_completed_program_source_ids(messages: &[MessageRef]) -> HashSet<MessageId> {
-    let mut replaced = HashSet::new();
-    for (index, message) in messages.iter().enumerate() {
-        if !is_completed_program_source(message) {
-            continue;
-        }
-        if later_program_output(messages, index).is_some_and(|(has_body, _)| has_body) {
-            replaced.insert(message.id());
-        }
-    }
-    replaced
-}
-
 fn defer_completed_program_source(messages: &[MessageRef], index: usize) -> bool {
     if !is_completed_program_source(&messages[index]) {
         return false;
@@ -2296,45 +2256,32 @@ fn defer_completed_program_source(messages: &[MessageRef], index: usize) -> bool
         .is_some_and(|(has_body, status)| status == MessageStatus::InProgress && !has_body)
 }
 
-fn without_replaced_program_source(
-    selected: Vec<MessageRef>,
-    all: &[MessageRef],
-) -> Vec<MessageRef> {
-    let replaced = replaced_completed_program_source_ids(all);
-    selected
-        .into_iter()
-        .filter(|message| !replaced.contains(&message.id()))
-        .collect()
-}
-
 fn visible_printed_messages(
     messages: &[MessageRef],
     printed_ids: &HashSet<MessageId>,
 ) -> Vec<MessageRef> {
-    without_replaced_program_source(
-        messages
-            .iter()
-            .filter(|message| printed_ids.contains(&message.id()))
-            .cloned()
-            .collect(),
-        messages,
-    )
+    messages
+        .iter()
+        .filter(|message| printed_ids.contains(&message.id()))
+        .cloned()
+        .collect()
 }
 
 struct CanonicalCommitPlan {
     emit: Vec<MessageRef>,
-    consume_without_emit: Vec<MessageId>,
 }
 
-/// Completed prefix of unprinted messages. Replaced program source is consumed
-/// without writing so it cannot block later output or reappear in history.
+/// Completed prefix of unprinted messages. Since the component-owned say turn
+/// (#882) the program source is show_program-gated card content, never a
+/// deleted row: every completed message emits its canonical record exactly
+/// once. A completed program source only waits (staying in the live suffix)
+/// while its paired output is still running without body, so source and
+/// output cannot commit out of order.
 fn plan_canonical_commit(
     messages: &[MessageRef],
     printed_ids: &HashSet<MessageId>,
 ) -> CanonicalCommitPlan {
-    let replaced = replaced_completed_program_source_ids(messages);
     let mut emit = Vec::new();
-    let mut consume_without_emit = Vec::new();
     for (index, message) in messages.iter().enumerate() {
         if printed_ids.contains(&message.id()) {
             continue;
@@ -2342,27 +2289,16 @@ fn plan_canonical_commit(
         match message.status() {
             MessageStatus::InProgress => break,
             MessageStatus::Complete | MessageStatus::Failed => {
-                if replaced.contains(&message.id()) {
-                    consume_without_emit.push(message.id());
-                } else if defer_completed_program_source(messages, index) {
+                if defer_completed_program_source(messages, index) {
                     // Stay in the live suffix until the paired output has body
                     // or completes empty.
                     break;
-                } else {
-                    emit.push(message.clone());
                 }
+                emit.push(message.clone());
             }
         }
     }
-    CanonicalCommitPlan {
-        emit,
-        consume_without_emit,
-    }
-}
-
-fn swap_completed_program_source_for_output(messages: Vec<MessageRef>) -> Vec<MessageRef> {
-    let all = messages.clone();
-    without_replaced_program_source(messages, &all)
+    CanonicalCommitPlan { emit }
 }
 
 /// Select the newest transcript rows that fit in a visible viewport slice.
@@ -2674,7 +2610,7 @@ impl TuiRenderer {
         // uncommitted suffix until its canonical bytes are actually written.
         if self.viewport_invalidated {
             self.redraw_full_viewport()?;
-            if plan.emit.is_empty() && plan.consume_without_emit.is_empty() {
+            if plan.emit.is_empty() {
                 self.live_area_dirty = false;
                 return Ok(());
             }
@@ -2685,7 +2621,6 @@ impl TuiRenderer {
             prepare_canonical_commit_guarded(&mut stdout)?;
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
-            self.printed_ids.extend(plan.consume_without_emit);
             let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
             let committed_rows = match commit_complete_messages(
                 &mut stdout,
@@ -2712,10 +2647,6 @@ impl TuiRenderer {
             self.redraw_full_viewport_inner(true)?;
             self.live_area_dirty = false;
         } else {
-            if !plan.consume_without_emit.is_empty() {
-                self.printed_ids.extend(plan.consume_without_emit);
-                self.live_area_dirty = true;
-            }
             // Only redraw when something actually changed: a message is streaming
             // (InProgress) or explicit state mutation marked the area dirty.
             // This eliminates the unconditional erase+draw every 33 ms tick that
@@ -2967,6 +2898,16 @@ impl TuiRenderer {
         message: &MessageRef,
         width: usize,
     ) -> Vec<RenderedTranscriptLine> {
+        // Component-owned say turns (#882): the card renders from the
+        // component ViewModel each frame. Disclosure state lives on the VM —
+        // the renderer's RowId-keyed maps never hold it — and the engine
+        // never matches on the message type: the Message trait answers.
+        if let Some(view) = message.say_turn_view() {
+            let lines = crate::cli::components::card_lines(&view);
+            return self
+                .tool_viewports
+                .project(lines, width, DEFAULT_TOOL_OUTPUT_ROWS);
+        }
         // The ViewModel is the one domain → widget projection: convert the
         // message to props, then render them under the renderer's disclosure
         // state. Widgets never query WorkUnits to decide visibility (#805).
@@ -3075,6 +3016,28 @@ impl TuiRenderer {
         if self.handle_transcript_scroll_key(key) {
             return true;
         }
+        // Component-owned rows (#882): disclosure routes to the component's
+        // handle, which mutates the ViewModel under the message's lock. The
+        // open-set maps never hold these rows' state.
+        if matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+        ) {
+            if let Some(focused) = self.accordion.focused.clone() {
+                if self.accordion.is_component_row(&focused) {
+                    let want = match key.code {
+                        KeyCode::Left => Some(false),
+                        KeyCode::Right => Some(true),
+                        _ => None,
+                    };
+                    if self.dispatch_component_disclosure(&focused, want) {
+                        self.viewport_invalidated = true;
+                        self.live_area_dirty = true;
+                        return true;
+                    }
+                }
+            }
+        }
         if !self.accordion.handle_key(key) {
             return false;
         }
@@ -3134,6 +3097,18 @@ impl TuiRenderer {
                 return true;
             }
         }
+        // A click on a component-owned row (#882) resolves its hitbox to
+        // (RowId, action) and routes the action to the component's handle;
+        // the open-set maps are never consulted for these rows.
+        if is_left_click(&mouse) {
+            if let Some(row_id) = self.accordion.component_region_at(mouse.column, mouse.row) {
+                if self.dispatch_component_disclosure(&row_id, None) {
+                    self.viewport_invalidated = true;
+                    self.live_area_dirty = true;
+                    return true;
+                }
+            }
+        }
         if !self.accordion.handle_mouse(mouse) {
             return false;
         }
@@ -3142,6 +3117,37 @@ impl TuiRenderer {
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
         true
+    }
+
+    /// Route one disclosure event on a component-owned row to the owning
+    /// component's handle. `want` pins the target state for Left/Right
+    /// (`Some`) or toggles (`None`). The action itself is component-defined
+    /// and carried opaquely — the engine never inspects it.
+    fn dispatch_component_disclosure(
+        &self,
+        row_id: &view_model::RowId,
+        want: Option<bool>,
+    ) -> bool {
+        let messages = self.output_manager.get_messages();
+        let Some(message) = messages
+            .iter()
+            .find(|message| message.id() == row_id.message_id)
+        else {
+            return false;
+        };
+        if let Some(want) = want {
+            // Honour the pinned direction without disturbing an already-correct
+            // state: read the component's current disclosure from its ViewModel.
+            if let Some(view) = message.say_turn_view() {
+                if view.vm.show_program == want {
+                    return false;
+                }
+            }
+        }
+        let Some(action) = message.transcript_action(&row_id.path) else {
+            return false;
+        };
+        message.handle_transcript_action(&action)
     }
 
     /// Wheel ticks scroll what the pointer is over (#806): the focused
@@ -6705,7 +6711,14 @@ mod tests {
     }
 
     #[test]
-    fn completed_program_source_swaps_for_visible_output() {
+    fn completed_program_source_stays_visible_beside_its_output() {
+        // INVARIANT (#882, stage 1 of docs/TUI_DESIGN.md): the old say-turn
+        // rule deleted the program-source row once its output had body, which
+        // left a dead disclosure affordance over nothing. The program source
+        // is show_program-gated card content now, never a deleted row — so
+        // the live suffix keeps both rows and only the ordering deferral
+        // (source waits while its paired output is running without body)
+        // remains.
         let source = Arc::new(WorkUnit::new("source"));
         source.set_program_source("lisp");
         source.set_response("(say \"hello\")");
@@ -6718,28 +6731,18 @@ mod tests {
         let source_ref: MessageRef = source.clone();
         let output_ref: MessageRef = output.clone();
         let manager_messages = vec![source_ref.clone(), output_ref.clone()];
-        let live = swap_completed_program_source_for_output(uncommitted_suffix(
-            manager_messages.clone(),
-            &HashSet::new(),
-        ));
-        assert_eq!(live.len(), 1, "output replaces completed IR as the turn");
-        assert_eq!(live[0].format(&ColorScheme::default()), "hello");
-
-        let empty_output = Arc::new(WorkUnit::new("empty-output"));
-        empty_output.set_program_output();
-        let empty_ref: MessageRef = empty_output;
-        let waiting = swap_completed_program_source_for_output(vec![source_ref, empty_ref]);
-        assert_eq!(
-            waiting.len(),
-            2,
-            "completed IR stays until program output has a body"
+        let live = uncommitted_suffix(manager_messages, &HashSet::new());
+        let live_ids: Vec<MessageId> = live.iter().map(|message| message.id()).collect();
+        assert!(
+            live_ids.contains(&source.id()) && live_ids.contains(&output.id()),
+            "both the program source and its output stay visible in the live suffix; ids={live_ids:?}"
         );
 
         let streaming = Arc::new(WorkUnit::new("streaming"));
         streaming.set_program_source("lisp");
         streaming.set_response("(say");
         let streaming_ref: MessageRef = streaming.clone();
-        let ir_only = swap_completed_program_source_for_output(vec![streaming_ref.clone()]);
+        let ir_only = uncommitted_suffix(vec![streaming_ref.clone()], &HashSet::new());
         assert_eq!(
             ir_only.len(),
             1,
@@ -6747,7 +6750,7 @@ mod tests {
         );
 
         let streaming_with_output =
-            swap_completed_program_source_for_output(vec![streaming_ref, output_ref]);
+            uncommitted_suffix(vec![streaming_ref, output_ref], &HashSet::new());
         assert_eq!(
             streaming_with_output.len(),
             2,
@@ -6761,47 +6764,10 @@ mod tests {
             .is_some_and(|row| row.default_open),
             "source stays expanded only while InProgress"
         );
-
-        let tool = Arc::new(WorkUnit::new("tool"));
-        let source_one = Arc::new(WorkUnit::new("source-one"));
-        source_one.set_program_source("lisp");
-        source_one.set_response("(say \"one\")");
-        source_one.set_complete();
-        let output_one = Arc::new(WorkUnit::new("output-one"));
-        output_one.set_program_output();
-        let source_two = Arc::new(WorkUnit::new("source-two"));
-        source_two.set_program_source("lisp");
-        source_two.set_response("(say \"two\")");
-        source_two.set_complete();
-        let output_two = Arc::new(WorkUnit::new("output-two"));
-        output_two.set_program_output();
-        output_two.append_response("hello");
-        let tool_ref: MessageRef = tool;
-        let source_one_ref: MessageRef = source_one.clone();
-        let output_one_ref: MessageRef = output_one;
-        let source_two_ref: MessageRef = source_two.clone();
-        let output_two_ref: MessageRef = output_two;
-        let overlapping = swap_completed_program_source_for_output(vec![
-            tool_ref,
-            source_one_ref,
-            output_one_ref,
-            source_two_ref,
-            output_two_ref,
-        ]);
-        let overlapping_ids: Vec<MessageId> =
-            overlapping.iter().map(|message| message.id()).collect();
-        assert!(
-            overlapping_ids.contains(&source_one.id()),
-            "empty-output source stays visible when a later turn's output has body; ids={overlapping_ids:?}"
-        );
-        assert!(
-            !overlapping_ids.contains(&source_two.id()),
-            "completed IR whose own later output has body is hidden; ids={overlapping_ids:?}"
-        );
     }
 
     #[test]
-    fn completed_program_source_is_not_a_second_visible_item_after_commit() {
+    fn plan_canonical_commit_defers_completed_source_until_paired_output_has_body() {
         let colors = ColorScheme::default();
         let manager = Arc::new(OutputManager::new(colors.clone()));
         manager.disable_stdout();
@@ -6817,53 +6783,53 @@ mod tests {
         source.set_complete();
         let output = Arc::new(WorkUnit::new("output"));
         output.set_program_output();
-        output.append_response("hello");
         manager.add_trait_message(source.clone());
         manager.add_trait_message(output.clone());
 
-        let messages = manager.get_messages();
-        let plan = plan_canonical_commit(&messages, &renderer.printed_ids);
-        let emit_text = plan
-            .emit
-            .iter()
-            .map(|message| message.format(&colors))
-            .collect::<Vec<_>>()
-            .join(" | ");
+        // While the paired output is still running without body, the source
+        // waits in the live suffix; nothing commits out of order.
+        let waiting_plan = plan_canonical_commit(&manager.get_messages(), &HashSet::new());
         assert!(
-            plan.emit.iter().all(|message| message.id() != source.id()),
-            "completed IR must not enter native history once output has body; emit={emit_text}"
-        );
-        assert!(
-            plan.consume_without_emit.contains(&source.id()),
-            "replaced IR must be consumed so later output can commit; consume={:?}",
-            plan.consume_without_emit
+            waiting_plan.emit.is_empty(),
+            "source must not commit while its paired output is live and empty; emit={}",
+            waiting_plan
+                .emit
+                .iter()
+                .map(|message| message.format(&colors))
+                .collect::<Vec<_>>()
+                .join(" | ")
         );
 
+        // Once the output has a body, the source commits its raw program
+        // record: the program is show_program-gated card content now, not a
+        // deleted row (#882).
+        output.append_response("hello");
         let mut staged = Vec::new();
-        renderer.printed_ids.extend(plan.consume_without_emit);
-        if !plan.emit.is_empty() {
-            commit_complete_messages(
-                &mut staged,
-                &plan.emit,
-                &mut renderer.accordion,
-                &colors,
-                &mut renderer.printed_ids,
-                8,
-                80,
-            )
-            .expect("commit replaced-turn prefix");
-        }
+        let plan = plan_canonical_commit(&manager.get_messages(), &renderer.printed_ids);
+        commit_complete_messages(
+            &mut staged,
+            &plan.emit,
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            8,
+            80,
+        )
+        .expect("commit raw program record");
         let staged_text = String::from_utf8(staged).unwrap();
         assert!(
-            !staged_text.contains("Program source") && !staged_text.contains("(say \"hello\")"),
-            "canonical bytes must not contain IR after swap; staged={staged_text:?}"
+            staged_text.contains("(say \"hello\")"),
+            "the canonical record must contain the raw program; staged={staged_text:?}"
+        );
+        assert!(
+            !staged_text.contains("[expanded]") && !staged_text.contains("[collapsed]"),
+            "canonical bytes never carry disclosure chrome; staged={staged_text:?}"
         );
 
+        // The output completes and commits the say bytes exactly once.
         output.set_complete();
-        let messages = manager.get_messages();
-        let plan = plan_canonical_commit(&messages, &renderer.printed_ids);
         let mut staged = Vec::new();
-        renderer.printed_ids.extend(plan.consume_without_emit);
+        let plan = plan_canonical_commit(&manager.get_messages(), &renderer.printed_ids);
         commit_complete_messages(
             &mut staged,
             &plan.emit,
@@ -6879,24 +6845,29 @@ mod tests {
             staged_text.contains("hello"),
             "native history must contain program output; staged={staged_text:?}"
         );
-        assert!(
-            !staged_text.contains("Program source") && !staged_text.contains("(say \"hello\")"),
-            "native history must not contain IR after output commits; staged={staged_text:?}"
+        assert_eq!(
+            staged_text.matches("hello").count(),
+            1,
+            "the output commits exactly once; staged={staged_text:?}"
         );
 
+        // The reconstructed reader shows both rows; each committed exactly once.
         let printed = visible_printed_messages(&manager.get_messages(), &renderer.printed_ids);
         let projected = printed
             .iter()
-            .flat_map(
-                |message| match view_model::project_message(message, &colors) {
+            .flat_map(|message| {
+                if let Some(view) = message.say_turn_view() {
+                    return crate::cli::components::card_lines(&view);
+                }
+                match view_model::project_message(message, &colors) {
                     view_model::ProjectedMessage::Node(node) => {
                         renderer.accordion.render_node(&node)
                     }
                     view_model::ProjectedMessage::Plain(formatted) => {
                         renderer.accordion.render_plain(&formatted.join("\n"))
                     }
-                },
-            )
+                }
+            })
             .map(|line| line.text)
             .collect::<Vec<_>>()
             .join("\n");
@@ -6905,24 +6876,18 @@ mod tests {
             "reconstructed viewport must show program output; projected={projected:?}"
         );
         assert!(
-            !projected.contains("Program source") && !projected.contains("(say \"hello\")"),
-            "reconstructed viewport must not show a second Program source item; projected={projected:?}"
+            projected.contains("Program source"),
+            "reconstructed viewport keeps the program-source row; projected={projected:?}"
         );
 
         let retained = manager.get_messages();
         assert_eq!(
             retained.len(),
             2,
-            "source remains in the manager after it leaves the transcript"
-        );
-        assert!(
-            retained
-                .iter()
-                .any(|message| message.content().contains("(say \"hello\")")),
-            "manager still holds IR for inspect/copy; contents={:?}",
-            retained.iter().map(|m| m.content()).collect::<Vec<_>>()
+            "the manager retains both rows of the turn"
         );
 
+        // A source whose output finishes empty still commits (no dead wait).
         let waiting_manager = Arc::new(OutputManager::new(colors.clone()));
         waiting_manager.disable_stdout();
         let waiting_source = Arc::new(WorkUnit::new("waiting-source"));
@@ -6933,33 +6898,6 @@ mod tests {
         empty_output.set_program_output();
         waiting_manager.add_trait_message(waiting_source.clone());
         waiting_manager.add_trait_message(empty_output.clone());
-        let waiting_messages = waiting_manager.get_messages();
-        let waiting_plan = plan_canonical_commit(&waiting_messages, &HashSet::new());
-        assert!(
-            waiting_plan
-                .emit
-                .iter()
-                .all(|message| message.id() != waiting_source.id())
-                && !waiting_plan
-                    .consume_without_emit
-                    .contains(&waiting_source.id()),
-            "completed IR must not commit while paired output is still empty and live; emit={} consume={:?}",
-            waiting_plan
-                .emit
-                .iter()
-                .map(|message| message.format(&colors))
-                .collect::<Vec<_>>()
-                .join(" | "),
-            waiting_plan.consume_without_emit
-        );
-        let waiting_live = swap_completed_program_source_for_output(waiting_messages.clone());
-        assert!(
-            waiting_live
-                .iter()
-                .any(|message| message.id() == waiting_source.id()),
-            "empty live output keeps source visible until a body arrives"
-        );
-
         empty_output.set_complete();
         let empty_complete_plan =
             plan_canonical_commit(&waiting_manager.get_messages(), &HashSet::new());
@@ -6968,13 +6906,109 @@ mod tests {
                 .emit
                 .iter()
                 .any(|message| message.id() == waiting_source.id()),
-            "completed IR stays on the commit path when output finishes empty; emit={}",
+            "completed IR commits when its output finishes empty; emit={}",
             empty_complete_plan
                 .emit
                 .iter()
                 .map(|message| message.format(&colors))
                 .collect::<Vec<_>>()
                 .join(" | ")
+        );
+    }
+
+    #[test]
+    fn say_card_disclosure_lives_on_the_component_view_model_not_the_renderer_maps() {
+        // INVARIANT (#882): a migrated say turn's show_program state lives on
+        // the component ViewModel. The renderer's RowId-keyed maps must stay
+        // empty for the card's row, and toggling must go through the
+        // component action, not the accordion.
+        let colors = ColorScheme::default();
+        let manager = Arc::new(OutputManager::new(colors.clone()));
+        manager.disable_stdout();
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::clone(&manager),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+
+        let output = Arc::new(WorkUnit::new("VM program output"));
+        output.set_program_output();
+        output.begin_say_turn("lisp", "(say \"hello\")");
+        output.append_response("hello");
+        output.set_complete();
+        manager.add_trait_message(output.clone());
+
+        let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let chrome = lines.first().expect("the card renders a chrome line");
+        assert!(
+            chrome.component_owned,
+            "the card's chrome is a component-owned row; lines={lines:?}"
+        );
+        assert!(
+            chrome.text.contains('\u{25b6}'),
+            "program can be shown, so the closed arrow renders; got {:?}",
+            chrome.text
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.text.contains("(say \"hello\")")),
+            "show_program defaults to false for a say turn; got {:?}",
+            lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+        );
+
+        // Click the chrome row: the hitbox resolves to the card's RowId and
+        // the routed action toggles the ViewModel.
+        let row_id = chrome.row_id.clone().expect("chrome carries row identity");
+        renderer
+            .accordion
+            .rebuild_retained_hit_regions(&lines, 0, 80);
+        let clicked = renderer
+            .accordion
+            .component_region_at(0, 0)
+            .expect("the chrome row registers as a component hit region");
+        assert_eq!(
+            clicked, row_id,
+            "the component hit region is the chrome row"
+        );
+        assert!(
+            !renderer
+                .accordion
+                .handle_mouse(crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left
+                    ),
+                    column: 0,
+                    row: 0,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                }),
+            "the accordion must NOT toggle a component-owned row through its own maps"
+        );
+
+        assert!(
+            renderer.dispatch_component_disclosure(&row_id, None),
+            "the routed action must reach the component's handle"
+        );
+        let view = output.say_turn_view().expect("migrated say turn");
+        assert!(
+            view.vm.show_program,
+            "the component handle toggled show_program through the message lock"
+        );
+
+        // The next frame re-renders from the mutated VM.
+        let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.contains("(say \"hello\")")),
+            "after the toggle the program text renders; got {:?}",
+            lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+        );
+        let chrome = lines.first().expect("chrome still first");
+        assert!(
+            chrome.text.contains('\u{25bc}'),
+            "the arrow now shows the opened state; got {:?}",
+            chrome.text
         );
     }
 
@@ -9980,7 +10014,7 @@ mod tests {
     fn other_row_content_vis_width_empty_input_is_3() {
         // "> " (2) + cursor block (1) = 3 with no text
         let s = format_custom_input_content("", 0);
-        let vis = visible_length(&s);
+        let vis = shadow_buffer::visible_length(&s);
         assert_eq!(
             vis, 3,
             "empty input: visible length must be 3 (got {}); formula was previously 2 (off by 1)",
@@ -10002,7 +10036,7 @@ mod tests {
         ];
         for (input, cursor) in cases {
             let s = format_custom_input_content(input, *cursor);
-            let vis = visible_length(&s);
+            let vis = shadow_buffer::visible_length(&s);
             let expected = 3 + input.chars().count();
             assert_eq!(
                 vis,

@@ -23,30 +23,11 @@ use super::accordion::RenderedTranscriptLine;
 use super::autocomplete_widget::{completion_pane_lines, AutocompleteState};
 use super::widgets::{self, Axis, Rect, Track, Widget};
 
-/// Stable identity for one expandable row within the transcript.
-///
-/// `path` is append-only semantic ancestry (unit, call index, input/output),
-/// so streamed appends and terminal reflow never change an existing row's key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct RowId {
-    pub message_id: MessageId,
-    pub path: Vec<u32>,
-}
-
-/// Renderer-facing role of one transcript node. The ViewModel derives it from
-/// domain data at projection time; the renderer uses it to route disclosure,
-/// focus, and bounded tool viewports — never as a widget kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeRole {
-    Response,
-    Activity,
-    Program,
-    Output,
-    ToolGroup,
-    ToolCall,
-    Input,
-    ToolOutput,
-}
+/// Stable identity for one expandable row within the transcript, and the
+/// role vocabulary: moved to the widget vocabulary
+/// ([`crate::cli::components::vocab`]) so components can build row identity
+/// without the engine (#882). Engine call sites keep these stable paths.
+pub(crate) use crate::cli::components::vocab::{NodeRole, RowId};
 
 /// Widget props for one transcript row, projected from domain data.
 #[derive(Debug, Clone)]

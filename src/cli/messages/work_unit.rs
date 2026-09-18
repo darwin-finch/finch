@@ -82,6 +82,78 @@ impl fmt::Display for GrayDim {
 const GRAY_DIM: GrayDim = GrayDim;
 
 // ============================================================================
+// Say-turn component ViewModel (#882, stage 1 of docs/TUI_DESIGN.md)
+// ============================================================================
+
+/// Status of a component-owned say turn. The completion path transitions it
+/// exactly once; a finished turn therefore cannot keep wearing `running`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SayTurnStatus {
+    #[default]
+    Running,
+    Completed,
+}
+
+/// The program-source part of a say turn's ViewModel: the exact wire text the
+/// provider produced, retained so the reader can reveal it on demand.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProgramSourceVm {
+    pub language: String,
+    pub lines: Vec<String>,
+}
+
+/// The output part of a say turn's ViewModel, set when the program produces
+/// output and updated live as `say` chunks stream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputVm {
+    pub lines: Vec<String>,
+}
+
+/// The retained ViewModel of one say turn, living on the WorkUnit behind the
+/// message's existing lock. Holds presentation state (status, program,
+/// output) and the ephemeral UI state (`show_program`, default hidden for say
+/// turns — #350's prose ruling). Because it is retained, component state needs
+/// no renderer-side map.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkUnitViewModel {
+    pub status: SayTurnStatus,
+    pub program: ProgramSourceVm,
+    pub output: Option<OutputVm>,
+    pub show_program: bool,
+}
+
+/// One frame's component snapshot: the retained ViewModel plus the chrome
+/// timing, captured under the same lock read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SayTurnView {
+    pub message_id: MessageId,
+    pub vm: WorkUnitViewModel,
+    pub elapsed_secs: u64,
+}
+
+/// The say component's action vocabulary. The engine's hit-rect routing
+/// carries actions opaquely (`ComponentAction`) — there is no central action
+/// enum; each component defines its own payloads beside the ViewModel they
+/// mutate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToggleProgram;
+
+/// Opaque component-defined action. The engine never inspects the payload;
+/// the owning component downcasts it in its handle.
+#[derive(Debug)]
+pub struct ComponentAction(Box<dyn std::any::Any + Send + Sync>);
+
+impl ComponentAction {
+    pub fn new<A: std::any::Any + Send + Sync>(action: A) -> Self {
+        Self(Box::new(action))
+    }
+
+    pub fn downcast_ref<A: std::any::Any>(&self) -> Option<&A> {
+        self.0.downcast_ref::<A>()
+    }
+}
+
+// ============================================================================
 // WorkRowStatus / WorkRow
 // ============================================================================
 
@@ -201,6 +273,10 @@ struct WorkUnitInner {
     /// Producer-owned: host-rendered lifecycle text (proposals, notices) was
     /// appended to this port. That output is never assistant prose (#350).
     host_lifecycle: bool,
+    /// Component-owned ViewModel of a migrated say turn (#882). `None` keeps
+    /// the row on the pre-component projection path; renderer-side RowId-keyed
+    /// state maps hold disclosure only for those unmigrated rows.
+    say_vm: Option<WorkUnitViewModel>,
 }
 
 // ============================================================================
@@ -260,6 +336,7 @@ impl WorkUnit {
                 agent_activity: Vec::new(),
                 as_assistant_prose: false,
                 host_lifecycle: false,
+                say_vm: None,
             })),
         }
     }
@@ -285,10 +362,9 @@ impl WorkUnit {
 
     /// Set the final response text (call after streaming ends).
     pub fn set_response(&self, text: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .response_text = text.into();
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.response_text = text.into();
+        sync_say_output(&mut inner);
     }
 
     /// Return a generation unit to ordinary assistant/tool presentation.
@@ -313,11 +389,9 @@ impl WorkUnit {
 
     /// Append a chunk to the response text (for partial updates).
     pub fn append_response(&self, text: &str) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .response_text
-            .push_str(text);
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.response_text.push_str(text);
+        sync_say_output(&mut inner);
     }
 
     /// Render this unit as the exact program received from the provider.
@@ -391,21 +465,82 @@ impl WorkUnit {
         inner.as_assistant_prose = false;
     }
 
+    /// Migrate this output unit to component-owned say-turn rendering (#882).
+    ///
+    /// The producer calls this where it creates the say turn, before any
+    /// output streams: it retains the wire source in the ViewModel's program
+    /// part so the reader can reveal it on demand, and the card exists from
+    /// the first frame of execution. `show_program` defaults to false.
+    pub fn begin_say_turn(&self, language: impl Into<String>, source: &str) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.say_vm = Some(WorkUnitViewModel {
+            status: SayTurnStatus::Running,
+            program: ProgramSourceVm {
+                language: language.into(),
+                lines: source.lines().map(str::to_owned).collect(),
+            },
+            output: None,
+            show_program: false,
+        });
+    }
+
+    /// The component-owned ViewModel snapshot plus chrome timing, read under
+    /// the message's own lock. `None` for rows that have not migrated to
+    /// component-owned rendering; those keep the renderer's RowId-keyed
+    /// disclosure maps.
+    pub fn say_turn_snapshot(&self) -> Option<SayTurnView> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        Some(SayTurnView {
+            message_id: self.id,
+            vm: inner.say_vm.as_ref()?.clone(),
+            elapsed_secs: inner
+                .elapsed_at_finish
+                .unwrap_or_else(|| self.started_at.elapsed())
+                .as_secs(),
+        })
+    }
+
+    /// The component-defined action a click on the card row at `path`
+    /// produces. Only the chrome row (semantic path `[0]`) is a hitbox on a
+    /// migrated say turn; rows without a ViewModel produce nothing.
+    pub fn say_turn_action(&self, path: &[u32]) -> Option<ComponentAction> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        inner.say_vm.as_ref()?;
+        if path == [0] {
+            Some(ComponentAction::new(ToggleProgram))
+        } else {
+            None
+        }
+    }
+
+    /// Route a component action to the say component's handle: toggles
+    /// `show_program` under the message's lock. False for foreign actions or
+    /// unmigrated rows.
+    pub fn handle_say_turn_action(&self, action: &ComponentAction) -> bool {
+        if action.downcast_ref::<ToggleProgram>().is_none() {
+            return false;
+        }
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let Some(vm) = &mut inner.say_vm else {
+            return false;
+        };
+        vm.show_program = !vm.show_program;
+        true
+    }
+
     /// Update transient status independently from the durable visible body.
     pub fn set_transient_status(&self, status: Option<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .transient_status = status;
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.transient_status = status;
+        sync_say_output(&mut inner);
     }
 
     /// Update an explicit output handle's progress independently from its
     /// body and status. `None` represents indeterminate progress.
     pub fn set_output_progress(&self, completed: u64, total: Option<u64>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .progress = Some((completed, total));
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.progress = Some((completed, total));
+        sync_say_output(&mut inner);
     }
 
     /// Add a running tool-call sub-row; returns its index for later updates.
@@ -741,6 +876,14 @@ impl WorkUnit {
         }
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Complete;
+        // The completion path owns the say card's status transition: exactly
+        // once, guarded, so a settled turn cannot keep wearing `running`
+        // (#820-class residue is impossible by construction here).
+        if let Some(vm) = &mut inner.say_vm {
+            if vm.status == SayTurnStatus::Running {
+                vm.status = SayTurnStatus::Completed;
+            }
+        }
     }
 
     /// Mark the whole WorkUnit failed.
@@ -998,6 +1141,18 @@ impl Message for WorkUnit {
         Some(self.domain_view(colors))
     }
 
+    fn say_turn_view(&self) -> Option<SayTurnView> {
+        self.say_turn_snapshot()
+    }
+
+    fn transcript_action(&self, path: &[u32]) -> Option<ComponentAction> {
+        self.say_turn_action(path)
+    }
+
+    fn handle_transcript_action(&self, action: &ComponentAction) -> bool {
+        self.handle_say_turn_action(action)
+    }
+
     fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         Some(colors.message_band_style(message_band_for_inner(&inner)))
@@ -1223,6 +1378,23 @@ impl WorkUnit {
 fn reset_program_output_role(inner: &mut WorkUnitInner) {
     inner.as_assistant_prose = false;
     inner.host_lifecycle = false;
+}
+
+/// Mirror the say card's output part from the same fields the streaming path
+/// just mutated, under the lock the mutation already holds. `None` until the
+/// turn has anything to show — an empty output is not a rendered subwidget.
+fn sync_say_output(inner: &mut WorkUnitInner) {
+    let Some(vm) = &mut inner.say_vm else {
+        return;
+    };
+    let mut lines: Vec<String> = inner.response_text.lines().map(str::to_owned).collect();
+    if let Some(status) = &inner.transient_status {
+        lines.push(status.clone());
+    }
+    if let Some((completed, total)) = inner.progress {
+        lines.push(format_progress(completed, total));
+    }
+    vm.output = (!lines.is_empty()).then_some(OutputVm { lines });
 }
 
 fn projects_as_assistant_prose(inner: &WorkUnitInner) -> bool {

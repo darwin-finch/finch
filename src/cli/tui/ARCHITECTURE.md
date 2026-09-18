@@ -56,6 +56,20 @@ native history is not the reader; drag-selection under capture remains open on
   terminal rows; the retained-transcript region above is recounted from physical-row geometry
   after every frame and resize. Never persist terminal coordinates as row identity.
 
+**Component-owned say turn (#882)** (`src/cli/components/`): a successful untitled `say`
+turn renders through its component — the chrome (status glyph + elapsed + a disclosure arrow
+that exists only while the program source can be shown) plus the `ProgramSource`/`Output`
+subwidgets, both built from the say turn's retained ViewModel
+(`WorkUnitViewModel`, on the WorkUnit behind its own lock). A click resolves the chrome
+hitbox to `(RowId, opaque action)` and routes to the component's handle, which toggles
+`show_program` through the lock; the next frame re-renders from the mutated ViewModel. The
+renderer's RowId-keyed open-set maps never hold component rows. The canonical record is
+unchanged, and the say-turn suppression (deleting the program-source row) is deleted — the
+program source is show_program-gated card content, not a deleted row. The widget vocabulary
+(`Rect`/`Track`/`Axis`/`Widget`/`RenderedTranscriptLine`/`RowId`/line metrics) lives in
+`cli::components::vocab` so components build subtrees without `crossterm` or the shadow
+buffer; the engine re-exports it under its stable paths.
+
 **Claiming widget tree** (`widgets.rs`, `view_model.rs`): the live frame is a ViewModel
 snapshot projected into a tree of standard widgets laid out by depth-first frame claiming. The
 root column allocates chrome from the bottom (status, hr, input, hr, completions 0–N) and the
@@ -136,6 +150,8 @@ Virtual row helpers:
 ## Key files
 
 - `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
+- `src/cli/components/` — component-owned presentation: the widget vocabulary (`vocab.rs`)
+  and the say-turn component (`say_turn.rs`) (#882)
 - `src/cli/tui/view_model.rs` — the blit-time `LiveViewModel`, the domain → widget projection, and the root claiming tree
 - `src/cli/tui/markdown.rs` — bounded assistant-prose markdown parse/render for the viewport (#756); raw source stays the canonical record
 - `src/cli/tui/widgets.rs` — claiming layout: rects, tracks, hitboxes, resize

@@ -4,6 +4,15 @@ Status: **ruled by the maintainer (2026-09-18), staged migration** — this docu
 contract TUI work is reviewed against. It supersedes the 805 centralization *as the target*;
 the migration keeps main green at every stage.
 
+**Stage-1 outcome (#882, 2026-09-18): landed.** The say turn is component-owned as specified:
+`WorkUnitViewModel` on the say WorkUnit behind its own lock; chrome (glyph + elapsed + an
+arrow that renders only while the program source can be shown) and the `ProgramSource` /
+`Output` subwidgets in `src/cli/components/say_turn.rs`; the vocabulary extracted to
+`src/cli/components/vocab.rs`; clicks routed through opaque component actions to
+`handle_transcript_action`; the renderer's RowId-keyed maps hold no say-turn disclosure; and
+the say-turn suppression is deleted (the canonical record keeps its exactly-once semantics
+and pinned invariant). Stage 2+ remains open below.
+
 ## The maintainer's constraints, verbatim
 
 From the #824 closure ruling and the 2026-09-18 design session:

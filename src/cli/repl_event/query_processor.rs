@@ -410,6 +410,12 @@ async fn execute_wire_with_single_repair(
     );
     let output_unit = output_manager.start_work_unit("VM program output");
     output_unit.set_program_output();
+    // The say card owns the turn from here (#882): the producer retains the
+    // wire source in the component ViewModel so the reader can reveal it.
+    output_unit.begin_say_turn(
+        crate::programs::ProgramLanguage::infer_source(&source).as_str(),
+        &source,
+    );
     let initial = execute_direct_wire_response(
         runtime,
         Arc::clone(&output_manager),
@@ -568,6 +574,10 @@ async fn execute_wire_with_single_repair(
 
     let repair_output_unit = output_manager.start_work_unit("VM repaired program output");
     repair_output_unit.set_program_output();
+    repair_output_unit.begin_say_turn(
+        crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
+        &repaired_source,
+    );
     match execute_direct_wire_response(
         runtime,
         output_manager,

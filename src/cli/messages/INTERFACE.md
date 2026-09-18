@@ -19,6 +19,12 @@ pub struct BrainParticipantMessage { … }
 impl BrainParticipantMessage {
     pub fn new(subject: impl Into<String>, content: impl Into<String>, invokes_model: bool) -> Self;
 }
+/// Opaque component-defined action.
+pub struct ComponentAction(Box<dyn std::any::Any + Send + Sync>);
+impl ComponentAction {
+    pub fn downcast_ref<A: std::any::Any>(&self) -> Option<&A>;
+    pub fn new<A: std::any::Any + Send + Sync>(action: A) -> Self;
+}
 /// A live tool call message that shows: - "● Edit(src/foo.rs)" header immediately when tool starts - Diff/output lines streaming in as they arrive  The `content…
 pub struct LiveToolMessage { … }
 impl LiveToolMessage {
@@ -65,6 +71,10 @@ impl OperationMessage {
 pub struct OperationRow { … }
 /// Status of an individual row within an OperationMessage
 pub enum OperationRowStatus { Running, Complete, Error }
+/// The output part of a say turn's ViewModel, set when the program produces output and updated live as `say` chunks stream.
+pub struct OutputVm { … }
+/// The program-source part of a say turn's ViewModel: the exact wire text the provider produced, retained so the reader can reveal it on demand.
+pub struct ProgramSourceVm { … }
 /// Progress message for downloads, uploads, etc.
 pub struct ProgressMessage { … }
 impl ProgressMessage {
@@ -76,6 +86,10 @@ impl ProgressMessage {
     /// Update progress
     pub fn update_progress(&self, current: u64);
 }
+/// Status of a component-owned say turn.
+pub enum SayTurnStatus { Running, Completed }
+/// One frame's component snapshot: the retained ViewModel plus the chrome timing, captured under the same lock read.
+pub struct SayTurnView { … }
 /// Static message (immutable, for errors, system info, etc.)
 pub struct StaticMessage { … }
 impl StaticMessage {
@@ -99,6 +113,8 @@ impl StreamingResponseMessage {
     /// Set whether the model is thinking (for UI indicator)
     pub fn set_thinking(&self, thinking: bool);
 }
+/// The say component's action vocabulary.
+pub struct ToggleProgram;
 /// Tool execution message with separate stdout/stderr
 pub struct ToolExecutionMessage { … }
 impl ToolExecutionMessage {
@@ -142,6 +158,8 @@ impl WorkUnit {
     pub fn append_response(&self, text: &str);
     /// Append a live output line to a Running sub-row's body.
     pub fn append_row_body_line(&self, idx: usize, line: String);
+    /// Migrate this output unit to component-owned say-turn rendering (#882).
+    pub fn begin_say_turn(&self, language: impl Into<String>, source: &str);
     /// Mark a sub-row complete with an optional compact one-line summary.
     pub fn complete_row(&self, idx: usize, summary: impl Into<String>);
     /// Mark a sub-row complete with a one-line summary and body lines shown below it.
@@ -156,6 +174,8 @@ impl WorkUnit {
     pub fn fail_row(&self, idx: usize, error: impl Into<String>);
     /// Mark a sub-row as failed, optionally attaching diagnostic body lines shown when the row is expanded.
     pub fn fail_row_with_body(&self, idx: usize, error: impl Into<String>, body_lines: Vec<String>);
+    /// Route a component action to the say component's handle: toggles `show_program` under the message's lock.
+    pub fn handle_say_turn_action(&self, action: &ComponentAction) -> bool;
     /// True after [`Self::present_as_assistant_prose`] succeeded.
     pub fn is_assistant_prose(&self) -> bool;
     /// Record that host-rendered lifecycle text belongs on this port.
@@ -164,6 +184,10 @@ impl WorkUnit {
     pub fn new(verb: impl Into<String>) -> Self;
     /// Mark successful untitled default-port `say` as assistant prose.
     pub fn present_as_assistant_prose(&self);
+    /// The component-defined action a click on the card row at `path` produces.
+    pub fn say_turn_action(&self, path: &[u32]) -> Option<ComponentAction>;
+    /// The component-owned ViewModel snapshot plus chrome timing, read under the message's own lock.
+    pub fn say_turn_snapshot(&self) -> Option<SayTurnView>;
     /// Render retained rows as internal lifecycle activity rather than model tool calls.
     pub fn set_activity_presentation(&self, title: impl Into<String>);
     /// Return a generation unit to ordinary assistant/tool presentation.
@@ -199,6 +223,8 @@ impl WorkUnitHead {
 pub enum WorkUnitPresentation { Assistant, Activity, ProgramSource, ProgramOutput }
 /// Full blit-time domain snapshot of one WorkUnit run.
 pub struct WorkUnitView { … }
+/// The retained ViewModel of one say turn, living on the WorkUnit behind the message's existing lock.
+pub struct WorkUnitViewModel { … }
 ```
 
 ## Traits
@@ -213,6 +239,9 @@ pub trait Message: Send + Sync {
     fn complete_transcript(&self, colors: &crate::theme::ColorScheme) -> String;
     fn work_unit_head(&self) -> Option<WorkUnitHead>;
     fn work_unit_view(&self, _colors: &crate::theme::ColorScheme) -> Option<WorkUnitView>;
+    fn say_turn_view(&self) -> Option<SayTurnView>;
+    fn transcript_action(&self, _path: &[u32]) -> Option<ComponentAction>;
+    fn handle_transcript_action(&self, _action: &ComponentAction) -> bool;
     fn background_style(&self, _colors: &crate::theme::ColorScheme) -> Option<ratatui::style::Style>;
     fn background_style_for_line(&self, colors: &crate::theme::ColorScheme, _line_index: usize, _line_count: usize) -> Option<ratatui::style::Style>;
 }
