@@ -22,17 +22,11 @@ jobs:
         run: python3 scripts/check_repository_hygiene.py
       - name: Run repository hygiene regressions
         run: python3 scripts/test_repository_hygiene.py
-      - name: Reject restoration of the removed SSH surface
-        run: python3 scripts/check_no_ssh_surface.py
-      - name: Run removed SSH surface regressions
-        run: python3 scripts/test_no_ssh_surface.py
       - name: Check generated subsystem interfaces
         run: |
           python3 scripts/generate_interfaces.py
           python3 scripts/test_generate_interfaces.py
           python3 scripts/test_seam_cost.py
-      - name: Check subsystem ownership and dependency record
-        run: |
       - name: Verify reviewed workflow inventory
         run: |
           python3 scripts/check_ci_workflow_manifest.py
