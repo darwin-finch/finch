@@ -159,3 +159,41 @@ Each M1+ issue: normal `finch-implement-ticket` flow (claim, isolated worktree, 
 stages), merging into `language/full-spec-implementation`, not `main`. Paired fixtures land in
 `core.json` at that issue's level tag; `ACTIVE_CONFORMANCE_LEVELS` gains that level only once the
 issue is actually merged, not when it's claimed.
+
+## Ownership/memory model — design pass log (2026-09-17, same day as everything above)
+
+A long live design discussion with Shammah substantially extended and twice audited the ownership
+section beyond the #674 scoping work above. Summary, not a repeat of the commit history — read
+`git log` on this branch for the full sequence:
+
+- `steal` replaced `take` as the ownership-transfer keyword everywhere (full-document rename,
+  verified against 7 genuine non-keyword English uses of "take" that were deliberately excluded).
+- `steal x: Foo` / `take x: Foo` shorthand (accept any `Owner<Foo>`, carrier inferred) — added, then
+  the "no shorthand" requirement's rationale was fully reversed per explicit decision.
+- Retired as redundant, explicitly: `static Owner<Foo>` as a spelled-out alternative to bare `Foo`,
+  and explicit `(borrow x : Foo)` as an alternative to unannotated — both changed nothing over the
+  shorter form once checked, so both were cut rather than kept "for readability."
+- `Unique<T>` → `Shared<T>` by move; the reverse only via checked `try-into-unique`; `strong-count`
+  (diagnostic-only, pure-but-not-deterministic) and `get-mut` (borrow-not-consume) added alongside it.
+- Move-vs-copy default corrected (plain records move, `Copy` types copy — not the reverse), with the
+  mechanical nuance that move and copy are physically identical for pointer-free types, and why the
+  invalidation rule still earns its keep even then (decoupling from field layout; non-trivial drop
+  hooks).
+- `borrow-mut` deliberately excluded from the carrier-shorthand treatment (`Shared<T>` can't
+  unconditionally provide `&mut T`).
+- Escape-to-heap is a compile error requiring explicit `Unique`/`Shared`, never silent promotion —
+  reasoned through in detail (ownership-policy ambiguity; inserts an allocation absent from source;
+  is in the limit the GC-equivalent machinery the whole memory-model rationale trades away).
+- Two full audits found and fixed real defects: a stale pre-shorthand-revision paragraph that still
+  said carrier dispatch was mandatory, and one line-wrap bug in the `take`→`steal` rename script that
+  briefly mis-renamed a genuine English sentence (caught by re-verifying the exclusion count before
+  committing).
+- `same-address` (identity comparison, distinct from `==`, scoped to borrows) and `match-type`
+  (CTFE-time carrier introspection inside one generic body, narrowing the bound type per arm) added
+  to close two more gaps Shammah found: metaprogramming needing to know the concrete carrier, and
+  wanting automatic per-instantiation specialization without a second, competing declaration.
+
+None of this is implemented — it is still all `FINCH_LANGUAGE_DESIGN.md` prose, ahead of #674's
+code. Before #674 is claimed, re-read the ownership sections fresh rather than trusting this summary
+line-for-line; a design discussion this size run live in conversation is exactly where something
+subtle could still be wrong despite two audit passes.
