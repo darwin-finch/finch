@@ -996,16 +996,16 @@ beneath it:
 
 ```text
 dup          forall A: Copy, S. (S consume-value A -- S A A) ! CopyEffects<A>
-drop         forall A: Drop, S. (S take A -- S) ! DropEffects<A>
+drop         forall A: Drop, S. (S steal A -- S) ! DropEffects<A>
 +            forall S.   (S consume-value int consume-value int -- S int) guarantees pure
 file.read    forall R S. (S borrow path<R> -- S path<R> bytes) ! fs.read<R>
-agent.await  forall T S. (S take task<T> -- S result<T,agent-error>) ! agent.await
-yield        forall Y Resume S. (S take Y -- S Resume) ! yields<Y,Resume>
+agent.await  forall T S. (S steal task<T> -- S result<T,agent-error>) ! agent.await
+yield        forall Y Resume S. (S steal Y -- S Resume) ! yields<Y,Resume>
 ```
 
 The stack arrow describes values retained or removed from the logical operand stack. Source
 callables expose only the ownership modes programmers act on: `borrow T` receives a scoped `&T`;
-`borrow-mut T` receives an exclusive scoped `&mut T`; and `take T` consumes ownership. An ordinary
+`borrow-mut T` receives an exclusive scoped `&mut T`; and `steal T` consumes ownership. An ordinary
 source parameter defaults to `borrow`. Typed stack signatures additionally use `consume-value T`
 as a lowering-level cell mode: the instruction pops an independent value already materialized on
 the operand stack. It is deliberately not named merely `value`, because it describes consumption,
@@ -1013,10 +1013,10 @@ not the value's nominal type or storage placement.
 
 Call lowering may satisfy `consume-value T` by copying a `Copy` binding, so arithmetic need not move
 the caller's lexical scalar. A non-`Copy` binding cannot be silently materialized this way; an
-ownership transfer is written and typed as `take`. Yield likewise takes its payload because the
+ownership transfer is written and typed as `steal`. Yield likewise steals its payload because the
 resumable execution may retain it beyond the current activation. In Co-Forth the operand stack owns
 its cells: applying a borrowing callable to an owned top cell retains that owner and creates a
-distinct scoped borrow operand, whereas `take` or `consume-value` consumes the indicated cell. The
+distinct scoped borrow operand, whereas `steal` or `consume-value` consumes the indicated cell. The
 surface transform therefore also shows the borrowed owner in its output row; lowering creates a
 transient borrow cell for the callee and destroys only that cell on return. There is no word-specific
 implicit choice based on spelling. `dup` therefore requires explicit `Copy` evidence (and retaining
@@ -1051,7 +1051,7 @@ inferred escaping set is contained by the declared bound.
 The complete callable type and published signature include:
 
 - input and output stack rows;
-- the ordered parameter list including borrow, mutable-borrow, take, or value mode and receiver mode;
+- the ordered parameter list including borrow, mutable-borrow, steal, or value mode and receiver mode;
 - generic type/value/pack parameters, constraints, and selected evidence identities;
 - the result and tuple/product shape;
 - a capability/effect row;
@@ -1068,7 +1068,7 @@ freeze its exact inferred suspension summary. Widening an explicit public contra
 non-suspending to suspending, or widening an exact inferred summary, is breaking because callers may
 hold borrows or rely on checkpoint boundaries. These properties participate in callable
 substitution, module interface hashes, native cache keys, evidence-slot compatibility, and callback
-validation; a throwing, suspending, taking, or foreign-ABI callable cannot be stored behind a
+validation; a throwing, suspending, stealing, or foreign-ABI callable cannot be stored behind a
 narrower callable type merely because its value parameters and result match.
 
 Declaration attributes are separate compile-time metadata, uniformly spelled `@name(...)` for both
@@ -1144,7 +1144,7 @@ channels are separate explicit memory resources, not implicit fiber communicatio
 Ordinary callers do not acquire `async`/`await` coloring merely because a callee can park on I/O.
 For example, a database call may suspend the current ProgramRun internally and later return its
 ordinary value; `MaySuspend` is inferred and verified like the other effects. Explicit concurrency
-syntax appears only where the programmer creates or takes ownership of concurrent work, such as
+syntax appears only where the programmer creates or steals ownership of concurrent work, such as
 `spawn`, `join-all`, `race`, or cancellation. A caller must not need to know whether an ordinary
 callee parked, exhausted a scheduling quantum, or completed without suspension.
 
@@ -1194,18 +1194,18 @@ suspended-fiber<Y,Resume,R>   stopped at one yield
 fiber-step<Y,Resume,R>        yielded(Y, suspended-fiber<Y,Resume,R>) | Done(R)
 fiber-state<H,R>              pending(H,FiberStatus) | Done(R)
 
-defer        : take closure -> ready-fiber<Y,Resume,R>        ; throws ResumableLimit
-yield        : take Y -> Resume
-fiber-start  : take ready-fiber<Y,Resume,R> -> fiber-step<Y,Resume,R>
-fiber-resume : take suspended-fiber<Y,Resume,R>, take Resume -> fiber-step<Y,Resume,R>
-fiber-next   : take ready-or-suspended<Y,unit,R> -> fiber-step<Y,unit,R>
-done-value   : take Done<R> -> R                              ; ordinary library unwrap
-fiber-cancel : take ready-or-suspended<Y,Resume,R> -> unit    ; throws CleanupFailure
-fiber-try-join : take dynamic-handle<R> -> fiber-state<dynamic-handle<R>,R>
+defer        : steal closure -> ready-fiber<Y,Resume,R>        ; throws ResumableLimit
+yield        : steal Y -> Resume
+fiber-start  : steal ready-fiber<Y,Resume,R> -> fiber-step<Y,Resume,R>
+fiber-resume : steal suspended-fiber<Y,Resume,R>, steal Resume -> fiber-step<Y,Resume,R>
+fiber-next   : steal ready-or-suspended<Y,unit,R> -> fiber-step<Y,unit,R>
+done-value   : steal Done<R> -> R                              ; ordinary library unwrap
+fiber-cancel : steal ready-or-suspended<Y,Resume,R> -> unit    ; throws CleanupFailure
+fiber-try-join : steal dynamic-handle<R> -> fiber-state<dynamic-handle<R>,R>
 ```
 
-Here `take` is a parameter mode in the illustrative signature, not a mandatory token at every call
-site. Parameters borrow by default. Supplying a unique/affine value to a taking parameter moves it;
+Here `steal` is a parameter mode in the illustrative signature, not a mandatory token at every call
+site. Parameters borrow by default. Supplying a unique/affine value to a stealing parameter moves it;
 an eligible copy/shared owner uses its ordinary copy/retain operation so the caller remains valid,
 unless the caller explicitly chooses `move` to transfer that existing handle instead.
 
@@ -1252,11 +1252,11 @@ The standard task combinators have deterministic ownership and failure contracts
 caller-facing signatures are:
 
 ```text
-join            : take Task<R> -> R
-join-all        : take Tasks<Results> -> Results
-cancel-on-error : take Tasks<Results> -> Results
-race            : take HomogeneousTasks<Source,R> -> (Source,R)
-select-complete : take HomogeneousTasks<Source,R>
+join            : steal Task<R> -> R
+join-all        : steal Tasks<Results> -> Results
+cancel-on-error : steal Tasks<Results> -> Results
+race            : steal HomogeneousTasks<Source,R> -> (Source,R)
+select-complete : steal HomogeneousTasks<Source,R>
                   -> (Completed<Source,R>, RemainingTasks<Source,R>)
 ```
 
@@ -1660,7 +1660,7 @@ the same nodes without source-to-source CoLisp generation.
 | exception transfer | `(throw e)`, `(rethrow e)` | `throw`, `rethrow` | `Throw`, `Rethrow` |
 | scope guard | `(scope exit|success|failure action)` | quotation followed by `scope-exit`, `scope-success`, or `scope-failure` | lexical cleanup record |
 | closure capture | `lambda` capture specification | quotation `captures:` header | `CaptureSpec`, `MakeClosure` |
-| ownership | `new` (unique by default), `new unique`, `new shared`, `share`, borrow/take/retain | `new`, `new-unique`, `new-shared`, `share`, `borrow`, `take`, `retain`, `weaken` | owner/lifecycle operations |
+| ownership | `new` (unique by default), `new unique`, `new shared`, `share`, borrow/steal/retain | `new`, `new-unique`, `new-shared`, `share`, `borrow`, `steal`, `retain`, `weaken` | owner/lifecycle operations |
 | fibers/tasks | `defer`, `spawn`, `join`, `race`, `next` | same typed words applied to quotations/handles | scheduled-execution operations |
 | range iteration | range operations / `foreach` | range words and quotation `foreach` | concept calls and structured loop |
 | named tests/suites | `(test ...)`, `(test-suite ...)` | `test: ... {}`, `test-suite: ... {}` | test-profile declarations, no production instruction |
@@ -1749,7 +1749,7 @@ parameter. Illustrative canonical CoLisp forms are:
 (lambda (x) body...)                         ; inferred minimal captures
 (lambda :move (x) body...)                   ; used free bindings captured by value
 (lambda (:captures (borrow config)
-                   (take socket)
+                   (steal socket)
                    (retain cache))
         (x)
         body...)                              ; exact capture contract
@@ -1766,7 +1766,7 @@ on the operand stack:
 [ captures: move ( S consume-value int -- S int ) | ... ]
 [ captures: {
     borrow config
-    take socket
+    steal socket
     retain cache
   }
   ( S value Request -- S Response )
@@ -1783,12 +1783,12 @@ owning capture, or a `scoped` callback contract. `:move` captures each used free
 according to its existing type: `Copy` values copy, unique owners and other non-copyable values
 move, `Shared<T>` retains/copies its handle, and moving an existing borrow moves only that borrow
 without acquiring its referent. An exact `:captures` list rejects unlisted free bindings. Capture
-entries may explicitly borrow, mutably borrow, take, retain, weaken, clone, or bind a computed
+entries may explicitly borrow, mutably borrow, steal, retain, weaken, clone, or bind a computed
 expression under a capture name; each operation uses its ordinary ownership and effect contract.
 
 The compiler materializes captures conceptually as one anonymous record plus a code identity. That
 record is the callable's hidden receiver: readonly invocation borrows it, mutation of captured
-fields requires an exclusive receiver, and consuming an owned capture requires a taking receiver.
+fields requires an exclusive receiver, and consuming an owned capture requires a stealing receiver.
 The corresponding callable evidence is generated from those operations. A `self` referenced by a
 lambda inside an operation is an ordinary capture, not a second privileged context pointer.
 Lexically nested record declarations are context-free and never gain a hidden outer-object or
@@ -2032,30 +2032,28 @@ Unsafe/dynamic words cannot be silently inlined into a verified pure definition.
 This section is a normative target for both source syntaxes. CoLisp and Co-Forth must be able to
 state every rule below and must lower equivalent programs to equivalent ownership-bearing typed IR.
 The model separates three questions that class hierarchies and many smart-pointer APIs conflate:
-whether a call borrows or takes a value, which object owns its storage, and whether behavior uses
+whether a call borrows or steals a value, which object owns its storage, and whether behavior uses
 static or dynamic dispatch.
 
-### Borrowing and taking
+### Borrowing and stealing
 
-An ordinary parameter borrows for the invocation. A taking parameter receives ownership and may
-store, return, destroy, or transfer the value beyond that invocation. `take` grants permission to
+An ordinary parameter borrows for the invocation. A stealing parameter receives ownership and may
+store, return, destroy, or transfer the value beyond that invocation. `steal` grants permission to
 escape; it does not promise that the callee will store the value and does not itself select stack,
 heap, unique, or reference-counted storage. Illustrative syntax is:
 
 ```text
 inspect(x: Foo)                         # borrow; x cannot escape the invocation
-retain(take x: Foo)                     # take any Owner<Foo> carrier; x may escape
-retain(take x: static Owner<Foo>)       # equivalent to the line above, spelled out
-retain-open(take x: dyn Owner<Foo>)     # explicit erased carrier — a semantic choice, not shorthand
+retain(steal x: Foo)                     # steal any Owner<Foo> carrier; x may escape
+retain-open(steal x: dyn Owner<Foo>)     # explicit erased carrier — a semantic choice, not shorthand
 ```
 
-**Revised 2026-09-17: `take Foo` is shorthand, not an error.** Every ordinary owned value `T`
+**Revised 2026-09-17: `steal Foo` is shorthand, not an error.** Every ordinary owned value `T`
 supplies intrinsic inline `Owner<T>` evidence through the lifecycle kernel; `Unique<T>`, `Shared<T>`,
-and user-defined indirect carriers supply explicit implementations. Bare `take x: Foo` means "accept
-any `Owner<Foo>`" — equivalent to `take x: static Owner<Foo>` — with the hidden generic carrier type
-`O : Owner<T>` inferred solely from the argument, the parameter storage is `O`, and operations on `T`
-use its checked borrow projection; storing or returning the parameter stores or returns `O`, not an
-imaginary unwrapped `T`.
+and user-defined indirect carriers supply explicit implementations. Bare `steal x: Foo` means "accept
+any `Owner<Foo>`," with the hidden generic carrier type `O : Owner<T>` inferred solely from the
+argument, the parameter storage is `O`, and operations on `T` use its checked borrow projection;
+storing or returning the parameter stores or returns `O`, not an imaginary unwrapped `T`.
 
 Whether the compiler monomorphizes a specialized body per concrete `O` or shares one evidence-
 passing body across callers is an optimizer decision, not a semantic one — the same choice ordinary
@@ -2066,32 +2064,39 @@ a systems cost model" warns against: choosing a codegen strategy for an otherwis
 call is not the same as an implicit adaptation silently erasing static evidence, which changes what
 the program can observe or do. `dyn Owner<Foo>` remains available, but now as an explicit *semantic*
 choice — a programmer specifically wants one erased, storable-heterogeneously carrier type, not "the
-compiler picked erasure for me." Writing `static Owner<Foo>` explicitly also remains available for a
-reader who wants representation stated at a glance despite the shorthand covering the common case;
-neither spelling is deprecated, only the requirement to choose is.
+compiler picked erasure for me."
 
-The call site does not need a ceremonial `move` marker when the parameter already says it takes:
+**Revised again, 2026-09-17: there is no separate `static Owner<Foo>` spelling.** An earlier revision
+kept it as an optional explicit form "for a reader who wants representation stated at a glance," but
+checking that claim: writing it explicitly doesn't force monomorphization either — that stays an
+optimizer decision under either spelling — so it did nothing bare `Foo` doesn't, for any reader or
+any compiler. That's the same redundant-synonym problem the language keeps rejecting wherever it
+turns up (two spellings for one thing help no reader and cost every one), applied to itself. Bare
+`Foo` is the one spelling for "any `Owner<Foo>`"; `dyn Owner<Foo>` is the one spelling for the
+erased case, because it is the one place a real semantic difference exists.
+
+The call site does not need a ceremonial `move` marker when the parameter already says it steals:
 
 ```lisp
 (begin
   (let foo (Foo ...))
   (retain foo)
-  (inspect foo)) ; error: foo was moved by the preceding taking call
+  (inspect foo)) ; error: foo was moved by the preceding stealing call
 ```
 
-Passing a uniquely owned value to a taking parameter moves it and invalidates the source binding.
+Passing a uniquely owned value to a stealing parameter moves it and invalidates the source binding.
 Passing a shared owner retains another strong handle, so the source remains usable. Passing either
 kind to an ordinary parameter borrows through the owner without transferring or retaining it. An
 explicit move of a shared handle may transfer that handle without incrementing its count and then
 invalidates the source. Temporaries transfer directly because no source binding can be reused.
 
-**Clarified 2026-09-17: a plain owned record moves under `take`, it does not copy, unless it is
+**Clarified 2026-09-17: a plain owned record moves under `steal`, it does not copy, unless it is
 explicitly `Copy`.** Copyability is an explicit property of a type ("Library ownership carriers and
 the compiler lifecycle kernel"), and a plain `T`'s intrinsic `Owner<T>` evidence provides only
 `borrow`, not `retain` — `retain` belongs to `ShareableOwner<T>`, which ordinary records do not
-implement. An ordinary record therefore behaves exactly like `Unique<T>` under `take`: moved, source
+implement. An ordinary record therefore behaves exactly like `Unique<T>` under `steal`: moved, source
 invalidated. It copies only if the type is declared `Copy` — the same rule `consume-value` already
-uses for scalars above. Silently copying an arbitrary, possibly large record on every `take` call
+uses for scalars above. Silently copying an arbitrary, possibly large record on every `steal` call
 would itself be the hidden-cost violation "Scripting ergonomics with a systems cost model" forbids.
 
 For a record with no internal indirection, moving and copying are the identical physical operation
@@ -2121,7 +2126,7 @@ were `Copy`, every implicit reuse of a `Shared<T>` binding would need to silentl
 strong count — exactly the hidden cost forbidden above. So `Shared<T>` follows the ordinary
 move-by-default rule like any other non-`Copy` value: reusing a `Shared<T>` binding in more than one
 place is a use-after-move error unless the first use explicitly retains (`retain`, `:2191-2193`) or
-passes to a `take` parameter, which retains automatically but only because the taking mode is
+passes to a `steal` parameter, which retains automatically but only because the stealing mode is
 already written in the callee's signature — not an ambient, silent path. `Shared<T>` itself is an
 ordinary small pointer-sized handle to a heap-allocated control block, moved cheaply like any other
 non-`Copy` value; `retain`'s atomic increment is the one explicit, visible operation that produces a
@@ -2142,7 +2147,7 @@ being behind `Unique<T>`/`Shared<T>` is a compile error suggesting the fix, neve
 promotion. Three separate reasons converge here, not only cost-visibility: the two carriers are not
 interchangeable (`Unique<T>` for one destination, `Shared<T>` for more than one, with a real
 refcounting cost difference), so the compiler cannot know which one is meant without being told;
-unlike the `borrow`/`take` shorthand above, which only selects among existing carriers for an
+unlike the `borrow`/`steal` shorthand above, which only selects among existing carriers for an
 operation already fully specified, promoting an escape inserts an allocation that was not in the
 source at all — a `new`/`share` the programmer never wrote, not merely a dispatch choice; and
 generalized, "the compiler keeps anything alive as long as it needs to be, choosing the right
@@ -2150,7 +2155,7 @@ strategy automatically" is what a tracing collector or an ARC-insertion pass *is
 ceiling "Design rationale: optimize for the common case, not completeness" above trades away for
 velocity, on the same grounds D's OB system and Val/Hylo already chose.
 
-**`borrow-mut` does not get the `borrow`/`take` shorthand above, and should not.** `Shared<T>`
+**`borrow-mut` does not get the `borrow`/`steal` shorthand above, and should not.** `Shared<T>`
 cannot unconditionally provide `&mut T` — only conditionally, through the fallible `get-mut` above,
 which can fail. There is no `MutableOwner<T>`-shaped concept in the hierarchy a generic `borrow-mut
 x: Foo` could soundly bind against, because `Shared<T>` would have to fail to satisfy it
@@ -2160,11 +2165,11 @@ to carriers that are *structurally* exclusive — a plain frame value or `Unique
 picking a carrier or degrading the guarantee.
 
 The transfer is unconditional from the caller's perspective. A callee that conditionally decides
-not to retain a taken value still owns and must drop, return, or transfer it. It cannot make the
+not to retain a stolen value still owns and must drop, return, or transfer it. It cannot make the
 caller's moved state depend on a runtime branch. Control-flow joins track `available`, `borrowed`,
 `exclusively borrowed`, and `moved` states; a value moved on only some incoming paths is not usable
 after the join unless every path reinitializes it. A use-after-move is a compile error whose
-diagnostic points both to the use and the taking call.
+diagnostic points both to the use and the stealing call.
 
 Readonly borrows may coexist. A mutable borrow is exclusive and temporarily prevents all use of its
 owner. Borrows normally end at their last use, but the analysis is intraprocedural and directional:
@@ -2192,9 +2197,9 @@ not need it, not because cyclic programs do not matter.
 
 The same stance extends to borrowing, and is already normative below, not new: a value defaults to
 borrow — passed like a reference, no copy, no refcount traffic — for exactly as long as the
-compiler can prove it stays within the callee's invocation ("Borrowing and taking"). At the moment
+compiler can prove it stays within the callee's invocation ("Borrowing and stealing"). At the moment
 it can't prove that, the compiler does not guess or insert a hidden allocation; it requires the
-parameter to be explicitly declared `take` (or, for a closure, an explicit capture policy —
+parameter to be explicitly declared `steal` (or, for a closure, an explicit capture policy —
 "Closure conversion and capture ownership"), and the caller loses use of that binding unless the
 value is a `Shared<T>`, in which case passing it retains another strong handle instead of
 invalidating the source. The default therefore never corrupts a running program when it's wrong:
@@ -2236,16 +2241,61 @@ enough that an experienced systems-language implementer chose it independently �
 "fully specifying all the situations is a lot of work" concern above is not hypothetical: the same
 approach, attempted for real, stalled on completeness rather than on the core idea being wrong.
 Finch should expect the long tail of case-by-case interactions (closures, suspension, generics,
-FFI) to be where the actual implementation risk concentrates, not the top-level borrow/take
+FFI) to be where the actual implementation risk concentrates, not the top-level borrow/steal
 decision, which is the easy 80% both designs converged on quickly.
 
 The cost: a function cannot soundly return a borrow that is conditionally one of *several*
 different-lifetime input borrows (Rust's canonical `fn longest<'a>(x: &'a str, y: &'a str) -> &'a
 str` has no equivalent here). Returning a borrow only typechecks when the verifier can trace it to
 exactly one input owner — an ordinary getter returning a borrowed field, for example. A function
-that must pick between multiple borrowed inputs at runtime takes ownership (or an explicit
+that must pick between multiple borrowed inputs at runtime steals ownership (or an explicit
 `Shared<T>`) instead of borrowing; it is not a corner case the design forgot, it is the boundary
 being deliberately traded for never needing a lifetime parameter anywhere in source.
+
+**Elaborated 2026-09-17.** Rust's version works because both inputs' lifetimes are unified into one
+named parameter `'a`, and the return type is tagged with that same `'a` — the caller's own checker
+then enforces that *both* `x` and `y` individually stay valid for as long as whichever one comes
+back is used, no matter which branch ran. That's an inherently cross-parameter fact: it requires
+solving a lifetime relationship that spans two inputs and the return type together, which is exactly
+what "the compiler does not solve general lifetime variables backward through callers" (above) rules
+out. A getter avoids this because its return is derived from exactly one receiver, so "bounded by
+that one thing" is locally decidable with no unification needed — `longest` isn't, because the
+result could be tied to either of two receivers depending on a runtime branch, and there is no
+mechanism here to say "tied to whichever one it turns out to be, and the caller must know that."
+
+Rejected shape:
+
+```lisp
+(define (longest (x : string) (y : string)) : string
+  (if (> (length x) (length y)) x y))  ; error: return derived from either of two receivers
+```
+
+Two ways Finch code actually handles this, and when each is the right one:
+
+1. **Steal both, return the chosen one — usually the natural answer for value-like data.**
+   ```lisp
+   (define (longest (steal x : string) (steal y : string)) : string
+     (if (> (length x) (length y)) x y))
+   ```
+   Whichever string is longer moves into the return; the other is simply dropped as part of the
+   call. This costs nothing beyond an ordinary move, and for a type like `string` — no shared
+   identity to preserve — giving up the one not returned is usually exactly what the caller wanted
+   anyway. The real cost only shows up if the caller needed to keep using *both* strings afterward.
+2. **`Shared<T>` on both sides, when the caller does need to keep using both afterward.** Passing a
+   `Shared<string>` to a `steal` parameter retains rather than consumes (above), so the caller's own
+   bindings for `x` and `y` remain valid after the call regardless of which one the function returns
+   — the price is the retain's atomic increment on whichever one is returned, visible in the type.
+3. **Return a discriminant instead of the value, and let the immediate caller re-borrow directly —
+   often the best answer, and it needs neither ownership transfer nor a refcount:**
+   ```lisp
+   (define (pick-longer (x : string) (y : string)) : bool
+     (> (length x) (length y)))
+   ; caller:
+   (let winner (if (pick-longer a b) a b))  ; ordinary borrow, traceable to exactly one of a, b
+   ```
+   The helper never touches ownership at all; the caller does the actual borrow itself, at the point
+   where "exactly one input owner" is trivially satisfiable, because by then the branch has already
+   been resolved to a single concrete binding.
 
 ### Library ownership carriers and the compiler lifecycle kernel
 
@@ -2267,7 +2317,7 @@ lifecycle and ownership concepts, conceptually:
 concept Lifecycle {
     associated CopyEffects = effects
     associated DropEffects = effects
-    operation drop = take Self -> unit ! DropEffects
+    operation drop = steal Self -> unit ! DropEffects
 }
 
 concept Owner<T> : Lifecycle {
@@ -2287,18 +2337,18 @@ concept StableAddressOwner<T> : Owner<T> {
 concept PinnableOwner<T> : Owner<T> {
     associated Pinned : StableAddressOwner<T>
     # Guaranteed nothrow and non-suspending: no allocation or reservation may newly fail.
-    operation pin = take Self -> Pinned
+    operation pin = steal Self -> Pinned
 }
 
 concept TryPinnableOwner<T> : Owner<T> {
     associated Pinned : StableAddressOwner<T>
     # Failure returns the still-owned original carrier with the diagnostic.
-    operation try-pin = take Self -> result<Pinned, PinFailure<Self>>
+    operation try-pin = steal Self -> result<Pinned, PinFailure<Self>>
 }
 
 concept TryUniqueRecoverable<T> : ShareableOwner<T> {
     # Succeeds only when this is the sole strong handle; failure returns the still-shared original.
-    operation try-into-unique = take Self -> result<Unique<T>, Self>
+    operation try-into-unique = steal Self -> result<Unique<T>, Self>
 }
 
 Unique<T> : Owner<T>                          # movable, not copyable
@@ -2368,19 +2418,18 @@ or authority-acquiring work is not a fourth kind of destructor; it belongs in `c
 a scope guard. The compiler rejects a custom hook that cannot be certified into one of these bounded
 classes and reports which operation or field prevented certification.
 
-An ownership-taking API should not need to name `Shared<T>` merely because one caller uses shared
+An ownership-stealing API should not need to name `Shared<T>` merely because one caller uses shared
 storage. If the callee only needs to hold and eventually release one owner, it accepts an ownership
-carrier — bare `take x: Foo` (the "Borrowing and taking" shorthand, revised 2026-09-17: this
+carrier — bare `steal x: Foo` (the "Borrowing and stealing" shorthand, revised 2026-09-17: this
 paragraph predates that revision and previously said carrier dispatch was always explicit, which is
 no longer accurate). If it must manufacture additional owners, its signature honestly requires the
 stronger `ShareableOwner<T>` bound — *that* choice is still explicit, because it changes what the
 function can do (call `retain`), not merely which carrier represents an unchanged operation:
 
 ```text
-store(take x: Foo)                     # shorthand; carrier statically inferred, may specialize
-store(take x: static Owner<Foo>)       # equivalent, spelled out
-store-runtime(take x: dyn Owner<Foo>)  # erased owner for factories/open runtime sets — still explicit
-duplicate(take x: ShareableOwner<Foo>) # operation genuinely needs another owner — still explicit
+store(steal x: Foo)                     # carrier statically inferred, may specialize — the only spelling
+store-runtime(steal x: dyn Owner<Foo>)  # erased owner for factories/open runtime sets — still explicit
+duplicate(steal x: ShareableOwner<Foo>) # operation genuinely needs another owner — still explicit
 ```
 
 The static form retains checked parametric HIR and may specialize for `Unique<Foo>`, `Shared<Foo>`,
@@ -2541,7 +2590,7 @@ recovered-uniqueness evidence explicitly permits mutation.
 ### Receiver mutability, deep immutability, and copy-on-write
 
 Receiver access is the ordinary mutability contract. A receiver defaults to readonly `&self`;
-mutation requires `&mut self`, and ownership escape or destruction requires `take self`. An
+mutation requires `&mut self`, and ownership escape or destruction requires `steal self`. An
 operation declared with `&self` is usable through mutable, readonly, unique, shared, or deeply
 immutable storage because it promises not to mutate through that receiver. The compiler rejects
 mutation in such an operation and should diagnose an unnecessarily exclusive private receiver, so
@@ -2610,7 +2659,7 @@ invisible snapshot copy.
 ### Co-Forth parity and IR verification
 
 Every ownership construct exposed by CoLisp must have a direct typed Co-Forth spelling or word:
-borrowing, taking, unique/shared/weak construction, promotion, static/dynamic owner evidence, drop,
+borrowing, stealing, unique/shared/weak construction, promotion, static/dynamic owner evidence, drop,
 unsafe boundaries, variant construction/destructuring, `throw`, handler regions, catch patterns,
 `nothrow` guarantees, record layout declarations, safe receiver projection, and inferred/move/exact
 closure capture policies. Co-Forth stack effects record whether an input is borrowed or consumed,
@@ -2621,7 +2670,7 @@ source-level guarantee. CoLisp lowers the same semantics rather than routing thr
 **CoLisp per-parameter ownership spelling (draft — not yet frozen; flagged as missing during #674
 scoping, 2026-09-17).** CoLisp states the same mode as an explicit keyword before the binding,
 reusing the vocabulary already established for lambda `:captures` entries (`(borrow config)`,
-`(take socket)`) and parameter-pack element modes (`(borrow Ts)` in "Parameter packs, runtime rest
+`(steal socket)`) and parameter-pack element modes (`(borrow Ts)` in "Parameter packs, runtime rest
 arguments, and C varargs"), rather than introducing a second notation:
 
 ```lisp
@@ -2644,24 +2693,27 @@ has no shared operand stack to preserve, so a borrowed parameter never appears i
 not the path. A literal field-for-field transliteration of the Co-Forth output row into CoLisp's
 return type would be wrong; the parity is in the ownership semantics, not the surface shape.
 
-**Take, and the rest of #674's scope.** `square` above only exercises `consume-value`, which is
+**Steal, and the rest of #674's scope.** `square` above only exercises `consume-value`, which is
 itself a lowering-level cell mode for an already-`Copy` scalar ("Typed stack signatures" above) —
 the narrowest case in the ownership model, not a representative one. The declaration syntax for
-`take` still needed a worked example; "Borrowing and taking" already gives the *call-site* behavior
+`steal` still needed a worked example; "Borrowing and stealing" already gives the *call-site* behavior
 in CoLisp (`:2062`, the `retain`/`inspect`/`Foo` use-after-move example) but only pseudocode for the
 *declarations* being called (`:2046-2048`). Here are those two declarations, concretely, using the
 same names so the two passages now read as one example instead of two disconnected ones:
 
 ```lisp
 (define (inspect (x : Foo)) : unit ...)                    ; ordinary parameter, borrow by default
-(define (retain (take x : Foo)) : unit ...)                ; take any Owner<Foo>; x may escape
+(define (retain (steal x : Foo)) : unit ...)                ; steal any Owner<Foo>; x may escape
 ```
 
-Explicit `(borrow x : Foo)` is also accepted and is equivalent to the unannotated form — stated
-explicitly rather than only inferred, for a reader comparing two mixed-mode parameters at a glance.
-Likewise `(take x : static Owner<Foo>)` is accepted and equivalent to the shorthand above, and
-`(take x : dyn Owner<Foo>)` remains available as an explicit request for an erased carrier — see the
-2026-09-17 revision in "Borrowing and taking" above, which replaced the original no-shorthand rule.
+**Revised again, 2026-09-17.** The previous version of this paragraph offered explicit
+`(borrow x : Foo)` as an accepted alternative to leaving the parameter unannotated, "for a reader
+comparing two mixed-mode parameters at a glance" — the same redundant-synonym justification just
+rejected for `static Owner<Foo>` in "Borrowing and stealing," applied to itself: annotating `borrow`
+explicitly changes nothing, since unannotated already means borrow. Retired for the same reason.
+Unannotated is the one spelling for the default; `(steal x : dyn Owner<Foo>)` remains, since erasure
+is a real semantic choice, not a spelling preference — see the 2026-09-17 revisions in "Borrowing
+and stealing" above.
 
 The rest of #674's scope already has a paired example elsewhere in this document; #674's owner
 should use these directly rather than re-deriving them:
@@ -2671,7 +2723,7 @@ should use these directly rather than re-deriving them:
 - **Deterministic drop / cleanup ordering** — "Typed failures and scope guards" (`:2004-2008`):
   `(scope exit cleanup)`, `(scope success publish)`, `(scope failure compensate)`, paired with the
   Co-Forth `scope-exit`/`scope-success`/`scope-failure` words.
-- **Closure capture ownership modes** (`borrow`/`take`/`retain` on a capture, distinct from an
+- **Closure capture ownership modes** (`borrow`/`steal`/`retain` on a capture, distinct from an
   ordinary parameter) — "Closure conversion and capture ownership" (`:1751-1774`), already paired.
 
 **Named gap, not fabricated:** `borrow-mut` (exclusive mutable borrow) has no worked declaration
@@ -2975,7 +3027,7 @@ implementation MyListRange<T> : Range {
 ```
 
 An operation requirement defines one canonical receiver and call ABI. Receiver forms are
-readonly `&self`, exclusive `&mut self`, consuming `take self`, or no receiver for an associated
+readonly `&self`, exclusive `&mut self`, consuming `steal self`, or no receiver for an associated
 operation. An implementation mapping is a type-checked receiver adapter, not only a function-name
 alias: it binds the concept parameters and states exactly how they reach a member, namespaced/static
 function, free function, generated callable, or composed delegate. For example:
@@ -3136,7 +3188,7 @@ property evidence. The standard library may define a facility conceptually like:
 concept MissingProperty<V> {
     operation property-get(&self, name: symbol) -> option<&V>
     operation property-get-mut(&mut self, name: symbol) -> option<&mut V>
-    operation property-set(&mut self, name: symbol, take value: V) -> option<V>
+    operation property-set(&mut self, name: symbol, steal value: V) -> option<V>
 }
 ```
 
@@ -3211,7 +3263,7 @@ Ts...` contains corresponding compile-time values; and `params ps...` contains o
 descriptors carrying type, ownership mode, binding identity, and source origin. Packs may be empty
 and are initially final in their parameter list. Bounded CTFE may inspect, slice, destructure, zip,
 and `foreach` over them, but expansion occurs only at an explicit expansion site. Each argument is
-evaluated exactly once from left to right and retains its own borrow/take/value/retain contract.
+evaluated exactly once from left to right and retains its own borrow/steal/value/retain contract.
 Instantiation erases the pack abstraction and produces an ordinary fixed-arity callable signature.
 An uninstantiated pack-generic is not a first-class closure, callback, dynamic evidence slot, or FFI
 function; it must first be selected and instantiated. A pack cannot be addressed, stored, returned,
@@ -3219,7 +3271,7 @@ or carried across suspension unless explicitly reified as a `tuple<T...>`, list,
 
 A runtime-variable homogeneous rest parameter is instead one fixed-ABI collection operand.
 `rest-borrow<T>` receives a call-scoped readonly slice and cannot escape; an ordinary owned
-`list<T>` (or another explicitly selected collection/range) may be taken and retained. Call syntax
+`list<T>` (or another explicitly selected collection/range) may be stolen and retained. Call syntax
 may construct or explicitly spread a collection into that operand, but the declaration determines
 the representation and no callee consumes an unknown number of ambient stack cells. Exact fixed
 arity ranks ahead of a rest or pack candidate; a pack candidate participates only when its declared
