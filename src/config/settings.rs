@@ -1019,18 +1019,14 @@ impl Config {
     }
 
     /// Save configuration to an explicit path owned by the caller.
+    ///
+    /// The write is atomic — private temporary beside the target, fsync,
+    /// rename — so a save that fails partway leaves the previous configuration
+    /// intact. Only intentional changes reach this path; ordinary startup
+    /// saves nothing (#76).
     pub(crate) fn save_to(&self, config_path: &std::path::Path) -> anyhow::Result<()> {
-        use std::fs;
-
         self.validate()
             .context("Configuration validation failed before save")?;
-
-        let config_dir = config_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Configuration path has no parent directory"))?;
-
-        // Create directory if it doesn't exist
-        fs::create_dir_all(&config_dir)?;
 
         // Build the providers list — prefer the explicit providers field; fall
         // back to deriving from teachers+backend for configs constructed via
@@ -1068,7 +1064,7 @@ impl Config {
         };
 
         let toml_string = toml::to_string_pretty(&toml_config)?;
-        fs::write(&config_path, toml_string)?;
+        super::atomic_write::atomic_write(config_path, toml_string.as_bytes())?;
 
         tracing::info!("Configuration saved to {:?}", config_path);
         Ok(())
@@ -1391,5 +1387,164 @@ mod tests {
         let config = Config::with_providers(providers);
         assert_eq!(config.cloud_providers().len(), 1);
         assert_eq!(config.local_providers().len(), 1);
+    }
+
+    /// A config the tests can actually save: one provider, valid enough to
+    /// pass `validate()` on the save path.
+    fn savable_config() -> Config {
+        Config::with_providers(vec![ProviderEntry::Claude {
+            api_key: "sk-ant-test-key-1234567890".to_string(),
+            model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("claude".to_string()),
+        }])
+    }
+
+    /// An intentional save must be able to replace a file it cannot open for
+    /// writing — that is what "atomic" buys.
+    ///
+    /// A mode the owner can read but not write is exactly the case where a
+    /// plain `fs::write` fails (EACCES on open) and a temporary-then-rename
+    /// succeeds (the rename needs only the directory), so this test fails
+    /// under the pre-#76 direct write and discriminates the two.
+    #[cfg(unix)]
+    #[test]
+    fn test_an_intentional_save_replaces_a_read_only_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(&config_path, b"# user's own bytes\n").unwrap();
+        let mut perms = std::fs::metadata(&config_path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&config_path, perms).unwrap();
+
+        savable_config()
+            .save_to(&config_path)
+            .expect("an atomic save replaces a read-only target");
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            saved.contains("providers"),
+            "the new configuration must be in place; file was:\n{saved}"
+        );
+        assert_eq!(
+            std::fs::metadata(&config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444,
+            "and the save must not silently change the permissions the user had"
+        );
+    }
+
+    /// A save that cannot complete leaves the previous configuration exactly
+    /// as it was — the data-loss half of #76's atomic-write clause.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_failed_intentional_save_preserves_the_previous_config_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        savable_config().save_to(&config_path).unwrap();
+        let previous = std::fs::read(&config_path).unwrap();
+        let previous_mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+
+        let mut perms = std::fs::metadata(directory.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(directory.path(), perms).unwrap();
+        let outcome = savable_config().save_to(&config_path);
+        let mut perms = std::fs::metadata(directory.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(directory.path(), perms).unwrap();
+
+        assert!(
+            outcome.is_err(),
+            "a save that cannot create its temporary must report failure"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            previous,
+            "the previous configuration must survive a failed save byte-for-byte"
+        );
+        assert_eq!(
+            std::fs::metadata(&config_path).unwrap().modified().unwrap(),
+            previous_mtime,
+            "and a failed save must not move its mtime"
+        );
+    }
+
+    /// Setup must not follow a symlink planted at the config path: the loader
+    /// refuses one on read, and the save path refuses to write through one.
+    #[cfg(unix)]
+    #[test]
+    fn test_an_intentional_save_refuses_to_write_through_a_config_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("elsewhere.toml");
+        std::fs::write(&real, b"sentinel\n").unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &config_path).unwrap();
+
+        let outcome = savable_config().save_to(&config_path);
+
+        assert!(
+            outcome.is_err(),
+            "a symlinked config must be refused, not written through"
+        );
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            b"sentinel\n",
+            "nothing may be written through the link"
+        );
+        assert!(
+            std::fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link itself must survive the refused save"
+        );
+    }
+
+    /// No temporary may survive a completed save.
+    #[test]
+    fn test_a_completed_save_leaves_only_the_config_file_behind() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        savable_config().save_to(&config_path).unwrap();
+
+        let entries: Vec<String> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["config.toml"],
+            "a completed save must leave no temporary behind; directory held {entries:?}"
+        );
+    }
+
+    /// A freshly written config holds API keys, so it must be owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_freshly_saved_config_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        savable_config().save_to(&config_path).unwrap();
+
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a fresh config.toml must not be readable by group or other (mode was {mode:o})"
+        );
     }
 }
