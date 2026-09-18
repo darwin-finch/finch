@@ -581,3 +581,25 @@ deterministic destruction"). Worse: `upgrade` was matched with `(ok s2 ...)`/`(e
 process of fixing it, left open rather than guessed past: `weaken` is confirmed as a real word, but
 only ever shown as a *closure-capture* mode, never as an ordinary function on an arbitrary
 `Shared<T>` outside a capture clause — whether the same word does both jobs is unstated.
+
+**Continued 2026-09-18 — §11, closure captures composed with `weaken`/`upgrade`,** testing exactly
+the capture-mode usage the `weaken` gap above says *is* confirmed (as opposed to the ordinary-
+function usage that isn't). Composes cleanly against the document's own real `:captures` syntax —
+narrows the open gap rather than closing it (confirms `weaken` itself is solid where documented;
+`upgrade`'s call syntax remains the unresolved part, same as §2).
+
+**Stopping point for this autonomous pass.** Summary of what changed while Shammah slept, all
+committed incrementally rather than as one batch: `feature_tour.md` grew from 5 sections to 12,
+`FINCH_LANGUAGE_DESIGN.md` gained no new content this stretch (this pass was entirely example-
+writing and auditing existing examples against real syntax, not new spec surface) — two real
+mistakes were caught and fixed in already-written examples (invented `Unique.new`/`Shared.downgrade`
+calling convention; `option` matched with `result`'s `ok`/`err` shape instead of `some`/`none`), one
+stale UNVERIFIED note was resolved and cross-referenced (generic-header placement, confirmed against
+`render-all`), and five new gaps were found and precisely named rather than guessed past
+(`ParameterSpec -> syntax`, `function-spec-of`, mutable locals for pack accumulation, the CTFE-vs-
+ordinary-effects question inside `ct-foreach`, and `weaken`/`upgrade`'s ordinary-code call syntax).
+Every finding this pass came from writing a complete, real program and hitting an actual wall — the
+established, working method from earlier in the session, just run unattended. Next candidates,
+roughly in order of how load-bearing they are: `ParameterSpec -> syntax` (blocks any further
+structural-CTFE example), the compile-time-hook catalog (mechanism is specified, nothing concrete
+uses it yet), and `borrow-mut`/mutable-locals (two names for what may be one underlying gap).

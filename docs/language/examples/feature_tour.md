@@ -293,7 +293,29 @@ own real example exactly — extending the body is what surfaced the *next* laye
 locals, CTFE-vs-runtime boundary inside a `ct-foreach` body), not a problem with the pack feature
 itself.
 
-## 10. Open gaps, current as of this pass — what's still missing and why
+## 11. Closure captures with mixed ownership modes, `weaken` where it's actually confirmed
+
+§2 flagged `weaken` as confirmed only for closure captures, not as an ordinary standalone function.
+Testing exactly that composition — `weaken` in a capture list, `upgrade` used on it inside the body —
+using the document's own real capture-list syntax directly:
+
+```lisp
+(define (make-observer (cache : Shared<Cache>)) : (fn () -> string)   ; UNVERIFIED return-type
+  (lambda (:captures (weaken cache))                                  ; annotation, same as §6 —
+          ()                                                          ; not re-flagging separately.
+    (match (upgrade cache)
+      (some c (describe c))
+      (none "cache is gone"))))
+```
+
+No gap in the capture mechanics themselves: `(:captures (weaken cache))` matches the document's own
+`(:captures (borrow config) (steal socket) (retain cache))` shape exactly, just with the fifth listed
+capture mode (`weaken`) instead of the first three shown. `upgrade`'s `some`/`none` destructuring
+(fixed in §2) is consistent here too. **Same UNVERIFIED as §2, not a new one:** whether `upgrade` is
+called bare like this, or some other way, is still a guess — this example just confirms `weaken`
+*itself* is solid in the one place it's actually documented, narrowing rather than closing that gap.
+
+## 12. Open gaps, current as of this pass — what's still missing and why
 
 - **Capability requests with wildcarded paths** (`read{path="~/**"}`) — still ungrammared; unchanged
   since first flagged.
