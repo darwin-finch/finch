@@ -1,17 +1,22 @@
-//! Mouse tracking vs native terminal scrollback.
+//! Mouse tracking for the in-app conversation scroll view.
 //!
-//! `EnableMouseCapture` is what makes accordion click-to-toggle (and
-//! click-to-navigate in the input box) possible. It also makes the terminal
-//! deliver every drag to Finch instead of the host's own selection, and every
-//! wheel tick instead of native scrollback. Issue #221 requires native
-//! click-drag copy by default; accordion expand/collapse stays on the
-//! keyboard. Capture is therefore off unless an opt-in path later holds it.
+//! `EnableMouseCapture` is what makes wheel-and-click hit testing possible at
+//! all: with tracking off the terminal never reports a wheel or a click, so
+//! the only scroll surface is the host's own native history. #806 decides the
+//! #443 fork toward in-app conversation scroll (like Claude Code and Grok,
+//! not Codex's native-history reader), so tracking is **held by default**:
+//! wheels hit the conversation ScrollView, nested tool-result viewports, or
+//! nothing, and clicks hit the disclosure and composer hitboxes.
 //!
-//! When tracking *is* held, issue #441's option A still applies: release on a
-//! wheel so subsequent ticks belong to the terminal, restore on the next
-//! keypress. The first wheel tick is consumed as the release. Shutdown, panic,
-//! suspend, and emergency restore always emit `DisableMouseCapture` so a
-//! session that did hold tracking cannot leak it into the shell.
+//! The #441 release-on-first-wheel policy is retired: the wheel is no longer
+//! handed back to the terminal, because native scrollback is not the reader —
+//! `canonical_commit` keeps the fully expanded copyable record there instead.
+//! Native text drag-selection under held capture remains the known trade
+//! tracked on #221, and a future opt-out preference is #244.
+//!
+//! Shutdown, panic, suspend, and emergency restore always emit
+//! `DisableMouseCapture` so a session that held tracking cannot leak it into
+//! the shell.
 
 use std::io::{self, Write};
 
@@ -28,23 +33,25 @@ use crossterm::terminal::LeaveAlternateScreen;
 /// Whether Finch currently holds mouse tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MouseTracking {
-    /// Default: the host terminal owns click-drag selection and the wheel
-    /// (#221). Accordion disclosure stays on the keyboard.
-    Off,
-    /// Terminal reports mouse events to Finch. Clicks work; the wheel does not
-    /// scroll native history. Reached only if an opt-in path enables capture.
+    /// The terminal reports mouse events to Finch: wheels and clicks hit the
+    /// in-app widget hitboxes (conversation scroll view, tool viewports,
+    /// disclosure). This is the production default since #806.
     Held,
-    /// Terminal owns the wheel, so native scrollback is reachable. Restored on
-    /// the next keypress, and only if tracking was previously [`Self::Held`].
-    ReleasedForNativeScroll,
+    /// Reserved for the future opt-out preference (#244): the host terminal
+    /// owns the wheel and click-drag selection, and accordion disclosure
+    /// stays on the keyboard.
+    #[allow(dead_code)]
+    Off,
 }
 
 impl MouseTracking {
-    /// Production default: native selection, no mouse reporting.
-    pub(super) const DEFAULT: Self = Self::Off;
+    /// Production default: capture held, so the conversation ScrollView owns
+    /// the wheel (#806).
+    pub(super) const DEFAULT: Self = Self::Held;
 }
 
-/// Crossterm `EnableMouseCapture` bytes, used to assert their absence.
+/// Crossterm `EnableMouseCapture` bytes, used to assert their presence.
+#[cfg(test)]
 pub(super) fn enable_mouse_capture_bytes() -> Vec<u8> {
     let mut out = Vec::new();
     execute!(&mut out, EnableMouseCapture).expect("encode EnableMouseCapture");
@@ -52,12 +59,14 @@ pub(super) fn enable_mouse_capture_bytes() -> Vec<u8> {
 }
 
 /// Crossterm `DisableMouseCapture` bytes, used to assert restore symmetry.
+#[cfg(test)]
 pub(super) fn disable_mouse_capture_bytes() -> Vec<u8> {
     let mut out = Vec::new();
     execute!(&mut out, DisableMouseCapture).expect("encode DisableMouseCapture");
     out
 }
 
+#[cfg(test)]
 pub(super) fn contains_enable_mouse_capture(bytes: &[u8]) -> bool {
     let needle = enable_mouse_capture_bytes();
     if needle.is_empty() {
@@ -66,6 +75,7 @@ pub(super) fn contains_enable_mouse_capture(bytes: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|window| window == needle)
 }
 
+#[cfg(test)]
 pub(super) fn contains_disable_mouse_capture(bytes: &[u8]) -> bool {
     let needle = disable_mouse_capture_bytes();
     if needle.is_empty() {
@@ -76,12 +86,11 @@ pub(super) fn contains_disable_mouse_capture(bytes: &[u8]) -> bool {
 
 /// Post-`enable_raw_mode` sequences written by [`super::TuiRenderer::new`].
 ///
-/// Mouse capture must not appear here: click-drag belongs to the host terminal
-/// (#221).
+/// Mouse capture is enabled so wheels and clicks reach the in-app widget
+/// hitboxes (#806); the wheel scrolls the conversation, never native history.
 pub(super) fn write_startup_terminal_modes(out: &mut impl Write) -> io::Result<()> {
     // Bracketed paste cannot corrupt the terminal on unclean exit.
-    // EnableMouseCapture is omitted so click-drag belongs to the host (#221).
-    let _ = execute!(out, EnableBracketedPaste);
+    let _ = execute!(out, EnableBracketedPaste, EnableMouseCapture);
     let _ = execute!(
         out,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
@@ -95,8 +104,8 @@ fn write_enable_if_held(out: &mut impl Write, tracking: MouseTracking) {
     }
 }
 
-/// Resume after [`super::TuiRenderer::suspend`]. Default tracking does not
-/// re-enable mouse capture; only an opt-in [`MouseTracking::Held`] session does.
+/// Resume after [`super::TuiRenderer::suspend`]. A held session re-enables
+/// capture; the reserved opt-out (#244) writes nothing.
 pub(super) fn write_resume_terminal_modes(
     out: &mut impl Write,
     tracking: MouseTracking,
@@ -164,156 +173,53 @@ pub(super) fn is_wheel(kind: MouseEventKind) -> bool {
     )
 }
 
-/// Release tracking so later wheel ticks scroll native history.
-///
-/// Idempotent: a second wheel while already released writes nothing.
-pub(super) fn release_for_native_scroll(
-    out: &mut impl Write,
-    tracking: MouseTracking,
-) -> MouseTracking {
-    if tracking != MouseTracking::Held {
-        return tracking;
-    }
-    let _ = execute!(out, DisableMouseCapture);
-    MouseTracking::ReleasedForNativeScroll
-}
-
-/// Restore tracking after the user is interacting with the live area again.
-///
-/// Idempotent: a keypress while already held writes nothing.
-pub(super) fn restore_after_interaction(
-    out: &mut impl Write,
-    tracking: MouseTracking,
-) -> MouseTracking {
-    if tracking != MouseTracking::ReleasedForNativeScroll {
-        return tracking;
-    }
-    let _ = execute!(out, EnableMouseCapture);
-    MouseTracking::Held
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::MouseButton;
 
     fn tracking_on() -> Vec<u8> {
-        let mut out = Vec::new();
-        execute!(&mut out, EnableMouseCapture).expect("encode EnableMouseCapture");
-        out
-    }
-
-    fn tracking_off() -> Vec<u8> {
-        let mut out = Vec::new();
-        execute!(&mut out, DisableMouseCapture).expect("encode DisableMouseCapture");
-        out
+        enable_mouse_capture_bytes()
     }
 
     #[test]
-    fn test_wheel_releases_mouse_tracking_so_native_scrollback_is_reachable() {
+    fn test_default_tracking_holds_capture_for_the_conversation_scrollview() {
+        assert_eq!(
+            MouseTracking::DEFAULT,
+            MouseTracking::Held,
+            "INVARIANT (#806): the production default holds mouse tracking so \
+             wheels hit the conversation ScrollView and nested tool viewports \
+             instead of falling through to native scrollback"
+        );
+    }
+
+    #[test]
+    fn test_wheel_kinds_are_recognised_for_scroll_dispatch() {
         for kind in [
             MouseEventKind::ScrollUp,
             MouseEventKind::ScrollDown,
             MouseEventKind::ScrollLeft,
             MouseEventKind::ScrollRight,
         ] {
-            let mut bytes = Vec::new();
-            let next = if is_wheel(kind) {
-                release_for_native_scroll(&mut bytes, MouseTracking::Held)
-            } else {
-                MouseTracking::Held
-            };
-            assert_eq!(
-                next,
-                MouseTracking::ReleasedForNativeScroll,
-                "INVARIANT: a wheel tick releases mouse tracking so the terminal \
-                 owns subsequent wheel events and native scrollback is reachable \
-                 (#441). kind={kind:?}"
-            );
-            assert_eq!(
-                bytes,
-                tracking_off(),
-                "INVARIANT: the release is DisableMouseCapture, the sequence the \
-                 terminal needs to stop reporting the wheel (#441). kind={kind:?} \
-                 terminal received {bytes:?}"
+            assert!(
+                is_wheel(kind),
+                "INVARIANT: {kind:?} is a wheel event and must be routed to the \
+                 scroll hitboxes (#806)"
             );
         }
-    }
-
-    #[test]
-    fn test_second_wheel_does_not_repeat_the_scrollback_release() {
-        let mut bytes = Vec::new();
-        let tracking = release_for_native_scroll(&mut bytes, MouseTracking::Held);
-        bytes.clear();
-        let tracking = release_for_native_scroll(&mut bytes, tracking);
-        assert_eq!(tracking, MouseTracking::ReleasedForNativeScroll);
-        assert!(
-            bytes.is_empty(),
-            "INVARIANT: a second wheel while tracking is already released must \
-             not emit another DisableMouseCapture (#441). terminal received \
-             {bytes:?}"
-        );
-    }
-
-    #[test]
-    fn test_left_click_does_not_release_mouse_tracking_for_native_scrollback() {
-        let mut bytes = Vec::new();
         assert!(
             !is_wheel(MouseEventKind::Down(MouseButton::Left)),
-            "INVARIANT: a left click is not a wheel; accordion click-to-toggle \
-             must keep mouse tracking (#441)"
-        );
-        let next = if is_wheel(MouseEventKind::Down(MouseButton::Left)) {
-            release_for_native_scroll(&mut bytes, MouseTracking::Held)
-        } else {
-            MouseTracking::Held
-        };
-        assert_eq!(next, MouseTracking::Held);
-        assert!(
-            bytes.is_empty(),
-            "INVARIANT: clicks must not disable mouse tracking; that would drop \
-             click-to-toggle for the rest of the gesture (#441). terminal \
-             received {bytes:?}"
+            "INVARIANT: a left click is not a wheel; it follows the click path \
+             (disclosure toggle, tool-result expansion)"
         );
     }
 
-    #[test]
-    fn test_keypress_restores_mouse_tracking_after_native_scrollback() {
-        let mut bytes = Vec::new();
-        let tracking =
-            restore_after_interaction(&mut bytes, MouseTracking::ReleasedForNativeScroll);
-        assert_eq!(
-            tracking,
-            MouseTracking::Held,
-            "INVARIANT: the next keypress after a wheel restores mouse tracking \
-             so clicks work again (#441)"
-        );
-        assert_eq!(
-            bytes,
-            tracking_on(),
-            "INVARIANT: the restore is EnableMouseCapture (#441). terminal \
-             received {bytes:?}"
-        );
-    }
-
-    #[test]
-    fn test_keypress_while_tracking_held_does_not_reenable_for_scrollback() {
-        let mut bytes = Vec::new();
-        let tracking = restore_after_interaction(&mut bytes, MouseTracking::Held);
-        assert_eq!(tracking, MouseTracking::Held);
+    fn assert_enables_mouse_capture(bytes: &[u8], path: &str) {
         assert!(
-            bytes.is_empty(),
-            "INVARIANT: a keypress while tracking is already held must not emit \
-             another EnableMouseCapture (#441). terminal received {bytes:?}"
-        );
-    }
-
-    fn assert_no_enable_mouse_capture(bytes: &[u8], path: &str) {
-        assert!(
-            !contains_enable_mouse_capture(bytes),
-            "INVARIANT: the default TUI {path} path must not emit EnableMouseCapture, \
-             so click-drag selection stays with the host terminal (#221). \
-             EnableMouseCapture bytes are {:02x?}; terminal received {bytes:02x?}",
+            contains_enable_mouse_capture(bytes),
+            "INVARIANT: the default TUI {path} path must hold mouse capture, so \
+             wheels scroll the conversation ScrollView (#806). EnableMouseCapture \
+             bytes are {:02x?}; terminal received {bytes:02x?}",
             enable_mouse_capture_bytes()
         );
     }
@@ -329,26 +235,28 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_startup_modes_do_not_enable_mouse_capture() {
+    fn test_tui_startup_modes_hold_mouse_capture_for_the_scroll_view() {
         let mut bytes = Vec::new();
         write_startup_terminal_modes(&mut bytes).expect("encode startup modes");
-        assert_no_enable_mouse_capture(&bytes, "startup/enter-raw-mode");
+        assert_enables_mouse_capture(&bytes, "startup/enter-raw-mode");
+        // Capture is harmless on unclean exit only if every restore path
+        // disables it; the restore tests below pin those paths.
     }
 
     #[test]
-    fn test_tui_resume_modes_do_not_enable_mouse_capture_by_default() {
+    fn test_tui_resume_modes_hold_mouse_capture_by_default() {
         let mut bytes = Vec::new();
         write_resume_terminal_modes(&mut bytes, MouseTracking::DEFAULT)
             .expect("encode resume modes");
-        assert_no_enable_mouse_capture(&bytes, "resume");
+        assert_enables_mouse_capture(&bytes, "resume");
     }
 
     #[test]
-    fn test_tui_resume_after_emergency_modes_do_not_enable_mouse_capture_by_default() {
+    fn test_tui_resume_after_emergency_modes_hold_mouse_capture_by_default() {
         let mut bytes = Vec::new();
         write_resume_after_emergency_modes(&mut bytes, MouseTracking::DEFAULT)
             .expect("encode resume-after-emergency modes");
-        assert_no_enable_mouse_capture(&bytes, "resume after emergency restore");
+        assert_enables_mouse_capture(&bytes, "resume after emergency restore");
     }
 
     #[test]
@@ -357,17 +265,17 @@ mod tests {
         write_resume_terminal_modes(&mut held, MouseTracking::Held).expect("encode held resume");
         assert_eq!(
             held,
-            enable_mouse_capture_bytes(),
-            "INVARIANT: an opt-in Held session must restore EnableMouseCapture on \
-             resume (#221 / #244). terminal received {held:02x?}"
+            tracking_on(),
+            "INVARIANT: a Held session must restore EnableMouseCapture on resume \
+             (#806). terminal received {held:02x?}"
         );
 
         let mut off = Vec::new();
         write_resume_terminal_modes(&mut off, MouseTracking::Off).expect("encode off resume");
         assert!(
             off.is_empty(),
-            "INVARIANT: default-off resume must write nothing, not EnableMouseCapture \
-             (#221). terminal received {off:02x?}"
+            "INVARIANT: an opted-out resume must write nothing, not EnableMouseCapture \
+             (#244). terminal received {off:02x?}"
         );
     }
 
@@ -386,20 +294,7 @@ mod tests {
         assert_disables_mouse_capture(&emergency, "emergency restore");
 
         let mut panic_restore = Vec::new();
-        write_panic_restore_modes(&mut panic_restore).expect("encode panic restore");
+        write_panic_restore_modes(&mut panic_restore).expect("encode panic");
         assert_disables_mouse_capture(&panic_restore, "panic");
-    }
-
-    #[test]
-    fn test_default_tracking_does_not_restore_capture_on_keypress() {
-        let mut bytes = Vec::new();
-        let next = restore_after_interaction(&mut bytes, MouseTracking::DEFAULT);
-        assert_eq!(
-            next,
-            MouseTracking::DEFAULT,
-            "INVARIANT: a keypress with default-off tracking must not switch into \
-             Held and re-enable capture (#221). tracking was {next:?}"
-        );
-        assert_no_enable_mouse_capture(&bytes, "keypress restore with default tracking");
     }
 }

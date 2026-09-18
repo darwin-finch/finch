@@ -706,20 +706,22 @@ fn test_committed_messages_reach_terminal_scrollback_under_mouse_capture() {
     );
 }
 
-/// Default TUI startup must not enable mouse capture, so click-drag copy
-/// stays with the host terminal (#221).
+/// Default TUI startup holds mouse capture so the conversation ScrollView owns
+/// the wheel (#806, which decides the #443 fork over #221's capture-off
+/// default). Shutdown must still disable reporting so nothing leaks into the
+/// shell.
 #[test]
-fn test_tui_startup_does_not_enable_mouse_capture() {
+fn test_tui_startup_enables_mouse_capture_for_the_scroll_view() {
     let fixture = Fixture::new();
     let mut session = Session::spawn(&fixture);
     session.wait_for("finch v", READY_DEADLINE, "the startup header was drawn");
 
     let on_at = find_subslice(&session.transcript_bytes(), MOUSE_TRACKING_ON);
     assert!(
-        on_at.is_none(),
-        "INVARIANT: the default TUI must not emit EnableMouseCapture at startup, \
-         so click-drag selection stays with the host terminal (#221). First \
-         enable was at byte {on_at:?}. Readable terminal:\n{}",
+        on_at.is_some(),
+        "INVARIANT: the default TUI must emit EnableMouseCapture at startup so \
+         wheels and clicks reach the conversation ScrollView and disclosure \
+         hitboxes (#806). Readable terminal:\n{}",
         session.readable_transcript()
     );
 
@@ -727,42 +729,38 @@ fn test_tui_startup_does_not_enable_mouse_capture() {
     let status = session.wait_for_exit();
     let bytes = session.transcript_bytes();
     assert!(
-        find_subslice(&bytes, MOUSE_TRACKING_ON).is_none(),
-        "INVARIANT: EnableMouseCapture must not appear across the whole session, \
-         including shutdown (#221). finch exited with {status:?}. Readable \
-         terminal:\n{}",
-        session.readable_transcript()
-    );
-    assert!(
         find_subslice(&bytes, MOUSE_TRACKING_OFF).is_some(),
-        "INVARIANT: shutdown still emits DisableMouseCapture so a session that \
-         had held tracking cannot leak reporting into the shell (#221). \
-         finch exited with {status:?}. Readable terminal:\n{}",
+        "INVARIANT: shutdown emits DisableMouseCapture so a session that held \
+         tracking cannot leak reporting into the shell. finch exited with \
+         {status:?}. Readable terminal:\n{}",
         session.readable_transcript()
     );
 }
 
-/// A wheel tick or later keypress must not turn mouse capture on when the
-/// default is off. Native scroll and selection stay with the terminal.
+/// A wheel tick or a keypress must not hand the wheel back to the terminal:
+/// the #441 release-on-first-wheel hybrid is retired (#806). Capture stays
+/// held through ordinary review, and shutdown still disables it exactly
+/// through the normal path.
 #[test]
-fn test_wheel_and_keypress_do_not_enable_mouse_capture() {
+fn test_wheel_and_keypress_hold_mouse_capture() {
     let fixture = Fixture::new();
     let mut session = Session::spawn(&fixture);
     session.wait_for("finch v", READY_DEADLINE, "the startup header was drawn");
 
+    let before_wheel = find_subslice(&session.transcript_bytes(), MOUSE_TRACKING_OFF);
     session.send_bytes(SGR_WHEEL_UP);
-    // A printable key is the production trigger that used to restore capture
-    // after a wheel (#441). Backspace afterwards so `/exit` is not submitted
-    // as `x/exit`.
+    // A printable key plus backspace so `/exit` is not submitted as `x/exit`.
     session.send_bytes(b"x");
     session.send_bytes(b"\x7f");
 
-    let on_at = find_subslice(&session.transcript_bytes(), MOUSE_TRACKING_ON);
-    assert!(
-        on_at.is_none(),
-        "INVARIANT: a wheel or keypress must not emit EnableMouseCapture when \
-         tracking is default-off (#221). First enable was at byte {on_at:?}. \
-         Readable terminal:\n{}",
+    let off_at = find_subslice(&session.transcript_bytes(), MOUSE_TRACKING_OFF);
+    assert_eq!(
+        off_at,
+        before_wheel,
+        "INVARIANT: a wheel or keypress must not disable mouse capture — native \
+         scrollback is the copyable record, never the reader (#806), so the \
+         #441 release-on-first-wheel policy is retired. First disable was at \
+         byte {off_at:?} (was {before_wheel:?}). Readable terminal:\n{}",
         session.readable_transcript()
     );
 
@@ -770,7 +768,7 @@ fn test_wheel_and_keypress_do_not_enable_mouse_capture() {
         Ok(None) => {}
         Ok(Some(status)) => panic!(
             "INVARIANT: the session must still be live after the wheel and \
-             keypress (#221). finch exited with {status:?}. Readable \
+             keypress (#806). finch exited with {status:?}. Readable \
              terminal:\n{}",
             session.readable_transcript()
         ),
@@ -778,5 +776,12 @@ fn test_wheel_and_keypress_do_not_enable_mouse_capture() {
     }
 
     session.send_line("/exit");
-    let _ = session.wait_for_exit();
+    let status = session.wait_for_exit();
+    let bytes = session.transcript_bytes();
+    assert!(
+        find_subslice(&bytes, MOUSE_TRACKING_OFF).is_some(),
+        "INVARIANT: shutdown emits DisableMouseCapture so tracking cannot leak \
+         into the shell. finch exited with {status:?}. Readable terminal:\n{}",
+        session.readable_transcript()
+    );
 }

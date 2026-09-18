@@ -8,7 +8,7 @@ Full documentation lives at `docs/TUI_ARCHITECTURE.md`.
 - Canonical transcript commit — `commit_complete_messages()` prints complete
   messages above the live area, then spools a viewport of linefeeds so those
   rows land in native terminal scrollback (permanent) exactly once per
-  message id.
+  message id. Native history is the copyable record, never the reader.
 - Live area — `erase_live_area()` + `draw_live_area()` erase and redraw the
   streaming WorkUnit, input, and status every frame via the shadow buffer.
   Redraws stay inside the terminal so they never enter native history.
@@ -20,6 +20,22 @@ clears the visible projection first, so a re-commit after a resize cannot spool
 the row into native history twice. Test:
 `canonical_commit_marks_only_after_success_and_follows_resize_clear` in
 `src/cli/tui/mod.rs`.
+
+**Conversation ScrollView** (`scroll_view.rs`, #806): the transcript region —
+the 805 root column's `Flex` `TRANSCRIPT` claim, the leftover frame under the
+bottom chrome — is an in-app scroll view over the conversation. Renderer state
+is one `offset_from_bottom` (physical rows hidden below the viewport; `0` is
+follow mode). The window is derived at paint time: `scroll_window_split` cuts
+the projected retained transcript at the offset, and the full-viewport repaint
+and the retained hit-region rebuild share the same split, so paint and
+hitboxes never diverge. Wheel ticks land on it wherever the pointer is inside
+the claim and outside every nested tool-result control; PageUp/PageDown do the
+same from the keyboard, independent of mouse tracking. While scrolled up, a
+canonical commit anchors the window (`anchor_committed_rows`) so streaming
+content cannot drag the reader. Mouse tracking is held by default
+(`mouse_capture.rs`): the #441 release-on-first-wheel hybrid is retired —
+native history is not the reader; drag-selection under capture remains open on
+#221 and a capture opt-out on #244.
 
 **Retained transcript disclosure** (`accordion.rs`, `view_model.rs`):
 - The ViewModel projects a WorkUnit's `domain_view()` into `TranscriptNode` widget props with
@@ -64,9 +80,9 @@ the width-conditional rails (#810).
 - Per-row scroll offsets live in `ToolViewportState`, keyed by the append-stable
   `view_model::RowId` — interleaved tool updates never reset them. Hit regions are
   rebuilt from physical-row geometry after every frame and resize, mirroring the
-  accordion; a wheel whose X/Y lands inside a control scrolls that result only
-  and keeps mouse tracking (native scrollback stays reachable for wheels off the
-  control, per #441).
+  accordion; a wheel whose X/Y lands inside a control scrolls that result only.
+  A wheel anywhere else in the transcript claim scrolls the conversation
+  ScrollView (#806); a wheel over the bottom chrome is claimed by nobody.
 - Click on the control's cells, or Enter/Space with the row focused via F6,
   opens a focused expanded surface (title bar, scrolled body, plain-text
   footer). Up/Down/PageUp/PageDown/Home/End scroll it, Esc/q/Enter close it, and
@@ -85,6 +101,7 @@ Virtual row helpers:
 - `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
 - `src/cli/tui/view_model.rs` — the blit-time `LiveViewModel`, the domain → widget projection, and the root claiming tree
 - `src/cli/tui/widgets.rs` — claiming layout: rects, tracks, hitboxes, resize
+- `src/cli/tui/scroll_view.rs` — the conversation ScrollView: scroll offset, wheel claim, window split
 - `src/cli/tui/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`
 - `src/cli/tui/accordion.rs` — renderer-owned disclosure: open set, focus, hit regions
 - `src/cli/tui/tool_viewport.rs` — bounded tool-result controls: child viewport state, wheel hit regions, expanded surface
