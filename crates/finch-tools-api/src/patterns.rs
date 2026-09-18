@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-use super::executor::ToolSignature;
-use super::permissions::{bash_command_is_constitutionally_denied, resolve_canonical_path};
+use crate::permissions::{bash_command_is_constitutionally_denied, resolve_canonical_path};
+use crate::signature::ToolSignature;
 
 /// Type of pattern matching to use
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

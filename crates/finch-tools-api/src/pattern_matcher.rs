@@ -3,7 +3,7 @@
 // Extracts tool uses from query text using regex patterns
 // Provides immediate value before neural tool selector is trained
 
-use crate::tools::types::ToolUse;
+use crate::types::ToolUse;
 use anyhow::Result;
 use regex::Regex;
 use serde_json::json;

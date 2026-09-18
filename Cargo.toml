@@ -15,6 +15,7 @@ repository = "https://github.com/darwin-finch/finch"
 [workspace]
 members = [
     "crates/finch-coforth",
+    "crates/finch-tools-api",
     "crates/finch-colisp",
     "crates/finch-generation",
     "crates/finch-language",
@@ -24,6 +25,7 @@ members = [
 ]
 default-members = [
     ".",
+    "crates/finch-tools-api",
     "crates/finch-coforth",
     "crates/finch-colisp",
     "crates/finch-generation",
@@ -36,6 +38,7 @@ resolver = "2"
 
 [dependencies]
 finch-generation = { path = "crates/finch-generation" }
+finch-tools-api = { path = "crates/finch-tools-api" }
 finch-language = { path = "crates/finch-language" }
 finch-providers = { path = "crates/finch-providers" }
 finch-vm = { path = "crates/finch-vm" }

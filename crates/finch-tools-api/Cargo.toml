@@ -1,0 +1,26 @@
+[package]
+name = "finch-tools-api"
+version = "0.7.31"
+publish = false
+rust-version = "1.98"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0"
+description = "Dependency-free tool surface: Tool trait, typed requests/results, permissions, approval patterns, and the event-loop tool protocol"
+repository = "https://github.com/darwin-finch/finch"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+finch-providers = { path = "../finch-providers" }
+finch-vm = { path = "../finch-vm" }
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["sync"] }
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.8"

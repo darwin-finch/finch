@@ -13,8 +13,8 @@
 // Returns a colored summary of applied hunks.
 
 use crate::programs::ExecutionEffect;
-use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};

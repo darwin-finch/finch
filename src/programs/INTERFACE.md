@@ -10,12 +10,8 @@ Everything below is what callers outside this module can reach. Implementation m
 ## Types
 
 ```rust
-/// Upper bound on what executing a program may affect.
+/// Upper bound on what executing a program may affect. Re-exported from `finch-tools-api`.
 pub enum ExecutionEffect { Pure, VmRead, VmWrite, WorkspaceRead, ExternalRead, WorkspaceWrite, ExternalWrite, Destructive, Unclassified }
-impl ExecutionEffect {
-    pub fn as_str(self) -> &'static str;
-    pub fn runs_autonomously(self) -> bool;
-}
 /// A self-executing Finch source file after its shebang has been removed.
 pub struct FinchScript { … }
 /// Incremental lexical receiver for the compact Co-Forth wire form.

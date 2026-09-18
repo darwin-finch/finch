@@ -1,5 +1,6 @@
 //! Durable application-side delivery log for portable VM effects.
 
+use super::VmEffectEnvelopeRuntimeMethods;
 use crate::runtime::{
     DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, TypedEffectSink, VmEffectEnvelope,
     VmEffectHandle,

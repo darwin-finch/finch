@@ -352,17 +352,9 @@ impl VmEffectDeliveryLog {
     /// Unacknowledged events that target one concurrent output handle at its exact generation.
     pub fn pending_for_handle(&self, consumer: &DeliveryConsumerIdentity, handle: &OutputHandleRef) -> Vec<VmEffectEnvelope>;
 }
-/// A portable VM event attached to its owning ProgramRun.
+/// A portable VM event attached to its owning ProgramRun. Re-exported from `finch-tools-api`.
 pub struct VmEffectEnvelope { … }
-impl VmEffectEnvelope {
-    /// Stable `(execution_id, sequence)` handle for this envelope.
-    pub fn handle(&self) -> VmEffectHandle;
-    /// Concurrent output handle targeted by this event, if any.
-    pub fn output_handle(&self) -> Option<OutputHandleRef>;
-    /// ProgramRun identity carried by this envelope.
-    pub fn program_run(&self) -> ProgramRun;
-}
-/// Stable identity for one journaled VM effect.
+/// Stable identity for one journaled VM effect. Re-exported from `finch-tools-api`.
 pub struct VmEffectHandle { … }
 /// The portable, correlated reply to one awaited VM effect.
 pub struct VmResume { … }
@@ -385,6 +377,11 @@ pub trait AgentSpawning: Send + Sync {
     async fn poll(&self, task_id: Uuid) -> Result<AgentTaskSnapshot>;
     async fn wait(&self, task_id: Uuid) -> Result<AgentTaskResult>;
     async fn cancel(&self, task_id: Uuid) -> Result<()>;
+}
+/// Runtime-coupled methods over the re-exported [`VmEffectEnvelope`].
+pub(crate) trait VmEffectEnvelopeRuntimeMethods {
+    fn program_run(&self) -> ProgramRun;
+    fn output_handle(&self) -> Option<OutputHandleRef>;
 }
 ```
 

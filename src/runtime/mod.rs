@@ -105,40 +105,30 @@ fn default_capability_policy() -> CapabilityPolicy {
     }
 }
 
-/// A portable VM event attached to its owning ProgramRun. The VM event itself
-/// remains embedder-neutral; the envelope provides the other half of its
-/// idempotency key to a host/UI callback.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VmEffectEnvelope {
-    pub execution_id: uuid::Uuid,
-    pub effect: VmSideEffect,
-}
+/// A portable VM event attached to its owning ProgramRun. Defined in the
+/// dependency-free `finch-tools-api` crate (the tool API's live-output sink
+/// receives it) and re-exported here, so `crate::runtime::VmEffectEnvelope`
+/// is the same type it always was. The runtime-coupled methods remain on
+/// [`VmEffectEnvelopeRuntimeMethods`].
+pub use finch_tools_api::{VmEffectEnvelope, VmEffectHandle};
 
-/// Stable identity for one journaled VM effect. It is usable as a proposal
-/// handle while a `program.invoke` request awaits an editor/IDE result, and
-/// is equally valid for every other portable host effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VmEffectHandle {
-    pub execution_id: uuid::Uuid,
-    pub sequence: u64,
-}
-
-impl VmEffectEnvelope {
-    /// Stable `(execution_id, sequence)` handle for this envelope.
-    pub fn handle(&self) -> VmEffectHandle {
-        VmEffectHandle {
-            execution_id: self.execution_id,
-            sequence: self.effect.sequence,
-        }
-    }
-
+/// Runtime-coupled methods over the re-exported [`VmEffectEnvelope`]. They
+/// name `ProgramRun` and the runtime ABI, so they cannot live in the API
+/// crate with the type itself.
+pub(crate) trait VmEffectEnvelopeRuntimeMethods {
     /// ProgramRun identity carried by this envelope.
-    pub fn program_run(&self) -> ProgramRun {
+    fn program_run(&self) -> ProgramRun;
+
+    /// Concurrent output handle targeted by this event, if any.
+    fn output_handle(&self) -> Option<OutputHandleRef>;
+}
+
+impl VmEffectEnvelopeRuntimeMethods for VmEffectEnvelope {
+    fn program_run(&self) -> ProgramRun {
         ProgramRun::new(self.execution_id)
     }
 
-    /// Concurrent output handle targeted by this event, if any.
-    pub fn output_handle(&self) -> Option<OutputHandleRef> {
+    fn output_handle(&self) -> Option<OutputHandleRef> {
         abi::output_handle_ref(self.execution_id, &self.effect)
     }
 }

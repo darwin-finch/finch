@@ -1,3 +1,4 @@
+use super::VmEffectEnvelopeRuntimeMethods;
 use super::*;
 
 fn production_host_handler(runtime: &ProgramRuntime) -> TypedHostHandler {

@@ -2,8 +2,8 @@
 //
 // Manages available tools and provides uniform execution interface
 
-use crate::programs::ExecutionEffect;
-use crate::tools::types::{ToolContext, ToolDefinition, ToolInputSchema};
+use crate::effects::ExecutionEffect;
+use crate::types::{ToolContext, ToolDefinition, ToolInputSchema};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;

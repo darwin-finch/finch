@@ -5,9 +5,9 @@
 // Arc<RwLock<TodoList>> directly — no ToolContext fields needed.
 
 use crate::programs::ExecutionEffect;
-use crate::tools::registry::Tool;
 use crate::tools::todo::{TodoItem, TodoList};
 use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
