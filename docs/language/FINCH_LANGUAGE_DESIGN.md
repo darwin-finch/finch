@@ -1660,7 +1660,7 @@ the same nodes without source-to-source CoLisp generation.
 | exception transfer | `(throw e)`, `(rethrow e)` | `throw`, `rethrow` | `Throw`, `Rethrow` |
 | scope guard | `(scope exit|success|failure action)` | quotation followed by `scope-exit`, `scope-success`, or `scope-failure` | lexical cleanup record |
 | closure capture | `lambda` capture specification | quotation `captures:` header | `CaptureSpec`, `MakeClosure` |
-| ownership | `new unique`, `new shared`, `share`, borrow/take/retain | `new-unique`, `new-shared`, `share`, `borrow`, `take`, `retain`, `weaken` | owner/lifecycle operations |
+| ownership | `new` (unique by default), `new unique`, `new shared`, `share`, borrow/take/retain | `new`, `new-unique`, `new-shared`, `share`, `borrow`, `take`, `retain`, `weaken` | owner/lifecycle operations |
 | fibers/tasks | `defer`, `spawn`, `join`, `race`, `next` | same typed words applied to quotations/handles | scheduled-execution operations |
 | range iteration | range operations / `foreach` | range words and quotation `foreach` | concept calls and structured loop |
 | named tests/suites | `(test ...)`, `(test-suite ...)` | `test: ... {}`, `test-suite: ... {}` | test-profile declarations, no production instruction |
@@ -2044,18 +2044,31 @@ heap, unique, or reference-counted storage. Illustrative syntax is:
 
 ```text
 inspect(x: Foo)                         # borrow; x cannot escape the invocation
-retain(take x: static Owner<Foo>)       # take an owner; x may escape
-retain-open(take x: dyn Owner<Foo>)     # same contract with an erased carrier
+retain(take x: Foo)                     # take any Owner<Foo> carrier; x may escape
+retain(take x: static Owner<Foo>)       # equivalent to the line above, spelled out
+retain-open(take x: dyn Owner<Foo>)     # explicit erased carrier — a semantic choice, not shorthand
 ```
 
-There is no hidden `take Foo` shorthand in the initial grammar. A taking signature states its
-carrier dispatch so the parameter's representation is always knowable. Every ordinary owned value
-`T` supplies intrinsic inline `Owner<T>` evidence through the lifecycle kernel; `Unique<T>`,
-`Shared<T>`, and user-defined indirect carriers supply explicit implementations. In the static form
-the hidden generic carrier type `O : Owner<T>` is inferred solely from the argument, the parameter
-storage is `O`, and operations on `T` use its checked borrow projection. Storing or returning the
-parameter stores or returns `O`, not an imaginary unwrapped `T`. The dynamic form receives the
-declared erased envelope. Expected results never participate in this choice.
+**Revised 2026-09-17: `take Foo` is shorthand, not an error.** Every ordinary owned value `T`
+supplies intrinsic inline `Owner<T>` evidence through the lifecycle kernel; `Unique<T>`, `Shared<T>`,
+and user-defined indirect carriers supply explicit implementations. Bare `take x: Foo` means "accept
+any `Owner<Foo>`" — equivalent to `take x: static Owner<Foo>` — with the hidden generic carrier type
+`O : Owner<T>` inferred solely from the argument, the parameter storage is `O`, and operations on `T`
+use its checked borrow projection; storing or returning the parameter stores or returns `O`, not an
+imaginary unwrapped `T`.
+
+Whether the compiler monomorphizes a specialized body per concrete `O` or shares one evidence-
+passing body across callers is an optimizer decision, not a semantic one — the same choice ordinary
+generic instantiation already makes (see "Semantic analysis should be dependency-driven..." and
+"parametric elaborated representation" above: specialization "does not require code multiplication").
+This is why the shorthand doesn't reintroduce the cost-visibility problem "Scripting ergonomics with
+a systems cost model" warns against: choosing a codegen strategy for an otherwise-identical-behavior
+call is not the same as an implicit adaptation silently erasing static evidence, which changes what
+the program can observe or do. `dyn Owner<Foo>` remains available, but now as an explicit *semantic*
+choice — a programmer specifically wants one erased, storable-heterogeneously carrier type, not "the
+compiler picked erasure for me." Writing `static Owner<Foo>` explicitly also remains available for a
+reader who wants representation stated at a glance despite the shorthand covering the common case;
+neither spelling is deprecated, only the requirement to choose is.
 
 The call site does not need a ceremonial `move` marker when the parameter already says it takes:
 
@@ -2304,17 +2317,24 @@ specialization is an optimization.
 
 A plain lexical value is stack/frame-owned unless an explicit storage operation moves it elsewhere;
 an optimizer may change physical placement only when that is unobservable. Safe heap allocation
-always names an ownership policy. The `new unique`, `new shared`, and `share` spellings below lower
+always names an ownership policy. The `new`, `new shared`, and `share` spellings below lower
 to standard-library carrier/allocator constructors; they do not give those types compiler-owned
 layouts:
 
 ```lisp
 (let local (Foo ...))
-(let unique-foo (new unique Foo ...))
+(let unique-foo (new Foo ...))            ; unique is the default heap policy, no keyword needed
+(let unique-foo-explicit (new unique Foo ...)) ; equivalent, spelled out
 (let shared-foo (new shared Foo ...))
 (let promoted (share local))       ; allocates shared storage and moves local
 (let promoted-unique (share unique-foo)) ; moves an existing Unique<Foo> into Shared<Foo>
 ```
+
+**Revised 2026-09-17:** `new` alone means `new unique` — unique is already stated as the default
+ownership policy above ("Library ownership carriers and the compiler lifecycle kernel"), so
+requiring the word `unique` to get the default was exactly the kind of boilerplate that default was
+supposed to remove. `new unique` remains valid and equivalent, for a reader who wants the policy
+stated explicitly; only `new shared` requires the keyword now, since shared is the one opted into.
 
 `share` therefore has two callers: a plain local (allocates new shared storage) and an existing
 `Unique<T>` (reuses its storage, no new allocation, still a move — `unique-foo` is invalidated
@@ -2556,11 +2576,14 @@ same names so the two passages now read as one example instead of two disconnect
 
 ```lisp
 (define (inspect (x : Foo)) : unit ...)                    ; ordinary parameter, borrow by default
-(define (retain (take x : Owner<Foo>)) : unit ...)         ; take; x may escape the invocation
+(define (retain (take x : Foo)) : unit ...)                ; take any Owner<Foo>; x may escape
 ```
 
 Explicit `(borrow x : Foo)` is also accepted and is equivalent to the unannotated form — stated
 explicitly rather than only inferred, for a reader comparing two mixed-mode parameters at a glance.
+Likewise `(take x : static Owner<Foo>)` is accepted and equivalent to the shorthand above, and
+`(take x : dyn Owner<Foo>)` remains available as an explicit request for an erased carrier — see the
+2026-09-17 revision in "Borrowing and taking" above, which replaced the original no-shorthand rule.
 
 The rest of #674's scope already has a paired example elsewhere in this document; #674's owner
 should use these directly rather than re-deriving them:
