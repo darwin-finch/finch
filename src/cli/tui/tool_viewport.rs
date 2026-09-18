@@ -9,7 +9,7 @@
 //! console, and never releases mouse tracking to native scrollback.
 //!
 //! The control is reusable: it applies to every row of
-//! [`TranscriptRowKind::ToolOutput`], not to one tool name. Activation (click
+//! [`NodeRole::ToolOutput`], not to one tool name. Activation (click
 //! on the window, or Enter with the row focused) opens a focused expanded
 //! surface; closing it restores the child scroll offset, disclosure grouping,
 //! and focus exactly as they were.
@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
-use crate::cli::messages::{TranscriptRowId, TranscriptRowKind};
+use super::view_model::{NodeRole, RowId};
 
 use super::accordion::RenderedTranscriptLine;
 use super::shadow_buffer;
@@ -48,7 +48,7 @@ pub const PAGE_STEP_LINES: usize = 4;
 /// focus are never touched by the surface, so they restore by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedToolView {
-    pub row_id: TranscriptRowId,
+    pub row_id: RowId,
     pub title: String,
     pub saved_scroll: usize,
     pub scroll: usize,
@@ -69,7 +69,7 @@ pub struct ChildViewport {
 /// render and resize; terminal coordinates are never persisted as identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolViewportRegion {
-    pub row_id: TranscriptRowId,
+    pub row_id: RowId,
     pub top: u16,
     pub bottom: u16,
     pub left: u16,
@@ -84,9 +84,9 @@ impl ToolViewportRegion {
 
 #[derive(Debug, Default)]
 pub struct ToolViewportState {
-    viewports: HashMap<TranscriptRowId, ChildViewport>,
+    viewports: HashMap<RowId, ChildViewport>,
     regions: Vec<ToolViewportRegion>,
-    visible_kinds: HashMap<TranscriptRowId, TranscriptRowKind>,
+    visible_kinds: HashMap<RowId, NodeRole>,
 }
 
 impl ToolViewportState {
@@ -101,11 +101,11 @@ impl ToolViewportState {
     /// Whether the given row currently presents a tool result control. Only
     /// rows painted in the last frame can answer; an unpainted row returns
     /// `None` like the accordion's `visible_expanded` cache.
-    pub fn kind_of(&self, row_id: &TranscriptRowId) -> Option<TranscriptRowKind> {
+    pub fn kind_of(&self, row_id: &RowId) -> Option<NodeRole> {
         self.visible_kinds.get(row_id).copied()
     }
 
-    pub fn child_scroll(&self, row_id: &TranscriptRowId) -> usize {
+    pub fn child_scroll(&self, row_id: &RowId) -> usize {
         self.viewports
             .get(row_id)
             .map(|viewport| viewport.scroll)
@@ -114,7 +114,7 @@ impl ToolViewportState {
 
     /// Scroll one child viewport by `delta` lines. Clamped to the body length
     /// observed at the last projection; returns whether anything changed.
-    pub fn scroll_child(&mut self, row_id: &TranscriptRowId, delta: isize) -> bool {
+    pub fn scroll_child(&mut self, row_id: &RowId, delta: isize) -> bool {
         let Some(viewport) = self.viewports.get_mut(row_id) else {
             return false;
         };
@@ -133,7 +133,7 @@ impl ToolViewportState {
 
     /// Directly set a child scroll offset (restoration after closing the
     /// expanded surface).
-    pub fn set_child_scroll(&mut self, row_id: &TranscriptRowId, scroll: usize) {
+    pub fn set_child_scroll(&mut self, row_id: &RowId, scroll: usize) {
         if let Some(viewport) = self.viewports.get_mut(row_id) {
             viewport.scroll = scroll.min(viewport.body_lines.saturating_sub(1));
         }
@@ -160,7 +160,7 @@ impl ToolViewportState {
             let owner = lines[index]
                 .body_of
                 .clone()
-                .filter(|_| lines[index].kind == Some(TranscriptRowKind::ToolOutput));
+                .filter(|_| lines[index].role == Some(NodeRole::ToolOutput));
             let Some(owner) = owner else {
                 projected.push(lines[index].clone());
                 index += 1;
@@ -169,7 +169,7 @@ impl ToolViewportState {
             let start = index;
             while index < lines.len()
                 && lines[index].body_of.as_ref() == Some(&owner)
-                && lines[index].kind == Some(TranscriptRowKind::ToolOutput)
+                && lines[index].role == Some(NodeRole::ToolOutput)
             {
                 index += 1;
             }
@@ -187,7 +187,7 @@ impl ToolViewportState {
     /// the visible range and total in plain text.
     fn window(
         &mut self,
-        row_id: TranscriptRowId,
+        row_id: RowId,
         body: &[RenderedTranscriptLine],
         width: usize,
         budget_rows: usize,
@@ -221,7 +221,7 @@ impl ToolViewportState {
             windowed.push(RenderedTranscriptLine {
                 text: truncate_body_line(&status_text(scroll, end, body.len()), width),
                 body_of: Some(row_id),
-                kind: Some(TranscriptRowKind::ToolOutput),
+                role: Some(NodeRole::ToolOutput),
                 ..RenderedTranscriptLine::default()
             });
         }
@@ -241,8 +241,8 @@ impl ToolViewportState {
         self.visible_kinds.clear();
         let width = width.max(1);
         let mut y = top;
-        let mut open: Option<(TranscriptRowId, u16)> = None;
-        let close_open = |open: Option<(TranscriptRowId, u16)>,
+        let mut open: Option<(RowId, u16)> = None;
+        let close_open = |open: Option<(RowId, u16)>,
                           regions: &mut Vec<ToolViewportRegion>,
                           bottom: u16,
                           width: usize| {
@@ -261,7 +261,7 @@ impl ToolViewportState {
             let owner = line
                 .body_of
                 .clone()
-                .filter(|_| line.kind == Some(TranscriptRowKind::ToolOutput));
+                .filter(|_| line.role == Some(NodeRole::ToolOutput));
             let continues = match (&owner, &open) {
                 (Some(owner), Some((open_id, _))) => open_id == owner,
                 _ => false,
@@ -278,8 +278,8 @@ impl ToolViewportState {
                 }
             }
             if let Some(id) = &line.row_id {
-                if let Some(kind) = line.kind {
-                    self.visible_kinds.insert(id.clone(), kind);
+                if let Some(role) = line.role {
+                    self.visible_kinds.insert(id.clone(), role);
                 }
             }
             y = y.saturating_add(rows as usize);
@@ -384,7 +384,7 @@ pub fn is_left_click(mouse: &MouseEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::{Message, MessageRef, WorkUnit};
+    use crate::cli::messages::{MessageRef, WorkUnit};
     use crate::theme::ColorScheme;
     use std::sync::Arc;
 
@@ -394,7 +394,7 @@ mod tests {
     /// output, projected by the real accordion renderer. Completed output with
     /// an empty summary defaults to expanded, so the body lines are part of
     /// every default projection — the shape the bound must control.
-    fn projected_tool_group(lines: usize) -> (TranscriptRowId, Vec<RenderedTranscriptLine>) {
+    fn projected_tool_group(lines: usize) -> (RowId, Vec<RenderedTranscriptLine>) {
         let work = Arc::new(WorkUnit::new("Tools"));
         let call = work.add_row("bash(build)");
         work.complete_row_with_body(
@@ -404,8 +404,7 @@ mod tests {
         );
         work.set_complete();
         let colors = ColorScheme::default();
-        let output_row = work
-            .transcript_row(&colors)
+        let output_row = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
             .expect("a tool group projects a transcript row")
             .children[0]
             .children[1]
@@ -413,7 +412,12 @@ mod tests {
             .clone();
         let message: MessageRef = work;
         let state = AccordionState::default();
-        let projected = state.render_message(&message, &colors);
+        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
+            crate::cli::tui::view_model::ProjectedMessage::Node(node) => state.render_node(&node),
+            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+                state.render_plain(&lines.join("\n"))
+            }
+        };
         (output_row, projected)
     }
 
@@ -547,7 +551,14 @@ mod tests {
         work.set_complete();
         let colors = ColorScheme::default();
         let message: MessageRef = work;
-        let projected = AccordionState::default().render_message(&message, &colors);
+        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
+            crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+                AccordionState::default().render_node(&node)
+            }
+            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+                AccordionState::default().render_plain(&lines.join("\n"))
+            }
+        };
         let mut state = ToolViewportState::default();
         let bounded = state.project(projected, 20, DEFAULT_TOOL_OUTPUT_ROWS);
 
@@ -582,7 +593,14 @@ mod tests {
         work.set_complete();
         let colors = ColorScheme::default();
         let message: MessageRef = work;
-        let projected = AccordionState::default().render_message(&message, &colors);
+        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
+            crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+                AccordionState::default().render_node(&node)
+            }
+            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+                AccordionState::default().render_plain(&lines.join("\n"))
+            }
+        };
         let mut state = ToolViewportState::default();
         let bounded = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
         assert!(
@@ -622,11 +640,20 @@ mod tests {
         );
         work.set_complete();
         let colors = ColorScheme::default();
-        let rows = work.transcript_row(&colors).unwrap().children;
+        let rows = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+            .unwrap()
+            .children;
         let first_output = rows[0].children[1].id.clone();
         let second_output = rows[1].children[1].id.clone();
         let message: MessageRef = work;
-        let projected = AccordionState::default().render_message(&message, &colors);
+        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
+            crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+                AccordionState::default().render_node(&node)
+            }
+            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+                AccordionState::default().render_plain(&lines.join("\n"))
+            }
+        };
         let mut state = ToolViewportState::default();
         let bounded = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
 
@@ -643,7 +670,14 @@ mod tests {
 
         state.scroll_child(&first_output, 3);
         let rescrolled = state.project(
-            AccordionState::default().render_message(&message, &colors),
+            match crate::cli::tui::view_model::project_message(&message, &colors) {
+                crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+                    AccordionState::default().render_node(&node)
+                }
+                crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+                    AccordionState::default().render_plain(&lines.join("\n"))
+                }
+            },
             80,
             DEFAULT_TOOL_OUTPUT_ROWS,
         );
@@ -689,7 +723,14 @@ mod tests {
         let message: MessageRef = work.clone();
         let mut state = ToolViewportState::default();
 
-        let projected = AccordionState::default().render_message(&message, &colors);
+        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
+            crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+                AccordionState::default().render_node(&node)
+            }
+            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+                AccordionState::default().render_plain(&lines.join("\n"))
+            }
+        };
         let row_id = projected
             .iter()
             .find(|line| line.body_of.is_some())
@@ -705,7 +746,14 @@ mod tests {
             "",
             (0..15).map(|n| format!("out {n}")).collect::<Vec<_>>(),
         );
-        let projected = AccordionState::default().render_message(&message, &colors);
+        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
+            crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+                AccordionState::default().render_node(&node)
+            }
+            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+                AccordionState::default().render_plain(&lines.join("\n"))
+            }
+        };
         let rescrolled = state.project(projected, 80, DEFAULT_TOOL_OUTPUT_ROWS);
         assert_eq!(
             state.child_scroll(&row_id),

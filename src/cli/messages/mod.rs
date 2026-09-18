@@ -16,42 +16,16 @@ use uuid::Uuid;
 pub mod concrete;
 pub mod work_unit;
 
-pub use concrete::*;
-pub use work_unit::{random_spinner_verb, WorkRow, WorkRowStatus, WorkUnit};
-
-/// Stable identity for one expandable row within a retained message.
-///
-/// `path` is append-only semantic ancestry (unit, call index, input/output), so
-/// streamed appends and terminal reflow never change an existing row's key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TranscriptRowId {
-    pub message_id: MessageId,
-    pub path: Vec<u32>,
-}
-
-/// Semantic defaults used by the transcript disclosure renderer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TranscriptRowKind {
-    Response,
-    Activity,
-    Program,
-    Output,
-    ToolGroup,
-    ToolCall,
-    Input,
-    ToolOutput,
-}
-
-/// A presentation-only tree projected from canonical message data.
-#[derive(Debug, Clone)]
-pub struct TranscriptRow {
-    pub id: TranscriptRowId,
-    pub kind: TranscriptRowKind,
-    pub label: String,
-    pub body: Vec<String>,
-    pub children: Vec<TranscriptRow>,
-    pub default_expanded: bool,
-}
+pub use concrete::{
+    BrainParticipantMessage, LiveToolMessage, OperationMessage, OperationRow, OperationRowStatus,
+    ProgressMessage, StaticMessage, StaticMessageType, StreamingResponseMessage,
+    ToolExecutionMessage, UserQueryMessage,
+};
+pub use work_unit::{
+    random_spinner_verb, AgentActivityView, AgentToolView, WorkRow, WorkRowStatus, WorkRowView,
+    WorkUnit, WorkUnitHead, WorkUnitView,
+};
+pub use work_unit::{WorkRowPresentation, WorkUnitPresentation};
 
 /// Unique identifier for messages
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,19 +89,19 @@ pub trait Message: Send + Sync {
         self.format(colors)
     }
 
-    /// Optional semantic retained-row projection for interactive disclosure.
-    fn transcript_row(&self, _colors: &crate::theme::ColorScheme) -> Option<TranscriptRow> {
+    /// Lightweight domain snapshot of this message when it is a WorkUnit run:
+    /// presentation class, status, and body text, without row bodies. Filter
+    /// and classify consumers use this instead of a full projection.
+    fn work_unit_head(&self) -> Option<WorkUnitHead> {
         None
     }
 
-    /// Persist presentation-only disclosure on this widget.
-    ///
-    /// Accordion focus and hit regions stay in the renderer; the row's open
-    /// or closed choice belongs here so completing a run cannot collapse a
-    /// result by flipping a global cache. Returns whether this message owns
-    /// `path`.
-    fn set_disclosure(&self, _path: &[u32], _expanded: bool) -> bool {
-        false
+    /// Full blit-time domain snapshot of this message when it is a WorkUnit
+    /// run: plain domain data (labels, statuses, bodies) the renderer's
+    /// ViewModel projects into widget props once per frame. A WorkUnit is
+    /// domain data, never a widget kind (#805).
+    fn work_unit_view(&self, _colors: &crate::theme::ColorScheme) -> Option<WorkUnitView> {
+        None
     }
 
     /// Get the background style for this message type (for TUI rendering)

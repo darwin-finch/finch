@@ -121,8 +121,6 @@ impl LiveFrame {
     /// Render this frame into a shadow buffer of the given size, so a test can assert on the cells a terminal would end up holding.
     pub fn to_shadow_buffer(&self, width: usize, height: usize) -> shadow_buffer::ShadowBuffer;
 }
-/// Everything [`plan_live_frame`] reads.
-pub(crate) struct LiveFrameInputs<'a> { … }
 pub enum PosetPanelMode { Graph, Forth, Typing }
 /// Tabbed dialog for multiple questions
 pub struct TabbedDialog { … }
@@ -232,7 +230,7 @@ pub(crate) fn format_custom_input_content(input: &str, cursor: usize) -> String 
 /// Returns `(ansi_on, marker)` for the "Other (custom response)" row.
 pub(crate) fn other_row_parts(is_selected: bool) -> (String, &'static str) { … }
 /// Lay out one live-area frame.
-pub(crate) fn plan_live_frame(inputs: &LiveFrameInputs<'_>, autocomplete: &mut AutocompleteState) -> LiveFrame { … }
+pub(crate) fn plan_live_frame(vm: &view_model::LiveViewModel<'_>, autocomplete: &mut AutocompleteState) -> LiveFrame { … }
 /// Spawn a background task that polls keyboard input and sends to channel  This enables non-blocking input handling in the event loop: - Polls keyboard with 100…
 pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>, quit_tx: mpsc::UnboundedSender<Vec<u8>>) -> mpsc::UnboundedReceiver<InputEvent> { … }
 /// Calculate visible display-column width of string (excluding ANSI escape codes).
@@ -243,8 +241,9 @@ pub fn visible_length(s: &str) -> usize { … }
 
 ```rust
 pub mod activity;
+pub(crate) mod view_model;
 ```
 
 ## Referenced but not exported
 
-These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `ActivityUpdate`, `ShadowBuffer`, `SharedActivityRows`, `TabState`
+These types appear in the signatures above but the facade does not export them, so a caller can hold a value and never name its type. Export them or change the signature: `ActivityUpdate`, `LiveViewModel`, `ShadowBuffer`, `SharedActivityRows`, `TabState`

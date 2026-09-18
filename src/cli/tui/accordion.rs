@@ -1,55 +1,71 @@
-//! Presentation-only disclosure state for retained transcript rows.
+//! Presentation-only disclosure state for the transcript.
+//!
+//! The renderer owns expand/collapse and focus (#805): the open set lives in
+//! [`AccordionState::expanded`], keyed by the ViewModel's stable [`RowId`], and
+//! a row's default is a projection-time prop (`TranscriptNode::default_open`),
+//! never state stored on domain data. Rendering consumes ViewModel props —
+//! a leaf line shows exactly the label the ViewModel projected, which already
+//! carries any status glyph; the disclosure never invents a bullet and never
+//! sniffs glyph characters (#821).
 
 use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use crate::cli::messages::{MessageRef, TranscriptRow, TranscriptRowId, TranscriptRowKind};
-use crate::theme::ColorScheme;
+use super::view_model::{NodeRole, RowId, TranscriptNode};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderedTranscriptLine {
     pub text: String,
-    pub row_id: Option<TranscriptRowId>,
+    pub row_id: Option<RowId>,
     /// Expand/collapse for assistive consumers. Set on expandable header
     /// lines; never encoded as a second visible `[expanded]`/`[collapsed]`
     /// token in `text`.
     pub row_expanded: Option<bool>,
-    /// Kind of the row that produced this line, when the line belongs to an
+    /// Role of the row that produced this line, when the line belongs to an
     /// interactive row. Set on the row's header line and on its body lines.
-    pub kind: Option<TranscriptRowKind>,
+    pub role: Option<NodeRole>,
     /// The tool result whose bounded child viewport this body line belongs to.
     /// Only `ToolOutput` body lines carry it; the hit-region rebuild uses it to
     /// give the control ownership of its own cells.
-    pub body_of: Option<TranscriptRowId>,
+    pub body_of: Option<RowId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptHitRegion {
-    pub row_id: TranscriptRowId,
+    pub row_id: RowId,
     pub top: u16,
     pub bottom: u16,
     pub left: u16,
     pub right: u16,
 }
 
+/// A disclosure hit rect the layout pass claimed inside the transcript
+/// viewport, with the row's painted disclosure state for the renderer's
+/// open-set cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedDisclosureRect {
+    pub region: TranscriptHitRegion,
+    pub row_expanded: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct AccordionState {
-    expanded: HashMap<TranscriptRowId, bool>,
-    pub focused: Option<TranscriptRowId>,
+    /// The single owner of open/closed. Completing a run re-projects the row
+    /// with the same stable id, so a recorded choice survives it.
+    expanded: HashMap<RowId, bool>,
+    pub focused: Option<RowId>,
     pub hit_regions: Vec<TranscriptHitRegion>,
-    visible_order: Vec<TranscriptRowId>,
-    visible_expanded: HashMap<TranscriptRowId, bool>,
-    /// Row whose disclosure was last changed by key or click.
-    last_toggled: Option<TranscriptRowId>,
+    visible_order: Vec<RowId>,
+    visible_expanded: HashMap<RowId, bool>,
 }
 
 impl AccordionState {
-    pub fn is_expanded(&self, row: &TranscriptRow) -> bool {
+    pub fn is_expanded(&self, row: &TranscriptNode) -> bool {
         self.expanded
             .get(&row.id)
             .copied()
-            .unwrap_or(row.default_expanded)
+            .unwrap_or(row.default_open)
     }
 
     /// What a row is currently showing as, for a toggle that has only the row's
@@ -66,7 +82,7 @@ impl AccordionState {
     /// and every row on the ≤3-row path, which rebuilds from an empty slice —
     /// was reported collapsed whatever it was really showing, so toggling an
     /// open work unit opened it again instead of closing it.
-    fn resolved_expanded(&self, row_id: &TranscriptRowId) -> bool {
+    fn resolved_expanded(&self, row_id: &RowId) -> bool {
         self.expanded
             .get(row_id)
             .or_else(|| self.visible_expanded.get(row_id))
@@ -74,52 +90,49 @@ impl AccordionState {
             .unwrap_or(false)
     }
 
-    pub fn render_message(
-        &self,
-        message: &MessageRef,
-        colors: &ColorScheme,
-    ) -> Vec<RenderedTranscriptLine> {
-        let Some(root) = message.transcript_row(colors) else {
-            return message
-                .format(colors)
-                .split('\n')
-                .map(|text| RenderedTranscriptLine {
-                    text: text.to_owned(),
-                    ..RenderedTranscriptLine::default()
-                })
-                .collect();
-        };
+    /// Render one ViewModel-projected transcript node under this state's
+    /// disclosure choices.
+    pub fn render_node(&self, node: &TranscriptNode) -> Vec<RenderedTranscriptLine> {
         let mut lines = Vec::new();
-        self.render_row(&root, 0, false, &mut lines);
+        self.render_row(node, 0, false, &mut lines);
         lines
     }
 
-    pub fn render_message_fully_expanded(
-        &self,
-        message: &MessageRef,
-        colors: &ColorScheme,
-    ) -> Vec<RenderedTranscriptLine> {
-        let Some(root) = message.transcript_row(colors) else {
-            return self.render_message(message, colors);
-        };
+    /// Render one node with every disclosure forced open, for the canonical
+    /// transcript commit.
+    pub fn render_node_fully_expanded(&self, node: &TranscriptNode) -> Vec<RenderedTranscriptLine> {
         let mut lines = Vec::new();
-        self.render_row(&root, 0, true, &mut lines);
+        self.render_row(node, 0, true, &mut lines);
         lines
+    }
+
+    /// Render a message that is not a WorkUnit run as its formatted lines.
+    pub fn render_plain(&self, formatted: &str) -> Vec<RenderedTranscriptLine> {
+        formatted
+            .split('\n')
+            .map(|text| RenderedTranscriptLine {
+                text: text.to_owned(),
+                ..RenderedTranscriptLine::default()
+            })
+            .collect()
     }
 
     fn render_row(
         &self,
-        row: &TranscriptRow,
+        row: &TranscriptNode,
         depth: usize,
         force_expanded: bool,
         lines: &mut Vec<RenderedTranscriptLine>,
     ) {
         let expandable = !row.body.is_empty() || !row.children.is_empty();
         let expanded = expandable && (force_expanded || self.is_expanded(row));
+        // A leaf shows the label alone: the ViewModel's label already carries
+        // the status glyph, and a second invented bullet is chrome in the
+        // wrong layer (#821).
         let marker = match (expandable, expanded) {
-            (true, true) => "▼",
-            (true, false) => "▶",
-            (false, _) => "•",
+            (true, true) => "▼ ",
+            (true, false) => "▶ ",
+            (false, _) => "",
         };
         let focus = if self.focused.as_ref() == Some(&row.id) {
             "> "
@@ -127,10 +140,10 @@ impl AccordionState {
             "  "
         };
         lines.push(RenderedTranscriptLine {
-            text: format!("{focus}{}{} {}", "  ".repeat(depth), marker, row.label),
+            text: format!("{focus}{}{}{}", "  ".repeat(depth), marker, row.label),
             row_id: expandable.then(|| row.id.clone()),
             row_expanded: expandable.then_some(expanded),
-            kind: Some(row.kind),
+            role: Some(row.role),
             body_of: None,
         });
         if !expanded {
@@ -141,7 +154,7 @@ impl AccordionState {
                 text: format!("{}  {}", "  ".repeat(depth), body),
                 row_id: None,
                 row_expanded: None,
-                kind: Some(row.kind),
+                role: Some(row.role),
                 body_of: expandable.then(|| row.id.clone()),
             });
         }
@@ -150,7 +163,9 @@ impl AccordionState {
         }
     }
 
-    pub fn rebuild_hit_regions(
+    /// Register the hit regions of the retained transcript region above the
+    /// live frame, recounting physical rows from the lines that were painted.
+    pub fn rebuild_retained_hit_regions(
         &mut self,
         lines: &[RenderedTranscriptLine],
         top: usize,
@@ -161,7 +176,41 @@ impl AccordionState {
         // `visible_expanded` is not cleared: it is the last resolved state per
         // row, and a row that is merely off-screen this frame has not changed.
         // Wiping it made a clipped row indistinguishable from a collapsed one.
+        self.register_line_regions(lines, top, width);
+    }
 
+    /// Adopt the disclosure hit rects the layout pass claimed for the live
+    /// frame's transcript viewport. The pass owns these rects — they are the
+    /// expandable rows' claimed sub-rects of the viewport box, not a recount.
+    /// `row_offset` shifts frame-relative rows into terminal rows.
+    pub fn adopt_claimed_hitboxes(
+        &mut self,
+        claimed: &[ClaimedDisclosureRect],
+        row_offset: usize,
+        width: usize,
+    ) {
+        for rect in claimed {
+            let top = rect.region.top as usize + row_offset;
+            let rows = rect.region.bottom as usize - rect.region.top as usize + 1;
+            self.visible_order.push(rect.region.row_id.clone());
+            self.visible_expanded
+                .insert(rect.region.row_id.clone(), rect.row_expanded);
+            self.hit_regions.push(TranscriptHitRegion {
+                row_id: rect.region.row_id.clone(),
+                top: top as u16,
+                bottom: top.saturating_add(rows).saturating_sub(1) as u16,
+                left: 0,
+                right: width.saturating_sub(1) as u16,
+            });
+        }
+    }
+
+    fn register_line_regions(
+        &mut self,
+        lines: &[RenderedTranscriptLine],
+        top: usize,
+        width: usize,
+    ) {
         let mut y = top;
         for line in lines {
             let rows = super::shadow_buffer::physical_rows(&line.text, width.max(1));
@@ -211,19 +260,16 @@ impl AccordionState {
                 let current = self.resolved_expanded(&focused);
                 self.expanded.insert(focused.clone(), !current);
                 self.visible_expanded.insert(focused.clone(), !current);
-                self.last_toggled = Some(focused);
                 true
             }
             KeyCode::Left => {
                 self.expanded.insert(focused.clone(), false);
                 self.visible_expanded.insert(focused.clone(), false);
-                self.last_toggled = Some(focused);
                 true
             }
             KeyCode::Right => {
                 self.expanded.insert(focused.clone(), true);
                 self.visible_expanded.insert(focused.clone(), true);
-                self.last_toggled = Some(focused);
                 true
             }
             KeyCode::Esc => {
@@ -254,22 +300,29 @@ impl AccordionState {
         let current = self.resolved_expanded(&row_id);
         self.expanded.insert(row_id.clone(), !current);
         self.visible_expanded.insert(row_id.clone(), !current);
-        self.last_toggled = Some(row_id);
         true
-    }
-
-    pub(crate) fn take_last_toggled(&mut self) -> Option<(TranscriptRowId, bool)> {
-        let row_id = self.last_toggled.take()?;
-        let expanded = self.resolved_expanded(&row_id);
-        Some((row_id, expanded))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::{Message, WorkUnit};
+    use crate::cli::messages::{Message, MessageRef, WorkUnit};
+    use crate::cli::tui::view_model::project_work_unit;
+    use crate::theme::ColorScheme;
     use std::sync::Arc;
+
+    fn colors() -> ColorScheme {
+        ColorScheme::default()
+    }
+
+    /// Project a WorkUnit message into ViewModel widget props.
+    fn projected_node(message: &MessageRef, colors: &ColorScheme) -> TranscriptNode {
+        let view = message
+            .work_unit_view(colors)
+            .expect("accordion tests project WorkUnit runs");
+        project_work_unit(&view)
+    }
 
     #[test]
     fn test_nested_rows_keep_ids_and_hidden_content_across_toggle() {
@@ -280,23 +333,34 @@ mod tests {
         let message: MessageRef = work.clone();
         let colors = ColorScheme::default();
         let mut state = AccordionState::default();
-        let first = state.render_message(&message, &colors);
-        let call_id = work.transcript_row(&colors).unwrap().children[0].id.clone();
-        state.rebuild_hit_regions(&first, 0, 80);
+        let first = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
+        let call_id = projected_node(&(Arc::clone(&work) as MessageRef), &colors).children[0]
+            .id
+            .clone();
+        state.rebuild_retained_hit_regions(&first, 0, 80);
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
-        let root_expanded = state.render_message(&message, &colors);
-        state.rebuild_hit_regions(&root_expanded, 0, 80);
+        let root_expanded = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
+        state.rebuild_retained_hit_regions(&root_expanded, 0, 80);
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert_eq!(state.focused.as_ref(), Some(&call_id));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
-        let expanded = state.render_message(&message, &colors);
+        let expanded = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
         assert!(expanded.iter().any(|line| line.text.contains("Input")));
         assert_eq!(work.content(), "");
         assert!(work.complete_transcript(&colors).contains("世界"));
         assert_eq!(
             call_id,
-            work.transcript_row(&colors).unwrap().children[0].id
+            projected_node(&(Arc::clone(&work) as MessageRef), &colors).children[0].id
         );
         assert_ne!(first, expanded);
     }
@@ -325,9 +389,12 @@ mod tests {
         let colors = ColorScheme::default();
         let (work, message) = collapsed_work_unit();
         let mut state = AccordionState::default();
-        let lines = state.render_message(&message, &colors);
-        state.rebuild_hit_regions(&lines, 0, 80);
-        let root = work.transcript_row(&colors).unwrap();
+        let lines = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
+        state.rebuild_retained_hit_regions(&lines, 0, 80);
+        let root = projected_node(&(Arc::clone(&work) as MessageRef), &colors);
 
         state.focused = Some(root.id.clone());
         assert!(
@@ -342,7 +409,7 @@ mod tests {
 
         // A frame in which this row is not painted: clipped by the viewport
         // budget, or a terminal too short to host a live area at all.
-        state.rebuild_hit_regions(&[], 0, 80);
+        state.rebuild_retained_hit_regions(&[], 0, 80);
 
         state.focused = Some(root.id.clone());
         assert!(state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
@@ -361,9 +428,12 @@ mod tests {
         let colors = ColorScheme::default();
         let (work, message) = collapsed_work_unit();
         let mut state = AccordionState::default();
-        let lines = state.render_message(&message, &colors);
-        state.rebuild_hit_regions(&lines, 0, 80);
-        let root = work.transcript_row(&colors).unwrap();
+        let lines = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
+        state.rebuild_retained_hit_regions(&lines, 0, 80);
+        let root = projected_node(&(Arc::clone(&work) as MessageRef), &colors);
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -378,7 +448,7 @@ mod tests {
         // applied — the renderer plans a frame from the snapshot it holds, and
         // input is drained separately. The cache then says "collapsed" about a
         // row the user just opened.
-        state.rebuild_hit_regions(&lines, 0, 80);
+        state.rebuild_retained_hit_regions(&lines, 0, 80);
 
         let click_again = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -406,21 +476,27 @@ mod tests {
         let colors = ColorScheme::default();
         let mut state = AccordionState::default();
 
-        let compact = state.render_message(&message, &colors);
+        let compact = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
         assert_eq!(compact.len(), 1);
         assert!(compact[0].text.contains("catalog.validate"));
         assert_eq!(compact[0].text.matches("catalog unavailable").count(), 1);
         assert!(!compact[0].text.contains("Output (0)"));
 
-        state.rebuild_hit_regions(&compact, 3, 24);
+        state.rebuild_retained_hit_regions(&compact, 3, 24);
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
-        let keyboard_expanded = state.render_message(&message, &colors);
+        let keyboard_expanded = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
         assert!(keyboard_expanded
             .iter()
             .any(|line| line.text.contains("catalog.validate")));
 
-        state.rebuild_hit_regions(&keyboard_expanded, 1, 9);
+        state.rebuild_retained_hit_regions(&keyboard_expanded, 1, 9);
         let root = state.hit_regions[0].clone();
         assert!(state.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -428,9 +504,20 @@ mod tests {
             row: root.top,
             modifiers: KeyModifiers::NONE,
         }));
-        assert_eq!(state.render_message(&message, &colors).len(), 1);
+        assert_eq!(
+            state
+                .render_node(&projected_node(
+                    &(Arc::clone(&message) as MessageRef),
+                    &colors
+                ))
+                .len(),
+            1
+        );
 
-        let fully_expanded = state.render_message_fully_expanded(&message, &colors);
+        let fully_expanded = state.render_node_fully_expanded(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
         assert!(fully_expanded
             .iter()
             .any(|line| line.text.contains("catalog.validate provider=chatgpt")));
@@ -449,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_unicode_wrapped_hit_region_moves_after_resize() {
-        let id = TranscriptRowId {
+        let id = RowId {
             message_id: crate::cli::messages::MessageId::new(),
             path: vec![0],
         };
@@ -460,9 +547,9 @@ mod tests {
             ..RenderedTranscriptLine::default()
         }];
         let mut state = AccordionState::default();
-        state.rebuild_hit_regions(&lines, 8, 8);
+        state.rebuild_retained_hit_regions(&lines, 8, 8);
         assert!(state.hit_regions[0].bottom > state.hit_regions[0].top);
-        state.rebuild_hit_regions(&lines, 2, 80);
+        state.rebuild_retained_hit_regions(&lines, 2, 80);
         assert_eq!(
             (state.hit_regions[0].top, state.hit_regions[0].bottom),
             (2, 2)
@@ -479,16 +566,22 @@ mod tests {
         let colors = ColorScheme::default();
         let mut state = AccordionState::default();
 
-        let initial = state.render_message(&message, &colors);
-        state.rebuild_hit_regions(&initial, 0, 20);
+        let initial = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
+        state.rebuild_retained_hit_regions(&initial, 0, 20);
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         let focused = state.focused.clone().unwrap();
         assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
 
         work.append_row_body_line(call, "second 世界".into());
-        state.rebuild_hit_regions(&[], 0, 6);
+        state.rebuild_retained_hit_regions(&[], 0, 6);
         assert_eq!(state.focused.as_ref(), Some(&focused));
-        let after_append = state.render_message(&message, &colors);
+        let after_append = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
         assert!(after_append.iter().any(|line| line.text.contains("Input")));
         assert!(after_append
             .iter()
@@ -503,8 +596,11 @@ mod tests {
         let message: MessageRef = work;
         let colors = ColorScheme::default();
         let mut state = AccordionState::default();
-        let lines = state.render_message(&message, &colors);
-        state.rebuild_hit_regions(&lines, 7, 10);
+        let lines = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
+        state.rebuild_retained_hit_regions(&lines, 7, 10);
         let region = state.hit_regions[0].clone();
         assert!(state.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -513,21 +609,33 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert!(state
-            .render_message(&message, &colors)
+            .render_node(&projected_node(
+                &(Arc::clone(&message) as MessageRef),
+                &colors
+            ))
             .iter()
             .all(|line| !line.text.contains("one")));
         assert!(state.focused.is_none());
-        assert!(!state.render_message(&message, &colors)[0]
+        assert!(!state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors
+        ))[0]
             .text
             .starts_with("> "));
         assert!(!state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
-        assert!(state.render_message(&message, &colors)[0]
+        assert!(state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors
+        ))[0]
             .text
             .starts_with("> "));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(state
-            .render_message(&message, &colors)
+            .render_node(&projected_node(
+                &(Arc::clone(&message) as MessageRef),
+                &colors
+            ))
             .iter()
             .any(|line| line.text.contains("one")));
     }
@@ -542,7 +650,10 @@ mod tests {
         let state = AccordionState::default();
 
         let rendered = state
-            .render_message(&message, &colors)
+            .render_node(&projected_node(
+                &(Arc::clone(&message) as MessageRef),
+                &colors,
+            ))
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>();
@@ -580,7 +691,10 @@ mod tests {
         let state = AccordionState::default();
 
         let rendered = state
-            .render_message(&message, &colors)
+            .render_node(&projected_node(
+                &(Arc::clone(&message) as MessageRef),
+                &colors,
+            ))
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>();
@@ -618,7 +732,10 @@ mod tests {
         let state = AccordionState::default();
 
         let source_message: MessageRef = source;
-        let source_lines = state.render_message(&source_message, &colors);
+        let source_lines = state.render_node(&projected_node(
+            &(Arc::clone(&source_message) as MessageRef),
+            &colors,
+        ));
         let source_transcript = source_lines
             .iter()
             .map(|line| line.text.as_str())
@@ -634,7 +751,10 @@ mod tests {
 
         let output_message: MessageRef = output;
         let rendered = state
-            .render_message(&output_message, &colors)
+            .render_node(&projected_node(
+                &(Arc::clone(&output_message) as MessageRef),
+                &colors,
+            ))
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>();
@@ -666,7 +786,10 @@ mod tests {
         let message: MessageRef = output;
         let colors = ColorScheme::default();
         let state = AccordionState::default();
-        let lines = state.render_message(&message, &colors);
+        let lines = state.render_node(&projected_node(
+            &(Arc::clone(&message) as MessageRef),
+            &colors,
+        ));
         let rendered = lines
             .iter()
             .map(|line| line.text.as_str())
@@ -708,7 +831,10 @@ mod tests {
         let pending = Arc::new(WorkUnit::new("Channeling"));
         let message: MessageRef = pending;
         let rendered = state
-            .render_message(&message, &colors)
+            .render_node(&projected_node(
+                &(Arc::clone(&message) as MessageRef),
+                &colors,
+            ))
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>();
@@ -737,7 +863,10 @@ mod tests {
         failed.set_failed();
         let failed_message: MessageRef = failed;
         let failed_rendered = state
-            .render_message(&failed_message, &colors)
+            .render_node(&projected_node(
+                &(Arc::clone(&failed_message) as MessageRef),
+                &colors,
+            ))
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>();
@@ -774,11 +903,17 @@ mod tests {
         let source_message: MessageRef = source.clone();
         let output_message: MessageRef = output;
 
-        let collapsed = state.render_message(&source_message, &colors);
+        let collapsed = state.render_node(&projected_node(
+            &(Arc::clone(&source_message) as MessageRef),
+            &colors,
+        ));
         assert_eq!(collapsed[0].row_expanded, Some(false));
         assert_eq!(collapsed.len(), 1);
         assert!(source.complete_transcript(&colors).contains("a\nb\nc\nd"));
-        let visible = state.render_message(&output_message, &colors);
+        let visible = state.render_node(&projected_node(
+            &(Arc::clone(&output_message) as MessageRef),
+            &colors,
+        ));
         assert_eq!(visible[0].row_expanded, Some(true));
         assert!(visible
             .iter()
@@ -795,8 +930,11 @@ mod tests {
         let original_message: MessageRef = original;
         let colors = ColorScheme::default();
         let mut state = AccordionState::default();
-        let initial = state.render_message(&original_message, &colors);
-        state.rebuild_hit_regions(&initial, 0, 80);
+        let initial = state.render_node(&projected_node(
+            &(Arc::clone(&original_message) as MessageRef),
+            &colors,
+        ));
+        state.rebuild_retained_hit_regions(&initial, 0, 80);
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
 
@@ -805,7 +943,10 @@ mod tests {
         replayed.set_response("a\nb\nc\nd\nafter reconnect");
         replayed.set_complete();
         let replayed_message: MessageRef = replayed;
-        let rendered = state.render_message(&replayed_message, &colors);
+        let rendered = state.render_node(&projected_node(
+            &(Arc::clone(&replayed_message) as MessageRef),
+            &colors,
+        ));
         assert_eq!(rendered[0].row_expanded, Some(true));
         assert!(rendered
             .iter()
@@ -829,8 +970,14 @@ mod tests {
         let colors = ColorScheme::default();
         let source_message: MessageRef = source;
         let output_message: MessageRef = output;
-        let source_lines = state.render_message(&source_message, &colors);
-        let output_lines = state.render_message(&output_message, &colors);
+        let source_lines = state.render_node(&projected_node(
+            &(Arc::clone(&source_message) as MessageRef),
+            &colors,
+        ));
+        let output_lines = state.render_node(&projected_node(
+            &(Arc::clone(&output_message) as MessageRef),
+            &colors,
+        ));
         let dump = source_lines
             .iter()
             .chain(output_lines.iter())

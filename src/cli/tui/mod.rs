@@ -36,9 +36,7 @@ use std::time::Duration;
 use tui_textarea::TextArea;
 
 use super::{OutputManager, StatusBar, StatusLineType};
-use crate::cli::messages::{
-    MessageId, MessageRef, MessageStatus, TranscriptRow, TranscriptRowId, TranscriptRowKind,
-};
+use crate::cli::messages::{MessageId, MessageRef, MessageStatus, WorkUnitPresentation};
 // Sub-modules
 mod accordion;
 pub mod activity;
@@ -60,8 +58,14 @@ mod tabbed_dialog_widget; // kept for wizard helpers
 mod tool_viewport;
 #[cfg(test)]
 mod vt_oracle;
+// The ViewModel is crate-visible: projection-feeding consumers outside this
+// module (and its tests) project messages through it.
+pub(crate) mod view_model;
+mod widgets;
 
-use accordion::{AccordionState, RenderedTranscriptLine};
+use accordion::{
+    AccordionState, ClaimedDisclosureRect, RenderedTranscriptLine, TranscriptHitRegion,
+};
 use tool_viewport::{
     is_left_click, wheel_delta, ExpandedToolView, ToolViewportState, DEFAULT_TOOL_OUTPUT_ROWS,
     PAGE_STEP_LINES,
@@ -527,51 +531,30 @@ fn live_viewport_lines(
     (selected, omitted_rows)
 }
 
-/// Rows available to the streaming WorkUnit after accounting for the rest of
-/// Finch's live region. Keeping the whole region within the terminal prevents
-/// redraws from scrolling their own clipped prefix into permanent scrollback.
-fn live_message_row_budget(terminal_height: usize, reserved_rows: usize) -> usize {
-    terminal_height.saturating_sub(reserved_rows)
-}
-
-/// Physical rows owned by the composer: session separator, input, completion,
-/// status rule, and status text. Live transcript and activity rows must yield
-/// this many rows so a typed draft cannot be clipped off the bottom.
-fn composer_physical_rows(
-    inputs: &LiveFrameInputs<'_>,
-    width: usize,
-    completion_lines: &[String],
-) -> usize {
-    let input_rows =
-        input_line_physical_rows_with_ghost(inputs.input_lines, width, inputs.ghost_text)
-            .into_iter()
-            .sum::<usize>();
-    let completion_rows = completion_lines
-        .iter()
-        .map(|line| shadow_buffer::physical_rows(line, width))
-        .sum::<usize>();
-    let status_rows = 1 + inputs
-        .effective_status
-        .lines()
-        .map(|line| shadow_buffer::physical_rows(line, width))
-        .sum::<usize>();
-    1 + input_rows + completion_rows + status_rows
-}
-
-/// Drop oldest prefix lines until the remaining prefix fits in `budget` rows.
+/// Drop the oldest transcript-viewport lines until the remaining content fits
+/// the viewport rect the widget tree claimed.
 ///
-/// Session tasks and child-agent rows are reserved against the live budget but
-/// were still painted in full. When they filled the viewport the composer was
-/// pushed off the bottom — typed draft hidden until the turn finished (#136).
-fn pin_composer_by_clipping_prefix(frame: &mut LiveFrame, width: usize, budget: usize) {
-    while !frame.lines.is_empty() && frame.physical_rows(width) > budget {
-        let dropped = frame.lines.remove(0);
-        if frame
-            .visible_live
-            .first()
-            .is_some_and(|line| line.text.trim_end_matches('\r') == dropped.as_str())
-        {
-            frame.visible_live.remove(0);
+/// Session tasks and child-agent rows are reserved against the viewport budget
+/// but painted in full. When they filled the viewport the composer was pushed
+/// off the bottom — typed draft hidden until the turn finished (#136).
+fn clip_viewport_prefix(
+    content: &mut Vec<RenderedTranscriptLine>,
+    visible_live: &mut Vec<RenderedTranscriptLine>,
+    width: usize,
+    budget: usize,
+) {
+    let occupied = |content: &[RenderedTranscriptLine]| {
+        content
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(&line.text, width))
+            .sum::<usize>()
+    };
+    while occupied(content) > budget && !content.is_empty() {
+        let dropped = content.remove(0);
+        if visible_live.first().is_some_and(|line| {
+            line.text.trim_end_matches('\r') == dropped.text.trim_end_matches('\r')
+        }) {
+            visible_live.remove(0);
         }
     }
 }
@@ -990,24 +973,6 @@ pub(crate) fn compute_effective_status(
     "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Ctrl+C cancel".to_string()
 }
 
-/// Allocate zero to nine rows to completion after fixed UI, preserving one
-/// live-output row when a stream is active. Critical UI suppresses completion.
-fn completion_row_budget(
-    terminal_rows: usize,
-    fixed_rows: usize,
-    has_live_output: bool,
-    visible: bool,
-    critical_ui_active: bool,
-) -> usize {
-    if !visible || critical_ui_active {
-        return 0;
-    }
-    let live_reserve = usize::from(has_live_output);
-    terminal_rows
-        .saturating_sub(fixed_rows + live_reserve)
-        .min(autocomplete_widget::MAX_VISIBLE_SUGGESTIONS + 1)
-}
-
 fn write_live_area_erase(
     out: &mut impl Write,
     active_rows: usize,
@@ -1032,12 +997,6 @@ fn write_live_area_erase(
         execute!(out, cursor::MoveToColumn(0))?;
     }
     Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct LiveContentFrame {
-    live_lines: Vec<String>,
-    completion_lines: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1106,69 +1065,10 @@ fn write_tiny_live_frame(out: &mut impl Write, frame: &TinyLiveFrame) -> Result<
     Ok(frame.lines.len())
 }
 
-fn plan_live_content_frame(
-    autocomplete: &mut AutocompleteState,
-    terminal_rows: usize,
-    terminal_width: usize,
-    fixed_rows: usize,
-    all_live_lines: &[String],
-    critical_ui_active: bool,
-) -> LiveContentFrame {
-    let completion_budget = completion_row_budget(
-        terminal_rows,
-        fixed_rows,
-        !all_live_lines.is_empty(),
-        autocomplete.visible,
-        critical_ui_active,
-    );
-    let completion_lines = completion_pane_lines(autocomplete, terminal_width, completion_budget);
-    let live_budget = live_message_row_budget(terminal_rows, fixed_rows + completion_lines.len());
-    let live_lines = if all_live_lines.is_empty() {
-        Vec::new()
-    } else {
-        live_viewport_lines(all_live_lines, terminal_width, live_budget).0
-    };
-    LiveContentFrame {
-        live_lines,
-        completion_lines,
-    }
-}
-
 // ─── Live-area frame ──────────────────────────────────────────────────────────
 
 /// Columns the input prompt (`❯ `) and its continuation (`  `) both occupy.
 const PROMPT_COLUMNS: usize = 2;
-
-/// Everything [`plan_live_frame`] reads.
-///
-/// Gathering the renderer's state into one borrowed struct is the whole point:
-/// a frame becomes computable, and therefore assertable, without a terminal.
-/// `TuiRenderer::new` enables raw mode and installs a global panic hook, so no
-/// test can construct a renderer — before this, nothing about the live area's
-/// layout could be checked at all.
-pub(crate) struct LiveFrameInputs<'a> {
-    pub terminal_width: usize,
-    pub terminal_height: usize,
-    pub input_lines: &'a [String],
-    pub input_cursor: (usize, usize),
-    pub ghost_text: Option<&'a str>,
-    pub effective_status: &'a str,
-    pub cwd_label: &'a str,
-    pub session_label: &'a str,
-    pub dialog: Option<&'a Dialog>,
-    /// Lines of the focused expanded tool-result surface (#656), pre-rendered
-    /// by the caller so the planner stays a pure function of its inputs.
-    pub expanded_lines: Option<&'a [String]>,
-    /// A render error, like a dialog, owns the viewport and suppresses
-    /// completions.
-    pub render_error: bool,
-    /// Polled session task list, including `Done` rows: the layout reserves a
-    /// row for each, and the draw skips the finished ones.
-    pub task_rows: &'a [activity::ActivityRow],
-    /// Child-agent rows, already ordered by depth then identity.
-    pub tracked_rows: &'a [activity::ActivityRow],
-    pub live_rendered: &'a [RenderedTranscriptLine],
-}
 
 fn aggregate_agent_usage<'a>(
     usage: impl Iterator<Item = &'a activity::ActivityUsage>,
@@ -1221,6 +1121,11 @@ pub(crate) struct LiveFrame {
     /// The live transcript lines that survived the viewport budget, carried so
     /// the caller can rebuild mouse hit regions against what was really drawn.
     pub visible_live: Vec<RenderedTranscriptLine>,
+    /// The regions the widget tree claimed for this frame (#805).
+    pub rects: view_model::FrameRects,
+    /// Disclosure hit rects the layout pass claimed inside the transcript
+    /// viewport, in the frame's own coordinates.
+    pub hitboxes: Vec<ClaimedDisclosureRect>,
 }
 
 impl LiveFrame {
@@ -1284,131 +1189,125 @@ fn write_live_frame(
 
 /// Lay out one live-area frame.
 ///
-/// Sections, top to bottom: live message lines, session task list, child-agent
-/// tree, the workspace/session separator, then either a dialog or the input
-/// area with its completion pane and status lines.
+/// The ViewModel is projected into a widget tree whose root column allocates
+/// from the bottom — status, hr, input, hr, completions (0–N) — and the live
+/// transcript viewport claims the leftover rows (#805). The completion pane is
+/// a sibling **above** the composer: an empty pane claims zero rows, so
+/// opening or closing it never moves the composer or status rects (#232).
 pub(crate) fn plan_live_frame(
-    inputs: &LiveFrameInputs<'_>,
+    vm: &view_model::LiveViewModel<'_>,
     autocomplete: &mut AutocompleteState,
 ) -> LiveFrame {
-    let width = inputs.terminal_width.max(1);
-    let height = inputs.terminal_height;
+    let width = vm.terminal_width.max(1);
+    let height = vm.terminal_height;
     // A dialog or the expanded tool-result surface owns the viewport: a
     // focused surface's own scrolling must never move the transcript behind it.
-    let dialog_active = inputs.dialog.is_some() || inputs.expanded_lines.is_some();
+    let dialog_active = vm.dialog.is_some() || vm.expanded_lines.is_some();
     let mut frame = LiveFrame::default();
 
-    // ── Row budget ────────────────────────────────────────────────────────────
-    // Budget actual physical rows after reserving the separator, input, status,
-    // TODOs and child tasks. A fixed reserve overflows the viewport when
-    // context lines wrap, which permanently duplicates live rows.
-    let status_rows = 1 + inputs
-        .effective_status
-        .lines()
-        .map(|line| shadow_buffer::physical_rows(line, width))
-        .sum::<usize>();
-    let input_rows =
-        input_line_physical_rows_with_ghost(inputs.input_lines, width, inputs.ghost_text)
-            .into_iter()
-            .sum::<usize>();
-    let base_reserved_rows = if dialog_active {
-        // A critical dialog owns the viewport. Streaming, tasks, draft, status
-        // and completion stay in structured state but cannot compete with the
-        // bounded approval/error surface.
-        height
-    } else {
-        1 // upper separator
-            + input_rows
-            + status_rows
-            + inputs.task_rows.len()
-            + inputs.tracked_rows.len()
-    };
+    // ── Claiming pass: the widget tree claims the frame's regions ────────────
+    // The completions pane's natural extent is a ViewModel prop — empty unless
+    // the draft is a slash command or mention, or a mention lookup failed.
+    // Critical UI (dialog, render error) suppresses the pane entirely.
+    let natural_pane =
+        view_model::natural_completion_pane(autocomplete, width, dialog_active || vm.render_error);
+    let sizing = view_model::claim_live_frame(vm, None, natural_pane.len());
+    let rects = view_model::frame_rects(&sizing);
 
-    // ── 1. Live message lines ────────────────────────────────────────────────
-    let all_live_lines = inputs
-        .live_rendered
-        .iter()
-        .map(|line| line.text.clone())
-        .collect::<Vec<_>>();
-    let mut content_frame = plan_live_content_frame(
+    // ── 1. Transcript viewport content, sized by its claimed rect ────────────
+    let completion_lines = view_model::completion_pane_for_claim(
         autocomplete,
-        height,
         width,
-        base_reserved_rows,
-        &all_live_lines,
-        dialog_active || inputs.render_error,
+        rects.completions.map_or(0, |rect| rect.height),
+        &natural_pane,
     );
-    pin_live_disclosure_header(inputs.live_rendered, &mut content_frame, width);
-    frame.visible_live =
-        rendered_metadata_for_visible(inputs.live_rendered, &content_frame.live_lines);
-    // A Brain can have more than one live work unit (a streamed VM program
-    // alongside a child task or output handle). Rendering only the newest made
-    // earlier source appear and then vanish on the next redraw.
-    for line in &content_frame.live_lines {
-        frame.push(line.trim_end_matches('\r'));
-    }
 
-    // ── 1b. Session task list (active items only) ────────────────────────────
+    let mut viewport_content: Vec<RenderedTranscriptLine> = Vec::new();
     if !dialog_active {
-        for row in inputs.task_rows {
-            let (symbol, color) = match row.state {
-                activity::ActivityState::Active => ("●", CYAN),
-                activity::ActivityState::Pending => ("○", DIM_GRAY),
-                activity::ActivityState::Done => continue,
-            };
-            let urgent_tag = if row.urgent { " [!]" } else { "" };
-            // "● " prefix plus the optional " [!]" suffix, measured in columns.
-            let max_content = width.saturating_sub(2 + urgent_tag.len());
-            let content = shadow_buffer::truncate_to_columns(&row.text, max_content);
-            frame.push(format!("{color}{symbol} {content}{urgent_tag}{RESET}"));
+        // A Brain can have more than one live work unit (a streamed VM program
+        // alongside a child task or output handle). Rendering only the newest
+        // made earlier source appear and then vanish on the next redraw.
+        let all_live_lines = vm
+            .live_rendered
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        // Session tasks and child-agent rows are reserved one row each before
+        // the live transcript claims its window.
+        let live_budget = rects
+            .transcript
+            .height
+            .saturating_sub(vm.task_rows.len() + vm.tracked_rows.len());
+        let mut live_lines = if all_live_lines.is_empty() {
+            Vec::new()
+        } else {
+            live_viewport_lines(&all_live_lines, width, live_budget).0
+        };
+        pin_live_disclosure_header(vm.live_rendered, &mut live_lines, width);
+        let mut visible_live = rendered_metadata_for_visible(vm.live_rendered, &live_lines);
+        viewport_content.extend(visible_live.iter().cloned());
+
+        // ── 1b. Session task list (active items only) ────────────────────────
+        for row in vm.task_rows {
+            if let Some(text) = session_task_line(row, width) {
+                viewport_content.push(RenderedTranscriptLine {
+                    text,
+                    ..RenderedTranscriptLine::default()
+                });
+            }
         }
-    }
 
-    // ── 1c. Child-agent task tree ────────────────────────────────────────────
-    if !dialog_active {
-        for row in inputs.tracked_rows {
-            let indent = "  ".repeat(row.depth);
-            let symbol = match row.state {
-                activity::ActivityState::Pending => "○",
-                activity::ActivityState::Active => "●",
-                activity::ActivityState::Done => "✓",
-            };
-            let color = if row.state == activity::ActivityState::Active {
-                CYAN
-            } else {
-                DIM_GRAY
-            };
-            let detail = row.detail.clone().unwrap_or_default();
-            let prefix_width = indent.chars().count() + 2;
-            let available =
-                width.saturating_sub(prefix_width + shadow_buffer::visible_length(&detail) + 3);
-            let task_text = shadow_buffer::truncate_to_columns(&row.text, available);
-            frame.push(format!(
-                "{color}{indent}{symbol}{RESET} {task_text}{DIM_GRAY}{detail}{RESET}"
-            ));
+        // ── 1c. Child-agent task tree ────────────────────────────────────────
+        for row in vm.tracked_rows {
+            viewport_content.push(RenderedTranscriptLine {
+                text: tracked_agent_line(row, width),
+                ..RenderedTranscriptLine::default()
+            });
         }
+
+        // Pin the composer in the viewport: activity rows were painted in full
+        // and could still consume every remaining row. Clip that prefix so
+        // separator + draft + status always fit.
+        clip_viewport_prefix(
+            &mut viewport_content,
+            &mut visible_live,
+            width,
+            rects.transcript.height,
+        );
+        frame.visible_live = visible_live;
     }
 
-    // ── 1d. Co-Forth panel ───────────────────────────────────────────────────
-    // Drawn as a floating overlay by draw_poset_overlay(), which saves and
-    // restores the cursor and so owns no rows here.
+    // ── 2. Second claiming pass with the content it will paint ───────────────
+    // The claims are content-independent, so the rects are the sizing pass's
+    // rects; this pass additionally records the viewport window and the
+    // disclosure hit rects the depth-first claim produced.
+    let content = view_model::LiveFrameContent {
+        viewport: viewport_content.clone(),
+        completions: completion_lines.clone(),
+    };
+    let claimed = view_model::claim_live_frame(vm, Some(&content), 0);
+    let claimed_rects = view_model::frame_rects(&claimed);
 
-    // Pin the composer in the viewport. Live transcript is already budgeted,
-    // but activity rows were painted in full and could still consume every
-    // remaining row. Clip that prefix so separator + draft + status always fit.
-    if !dialog_active {
-        let composer_rows = composer_physical_rows(inputs, width, &content_frame.completion_lines);
-        pin_composer_by_clipping_prefix(&mut frame, width, height.saturating_sub(composer_rows));
+    // ── 3. Paint in claimed order: transcript, completions, hr, input, hr,
+    //       status ────────────────────────────────────────────────────────────
+    for line in &viewport_content {
+        frame.push(line.text.trim_end_matches('\r'));
+    }
+    // ── 3b. Slash-command completion pane, above the composer ────────────────
+    // Plain text is deliberate: the raw/no-colour path stays fully speakable,
+    // and every line is width-bounded before it reaches the terminal.
+    for line in &completion_lines {
+        frame.push(line.clone());
     }
 
-    // ── 2. Separator: "──  ~/repos/finch ──────── jade-river ──" ─────────────
-    let separator = session_separator_line(width, inputs.cwd_label, inputs.session_label);
+    // ── 3c. Separator: "──  ~/repos/finch ──────── jade-river ──" ────────────
+    let separator = session_separator_line(width, vm.cwd_label, vm.session_label);
     if frame.physical_rows(width) < height {
         frame.push(format!("{DIM_GRAY}{separator}{RESET}"));
     }
 
-    // ── 3. Dialog, expanded tool result, or input ────────────────────────────
-    if let Some(dialog) = inputs.dialog {
+    // ── 4. Dialog, expanded tool result, or input ────────────────────────────
+    if let Some(dialog) = vm.dialog {
         let budget = height.saturating_sub(frame.physical_rows(width));
         for line in TuiRenderer::dialog_lines(dialog, width, budget) {
             frame.push(line);
@@ -1417,9 +1316,10 @@ pub(crate) fn plan_live_frame(
         // final owned row so painting at the viewport bottom cannot scroll it.
         frame.cursor_visible = false;
         frame.cursor_row = frame.physical_rows(width).saturating_sub(1);
+        frame.rects = view_model::FrameRects::default();
         return frame;
     }
-    if let Some(expanded) = inputs.expanded_lines {
+    if let Some(expanded) = vm.expanded_lines {
         // Same budget discipline as a dialog: the surface owns what remains of
         // the viewport and never pushes rows past it. Title and footer are
         // preferred; the body window clips from the bottom.
@@ -1463,49 +1363,42 @@ pub(crate) fn plan_live_frame(
         // the final owned row like a dialog does.
         frame.cursor_visible = false;
         frame.cursor_row = frame.physical_rows(width).saturating_sub(1);
+        frame.rects = view_model::FrameRects::default();
         return frame;
     }
 
     frame.cursor_visible = true;
-    let (cursor_row, cursor_col) = inputs.input_cursor;
+    let (cursor_row, cursor_col) = vm.input_cursor;
     let rows_before_input = frame.physical_rows(width);
-    let input_phys_rows =
-        input_line_physical_rows_with_ghost(inputs.input_lines, width, inputs.ghost_text);
+    let input_phys_rows = input_line_physical_rows_with_ghost(vm.input_lines, width, vm.ghost_text);
 
-    // ── 4. Input area, with the dim ghost suffix on its last row ─────────────
+    // ── 5. Input area, with the dim ghost suffix on its last row ─────────────
     let prompt = format!("{CYAN}❯{RESET} ");
-    let ghost = inputs
+    let ghost = vm
         .ghost_text
         .map(|ghost| format!("{DIM_GRAY}{ghost}{RESET}"))
         .unwrap_or_default();
-    if inputs.input_lines.is_empty() {
+    if vm.input_lines.is_empty() {
         frame.push(format!("{prompt}{ghost}"));
     } else {
-        let last = inputs.input_lines.len() - 1;
-        for (index, line) in inputs.input_lines.iter().enumerate() {
+        let last = vm.input_lines.len() - 1;
+        for (index, line) in vm.input_lines.iter().enumerate() {
             let prefix = if index == 0 { prompt.as_str() } else { "  " };
             let suffix = if index == last { ghost.as_str() } else { "" };
             frame.push(format!("{prefix}{line}{suffix}"));
         }
     }
 
-    // ── 4c. Slash-command completion pane ────────────────────────────────────
-    // Plain text is deliberate: the raw/no-colour path stays fully speakable,
-    // and every line is width-bounded before it reaches the terminal.
-    for line in &content_frame.completion_lines {
-        frame.push(line.clone());
-    }
-
-    // ── 5. Status separator and status line(s) ───────────────────────────────
+    // ── 6. Status separator and status line(s) ───────────────────────────────
     // Session identity is projected into the upper separator; repeating it here
     // wasted a row and made the Brain appear twice.
     frame.push(format!("{DIM_GRAY}{}{RESET}", "─".repeat(width)));
-    for line in inputs.effective_status.lines() {
+    for line in vm.effective_status.lines() {
         frame.push(format!("{DIM_GRAY}{line}{RESET}"));
     }
 
-    // ── 6. Cursor position inside the input area ─────────────────────────────
-    let cursor_text_width = inputs
+    // ── 7. Cursor position inside the input area ─────────────────────────────
+    let cursor_text_width = vm
         .input_lines
         .get(cursor_row)
         .map(|line| {
@@ -1521,7 +1414,59 @@ pub(crate) fn plan_live_frame(
         .iter()
         .sum();
     frame.cursor_row = rows_before_input + cursor_phys_above + cursor_sub_row;
+
+    frame.rects = claimed_rects;
+    frame.hitboxes = claimed
+        .hit_rects()
+        .map(|(index, rect)| ClaimedDisclosureRect {
+            region: TranscriptHitRegion {
+                row_id: viewport_content[index]
+                    .row_id
+                    .clone()
+                    .expect("hit lines belong to expandable transcript rows"),
+                top: rect.y as u16,
+                bottom: rect.bottom().saturating_sub(1) as u16,
+                left: 0,
+                right: width.saturating_sub(1) as u16,
+            },
+            row_expanded: viewport_content[index].row_expanded.unwrap_or(false),
+        })
+        .collect();
     frame
+}
+
+/// One session task list row, or `None` for a finished row the draw skips.
+fn session_task_line(row: &activity::ActivityRow, width: usize) -> Option<String> {
+    let (symbol, color) = match row.state {
+        activity::ActivityState::Active => ("●", CYAN),
+        activity::ActivityState::Pending => ("○", DIM_GRAY),
+        activity::ActivityState::Done => return None,
+    };
+    let urgent_tag = if row.urgent { " [!]" } else { "" };
+    // "● " prefix plus the optional " [!]" suffix, measured in columns.
+    let max_content = width.saturating_sub(2 + urgent_tag.len());
+    let content = shadow_buffer::truncate_to_columns(&row.text, max_content);
+    Some(format!("{color}{symbol} {content}{urgent_tag}{RESET}"))
+}
+
+/// One child-agent task tree row.
+fn tracked_agent_line(row: &activity::ActivityRow, width: usize) -> String {
+    let indent = "  ".repeat(row.depth);
+    let symbol = match row.state {
+        activity::ActivityState::Pending => "○",
+        activity::ActivityState::Active => "●",
+        activity::ActivityState::Done => "✓",
+    };
+    let color = if row.state == activity::ActivityState::Active {
+        CYAN
+    } else {
+        DIM_GRAY
+    };
+    let detail = row.detail.clone().unwrap_or_default();
+    let prefix_width = indent.chars().count() + 2;
+    let available = width.saturating_sub(prefix_width + shadow_buffer::visible_length(&detail) + 3);
+    let task_text = shadow_buffer::truncate_to_columns(&row.text, available);
+    format!("{color}{indent}{symbol}{RESET} {task_text}{DIM_GRAY}{detail}{RESET}")
 }
 
 // ─── Poset panel view mode ─────────────────────────────────────────────────────
@@ -1962,12 +1907,16 @@ fn commit_complete_messages(
         if printed_ids.contains(&message.id()) {
             continue;
         }
-        let complete = accordion
-            .render_message_fully_expanded(message, colors)
-            .into_iter()
-            .map(|line| line.text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let complete = match view_model::project_message(message, colors) {
+            view_model::ProjectedMessage::Node(node) => accordion.render_node_fully_expanded(&node),
+            view_model::ProjectedMessage::Plain(formatted) => {
+                accordion.render_plain(&formatted.join("\n"))
+            }
+        }
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+        .join("\n");
         for line in complete.split('\n') {
             execute!(staged, Print(line.trim_end_matches('\r')), Print("\r\n"))?;
         }
@@ -2065,24 +2014,13 @@ impl TuiRenderer {
         let (term_width, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
         let (term_width, term_h) = (term_width as usize, term_h as usize);
 
-        let input_lines = self.input_textarea.lines().to_vec();
-        let raw_status = self
-            .status_bar
-            .get_status_without(&StatusLineType::SessionLabel);
-        let current_input = input_lines.join("\n");
-        let effective_status = compute_effective_status(
-            self.ghost_text.as_deref(),
-            &raw_status,
-            &current_input,
-            &self.command_registry,
-        );
-
         if term_h <= 3 && self.active_dialog.is_none() && self.expanded_tool.is_none() {
+            let sources = self.live_frame_sources(term_width);
             completion_pane_lines(&mut self.autocomplete_state, term_width, 0);
             let frame = plan_tiny_live_frame(
-                &input_lines,
-                self.input_textarea.cursor(),
-                &effective_status,
+                &sources.input_lines,
+                sources.input_cursor,
+                &sources.effective_status,
                 term_h,
                 term_width,
             );
@@ -2092,34 +2030,13 @@ impl TuiRenderer {
             out.flush()?;
             self.active_rows = rows;
             self.cursor_row_from_top = frame.cursor_row;
-            self.accordion.rebuild_hit_regions(&[], 0, term_width);
+            self.accordion
+                .rebuild_retained_hit_regions(&[], 0, term_width);
             self.tool_viewports.rebuild_hit_regions(&[], 0, term_width);
             return Ok(());
         }
 
-        let task_rows = self
-            .task_rows
-            .as_ref()
-            .map(|source| source.rows())
-            .unwrap_or_default();
-        // Depth first, then identity, so sibling rows keep a stable order
-        // between frames.
-        let mut tracked = self.tracked_rows.iter().collect::<Vec<_>>();
-        tracked.sort_by_key(|(id, row)| (row.depth, **id));
-        let tracked = tracked
-            .into_iter()
-            .map(|(_, row)| row.clone())
-            .collect::<Vec<_>>();
-
-        let cwd_label = tilde_cwd();
-        let session_label = self
-            .status_bar
-            .get_line(&StatusLineType::SessionLabel)
-            .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| self.session_label.clone());
-
-        let live_messages = self.find_live_messages();
-        let live_rendered = self.projected_lines(live_messages, term_width);
+        let sources = self.live_frame_sources(term_width);
 
         // The expanded tool-result surface owns the frame when open. A body
         // that can no longer be found closes the surface before drawing.
@@ -2134,23 +2051,19 @@ impl TuiRenderer {
             }
         };
 
-        let inputs = LiveFrameInputs {
-            terminal_width: term_width,
-            terminal_height: term_h,
-            input_lines: &input_lines,
-            input_cursor: self.input_textarea.cursor(),
-            ghost_text: self.ghost_text.as_deref(),
-            effective_status: &effective_status,
-            cwd_label: &cwd_label,
-            session_label: &session_label,
-            dialog: self.active_dialog.as_ref(),
-            expanded_lines: expanded_lines.as_deref(),
-            render_error: self.last_render_error.is_some(),
-            task_rows: &task_rows,
-            tracked_rows: &tracked,
-            live_rendered: &live_rendered,
+        // `sources` is the owned state the ViewModel borrows; the dialog and
+        // expanded surface are field borrows disjoint from the autocomplete
+        // state the planner mutates.
+        let frame = {
+            let vm = live_view_model(
+                &sources,
+                term_width,
+                term_h,
+                self.active_dialog.as_ref(),
+                expanded_lines.as_deref(),
+            );
+            plan_live_frame(&vm, &mut self.autocomplete_state)
         };
-        let frame = plan_live_frame(&inputs, &mut self.autocomplete_state);
 
         let rows = write_live_frame(out, &frame, term_width.max(1))?;
         execute!(out, EndSynchronizedUpdate)?;
@@ -2159,8 +2072,57 @@ impl TuiRenderer {
 
         self.active_rows = rows;
         self.cursor_row_from_top = frame.cursor_row;
-        self.rebuild_transcript_hit_regions(&frame.visible_live, rows, term_width, term_h);
+        self.rebuild_transcript_hit_regions(&frame, rows, term_width, term_h);
         Ok(())
+    }
+
+    /// Gather the owned state one live-frame blit reads, so the ViewModel can
+    /// borrow it for the planning call.
+    fn live_frame_sources(&mut self, term_width: usize) -> LiveFrameSources {
+        let input_lines = self.input_textarea.lines().to_vec();
+        let raw_status = self
+            .status_bar
+            .get_status_without(&StatusLineType::SessionLabel);
+        let current_input = input_lines.join("\n");
+        let effective_status = compute_effective_status(
+            self.ghost_text.as_deref(),
+            &raw_status,
+            &current_input,
+            &self.command_registry,
+        );
+        let task_rows = self
+            .task_rows
+            .as_ref()
+            .map(|source| source.rows())
+            .unwrap_or_default();
+        // Depth first, then identity, so sibling rows keep a stable order
+        // between frames.
+        let mut tracked = self.tracked_rows.iter().collect::<Vec<_>>();
+        tracked.sort_by_key(|(id, row)| (row.depth, **id));
+        let tracked_rows = tracked
+            .into_iter()
+            .map(|(_, row)| row.clone())
+            .collect::<Vec<_>>();
+        let cwd_label = tilde_cwd();
+        let session_label = self
+            .status_bar
+            .get_line(&StatusLineType::SessionLabel)
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| self.session_label.clone());
+        let live_messages = self.find_live_messages();
+        let live_rendered = self.projected_lines(live_messages, term_width);
+        LiveFrameSources {
+            input_cursor: self.input_textarea.cursor(),
+            ghost_text: self.ghost_text.clone(),
+            input_lines,
+            effective_status,
+            cwd_label,
+            session_label,
+            task_rows,
+            tracked_rows,
+            live_rendered,
+            render_error: self.last_render_error.is_some(),
+        }
     }
 
     /// Write `\x07` when an approval dialog first occupies the live surface.
@@ -2221,35 +2183,42 @@ fn uncommitted_suffix(
         .collect()
 }
 
-fn later_program_output(
-    messages: &[MessageRef],
-    index: usize,
-    colors: &ColorScheme,
-) -> Option<(bool, MessageStatus)> {
+/// The nearest later WorkUnit message that projects as program output, with
+/// whether its visible body has content. Classification reads the lightweight
+/// domain snapshot, not a presentation projection.
+fn later_program_output(messages: &[MessageRef], index: usize) -> Option<(bool, MessageStatus)> {
     messages[index + 1..].iter().find_map(|later| {
-        later.transcript_row(colors).and_then(|row| {
-            (row.kind == TranscriptRowKind::Output)
-                .then_some((row.body.iter().any(|line| !line.is_empty()), later.status()))
+        later.work_unit_head().and_then(|head| {
+            matches!(
+                head.presentation,
+                WorkUnitPresentation::ProgramOutput { .. }
+            )
+            .then_some((
+                head.output_body_lines().iter().any(|line| !line.is_empty()),
+                later.status(),
+            ))
         })
     })
 }
 
-fn is_completed_program_source(message: &MessageRef, colors: &ColorScheme) -> bool {
+fn is_completed_program_source(message: &MessageRef) -> bool {
     message.status() == MessageStatus::Complete
-        && message
-            .transcript_row(colors)
-            .is_some_and(|row| row.kind == TranscriptRowKind::Program)
+        && message.work_unit_head().is_some_and(|head| {
+            matches!(
+                head.presentation,
+                WorkUnitPresentation::ProgramSource { .. }
+            )
+        })
 }
 
 /// Completed program source whose nearest later program-output row has body.
 fn replaced_completed_program_source_ids(messages: &[MessageRef]) -> HashSet<MessageId> {
-    let colors = ColorScheme::default();
     let mut replaced = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
-        if !is_completed_program_source(message, &colors) {
+        if !is_completed_program_source(message) {
             continue;
         }
-        if later_program_output(messages, index, &colors).is_some_and(|(has_body, _)| has_body) {
+        if later_program_output(messages, index).is_some_and(|(has_body, _)| has_body) {
             replaced.insert(message.id());
         }
     }
@@ -2257,11 +2226,10 @@ fn replaced_completed_program_source_ids(messages: &[MessageRef]) -> HashSet<Mes
 }
 
 fn defer_completed_program_source(messages: &[MessageRef], index: usize) -> bool {
-    let colors = ColorScheme::default();
-    if !is_completed_program_source(&messages[index], &colors) {
+    if !is_completed_program_source(&messages[index]) {
         return false;
     }
-    later_program_output(messages, index, &colors)
+    later_program_output(messages, index)
         .is_some_and(|(has_body, status)| status == MessageStatus::InProgress && !has_body)
 }
 
@@ -2472,24 +2440,26 @@ fn rendered_metadata_for_visible(
     matched
 }
 
+/// When the transcript viewport shows no expandable row at all, re-window the
+/// live lines so at least one disclosure header stays reachable (#805 keeps
+/// the disclosure reachable while the tree owns the viewport).
 fn pin_live_disclosure_header(
     all: &[RenderedTranscriptLine],
-    frame: &mut LiveContentFrame,
+    live_lines: &mut Vec<String>,
     terminal_width: usize,
 ) {
-    if frame.live_lines.is_empty() || !all.iter().any(|line| line.row_id.is_some()) {
+    if live_lines.is_empty() || !all.iter().any(|line| line.row_id.is_some()) {
         return;
     }
-    let visible = rendered_metadata_for_visible(all, &frame.live_lines);
+    let visible = rendered_metadata_for_visible(all, live_lines);
     if visible.iter().any(|line| line.row_id.is_some()) {
         return;
     }
-    let budget = frame
-        .live_lines
+    let budget = live_lines
         .iter()
         .map(|line| shadow_buffer::physical_rows(line, terminal_width.max(1)))
         .sum();
-    frame.live_lines = viewport_tail_rendered_lines(all, terminal_width, budget)
+    *live_lines = viewport_tail_rendered_lines(all, terminal_width, budget)
         .into_iter()
         .map(|line| line.text)
         .collect();
@@ -2555,11 +2525,11 @@ fn continue_full_viewport_paint(
 
 // ─── flush_output_safe / render ───────────────────────────────────────────────
 
-/// Depth-first search of a transcript row tree by stable identity.
+/// Depth-first search of a projected transcript node tree by stable identity.
 fn find_transcript_row<'a>(
-    row: &'a TranscriptRow,
-    id: &TranscriptRowId,
-) -> Option<&'a TranscriptRow> {
+    row: &'a view_model::TranscriptNode,
+    id: &view_model::RowId,
+) -> Option<&'a view_model::TranscriptNode> {
     if row.id == *id {
         return Some(row);
     }
@@ -2571,11 +2541,11 @@ fn find_transcript_row<'a>(
     None
 }
 
-/// The row whose direct child has the given identity, for surface titles.
+/// The node whose direct child has the given identity, for surface titles.
 fn find_parent_transcript_row<'a>(
-    row: &'a TranscriptRow,
-    id: &TranscriptRowId,
-) -> Option<&'a TranscriptRow> {
+    row: &'a view_model::TranscriptNode,
+    id: &view_model::RowId,
+) -> Option<&'a view_model::TranscriptNode> {
     for child in &row.children {
         if child.id == *id {
             return Some(row);
@@ -2585,6 +2555,48 @@ fn find_parent_transcript_row<'a>(
         }
     }
     None
+}
+
+/// Owned state for one live-frame blit, gathered once so the ViewModel can
+/// borrow it for the planning call.
+struct LiveFrameSources {
+    input_lines: Vec<String>,
+    input_cursor: (usize, usize),
+    ghost_text: Option<String>,
+    effective_status: String,
+    cwd_label: String,
+    session_label: String,
+    task_rows: Vec<activity::ActivityRow>,
+    tracked_rows: Vec<activity::ActivityRow>,
+    live_rendered: Vec<RenderedTranscriptLine>,
+    render_error: bool,
+}
+
+/// Borrow the owned sources into the blit-time ViewModel snapshot.
+#[allow(clippy::too_many_arguments)]
+fn live_view_model<'a>(
+    sources: &'a LiveFrameSources,
+    terminal_width: usize,
+    terminal_height: usize,
+    dialog: Option<&'a Dialog>,
+    expanded_lines: Option<&'a [String]>,
+) -> view_model::LiveViewModel<'a> {
+    view_model::LiveViewModel {
+        terminal_width,
+        terminal_height,
+        input_lines: &sources.input_lines,
+        input_cursor: sources.input_cursor,
+        ghost_text: sources.ghost_text.as_deref(),
+        effective_status: &sources.effective_status,
+        cwd_label: &sources.cwd_label,
+        session_label: &sources.session_label,
+        dialog,
+        expanded_lines,
+        render_error: sources.render_error,
+        task_rows: &sources.task_rows,
+        tracked_rows: &sources.tracked_rows,
+        live_rendered: &sources.live_rendered,
+    }
 }
 
 impl TuiRenderer {
@@ -2884,7 +2896,15 @@ impl TuiRenderer {
         message: &MessageRef,
         width: usize,
     ) -> Vec<RenderedTranscriptLine> {
-        let lines = self.accordion.render_message(message, &self.colors);
+        // The ViewModel is the one domain → widget projection: convert the
+        // message to props, then render them under the renderer's disclosure
+        // state. Widgets never query WorkUnits to decide visibility (#805).
+        let lines = match view_model::project_message(message, &self.colors) {
+            view_model::ProjectedMessage::Node(node) => self.accordion.render_node(&node),
+            view_model::ProjectedMessage::Plain(formatted) => {
+                self.accordion.render_plain(&formatted.join("\n"))
+            }
+        };
         // Tool results are bounded child viewports (#656): the visible
         // projection shows a configured number of rows with a scroll offset
         // the control owns. Canonical scrollback is projected separately
@@ -2910,7 +2930,7 @@ impl TuiRenderer {
 
     fn rebuild_transcript_hit_regions(
         &mut self,
-        live: &[RenderedTranscriptLine],
+        frame: &LiveFrame,
         live_rows: usize,
         width: usize,
         height: usize,
@@ -2939,11 +2959,24 @@ impl TuiRenderer {
         combined.extend((0..padding).map(|_| RenderedTranscriptLine {
             ..RenderedTranscriptLine::default()
         }));
-        combined.extend_from_slice(live);
-        self.accordion
-            .rebuild_hit_regions(&combined, plan.transcript_top, width);
+        // The tool viewports still register over the whole painted surface.
+        combined.extend(frame.visible_live.iter().cloned());
         self.tool_viewports
             .rebuild_hit_regions(&combined, plan.transcript_top, width);
+
+        // The live frame's disclosure hit regions come from the claiming pass
+        // itself — the rects the expandable rows claimed inside the viewport
+        // box — offset from frame coordinates into terminal rows. Only the
+        // retained transcript region above is recounted from lines.
+        let retained_len = combined.len().saturating_sub(frame.visible_live.len());
+        self.accordion.rebuild_retained_hit_regions(
+            &combined[..retained_len],
+            plan.transcript_top,
+            width,
+        );
+        let live_top = height.saturating_sub(live_rows);
+        self.accordion
+            .adopt_claimed_hitboxes(&frame.hitboxes, live_top, width);
     }
 
     pub(crate) fn handle_accordion_key(&mut self, key: KeyEvent) -> bool {
@@ -2959,21 +2992,11 @@ impl TuiRenderer {
         if !self.accordion.handle_key(key) {
             return false;
         }
-        self.persist_last_disclosure();
+        // Disclosure is renderer state (#805): the accordion's open set is the
+        // single owner, so there is nothing to persist back onto the message.
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
         true
-    }
-
-    fn persist_last_disclosure(&mut self) {
-        let Some((row_id, expanded)) = self.accordion.take_last_toggled() else {
-            return;
-        };
-        for message in self.output_manager.get_messages() {
-            if message.id() == row_id.message_id {
-                message.set_disclosure(&row_id.path, expanded);
-            }
-        }
     }
 
     /// Keyboard equivalents for a bounded tool-result control (#656).
@@ -2986,7 +3009,7 @@ impl TuiRenderer {
         let Some(focused) = self.accordion.focused.clone() else {
             return false;
         };
-        if self.tool_viewports.kind_of(&focused) != Some(TranscriptRowKind::ToolOutput) {
+        if self.tool_viewports.kind_of(&focused) != Some(view_model::NodeRole::ToolOutput) {
             return false;
         }
         if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
@@ -3028,7 +3051,8 @@ impl TuiRenderer {
         if !self.accordion.handle_mouse(mouse) {
             return false;
         }
-        self.persist_last_disclosure();
+        // Disclosure is renderer state (#805): the accordion's open set is the
+        // single owner, so there is nothing to persist back onto the message.
         self.viewport_invalidated = true;
         self.live_area_dirty = true;
         true
@@ -3099,7 +3123,7 @@ impl TuiRenderer {
     /// Open the focused expanded surface for one tool result. The surface
     /// starts at the compact window's scroll position, so reading continues
     /// where the bounded viewport left off.
-    pub(crate) fn open_expanded_tool(&mut self, row_id: &TranscriptRowId) {
+    pub(crate) fn open_expanded_tool(&mut self, row_id: &view_model::RowId) {
         if self
             .expanded_tool
             .as_ref()
@@ -3194,28 +3218,33 @@ impl TuiRenderer {
 
     /// Current body lines of one tool result, looked up from the retained
     /// messages so appends that arrived after the surface opened stay visible.
-    fn tool_output_body(&self, row_id: &TranscriptRowId) -> Option<Vec<String>> {
+    fn tool_output_body(&self, row_id: &view_model::RowId) -> Option<Vec<String>> {
         let messages = self.output_manager.get_messages();
         for message in &messages {
             if message.id() != row_id.message_id {
                 continue;
             }
-            let root = message.transcript_row(&self.colors)?;
+            let root = match view_model::project_message(message, &self.colors) {
+                view_model::ProjectedMessage::Node(root) => root,
+                view_model::ProjectedMessage::Plain(_) => return None,
+            };
             return find_transcript_row(&root, row_id)
-                .filter(|row| row.kind == TranscriptRowKind::ToolOutput)
+                .filter(|row| row.role == view_model::NodeRole::ToolOutput)
                 .map(|row| row.body.clone());
         }
         None
     }
 
     /// Label of the tool call that owns the result row, for the surface title.
-    fn tool_row_title(&self, row_id: &TranscriptRowId) -> String {
+    fn tool_row_title(&self, row_id: &view_model::RowId) -> String {
         let messages = self.output_manager.get_messages();
         for message in &messages {
             if message.id() != row_id.message_id {
                 continue;
             }
-            if let Some(root) = message.transcript_row(&self.colors) {
+            if let view_model::ProjectedMessage::Node(root) =
+                view_model::project_message(message, &self.colors)
+            {
                 if let Some(parent) = find_parent_transcript_row(&root, row_id) {
                     return parent.label.clone();
                 }
@@ -3311,117 +3340,24 @@ impl TuiRenderer {
         let term_width = usize::from(width).max(1);
         let draw_width = term_width;
         let draw_height = usize::from(height);
-        let input_lines = self.input_textarea.lines().to_vec();
-        let raw_status = self
-            .status_bar
-            .get_status_without(&StatusLineType::SessionLabel);
-        let effective_status = compute_effective_status(
-            self.ghost_text.as_deref(),
-            &raw_status,
-            &input_lines.join("\n"),
-            &self.command_registry,
-        );
+        let sources = self.live_frame_sources(draw_width);
         if draw_height <= 3 {
             let frame = plan_tiny_live_frame(
-                &input_lines,
-                self.input_textarea.cursor(),
-                &effective_status,
+                &sources.input_lines,
+                sources.input_cursor,
+                &sources.effective_status,
                 draw_height,
                 draw_width,
             );
             return Some((frame.lines.len(), frame.cursor_row));
         }
-        let todo_rows = self
-            .task_rows
-            .as_ref()
-            .map(|source| source.rows().len())
-            .unwrap_or(0);
-        let drawn_status_rows = 1 + effective_status
-            .lines()
-            .map(|line| shadow_buffer::physical_rows(line, draw_width))
-            .sum::<usize>();
-        let drawn_input_rows = input_line_physical_rows_with_ghost(
-            &input_lines,
-            draw_width,
-            self.ghost_text.as_deref(),
-        )
-        .into_iter()
-        .sum::<usize>();
-        let base_reserved_rows =
-            1 + drawn_input_rows + drawn_status_rows + todo_rows + self.tracked_rows.len();
-        let all_live_rendered = self.projected_lines(self.find_live_messages(), draw_width);
-        let all_live_lines = all_live_rendered
-            .iter()
-            .map(|line| line.text.clone())
-            .collect::<Vec<_>>();
+        // The geometry estimator plans the same claiming pass the draw will,
+        // so erase accounting can never disagree with what was painted: one
+        // planner, two consumers.
         let mut autocomplete = self.autocomplete_state.clone();
-        let mut content_frame = plan_live_content_frame(
-            &mut autocomplete,
-            draw_height,
-            draw_width,
-            base_reserved_rows,
-            &all_live_lines,
-            self.last_render_error.is_some(),
-        );
-        pin_live_disclosure_header(&all_live_rendered, &mut content_frame, term_width);
-        let completion_rows = content_frame.completion_lines.len();
-        let mut rows = 0;
-        rows += content_frame
-            .live_lines
-            .iter()
-            .map(|line| shadow_buffer::physical_rows(line.trim_end_matches('\r'), term_width))
-            .sum::<usize>();
-
-        if let Some(source) = self.task_rows.as_ref() {
-            for row in source.rows() {
-                let urgent_tag = if row.urgent { " [!]" } else { "" };
-                let max_content = draw_width.saturating_sub(2 + urgent_tag.len());
-                let content = row.text.chars().take(max_content).collect::<String>();
-                let line = format!("● {content}{urgent_tag}");
-                rows += shadow_buffer::physical_rows(&line, term_width);
-            }
-        }
-        for row in self.tracked_rows.values() {
-            let indent = "  ".repeat(row.depth);
-            let detail = row.detail.clone().unwrap_or_default();
-            let prefix_width = indent.chars().count() + 2;
-            let available = draw_width.saturating_sub(prefix_width + detail.chars().count() + 3);
-            let task_text = row.text.chars().take(available).collect::<String>();
-            let line = format!("{indent}● {task_text}{detail}");
-            rows += shadow_buffer::physical_rows(&line, term_width);
-        }
-        let session_label = self
-            .status_bar
-            .get_line(&StatusLineType::SessionLabel)
-            .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| self.session_label.clone());
-        let separator = session_separator_line(draw_width, &tilde_cwd(), &session_label);
-        rows += shadow_buffer::physical_rows(&separator, term_width);
-        let rows_before_input = rows;
-
-        let (cursor_row, cursor_col) = self.input_textarea.cursor();
-        let input_phys_rows = input_line_physical_rows_with_ghost(
-            &input_lines,
-            term_width,
-            self.ghost_text.as_deref(),
-        );
-        let status_rows = shadow_buffer::physical_rows(&"─".repeat(draw_width), term_width)
-            + effective_status
-                .lines()
-                .map(|line| shadow_buffer::physical_rows(line, term_width))
-                .sum::<usize>();
-        rows += input_phys_rows.iter().sum::<usize>() + completion_rows + status_rows;
-        let cursor_text_width = input_lines
-            .get(cursor_row)
-            .map(|line| {
-                shadow_buffer::visible_length(&line.chars().take(cursor_col).collect::<String>())
-            })
-            .unwrap_or(0);
-        let cursor_sub_row = (2 + cursor_text_width) / term_width;
-        let cursor_phys_above = input_phys_rows[..cursor_row.min(input_phys_rows.len())]
-            .iter()
-            .sum::<usize>();
-        Some((rows, rows_before_input + cursor_phys_above + cursor_sub_row))
+        let vm = live_view_model(&sources, draw_width, draw_height, None, None);
+        let frame = plan_live_frame(&vm, &mut autocomplete);
+        Some((frame.physical_rows(draw_width), frame.cursor_row))
     }
 
     /// Clear and reconstruct Finch's complete visible viewport after terminal
@@ -4897,6 +4833,22 @@ fn terminal_char_width(ch: char) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    /// Render a message the way the live frame does: project once into
+    /// ViewModel props, then hand them to the disclosure widget.
+    fn render_via_view_model(
+        state: &AccordionState,
+        message: &MessageRef,
+        colors: &ColorScheme,
+    ) -> Vec<RenderedTranscriptLine> {
+        match view_model::project_message(message, colors) {
+            view_model::ProjectedMessage::Node(node) => state.render_node(&node),
+            view_model::ProjectedMessage::Plain(formatted) => {
+                state.render_plain(&formatted.join("\n"))
+            }
+        }
+    }
+
     use super::*;
     use crate::cli::command_autocomplete::CommandRegistry;
     use crate::cli::diff::{summarize_files, DiffColorMode, FileDiff};
@@ -4930,13 +4882,18 @@ mod tests {
         let output = Arc::new(OutputManager::new(colors.clone()));
         let mut renderer = TuiRenderer::new_headless(output, Arc::new(StatusBar::new()), colors);
         renderer.add_trait_message(work);
-        let lines = renderer
+        let lines = match view_model::project_message(&message, &renderer.colors) {
+            view_model::ProjectedMessage::Node(node) => renderer.accordion.render_node(&node),
+            view_model::ProjectedMessage::Plain(formatted) => {
+                renderer.accordion.render_plain(&formatted.join("\n"))
+            }
+        };
+        renderer
             .accordion
-            .render_message(&message, &renderer.colors);
-        renderer.accordion.rebuild_hit_regions(&lines, 0, 80);
-        let root = message
-            .transcript_row(&renderer.colors)
-            .expect("the work unit projects a transcript row");
+            .rebuild_retained_hit_regions(&lines, 0, 80);
+        let root =
+            crate::cli::tui::view_model::try_project_for_test(message.as_ref(), &renderer.colors)
+                .expect("projected row");
 
         assert_eq!(
             renderer.mouse_tracking,
@@ -5097,7 +5054,7 @@ mod tests {
     /// output row's stable identity.
     fn committed_tool_result_renderer(
         lines: usize,
-    ) -> (TuiRenderer, crate::cli::messages::TranscriptRowId) {
+    ) -> (TuiRenderer, crate::cli::tui::view_model::RowId) {
         use crate::cli::messages::WorkUnit;
 
         let colors = ColorScheme::default();
@@ -5109,9 +5066,8 @@ mod tests {
             (0..lines).map(|n| format!("line {n}")).collect::<Vec<_>>(),
         );
         work.set_complete();
-        let output_row = work
-            .transcript_row(&colors)
-            .expect("a tool group projects a transcript row")
+        let output_row = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+            .expect("projected row")
             .children[0]
             .children[1]
             .id
@@ -5129,7 +5085,7 @@ mod tests {
             .map(|message| message.id())
             .expect("the tool message was added");
         renderer.printed_ids.insert(message_id);
-        renderer.rebuild_transcript_hit_regions(&[], 0, 80, 24);
+        renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24);
         (renderer, output_row)
     }
 
@@ -5223,17 +5179,17 @@ mod tests {
             (0..40).map(|n| format!("beta {n}")).collect::<Vec<_>>(),
         );
         second.set_complete();
-        let second_output = second
-            .transcript_row(&colors)
-            .expect("a tool group projects a transcript row")
-            .children[0]
-            .children[1]
-            .id
-            .clone();
+        let second_output =
+            crate::cli::tui::view_model::try_project_for_test(second.as_ref(), &colors)
+                .expect("projected row")
+                .children[0]
+                .children[1]
+                .id
+                .clone();
         renderer.add_trait_message(second.clone());
         let second_id = second.id();
         renderer.printed_ids.insert(second_id);
-        renderer.rebuild_transcript_hit_regions(&[], 0, 80, 24);
+        renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24);
 
         let first_scroll = {
             let regions = renderer.tool_viewports.regions();
@@ -5409,7 +5365,7 @@ mod tests {
     #[test]
     fn test_keyboard_scroll_and_expand_of_focused_tool_result() {
         let (mut renderer, output_row) = committed_tool_result_renderer(40);
-        renderer.rebuild_transcript_hit_regions(&[], 0, 80, 24);
+        renderer.rebuild_transcript_hit_regions(&LiveFrame::default(), 0, 80, 24);
 
         // F6 cycles through the four expandable rows of the grouped turn:
         // unit root, tool call, Input, Output.
@@ -5704,13 +5660,6 @@ mod tests {
     }
 
     #[test]
-    fn test_live_budget_accounts_for_every_reserved_terminal_row() {
-        assert_eq!(live_message_row_budget(24, 9), 15);
-        assert_eq!(live_message_row_budget(24, 23), 1);
-        assert_eq!(live_message_row_budget(24, 30), 0);
-    }
-
-    #[test]
     fn input_row_budget_counts_wrapping() {
         assert_eq!(input_physical_rows(&[], 10), 1);
         assert_eq!(input_physical_rows(&["hello".into()], 10), 1);
@@ -5875,7 +5824,7 @@ mod tests {
         let message: MessageRef = work.clone();
         let colors = ColorScheme::default();
         let state = AccordionState::default();
-        let projected = state.render_message(&message, &colors);
+        let projected = render_via_view_model(&state, &message, &colors);
 
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].row_expanded, Some(false));
@@ -5920,7 +5869,7 @@ mod tests {
         let message: MessageRef = work;
         let colors = ColorScheme::default();
         let state = AccordionState::default();
-        let all = state.render_message(&message, &colors);
+        let all = render_via_view_model(&state, &message, &colors);
 
         let visible = viewport_tail_rendered_lines(&all, 20, 4);
 
@@ -5953,10 +5902,10 @@ mod tests {
         );
         assert_eq!(shadow_buffer::physical_rows(&tiny[0].text, 8), 1);
         let mut collapsed_state = AccordionState::default();
-        collapsed_state.rebuild_hit_regions(&all, 0, 20);
+        collapsed_state.rebuild_retained_hit_regions(&all, 0, 20);
         assert!(collapsed_state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert!(collapsed_state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
-        let collapsed = collapsed_state.render_message(&message, &colors);
+        let collapsed = render_via_view_model(&collapsed_state, &message, &colors);
         let collapsed_tiny = viewport_tail_rendered_lines(&collapsed, 8, 1);
         assert_eq!(
             collapsed_tiny[0].row_expanded,
@@ -5992,11 +5941,11 @@ mod tests {
         let message: MessageRef = work;
         let colors = ColorScheme::default();
         let mut state = AccordionState::default();
-        let initial = state.render_message(&message, &colors);
-        state.rebuild_hit_regions(&initial, 0, 80);
+        let initial = render_via_view_model(&state, &message, &colors);
+        state.rebuild_retained_hit_regions(&initial, 0, 80);
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
-        let before = state.render_message(&message, &colors);
+        let before = render_via_view_model(&state, &message, &colors);
         assert_eq!(before[0].row_expanded, Some(false));
         let mut printed = HashSet::new();
         let mut failure = FlushFailure(Vec::new());
@@ -6028,7 +5977,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(state.render_message(&message, &colors), before);
+        assert_eq!(render_via_view_model(&state, &message, &colors), before);
 
         let mut bytes = Vec::new();
         prepare_canonical_commit(&mut bytes).unwrap();
@@ -6262,9 +6211,11 @@ mod tests {
             "InProgress source stays visible beside output that already has a body"
         );
         assert!(
-            streaming
-                .transcript_row(&ColorScheme::default())
-                .is_some_and(|row| row.default_expanded),
+            crate::cli::tui::view_model::try_project_for_test(
+                streaming.as_ref(),
+                &ColorScheme::default()
+            )
+            .is_some_and(|row| row.default_open),
             "source stays expanded only while InProgress"
         );
 
@@ -6391,7 +6342,16 @@ mod tests {
         let printed = visible_printed_messages(&manager.get_messages(), &renderer.printed_ids);
         let projected = printed
             .iter()
-            .flat_map(|message| renderer.accordion.render_message(message, &colors))
+            .flat_map(
+                |message| match view_model::project_message(message, &colors) {
+                    view_model::ProjectedMessage::Node(node) => {
+                        renderer.accordion.render_node(&node)
+                    }
+                    view_model::ProjectedMessage::Plain(formatted) => {
+                        renderer.accordion.render_plain(&formatted.join("\n"))
+                    }
+                },
+            )
             .map(|line| line.text)
             .collect::<Vec<_>>()
             .join("\n");
@@ -6659,32 +6619,71 @@ mod tests {
         ];
         let terminal_rows = 60;
         let terminal_width = 120;
-        let fixed_rows = 1 + input_physical_rows(&draft, terminal_width) + 2;
         let stream = (0..1_050)
             .map(|row| format!("live Brain row {row}"))
             .collect::<Vec<_>>();
-        let frame = plan_live_content_frame(
-            &mut autocomplete,
-            terminal_rows,
-            terminal_width,
-            fixed_rows,
-            &stream,
-            false,
-        );
-
-        assert_eq!(
-            frame.completion_lines.len(),
-            9,
-            "heading plus eight matches"
-        );
-        assert!(frame.live_lines[0].contains("earlier live rows clipped"));
-        assert!(
-            fixed_rows + frame.completion_lines.len() + frame.live_lines.len() <= terminal_rows
-        );
-        assert!(frame
-            .completion_lines
+        let stream_rendered = stream
             .iter()
-            .any(|line| line.contains("/brain list")));
+            .map(|line| RenderedTranscriptLine {
+                text: line.clone(),
+                ..RenderedTranscriptLine::default()
+            })
+            .collect::<Vec<_>>();
+        let status = "";
+        let mut vm = live_inputs(terminal_width, terminal_rows, &draft, status);
+        vm.live_rendered = &stream_rendered;
+        let frame = plan_live_frame(&vm, &mut autocomplete);
+
+        // Painted rows inside the claimed completions rect: the pane sits
+        // above the composer, so its rows are the frame rows the layout gave
+        // the completions widget.
+        let pane_rect = frame
+            .rects
+            .completions
+            .expect("a slash draft must claim the completion pane");
+        let painted_completions = rows_in_rect(&frame, 120, pane_rect);
+        assert_eq!(painted_completions.len(), 9, "heading plus eight matches");
+        assert!(painted_completions[0].contains("Commands "));
+        assert!(frame.lines[0].contains("earlier live rows clipped"));
+        assert!(frame.physical_rows(terminal_width) <= terminal_rows);
+        let selected = autocomplete.get_selected().unwrap().full_syntax();
+
+        for (height, width, stream_rows, critical) in [
+            (60, 120, 1_001, false),
+            (18, 32, 1_040, false),
+            (60, 200, 1_080, false),
+            (60, 120, 1_080, true),
+            (60, 120, 1_100, false),
+        ] {
+            let live = (0..stream_rows)
+                .map(|row| format!("rapid stream row {row}"))
+                .collect::<Vec<_>>();
+            let live_rendered = live
+                .iter()
+                .map(|line| RenderedTranscriptLine {
+                    text: line.clone(),
+                    ..RenderedTranscriptLine::default()
+                })
+                .collect::<Vec<_>>();
+            let mut vm = live_inputs(width, height, &draft, status);
+            vm.render_error = critical;
+            vm.live_rendered = &live_rendered;
+            let frame = plan_live_frame(&vm, &mut autocomplete);
+            assert_eq!(autocomplete.get_selected().unwrap().full_syntax(), selected);
+            assert!(frame.lines.first().unwrap().contains("clipped"));
+            let painted_completions = frame
+                .rects
+                .completions
+                .map(|rect| rows_in_rect(&frame, width, rect).len())
+                .unwrap_or(0);
+            if critical {
+                assert_eq!(painted_completions, 0);
+                assert!(!autocomplete.is_interactive());
+            } else {
+                assert!(painted_completions > 0);
+                assert!(autocomplete.is_interactive());
+            }
+        }
     }
 
     #[test]
@@ -7300,39 +7299,36 @@ mod tests {
     }
 
     #[test]
-    fn test_completion_budget_is_resize_stable_and_yields_to_dialogs_and_errors() {
-        let normal = |height| completion_row_budget(height, 5, true, true, false);
-        assert_eq!(normal(4), 0);
-        assert_eq!(normal(8), 2);
-        assert_eq!(normal(40), 9);
-        assert_eq!(normal(8), 2, "repeated resize returns the same frame");
-        assert_eq!(normal(40), 9, "grow after shrink restores free rows");
-
-        assert_eq!(completion_row_budget(40, 5, true, true, true), 0);
-        assert_eq!(completion_row_budget(40, 5, false, true, true), 0);
-        assert_eq!(completion_row_budget(40, 5, true, false, false), 0);
-    }
-
-    #[test]
     fn test_one_to_three_row_viewports_never_create_an_invisible_interactive_pane() {
         let registry = CommandRegistry::new();
         for height in 1..=3 {
+            let draft = vec!["/brain ".to_string()];
+            let mut vm = live_inputs(20, height, &draft, "critical status that must not wrap");
+            let stream = [RenderedTranscriptLine {
+                text: "stream".to_string(),
+                ..RenderedTranscriptLine::default()
+            }];
+            vm.live_rendered = &stream;
             let mut autocomplete = AutocompleteState::new();
             autocomplete.show_matches(registry.match_prefix("/brain "));
-            let frame = plan_live_content_frame(
-                &mut autocomplete,
-                height,
-                20,
-                3,
-                &["stream".to_string()],
-                false,
-            );
+            let frame = plan_live_frame(&vm, &mut autocomplete);
 
-            assert!(frame.completion_lines.is_empty(), "height {height}");
-            assert!(frame.live_lines.is_empty(), "height {height}");
             assert!(
-                frame.completion_lines.len() + frame.live_lines.len() <= height,
-                "height {height}"
+                frame.rects.completions.is_none(),
+                "height {height}: a viewport too small for chrome must claim no completion pane"
+            );
+            assert!(
+                frame.rects.transcript.height <= height,
+                "height {height}: the transcript viewport cannot outgrow the terminal"
+            );
+            assert!(
+                !frame
+                    .lines
+                    .iter()
+                    .any(|line| line.starts_with("Commands ") || line.starts_with("> /")),
+                "height {height}: no completion rows may reach a viewport that cannot host them; \
+                 lines were {:?}",
+                frame.lines
             );
             assert!(!autocomplete.is_interactive(), "height {height}");
 
@@ -7379,9 +7375,22 @@ mod tests {
         let live = (0..1_050)
             .map(|row| format!("stream row {row}"))
             .collect::<Vec<_>>();
-        let frame = plan_live_content_frame(&mut autocomplete, 6, 40, 6, &live, true);
-        assert!(frame.live_lines.is_empty());
-        assert!(frame.completion_lines.is_empty());
+        let draft = vec![String::new()];
+        let live_rendered = live
+            .iter()
+            .map(|line| RenderedTranscriptLine {
+                text: line.clone(),
+                ..RenderedTranscriptLine::default()
+            })
+            .collect::<Vec<_>>();
+        let mut vm = live_inputs(40, 6, &draft, "status");
+        vm.render_error = true;
+        vm.live_rendered = &live_rendered;
+        let frame = plan_live_frame(&vm, &mut autocomplete);
+        assert!(frame
+            .lines
+            .iter()
+            .all(|line| !line.contains("Commands") && !line.contains("> /")));
         assert!(!autocomplete.is_interactive());
     }
 
@@ -7467,6 +7476,7 @@ mod tests {
         }
         let selected = autocomplete.get_selected().unwrap().full_syntax();
 
+        let draft = vec![String::new()];
         for (height, width, stream_rows, critical) in [
             (60, 120, 1_001, false),
             (18, 32, 1_040, false),
@@ -7477,18 +7487,29 @@ mod tests {
             let live = (0..stream_rows)
                 .map(|row| format!("rapid stream row {row}"))
                 .collect::<Vec<_>>();
-            let frame =
-                plan_live_content_frame(&mut autocomplete, height, width, 5, &live, critical);
+            let live_rendered = live
+                .iter()
+                .map(|line| RenderedTranscriptLine {
+                    text: line.clone(),
+                    ..RenderedTranscriptLine::default()
+                })
+                .collect::<Vec<_>>();
+            let mut vm = live_inputs(width, height, &draft, "status");
+            vm.render_error = critical;
+            vm.live_rendered = &live_rendered;
+            let frame = plan_live_frame(&vm, &mut autocomplete);
             assert_eq!(autocomplete.get_selected().unwrap().full_syntax(), selected);
-            assert!(frame.live_lines.first().unwrap().contains("clipped"));
+            assert!(frame.lines.first().unwrap().contains("clipped"));
+            let painted_completions = frame
+                .rects
+                .completions
+                .map(|rect| rows_in_rect(&frame, width, rect).len())
+                .unwrap_or(0);
             if critical {
-                assert!(frame.completion_lines.is_empty());
+                assert_eq!(painted_completions, 0);
                 assert!(!autocomplete.is_interactive());
             } else {
-                assert!(frame
-                    .completion_lines
-                    .iter()
-                    .any(|line| line.contains(&format!("> {selected}"))));
+                assert!(painted_completions > 0);
                 assert!(autocomplete.is_interactive());
             }
         }
@@ -7522,8 +7543,18 @@ mod tests {
             "completion rows must stay plain text so the no-colour path is speakable, got {:?}",
             completion_rows
         );
-        assert!(raw.contains("\r\nCommands 1-1 of 1"));
-        assert!(raw.contains("\r\n> /brain list - List named Brain sessions"));
+        // The pane is a sibling above the composer: its rows must paint
+        // before the prompt line and the separator rule below it.
+        let pane_at = raw.find("Commands 1-1 of 1").expect("pane heading painted");
+        let selected_at = raw
+            .find("> /brain list - List named Brain sessions")
+            .expect("selected suggestion painted");
+        let prompt_at = raw.find('❯').expect("composer prompt painted");
+        let separator_at = raw.find("──  ~/repos/finch").expect("separator painted");
+        assert!(
+            pane_at < selected_at && selected_at < separator_at && separator_at < prompt_at,
+            "the completion pane must paint above the composer, got:\n{raw}"
+        );
         assert!(!raw.contains("\x1b[3J"), "must not clear native scrollback");
         assert!(
             !raw.contains("\n\n"),
@@ -7543,8 +7574,8 @@ mod tests {
         height: usize,
         input_lines: &'a [String],
         status: &'a str,
-    ) -> LiveFrameInputs<'a> {
-        LiveFrameInputs {
+    ) -> view_model::LiveViewModel<'a> {
+        view_model::LiveViewModel {
             terminal_width: width,
             terminal_height: height,
             input_lines,
@@ -7560,6 +7591,362 @@ mod tests {
             tracked_rows: &[],
             live_rendered: &[],
         }
+    }
+
+    /// The frame lines whose painted rows fall inside `rect`, with the row
+    /// offset each was painted at. A frame line may wrap, so physical rows are
+    /// accumulated from the top of the frame.
+    fn rows_in_rect(frame: &LiveFrame, width: usize, rect: widgets::Rect) -> Vec<&str> {
+        let mut top = 0usize;
+        let mut found = Vec::new();
+        for line in &frame.lines {
+            let rows = shadow_buffer::physical_rows(line, width.max(1));
+            if top >= rect.y && top < rect.bottom() {
+                found.push(line.as_str());
+            }
+            top += rows;
+        }
+        found
+    }
+
+    // ── Acceptance regressions for the claiming widget tree (#805) ───────────
+
+    /// Line indexes of the frame rows painted inside `rect`.
+    fn line_indexes_in_rect(frame: &LiveFrame, width: usize, rect: widgets::Rect) -> Vec<usize> {
+        let mut top = 0usize;
+        let mut found = Vec::new();
+        for (index, line) in frame.lines.iter().enumerate() {
+            let rows = shadow_buffer::physical_rows(line, width.max(1));
+            if top >= rect.y && top < rect.bottom() {
+                found.push(index);
+            }
+            top += rows;
+        }
+        found
+    }
+
+    #[test]
+    fn test_completions_pane_claims_rows_above_the_composer_and_never_moves_the_chrome() {
+        // Regression for #232: the completion pane used to be concatenated
+        // after the input rows, so slash suggestions sat between `❯` and the
+        // status rule. The pane is now a sibling above the composer, and an
+        // empty pane claims zero rows so opening or closing it cannot move
+        // the composer or status rects.
+        let registry = CommandRegistry::new();
+        let width = 80;
+        let height = 24;
+
+        let plain_draft = vec!["hello world".to_string()];
+        let closed_vm = live_inputs(width, height, &plain_draft, "ready");
+        let closed = plan_live_frame(&closed_vm, &mut AutocompleteState::new());
+
+        let slash_draft = vec!["/quit".to_string()];
+        let open_vm = live_inputs(width, height, &slash_draft, "ready");
+        let mut open_autocomplete = AutocompleteState::new();
+        open_autocomplete.show_matches(registry.match_prefix("/quit"));
+        let open = plan_live_frame(&open_vm, &mut open_autocomplete);
+
+        // A non-slash draft claims height 0.
+        assert!(
+            closed.rects.completions.is_none(),
+            "a non-slash draft must claim no completion pane; rects were {:?}",
+            closed.rects
+        );
+        assert!(
+            !closed
+                .lines
+                .iter()
+                .any(|line| line.contains("/quit") && !line.contains('❯')),
+            "no completion rows may paint for a non-slash draft; frame was {:?}",
+            closed.lines
+        );
+
+        // With `/quit` the pane claims a rect above the input rect.
+        let pane = open
+            .rects
+            .completions
+            .expect("a slash draft must claim the completion pane");
+        assert!(
+            pane.bottom() <= open.rects.separator.y
+                && open.rects.separator.bottom() <= open.rects.composer.y,
+            "the pane must sit above the separator and the composer; rects were {:?}",
+            open.rects
+        );
+
+        // Painted order is the reproduction of #232: every completion row
+        // paints before the prompt line, never between `❯` and the status
+        // rule. On the pre-#805 planner this assertion failed: the pane's
+        // lines were pushed after the input rows.
+        let prompt_index = open
+            .lines
+            .iter()
+            .position(|line| line.contains('❯'))
+            .expect("the composer prompt must paint");
+        let status_rule_index = open
+            .lines
+            .iter()
+            // The status rule is a bare rule row; the session separator also
+            // draws dashes but carries the workspace and session labels.
+            .rposition(|line| line.contains("───") && !line.contains("jade-river"))
+            .expect("the status rule must paint");
+        for index in line_indexes_in_rect(&open, width, pane) {
+            assert!(
+                index < prompt_index,
+                "completion row {index} painted at or below the prompt row {prompt_index} — \
+                 the #232 placement; frame was {:?}",
+                open.lines
+            );
+        }
+        assert!(
+            status_rule_index > prompt_index,
+            "the status rule stays below the composer; frame was {:?}",
+            open.lines
+        );
+        assert!(
+            !line_indexes_in_rect(&open, width, open.rects.composer)
+                .iter()
+                .any(|index| open.lines[*index].starts_with("Commands ")),
+            "no completion row may paint inside the composer rect"
+        );
+
+        // Opening the pane moves the transcript viewport, not the chrome.
+        assert_eq!(
+            closed.rects.composer, open.rects.composer,
+            "opening the pane must not move the composer rect"
+        );
+        assert_eq!(
+            closed.rects.status, open.rects.status,
+            "opening the pane must not move the status rect"
+        );
+        assert_eq!(
+            closed.rects.status_rule, open.rects.status_rule,
+            "opening the pane must not move the status rule"
+        );
+        assert!(
+            closed.rects.transcript.height > open.rects.transcript.height,
+            "the transcript viewport yields the pane's rows"
+        );
+        assert_eq!(
+            closed.rects.transcript.height,
+            open.rects.transcript.height + pane.height,
+            "the pane's rows come out of the transcript viewport, row for row"
+        );
+    }
+
+    #[test]
+    fn test_resize_reclaims_the_frame_and_rebuilds_disclosure_hitboxes() {
+        // Successor to #266: a resize is a full layout pass. Sibling rects
+        // re-claim relative to the new frame, and the disclosure hitboxes are
+        // rebuilt from the new rects. A test fails if widgets keep their old
+        // absolute sizes.
+        let width = 100;
+        let work = Arc::new(WorkUnit::new("Tools"));
+        let call = work.add_row("bash(build)");
+        work.complete_row_with_body(call, "done", vec!["step one".to_string()]);
+        work.set_complete();
+        let colors = ColorScheme::default();
+        let node = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+            .expect("a WorkUnit projects");
+        let lines = AccordionState::default().render_node(&node);
+        let live_rendered = lines;
+
+        let plan_at = |w: usize, h: usize| {
+            let draft = vec![String::new()];
+            let status = "ready";
+            let vm = view_model::LiveViewModel {
+                terminal_width: w,
+                terminal_height: h,
+                input_lines: &draft,
+                input_cursor: (0, 0),
+                ghost_text: None,
+                effective_status: status,
+                cwd_label: "~/repos/finch",
+                session_label: "jade-river",
+                dialog: None,
+                expanded_lines: None,
+                render_error: false,
+                task_rows: &[],
+                tracked_rows: &[],
+                live_rendered: &live_rendered,
+            };
+            plan_live_frame(&vm, &mut AutocompleteState::new())
+        };
+
+        let tall = plan_at(width, 40);
+        let small = plan_at(60, 20);
+
+        // Fixed chrome keeps its height but re-claims its width; the flexible
+        // transcript viewport takes the leftover at each size.
+        assert_eq!(
+            tall.rects.composer.height, small.rects.composer.height,
+            "the composer's height does not depend on the frame height"
+        );
+        assert_eq!(
+            tall.rects.composer.width, width,
+            "the composer re-claims the full width at the larger size"
+        );
+        assert_eq!(small.rects.composer.width, 60);
+        assert!(
+            tall.rects.transcript.height > small.rects.transcript.height,
+            "the transcript viewport re-claims proportionally more rows in a taller frame; \
+             tall={:?} small={:?}",
+            tall.rects,
+            small.rects
+        );
+        assert_eq!(
+            tall.rects.transcript.height
+                + small.rects.composer.height
+                + small.rects.status.height
+                + small.rects.status_rule.height
+                + small.rects.separator.height,
+            40,
+            "the tall frame is fully claimed by viewport and chrome"
+        );
+
+        // Hitboxes rebuild from the new rects: they live inside the
+        // transcript viewport and differ between the passes.
+        assert!(
+            !tall.hitboxes.is_empty(),
+            "an expandable live row must claim a disclosure hitbox"
+        );
+        for region in &tall.hitboxes {
+            let rect = &region.region;
+            assert!(
+                rect.top >= tall.rects.transcript.y as u16
+                    && rect.bottom < tall.rects.transcript.bottom() as u16,
+                "every claimed hitbox lives inside the transcript viewport; region={rect:?} viewport={:?}",
+                tall.rects.transcript
+            );
+        }
+        assert_ne!(
+            tall.hitboxes, small.hitboxes,
+            "a resize must rebuild the hitboxes from the new claimed rects"
+        );
+    }
+
+    #[test]
+    fn test_disclosure_hitboxes_are_the_depth_first_claimed_rects_and_the_mouse_toggles_through_them(
+    ) {
+        // The hitboxes the claiming pass produced are the rects the
+        // disclosure rows claimed inside the viewport box — not a recount —
+        // and clicking one toggles the row through the renderer-owned open
+        // set.
+        let work = Arc::new(WorkUnit::new("Tools"));
+        let call = work.add_row("bash(echo hi)");
+        work.complete_row_with_body(call, "done", vec!["hi".to_string()]);
+        work.set_complete();
+        let colors = ColorScheme::default();
+        let node = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+            .expect("a WorkUnit projects");
+        let live_rendered = AccordionState::default().render_node(&node);
+        let width = 80;
+        let draft = vec![String::new()];
+        let status = "ready";
+        let vm = view_model::LiveViewModel {
+            terminal_width: width,
+            terminal_height: 24,
+            input_lines: &draft,
+            input_cursor: (0, 0),
+            ghost_text: None,
+            effective_status: status,
+            cwd_label: "~/repos/finch",
+            session_label: "jade-river",
+            dialog: None,
+            expanded_lines: None,
+            render_error: false,
+            task_rows: &[],
+            tracked_rows: &[],
+            live_rendered: &live_rendered,
+        };
+        let frame = plan_live_frame(&vm, &mut AutocompleteState::new());
+        assert!(
+            !frame.hitboxes.is_empty(),
+            "the expandable row claims a hitbox"
+        );
+
+        // The claimed rect is exactly the painted row of the row's header.
+        let region = &frame.hitboxes[0].region;
+        let header_index = frame
+            .visible_live
+            .iter()
+            .position(|line| line.row_id.as_ref() == Some(&region.row_id))
+            .expect("the claimed row's header is among the painted live lines");
+        assert!(
+            frame.visible_live[header_index].row_expanded.is_some(),
+            "hit targets are expandable headers"
+        );
+
+        let mut accordion = AccordionState::default();
+        accordion.adopt_claimed_hitboxes(&frame.hitboxes, 0, width);
+        let clicked = accordion
+            .hit_regions
+            .iter()
+            .find(|candidate| candidate.row_id == region.row_id)
+            .expect("the claimed rect was adopted");
+        assert_eq!(
+            (clicked.top, clicked.bottom, clicked.left, clicked.right),
+            (region.top, region.bottom, region.left, region.right),
+            "the adopted region is the rect the pass claimed"
+        );
+        let node_after = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+            .expect("a WorkUnit projects");
+        let expanded_before = accordion.is_expanded(&node_after);
+        let toggled = accordion.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: clicked.left,
+            row: clicked.top,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(toggled, "clicking the claimed rect must toggle the row");
+        let node_after_toggle =
+            crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+                .expect("a WorkUnit projects");
+        assert_ne!(
+            accordion.is_expanded(&node_after_toggle),
+            expanded_before,
+            "the click flips the renderer-owned open set"
+        );
+    }
+
+    #[test]
+    fn test_thinking_leaf_renders_one_glyph_from_view_model_props_without_an_invented_bullet() {
+        // #821: a leaf thinking line is one glyph plus its status text, taken
+        // from the ViewModel's label props. The disclosure must not invent a
+        // second `•` bullet in front of the glyph, and must not sniff glyph
+        // characters to decide anything.
+        let colors = ColorScheme::default();
+        let pending = Arc::new(WorkUnit::new("Analyzing"));
+        let node = crate::cli::tui::view_model::try_project_for_test(pending.as_ref(), &colors)
+            .expect("a WorkUnit projects");
+        let rendered = AccordionState::default().render_node(&node);
+        let header = &rendered[0].text;
+        assert!(
+            header.contains('\u{25cb}'),
+            "a pending thinking row carries its status glyph from the ViewModel props; header={header:?}"
+        );
+        assert!(
+            !header.contains('•'),
+            "the disclosure must not invent a bullet in front of a leaf's own status glyph \
+             (#821); header={header:?}"
+        );
+        assert!(
+            header.contains("Analyzing"),
+            "the leaf stays readable: one glyph plus the status text; header={header:?}"
+        );
+
+        // Expandable rows keep their disclosure marks.
+        let work = Arc::new(WorkUnit::new("Tools"));
+        let call = work.add_row("bash(echo hi)");
+        work.complete_row_with_body(call, "done", vec!["hi".to_string()]);
+        work.set_complete();
+        let node = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+            .expect("a WorkUnit projects");
+        let rendered = AccordionState::default().render_node(&node);
+        assert!(
+            rendered[0].text.contains('▶'),
+            "collapsed expandable rows keep the disclosure mark; header={:?}",
+            rendered[0].text
+        );
     }
 
     /// Rows the buffer actually holds content on.
@@ -7876,9 +8263,14 @@ mod tests {
             .into_iter()
             .next()
             .expect("lifecycle work unit must be present");
-        let live = renderer
-            .accordion
-            .render_message_fully_expanded(&message, &colors);
+        let live = match view_model::project_message(&message, &colors) {
+            view_model::ProjectedMessage::Node(node) => {
+                renderer.accordion.render_node_fully_expanded(&node)
+            }
+            view_model::ProjectedMessage::Plain(formatted) => {
+                renderer.accordion.render_plain(&formatted.join("\n"))
+            }
+        };
         let input = vec![String::new()];
         let mut inputs = live_inputs(width, 20, &input, "idle");
         inputs.live_rendered = &live;
@@ -7943,6 +8335,7 @@ mod tests {
             cursor_col: 9,
             cursor_visible: true,
             visible_live: Vec::new(),
+            ..LiveFrame::default()
         };
         let mut bytes = Vec::new();
         write_live_frame(&mut bytes, &frame, width).unwrap();
