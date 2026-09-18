@@ -2272,9 +2272,9 @@ The call site does not need a ceremonial `move` marker when the parameter alread
 
 ```lisp
 (begin
-  (let foo (Foo ...))
-  (retain foo)
-  (inspect foo)) ; error: foo was moved by the preceding stealing call
+  (let ((foo (Foo ...)))
+    (retain foo)
+    (inspect foo))) ; error: foo was moved by the preceding stealing call
 ```
 
 Passing a uniquely owned value to a stealing parameter moves it and invalidates the source binding.
@@ -2484,7 +2484,7 @@ Two ways Finch code actually handles this, and when each is the right one:
    (define (pick-longer (x : string) (y : string)) : bool
      (> (length x) (length y)))
    ; caller:
-   (let winner (if (pick-longer a b) a b))  ; ordinary borrow, traceable to exactly one of a, b
+   (let ((winner (if (pick-longer a b) a b))) ...) ; ordinary borrow, traceable to exactly one of a, b
    ```
    The helper never touches ownership at all; the caller does the actual borrow itself, at the point
    where "exactly one input owner" is trivially satisfiable, because by then the branch has already
@@ -2642,12 +2642,12 @@ to standard-library carrier/allocator constructors; they do not give those types
 layouts:
 
 ```lisp
-(let local (Foo ...))
-(let unique-foo (new Foo ...))            ; unique is the default heap policy, no keyword needed
-(let unique-foo-explicit (new unique Foo ...)) ; equivalent, spelled out
-(let shared-foo (new shared Foo ...))
-(let promoted (share local))       ; allocates shared storage and moves local
-(let promoted-unique (share unique-foo)) ; moves an existing Unique<Foo> into Shared<Foo>
+(let ((local (Foo ...))) ...)
+(let ((unique-foo (new Foo ...))) ...)                    ; unique is the default heap policy, no keyword needed
+(let ((unique-foo-explicit (new unique Foo ...))) ...)    ; equivalent, spelled out
+(let ((shared-foo (new shared Foo ...))) ...)
+(let ((promoted (share local))) ...)                      ; allocates shared storage and moves local
+(let ((promoted-unique (share unique-foo))) ...)          ; moves an existing Unique<Foo> into Shared<Foo>
 ```
 
 **Revised 2026-09-17:** `new` alone means `new unique` — unique is already stated as the default
