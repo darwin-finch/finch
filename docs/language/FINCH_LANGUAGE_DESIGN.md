@@ -1057,6 +1057,15 @@ grammars they were written in: a request looks like `namespace.word(args)` or a 
 contracts. Omitted `!` requests inference across all of it — both the open effect set and every
 predicate — never asserting emptiness or any particular value for any of them.
 
+**Added 2026-09-17: the closed predicate keywords are reserved and may never name a capability
+effect.** Telling requests from predicates "by shape" only works if the two vocabularies can never
+collide — a bare-word capability registered without a namespace could otherwise be mistaken for (or
+deliberately shadow) `pure`, `total`, `deterministic`, `nothrow`, `throws`, `suspends`, or
+`non-suspending`. The host capability registry must reject registering any of these bare names, and
+every worked capability example in this document is already namespaced (`fs.read<R>`, `vm.write`,
+`network.connect`) precisely so this collision cannot arise from ordinary use; this makes that
+existing convention a hard grammar rule instead of an accident of the examples chosen.
+
 **Revised 2026-09-17: `! pure` is valid — this reverses the original rule stated here, not a
 clarification of it.** An earlier version of this section kept `pure` in a syntactically separate
 `guarantees pure` clause specifically so it could never be mistaken for a row member, and declared
@@ -2724,6 +2733,16 @@ tuple may be the operator default in a scope" rule already governing operators a
 multiple candidates requires the explicit call, never a ranking between them. `Unique<T>` →
 `Shared<T>` stays an ordinary explicit `share(...)` call regardless, since establishing shared
 ownership sets up real refcount bookkeeping and does not verify as free.
+
+**Added 2026-09-17: for a generic `From<T>` implementation, `implicit` is checked per instantiation,
+not once for the whole definition.** A generic conversion's cost can depend on the type argument —
+`From<Foo> for Wrapper<Foo>` might be free for one concrete `Foo` and allocating for another. Nothing
+here says otherwise yet, and leaving it unstated risks exactly the wrong reading: that `implicit` is
+a property of the source declaration, checked once. It has to be a property of each *instantiation*,
+the same way `guarantees pure`/`! pure` on a generic function is already necessarily checked per
+concrete type argument, not once for the unbound definition. An instantiation that fails to verify
+falls back to requiring the explicit call at that call site specifically; it does not invalidate
+`implicit` for other instantiations that do verify.
 
 Core safe memory management requires no tracing garbage collector. Frame ownership, moves,
 explicit unique/shared carriers, deterministic drop, and bounded borrow analysis provide the
