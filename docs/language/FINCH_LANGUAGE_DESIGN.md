@@ -947,50 +947,88 @@ versus heap placement, an ownership policy, or static versus dynamic behavioral 
 `Unique<Foo>` or `Shared<Foo>`, or borrowed through any of those carriers without becoming a
 different aggregate type.
 
-**Added 2026-09-17: "construction invariants" are enforced, not conventional.** Private fields plus
-an ordinary associated function is not, by itself, a real guarantee — anything with field visibility
-(everything in the declaring module, ordinarily) can still write the raw record literal directly,
-bypassing whatever validation or transformation that function was supposed to perform; this is
-Go's and Rust's actual situation today, not a solved problem to imitate. The fix reuses the existing
-declaration-attribute mechanism rather than adding new syntax: `@constructor` marks an associated
-function as a constructor of its record, and the moment a record has *any* `@constructor`-attributed
-function, the ordinary record-literal syntax becomes unavailable everywhere *outside* that
-function's own body — not a style guideline, a compile error on the bypass. A constructor takes
-whatever input parameters its author declares, with no obligation to match the record's own field
-set, and may validate, default, or derive fields with arbitrary logic (subject to its own declared
-effect row) before producing the value, returning `Self` or `result<Self, E>`; only `@constructor`
-functions retain the privilege to use the literal form internally. A record may declare several
-constructors, each under its own distinct name — never overloaded on one name, the same discipline
-already applied to rejecting classic overload resolution elsewhere in this document. A record with
-no `@constructor` declared is unchanged: plain literal construction remains available, so this is
-purely additive and opt-in.
+**Revised 2026-09-17: a record's behavior lives in an `implementation` block with no concept bound —
+there is no separate "associated function" category.** The first draft of this section used
+"associated function" as if a record could have its own methods directly; nothing else in this
+document supports that — every other `implementation` in this document is
+`implementation X for Y : Concept {...}`. Rather than add a parallel mechanism, drop the concept
+bound: `implementation Foo { ... }` is an *inherent implementation*, the same declaration shape as a
+concept implementation with the `for Y : Concept` clause simply omitted. It hosts three kinds of
+member, told apart by leading keyword rather than by an attribute — `constructor`, `get`/`set`, and
+plain `operation`:
+
+```text
+implementation Account {
+    constructor open(id: string) -> Account =>
+        Account { id: id, balance: 0 }
+
+    get balance(&self) -> int =>
+        self.balance
+
+    set balance(&mut self, v: int) -> () ! throws NegativeBalance =>
+        if v < 0 { throw NegativeBalance } else { self.balance = v }
+
+    operation close(&mut self) -> () =>
+        self.balance = 0
+}
+```
+
+Co-Forth carries the same three keywords as word-prefixed declarations, matching `concept:`'s and
+`operation:`'s existing shape:
+
+```forth
+implementation: Account
+  constructor: open ( S string -- S Account ) ;
+  get: balance ( S borrow Self -- S int ) ;
+  set: balance ( S borrow-mut Self int -- S ! throws NegativeBalance ) ;
+  operation: close ( S borrow-mut Self -- S ) ;
+;
+```
+
+**`constructor` replaces the earlier `@constructor` attribute; enforcement is unchanged.** Private
+fields plus an ordinary function is not, by itself, a real guarantee — anything with field
+visibility (everything in the declaring module, ordinarily) can still write the raw record literal
+directly, bypassing whatever validation the function was supposed to perform; this is Go's and
+Rust's actual situation today, not a solved problem to imitate. The moment a record has *any*
+`constructor`-declared function, ordinary record-literal syntax becomes unavailable everywhere
+*outside* that function's own body — a compile error on the bypass, not a style guideline. A
+constructor takes whatever parameters its author declares, with no obligation to match the record's
+own field set, and may validate, default, or derive fields with arbitrary logic (subject to its own
+declared effect row) before producing the value, returning `Self` or `result<Self, E>`; only
+`constructor` functions retain the privilege to use the literal form internally. A record may
+declare several constructors, each under its own distinct name — never overloaded on one name, the
+same discipline already applied to rejecting classic overload resolution elsewhere in this document.
+A record with no `constructor` declared is unchanged: plain literal construction remains available,
+so this is purely additive and opt-in.
 
 **Added 2026-09-17: field visibility, concretely — checked, and nothing previously said how to
 write it.** "Owns its... visibility" (above) asserted the property without a mechanism; a field is
 readable and writable through a record value only from within the module that declares the record
 by default, matching the general rule already stated for every other declaration ("local visibility
 begins at the declaration"); `pub` before a field name in the record declaration exposes it outside
-the module. This is what makes `@constructor` mean something concrete rather than aspirational: a
-record whose fields are all module-private and that declares an `@constructor` is now genuinely
+the module. This is what makes `constructor` mean something concrete rather than aspirational: a
+record whose fields are all module-private and that declares a `constructor` is now genuinely
 encapsulated across a module boundary, not merely by convention — the same guarantee C++, Swift, and
 Rust's `pub`-field visibility give, composed from two small, separately-motivated rules rather than
 one bespoke "encapsulated record" feature.
 
-**Added 2026-09-17: `@property` getter/setter pairs, called with field syntax — modeled on C#'s
-proven shape, not D's, whose own documentation calls its version unsettled.** A getter (no explicit
-parameters beyond the receiver, returns `T`) and an optional setter (one parameter of type `T`,
-returns `unit`) sharing one name and marked `@property` are resolved through `foo.name` /
-`foo.name = value` the same way a plain field already is. The rule that keeps this unambiguous is
-narrower than avoiding D's specific trouble: **a record cannot declare both a plain field and a
-`@property` under the same name** — one name always resolves one way, so there is nothing to
-disambiguate between a field and a property in the first place, and Finch has no UFCS-style
-"search free functions by first-parameter type" mechanism for the comparison to D's actual problem
-to even apply to. A setter's effects are exactly its own declared or inferred effect row, checked
-and visible to the verifier the same as any ordinary function's — "looks like a field" is a surface
-syntax fact, never a reason the cost-visibility or effect-inference rules stop applying, so a setter
-that notifies observers, updates a dependency graph, or does other real work is fully checked and
-fully legible to the effect system, not a hidden side channel. This is exactly the reactive-property
-use case (a setter driving an observable/dependency graph) that motivated asking for the feature.
+**`get`/`set` replace the earlier `@property` attribute — modeled on C#'s and TypeScript's proven
+shape, not D's, whose own documentation calls its version unsettled.** A `get` (no explicit
+parameters beyond the receiver, returns `T`) and an optional `set` (one parameter of type `T`,
+returns `unit`) sharing one name are resolved through `foo.name` / `foo.name = value` the same way a
+plain field already is. A `get` may stand alone — a read-only computed property, the common case in
+both languages; a `set` alone is legal but unusual, matching both rather than forbidding it outright.
+The rule that keeps this unambiguous is narrower than avoiding D's specific trouble: **a record
+cannot declare both a plain field and a `get`/`set` under the same name** — one name always resolves
+one way, so there is nothing to disambiguate between a field and a property in the first place, and
+Finch has no UFCS-style "search free functions by first-parameter type" mechanism for the comparison
+to D's actual problem to even apply to. A setter's effects are exactly its own declared or inferred
+effect row, checked and visible to the verifier the same as any ordinary function's — "looks like a
+field" is a surface syntax fact, never a reason the cost-visibility or effect-inference rules stop
+applying, so a setter that notifies observers, updates a dependency graph, or does other real work is
+fully checked and fully legible to the effect system, not a hidden side channel. This is exactly the
+reactive-property use case (a setter driving an observable/dependency graph) that motivated asking
+for the feature.
 Named records have nominal identity. Matching field names do not make independently declared
 records interchangeable, because their invariants, constructors, lifecycle evidence, and layout
 contracts may differ. Structural width conversion is available only through an explicit readonly
@@ -1015,6 +1053,19 @@ receiver. Resolution tries a direct member first, then one proven borrow project
 ambiguity rather than following an unbounded user-defined dereference chain. Mutable access must
 produce an exclusive `&mut Foo`; `Shared<Foo>` cannot do so merely because it can produce `&Foo`.
 A raw pointer is never an automatic safe projection.
+
+**Added 2026-09-17: `.` resolution order across fields, properties, inherent operations, and
+concept-dispatched operations.** Inherent implementations (above) introduce a second source of
+`foo.name` besides fields: `foo.name` now resolves, in order, against (1) a plain field, (2) a
+`get`/`set` property, (3) an inherent `operation` — all three already mutually exclusive by name
+within one record — and only then (4) a concept-dispatched operation, resolved from whichever
+`implementation _ for Foo : Concept` bodies are in scope. An inherent hit at (1)-(3) shadows a
+same-named concept operation rather than conflicting with it, matching Rust's inherent-vs-trait-
+method precedence: adding a concept implementation to a type can never silently change behavior a
+caller was already getting from that type's own field, property, or operation. Two or more concept
+implementations in scope that both provide the same name at step (4) is an ambiguity error — the
+call site must qualify it (`Drawable.draw(&x)`), the same explicit-disambiguation shape already used
+in `implementation WidgetDrawable for Widget : Drawable` above (`using PresentationDrawable`).
 
 Records and maps remain different representations. A record field has a compile-time type and
 offset and cannot be absent. A `map<K,V>` performs runtime key lookup. Repeated dynamic shapes may
@@ -2870,11 +2921,11 @@ otherwise leaves "constructor" to mean record/variant construction syntax or an 
 function (`try-as-unitary`, `new-state`); there was no general, standard construction or conversion
 concept. Two distinct needs were bundled under that gap and get different answers:
 
-- **Validated construction** needs no new mechanism: an ordinary function plus the field visibility
-  a record already owns ("Records, layout, placement, and member access") gives the standard shape —
-  private fields, a checked associated function as the only public way to build one, returning
-  `Self` or `result<Self, E>`. This is already fully expressible; it only needed naming as the
-  recommended pattern instead of being left to convention.
+- **Validated construction** needs no new mechanism: `constructor` plus the field visibility a
+  record already owns ("Records, layout, placement, and member access") gives the standard shape —
+  private fields, a checked `constructor` as the only public way to build one, returning `Self` or
+  `result<Self, E>`. This is already fully expressible; it only needed naming as the recommended
+  pattern instead of being left to convention.
 - **Standard, generic-integrable conversion between types** is the real gap, and the fix is a
   `From<T>`/`Into<T>` concept pair — the same explicit-evidence mechanism as every other concept in
   this document, so generic code can bound on it (`fn f<T>(x : impl Into<T>)`-shaped) the same way it

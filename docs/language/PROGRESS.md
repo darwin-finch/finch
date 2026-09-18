@@ -256,3 +256,40 @@ on machine-code representability and buildability specifically, not just design 
   regardless of how many agents are running in parallel, not skipped because agents are doing the
   writing. Recorded here so it isn't lost as just a conversational aside — it should inform how the
   M1+ work in this tracker actually gets executed once agents start picking up issues.
+
+**Continued 2026-09-17 — caught a self-inconsistency in the records section, fixed it, and started
+a running example-program corpus (`docs/language/examples/feature_tour.md`) as a second review
+method alongside prose audit:**
+
+- **Records didn't actually have a way to declare behavior.** The `@constructor`/`@property`/
+  field-visibility additions from earlier the same day used the term "associated function" as if a
+  record had its own inherent methods; grep confirmed that term appeared nowhere else in the
+  document, and every other `implementation` block in the whole spec is `implementation X for Y :
+  Concept {...}` — there was no bare form. Shammah caught this by asking directly whether records
+  even have methods, recalling an earlier conversation had subsumed all record behavior into
+  `concept`/`implementation`.
+- **Fix:** `implementation Foo { ... }` with the concept bound simply omitted is now an *inherent
+  implementation* — same declaration shape, no new mechanism. It hosts three member kinds by leading
+  keyword: `constructor` (replaces `@constructor`, same enforcement — record-literal syntax becomes
+  unavailable outside a constructor's own body once any exist), and `get`/`set` (replace `@property`,
+  same C#-shaped getter/setter-as-field semantics, still forbidding a plain field and a `get`/`set`
+  under one name). Shammah specifically flagged `@constructor`/`@property` as possibly the wrong
+  spelling, citing C#/TypeScript's `get`/`set`; the attribute mechanism was dropped rather than
+  patched, since attributes-as-a-second-dimension were already something he'd pushed back on earlier
+  this session (the `!`-unification finding above).
+- **New gap this surfaced and closed in the same pass:** inherent implementations mean an
+  `operation` and a concept-dispatched operation can now share a name on one type, which the `.`
+  resolution passage never addressed. Added explicit precedence — field → `get`/`set` → inherent
+  `operation` → concept dispatch, inherent shadowing concept deliberately (Rust's inherent-vs-trait
+  precedent) — rather than leaving it to reach implementation as an undefined collision.
+- **Example-program corpus started, at Shammah's request, explicitly as future compiler test
+  material:** small CoLisp programs that each exercise several features together (records/
+  construction/properties; ownership + `match-type`; effects + concepts + `?`; variant + record-arm
+  destructuring; an inherent-vs-concept-operation shadowing case), rather than one feature at a time.
+  4 of the first 5 clusters composed cleanly as specified with no changes needed; the fifth (records)
+  is what surfaced the gap above. Also surfaced, by absence rather than by writing a broken example:
+  capability requests with wildcarded paths (`read{path="~/**"}`, asked about earlier this session)
+  were never actually specified — only a passing "broad selectors such as workspace `**`" mention
+  exists, with no grammar. Flagged, not guessed at. This is meant to keep running: the plan going
+  forward is prose-audit-and-example-program in the same pass, since the records gap was found by
+  trying to write code against the spec, not by re-reading it.
