@@ -93,12 +93,12 @@ reaches — same hazard Rust accepts for inherent-vs-trait methods, inherited de
 (define (absorb (steal x : Foo)) : Foo                       ; ownership transfer
   x)
 
-(define (log-carrier (steal x : O)) : string                 ; UNVERIFIED: generic-header placement
-  ! pure                                                      ; for a hand-written `<O : Owner<Foo>>`
-  (match-type O                                               ; is not shown anywhere in the document —
-    (Unique<Foo> "exclusively owned")                         ; every real match-type example matches on
-    (Shared<Foo> (retain x) "shared, retained a handle")      ; a parameter already in scope, never shows
-    (_ "some other owner")))                                  ; the enclosing signature that bound it.
+(define (log-carrier <O> (steal x : O)) : string             ; header placement now CONFIRMED —
+  ! pure                                                      ; `render-all`'s `<(types Ts...)>` in
+  (match-type O                                               ; "Parameter packs..." shows `<...>`
+    (Unique<Foo> "exclusively owned")                         ; right after the name — but that example
+    (Shared<Foo> (retain x) "shared, retained a handle")      ; only shows a *pack* header; `<O>` alone
+    (_ "some other owner")))                                  ; for an ordinary bound is still a guess.
 
 (let [u (Unique.new (Foo.default)) s (Shared.new (Foo.default))]
   (describe u)                        ; borrow, non-escaping — u still owns after this call
@@ -110,9 +110,11 @@ reaches — same hazard Rust accepts for inherent-vs-trait methods, inherited de
       (err _ (panic "unreachable: s is still alive")))))
 ```
 
-Composes cleanly apart from the flagged header-placement uncertainty: `match-type` narrowing, `steal`
-desugaring to `<O : Owner<Foo>>`, and `Weak::upgrade`'s CAS-loop-backed `result` all line up with
-what's specified.
+Composes cleanly: `match-type` narrowing, `steal` desugaring to `<O : Owner<Foo>>`, and
+`Weak::upgrade`'s CAS-loop-backed `result` all line up with what's specified. The generic-header
+*placement* question from the first draft is resolved (confirmed against `render-all` in §9, below);
+what's still an unconfirmed guess is only the narrower question of an ordinary bound's spelling
+inside it (`<O>` versus `<O : Owner<Foo>>` versus something else) for a hand-written, non-pack case.
 
 ## 3. Effects (`!`), `?` propagation, concepts together
 
@@ -186,16 +188,115 @@ patterns) is **UNVERIFIED** — no real `match`-over-`variant` CoLisp example ex
 document to check this against; only the abstract parity-ledger entry (`(match value ...)`) and the
 `option<T>`/`result<T,E>` exhaustive-destructuring mention, neither of which shows arm syntax.
 
-## 5. What I did NOT write, and why
+## 6. Simple call-forwarding needs no CTFE at all — ordinary generics already do it
 
-- **Capability requests with wildcarded paths** (`read{path="~/**"}`) — grepped the whole document;
-  the only wildcard language present is a passing mention of "broad selectors such as workspace `**`"
-  with no grammar for it. Asked about earlier this session and, as far as I can tell, never actually
-  specified. Flagging rather than inventing syntax.
-- **`borrow-mut` and in-place field mutation** — see the GAP note under §1; now understood as one
-  combined open item, not two.
-- **Explicit discriminant/`repr` for variants** — not specified, so `WebEvent` above has no `repr`
+From the `timed`/`define-syntax` retirement conversation: a wrapper that forwards to an unknown
+function with its signature unchanged doesn't need `syntax`, `mixin`, or any CTFE machinery — it's
+an ordinary generic higher-order function, the same way D's `alias name = template!(fn);` needs no
+macro either. `F` is monomorphized per instantiation (established for `steal`/`match-type` earlier),
+so `f` is a fully-known, directly-callable value at each concrete use:
+
+```lisp
+(define (require-pkg (name : string)) : void
+  (pkg.ensure name)
+  (svc.enable name))
+
+(define (timed <F> (f : F)) : (fn (...) -> ...)   ; UNVERIFIED: no real function-type return
+  (lambda (...args)                                ; annotation exists anywhere in the document —
+    (let [t (now)]                                 ; same gap flagged for `make-adder` earlier.
+      (let [r (f ...args)]
+        (log-elapsed t)
+        r))))
+
+(define timed-require-pkg (timed require-pkg))   ; ordinary top-level, callable-by-name function —
+                                                    ; define binds a value, a function is a value,
+                                                    ; nothing CTFE-shaped is happening here at all
+```
+
+## 7. Structural rewriting genuinely needs CTFE — and hits a real, still-open gap
+
+The advanced case from the same conversation: not wrapping a call, but inspecting and rewriting a
+function's actual body. Minimal version — prepend one statement rather than "every other line," to
+isolate the actual gap instead of burying it in list-splicing detail:
+
+```lisp
+(define (add-logging (f : syntax)) : syntax
+  (let [spec (function-spec-of f)]                        ; UNVERIFIED/GAP: `function-spec-of` —
+    `(lambda (,@(params->syntax (. spec parameters)))      ; resolve a syntax-carried reference to
+       (log "entering")                                    ; its FunctionSpec — named here for the
+       ,@(. spec body))))                                  ; first time, not previously specified.
+
+(define require-pkg/logged (mixin (add-logging require-pkg)))
+```
+
+**Real gap, exactly the one flagged when `FunctionSpec` was added:** `params->syntax` doesn't exist.
+`FunctionSpec.parameters` is a `ParameterSpec` — structured `ParamEntry` values (name, type,
+ownership mode), deliberately *not* raw syntax, so ordinary code can inspect it without pattern-
+matching a tree. But rebuilding a new lambda's parameter list means going the other direction —
+struct back to syntax — and nothing plays `datum->syntax`'s role for `ParameterSpec` specifically.
+Without it, "keep the original signature, change only the body" cannot be written at all; the CTFE
+function would have to reconstruct each parameter's surface spelling by hand from `ParamEntry`
+fields, which is exactly the "re-invent a piece of the compiler" cost `ParameterSpec` was added to
+avoid in the first place — just moved one step later, from reading a signature to rebuilding one.
+Also unverified in the same example: whether `,@` (splice) is legal against something that isn't a
+literal list already in the source (here, the *result* of calling `params->syntax`) — every real
+`,@` example in the document splices an already-bound list value, so this should be fine, but it's
+worth flagging since it's the first time this file uses `,@` at all.
+
+## 9. Compile-time heterogeneous parameter packs, extended past the document's own sketch
+
+The document's own `render-all`/`sum` examples ("Parameter packs, runtime rest arguments, and C
+varargs") are real, established syntax, but both bodies are just `...` / left empty. Extending
+`render-all` to an actual working body, to test the composition rather than just the declaration
+shape:
+
+```lisp
+(define (render-all <(types Ts...)>
+                    (args : (params (borrow Ts)...))) : string
+  (let [pieces (list)]
+    (ct-foreach ((T arg) args)
+      (set! pieces (append pieces (to-string arg))))
+    (join pieces ", ")))
+
+(render-all 1 "x" true)   ; => "1, x, true" — exact call syntax the document itself shows
+```
+
+**UNVERIFIED, flagged rather than assumed:** `set!`/mutable-local reassignment (`pieces` needs to
+accumulate across pack iterations) isn't established anywhere confirmed in this document either —
+same family of gap as `borrow-mut`/in-place field mutation from §1, now hit from a different angle.
+Whether `ct-foreach`'s body may perform ordinary (non-CTFE) side effects like this at all, or
+whether it's restricted to CTFE-only operations since the pack itself only exists at compile time,
+is also not stated — the document says CTFE "may inspect, slice, destructure, zip, and `foreach`
+over" packs, but doesn't say what an *ordinary* runtime value built up during that iteration is
+allowed to do. `to-string`/`append`/`join`/`list` are also invented for this example — plausible
+stdlib names, not confirmed against anything.
+
+No gap in the pack mechanics themselves: `<(types Ts...)>` header placement, `(params (borrow Ts)...)`
+as the pack-typed parameter, and the call syntax `(render-all 1 "x" true)` all match the document's
+own real example exactly — extending the body is what surfaced the *next* layer of gaps (mutable
+locals, CTFE-vs-runtime boundary inside a `ct-foreach` body), not a problem with the pack feature
+itself.
+
+## 10. Open gaps, current as of this pass — what's still missing and why
+
+- **Capability requests with wildcarded paths** (`read{path="~/**"}`) — still ungrammared; unchanged
+  since first flagged.
+- **`borrow-mut` and in-place field mutation** — one combined open item (§1); a mutable-borrow
+  keyword with nothing legal to write through it once you have one is half a feature.
+- **Explicit discriminant/`repr` for variants** — not specified, so `WebEvent` (§4) has no `repr`
   clause.
-- **Variadic/parameter-pack example** (`types Ts...`, `params ps...`, `rest<T>`) — not attempted yet;
-  next candidate once a real generic-header CoLisp example resolves the §2 UNVERIFIED note, since a
-  variadic-forwarding constructor is exactly where packs and generic headers meet.
+- **`ParameterSpec -> syntax` reconstruction** (§7, new this pass) — needed to rebuild a signature
+  from its introspected form; without it, "same signature, different body" CTFE can't be written.
+  This is the concrete, load-bearing case; §1's `borrow-mut` is the other half of the same family
+  (a capability with no way to act on what it gives you).
+- **`function-spec-of`, or whatever resolves a captured `syntax` reference to its `FunctionSpec`**
+  (§7, new this pass) — named here for the first time; the document establishes the two-step
+  resolve-then-`require` *pattern* but never names the actual entry point a CTFE body would call.
+- **Mutable locals** (`set!` or equivalent, §9, new this pass) — hit from a different angle than
+  §1's field mutation: accumulating a value across a `ct-foreach` pack iteration needs *some* local
+  reassignment primitive, and none is established. Possibly the same underlying gap as `borrow-mut`,
+  possibly a separate, narrower one (a local isn't behind a borrow) — not resolved either way.
+- **Whether ordinary runtime side effects are permitted inside a `ct-foreach` body at all** (§9, new
+  this pass) — the document says CTFE may inspect/slice/`foreach` a pack, but not whether the loop
+  body itself runs as ordinary code (with ordinary effects) or is restricted to CTFE-only operations
+  the way the pack's own existence is compile-time-only.

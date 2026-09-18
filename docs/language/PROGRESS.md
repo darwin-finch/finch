@@ -537,3 +537,36 @@ per-tag argument shapes checked by nothing, versus distinctly-named, properly-ty
 hook — the same "named forms over one stringly-dispatched mega-form" fix already applied to
 `get`/`set`/`constructor` earlier this session. The actual hook catalog (what specific compiler
 queries exist) is still unscoped — this pass only settled the general mechanism.
+
+**Continued 2026-09-18 (Shammah asleep, working solo per his instruction: "play with the spec and
+writing programs in this system, discover any holes, iterate on that repeatedly") — four new
+`feature_tour.md` sections, each surfacing a real gap by writing a real program against it rather
+than by re-reading prose:**
+
+- **§6/§7 — the simple-vs-advanced CTFE split from tonight's conversation, both actually written
+  out.** §6: the ordinary-generics `timed` wrapper (no CTFE, matches D's `alias name = template!(fn)`
+  precedent) — composes cleanly. §7: the genuinely-needs-CTFE case (rewrite a body, keep the
+  signature) — hits a real wall and stops there rather than inventing past it: rebuilding a new
+  lambda's parameter list from an introspected `ParameterSpec` needs a `ParameterSpec -> syntax`
+  operation that was flagged as missing when `FunctionSpec` was added but never named or built.
+  Also named, for the first time, a second small gap the same example needed and glossed over
+  earlier: resolving a captured `syntax` reference to its `FunctionSpec` needs an actual entry-point
+  function (called `function-spec-of` here, illustratively) — the document establishes the
+  resolve-then-`require` *pattern* but never names the thing a CTFE body would actually call.
+- **§9 — extended the document's own `render-all`/`sum` parameter-pack examples past their `...`
+  placeholder bodies**, to test composition rather than just the declaration shape. The pack
+  mechanics themselves (`<(types Ts...)>` header, `(params (borrow Ts)...)`, the exact call syntax)
+  all held up with zero changes needed — real, solid, already-correct spec text. Extending to an
+  actual working body surfaced two gaps one layer further in: no established mutable-local
+  primitive (`set!` or equivalent) to accumulate a value across pack iterations, and no statement
+  about whether a `ct-foreach` body runs as ordinary code with ordinary effects or is restricted to
+  CTFE-only operations the way the pack's own existence already is.
+- **Also resolved, partially, an old UNVERIFIED note from §2**: generic-header *placement* (`<...>`
+  right after the function name) is now confirmed against `render-all`'s real, established example —
+  cross-referenced and fixed in place rather than left stale. What's still a guess is narrower than
+  before: only the spelling of an *ordinary* (non-pack) bound inside that header, e.g. `<O>` vs.
+  `<O : Owner<Foo>>`, for a hand-written generic — the placement question itself is closed.
+- **Pattern holding up across all of this**: every real gap found this pass was found by writing an
+  actual, complete program and hitting a wall partway through — never by auditing prose in isolation.
+  The two newest gaps (`ParameterSpec -> syntax`, `function-spec-of`) are both direct, foreseeable
+  consequences of `FunctionSpec` added earlier tonight — expected follow-on work, not new surprises.
