@@ -1381,7 +1381,12 @@ mod isolation_tests {
         );
     }
 
-    const HOSTILE_MODE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    // Coarse liveness bound, not a latency assertion: the child performs a
+    // full nested proof-rejection while sibling tests hash supervisor images
+    // on the same cores, so a tight deadline flaked on loaded runners (#476).
+    // What the test asserts is rejection and group reclamation, which hold at
+    // any speed.
+    const HOSTILE_MODE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
     const HOSTILE_MODE_STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
     const HOSTILE_MODE_OUTPUT_LIMIT: usize = 64 * 1024;
     const HOSTILE_MODE_READY_ENV: &str = "FINCH_TEST_HOSTILE_MODE_READY";

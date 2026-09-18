@@ -20,7 +20,10 @@ on:
       - 'src/server/**'
       - 'src/client/daemon_client.rs'
       - 'src/cli/repl_event/brain_handler.rs'
-      - 'scripts/**'
+      - 'scripts/test_brains.sh'
+      - 'scripts/test_brain_isolation.sh'
+      - 'scripts/with-cargo-slot'
+      - 'scripts/test-with-cargo-slot'
       - 'tests/**'
       - 'docs/AUTOMATIC_TRAINING.md'
       - 'docs/DEVELOPMENT.md'
@@ -41,7 +44,10 @@ on:
       - 'src/server/**'
       - 'src/client/daemon_client.rs'
       - 'src/cli/repl_event/brain_handler.rs'
-      - 'scripts/**'
+      - 'scripts/test_brains.sh'
+      - 'scripts/test_brain_isolation.sh'
+      - 'scripts/with-cargo-slot'
+      - 'scripts/test-with-cargo-slot'
       - 'tests/**'
       - 'docs/AUTOMATIC_TRAINING.md'
       - 'docs/DEVELOPMENT.md'
@@ -165,6 +171,9 @@ jobs:
 
   isolation-boundaries-macos:
     name: Isolation boundaries (macos-14)
+    # Not a pull-request gate (#518 throughput work): trusted main, weekly, and
+    # on demand only. Breakage is reported by the main breakage filer.
+    if: github.event_name != 'pull_request'
     runs-on: macos-14
     timeout-minutes: 120
     env:
