@@ -2623,17 +2623,27 @@ concept. Two distinct needs were bundled under that gap and get different answer
 - **Standard, generic-integrable conversion between types** is the real gap, and the fix is a
   `From<T>`/`Into<T>` concept pair — the same explicit-evidence mechanism as every other concept in
   this document, so generic code can bound on it (`fn f<T>(x : impl Into<T>)`-shaped) the same way it
-  bounds on `Owner<T>` or `Equal<L,R>`. Conversion is always an explicit call (`Foo::from(x)` or
-  `x.into()`); it is never invoked because a parameter's declared type happens to match, the way a
-  C++ converting constructor fires. An automatic-invocation form was considered and rejected for the
-  reasons already established elsewhere in this section: it would hide a real, possibly-failing,
-  possibly-allocating operation behind no syntax at the call site (the same hidden-cost pattern
-  "Scripting ergonomics with a systems cost model" forbids everywhere else), and if more than one
-  `From<T>` could apply, "which one fires" needs a resolution algorithm — the same speculative
-  overload-resolution shape already rejected for the `borrow`/`steal` shorthand, `match-type`, and
-  general function overloads. `Unique<T>` → `Shared<T>` above is the concrete instance of this rule:
-  `share(...)` is an ordinary explicit call, not an implicit conversion fired by a `Shared<T>`-typed
-  parameter, for exactly the same reason.
+  bounds on `Owner<T>` or `Equal<L,R>`. Conversion is an explicit call (`Foo::from(x)` or `x.into()`)
+  by default, never invoked merely because a parameter's declared type happens to match.
+
+**Revised 2026-09-17: bounded, compiler-checked implicit conversion, not blanket implicit
+invocation.** A blanket form — any `From<T>` firing automatically wherever a type mismatches — was
+considered and rejected: it hides a real, possibly-failing, possibly-allocating operation behind no
+call-site syntax, and if more than one `From<T>` could apply, "which one fires" needs a resolution
+algorithm, the same speculative shape already rejected for the `borrow`/`steal` shorthand,
+`match-type`, and general function overloads. But a narrower, explicitly marked form doesn't have
+either problem, and is worth having: a `From<T>` implementation may be declared `implicit` only when
+the compiler's own effect/purity inference proves it satisfies the same bar already required of every
+other automatic adaptation in this document ("Scripting ergonomics with a systems cost model" above:
+`nothrow`, non-suspending, no new allocation, no authority acquisition) — the same certified-not-
+merely-asserted discipline already required of algebraic law declarations ("an unchecked declaration
+is never an optimizer certificate"). `implicit` on an implementation that doesn't verify is a compile
+error, not a keyword the author's word alone makes true. At most one *direct*, non-chained implicit
+conversion may apply at any call site — the same "at most one implementation for a concept/type
+tuple may be the operator default in a scope" rule already governing operators above; zero or
+multiple candidates requires the explicit call, never a ranking between them. `Unique<T>` →
+`Shared<T>` stays an ordinary explicit `share(...)` call regardless, since establishing shared
+ownership sets up real refcount bookkeeping and does not verify as free.
 
 Core safe memory management requires no tracing garbage collector. Frame ownership, moves,
 explicit unique/shared carriers, deterministic drop, and bounded borrow analysis provide the
