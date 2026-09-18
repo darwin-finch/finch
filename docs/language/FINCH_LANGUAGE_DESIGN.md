@@ -895,6 +895,30 @@ explicit policies. Hashing streams the same logical bytes across chunk boundarie
 segmented text values hash identically. Immutable views with proven identical owner/range identity
 may short-circuit before reading bytes.
 
+**Added 2026-09-17: identity comparison is a distinct, separately named operation from `==`.**
+`Equal<L,R>` above answers "do these have the same content"; "do these two borrows refer to the
+exact same storage" is a different relation and gets its own name rather than overloading `==`'s
+meaning by context — the same discipline already applied to keeping `Equivalence<T>` and `HashKey<T>`
+distinct from ordinary `Equal<T,T>`. `same-address` compares two *borrows* (`scoped &T`), not owners
+directly, because a borrow's address is guaranteed stable for the duration of that borrow ("Every
+`Owner<T>` keeps the pointee valid and at one address for the duration of each active borrow,"
+"Library ownership carriers...") regardless of whether the owner itself provides the stronger, rarer
+`StableAddressOwner<T>` — the comparison is sound within that active window either way.
+
+```text
+CoLisp:   (same-address (borrow a) (borrow b))
+Co-Forth: a borrow b borrow same-address
+```
+
+Two owned `string` values with identical content are `==` but never `same-address`, unless one is
+actually a view derived from the other's storage (a substring, a shared rope chunk) — an
+independently constructed owned value has its own storage by definition, so asking whether it is
+"the same object" as another independently constructed value of equal content is a coherent
+question with a definite, usually-false answer, not a meaningless one. `same-address` never exposes
+the address itself as an integer or raw pointer — that remains behind the `unsafe` boundary
+("Safe-code boundary, subtyping, and variance"); it only answers the one safe boolean question two
+borrows can pose.
+
 For other sequences, a certified `BytewiseEqual<T>` property permits bulk comparison of contiguous
 regions only when every bit pattern and padding rule makes that operation semantically equivalent to
 element equality. Otherwise comparison invokes element evidence. Arrays with incompatible static
@@ -2065,6 +2089,39 @@ call is not the same as an implicit adaptation silently erasing static evidence,
 the program can observe or do. `dyn Owner<Foo>` remains available, but now as an explicit *semantic*
 choice — a programmer specifically wants one erased, storable-heterogeneously carrier type, not "the
 compiler picked erasure for me."
+
+**Added 2026-09-17: a generic body can ask which concrete carrier it received, without a second
+declaration.** The `Owner<Foo>` bound only exposes `borrow`, so a body written against it alone
+cannot call `get-mut`, `retain`, or anything specific to a stronger concept — that's deliberate
+(above), but it would be a real gap if there were no way to ask "which concrete `O` did I actually
+get" when the body genuinely needs to branch on it (a debug/logging path that reports "retained
+`Shared`" versus "moved `Unique`", say). `match-type` answers this at the same CTFE stage ordinary
+`if` already resolves a compile-time-constant condition: each arm is checked only against its
+concrete type for that specific instantiation, and within an arm the generic binding narrows from
+`Owner<Foo>` to the matched concrete type, unlocking that type's full operation set for the rest of
+the arm — this is why `get-mut` becomes callable inside the `Shared<Foo>` arm and not outside it.
+
+```text
+CoLisp:   (match-type O
+            (Unique<Foo> ...)
+            (Shared<Foo> ... (get-mut x) ...)
+            (_ ...))
+Co-Forth: O ct:type-case
+            Unique<Foo> of ... endof
+            Shared<Foo> of ... (x get-mut) ... endof
+            otherwise ... ct:endcase
+```
+
+This is deliberately *not* a second, separately declared specialization competing with the generic
+body — there is exactly one definition, so there is nothing for automatic per-instantiation codegen
+to conflict with: each concrete `O` still gets its own compiled body or shares evidence-passing IR
+exactly as an optimizer decision already permits, `match-type`'s arms just make that one body's
+checked semantics differ correctly per instantiation. A separate "manually specialize this generic
+for `Shared<Foo>`" declaration was considered and rejected for the same reason classic overloading
+was: it would mean two independently authored bodies under one name, needing a resolution rule
+between them — exactly the speculative-body-compilation risk "Operators, comparison evidence, and
+segmented text" already rules out for a different mechanism. One body, CTFE-branched, keeps the
+same deterministic-resolution property this whole design has held everywhere else.
 
 **Revised again, 2026-09-17: there is no separate `static Owner<Foo>` spelling.** An earlier revision
 kept it as an optional explicit form "for a reader who wants representation stated at a glance," but
