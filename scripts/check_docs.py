@@ -316,9 +316,10 @@ RUST_FIELD = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?([a-z_][a-z0-9_]*)\s*:", 
 
 
 def defined_identifiers(root: Path) -> set[str]:
-    """Every name `src/` and `tests/` define, as items or as struct fields."""
+    """Every name the workspace Rust sources define, as items or as struct fields."""
     names: set[str] = set()
-    for directory in ("src", "tests"):
+    directories = ["src", "tests", *sorted(str(p) for p in (root / "crates").glob("*"))]
+    for directory in directories:
         for path in (root / directory).rglob("*.rs"):
             text = path.read_text(errors="replace")
             names.update(RUST_DEFINITION.findall(text))
