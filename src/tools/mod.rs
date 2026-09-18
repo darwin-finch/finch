@@ -3,6 +3,7 @@
 // Enables Shammah to execute tools (WebFetch, Bash, Read, etc.) locally
 // instead of only generating text responses.
 
+mod diagnostics;
 mod executor;
 mod implementations;
 mod mcp;

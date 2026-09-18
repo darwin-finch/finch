@@ -9,7 +9,13 @@ local tool implementations. Connecting to external Model Context Protocol server
 is the nested [`mcp`](mcp/AGENTS.md) capsule. The background command tools
 (`background_bash`, `background_poll`, `background_stop`, issue #754) are thin
 siblings of bash over the brain-owned `BackgroundTaskManager` lifecycle; the
-task records and process ownership live in `src/brain`, not here.
+task records and process ownership live in `src/brain`, not here. The
+post-edit diagnostics service (`diagnostics/`, issue #757) annotates completed
+write/edit/patch results with bounded output from a check command the user
+declared in `[diagnostics]` config — nothing is inferred, and the declared
+command's authority verdict is read from the existing bash approval path
+(`PermissionManager::check_tool_use("bash", …)`), so it never runs where bash
+would not.
 
 **ToolLoop is the single execution lifecycle.** REPL and scheduler drive it.
 Generators and provider adapters never import or invoke `ToolExecutor`.

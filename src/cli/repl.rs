@@ -299,6 +299,7 @@ mod disabled_training_tests {
                 embedding_cache_dir: temp.path().join("embedding-cache"),
             },
             license: crate::config::LicenseConfig::default(),
+            diagnostics: crate::config::DiagnosticsConfig::default(),
         };
         let metrics = MetricsLogger::new(config.metrics_dir.clone()).unwrap();
         let router = Router::new(crate::models::ThresholdRouter::default());
@@ -1067,7 +1068,12 @@ impl Repl {
         // timed so that stops being invisible the moment one is (#364).
         let mcp_phase = crate::startup::phase(crate::startup::PHASE_MCP_CONNECT);
         let configured_servers = config.mcp_servers.len() as u64;
-        let executor = executor.with_mcp(&config).await;
+        let executor = executor
+            .with_mcp(&config)
+            .await
+            // Declared post-edit diagnostics sources (issue #757). Inert
+            // without a [diagnostics] declaration.
+            .with_diagnostics(&config.diagnostics);
         // Servers that actually answered, not servers that were configured.
         // Five configured servers that all failed reported `count=5`, which
         // reads as five connections (#364).

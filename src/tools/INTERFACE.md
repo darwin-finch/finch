@@ -379,6 +379,8 @@ impl ToolExecutor {
     pub fn save_if_dirty(&mut self) -> Result<()>;
     /// Save patterns to disk if modified
     pub fn save_patterns(&mut self) -> Result<()>;
+    /// Attach declared post-edit diagnostics sources (issue #757).
+    pub fn with_diagnostics(mut self, config: &crate::config::DiagnosticsConfig) -> Self;
 }
 /// JSON Schema for tool input parameters Re-exported from `finch-providers`.
 pub struct ToolInputSchema { … }
