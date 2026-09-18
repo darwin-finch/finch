@@ -329,3 +329,48 @@ rather than pseudocode, both now logged rather than guessed past:
 None of these three are fixed yet — they're the next things to resolve, in that order, since the
 constructor/operation call-site question blocks writing any further inherent-implementation example
 cleanly.
+
+**Continued 2026-09-17 — a live design conversation with Shammah about surface aesthetics ended in a
+real, shipped syntax change: `let`/binding lists now use `[...]`, not doubled `(( ))`.**
+
+- **Path here:** Shammah said plainly he's more drawn to C-family syntax than Lisp's, specifically
+  citing "extra `()`s everywhere and no distinguishing blocks from tuples" and noting the type system
+  already compromises pure homoiconicity, so treating uniform-parens as untouchable was inconsistent.
+  Landed on Clojure's bracket-variety convention (`[]` for sequences/bindings, distinct from `()` for
+  calls) rather than a full C-syntax rewrite — real, heavily-trained-on precedent, not invented
+  syntax, which matters given the explicit LLM-usability constraint Shammah added mid-discussion.
+- **Naming-convention side-thread, same conversation, resolved differently than first proposed:**
+  considered a hard PascalCase-types/PascalCase-methods/camelCase-locals rule (real .NET convention).
+  Shammah's gut reaction to `Account.Open()` was right — revised to PascalCase-types/camelCase-
+  everything-else, which is actually *more* universal (Java/JS/TS/Swift/Kotlin agree; C#'s
+  PascalCase-methods is the outlier) and simpler (two buckets, not three). Not yet written into the
+  spec — this session's actual syntax work stayed on brackets; casing is still open.
+- **Real collision caught against shipped code before committing to `[]`:** `reader.rs` already
+  treats `[...]` as an unconditional JSON-array span parsed by `serde_json`. Resolved as Shammah
+  proposed once the shape was checked — `[...]` is a strict superset of JSON-array syntax: content
+  that parses as valid JSON is a JSON literal exactly as today (handled by the JSON sub-parser,
+  untouched); content that doesn't falls back to ordinary form-by-form Lisp reading, the same
+  tokenizer `(...)` already uses. Every JSON scalar already had an existing Lisp-atom reading in this
+  reader (`true`/`false` already aliased to `#t`/`#f`, `null` to `nil`), so JSON is genuinely a
+  subset, not a second case needing separate fallback logic.
+- **Self-caught error, same day, same addition:** the first version of this rule said `,` becomes "an
+  insignificant separator... inside `[...]` specifically." Checking that against this document's own
+  quasiquote example (`` `(let [r ,body] ...) ``, in "Definitions and signatures") shows it's wrong —
+  `,body` is load-bearing unquote there, and that example already lives inside a `[...]` binding
+  vector. Corrected: comma is never blanket-optional; a `[...]` span is either fully valid JSON
+  (comma is JSON's own separator, a different sub-parser entirely) or it isn't (comma keeps its one
+  existing, unconditional meaning as unquote, exactly as everywhere else) — never a blend of both
+  rules in one span. Caught by Shammah asking "could `,` be optional in a list?" before the rule was
+  ever exercised against a real example rather than after.
+- **Executed, not just decided:** every `let` in `FINCH_LANGUAGE_DESIGN.md` (13 occurrences) and
+  `feature_tour.md` (5, including one multi-binding case) converted from `(let ((n 10)) ...)` to
+  `(let [n 10] ...)` / `(let [a 1 b 2] ...)`. Also closed a real, separate, previously-unfound gap
+  while writing the rule: no CoLisp tuple *construction* literal existed anywhere before this —
+  `[1 2 3]` now constructs `tuple<int,int,int>`, the same `[...]` form used positionally.
+- **Not yet done:** the same nested-list problem exists in parameter lists (`(square (x : int))` —
+  list-of-one-list for a single parameter, for the same structural reason `let` had it). Diagnosed in
+  conversation — the fix isn't a straight copy of `let`'s, since parameter entries have variable
+  token count (an optional ownership keyword) unlike `let`'s always-exactly-two-forms bindings, so
+  full flattening would be ambiguous. The proposed fix instead re-brackets only the outer list to
+  `[...]`, keeping each parameter's own `(...)` grouping: `(define (square [(x : int)]) : int ...)`.
+  Proposed, not yet written into the spec or applied to existing examples — pending confirmation.

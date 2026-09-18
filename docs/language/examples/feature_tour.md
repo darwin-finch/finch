@@ -16,6 +16,12 @@ S-expression the body is simply whatever forms remain. Record construction was a
 first pass — `Foo { x: a, y: b }` is Co-Forth's spelling; CoLisp's is `(Foo :x a :y b)` per the
 parity ledger. Rewritten throughout below.
 
+**Updated 2026-09-17: `let` bindings now use `[...]`, not doubled `(( ))`.** `[n 10]` for one
+binding, `[a 1 b 2]` for several — flat, Clojure-style, never nested pairs. `[...]`'s grammar is a
+strict superset of the JSON-array syntax it already handled, so this needed no new bracket and
+changes nothing about existing JSON literals — see the "binding lists... use `[...]`" addition in
+`FINCH_LANGUAGE_DESIGN.md`.
+
 ## 1. Records, construction, properties
 
 ```lisp
@@ -32,7 +38,7 @@ parity ledger. Rewritten throughout below.
     ; `self` is an ordinary parameter — unannotated defaults to `borrow`, same as every other
     ; parameter. No new receiver notation needed for a read-only accessor.
 
-(let ((a (Account.open "acct-1")))
+(let [a (Account.open "acct-1")]
   (assert-eq (. a balance) 0))   ; `get balance` is defined to resolve through `.` exactly like a plain field
 ```
 
@@ -69,7 +75,7 @@ implementation AccountDescribable for Account : Describable {
   (operation (describe (self)) : string             ; inherent — same name as the concept operation
     (format "Account #{} (balance {})" (. self id) (. self balance))))
 
-(let ((a (Account.open "acct-2")))
+(let [a (Account.open "acct-2")]
   (assert-eq (Account.describe a) "Account #acct-2 (balance 0)"))  ; inherent wins — shadowed, not ambiguous
 ```
 
@@ -94,12 +100,11 @@ reaches — same hazard Rust accepts for inherent-vs-trait methods, inherited de
     (Shared<Foo> (retain x) "shared, retained a handle")      ; a parameter already in scope, never shows
     (_ "some other owner")))                                  ; the enclosing signature that bound it.
 
-(let ((u (Unique.new (Foo.default)))
-      (s (Shared.new (Foo.default))))
+(let [u (Unique.new (Foo.default)) s (Shared.new (Foo.default))]
   (describe u)                        ; borrow, non-escaping — u still owns after this call
   (log-carrier (steal u))             ; ownership transferred; u is dead from here on
   (log-carrier (steal s))             ; Shared's steal just moves the handle, not the payload
-  (let ((w (Shared.downgrade s)))
+  (let [w (Shared.downgrade s)]
     (match (Weak.upgrade w)
       (ok s2 (assert-eq (log-carrier (steal s2)) "shared, retained a handle"))
       (err _ (panic "unreachable: s is still alive")))))
@@ -127,7 +132,7 @@ implementation UserJson for User : JsonSerializable {
 
 (define (save-user (u : User) (opts : borrow JsonOptions)) : (result unit IoError)
   ! throws IoError
-  (let ((bytes (serialize u opts)))          ; bare-name concept dispatch + one default-imported evidence,
+  (let [bytes (serialize u opts)]          ; bare-name concept dispatch + one default-imported evidence,
     (? (fs-write "user.json" bytes))         ; per "Every implementation has a stable qualified name..." —
     (ok unit)))                              ; NOT `Type.operation`; `using UserJson` would disambiguate
 

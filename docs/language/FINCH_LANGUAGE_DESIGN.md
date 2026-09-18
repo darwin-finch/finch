@@ -2029,10 +2029,56 @@ Lexically nested record declarations are context-free and never gain a hidden ou
 enclosing-frame field merely because of their declaration location; required context must be an
 explicit field or closure capture.
 
+**Added 2026-09-17: binding lists (`let`, and any construct that introduces several names at once)
+use `[...]`, not doubled `(( ))` — one flat, Clojure-style vector, never nested pairs.** The doubled
+form existed only because `()` was the sole bracket available, and `()` cannot look different for
+"this is a list of bindings" versus "this is a call" — the same visual-overload complaint this
+document already has for records before they got their own `{...}`. The production CoLisp reader
+already tokenizes `[` and `]` as their own token, distinct from `(`/`)` — currently reserved for a
+JSON-array literal, parsed by handing the whole bracket-balanced span to a strict JSON parser. Rather
+than add a fourth bracket or make `[` mean different things in different positions (both considered
+and rejected — a position-dependent meaning reintroduces the exact "know where you are to know what
+this means" cost bracket-variety exists to remove), `[...]`'s grammar is extended, not replaced: it
+is a **strict superset of JSON-array syntax**. Content that parses as valid JSON is a JSON literal,
+exactly as today — that whole span is handed to the JSON sub-parser, where `,` is JSON's own
+mandatory element separator and never touches the Lisp reader at all. Content that doesn't parse as
+JSON is read the *other* way, the same way `(...)`'s contents already are, form by form, using the
+ordinary tokenizer — and there, `,` keeps its one existing, unconditional meaning as unquote sugar,
+exactly as everywhere else in this document, with no exception carved out for being inside `[...]`.
+
+**Corrected 2026-09-17, same addition, caught immediately by asking whether `,` could just be
+optional in any list:** an earlier draft of this paragraph said comma becomes "an insignificant
+separator alongside whitespace *inside* `[...]` specifically" — checking that against this
+document's own quasiquote example a few sections down (`` `(let [r ,body] ...) ``) shows it's wrong:
+`,body` there is load-bearing unquote, splicing the macro's actual argument into generated code, and
+that example lives inside a `[...]` binding vector. If comma became blanket-insignificant inside
+`[...]`, `,body` would silently stop unquoting and instead bind `r` to the literal symbol `body` —
+exactly the "typo silently produces a different, still-valid program" failure mode found earlier with
+`ReturnType!`, just self-inflicted this time. There is no in-between mode where a `[...]` span is
+simultaneously "comma-optional" and "comma-still-means-unquote": it's one or the other, decided
+per-span by which sub-parser actually accepts it, never a blend. Comma is never optional in the
+general sense the question asked — it's exactly as meaningful inside `[...]` as everywhere else,
+right up until the moment the whole span happens to also be valid JSON, at which point a completely
+separate parser with its own, unrelated comma rules takes over the string, not the Lisp reader
+loosening its rule.
+
+This works cleanly because every JSON scalar already has an existing Lisp-atom reading in this
+reader — numbers, strings, `true`/`false` (already aliased to `#t`/`#f`), and `null` (already
+aliased to `nil`, per `parse_atom`) — so nothing JSON can express falls outside what ordinary
+atom-reading already covers; JSON is genuinely a subset, not a separate case needing its own
+fallback logic. A binding list is exactly this general sequence form, used in binding position: flat,
+alternating name/value entries — `[n 10]` for one binding, `[a 1 b 2]` for several — never a nested
+`((n 10))` pair-of-pairs.
+
+**Also closes a real, separate gap while it's here:** no CoLisp tuple *construction* literal existed
+anywhere in this document (only the `tuple<T...>` type). It's the same `[...]` form used
+positionally as a value rather than a binding list — `[1 2 3]` constructs a `tuple<int,int,int>`.
+Flagging this as new rather than found, since nothing else in the document confirms it.
+
 For example, this Lisp:
 
 ```lisp
-(let ((n 10))
+(let [n 10]
   ((lambda ((x : int)) (+ x n)) 5))
 ```
 
@@ -2493,7 +2539,7 @@ The call site does not need a ceremonial `move` marker when the parameter alread
 
 ```lisp
 (begin
-  (let ((foo (Foo ...)))
+  (let [foo (Foo ...)]
     (retain foo)
     (inspect foo))) ; error: foo was moved by the preceding stealing call
 ```
@@ -2705,7 +2751,7 @@ Two ways Finch code actually handles this, and when each is the right one:
    (define (pick-longer (x : string) (y : string)) : bool
      (> (length x) (length y)))
    ; caller:
-   (let ((winner (if (pick-longer a b) a b))) ...) ; ordinary borrow, traceable to exactly one of a, b
+   (let [winner (if (pick-longer a b) a b)] ...) ; ordinary borrow, traceable to exactly one of a, b
    ```
    The helper never touches ownership at all; the caller does the actual borrow itself, at the point
    where "exactly one input owner" is trivially satisfiable, because by then the branch has already
@@ -2863,12 +2909,12 @@ to standard-library carrier/allocator constructors; they do not give those types
 layouts:
 
 ```lisp
-(let ((local (Foo ...))) ...)
-(let ((unique-foo (new Foo ...))) ...)                    ; unique is the default heap policy, no keyword needed
-(let ((unique-foo-explicit (new unique Foo ...))) ...)    ; equivalent, spelled out
-(let ((shared-foo (new shared Foo ...))) ...)
-(let ((promoted (share local))) ...)                      ; allocates shared storage and moves local
-(let ((promoted-unique (share unique-foo))) ...)          ; moves an existing Unique<Foo> into Shared<Foo>
+(let [local (Foo ...)] ...)
+(let [unique-foo (new Foo ...)] ...)                    ; unique is the default heap policy, no keyword needed
+(let [unique-foo-explicit (new unique Foo ...)] ...)    ; equivalent, spelled out
+(let [shared-foo (new shared Foo ...)] ...)
+(let [promoted (share local)] ...)                      ; allocates shared storage and moves local
+(let [promoted-unique (share unique-foo)] ...)          ; moves an existing Unique<Foo> into Shared<Foo>
 ```
 
 **Revised 2026-09-17:** `new` alone means `new unique` — unique is already stated as the default
@@ -3415,9 +3461,9 @@ bindings, then a body whose **value** is the result (typically a quasiquoted lis
   (svc.enable name))
 
 (define (expand-timed (form : syntax)) : syntax
-  (let ((body (second form)))
-    `(let ((t (now)))
-       (let ((r ,body))
+  (let [body (second form)]
+    `(let [t (now)]
+       (let [r ,body]
          (log-elapsed t)
          r))))
 
@@ -4382,7 +4428,7 @@ Conceptually, both frontends construct the same `TestDeclaration` and `TestSuite
 ```lisp
 (test-suite "JSON parser"
   (test "rejects trailing input" (ctx)
-    (let ((actual (json/parse "{} junk")))
+    (let [actual (json/parse "{} junk")]
       (expect ctx actual (matches (err (TrailingInput _)))))))
 ```
 
