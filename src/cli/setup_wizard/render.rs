@@ -913,6 +913,9 @@ fn features_section_content(
     // `start` only ever advances toward the selection, so a selected group
     // taller than the whole budget converges (its name line shows at the
     // window's head) instead of oscillating.
+    // macOS-only: `show_gui_details` and the compact status box exist only
+    // there; elsewhere the list budget simply keeps the extra rows.
+    #[cfg(target_os = "macos")]
     let compact_extra: usize = if show_gui_details {
         2 + compact_rows
             .iter()
@@ -921,6 +924,8 @@ fn features_section_content(
     } else {
         0
     };
+    #[cfg(not(target_os = "macos"))]
+    let compact_extra: usize = 0;
     let list_budget = section_rows
         .saturating_sub(1) // title
         .saturating_sub(2) // options box borders
