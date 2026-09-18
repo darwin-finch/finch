@@ -2085,6 +2085,35 @@ kind to an ordinary parameter borrows through the owner without transferring or 
 explicit move of a shared handle may transfer that handle without incrementing its count and then
 invalidates the source. Temporaries transfer directly because no source binding can be reused.
 
+**Clarified 2026-09-17: a plain owned record moves under `take`, it does not copy, unless it is
+explicitly `Copy`.** Copyability is an explicit property of a type ("Library ownership carriers and
+the compiler lifecycle kernel"), and a plain `T`'s intrinsic `Owner<T>` evidence provides only
+`borrow`, not `retain` — `retain` belongs to `ShareableOwner<T>`, which ordinary records do not
+implement. An ordinary record therefore behaves exactly like `Unique<T>` under `take`: moved, source
+invalidated. It copies only if the type is declared `Copy` — the same rule `consume-value` already
+uses for scalars above. Silently copying an arbitrary, possibly large record on every `take` call
+would itself be the hidden-cost violation "Scripting ergonomics with a systems cost model" forbids.
+
+**Moving a stack-owned value through or up the call stack never requires heap promotion.** This is a
+static, calling-convention concern, not a runtime or GC-like decision: the destination frame's slot
+is known from the call graph at compile time, so a moved value is constructed or relocated directly
+into it — the same mechanism as ordinary guaranteed return-value construction, however many frames
+it passes through. It never needs an address that outlives every frame on the current call stack, so
+nothing needs promoting. A value that genuinely needs indefinite (heap-like) lifetime — stored in a
+collection, captured by an escaping closure, placed in persistent state — is a different case,
+already covered above and in "Closure conversion and capture ownership": escaping without already
+being behind `Unique<T>`/`Shared<T>` is a compile error suggesting the fix, never a silent
+promotion, for the same cost-visibility reason.
+
+**`borrow-mut` does not get the `borrow`/`take` shorthand above, and should not.** `Shared<T>`
+cannot unconditionally provide `&mut T` — only conditionally, through the fallible `get-mut` above,
+which can fail. There is no `MutableOwner<T>`-shaped concept in the hierarchy a generic `borrow-mut
+x: Foo` could soundly bind against, because `Shared<T>` would have to fail to satisfy it
+unconditionally, which an ordinary concept bound cannot express. `borrow-mut` therefore stays bound
+to carriers that are *structurally* exclusive — a plain frame value or `Unique<T>` — and passing a
+`Shared<T>` to it is a compile error pointing at `get-mut` or `try-into-unique` instead of silently
+picking a carrier or degrading the guarantee.
+
 The transfer is unconditional from the caller's perspective. A callee that conditionally decides
 not to retain a taken value still owns and must drop, return, or transfer it. It cannot make the
 caller's moved state depend on a runtime branch. Control-flow joins track `available`, `borrowed`,
