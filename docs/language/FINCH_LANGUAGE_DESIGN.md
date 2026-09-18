@@ -3434,12 +3434,42 @@ Wrapping two ordinary calls is a **function**, not syntax CTFE. Reach for `synta
 for things like `timed` around a call (no extra `lambda`), `with-lock` introducing bindings
 around a body, or a converge `require` that yields.
 
-**Quote and quasiquote.** `'form` produces `syntax` (data, not evaluated). `` ` `` is a template;
-`,` fills **one** hole with a value (if that value is a list, it stays one nested list); `,@`
-spreads a list’s **elements** into the surrounding quoted list and is legal **only inside**
-quasiquote (the module is code-first, not an implicit template). These operations copy origin and
-expansion ancestry. They never parse source bytes. The current symbol-only `quote` restriction is
-transitional.
+**Revised 2026-09-18: `'` and `` ` `` split bare data from scope-aware syntax, the way Clojure's
+`'`/`` ` `` already do — not "the same value, `` ` `` just also permits holes."** The earlier version
+of this paragraph said both operators produce the identical `syntax` value, differing only in
+whether `,`/`,@` holes are legal. Checked against real precedent rather than kept as a plausible-
+sounding simplification: that's not how any real Lisp with both operators actually splits them.
+Vanilla Scheme's `'` produces a bare, contextless datum — no scope information at all. Racket keeps
+that and adds a genuinely *different* operator, `#'`, for a scope-aware syntax object. Clojure
+folds the richer behavior into its own `` ` `` instead of adding a third operator: `'foo` stays a
+plain, unqualified symbol, while `` `foo `` (syntax-quote) auto-resolves and namespace-qualifies
+symbols and supports auto-gensym for introduced bindings (`x#`) — richer than plain quote even with
+zero unquote holes present. Collapsing `'` and `` ` `` into one behavior, as the previous draft did,
+matches neither model and fights the exact "regular Lisp should just work" goal this document keeps
+returning to: a reader (or model) trained on real Scheme/Racket/Clojure expects `'foo` to be inert.
+
+So, split the same way Clojure already does, reusing the two operators this document already has
+rather than adding a third (`^` or otherwise):
+
+- **`'form` produces a bare datum** — an ordinary, contextless value, no scope marks, no expansion-
+  ancestry tracking. This is what a Lisp-trained reader already expects from plain quote. Because
+  it carries none of `syntax`'s bookkeeping, there is nothing left for a "symbol-only" restriction to
+  stage around — quoting an arbitrary nested structure this way is exactly as simple as quoting a
+  bare symbol, so that earlier transitional restriction does not apply to this operator anymore.
+- **`` ` `` produces `syntax`** — origin, expansion ancestry, and lexical scope marks attached,
+  matching Clojure's syntax-quote (though Finch's scope marks aim at Racket-style fully automatic
+  hygiene, not Clojure's opt-in `#`-suffix gensym — a real, separate choice, not implied by adopting
+  Clojure's operator split). `` ` `` is also still the only place `,`/`,@` holes are legal: `,` fills
+  **one** hole with a value (if that value is a list, it stays one nested list); `,@` spreads a
+  list's **elements** into the surrounding quoted list (the module is code-first, not an implicit
+  template). Richness belongs to the skeleton `` ` `` itself builds, not to whatever lands in a hole:
+  `` `(foo ,bar) `` attaches scope marks to the literal `foo`, but `,bar` splices in whatever `bar`
+  already evaluated to, unchanged — quasiquote doesn't retroactively enrich a spliced-in value.
+
+Neither operator parses source bytes; both only ever operate on syntax already inside the one parse
+boundary. A CTFE function typed to receive `syntax` (like `expand-timed` below) must be handed a
+`` ` ``-produced value, not a `'`-produced one — passing bare data where hygiene-aware syntax is
+required is a type error, the same as passing anything else of the wrong type.
 
 **`mixin` vs `,@`.** `,@` is **array-style splice**: it is legal only inside quasiquote and
 spreads list elements into the quoted list. `(mixin ast)` is **in-place mix-back**: the
@@ -3451,8 +3481,11 @@ not valid as the body of a `define` that is supposed to return a function.
 **`define` vs `define-syntax`.** `define` / `lambda` bind a **value** (a function is a value).
 `define-syntax` **registers** a `syntax -> syntax` CTFE function in the expander: arguments are
 not evaluated; `(timed (require-pkg name))` compiles as
-`(mixin (expand-timed '(timed (require-pkg name))))`. Without `define-syntax`, the transformer
-is an ordinary function and the caller must quote. `let` in a transformer is an expression:
+`` (mixin (expand-timed `(timed (require-pkg name)))) ``. Without `define-syntax`, the transformer
+is an ordinary function and the caller must quasiquote — `expand-timed` takes `syntax`, and plain
+`'` no longer produces that (see "quote and quasiquote," above); this is exactly the site the
+`'`/`` ` `` split above changes, caught by checking every existing use of plain quote in this
+document before writing the split in. `let` in a transformer is an expression:
 bindings, then a body whose **value** is the result (typically a quasiquoted list).
 
 ```

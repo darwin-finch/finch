@@ -406,3 +406,36 @@ was wrong, reverted before committing, and shipped a different, real addition in
   quasiquote allows `,`/`,@` holes and quote doesn't. Also corrected my own earlier answer in this
   same conversation, which had described a quoted parameter form as "a flat list of symbols" — that
   describes `syntax->datum`'s explicit, lossy output, not the default `syntax` value.
+
+**Continued 2026-09-18 — that "quote and quasiquote produce the same value" claim from the previous
+entry was itself wrong, caught by Shammah asking a pointed enough question about it, and reversed.**
+
+- **Path here:** a long CTFE/macro-hygiene design conversation (how does a CTFE function resolve a
+  quoted identifier passed through several layers of compile-time function calls; why that's not
+  the same problem as "can a macro emit an already-resolved reference," which it can) led to
+  Shammah noticing that what I'd been describing `'` as doing — carrying lexical scope marks
+  sufficient for correct hygiene — is not what plain quote does in any real Lisp. Checked precisely:
+  vanilla Scheme's `'` is bare, contextless data; Racket keeps that and adds a *separate* operator,
+  `#'`, for scope-aware syntax; Clojure instead folds the richer behavior into its own `` ` ``
+  (auto-namespace-qualification, `#`-suffix auto-gensym), leaving `'` as plain, unqualified data —
+  Clojure never collapses the two into one operator the way the previous PROGRESS.md entry (and the
+  spec text it described) had done.
+- **Fix:** reused Clojure's split rather than inventing a third operator (a `^` sigil was floated
+  and set aside for this reason) or copying Racket's separate-operator shape (which would cost a new
+  reader character this document doesn't need to spend). `'form` is now a bare datum — no scope
+  marks, no expansion-ancestry tracking — matching what a reader trained on real Scheme/Racket/
+  Clojure already expects from plain quote, which is exactly the "regular Lisp should just work"
+  goal this kept being checked against. `` ` `` keeps its existing hole-permission (`,`/`,@`) and
+  additionally is now the one that produces `syntax` (origin, ancestry, lexical scope marks) —
+  matching Clojure's syntax-quote, though Finch's scope marks aim at Racket-style automatic hygiene
+  rather than Clojure's weaker, opt-in `#`-suffix gensym (a separate, explicit choice, not implied
+  by borrowing Clojure's operator assignment).
+- **One real site actually broke and was fixed:** grepped every use of plain `'` in the document
+  before committing to the split (a lesson repeated from the `let`/`[...]` rewrite earlier this
+  session — check real usage before a semantics change, don't assume). Exactly one: `expand-timed`'s
+  example call site quoted its argument with `'`, but `expand-timed` takes `syntax` — under the new
+  split that's a type error (bare data where hygiene-aware syntax is required). Fixed to quasiquote.
+  Also resolves a smaller, previously-unexamined loose end in the same paragraph: the old "current
+  symbol-only `quote` restriction is transitional" note no longer applies to `'`, since bare data
+  needs no staged hygiene machinery to quote an arbitrary structure — flagged as reasoned inference,
+  not re-confirmed against anything else.
