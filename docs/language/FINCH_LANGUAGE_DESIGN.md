@@ -3568,11 +3568,20 @@ the worked examples above (`timed`, coverage, a barrier-inserting transform) spe
 `! comptime` discharges at exactly two points, mirroring how other effects are handled rather than
 propagated:
 
-- **`mixin`** discharges it for `syntax`-shaped results. `mixin` is the boundary between compile-time
-  computation and code that will actually run: whatever `! comptime` operations went into producing
-  the `syntax` value, the *declaration* that lands in the module via `mixin` is ordinary code with no
-  residual taint. A function that calls `(mixin (some-comptime-fn ...))` does not itself inherit
-  `! comptime` from that call — `mixin` consumes it, the same way a `match`/`try` consumes `throws`.
+- **`mixin`** discharges it for `syntax`-shaped results, but only for the *outer CTFE call that
+  produced the syntax* — whatever `! comptime` operations `timed` (say) performed while computing
+  its result are discharged the moment that result is handed to `mixin`; the function that wrote
+  `(mixin (timed require-pkg))` does not itself inherit `! comptime` from that call, the same way a
+  `match`/`try` consumes `throws`. This says nothing about the *generated code's own contents*:
+  mixin-spliced code is not exempt from any ordinary compilation stage ("generated implementations
+  enter the same post-expansion name-resolution, coherence, visibility, effect, and verification
+  passes as handwritten ones," above), effect-checking included. If the spliced-in body still
+  genuinely contains its own unresolved `! comptime` call — unusual, since generation would normally
+  fold such calls away rather than leave them in the output — that declaration picks up `! comptime`
+  in its own row through ordinary effect-inference, exactly as hand-written code would, and is
+  subject to the same discharge-or-error rule independently. `mixin` is not a general
+  comptime-laundering operation; it discharges one specific call's effect, nothing recursively
+  inside what that call produced.
 - **Full constant-folding** discharges it for ordinary-value results. A `! comptime` computation
   invoked where its inputs are themselves compile-time constants (the existing "CTFE of values,
   `if`/`foreach` unroll" mechanism) and that fully resolves to a concrete, ordinary-typed constant —
