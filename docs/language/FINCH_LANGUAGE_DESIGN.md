@@ -2095,16 +2095,40 @@ uses for scalars above. Silently copying an arbitrary, possibly large record on 
 would itself be the hidden-cost violation "Scripting ergonomics with a systems cost model" forbids.
 
 For a record with no internal indirection, moving and copying are the identical physical operation
-— both are a bytewise copy; there is no buffer to steal, so "move" saves no runtime work for such a
-type specifically. What move-invalidation still adds is a compile-time-only restriction, and it
-earns its keep for two reasons even then: a type's move-vs-copy contract must stay decoupled from
-its current field layout (adding an indirectly-owned field to a previously-all-inline record must
-not silently change every existing caller's aliasing assumptions with nothing at the call site to
-explain why), and a record with no pointers can still have a non-trivial `drop` hook (logging, a
-counter, an assertion) that the exactly-once-drop invariant (above) must not run twice. Neither
-reason depends on the type actually owning a heap resource today. A record with no drop hook and no
-non-`Copy` field is exactly the type that should be declared `Copy`, at which point both bindings
-staying valid is correct and intentional, not a special case.
+at the *language-semantics* level — both are a bytewise copy of the declared representation; there
+is no buffer to steal, so "move" implies no required runtime saving purely from the type's source
+declaration. This is not a claim about the compiled machine code: the optimizer already may change
+physical placement "when that is unobservable" (below), and if it decides a large record is cheaper
+represented behind a pointer internally, move (pointer swap) becomes cheap relative to copy (full
+duplicate) again, entirely inside the optimizer, invisible to source. That optimization is only
+*safe* to apply to any type later, without breaking existing callers, because move-invalidation
+already holds uniformly regardless of current representation — a fourth reason for the uniform rule,
+alongside the two below.
+
+What move-invalidation adds at the language level, even for a type the optimizer never chooses to
+represent indirectly, is a compile-time-only restriction, and it earns its keep for two more
+reasons: a type's move-vs-copy contract must stay decoupled from its current field layout (adding an
+indirectly-owned field to a previously-all-inline record must not silently change every existing
+caller's aliasing assumptions with nothing at the call site to explain why), and a record with no
+pointers can still have a non-trivial `drop` hook (logging, a counter, an assertion) that the
+exactly-once-drop invariant (above) must not run twice. Neither of those two reasons depends on the
+type actually owning a heap resource today. A record with no drop hook and no non-`Copy` field is
+exactly the type that should be declared `Copy`, at which point both bindings staying valid is
+correct and intentional, not a special case.
+
+**`Shared<T>` is deliberately not `Copy`, and that is what makes implementing it sound.** If it
+were `Copy`, every implicit reuse of a `Shared<T>` binding would need to silently increment the
+strong count — exactly the hidden cost forbidden above. So `Shared<T>` follows the ordinary
+move-by-default rule like any other non-`Copy` value: reusing a `Shared<T>` binding in more than one
+place is a use-after-move error unless the first use explicitly retains (`retain`, `:2191-2193`) or
+passes to a `take` parameter, which retains automatically but only because the taking mode is
+already written in the callee's signature — not an ambient, silent path. `Shared<T>` itself is an
+ordinary small pointer-sized handle to a heap-allocated control block, moved cheaply like any other
+non-`Copy` value; `retain`'s atomic increment is the one explicit, visible operation that produces a
+second live handle to the same object. Nothing about move-by-default prevents implementing reference
+semantics as a library type — it is what makes that implementation's cost model honest: you cannot
+accidentally end up with two handles sharing identity, or two values that were supposed to share
+identity silently diverging, without writing the operation that decides which one you meant.
 
 **Moving a stack-owned value through or up the call stack never requires heap promotion.** This is a
 static, calling-convention concern, not a runtime or GC-like decision: the destination frame's slot
