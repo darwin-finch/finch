@@ -145,16 +145,39 @@ if [[ ! "$timeout_seconds" =~ ^[0-9]+$ ]]; then
 fi
 
 locked_exec='
-    proof_path="$(umask 077; mktemp "$1/finch-cargo-slot-proof.XXXXXX")" || exit 69
-    printf "%s\n" "$1" >"$proof_path" || exit 69
-    chmod 0400 "$proof_path" || exit 69
-    exec 107<"$proof_path" || exit 69
-    rm -f -- "$proof_path" || exit 69
+    proof_path="$(umask 077; mktemp "$1/finch-cargo-slot-proof.XXXXXX")" || {
+        status=$?
+        echo "with-cargo-slot: could not create the cargo-slot proof descriptor: directory=$1 mktemp_status=$status" >&2
+        exit 69
+    }
+    printf "%s\n" "$1" >"$proof_path" || {
+        status=$?
+        echo "with-cargo-slot: could not write the cargo-slot proof descriptor: path=$proof_path write_status=$status" >&2
+        exit 69
+    }
+    chmod 0400 "$proof_path" || {
+        status=$?
+        echo "with-cargo-slot: could not seal the cargo-slot proof descriptor read-only: path=$proof_path chmod_status=$status" >&2
+        exit 69
+    }
+    exec 107<"$proof_path" || {
+        status=$?
+        echo "with-cargo-slot: could not open the cargo-slot proof descriptor on fd 107: path=$proof_path open_status=$status" >&2
+        exit 69
+    }
+    rm -f -- "$proof_path" || {
+        status=$?
+        echo "with-cargo-slot: could not unlink the cargo-slot proof descriptor after opening fd 107: path=$proof_path rm_status=$status" >&2
+        exit 69
+    }
     export FINCH_CARGO_SLOT_HELD="$1"
     export FINCH_CARGO_SLOT_OWNER_PID="$PPID"
     export FINCH_CARGO_SLOT_PROOF_FD=107
     shift
     exec "$@"
+    status=$?
+    echo "with-cargo-slot: could not exec the wrapped command: status=$status argv=$*" >&2
+    exit 69
 '
 
 case "$(uname -s)" in

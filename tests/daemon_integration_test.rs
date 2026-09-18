@@ -299,6 +299,14 @@ fn bounded_child_stderr(_stderr: &std::fs::File) -> String {
     "<bounded daemon stderr capture requires Unix>".to_owned()
 }
 
+// `[backend]` must stay disabled here: `BackendConfig::default()` (enabled=true)
+// spawns real ONNX Qwen model loading as a plain `tokio::spawn` task that does
+// not yield, which on a 2-vCPU CI runner starves the same multi-thread runtime
+// the HTTP listener needs to reach `publish_isolated_test_address` — the
+// isolated daemon stays alive but doesn't publish its address for 40s+, well
+// past the address-wait bound, even though the test asserts nothing about
+// local generation. `tests/named_brain_attach.rs` already disables it for the
+// same reason.
 fn write_config(
     home: &Path,
     daemon_address: &str,
@@ -317,6 +325,10 @@ auto_spawn = false
 timeout_seconds = 10
 auto_discover = false
 prefer_local = true
+
+[backend]
+enabled = false
+execution_target = "cpu"
 
 [server]
 enabled = true
@@ -430,4 +442,35 @@ fn test_daemon_config_parsing() {
         Some("127.0.0.1:0")
     );
     assert_eq!(config["client"]["auto_spawn"].as_bool(), Some(false));
+}
+
+// Regression for the isolation-gate flake root-caused on 2026-09-18: without
+// `[backend] enabled = false`, `write_config` produces a config that falls
+// back to `BackendConfig::default()` (enabled=true), which makes the isolated
+// daemon load a real ONNX Qwen model on a plain (non-yielding) `tokio::spawn`
+// task. On the 2-vCPU ubuntu-24.04 CI runner that starves the multi-thread
+// runtime's other worker for 40s+, so `TestDaemon::start` misses its
+// address-publication bound even though the test never exercises local
+// generation. This test fails before the `[backend]` block existed (no
+// `enabled` key at all, so a real loader would default it to `true`) and
+// passes after.
+#[test]
+fn test_write_config_disables_local_backend() {
+    let home = std::env::temp_dir().join(format!(
+        "finch-daemon-integration-test-write-config-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(home.join(".finch")).unwrap();
+    write_config(&home, "127.0.0.1:0", "sk-ant-test", "test-password").unwrap();
+    let contents = std::fs::read_to_string(home.join(".finch/config.toml")).unwrap();
+    let config: toml::Value = toml::from_str(&contents).unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+    assert_eq!(
+        config["backend"]["enabled"].as_bool(),
+        Some(false),
+        "isolated daemon test config must disable the local model backend, or the daemon \
+         spawns real ONNX model loading and can miss its address-publication bound under CI \
+         load: config={contents:?}"
+    );
 }
