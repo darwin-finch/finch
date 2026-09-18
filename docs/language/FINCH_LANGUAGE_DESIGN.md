@@ -2848,7 +2848,10 @@ polymorphism.
 `Shared<T>` lends readonly access by default. Possessing one handle can never prove alias-wide
 exclusive access, so it does not directly provide a mutable borrow of `T`. Mutation requires a
 library type whose evidence enforces the rule—an atomic, mutex, actor, transactional cell, or an
-operation that proves sole ownership and recovers a unique carrier. Moving a unique owner between
+operation that proves sole ownership, either temporarily (`get-mut` lends `&mut T` while `Self`
+remains `Shared<T>`, above) or by recovering a unique carrier (`try-into-unique`, above). Both are
+instances of this same rule, stated here first; neither is a special exception to it. Moving a
+unique owner between
 workers requires `Transfer<T>` evidence. Retaining a shared owner across workers additionally
 requires `ShareAcrossWorkers<T>` evidence, normally derived only for immutable values or explicitly
 synchronized containers. Reference counting alone is not a thread-safety claim.
@@ -3047,12 +3050,24 @@ Illustrative syntax:
   (* x x))
 
 (define (save-report
-          (path : (path workspace "generated/**"))
+          (path : path<workspace:"generated/**">)
           (contents : string))
   : unit
-  ! (effects (fs/write workspace "generated/**"))
-  (file/write path contents))
+  ! {fs.write(root=workspace, path="generated/**")}
+  (file.write path contents))
 ```
+
+**Corrected 2026-09-17.** This example previously used `(path workspace "generated/**")` for the
+refined path type, `(effects (fs/write workspace "generated/**"))` for the capability clause, and
+`file/write` for the host call — an older, slash-namespaced notation that predates and disagrees
+with the conventions established everywhere else in this document: the angle-bracket refined-path
+type (`path<workspace:"generated/**">`, "Capability effects are authority requirements" and
+throughout), the braced, named-argument capability syntax (`{fs.write(root=workspace,
+path="generated/**")}`, `:1593-1600`), and dot-namespaced words (`file.write`, matching the
+Co-Forth `save-report` counterpart under "Definitions and signatures"). Two unrelated capability
+spellings for the same effect in the same document is exactly the kind of inconsistency an
+implementer — human or automated — has no principled way to resolve alone; fixed to match the
+convention used everywhere else rather than left as a second, competing notation.
 
 The intended experience is *statically safe scripting*, not annotation-heavy systems programming.
 Infer literals, locals, parameters, results, stack rows, effects, yields, and generic
