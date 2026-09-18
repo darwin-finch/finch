@@ -1202,8 +1202,10 @@ pub(crate) fn plan_live_frame(
 ) -> LiveFrame {
     let width = vm.terminal_width.max(1);
     let height = vm.terminal_height;
-    // A dialog or the expanded tool-result surface owns the viewport: a
-    // focused surface's own scrolling must never move the transcript behind it.
+    // A dialog or the expanded tool-result surface owns the focus: a focused
+    // surface's own scrolling must never move the transcript behind it. The
+    // dialog no longer owns the whole viewport (#807) — the conversation stays
+    // projected above its card — but the completion pane still yields.
     let dialog_active = vm.dialog.is_some() || vm.expanded_lines.is_some();
     let mut frame = LiveFrame::default();
 
@@ -1213,7 +1215,11 @@ pub(crate) fn plan_live_frame(
     // Critical UI (dialog, render error) suppresses the pane entirely.
     let natural_pane =
         view_model::natural_completion_pane(autocomplete, width, dialog_active || vm.render_error);
-    let sizing = view_model::claim_live_frame(vm, None, natural_pane.len());
+    let dialog_card_natural = vm
+        .dialog
+        .map(|dialog| TuiRenderer::dialog_card_natural_rows(dialog, width, height))
+        .unwrap_or(0);
+    let sizing = view_model::claim_live_frame(vm, None, natural_pane.len(), dialog_card_natural);
     let rects = view_model::frame_rects(&sizing);
 
     // ── 1. Transcript viewport content, sized by its claimed rect ────────────
@@ -1225,7 +1231,9 @@ pub(crate) fn plan_live_frame(
     );
 
     let mut viewport_content: Vec<RenderedTranscriptLine> = Vec::new();
-    if !dialog_active {
+    if vm.expanded_lines.is_none() {
+        // The conversation stays projected while a dialog card is open (#807);
+        // only the expanded tool-result surface still empties the viewport.
         // A Brain can have more than one live work unit (a streamed VM program
         // alongside a child task or output handle). Rendering only the newest
         // made earlier source appear and then vanish on the next redraw.
@@ -1282,12 +1290,21 @@ pub(crate) fn plan_live_frame(
     // ── 2. Second claiming pass with the content it will paint ───────────────
     // The claims are content-independent, so the rects are the sizing pass's
     // rects; this pass additionally records the viewport window and the
-    // disclosure hit rects the depth-first claim produced.
+    // disclosure hit rects the depth-first claim produced. The dialog card's
+    // lines are pinned to the height the sizing pass claimed and padded to
+    // exactly that height, so both passes claim the same card box (#807).
+    let dialog_card_lines = vm
+        .dialog
+        .map(|dialog| {
+            TuiRenderer::dialog_card_lines_for_claim(dialog, width, rects.dialog_card.height)
+        })
+        .unwrap_or_default();
     let content = view_model::LiveFrameContent {
         viewport: viewport_content.clone(),
         completions: completion_lines.clone(),
+        dialog_card: dialog_card_lines,
     };
-    let claimed = view_model::claim_live_frame(vm, Some(&content), 0);
+    let claimed = view_model::claim_live_frame(vm, Some(&content), 0, dialog_card_natural);
     let claimed_rects = view_model::frame_rects(&claimed);
 
     // ── 3. Paint in claimed order: transcript, completions, hr, input, hr,
@@ -1308,17 +1325,19 @@ pub(crate) fn plan_live_frame(
         frame.push(format!("{DIM_GRAY}{separator}{RESET}"));
     }
 
-    // ── 4. Dialog, expanded tool result, or input ────────────────────────────
-    if let Some(dialog) = vm.dialog {
-        let budget = height.saturating_sub(frame.physical_rows(width));
-        for line in TuiRenderer::dialog_lines(dialog, width, budget) {
-            frame.push(line);
+    // ── 4. Open dialog card, expanded tool result, or input ──────────────────
+    if vm.dialog.is_some() {
+        // The card is a claimed inline region (#807): its pinned lines were
+        // painted below the separator, sized to the claimed box. The dialog
+        // owns the keys, so the editable cursor stays hidden and parks on the
+        // card's last row.
+        for line in &content.dialog_card {
+            frame.push(line.clone());
         }
-        // A dialog has no editable text cursor. Keep the hidden cursor on the
-        // final owned row so painting at the viewport bottom cannot scroll it.
         frame.cursor_visible = false;
         frame.cursor_row = frame.physical_rows(width).saturating_sub(1);
-        frame.rects = view_model::FrameRects::default();
+        frame.rects = claimed_rects;
+        frame.hitboxes = transcript_disclosure_hitboxes(&claimed, &viewport_content, width);
         return frame;
     }
     if let Some(expanded) = vm.expanded_lines {
@@ -1418,7 +1437,18 @@ pub(crate) fn plan_live_frame(
     frame.cursor_row = rows_before_input + cursor_phys_above + cursor_sub_row;
 
     frame.rects = claimed_rects;
-    frame.hitboxes = claimed
+    frame.hitboxes = transcript_disclosure_hitboxes(&claimed, &viewport_content, width);
+    frame
+}
+
+/// The disclosure hit rects the claiming pass recorded inside the transcript
+/// viewport, joined with the projected row metadata that named them.
+fn transcript_disclosure_hitboxes(
+    claimed: &widgets::Layout,
+    viewport_content: &[RenderedTranscriptLine],
+    width: usize,
+) -> Vec<ClaimedDisclosureRect> {
+    claimed
         .hit_rects()
         .map(|(index, rect)| ClaimedDisclosureRect {
             region: TranscriptHitRegion {
@@ -1433,8 +1463,7 @@ pub(crate) fn plan_live_frame(
             },
             row_expanded: viewport_content[index].row_expanded.unwrap_or(false),
         })
-        .collect();
-    frame
+        .collect()
 }
 
 /// One session task list row, or `None` for a finished row the draw skips.
@@ -3357,24 +3386,23 @@ impl TuiRenderer {
     }
 
     fn live_geometry(&mut self, width: u16, height: u16) -> Option<(usize, usize)> {
-        if let Some(dialog) = self.active_dialog.as_ref() {
-            let terminal_rows = usize::from(height);
+        let terminal_rows = usize::from(height);
+        let active_dialog = self.active_dialog.clone();
+        if let Some(dialog) = active_dialog {
             if terminal_rows == 0 {
                 return Some((0, 0));
             }
-            let mut sink = Vec::new();
-            let dialog_rows = Self::draw_dialog_inline_bounded(
-                &mut sink,
-                dialog,
-                usize::from(width).max(1),
-                terminal_rows.saturating_sub(1),
-            )
-            .ok()?;
-            let rows = 1 + dialog_rows;
-            return Some((rows, rows.saturating_sub(1)));
+            // One planner, two consumers (#807): the erase estimator plans the
+            // same dialog-card frame the draw paints, so its row count can
+            // never disagree with what was painted.
+            let draw_width = usize::from(width).max(1);
+            let sources = self.live_frame_sources(draw_width);
+            let mut autocomplete = self.autocomplete_state.clone();
+            let vm = live_view_model(&sources, draw_width, terminal_rows, Some(&dialog), None);
+            let frame = plan_live_frame(&vm, &mut autocomplete);
+            return Some((frame.physical_rows(draw_width), frame.cursor_row));
         }
         if let Some(view) = self.expanded_tool.as_ref() {
-            let terminal_rows = usize::from(height);
             if terminal_rows == 0 {
                 return Some((0, 0));
             }
@@ -3932,21 +3960,6 @@ fn render_other_row_inline(
 }
 
 impl TuiRenderer {
-    /// Draw a `Dialog` inline, borderless and spanning the full terminal width.
-    ///
-    /// Sections are separated by a full-width horizontal rule; content lines are
-    /// indented two spaces with no left/right border and no right padding, so the
-    /// dialog fills the available width instead of sitting inside a capped box.
-    /// Returns the number of terminal rows consumed.
-    /// `box_width` is the total width the dialog spans (normally the terminal width).
-    pub(crate) fn draw_dialog_inline_static_with_width(
-        out: &mut impl io::Write,
-        dialog: &Dialog,
-        box_width: usize,
-    ) -> Result<usize> {
-        Self::draw_dialog_with_control_start(out, dialog, box_width, None).map(|(rows, _)| rows)
-    }
-
     /// Paint a dialog and report the logical line index where the control
     /// suffix starts (the options divider after title/help/body).
     ///
@@ -4251,28 +4264,6 @@ impl TuiRenderer {
         Ok((rows, control_start))
     }
 
-    fn draw_dialog_inline_static(out: &mut impl io::Write, dialog: &Dialog) -> Result<usize> {
-        let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let box_width = term_width.max(1);
-        Self::draw_dialog_inline_static_with_width(out, dialog, box_width)
-    }
-
-    fn draw_dialog_inline_bounded(
-        out: &mut impl io::Write,
-        dialog: &Dialog,
-        width: usize,
-        max_rows: usize,
-    ) -> Result<usize> {
-        let lines = Self::dialog_lines(dialog, width, max_rows);
-        for line in &lines {
-            execute!(out, Print(line), Print("\r\n"))?;
-        }
-        Ok(lines
-            .iter()
-            .map(|line| shadow_buffer::physical_rows(line, width.max(1)))
-            .sum())
-    }
-
     /// The dialog's lines, clipped to `max_rows` **physical** terminal rows.
     ///
     /// The row count returned to the live area was previously a count of
@@ -4317,6 +4308,66 @@ impl TuiRenderer {
         )
     }
 
+    /// The open dialog card's pinned natural extent at `width` (#807).
+    ///
+    /// The card may claim every row but the session separator's — the same
+    /// budget the overlay spent by leftover arithmetic, now the card's own
+    /// claim, so `pin_dialog_controls` keeps Yes/No inside the card at any
+    /// terminal size the overlay could.
+    pub(crate) fn dialog_card_natural_rows(
+        dialog: &Dialog,
+        width: usize,
+        frame_height: usize,
+    ) -> usize {
+        let width = width.max(1);
+        TuiRenderer::dialog_lines(dialog, width, frame_height.saturating_sub(1))
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(line, width))
+            .sum()
+    }
+
+    /// The dialog card's lines pinned to `claimed_rows` and padded to exactly
+    /// that many physical rows, so the sizing and content claiming passes both
+    /// see the same card box and the chrome below never shifts (#807).
+    pub(crate) fn dialog_card_lines_for_claim(
+        dialog: &Dialog,
+        width: usize,
+        claimed_rows: usize,
+    ) -> Vec<String> {
+        let width = width.max(1);
+        let mut lines = TuiRenderer::dialog_lines(dialog, width, claimed_rows);
+        let mut rows: usize = lines
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(line, width))
+            .sum();
+        while rows < claimed_rows {
+            lines.push(String::new());
+            rows += 1;
+        }
+        lines
+    }
+
+    /// Complete the active dialog: freeze its settled record into the
+    /// conversation, clear it, and stage the result for the event loop (#807).
+    ///
+    /// The settled record rides the standard canonical-commit pipeline — the
+    /// question, the options with the picked marker, and the answer become
+    /// speakable, copyable transcript rows exactly once.
+    pub fn complete_dialog(&mut self, result: DialogResult) {
+        if let Some(dialog) = self.active_dialog.take() {
+            self.settle_dialog(&dialog, &result);
+        }
+        self.pending_dialog_result = Some(result);
+        self.live_area_dirty = true;
+    }
+
+    /// Write the answered dialog's settled record into the transcript (#807).
+    pub fn settle_dialog(&mut self, dialog: &Dialog, result: &DialogResult) {
+        let record = dialog::settled_dialog_record(dialog, result);
+        self.output_manager.write_tool_raw(record);
+        self.live_area_dirty = true;
+    }
+
     /// Show a blocking dialog (used when no async event loop is running).
     /// Returns `DialogResult::Cancelled` if Esc is pressed.
     pub fn show_dialog(&mut self, dialog: Dialog) -> Result<DialogResult> {
@@ -4359,7 +4410,14 @@ impl TuiRenderer {
                                 self.erase_live_area()?;
                                 self.draw_live_area()?;
                             } else {
-                                self.active_dialog = None;
+                                // The blocking caller receives the result
+                                // directly; only the settled record is staged
+                                // here — never `pending_dialog_result`, which
+                                // the async event loop would route a second
+                                // time.
+                                if let Some(dialog) = self.active_dialog.take() {
+                                    self.settle_dialog(&dialog, &DialogResult::Cancelled);
+                                }
                                 self.erase_live_area()?;
                                 self.draw_live_area()?;
                                 return Ok(DialogResult::Cancelled);
@@ -4372,7 +4430,11 @@ impl TuiRenderer {
                                 .and_then(|d| d.handle_key_event(key));
 
                             if let Some(r) = result {
-                                self.active_dialog = None;
+                                // See the Esc branch: settle the record, hand
+                                // the result to the blocking caller only.
+                                if let Some(dialog) = self.active_dialog.take() {
+                                    self.settle_dialog(&dialog, &r);
+                                }
                                 self.erase_live_area()?;
                                 self.draw_live_area()?;
                                 return Ok(r);
@@ -4927,6 +4989,38 @@ mod tests {
 
     fn assert_vt(condition: bool, message: &str, terminal: &VtOracle) {
         assert!(condition, "{message}\n{}", terminal.diagnostic());
+    }
+
+    /// Visible text of one rendered line: SGR and OSC sequences removed.
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                match chars.peek() {
+                    Some('[') => {
+                        chars.next();
+                        for nc in chars.by_ref() {
+                            if nc.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        chars.next();
+                        for nc in chars.by_ref() {
+                            if nc == '\x07' || nc == '\x1b' {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     fn renderer_owning_mouse_capture() -> TuiRenderer {
@@ -7680,15 +7774,25 @@ mod tests {
             .map(|index| DialogOption::new(format!("approval choice {index}")))
             .collect();
         let dialog = Dialog::select("Critical approval", options);
-        let mut output = Vec::new();
 
-        let rows = TuiRenderer::draw_dialog_inline_bounded(&mut output, &dialog, 40, 5).unwrap();
-        let raw = String::from_utf8(output).unwrap();
-        assert_eq!(rows, 5);
-        assert_eq!(raw.matches("\r\n").count(), 5);
-        assert!(raw.contains("Critical approval"));
-        assert!(raw.contains("dialog clipped to viewport"));
-        assert!(!raw.contains("\x1b[3J"));
+        let lines = TuiRenderer::dialog_lines(&dialog, 40, 5);
+        let painted = lines
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(line, 40))
+            .sum::<usize>();
+        let visible = lines
+            .iter()
+            .map(|line| strip_sgr(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            painted <= 5 && !lines.is_empty(),
+            "the bounded dialog must paint at most 5 physical rows; it painted {painted}:\n{visible}"
+        );
+        assert!(
+            visible.contains("Critical approval") && visible.contains("dialog clipped to viewport"),
+            "the clip path must keep the title and the marker:\n{visible}"
+        );
 
         let mut autocomplete = AutocompleteState::new();
         autocomplete.show_matches(CommandRegistry::new().match_prefix("/brain "));
@@ -7720,8 +7824,9 @@ mod tests {
         // An option label is caller data and is never wrapped or truncated, so
         // a long one painted two terminal rows and was counted as one. That
         // count becomes `cursor_row_from_top`, which the erase walks up by, so
-        // the undercount left the top of the box unerased and redrew it one row
-        // lower every tick — the cascading duplicate dialogs.
+        // the undercount left the top of the box unerased and redrew it one
+        // row lower every tick — the cascading duplicate dialogs. The card's
+        // claimed height must be the physical rows its painted lines occupy.
         let width = 40;
         let dialog = Dialog::select(
             "Approve",
@@ -7729,26 +7834,28 @@ mod tests {
                 "run the migration against the production database and then report back",
             )],
         );
-        let mut output = Vec::new();
+        let draft = vec![String::new()];
+        let mut vm = live_inputs(width, 60, &draft, "status");
+        vm.dialog = Some(&dialog);
+        let frame = plan_live_frame(&vm, &mut AutocompleteState::new());
 
-        let rows =
-            TuiRenderer::draw_dialog_inline_bounded(&mut output, &dialog, width, 60).unwrap();
-
-        let raw = String::from_utf8(output).unwrap();
-        let painted = raw
-            .split_terminator("\r\n")
+        // With a dialog open the painted frame is [card lines, separator] —
+        // the card's lines are everything above the session separator.
+        let card_rows: usize = frame.lines[..frame.lines.len() - 1]
+            .iter()
             .map(|line| shadow_buffer::physical_rows(line, width))
-            .sum::<usize>();
-        let logical = raw.matches("\r\n").count();
+            .sum();
+        let logical = frame.lines.len() - 1;
         assert!(
-            painted > logical,
+            card_rows > logical,
             "this case must actually exercise a wrapping option label: {logical} logical lines \
-             occupying {painted} rows at width {width}"
+             occupying {card_rows} rows at width {width}"
         );
         assert_eq!(
-            painted, rows,
-            "the row count handed to cursor_row_from_top must be the rows the dialog paints, \
-             not its {logical} logical lines; dialog painted:\n{raw}"
+            card_rows, frame.rects.dialog_card.height,
+            "the card's claimed height must be the rows the card paints, \
+             not its {logical} logical lines; frame lines:\n{:?}",
+            frame.lines
         );
     }
 
@@ -7766,24 +7873,162 @@ mod tests {
             })
             .collect();
         let dialog = Dialog::select("Critical approval", options);
-        let mut output = Vec::new();
 
-        let rows = TuiRenderer::draw_dialog_inline_bounded(&mut output, &dialog, width, 5).unwrap();
-
-        let raw = String::from_utf8(output).unwrap();
-        let painted = raw
-            .split_terminator("\r\n")
+        let lines = TuiRenderer::dialog_lines(&dialog, width, 5);
+        let painted = lines
+            .iter()
             .map(|line| shadow_buffer::physical_rows(line, width))
             .sum::<usize>();
         assert!(
             painted <= 5,
-            "a dialog bounded to 5 rows must paint at most 5; it painted {painted}:\n{raw}"
+            "a dialog bounded to 5 rows must paint at most 5; it painted {painted}:\n{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| strip_sgr(line).contains("dialog clipped to viewport")),
+            "the wrapped clip must show the viewport marker:\n{lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_settled_dialog_record_rides_the_canonical_commit_pipeline() {
+        // #807: after submit the settled card stays in the transcript
+        // projection and the native commit writes the question and the answer
+        // as speakable text — never a pixel-only confirmation — through the
+        // standard exactly-once pipeline, not a new one.
+        let colors = ColorScheme::default();
+        let projection_colors = colors.clone();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let mut renderer = TuiRenderer::new_headless(output, Arc::new(StatusBar::new()), colors);
+        renderer.is_active = true;
+
+        let dialog = Dialog::tool_approval("Write", "create docs.html, 12 KB");
+        let result = DialogResult::Selected(2);
+        renderer.active_dialog = Some(dialog);
+        renderer.complete_dialog(result);
+
+        assert!(
+            renderer.active_dialog.is_none(),
+            "complete_dialog must clear the open dialog"
+        );
+        assert!(
+            matches!(
+                renderer.pending_dialog_result,
+                Some(DialogResult::Selected(2))
+            ),
+            "complete_dialog must stage the result for the async event loop, got {:?}",
+            renderer.pending_dialog_result
+        );
+
+        let width = 80;
+        let record_text = |messages: Vec<MessageRef>, colors: &ColorScheme| -> String {
+            let mut text = String::new();
+            for message in &messages {
+                match view_model::project_message(message, colors) {
+                    view_model::ProjectedMessage::Node(node) => {
+                        for line in node.body {
+                            text.push_str(&strip_sgr(&line));
+                            text.push('\n');
+                        }
+                    }
+                    view_model::ProjectedMessage::Plain(formatted) => {
+                        text.push_str(&strip_sgr(&formatted.join("\n")));
+                        text.push('\n');
+                    }
+                }
+            }
+            text
+        };
+
+        // Before the commit, the settled card is the conversation's live
+        // suffix — projected, speakable, with the picked radio marker.
+        let suffix = record_text(renderer.output_manager.get_messages(), &projection_colors);
+        assert!(
+            suffix.contains("? Write") && suffix.contains("create docs.html, 12 KB"),
+            "the settled card must keep the question in the transcript projection:\n{suffix}"
+        );
+        assert!(
+            suffix.contains("● 3. Yes, and don't ask again for: Write:*")
+                && suffix.contains("○ 1. Yes"),
+            "the settled card must keep every option with the picked radio marker:\n{suffix}"
+        );
+        assert!(
+            suffix.contains("✓ Answer: 3. Yes, and don't ask again for: Write:*"),
+            "the settled card must name the answer:\n{suffix}"
+        );
+
+        let plan = plan_canonical_commit(
+            &renderer.output_manager.get_messages(),
+            &renderer.printed_ids,
         );
         assert_eq!(
-            painted, rows,
-            "the returned count must match the painted height; dialog painted:\n{raw}"
+            plan.emit.len(),
+            1,
+            "precondition: the settled record is the one pending commit"
         );
-        assert!(raw.contains("dialog clipped to viewport"));
+        let mut sink = Vec::new();
+        let rows = commit_complete_messages(
+            &mut sink,
+            &plan.emit,
+            &mut renderer.accordion,
+            &renderer.colors,
+            &mut renderer.printed_ids,
+            24,
+            width,
+        )
+        .expect("canonical commit succeeds");
+        assert!(rows > 0, "the settled record must commit at least one row");
+        let committed = String::from_utf8(sink).unwrap();
+        assert!(
+            committed.contains("? Write")
+                && committed.contains("create docs.html, 12 KB")
+                && committed.contains("✓ Answer: 3. Yes, and don't ask again for: Write:*"),
+            "native commit text must carry the question and the answer:\n{committed}"
+        );
+
+        let replay = plan_canonical_commit(
+            &renderer.output_manager.get_messages(),
+            &renderer.printed_ids,
+        );
+        assert!(
+            replay.emit.is_empty(),
+            "the settled record must commit exactly once; a second plan emitted {:?}",
+            replay.emit.len()
+        );
+
+        // After the commit, the settled card remains in the retained
+        // transcript projection — the conversation history shows what was
+        // asked and what was picked.
+        let retained = record_text(
+            visible_printed_messages(
+                &renderer.output_manager.get_messages(),
+                &renderer.printed_ids,
+            ),
+            &projection_colors,
+        );
+        assert!(
+            retained.contains("✓ Answer: 3. Yes, and don't ask again for: Write:*")
+                && retained.contains("● 3. Yes, and don't ask again for: Write:*"),
+            "the settled card must remain in the retained transcript projection after \
+             the commit:\n{retained}"
+        );
+        renderer.is_active = false;
+    }
+
+    #[test]
+    fn test_settled_dialog_dismissal_record_is_speakable() {
+        let dialog = dialog::settled_dialog_record(
+            &Dialog::select(
+                "Proceed?",
+                vec![DialogOption::new("Yes"), DialogOption::new("No")],
+            ),
+            &DialogResult::Cancelled,
+        );
+        assert!(
+            dialog.contains("? Proceed?") && dialog.contains("Dismissed without answering"),
+            "a dismissed dialog must still record the question and the dismissal:\n{dialog}"
+        );
     }
 
     #[test]
@@ -10106,14 +10351,12 @@ mod draw_dialog_tests {
         out
     }
 
-    /// Render a dialog to a string using box_width=72, strip ANSI, return lines.
+    /// Render a dialog to plain lines at width 72 — the same painter the
+    /// planner uses — with ANSI stripped.
     fn render_lines(dialog: &Dialog) -> Vec<String> {
-        let mut buf: Vec<u8> = Vec::new();
-        // Call the static function directly — it now accepts &mut impl io::Write
-        TuiRenderer::draw_dialog_inline_static_with_width(&mut buf, dialog, 72).unwrap();
-        let raw = String::from_utf8(buf).unwrap();
-        raw.lines()
-            .map(|l| l.trim_end_matches('\r').to_string())
+        TuiRenderer::dialog_lines(dialog, 72, usize::MAX)
+            .iter()
+            .map(|line| strip_ansi(line))
             .collect()
     }
 
@@ -10231,20 +10474,23 @@ mod draw_dialog_tests {
             "Choose all that apply",
             vec![DialogOption::new("Option A"), DialogOption::new("Option B")],
         );
-        let mut output = Vec::new();
-        let rendered_rows =
-            TuiRenderer::draw_dialog_inline_static_with_width(&mut output, &dialog, 72).unwrap();
-        let rendered = String::from_utf8(output).unwrap();
-        let visible = rendered
-            .lines()
-            .map(strip_ansi)
+        let lines = TuiRenderer::dialog_lines(&dialog, 72, usize::MAX);
+        let visible = lines
+            .iter()
+            .map(|line| strip_ansi(line))
             .collect::<Vec<_>>()
             .join("\n");
+        let painted = lines
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(line, 72))
+            .sum::<usize>();
 
         assert_eq!(
-            rendered_rows,
-            rendered.lines().count(),
-            "live multiselect row accounting must include every rendered keyboard-hint row"
+            painted,
+            lines.len(),
+            "live multiselect row accounting must include every rendered keyboard-hint row: \
+             {painted} physical rows across {} logical lines",
+            lines.len()
         );
 
         for expected in [

@@ -60,9 +60,10 @@ native history is not the reader; drag-selection under capture remains open on
 snapshot projected into a tree of standard widgets laid out by depth-first frame claiming. The
 root column allocates chrome from the bottom (status, hr, input, hr, completions 0–N) and the
 transcript viewport claims the leftover; an empty completions pane claims zero rows so the
-composer and status never move (#232). Resize is a full layout pass — no widget keeps a cell
-count from the previous frame. `Row` parents place children side by side, and `Side` tracks are
-the width-conditional rails (#810).
+composer and status never move (#232). While a dialog is open the column instead carries the
+dialog card as an inline child (#807) and the composer/status yield. Resize is a full layout
+pass — no widget keeps a cell count from the previous frame. `Row` parents place children side
+by side, and `Side` tracks are the width-conditional rails (#810).
 
 **Dialog system** (`src/cli/tui/dialog.rs`):
 - `Select` — Enter submits immediately; `o`/`O` or typing on Other row activates custom input
@@ -70,6 +71,16 @@ the width-conditional rails (#810).
 - `TextInput` — Enter submits
 - `Confirm` — `y`/`n` or Enter/Esc
 - Approval payload is a bounded, scrollable region. `dialog_lines` pins Yes/No/Cancel so a long write never moves the controls off-screen. Write approvals summarise path, size, and create-vs-overwrite; the full preview stays behind body scroll.
+
+**Dialogs are conversation widgets** (#807): an open dialog is a `Widget::DialogCard`
+claimed as an inline region of the root column (`DIALOG_CARD` key) below the still-projected
+conversation, not a viewport-owning overlay. The card's lines are `dialog_lines`' pinned
+output — Yes/No/Submit stay inside the card while the preview body scrolls inside it, the
+#435 guarantee — re-rendered and padded to the claimed height so both claiming passes and
+the erase estimator agree. After submit, `complete_dialog`/`settle_dialog` writes the
+settled record (question, options with the picked marker, `Answer:` line) through the
+standard canonical-commit pipeline; approval event semantics are unchanged.
+`TabbedDialog` remains the alternate-screen wizard as a follow-up.
 
 **Bounded tool-result controls** (`src/cli/tui/tool_viewport.rs`):
 - Every `ToolOutput` transcript row is a reusable semantic control with a bounded

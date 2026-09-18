@@ -158,6 +158,8 @@ impl TuiRenderer {
     pub fn check_and_refresh(&mut self) -> Result<()>;
     /// Clear the OperationStatus line from the status bar.
     pub fn clear_operation_status(&self);
+    /// Complete the active dialog: freeze its settled record into the conversation, clear it, and stage the result for the event loop (#807).
+    pub fn complete_dialog(&mut self, result: DialogResult);
     pub fn create_clean_textarea() -> TextArea<'static>;
     pub fn create_clean_textarea_with_text(text: &str) -> TextArea<'static>;
     /// Draw the live area from scratch and track `active_rows`.
@@ -192,6 +194,8 @@ impl TuiRenderer {
     pub fn set_task_rows(&mut self, rows: activity::SharedActivityRows);
     /// Update the live typing words and switch the panel to Typing mode.
     pub fn set_typing_words(&mut self, words: Vec<String>);
+    /// Write the answered dialog's settled record into the transcript (#807).
+    pub fn settle_dialog(&mut self, dialog: &Dialog, result: &DialogResult);
     /// Show a blocking dialog (used when no async event loop is running).
     pub fn show_dialog(&mut self, dialog: Dialog) -> Result<DialogResult>;
     /// Open a file in a full-screen TUI viewer.

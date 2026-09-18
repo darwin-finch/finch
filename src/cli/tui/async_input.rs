@@ -194,9 +194,11 @@ pub fn spawn_input_task(
                                 };
 
                                 if let Some(result) = dialog_result {
-                                    // Dialog completed, clear it and store result
-                                    tui.active_dialog = None;
-                                    tui.pending_dialog_result = Some(result);
+                                    // Dialog completed: freeze the settled
+                                    // record into the conversation, clear it,
+                                    // and stage the result for the event loop
+                                    // (#807).
+                                    tui.complete_dialog(result);
                                 }
 
                                 // Mark for render so dialog updates are shown
@@ -212,9 +214,7 @@ pub fn spawn_input_task(
                                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
                                     && tui.active_dialog.is_some()
                                 {
-                                    tui.active_dialog = None;
-                                    tui.pending_dialog_result =
-                                        Some(crate::cli::tui::DialogResult::Cancelled);
+                                    tui.complete_dialog(crate::cli::tui::DialogResult::Cancelled);
                                 }
                                 match tui.dispatch_composer_key(key) {
                                     ComposerDispatch::Submit(input) => {
@@ -432,17 +432,15 @@ pub fn spawn_input_task(
                                         .as_mut()
                                         .and_then(|dialog| dialog.handle_key_event(key));
                                     if let Some(result) = result {
-                                        tui.active_dialog = None;
-                                        tui.pending_dialog_result = Some(result);
+                                        // Settled record + staged result (#807).
+                                        tui.complete_dialog(result);
                                     }
                                     tui.mark_dirty();
                                     needs_render = true;
                                     continue;
                                 }
                                 if tui.active_dialog.is_some() {
-                                    tui.active_dialog = None;
-                                    tui.pending_dialog_result =
-                                        Some(crate::cli::tui::DialogResult::Cancelled);
+                                    tui.complete_dialog(crate::cli::tui::DialogResult::Cancelled);
                                 }
 
                                 if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {

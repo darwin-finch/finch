@@ -437,6 +437,7 @@ pub(crate) mod frame_key {
     pub const COMPOSER: u16 = 3;
     pub const STATUS_RULE: u16 = 4;
     pub const STATUS: u16 = 5;
+    pub const DIALOG_CARD: u16 = 6;
 }
 
 /// The regions of one live frame, claimed by the widget tree. Rects are in the
@@ -450,6 +451,9 @@ pub(crate) struct FrameRects {
     pub composer: Rect,
     pub status_rule: Rect,
     pub status: Rect,
+    /// The open dialog's inline card (#807). Empty when no dialog is open or
+    /// the card was squeezed out of a tiny frame.
+    pub dialog_card: Rect,
 }
 
 /// Everything the live-frame planner reads: the blit-time ViewModel snapshot.
@@ -488,19 +492,27 @@ pub(crate) struct LiveViewModel<'a> {
 pub(crate) struct LiveFrameContent {
     pub viewport: Vec<RenderedTranscriptLine>,
     pub completions: Vec<String>,
+    /// The open dialog card's pinned lines, rendered to (and padded to) the
+    /// claimed height. Empty when no dialog is open.
+    pub dialog_card: Vec<String>,
 }
 
 /// Project the root of the live frame: a single column whose chrome allocates
 /// from the bottom — status, hr, input, hr, completions (0–N) — with the live
 /// transcript viewport claiming the leftover (#805).
 ///
-/// `content` is `None` for the sizing pass, which carries the completions
-/// pane's natural extent and an empty viewport; the claims are
-/// content-independent, so both passes produce identical rects.
+/// When a dialog is open the card is an inline child of the same column
+/// (#807): the conversation viewport stays projected above it, the card
+/// claims its pinned extent below the separator, and the composer/status
+/// chrome yields for the duration (the dialog owns the keys, as before).
+/// `dialog_card_natural` is the card's pinned extent for the sizing pass;
+/// `content`, when given, is the pane, viewport, and card content sized to
+/// the first pass's claims.
 pub(crate) fn project_root(
     vm: &LiveViewModel<'_>,
     content: Option<&LiveFrameContent>,
     natural_completion_rows: usize,
+    dialog_card_natural: usize,
 ) -> Widget {
     let width = vm.terminal_width.max(1);
     let separator = super::session_separator_line(width, vm.cwd_label, vm.session_label);
@@ -510,39 +522,66 @@ pub(crate) fn project_root(
     let completions_rows = content
         .map(|c| c.completions.clone())
         .unwrap_or_else(|| vec![String::new(); completion_rows]);
-    Widget::Stack {
-        axis: Axis::Column,
-        children: vec![
-            (
-                Track::Flex {
-                    weight: 1,
-                    min: usize::from(!vm.live_rendered.is_empty()),
-                },
-                Widget::Marked(
-                    frame_key::TRANSCRIPT,
-                    Box::new(Widget::Viewport {
-                        lines: viewport_lines,
-                    }),
-                ),
+    let mut children: Vec<(Track, Widget)> = vec![(
+        // While a dialog owns focus the card outranks the live transcript:
+        // the floor yields so Yes/No keep their rows on small frames (#435).
+        Track::Flex {
+            weight: 1,
+            min: usize::from(!vm.live_rendered.is_empty() && vm.dialog.is_none()),
+        },
+        Widget::Marked(
+            frame_key::TRANSCRIPT,
+            Box::new(Widget::Viewport {
+                lines: viewport_lines,
+            }),
+        ),
+    )];
+    if vm.dialog.is_some() {
+        // Paint order below is [conversation, separator, card], so the tree
+        // carries the separator between the viewport and the card: the card
+        // claims the frame's trailing rows, exactly where the pinned lines
+        // are painted.
+        children.push((
+            Track::Natural,
+            Widget::Marked(
+                frame_key::SEPARATOR,
+                Box::new(Widget::Text {
+                    lines: vec![separator],
+                }),
             ),
-            (
-                Track::Natural,
-                Widget::Marked(
-                    frame_key::COMPLETIONS,
-                    Box::new(Widget::Completions {
-                        rows: completions_rows,
-                    }),
-                ),
+        ));
+        let card_lines = content.map_or(vec![String::new(); dialog_card_natural], |c| {
+            c.dialog_card.clone()
+        });
+        children.push((
+            Track::Natural,
+            Widget::Marked(
+                frame_key::DIALOG_CARD,
+                Box::new(Widget::DialogCard { lines: card_lines }),
             ),
-            (
-                Track::Natural,
-                Widget::Marked(
-                    frame_key::SEPARATOR,
-                    Box::new(Widget::Text {
-                        lines: vec![separator],
-                    }),
-                ),
+        ));
+    } else {
+        children.push((
+            Track::Natural,
+            Widget::Marked(
+                frame_key::COMPLETIONS,
+                Box::new(Widget::Completions {
+                    rows: completions_rows,
+                }),
             ),
+        ));
+        children.push((
+            Track::Natural,
+            Widget::Marked(
+                frame_key::SEPARATOR,
+                Box::new(Widget::Text {
+                    lines: vec![separator],
+                }),
+            ),
+        ));
+    }
+    if vm.dialog.is_none() {
+        children.extend([
             (
                 Track::Natural,
                 Widget::Marked(
@@ -566,7 +605,11 @@ pub(crate) fn project_root(
                     }),
                 ),
             ),
-        ],
+        ]);
+    }
+    Widget::Stack {
+        axis: Axis::Column,
+        children,
     }
 }
 
@@ -574,12 +617,14 @@ pub(crate) fn project_root(
 /// marked regions' rects.
 ///
 /// `natural_completion_rows` is the pane's unclamped extent (0 when a critical
-/// surface suppresses it); `content`, when given, is the pane and viewport
-/// content sized to the first pass's claims.
+/// surface suppresses it) and `dialog_card_natural` the open dialog card's
+/// pinned extent (0 when no dialog is open); `content`, when given, is the
+/// pane, viewport, and card content sized to the first pass's claims.
 pub(crate) fn claim_live_frame(
     vm: &LiveViewModel<'_>,
     content: Option<&LiveFrameContent>,
     natural_completion_rows: usize,
+    dialog_card_natural: usize,
 ) -> widgets::Layout {
     let frame = Rect {
         x: 0,
@@ -587,7 +632,10 @@ pub(crate) fn claim_live_frame(
         width: vm.terminal_width.max(1),
         height: vm.terminal_height,
     };
-    widgets::layout(&project_root(vm, content, natural_completion_rows), frame)
+    widgets::layout(
+        &project_root(vm, content, natural_completion_rows, dialog_card_natural),
+        frame,
+    )
 }
 
 /// The claimed regions of a layout, by name.
@@ -601,6 +649,7 @@ pub(crate) fn frame_rects(layout: &widgets::Layout) -> FrameRects {
         composer: layout.keyed(frame_key::COMPOSER).unwrap_or_default(),
         status_rule: layout.keyed(frame_key::STATUS_RULE).unwrap_or_default(),
         status: layout.keyed(frame_key::STATUS).unwrap_or_default(),
+        dialog_card: layout.keyed(frame_key::DIALOG_CARD).unwrap_or_default(),
     }
 }
 
