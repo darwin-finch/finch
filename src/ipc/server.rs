@@ -2643,7 +2643,17 @@ async fn prepare_ipc_listener() -> Result<PreparedIpcListener> {
     // A supervised daemon must consume the short, private socket path sealed
     // into its authenticated proof. The supervisor already bound the listener;
     // the child performs no pathname operation at startup or shutdown.
-    if let Some(proof) = crate::brain::isolated_test_proof_if_present()? {
+    // Cached per-process (#858); this call directly gates the "IPC server
+    // listening" log line below, so it is free unless it is the first proof
+    // validation the daemon reaches.
+    let proof_start = std::time::Instant::now();
+    let proof = crate::brain::isolated_test_proof_if_present()?;
+    tracing::debug!(
+        elapsed_ms = proof_start.elapsed().as_millis(),
+        present = proof.is_some(),
+        "isolated_test_proof_if_present (prepare_ipc_listener)"
+    );
+    if let Some(proof) = proof {
         let path = std::env::var_os("FINCH_TEST_IPC_SOCKET")
             .map(std::path::PathBuf::from)
             .context("supervised daemon is missing its sealed IPC socket path")?;

@@ -56,6 +56,11 @@ mod tasks;
 
 #[doc(hidden)]
 pub struct IsolatedTestProof {
+    // Clone is implemented by hand below, not derived: a derived impl is
+    // exempt from dead-code analysis, which would then flag every field
+    // this struct carries purely for later test-only verification
+    // (`root_identity`, `socket_root`, `socket_root_identity`,
+    // `supervisor_pid`) as unread in a non-test build.
     pub home: std::path::PathBuf,
     pub root: std::path::PathBuf,
     pub(crate) home_identity: (u64, u64),
@@ -68,6 +73,25 @@ pub struct IsolatedTestProof {
     pub(crate) ipc_listener_identity: (u64, u64),
     pub(crate) supervisor_pid: u32,
     pub(crate) password_digest: String,
+}
+
+impl Clone for IsolatedTestProof {
+    fn clone(&self) -> Self {
+        Self {
+            home: self.home.clone(),
+            root: self.root.clone(),
+            home_identity: self.home_identity,
+            root_identity: self.root_identity,
+            brain_addr: self.brain_addr.clone(),
+            daemon_addr: self.daemon_addr.clone(),
+            ipc_socket: self.ipc_socket.clone(),
+            socket_root: self.socket_root.clone(),
+            socket_root_identity: self.socket_root_identity,
+            ipc_listener_identity: self.ipc_listener_identity,
+            supervisor_pid: self.supervisor_pid,
+            password_digest: self.password_digest.clone(),
+        }
+    }
 }
 
 impl IsolatedTestProof {
@@ -682,9 +706,19 @@ fn verify_supervisor_image(
     // observe two different files.
     let metadata = file.metadata()?;
     let identity = format!("{}:{}", metadata.dev(), metadata.ino());
+    let read_start = std::time::Instant::now();
     let mut image = Vec::new();
     file.read_to_end(&mut image)?;
+    let read_elapsed = read_start.elapsed();
+    let hash_start = std::time::Instant::now();
     let digest = hex::encode(Sha256::digest(&image));
+    tracing::debug!(
+        executable = %executable.display(),
+        image_bytes = image.len(),
+        read_ms = read_elapsed.as_millis(),
+        hash_ms = hash_start.elapsed().as_millis(),
+        "supervisor executable image read and hashed"
+    );
 
     if let Some(path_digest) = content_addressed_supervisor_digest(executable) {
         anyhow::ensure!(
@@ -791,7 +825,48 @@ fn process_executable(pid: u32) -> anyhow::Result<std::path::PathBuf> {
     )))
 }
 
+#[cfg(test)]
+static PROOF_VALIDATION_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of times the full FD9 restore-and-verify transaction actually ran
+/// in this process, as opposed to being served from the cache below. A
+/// single `finch daemon` process calls into the proof at four separate
+/// sites over its startup (`run_daemon`, `AgentServer::new`,
+/// `AgentServer::serve`, `prepare_ipc_listener`); before caching, each one
+/// re-opened and re-hashed the full supervisor executable (issue #858 — a
+/// consistent ~42s startup delay isolated to exactly this redundant work).
+#[cfg(test)]
+pub(crate) fn proof_validation_call_count_for_tests() -> usize {
+    PROOF_VALIDATION_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// FD9, the inherited listeners, and the environment are sealed once at the
+/// supervisor's `exec`, so re-deriving the proof after the first successful
+/// validation only pays disk and CPU cost for the same answer. Cached for
+/// the life of the process, not merely memoized per call site, so all four
+/// production call sites in a daemon's startup share one validation.
 fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<u8>)> {
+    static CACHE: std::sync::OnceLock<Result<(IsolatedTestProof, Vec<u8>), String>> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let start = std::time::Instant::now();
+            let result = isolated_test_proof_with_encoded_uncached();
+            tracing::debug!(
+                elapsed_ms = start.elapsed().as_millis(),
+                ok = result.is_ok(),
+                "supervisor proof validated (cached for the remaining process lifetime)"
+            );
+            result.map_err(|error| format!("{error:#}"))
+        })
+        .clone()
+        .map_err(|message| anyhow::anyhow!(message))
+}
+
+fn isolated_test_proof_with_encoded_uncached() -> anyhow::Result<(IsolatedTestProof, Vec<u8>)> {
+    #[cfg(test)]
+    PROOF_VALIDATION_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     use anyhow::Context as _;
 
     // FD9 is the conventional production-facing descriptor and dup2 replaces
@@ -1443,6 +1518,42 @@ mod isolation_tests {
         // The permanent Brain-isolation CI gate runs these entries through
         // scripts/test_brains.sh, which supplies the authenticated contract.
         std::env::var_os("FINCH_BRAIN_TEST_TOKEN").is_some()
+    }
+
+    /// #858. A single `finch daemon` process under the supervised proof calls
+    /// into `isolated_test_proof_if_present()` from four separate startup
+    /// sites (`run_daemon`, `AgentServer::new`, `AgentServer::serve`,
+    /// `prepare_ipc_listener`). Before caching, each site independently
+    /// re-opened and re-hashed the full supervisor executable — a
+    /// consistent ~42s delay between local-generator construction and the
+    /// IPC socket bind on CI runners, isolated to exactly this redundant
+    /// work (see the diagnosis on issue #858). The fix is a process-lifetime
+    /// cache; this asserts the structural fact — exactly one validation no
+    /// matter how many call sites ask — rather than a wall-clock comparison.
+    #[test]
+    fn test_isolated_test_proof_validates_supervisor_image_once_per_process() {
+        if !supervisor_contract_present() {
+            return;
+        }
+        isolated_test_proof().expect("first proof validation must succeed");
+        let calls_after_first = proof_validation_call_count_for_tests();
+        assert!(
+            calls_after_first >= 1,
+            "the proof must have been validated at least once by now; calls={calls_after_first}"
+        );
+
+        isolated_test_proof().expect("second proof validation must succeed");
+        isolated_test_proof_if_present()
+            .expect("third proof validation must succeed")
+            .expect("supervisor contract is present, so the proof must be Some");
+
+        let calls_after_more = proof_validation_call_count_for_tests();
+        assert_eq!(
+            calls_after_more, calls_after_first,
+            "isolated_test_proof() must be served from the process-lifetime cache after its \
+             first successful validation, not re-open and re-hash the supervisor executable on \
+             every call site; calls_after_first={calls_after_first} calls_after_more={calls_after_more}"
+        );
     }
 
     fn drain_bounded<R: std::io::Read>(reader: &mut R, output: &mut Vec<u8>) {
