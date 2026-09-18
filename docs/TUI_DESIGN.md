@@ -169,9 +169,36 @@ ViewModel + component, attach it via the message's component accessor, done.
 | Stage | Scope | Bugs it kills | Gates |
 |---|---|---|---|
 | 1 | `WorkUnitComponent` for say turns: VM + chrome + ProgramSource/Output subwidgets + click routing; delete the `is_assistant_prose` suppression | dead ▼ affordance; program text unrecoverable by click; #820-class status residue re-checked at the PTY/daemon boundary | existing pinned invariants; new component tests at the claiming boundary |
-| 2 | Remaining WorkUnit presentations (program source/output turns, thinking section #749 as a subwidget, agent activity) | per-type rendering out of `view_model.rs` | `canonical_commit_marks_only_after_success_and_follows_resize_clear` untouched |
+| 2 | Say-turn consolidation to the maintainer's target (spec below); remaining WorkUnit presentations; thinking section #749 as a subwidget; agent activity | the stage-1 transition duplication (source group + card both rendering); per-type rendering out of `view_model.rs` | `canonical_commit_marks_only_after_success_and_follows_resize_clear` untouched |
 | 3 | `OperationMessage`, `LiveToolMessage`, `ProgressMessage`, `StaticMessage` (text is its view) get components — completing "every typed message has a view"; the `work_unit_view`-era trait hooks retire | structure flattened to text | RowId stability across message kinds |
 | 4 | DOM lowering + spans migration → Tauri #808 | — | one tree, two modes |
+
+### Stage-2 say-turn target (maintainer spec, 2026-09-18 — verbatim)
+
+A say turn renders as **one** thing per state — never a card stacked beside the legacy
+source group:
+
+- **Generating** (model working, no program yet): an animated progress indicator in the
+  opencode/codex/claude style, showing the model is producing the response.
+- **Running** (program exists, executing): the program source inline —
+  `(say "Hi, Shammah! …")` — no chrome row, no card, no glyph.
+- **Completed**: the output prose inline, wrapped naturally, plus the elapsed annotation
+  `(ran 0s)`. No Program source row, no Brain run row, no UUID, no result row, no card
+  chrome. Exactly:
+
+  ```
+   ❯ shammah: hi
+
+  Hi, Shammah! What would you like to work on? …(wrapped prose)…
+
+  (ran 0s)
+  ```
+- **Toggle**: clicking the completed output swaps it to the program source and back
+  (`show_program` on the component VM; the hit target is the output region, with the
+  keyboard path preserved for accessibility).
+
+The legacy Program source / Brain run / result rows do not render for say turns after this
+stage — the canonical record still contains the raw program and output once.
 
 Non-goals (unchanged): no observer/signal graph, no retained widget-object graph with
 shared mutability, no ratatui, components do not paint raw cells (they emit subtrees), the
