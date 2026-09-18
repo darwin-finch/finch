@@ -872,6 +872,85 @@ fn take_last_physical(lines: &[String], max_rows: usize, width: usize) -> Vec<St
     kept
 }
 
+/// The speakable, copyable record of an answered dialog (#807).
+///
+/// Native scrollback must carry the question, the options, and what was
+/// picked — never a pixel-only confirmation. The record is plain text: the
+/// question (the title), one line per option with its radio/checkbox state at
+/// submit time, and an explicit `Answer:` line naming the choice. Sanitised so
+/// provider-supplied question or option text cannot smuggle control sequences
+/// into the copyable record.
+pub(crate) fn settled_dialog_record(dialog: &Dialog, result: &DialogResult) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (index, title_line) in dialog.title.lines().enumerate() {
+        let prefix = if index == 0 { "? " } else { "  " };
+        lines.push(format!("{prefix}{title_line}"));
+    }
+
+    let mut answer = String::new();
+    match (&dialog.dialog_type, result) {
+        (DialogType::Select { options, .. }, DialogResult::Selected(picked)) => {
+            for (index, option) in options.iter().enumerate() {
+                let marker = if index == *picked { "●" } else { "○" };
+                lines.push(format!("  {marker} {}", option.label));
+            }
+            if let Some(option) = options.get(*picked) {
+                answer.clone_from(&option.label);
+            }
+        }
+        (DialogType::Select { .. }, DialogResult::CustomText(text)) => {
+            lines.push(format!("  ● Other: {text}"));
+            answer = format!("Other: {text}");
+        }
+        (DialogType::MultiSelect { options, .. }, DialogResult::MultiSelected(picked)) => {
+            for (index, option) in options.iter().enumerate() {
+                let marker = if picked.contains(&index) {
+                    "☑"
+                } else {
+                    "☐"
+                };
+                lines.push(format!("  {marker} {}", option.label));
+            }
+            let labels: Vec<&str> = picked
+                .iter()
+                .filter_map(|index| options.get(*index))
+                .map(|option| option.label.as_str())
+                .collect();
+            answer = if labels.is_empty() {
+                "(none)".to_string()
+            } else {
+                labels.join(", ")
+            };
+        }
+        (DialogType::MultiSelect { .. }, DialogResult::CustomText(text)) => {
+            lines.push(format!("  ● Other: {text}"));
+            answer = format!("Other: {text}");
+        }
+        (DialogType::Confirm { .. }, DialogResult::Confirmed(chosen)) => {
+            answer = if *chosen { "Yes" } else { "No" }.to_string();
+        }
+        (DialogType::TextInput { .. }, DialogResult::TextEntered(text)) => {
+            answer.clone_from(text);
+        }
+        (_, DialogResult::Cancelled) => {}
+        // A submit never produces these pairings; if one ever does, the
+        // question and the raw result are still recorded speakably.
+        (dialog_type, other) => {
+            lines.push(format!(
+                "  (unresolved result {other:?} for {dialog_type:?})"
+            ));
+            answer = format!("{other:?}");
+        }
+    }
+
+    if result.is_cancelled() {
+        lines.push("✗ Dismissed without answering".to_string());
+    } else {
+        lines.push(format!("✓ Answer: {answer}"));
+    }
+    crate::cli::diff::sanitize_multiline(&lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2126,6 +2205,250 @@ mod tests {
             live_rendered: &[],
         };
         super::super::plan_live_frame(&inputs, &mut autocomplete)
+    }
+
+    /// A frame with a live conversation streaming above an open dialog.
+    fn plan_conversation_with_dialog(
+        dialog: &Dialog,
+        width: usize,
+        height: usize,
+    ) -> super::super::LiveFrame {
+        let live: Vec<super::super::accordion::RenderedTranscriptLine> = (0..40)
+            .map(|row| super::super::accordion::RenderedTranscriptLine {
+                text: format!("conversation row {row}"),
+                ..super::super::accordion::RenderedTranscriptLine::default()
+            })
+            .collect();
+        let input = vec![String::new()];
+        let mut autocomplete = super::super::AutocompleteState::new();
+        let inputs = super::super::view_model::LiveViewModel {
+            terminal_width: width,
+            terminal_height: height,
+            input_lines: &input,
+            input_cursor: (0, 0),
+            ghost_text: None,
+            effective_status: "approval pending",
+            cwd_label: "~/repos/finch",
+            session_label: "jade-river",
+            dialog: Some(dialog),
+            expanded_lines: None,
+            render_error: false,
+            task_rows: &[],
+            tracked_rows: &[],
+            live_rendered: &live,
+        };
+        super::super::plan_live_frame(&inputs, &mut autocomplete)
+    }
+
+    /// The card's painted lines: the trailing physical rows of the frame up to
+    /// the card's claimed height (the card is the frame's last region).
+    fn card_lines_of(frame: &super::super::LiveFrame, width: usize) -> Vec<String> {
+        let card_height = frame.rects.dialog_card.height;
+        let mut lines = Vec::new();
+        let mut used = 0usize;
+        for line in frame.lines.iter().rev() {
+            lines.push(line.clone());
+            used += super::super::shadow_buffer::physical_rows(line, width);
+            if used >= card_height {
+                break;
+            }
+        }
+        lines.reverse();
+        lines
+    }
+
+    fn plain_text(lines: &[String]) -> String {
+        lines
+            .iter()
+            .map(|line| strip_sgr(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #807: an open dialog is an inline region of the conversation — a
+    /// claimed card below a still-projected transcript, with radio markers
+    /// inside the card and focus driving the untouched state machine.
+    #[test]
+    fn test_open_dialog_is_an_inline_region_in_the_conversation_frame() {
+        let width = 80;
+        let height = 24;
+        let mut dialog = Dialog::select(
+            "Which database should the migration target?",
+            vec![
+                DialogOption::new("production"),
+                DialogOption::new("staging"),
+            ],
+        );
+        let frame = plan_conversation_with_dialog(&dialog, width, height);
+        let card = frame.rects.dialog_card;
+
+        assert!(
+            !card.is_empty() && card.width == width && card.bottom() <= height,
+            "the open dialog must claim an inline card region inside the frame; \
+             card={card:?} frame={width}x{height}"
+        );
+        assert!(
+            frame.rects.transcript.height > 0,
+            "the conversation must stay projected above the card: rects={:?}",
+            frame.rects
+        );
+        assert!(
+            frame.rects.transcript.bottom() <= card.y,
+            "the card must not overlap the transcript region: transcript={:?} card={card:?}",
+            frame.rects.transcript
+        );
+        assert!(
+            frame.physical_rows(width) <= height,
+            "the card must never push the frame past the terminal: painted={} height={height}",
+            frame.physical_rows(width)
+        );
+        assert_eq!(
+            card.bottom(),
+            frame.physical_rows(width),
+            "the card must claim the frame's trailing rows, exactly where its lines \
+             are painted: card={card:?} painted={}",
+            frame.physical_rows(width)
+        );
+        assert_eq!(
+            frame.rects.separator.bottom(),
+            card.y,
+            "the separator must be claimed directly above the card, matching the paint \
+             order: separator={:?} card={card:?}",
+            frame.rects.separator
+        );
+
+        // The conversation ScrollView keeps the transcript claim it had
+        // without a dialog, so the open card does not own the whole viewport.
+        let mut scroll_view = super::super::scroll_view::TranscriptScrollView::new();
+        scroll_view.set_claim(frame.rects.transcript);
+        assert!(
+            scroll_view.owns(0, frame.rects.transcript.y as u16),
+            "the ScrollView must own the projected conversation above the card; \
+             claim={:?}",
+            frame.rects.transcript
+        );
+
+        // The card paints the question and radio markers; Space toggles the
+        // focused radio inside the still-focused state machine.
+        let card_text = plain_text(&card_lines_of(&frame, width));
+        assert!(
+            card_text.contains("Which database should the migration target?")
+                && card_text.contains("● production")
+                && card_text.contains("○ staging"),
+            "the card must render the question with radio markers:\n{card_text}"
+        );
+
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        let focused = plan_conversation_with_dialog(&dialog, width, height);
+        let focused_text = plain_text(&card_lines_of(&focused, width));
+        assert!(
+            focused_text.contains("○ production") && focused_text.contains("● staging"),
+            "Space/arrows must toggle the focused radio inside the card:\n{focused_text}"
+        );
+        assert_eq!(
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Enter)),
+            Some(DialogResult::Selected(1)),
+            "Enter must submit the focused option through the untouched state machine"
+        );
+    }
+
+    /// #435 regression, card-shaped (#807): a long write preview scrolls
+    /// INSIDE the card's box — Yes/No stay pinned inside the card's claimed
+    /// rect at the same trailing rows, the card's height never moves, and the
+    /// frame never overflows the terminal. The old overlay had no claimed card
+    /// region at all, so the claimed-rect assertions fail against it.
+    #[test]
+    fn test_write_approval_card_keeps_controls_inside_the_card_while_body_scrolls() {
+        let body = (0..400)
+            .map(|i| format!("payload-line-{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dialog = Dialog::tool_approval(
+            "Write",
+            "overwrite docs.html, 12 KB, replacing existing content",
+        )
+        .with_body(body);
+        let width = 72;
+        let height = 18;
+
+        let frame = plan_approval_frame(&dialog, width, height);
+        let card = frame.rects.dialog_card;
+        let card_text = plain_text(&card_lines_of(&frame, width));
+        assert!(
+            !card.is_empty() && card.bottom() <= height,
+            "the open approval must claim its card inside the frame: card={card:?} \
+             frame={width}x{height}"
+        );
+        assert!(
+            card_text.contains("1. Yes") && card_text.contains("4. No"),
+            "Yes/No must be inside the card's claimed rect: card={card:?}\n{card_text}"
+        );
+        assert!(
+            card_text.contains("payload-line-000"),
+            "the preview body must render inside the card:\n{card_text}"
+        );
+        assert!(
+            frame.physical_rows(width) <= height,
+            "the card must never push the frame past the terminal: painted={} height={height}",
+            frame.physical_rows(width)
+        );
+        assert_eq!(
+            card.bottom(),
+            frame.physical_rows(width),
+            "the card must claim the frame's trailing rows, exactly where its lines \
+             are painted: card={card:?} painted={}",
+            frame.physical_rows(width)
+        );
+        let yes_trailing = card_text
+            .lines()
+            .position(|line| line.contains("1. Yes"))
+            .expect("Yes inside the card");
+
+        let mut scrolled = dialog.clone();
+        scrolled.body_scroll_offset = 80;
+        let scrolled_frame = plan_approval_frame(&scrolled, width, height);
+        let scrolled_card = scrolled_frame.rects.dialog_card;
+        let scrolled_text = plain_text(&card_lines_of(&scrolled_frame, width));
+        assert_eq!(
+            card.height, scrolled_card.height,
+            "scrolling the body must not resize the card: {card:?} vs {scrolled_card:?}"
+        );
+        let scrolled_yes = scrolled_text
+            .lines()
+            .position(|line| line.contains("1. Yes"))
+            .expect("Yes inside the card after scroll");
+        assert_eq!(
+            yes_trailing, scrolled_yes,
+            "Yes must keep its row inside the card while the body scrolls:\nbefore:\n{card_text}\
+             \nafter:\n{scrolled_text}"
+        );
+        assert!(
+            !scrolled_text.contains("payload-line-000")
+                && scrolled_text.contains("payload-line-080"),
+            "the body must scroll INSIDE the card, not move the card:\n{scrolled_text}"
+        );
+    }
+
+    /// The exact-fit budget the overlay guaranteed at tiny terminals carries
+    /// over to the card: on an 8-row frame the card keeps Yes/No visible.
+    #[test]
+    fn test_dialog_card_keeps_approval_controls_on_a_tiny_frame() {
+        let (dialog, payload_bytes) = huge_html_write_dialog();
+        let width = 80;
+        let height = 8;
+        let frame = plan_approval_frame(&dialog, width, height);
+        let card = frame.rects.dialog_card;
+        let card_text = plain_text(&card_lines_of(&frame, width));
+        assert!(
+            card_text.contains("1. Yes") && card_text.contains("4. No"),
+            "an exact-fit card must keep approve/deny on an 8-row frame: card={card:?} \
+             payload_bytes={payload_bytes}\n{card_text}"
+        );
+        assert!(
+            !card_text.contains("dialog clipped to viewport"),
+            "the exact-fit suffix must not take the too-many-options top-clip: \
+             card={card:?} payload_bytes={payload_bytes}\n{card_text}"
+        );
     }
 
     /// A minified HTML write used to push approve/deny off-screen before the

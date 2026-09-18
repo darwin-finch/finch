@@ -102,6 +102,12 @@ pub(crate) enum Widget {
     /// has left; only lines that fit are visible, and expandable rows inside
     /// the visible window claim the hit rects the depth-first pass records.
     Viewport { lines: Vec<RenderedTranscriptLine> },
+    /// One dialog card (#807): the pinned lines `dialog_lines` produced for a
+    /// `Dialog`, painted as an inline region of the conversation column. The
+    /// card claims exactly the physical rows its lines occupy — the caller
+    /// pins and pads the lines to the claimed budget, so the box, not the
+    /// content, decides the height and Yes/No/Submit can never leave it.
+    DialogCard { lines: Vec<String> },
     /// Marks a subtree so the layout result can hand back its claimed rect
     /// under a stable key.
     Marked(u16, Box<Widget>),
@@ -184,7 +190,10 @@ fn claim(widget: &Widget, offered: Rect, result: &mut Layout) -> Rect {
             });
             rect
         }
-        Widget::Text { lines: _ } | Widget::Completions { rows: _ } | Widget::Composer { .. } => {
+        Widget::Text { lines: _ }
+        | Widget::Completions { rows: _ }
+        | Widget::Composer { .. }
+        | Widget::DialogCard { lines: _ } => {
             result.nodes.push(NodeLayout {
                 key: None,
                 rect: offered,
@@ -415,6 +424,10 @@ fn natural_height(widget: &Widget, cross: usize) -> usize {
             .iter()
             .map(|line| shadow_buffer::physical_rows(line, width))
             .sum(),
+        Widget::DialogCard { lines } => lines
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(line, width))
+            .sum(),
         Widget::Rule => 1,
         Widget::Completions { rows } => rows.len(),
         Widget::Composer { input_lines, ghost } => {
@@ -444,6 +457,11 @@ fn natural_width(widget: &Widget) -> usize {
             }
         }
         Widget::Text { lines } => lines
+            .iter()
+            .map(|line| shadow_buffer::visible_length(line))
+            .max()
+            .unwrap_or(0),
+        Widget::DialogCard { lines } => lines
             .iter()
             .map(|line| shadow_buffer::visible_length(line))
             .max()

@@ -55,6 +55,31 @@ release-on-first-wheel hybrid is retired, native history stays the copyable reco
 `canonical_commit`, and while scrolled up a commit anchors the window instead of dragging
 the reader.
 
+## Dialogs are conversation widgets (#807)
+
+An open dialog is an inline card claimed by the widget tree, not a global overlay. When
+`vm.dialog` is set, `project_root` places a `Widget::DialogCard` child (`Track::Natural`,
+marked `DIALOG_CARD`) between the transcript viewport and the session separator; the
+conversation above stays projected and the ScrollView keeps its claim, while the composer
+and status yield for the duration (the dialog owns the keys, exactly as the old overlay
+did). The card's lines are the pinned output of `TuiRenderer::dialog_lines` — the
+`pin_dialog_controls` discipline that keeps Yes/No/Submit inside the card while the
+preview body scrolls inside it (#435) — re-rendered to, and padded to exactly, the
+height the sizing pass claimed, so both claiming passes see the same box and the erase
+estimator (`live_geometry`) plans the identical frame ("one planner, two consumers").
+Wheels and clicks over the conversation stay gated while a dialog owns focus. Overlay
+placement (a z-layer above the conversation, #713/#793) is the same widget under a
+different parent; it is not a second renderer and must blit through the shadow buffer.
+
+After submit the renderer freezes the settled card into the conversation:
+`complete_dialog` (async input) / `settle_dialog` (blocking `show_dialog`) writes a
+speakable, sanitised record — the question, every option with its radio/checkbox state at
+submit time, and an explicit `Answer:` line — into the OutputManager, so the standard
+exactly-once canonical-commit pipeline carries it into native scrollback. Approval
+event semantics (`ToolApprovalNeeded` routing, `pending_dialog_result` consumers) are
+untouched. `TabbedDialog` (2+ question cards) is still the ratatui alternate-screen
+wizard and is a follow-up.
+
 ## View types the renderer owns
 
 The same inversion the todo list and child-agent rows already use (`activity.rs`): the renderer
@@ -69,7 +94,7 @@ draws a view, and the caller converts.
 | [`cell_format::workbook_cell_to_string`](cell_format.rs) | one cell as text | calamine `Data`, inside `spreadsheet_preview_rows` |
 
 When `active_dialog` first occupies the live surface, `draw_live_area` writes one terminal bell
-(`\x07`). Redraws of the same pending overlay stay silent. OS notifications, duration-threshold
+(`\x07`). Redraws of the same pending card stay silent. OS notifications, duration-threshold
 run-complete toasts, and a config off-switch remain follow-up on #752 (notify on attention-needed).
 
 ## Disclosure and focus are renderer state
