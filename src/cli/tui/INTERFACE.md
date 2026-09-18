@@ -214,6 +214,37 @@ impl TuiRenderer {
     pub fn trigger_refresh(&mut self);
     pub fn update_ghost_text(&mut self);
 }
+/// One overlay card: a claimed rect whose chrome is pinned inside it.
+pub struct WizardCard { … }
+impl WizardCard {
+    /// A card that announces and instructs: title, body, controls, cyan chrome.
+    pub fn new(title: impl Into<String>, body: Vec<String>, controls: Option<String>) -> Self;
+}
+/// The wizard view's own colour vocabulary.
+pub enum WizardColor { Black, Red, Green, Yellow, Blue, Magenta, Cyan, Gray, DarkGray, White, Truecolor }
+/// One planned wizard frame: the painted lines, the rects the tree claimed, and each line's physical-row span for the row-diff blit.
+pub struct WizardFrame { … }
+impl WizardFrame {
+    /// Render this frame into a shadow buffer of the given size, so a test can assert on the cells a terminal would end up holding.
+    pub fn to_shadow_buffer(&self, width: usize, height: usize) -> ShadowBuffer;
+}
+/// The wizard's renderer host.
+pub struct WizardHost { … }
+impl WizardHost {
+    pub fn new() -> Self;
+    /// Blit one frame to `out`.
+    pub fn paint(&mut self, out: &mut impl Write, frame: &WizardFrame, width: usize, height: usize) -> Result<()>;
+}
+/// The claimed regions of one wizard frame, in the frame's own coordinates.
+pub struct WizardRects { … }
+/// The section content: full logical lines plus how the host should window them into the claimed leftover.
+pub struct WizardSectionContent { … }
+impl WizardSectionContent {
+    /// Plain top-anchored content.
+    pub fn plain(lines: Vec<String>) -> Self;
+}
+/// Everything one wizard frame paints.
+pub struct WizardView { … }
 ```
 
 ## Functions
@@ -233,12 +264,28 @@ pub fn emergency_restore_terminal() { … }
 pub(crate) fn format_custom_input_content(input: &str, cursor: usize) -> String { … }
 /// Returns `(ansi_on, marker)` for the "Other (custom response)" row.
 pub(crate) fn other_row_parts(is_selected: bool) -> (String, &'static str) { … }
+/// Number of physical terminal rows occupied by one logical line.
+pub fn physical_rows(s: &str, terminal_width: usize) -> usize { … }
 /// Lay out one live-area frame.
 pub(crate) fn plan_live_frame(vm: &view_model::LiveViewModel<'_>, autocomplete: &mut AutocompleteState) -> LiveFrame { … }
+/// Plan one wizard frame: run the claiming pass, then size the section and card contents to the claimed rects and emit the lines in paint order.
+pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> WizardFrame { … }
 /// Spawn a background task that polls keyboard input and sends to channel  This enables non-blocking input handling in the event loop: - Polls keyboard with 100…
 pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>, quit_tx: mpsc::UnboundedSender<Vec<u8>>) -> mpsc::UnboundedReceiver<InputEvent> { … }
 /// Calculate visible display-column width of string (excluding ANSI escape codes).
 pub fn visible_length(s: &str) -> usize { … }
+/// A coloured, bold wizard span.
+pub fn wizard_bold(text: &str, fg: WizardColor) -> String { … }
+/// One boxed region of a wizard section: `title` on the top border, every body line wrapped and padded so the accent border stays on the box.
+pub fn wizard_boxed(title: &str, body: &[String], accent: WizardColor, width: usize) -> Vec<String> { … }
+/// Centre `text` (ANSI-aware) in `width` display columns.
+pub fn wizard_centered(text: &str, width: usize) -> String { … }
+/// A coloured, non-bold wizard span.
+pub fn wizard_line(text: &str, fg: WizardColor) -> String { … }
+/// One styled wizard span: optional foreground colour plus bold.
+pub fn wizard_paint(text: &str, fg: Option<WizardColor>, bold: bool) -> String { … }
+/// A plain wizard span.
+pub fn wizard_plain(text: &str) -> String { … }
 ```
 
 ## Modules

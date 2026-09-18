@@ -65,6 +65,20 @@ dialog card as an inline child (#807) and the composer/status yield. Resize is a
 pass — no widget keeps a cell count from the previous frame. `Row` parents place children side
 by side, and `Side` tracks are the width-conditional rails (#810).
 
+**The setup wizard rides the same tree** (`src/cli/tui/wizard_host.rs`, #812): the setup
+wizard is no longer a second terminal app. `setup_wizard/render.rs` converts wizard
+state into one `WizardView` snapshot (tab titles, section lines, help, one optional
+overlay card); `plan_wizard_frame` projects it into the claiming `widgets` tree — a
+column whose 3-row tab block and 1-row help claim natural extents and whose section
+claims the leftover — and `WizardHost::paint` renders the frame into a `ShadowBuffer`,
+diffs rows against the previous frame, and rewrites only the logical lines whose visible
+rows changed. Device-code/add-provider/cancel overlays are `Widget::DialogCard` children
+(the #807 contract: claimed rect, chrome pinned inside the card, help yields while the
+card owns keys). The wizard keeps its own terminal lifecycle (raw mode, alternate
+screen, mouse capture), so the #265 editor/PTY handoff is unchanged; the view props are
+the speakable canonical form a GUI setup surface (#808) can consume. The general
+z-compositor (#793) remains a follow-up.
+
 **Dialog system** (`src/cli/tui/dialog.rs`):
 - `Select` — Enter submits immediately; `o`/`O` or typing on Other row activates custom input
 - `MultiSelect` — live prompts render the complete `↑/↓`, Space, Enter, and Esc keyboard hint; Space toggles, and Enter on the virtual Submit row emits `DialogResult::MultiSelected`
@@ -118,5 +132,6 @@ Virtual row helpers:
 - `src/cli/tui/tool_viewport.rs` — bounded tool-result controls: child viewport state, wheel hit regions, expanded surface
 - `src/cli/tui/scrollback.rs` — `ScrollbackBuffer`
 - `src/cli/tui/dialog.rs` — Dialog state machine and approval control pin
+- `src/cli/tui/wizard_host.rs` — the setup wizard's widget host: view snapshot, claiming plan, shadow-buffer row-diff blit (#812)
 - `src/cli/tui/input_widget.rs` — Input area (tui-textarea)
 - `src/cli/tui/status_widget.rs` — Status bar

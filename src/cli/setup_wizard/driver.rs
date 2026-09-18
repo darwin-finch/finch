@@ -256,9 +256,12 @@ pub(super) fn advance_scan_if_done(state: &mut WizardState) {
     }
 }
 
-/// Run the NEW tabbed wizard with section navigation
+/// Run the NEW tabbed wizard with section navigation.
+///
+/// #812: the frame is planned by the widget host (`wizard_view` →
+/// `plan_wizard_frame`) and blitted through the shadow buffer — the wizard
+/// constructs no private terminal and owns no second painter.
 pub(super) fn run_tabbed_wizard(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     existing_config: Option<&crate::config::Config>,
 ) -> Result<SetupResult> {
     let mut state = WizardState::new(existing_config);
@@ -296,10 +299,16 @@ pub(super) fn run_tabbed_wizard(
         }
     };
 
+    let mut host = crate::cli::tui::WizardHost::new();
+
     loop {
-        terminal.draw(|f| {
-            render_tabbed_wizard(f, &state);
-        })?;
+        // Resize is a fresh planning pass every frame; the host diffs rows
+        // through the shadow buffer, so only changed lines reach the wire.
+        let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let (width, height) = (term_w as usize, term_h as usize);
+        let view = wizard_view(&state, width, height);
+        let frame = crate::cli::tui::plan_wizard_frame(&view, width, height);
+        host.paint(&mut io::stdout(), &frame, width, height)?;
 
         // When scanning for network agents, poll with a short timeout so we can check
         // the background thread's results without blocking on keyboard input.
