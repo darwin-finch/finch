@@ -965,6 +965,17 @@ already applied to rejecting classic overload resolution elsewhere in this docum
 no `@constructor` declared is unchanged: plain literal construction remains available, so this is
 purely additive and opt-in.
 
+**Added 2026-09-17: field visibility, concretely — checked, and nothing previously said how to
+write it.** "Owns its... visibility" (above) asserted the property without a mechanism; a field is
+readable and writable through a record value only from within the module that declares the record
+by default, matching the general rule already stated for every other declaration ("local visibility
+begins at the declaration"); `pub` before a field name in the record declaration exposes it outside
+the module. This is what makes `@constructor` mean something concrete rather than aspirational: a
+record whose fields are all module-private and that declares an `@constructor` is now genuinely
+encapsulated across a module boundary, not merely by convention — the same guarantee C++, Swift, and
+Rust's `pub`-field visibility give, composed from two small, separately-motivated rules rather than
+one bespoke "encapsulated record" feature.
+
 Named records have nominal identity. Matching field names do not make independently declared
 records interchangeable, because their invariants, constructors, lifecycle evidence, and layout
 contracts may differ. Structural width conversion is available only through an explicit readonly
