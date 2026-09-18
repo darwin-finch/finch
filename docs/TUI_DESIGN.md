@@ -125,6 +125,28 @@ back from the DOM as the same opaque `(RowId, Action)` pairs — DOM click handl
 element's data attributes. One ViewModel, two lowering methods, no fork. This is why the
 `format()`-style pre-rendered SGR strings must migrate to spans as surfaces are converted.
 
+### The DOM boundary (2026-09-18 refinement)
+
+The component ViewModel stays **typed**; composability comes from trait-object components
+and the manifest tree, not from untyped state. What is generalized is the serialization
+boundary only:
+
+- **Manifest node** — the engine lowers the widget tree to a serializable
+  `DynamicUiNode { element_type, id, props: HashMap<String, Value>, children }`
+  (serde; JSON-valued props, not strings). This is the wire format for Tauri.
+- **Component registry** — the JSX side maps `element_type` to components via a registry
+  (Vite glob imports keep it decentralized). Maintainer-accepted centralization.
+- **Backpropagation** — one generic IPC command `propagate_ui_action(widget_id, action_id,
+  payload)` routes to the component by id; the command is a pass-through and knows nothing
+  about components, mirroring the terminal `(RowId, Action)` routing. A Tauri mutation
+  wakes the same redraw mechanism the terminal event loop already uses.
+- **Override hook** — a component may override the DOM lowering for bespoke nodes
+  (`render_dom` per node); the default lowers the shared subtree. Prefer the default:
+  two render methods per component are a drift hazard.
+- **Topology** — components live in the daemon process; the Tauri binary is a thin client
+  receiving the manifest over the daemon's IPC (#808 attach-or-spawn). The widget engine is
+  never compiled into the GUI process.
+
 ## Dependency direction (the one structural move)
 
 Components need the widget vocabulary without touching `crossterm` or the shadow buffer.
