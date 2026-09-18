@@ -293,3 +293,39 @@ method alongside prose audit:**
   exists, with no grammar. Flagged, not guessed at. This is meant to keep running: the plan going
   forward is prose-audit-and-example-program in the same pass, since the records gap was found by
   trying to write code against the spec, not by re-reading it.
+
+**Continued 2026-09-17 — the example programs immediately caught a second, worse defect than the
+records one: I'd been writing CoLisp with invented syntax (`fn`, `->` for return types, `=>` before a
+body) that isn't in this document anywhere.** Shammah caught it by asking directly whether Finch uses
+that arrow notation. The real form, already established in "Functions and annotations"
+(`square`/`save-report`) and now used consistently in the `constructor`/`get` fix above and
+throughout `feature_tour.md`: `(define (name (params...)) : ReturnType ! effects body...)` — `define`,
+`: T` after the parameter list closes, no separator token before the body. Also wrong: record
+construction as `Foo { x: a, y: b }` (that's Co-Forth's spelling) instead of CoLisp's
+`(Foo :x a :y b)` from the parity ledger, and a redundant explicit `(borrow x : Foo)` this document
+already retired.
+
+Also answered directly, since Shammah asked it precisely: `->` is not a C++-style parsing hazard in
+either frontend, because both readers tokenize purely by whitespace and a small fixed reader-macro
+set, never by context-dependent retokenization — a bare `->` always reads as one atom. The actual
+defect was spelling, not ambiguity; noted in the doc so it isn't re-litigated.
+
+Fixing this surfaced two more open items while writing real code against real established syntax
+rather than pseudocode, both now logged rather than guessed past:
+- **No confirmed call-site convention for an inherent constructor or operation.** `Account.open(...)`
+  is a guess by analogy (a constructor has no receiver to call through, so it needs *some*
+  namespacing), not a confirmed spelling — nothing else in the document calls one.
+- **Concept dispatch is not `Type.operation(...)`.** Checked against "Every implementation has a
+  stable qualified name... a call either names it with `using`, receives it through a generic
+  evidence parameter, or uses one default explicitly imported" ("Generics, concepts, dispatch, and
+  metaprogramming") — dispatch is a bare call resolved against evidence in scope, not
+  type-qualification. `feature_tour.md` §3 corrected to `(serialize u opts)` instead of
+  `User.serialize u opts`.
+- **Generic-header placement on a hand-written `define`** (e.g. `<O : Owner<Foo>>` for a
+  `match-type` body) has no example anywhere either — every real `match-type` example matches on a
+  parameter already in scope, never shows the signature that bound it. Marked UNVERIFIED in
+  `feature_tour.md` §2 rather than presented as settled.
+
+None of these three are fixed yet — they're the next things to resolve, in that order, since the
+constructor/operation call-site question blocks writing any further inherent-implementation example
+cleanly.

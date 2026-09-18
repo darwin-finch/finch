@@ -955,35 +955,71 @@ document supports that — every other `implementation` in this document is
 bound: `implementation Foo { ... }` is an *inherent implementation*, the same declaration shape as a
 concept implementation with the `for Y : Concept` clause simply omitted. It hosts three kinds of
 member, told apart by leading keyword rather than by an attribute — `constructor`, `get`/`set`, and
-plain `operation`:
+plain `operation`.
 
-```text
-implementation Account {
-    constructor open(id: string) -> Account =>
-        Account { id: id, balance: 0 }
+**Corrected 2026-09-17: the first draft of this example used `fn`, `->` for a return type, and `=>`
+before a body — none of which are CoLisp.** Caught by Shammah asking directly whether Finch even
+uses that arrow notation. It doesn't, and checking why matters: the *real* canonical CoLisp function
+form, already established in "Functions and annotations" (`square`, `save-report`), is
+`(define (name (params...)) : ReturnType ! effects body...)` — `define`, not `fn`; the return type
+is `: T` **after** the closing parenthesis of the parameter list, not `-> T` inside it; and there is
+no separator token before the body at all, because in an S-expression the body is simply whatever
+forms remain — that's how every Lisp body has always worked, and inventing `=>` to mark it was
+pure, ungrounded overhead, exactly the kind of extra mental load this whole document keeps trying to
+retire rather than add. Record construction is likewise not `Foo { x: a, y: b }` — that curly-brace
+form is Co-Forth's; CoLisp's own parity-ledger entry ("Canonical structured surface and parity
+ledger," above) is keyword-argument style, `(Foo :x a :y b)`.
 
-    get balance(&self) -> int =>
-        self.balance
+Concept/implementation blocks were never actually given a real CoLisp form to match against — the
+`JsonSerializable`/`UserJson` example above ("Generics, concepts, dispatch, and metaprogramming") is
+itself only pseudocode paired with a real Co-Forth form, and the parity ledger has no
+concept/implementation/operation row at all. That gap predates this section and is out of scope to
+close here (logged in `PROGRESS.md` instead), but this addition still needs *a* real CoLisp form to
+be usable, so it defines one for the inherent case using only vocabulary already established
+elsewhere in this document — `define`'s signature shape, and the keyword-argument record
+constructor just above:
 
-    set balance(&mut self, v: int) -> () ! throws NegativeBalance =>
-        if v < 0 { throw NegativeBalance } else { self.balance = v }
+```lisp
+(implementation Account
+  (constructor (open (id : string)) : Account
+    (Account :id id :balance 0))
 
-    operation close(&mut self) -> () =>
-        self.balance = 0
-}
+  (get (balance (self)) : int
+    (. self balance)))
 ```
 
-Co-Forth carries the same three keywords as word-prefixed declarations, matching `concept:`'s and
-`operation:`'s existing shape:
+`self` is an ordinary parameter; unannotated, it defaults to `borrow`, the same default every other
+parameter already uses — no new receiver notation needed for a read-only accessor.
+
+**Named gap, not fabricated, surfaced by trying to write `set` in real CoLisp rather than pseudocode:**
+a setter's receiver needs the exclusive mutable borrow this document already flags as unnamed
+(`borrow-mut`, "Steal, and the rest of #674's scope," above), and once inside the body, writing the
+field in place needs a primitive this document has also never named — `record-set` is explicitly
+functional/copying, and "mutation only through typed references with explicit `vm.write` effects" is
+stated as a semantic-profile goal, never given a surface form. These are two separate decisions
+(what a caller writes for the receiver; what the body writes to mutate through it), and `set`/any
+mutating inherent `operation` stays pseudocode-only — not sketched with an invented primitive — until
+both are named. Both belong with `borrow-mut` as one open item, not two, since a mutable-borrow
+keyword with nothing you can legally do through it once you have one is half a feature.
+
+Co-Forth's shape for the part that *is* resolved:
 
 ```forth
 implementation: Account
   constructor: open ( S string -- S Account ) ;
   get: balance ( S borrow Self -- S int ) ;
-  set: balance ( S borrow-mut Self int -- S ! throws NegativeBalance ) ;
-  operation: close ( S borrow-mut Self -- S ) ;
 ;
 ```
+
+**On why `->` isn't a parsing hazard here even where it appeared (a question worth answering
+precisely rather than waving at "Lisp is fine"):** both readers tokenize purely by whitespace and a
+small fixed set of reader macro characters (parens, quotes) — never by retokenizing an operator
+based on the type of what surrounds it. A bare `->` is read as one atom the same way `set!` or
+`string->number`-style names already are in Scheme convention; there is no C++-style
+maximal-munch step that could instead see `-` then `>` depending on context, because no such step
+exists in either reader. The actual defect in the original draft wasn't an ambiguity risk — it was
+using a token the language had never adopted for this purpose, when an unambiguous one (`: T`)
+already existed and was already load-bearing elsewhere in this same document.
 
 **`constructor` replaces the earlier `@constructor` attribute; enforcement is unchanged.** Private
 fields plus an ordinary function is not, by itself, a real guarantee — anything with field
