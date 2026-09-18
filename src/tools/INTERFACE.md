@@ -36,6 +36,21 @@ pub struct AnsibleTool;
 /// Source of approval for a tool execution
 pub enum ApprovalSource { NotApproved, SessionExact, SessionPattern, PersistentExact, PersistentPattern }
 pub struct AskUserQuestionTool;
+/// Start a shell command in the background; returns a stable task ID.
+pub struct BackgroundBashTool { … }
+impl BackgroundBashTool {
+    pub fn new(tasks: Arc<BackgroundTaskManager>) -> Self;
+}
+/// Poll a background task's status and captured output.
+pub struct BackgroundPollTool { … }
+impl BackgroundPollTool {
+    pub fn new(tasks: Arc<BackgroundTaskManager>) -> Self;
+}
+/// Stop a background task: kill its recorded process and reap it.
+pub struct BackgroundStopTool { … }
+impl BackgroundStopTool {
+    pub fn new(tasks: Arc<BackgroundTaskManager>) -> Self;
+}
 pub struct BashTool;
 /// Extended ContentBlock enum to support tool use
 pub enum ContentBlock { Text, ToolUse, ToolResult }

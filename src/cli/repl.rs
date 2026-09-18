@@ -875,6 +875,18 @@ impl Repl {
         tool_registry.register(Box::new(GrepTool));
         tool_registry.register(Box::new(WebFetchTool::new()));
         tool_registry.register(Box::new(BashTool));
+        // Background command lifecycle (#754): one manager per session, so
+        // tasks live beyond turns under the process that runs the tool loop.
+        let background_tasks = Arc::new(crate::brain::BackgroundTaskManager::new());
+        tool_registry.register(Box::new(crate::tools::BackgroundBashTool::new(Arc::clone(
+            &background_tasks,
+        ))));
+        tool_registry.register(Box::new(crate::tools::BackgroundPollTool::new(Arc::clone(
+            &background_tasks,
+        ))));
+        tool_registry.register(Box::new(crate::tools::BackgroundStopTool::new(
+            background_tasks,
+        )));
         tool_registry.register(Box::new(EditTool));
         tool_registry.register(Box::new(PatchTool));
         tool_registry.register(Box::new(WriteTool));
@@ -1007,6 +1019,16 @@ impl Repl {
                 fallback_registry.register(Box::new(GrepTool));
                 fallback_registry.register(Box::new(WebFetchTool::new()));
                 fallback_registry.register(Box::new(BashTool));
+                let background_tasks = Arc::new(crate::brain::BackgroundTaskManager::new());
+                fallback_registry.register(Box::new(crate::tools::BackgroundBashTool::new(
+                    Arc::clone(&background_tasks),
+                )));
+                fallback_registry.register(Box::new(crate::tools::BackgroundPollTool::new(
+                    Arc::clone(&background_tasks),
+                )));
+                fallback_registry.register(Box::new(crate::tools::BackgroundStopTool::new(
+                    background_tasks,
+                )));
                 fallback_registry.register(Box::new(crate::tools::SubmitProgramTool::new(
                     Arc::clone(&program_runtime),
                 )));
