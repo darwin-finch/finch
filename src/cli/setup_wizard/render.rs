@@ -634,10 +634,10 @@ fn features_section_content(
     width: usize,
     height: usize,
 ) -> WizardSectionContent {
+    // macOS-only: the expanded-details early return below reads these, and
+    // the GUI-automation section itself is a macOS surface.
     #[cfg(target_os = "macos")]
     let show_gui_details = selected_idx == 3 && gui_automation;
-    #[cfg(not(target_os = "macos"))]
-    let show_gui_details = false;
 
     #[cfg(target_os = "macos")]
     let gui_automation_status = gui_automation_status_lines(
@@ -652,16 +652,19 @@ fn features_section_content(
 
     #[cfg(target_os = "macos")]
     let expanded_gui_details = show_gui_details && gui_automation_details_expanded;
-    #[cfg(not(target_os = "macos"))]
-    let expanded_gui_details = false;
 
     // Rows the frame reserves outside the section: the 3-row tab block and
     // the 1-row help line — the same arithmetic the host's claiming pass runs.
     let section_rows = height.saturating_sub(4);
 
+    // The expanded status owns the section: its scroll offset skips whole
+    // wrapped rows, and the instructions stay visible beneath the box. The
+    // whole block is macOS-only: it reads the macOS-only automation status
+    // lines and scroll offset, and `expanded_gui_details` can only be true
+    // there. Compiling it on other platforms would name values that do not
+    // exist (E0425 on the Linux CI lane).
+    #[cfg(target_os = "macos")]
     if expanded_gui_details {
-        // The expanded status owns the section: its scroll offset skips whole
-        // wrapped rows, and the instructions stay visible beneath the box.
         let inner_width = width.saturating_sub(4);
         let body_budget = section_rows
             .saturating_sub(1)
