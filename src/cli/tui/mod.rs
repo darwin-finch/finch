@@ -2809,8 +2809,10 @@ impl TuiRenderer {
     /// corrupt scrollback accounting on the first redraw.
     pub fn startup_header(model: &str, cwd: &str, session_label: &str) -> String {
         let version = env!("CARGO_PKG_VERSION");
+        // The tagline renders BELOW the mascot: interpolating it inside the
+        // art split the bird between its head and body (#558).
         format!(
-            "      ▄▄▄▄▄▄\n    ▗▟█●██▙►  finch v{version}\n{}\n  ▐████████▌   {model}\n  ▝▜██████▛▘   {session_label}  ·  {cwd}\n     ╥  ╥\n    ╱    ╲",
+            "      ▄▄▄▄▄▄\n    ▗▟█●██▙►  finch v{version}\n  ▐████████▌   {model}\n  ▝▜██████▛▘   {session_label}  ·  {cwd}\n     ╥  ╥\n    ╱    ╲\n\n{}",
             crate::ABOUT
         )
     }
@@ -6157,6 +6159,26 @@ mod tests {
         assert!(
             header.lines().all(|line| line.chars().count() <= 80),
             "startup header must remain readable in an 80-column terminal; header={header:?}"
+        );
+    }
+
+    /// The tagline must not split the mascot: the bird's body line comes
+    /// before any tagline text (#558).
+    #[test]
+    fn startup_tagline_renders_below_the_mascot_not_through_it() {
+        let header = TuiRenderer::startup_header("grok-code-fast-1", "~/repo", "amber-river");
+        let body_at = header
+            .find("\u{2580}███████▌")
+            .or_else(|| header.find("▐████████▌"));
+        let tagline_at = header.find(crate::ABOUT);
+        let (body_at, tagline_at) = (
+            body_at.expect("the mascot body line must be present"),
+            tagline_at.expect("the tagline must be present"),
+        );
+        assert!(
+            body_at < tagline_at,
+            "INVARIANT: the tagline must render below the mascot, not between its \
+             head and body (#558); body at byte {body_at}, tagline at {tagline_at}:\n{header}"
         );
     }
 
