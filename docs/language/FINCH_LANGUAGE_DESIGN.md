@@ -2079,16 +2079,23 @@ any `Owner<Foo>`," with the hidden generic carrier type `O : Owner<T>` inferred 
 argument, the parameter storage is `O`, and operations on `T` use its checked borrow projection;
 storing or returning the parameter stores or returns `O`, not an imaginary unwrapped `T`.
 
-Whether the compiler monomorphizes a specialized body per concrete `O` or shares one evidence-
-passing body across callers is an optimizer decision, not a semantic one — the same choice ordinary
-generic instantiation already makes (see "Semantic analysis should be dependency-driven..." and
-"parametric elaborated representation" above: specialization "does not require code multiplication").
-This is why the shorthand doesn't reintroduce the cost-visibility problem "Scripting ergonomics with
-a systems cost model" warns against: choosing a codegen strategy for an otherwise-identical-behavior
-call is not the same as an implicit adaptation silently erasing static evidence, which changes what
-the program can observe or do. `dyn Owner<Foo>` remains available, but now as an explicit *semantic*
-choice — a programmer specifically wants one erased, storable-heterogeneously carrier type, not "the
-compiler picked erasure for me."
+**Corrected 2026-09-17: the monomorphize-vs-share choice above is narrower than first stated, and
+the narrower version is the one that's actually representable.** `borrow` alone can be shared for
+free — it only needs a pointer to wherever the concrete `O` already lives plus a vtable pointer to
+find the right implementation, the same fat-pointer dispatch as `&dyn Trait`; no boxing, because the
+value stays in the caller's existing storage. Ownership transfer is a different case: the callee
+must be able to hold, move, or destroy the value itself, so a body compiled without knowing the
+concrete size at compile time needs somewhere sound to put a variably-sized value — and for an
+*owned* value of unknown size, that means a new heap allocation, not a reused stack slot, because
+there is no existing home for it once the callee might return, store, or move it elsewhere. That is
+boxing: a real, hidden allocation, exactly what "Scripting ergonomics with a systems cost model"
+already forbids as an invisible cost. So sharing one body genuinely works, for free, only among
+concrete carriers that already share a representation — `Unique<Foo>` and `Shared<Foo>` are both one
+pointer, so a body handling only those two can share soundly. A plain inline `Foo` cannot join that
+shared body without either boxing (forbidden, since it's invisible) or the compiler monomorphizing
+that call site separately — which is what actually happens, not a free optimizer choice between two
+equally-costed strategies. `dyn Owner<Foo>` remains available as the explicit, visible choice when a
+programmer specifically wants one erased, storable-heterogeneous carrier and accepts its cost.
 
 **Added 2026-09-17: a generic body can ask which concrete carrier it received, without a second
 declaration.** The `Owner<Foo>` bound only exposes `borrow`, so a body written against it alone
@@ -2112,16 +2119,24 @@ Co-Forth: O ct:type-case
             otherwise ... ct:endcase
 ```
 
-This is deliberately *not* a second, separately declared specialization competing with the generic
-body — there is exactly one definition, so there is nothing for automatic per-instantiation codegen
-to conflict with: each concrete `O` still gets its own compiled body or shares evidence-passing IR
-exactly as an optimizer decision already permits, `match-type`'s arms just make that one body's
-checked semantics differ correctly per instantiation. A separate "manually specialize this generic
-for `Shared<Foo>`" declaration was considered and rejected for the same reason classic overloading
-was: it would mean two independently authored bodies under one name, needing a resolution rule
-between them — exactly the speculative-body-compilation risk "Operators, comparison evidence, and
-segmented text" already rules out for a different mechanism. One body, CTFE-branched, keeps the
-same deterministic-resolution property this whole design has held everywhere else.
+**Corrected 2026-09-17: `match-type` forces monomorphization, it does not merely permit it.** A
+shared/erased body — the sharing option just narrowed above — is compiled once against a fixed
+vtable shape, here `Owner<T>`'s one operation, `borrow`. It cannot call `get-mut`, because that
+operation isn't in that vtable and can't be added to it in general: `match-type` can match against
+*any* type and call *any* of that type's operations, which is unbounded, and no fixed vtable shape
+carries every operation of every type someone might match against. So reaching a type-specific
+operation through `match-type` cannot resolve against a shared body at all, for any instantiation —
+it requires a body compiled with the concrete type statically known, i.e. monomorphized, full stop.
+This is still not a second, separately declared specialization competing with the generic body —
+there remains exactly one source definition, so there is nothing to conflict with — but it does mean
+`match-type` trades away the sharing option from above whenever it reaches for something `Owner<T>`
+doesn't already provide; that cost is real and should be named, not hidden behind "the optimizer
+decides." A separate "manually specialize this generic for `Shared<Foo>`" *declaration* was still
+considered and rejected for the reason already given: two independently authored bodies under one
+name need a resolution rule between them, exactly the speculative-body-compilation risk "Operators,
+comparison evidence, and segmented text" already rules out for a different mechanism. `match-type`
+keeps that same deterministic-resolution property — one source body, no resolution search — even
+though it now costs monomorphization rather than being free the way plain `borrow`-only sharing is.
 
 **Revised again, 2026-09-17: there is no separate `static Owner<Foo>` spelling.** An earlier revision
 kept it as an optional explicit form "for a reader who wants representation stated at a glance," but
