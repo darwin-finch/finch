@@ -1,21 +1,21 @@
-# tools capsule: tool execution, permissions, and local implementations
+# tools capsule: tool execution, implementations, and composition-root wiring
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `src/tools/` except `mcp`: the executor, registry, permission policy, persistent
-approval patterns, session task list, the event-loop-owned [`ToolLoop`](tool_loop.rs)
-protocol, the semantic advertisement catalog (`semantic.rs`, issue #241), and the
-local tool implementations. Connecting to external Model Context Protocol servers
-is the nested [`mcp`](mcp/AGENTS.md) capsule. The background command tools
-(`background_bash`, `background_poll`, `background_stop`, issue #754) are thin
-siblings of bash over the brain-owned `BackgroundTaskManager` lifecycle; the
-task records and process ownership live in `src/brain`, not here. The
-post-edit diagnostics service (`diagnostics/`, issue #757) annotates completed
-write/edit/patch results with bounded output from a check command the user
-declared in `[diagnostics]` config — nothing is inferred, and the declared
-command's authority verdict is read from the existing bash approval path
-(`PermissionManager::check_tool_use("bash", …)`), so it never runs where bash
-would not.
+**Owns** `src/tools/` except `mcp`: the [`executor`](executor.rs), the concrete tool
+implementations, the event-loop integration of the tool-round protocol, the session
+task list (`todo.rs`), and the post-edit diagnostics service (`diagnostics/`, issue #757). The
+tool surface these implement — the `Tool` trait, `ToolRegistry`, typed requests and results, the
+permission and approval policy, `ExecutionEffect`, `ToolSignature`, and the tool-round protocol —
+is defined in the dependency-free [`finch-tools-api`](../../crates/finch-tools-api) crate
+(issue #872). Connecting to external Model Context Protocol servers is the nested
+[`mcp`](mcp/AGENTS.md) capsule. The background command tools (`background_bash`,
+`background_poll`, `background_stop`, issue #754) are thin siblings of bash over the brain-owned
+`BackgroundTaskManager` lifecycle; the task records and process ownership live in `src/brain`, not
+here. The diagnostics service annotates completed write/edit/patch results with bounded output
+from a check command the user declared in `[diagnostics]` config — nothing is inferred, and the
+declared command's authority verdict is read from the existing bash approval path
+(`PermissionManager::check_tool_use("bash", …)`), so it never runs where bash would not.
 
 **ToolLoop is the single execution lifecycle.** REPL and scheduler drive it.
 Generators and provider adapters never import or invoke `ToolExecutor`.
@@ -26,20 +26,23 @@ at most one result.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
 modules are private, so the `pub use` list in `src/tools/mod.rs` is the whole public surface, and
-`scripts/check_subsystems.py` rejects a `pub mod` there. Callers outside this directory use
+the facade convention keeps a `pub mod` out of it. Callers outside this directory use
 `crate::tools::Item` (or `finch::tools::Item`); they must not name `implementations`, `types`,
-`executor`, `permissions`, `registry`, `patterns`, `todo`, or `mcp`. `mcp` publishes its own
-interface for work inside that subtree.
+`executor`, `permissions`, `todo`, or `mcp`. `mcp` publishes its own interface for work inside that
+subtree. The shared tool surface itself is `finch_tools_api::Item` — `src/tools/mod.rs` and the
+`types.rs`/`permissions.rs` re-export shims keep the crate-internal paths working, and those shims
+carry zero `crate::` imports (the former knot metric).
 
-**Dependencies:** many, and most are unwanted. `types.rs` imports `cli`, `runtime`, `server`,
-`local`, and `models`, and each of those imports `tools` back. The planned split of a
-dependency-free tools API from the application-bound implementations is separate work; this
-capsule does not take that split. Add no new reverse edges.
+**Dependencies:** the application-bound side (executor, implementations, MCP, todo, diagnostics)
+may depend on any composition-root subsystem, and each of those may import `tools` back — that
+reverse edge is why implementations stay here. The shared surface they implement
+(`finch-tools-api`) depends on nothing in the root crate; add no new dependency from the API
+crate to any `src/` subsystem, and add no new authority surface outside it.
 
-**Permissions are authority.** Peer and constitutional rules in `permissions.rs` are invariants,
-not defaults to relax. Facade changes must not alter allowlist behavior: `is_readonly_bash()`
-still rejects shell operators, peers still cannot restart or spawn, and write/edit/patch still
-surface as AskUser. See the root [Security invariant](../../CLAUDE.md#security). The peer
+**Permissions are authority.** Peer and constitutional rules — defined in the
+`finch-tools-api` crate, re-exported here — are invariants, not defaults to relax. Facade changes
+must not alter allowlist behavior: `is_readonly_bash()` still rejects shell operators, peers still
+cannot restart or spawn, and write/edit/patch still surface as AskUser. See the root [Security invariant](../../CLAUDE.md#security). The peer
 hard-deny and allow tables are keyed on registered tool names (`PEER_HARD_DENY_TOOLS`,
 `PEER_SILENT_ALLOW_TOOLS`, `PEER_REVIEWED_CHANGESET_TOOLS`, `VM_DISCOVERY_TOOLS`); conformance
 tests in this subtree and in `src/cli/repl/always_allow_tests.rs` fail if a policy table names
@@ -65,11 +68,10 @@ effect — `refined_effect_for_approval` applies bash's read-only refinement and
 to the name `BashTool` registers. Deleting a tool's `effect()` is a compile error; changing one
 must trip `test_declared_effects_match_pre_refactor_classification` in
 `src/cli/repl/always_allow_tests.rs`, which pins every registered tool's declaration to its
-pre-refactor classification. The planning allowlists (`PLANNING_MODE_ALLOWED_TOOLS` in
-`src/cli/repl_event/plan_handler.rs`, `REPL_PLANNING_ALLOWED_TOOLS` in `src/cli/repl.rs`,
-`EXECUTOR_PLANNING_ALLOWED_TOOLS` in `permissions.rs`) are keyed on registered names or alias
-keys and are conformance-tested in the same file; spellings nothing registers (`ExitPlanMode`,
-`Bash`) are deliberately blocked. Declaring `Unclassified` is a real decision: enter_plan_mode, inspect_memory, and the four agent
+pre-refactor classification. The planning allowlist (`PLANNING_ALLOWED_TOOLS` in `src/cli/repl_event/plan_handler.rs`, shared
+by the dispatch path and the executor gate) is keyed on registered names or alias keys and is
+conformance-tested in the same file; spellings nothing registers (`ExitPlanMode`, `Bash`) are
+deliberately blocked. Declaring `Unclassified` is a real decision: enter_plan_mode, inspect_memory, and the four agent
 tools preserve their pre-refactor approval behavior that way, and re-authorizing any of them is a
 deliberate approval-policy change with its own review, not a drive-by declaration edit. Issue #426
 re-authorized `todo_read` (`VmRead`), `todo_write` (`VmWrite`), `present_plan` (`VmWrite`), and
@@ -80,6 +82,10 @@ own dialogs must not demand a second host-effect confirmation.
 schemas as data. MCP names are namespaced before they reach the registry; do not invent a second
 permission path around that.
 
-**Focused tests:** `./scripts/test_brains.sh cargo test --lib -- tools::`. That includes the
-security tests in `permissions.rs`. Run the full suite when changing a re-exported `pub` item or
-the permission policy, because the CLI, runtime, scheduler, and providers all hold these types.
+**Focused tests:** `./scripts/test_brains.sh cargo test --lib -- tools::` for the
+composition-root side, and `./scripts/test_brains.sh cargo test --lib -p finch-tools-api` for the
+API surface (the pure permission-policy tests moved there with the policy). The
+implementation-boundary security tests remain at `src/tools/permissions/tests.rs`, at their
+original `tools::permissions::tests::*` paths. Run the full suite when changing a re-exported
+`pub` item or the permission policy, because the CLI, runtime, scheduler, and providers all hold
+these types.
