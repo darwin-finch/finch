@@ -3546,6 +3546,44 @@ lower → verify; bytecode the VM interprets, or machine code if a JIT exists. I
 trees. Prefer module CTFE when the type is known in the file. An LLM does not get this hatch
 unless that Brain is granted it.
 
+**Added 2026-09-18: compile-time hook functions carry a `! comptime` effect, propagated and
+discharged by the effect system already in place — not a second, parallel mechanism.** Some CTFE
+genuinely needs type-resolved, compiler-internal information — a GC write-barrier inserter needs to
+know whether a given sub-expression's *type* is a pointer, which cannot be determined from `syntax`
+alone (deliberately pre-resolution, for the hygiene reasons under "quote and quasiquote"). Rather
+than either wall this off entirely or blow open the compiler-private HIR boundary generally, the
+compiler exposes specific, curated queries as ordinary, distinctly-named, properly-typed functions —
+modeled on D's `__traits`, but fixing what makes it unpleasant to use: `__traits` is one keyword
+dispatching on a string tag with inconsistent argument shapes per tag, checked by nothing; a hook
+here is just a function with a real signature, the same "distinct named forms over one
+stringly-dispatched form" fix already applied to `get`/`set`/`constructor` earlier. Each hook is
+declared with a `! comptime` effect, and any function whose body calls one inherits that effect in
+its own row through the ordinary effect-propagation rules already in place — the same mechanical
+consequence `! throws E` already has, not a new kind of propagation.
+
+An effect that only ever propagated with no way to discharge it would make this useless: nothing
+produced this way could ever become an ordinary, runtime-callable function again, and every one of
+the worked examples above (`timed`, coverage, a barrier-inserting transform) specifically needs its
+*output* to be ordinary code, even though computing that output needed `! comptime` operations.
+`! comptime` discharges at exactly two points, mirroring how other effects are handled rather than
+propagated:
+
+- **`mixin`** discharges it for `syntax`-shaped results. `mixin` is the boundary between compile-time
+  computation and code that will actually run: whatever `! comptime` operations went into producing
+  the `syntax` value, the *declaration* that lands in the module via `mixin` is ordinary code with no
+  residual taint. A function that calls `(mixin (some-comptime-fn ...))` does not itself inherit
+  `! comptime` from that call — `mixin` consumes it, the same way a `match`/`try` consumes `throws`.
+- **Full constant-folding** discharges it for ordinary-value results. A `! comptime` computation
+  invoked where its inputs are themselves compile-time constants (the existing "CTFE of values,
+  `if`/`foreach` unroll" mechanism) and that fully resolves to a concrete, ordinary-typed constant —
+  an int, a bool, not `syntax` — carries no taint once resolved: there is no runtime call left to
+  taint, the computation already happened and folded away, leaving a plain constant in the final
+  program.
+
+A `! comptime` effect that reaches a boundary requiring ordinary runtime callability without being
+discharged by either point is a compile error — not a new rule, the same consequence an unhandled
+`throws` already has at a boundary that can't accept it.
+
 Syntax values are not bare lists. They retain source origin, expansion ancestry, lexical scope
 marks, and stable module/symbol identity. Public syntax constructors and projections preserve those
 properties so ordinary structural Finch code can be hygienic without receiving ambient host access.

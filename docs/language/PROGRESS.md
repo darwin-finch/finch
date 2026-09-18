@@ -515,5 +515,25 @@ inconsistent argument shapes per tag, versus separate, properly-typed functions 
 `constructor` earlier this session). The other half of the idea: calling such a hook taints the
 caller as compile-time-only, and that's not a new mechanism either — it composes directly with the
 existing effect-row system as one more effect (something like `! comptime`), propagated by rules
-already in place, the same way `! throws E` already propagates. Not written into the spec yet —
-the general mechanism was agreed on in conversation but the actual edit hasn't landed. Do that next.
+already in place, the same way `! throws E` already propagates.
+
+**Continued 2026-09-18 — written into the spec, with the piece that would have made it useless
+caught before it landed rather than after.** Shammah immediately raised what an effect-only design
+was missing: `! comptime` needs a way to be *discharged*, or nothing produced this way could ever
+become an ordinary runtime-callable function again — exactly the failure mode that would have made
+every worked example (`timed`, coverage, a barrier-inserting transform) pointless, since all of them
+need their *output* to be ordinary code. Two discharge points, both reusing the existing "effects
+propagate unless something at the call site consumes them" pattern rather than adding a new kind of
+mechanism: `mixin` discharges it for `syntax` results (the declaration that lands in the module is
+ordinary code, no residual taint — the same way `match`/`try` already consumes `throws`), and full
+constant-folding discharges it for ordinary-value results (a `! comptime` computation that resolves
+to a concrete constant, not `syntax`, leaves nothing left to taint — the computation already
+happened and folded away). An undischarged `! comptime` reaching a boundary requiring ordinary
+callability is a compile error, the same consequence an unhandled `throws` already has.
+
+Compile-time hooks themselves modeled directly on D's `__traits`, with the specific fix for what
+makes `__traits` unpleasant identified precisely: one keyword dispatching on a string tag with
+per-tag argument shapes checked by nothing, versus distinctly-named, properly-typed functions per
+hook — the same "named forms over one stringly-dispatched mega-form" fix already applied to
+`get`/`set`/`constructor` earlier this session. The actual hook catalog (what specific compiler
+queries exist) is still unscoped — this pass only settled the general mechanism.
