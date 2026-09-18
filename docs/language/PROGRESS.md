@@ -106,14 +106,16 @@ re-architecture time (the original ask that started this epic).
 
 Not exhaustive — flag anything found later here rather than assuming this list is complete.
 
-1. **`! pure` is spec-invalid; the entire shipping implementation uses it exclusively.**
-   `FINCH_LANGUAGE_DESIGN.md:1029-1031` states purity is proven by a separate `guarantees pure`
-   clause and `! pure` is invalid — the only occurrence of that string in the document. All 46
-   `core.json` fixtures and the current Co-Forth parser use `! pure` throughout. The `:1632`
-   compatibility carve-out (classic `( ... )` comments) never mentions this spelling, so it isn't
-   even clear the spec means to grandfather it. **Blocks nothing today, but every fixture and every
-   real program written against the current parser is non-conformant the moment this is enforced.**
-   Needs a decision before M1 adds much more surface using the old spelling.
+1. **RESOLVED 2026-09-17, by changing the spec rather than the implementation.** `! pure` was
+   originally spec-invalid while the entire shipping implementation and all 46 `core.json` fixtures
+   used it exclusively — a real spec/implementation divergence. Resolution, reached while unifying
+   the effect-row and predicate-clause syntax into one `!`-introduced list (see the design-pass log
+   below): `pure`/`total`/`deterministic`/`nothrow`/`throws`/`suspends` all now live inside the same
+   `!`-list as capability effects, distinguished by shape rather than by a separate `guarantees`
+   clause. Under that reading `! pure` was correct all along — the classic `guarantees pure` clause
+   is what's retired, not `! pure`. **No implementation migration needed**; the existing parser and
+   all 46 fixtures already match the corrected spec. `guarantees` is retired as a keyword throughout
+   the document (propagated to every example, including ones predating this session).
 2. **"Initial module layout" (`:4393-4414`) is stale.** Names `src/vm/*.rs`, `src/coforth/frontend/`,
    `src/lisp/frontend/` — the pre-extraction layout. Actual layout (#673/#65/#667/#670, all closed):
    `crates/finch-vm-core/`, `crates/finch-colisp/`, `crates/finch-coforth/`, `crates/finch-language/`,
@@ -136,7 +138,7 @@ Not exhaustive — flag anything found later here rather than assuming this list
 
 | Item | Tier (per `finch-backlog`) | Action | Owner |
 |---|---|---|---|
-| `! pure` vs `guarantees pure` | Decision needed, then Tier 2/3 depending on choice | Shammah decides: (a) grandfather `! pure` explicitly as compatibility syntax and say so in the spec next to `:1632`, or (b) migrate — add `guarantees pure` fixtures at a new level, cut over `ACTIVE_CONFORMANCE_LEVELS`, then delete `! pure` parsing. CLAUDE.md's own stance ("migrate checked-in programs and delete superseded compiler paths rather than preserving a known wart solely because it was implemented first") argues for (b) while the surface is still 46 fixtures, not hundreds. | Shammah (decision) → whoever implements |
+| ~~`! pure` vs `guarantees pure`~~ | — | **Resolved 2026-09-17** — see findings list above. No action needed; spec now matches the shipping implementation. | — |
 | Stale module layout (`:4393-4414`) | Tier 1 | Rewrite to the actual crate layout or mark the section historical/superseded-by-roadmap. No contract, no review round needed. | anyone, immediately |
 | CoLisp ownership-parameter example missing | Decision needed | Shammah writes the missing worked example, or explicitly hands it to whoever picks up #674 as a stated blocker. | Shammah or #674's owner |
 
@@ -197,3 +199,49 @@ None of this is implemented — it is still all `FINCH_LANGUAGE_DESIGN.md` prose
 code. Before #674 is claimed, re-read the ownership sections fresh rather than trusting this summary
 line-for-line; a design discussion this size run live in conversation is exactly where something
 subtle could still be wrong despite two audit passes.
+
+**Continued the same day — further corrections and one syntax unification, found by Shammah pressing
+on machine-code representability and buildability specifically, not just design coherence:**
+
+- **Two real "not actually buildable" errors caught and fixed**, both by Shammah asking "how would
+  this actually compile": the borrow/take shorthand's claimed monomorphize-or-share choice isn't free
+  in general (ownership transfer across differently-sized carriers needs boxing to share; only
+  already-uniform-representation carriers like `Unique`/`Shared` can share for free), and `match-type`
+  forces monomorphization outright rather than merely permitting it (a shared/erased body is compiled
+  against a fixed vtable shape and cannot call an operation `match-type` might reach for). Also
+  confirmed `O` (the hidden carrier) is one ordinary generic type parameter sharing the same
+  instantiation-job keying as any hand-written generic, not a second specialization system —
+  and separately, `match-type` over an already-erased `dyn Owner<Foo>` value resolves at *runtime*
+  (comparing the runtime type identity `dyn` values already carry), not CTFE — a materially different
+  mechanism from the static-generic-parameter case, missed in the first pass.
+- **Syntax unification, requested directly ("I don't like having two attribute dimensions"):** the
+  effect row (`!`) and the separate predicate clauses (`guarantees pure`, `nothrow`, `throws A|B`,
+  `suspends`) are now one `!`-introduced list, told apart by shape (request-shaped vs. closed-keyword-
+  shaped) rather than by grammar. This is what resolved finding #1 above — `! pure` was correct all
+  along under the unified reading, so the fix was changing the spec, not migrating 46 fixtures.
+  Propagated to every example in the document, including several that predate this session (the
+  `Equal<L,R>`/`Compare<L,R>` concept operations, `square`, `save-report`, `load-user`, `read-user`,
+  the closure-conversion IR sketch).
+- **New rule added alongside it:** writing any predicate explicitly commits the signature to the
+  complete, atomic contract (both symmetric axes — throw-or-nothrow, suspend-or-not — resolved, never
+  a partial hybrid) — generalizes the publication-commitment rule already required for `throws`.
+  Applying it to the pre-existing `Equal`/`Compare` examples surfaced that they'd never stated
+  `nothrow` despite asserting everything else — fixed in the same pass.
+- **Standard construction/conversion added** (no prior general mechanism existed, only ad hoc factory
+  functions): `From<T>`/`Into<T>` as an ordinary concept, always explicit at the call site — and, after
+  a direct request for "explicitly marked implicit constructors," a *narrower*, compiler-*verified*
+  form (the conversion's inferred effects must satisfy the same cost bar as every other automatic
+  adaptation; at most one direct, non-chained candidate per call site) rather than blanket C++-style
+  implicit invocation, which was considered and rejected on the same grounds as classic overloading.
+- **A genuine strategic check-in, worth recording as a standing note, not just a design decision:**
+  Shammah's actual goal for this whole effort is to fully specify the language well enough to set
+  "an army of LLMs" building the compiler with minimal human bottleneck. Answered directly: a prose
+  spec reaching zero remaining ambiguity/error isn't a realistic bar — this session found real errors
+  under the best possible conditions (slow, adversarial, one decision at a time) — so what actually
+  makes large-scale parallel automated implementation viable isn't prose completeness, it's (a) the
+  executable fixture corpus (`core.json` and its planned growth) as the actual machine-checkable
+  arbiter, and (b) keeping the existing tiered review process (`finch-backlog`, Tier 3 for anything
+  authority/persistence/wire-format-shaped — a compiler qualifies) load-bearing *per change*
+  regardless of how many agents are running in parallel, not skipped because agents are doing the
+  writing. Recorded here so it isn't lost as just a conversational aside — it should inform how the
+  M1+ work in this tracker actually gets executed once agents start picking up issues.
