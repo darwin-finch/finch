@@ -2128,17 +2128,29 @@ never outlives the call, checked without lifetime parameters — is closer to th
 Hylo language calls "mutable value semantics": comparable safety to Rust's borrow checker without
 its annotation surface, at a real, explicit cost, not a free lunch.
 
-D independently reached the same design and shipped it as its own ownership/borrowing (OB) system
-([Walter Bright, "Ownership and Borrowing in D,"
-2019](https://blog.dlang.org/archive/2019/07/15/ownership-and-borrowing-in-d/)): compile-time,
-*intraprocedural* data-flow analysis reusing existing `ref`/`scope` syntax rather than a lifetime-
-parameter system, on the same principle Finch states above — "there is only one pointer to it, so
-that pointer must be the owner," with borrowing as a temporary, automatically-restored transfer of
-usage rights. Where a pattern doesn't fit — D names reference-counted objects specifically — OB is
-not extended to cover it; the pattern instead lives in `@system` code the checker treats as already
-satisfying the rules, the same shape as Finch's `unsafe` boundary and the `Shared<T>` fallback
-above. This is independent confirmation the DFA-not-lifetime-parameters shape is a real, shipped
-design, not only a hopeful simplification.
+D independently designed the same shape as its ownership/borrowing (OB) system, proposed as
+[DIP1021](https://github.com/dlang/DIPs/blob/master/DIPs/accepted/DIP1021.md) from [Walter Bright's
+2019 proposal](https://blog.dlang.org/archive/2019/07/15/ownership-and-borrowing-in-d/): compile-
+time, *intraprocedural* data-flow analysis reusing existing `ref`/`scope` syntax rather than a
+lifetime-parameter system, on the same principle Finch states above — "there is only one pointer to
+it, so that pointer must be the owner," with borrowing as a temporary, automatically-restored
+transfer of usage rights. Where a pattern doesn't fit — D names reference-counted objects
+specifically — OB is not extended to cover it; the pattern instead lives in `@system` code the
+checker treats as already satisfying the rules, the same shape as Finch's `unsafe` boundary and the
+`Shared<T>` fallback above.
+
+**This did not ship, and that is itself evidence worth having, not just the design.** DIP1021 was
+formally accepted and is implemented behind `-preview=dip1021`, but per the D Language Foundation's
+own April 2024 meeting notes it sat at roughly two-thirds implemented for years with little uptake,
+and its own author set it aside after `-preview=dip1000` (a narrower, more mainstream escape-
+analysis feature) turned out to have bugs demanding attention instead; the D language spec still
+calls it "experimental and subject to change." Read charitably, this confirms the *design* is sound
+enough that an experienced systems-language implementer chose it independently — and confirms the
+"fully specifying all the situations is a lot of work" concern above is not hypothetical: the same
+approach, attempted for real, stalled on completeness rather than on the core idea being wrong.
+Finch should expect the long tail of case-by-case interactions (closures, suspension, generics,
+FFI) to be where the actual implementation risk concentrates, not the top-level borrow/take
+decision, which is the easy 80% both designs converged on quickly.
 
 The cost: a function cannot soundly return a borrow that is conditionally one of *several*
 different-lifetime input borrows (Rust's canonical `fn longest<'a>(x: &'a str, y: &'a str) -> &'a
