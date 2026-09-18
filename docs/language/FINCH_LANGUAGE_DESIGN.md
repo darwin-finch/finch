@@ -1046,15 +1046,48 @@ transient borrow cell for the callee and destroys only that cell on return. Ther
 implicit choice based on spelling. `dup` therefore requires explicit `Copy` evidence (and retaining
 a `Shared<T>` is its copy operation); it cannot duplicate a `Unique<T>`.
 
-`!` introduces one canonical typed effect row. Capability requirements, suspension, mutation,
-nondeterminism, and other observable behavior are distinct tagged members of that row, not
-unrelated annotation systems. The broker selects capability-bearing members for authorization; the
-verifier, optimizer, scheduler, and generic reflection inspect the whole row. Omitted `!` requests
-inference rather than asserting an empty row. `pure` is not itself a row member or an alias for
-emptiness: it is a verifier-derived predicate over the resolved row and body. Source may request
-that proof with a separate `guarantees pure` clause; `! pure` is invalid. A deterministic
-function may throw and remain pure but partial; a function may separately be total, `nothrow`,
-deterministic, and non-suspending. Generic constraints can require those predicates explicitly.
+`!` introduces one unified clause for everything observable about a callable, replacing what earlier
+readings of this document split into a row plus separate keyword-clauses. Capability requirements,
+suspension, and mutation are open-ended, request-shaped members (the broker grants these); `pure`,
+`total`, `deterministic`, and the two mandatory symmetric contracts — `nothrow`/`throws A|B`/
+`throws infer`, and `non-suspending`/`suspends` — are the closed set of verifier-derived predicates.
+Both kinds live in the same `!`-introduced list, told apart by shape, not by which of two separate
+grammars they were written in: a request looks like `namespace.word(args)` or a generic effect token
+(`yields<Y,Resume>`); a predicate is a bare keyword from the closed set or one of the two symmetric
+contracts. Omitted `!` requests inference across all of it — both the open effect set and every
+predicate — never asserting emptiness or any particular value for any of them.
+
+**Revised 2026-09-17: `! pure` is valid — this reverses the original rule stated here, not a
+clarification of it.** An earlier version of this section kept `pure` in a syntactically separate
+`guarantees pure` clause specifically so it could never be mistaken for a row member, and declared
+`! pure` invalid for that reason. Splitting the syntax turned out to cost more than it protected:
+holding two separate grammars in mind for what is conceptually one question — "what does this
+callable do and guarantee" — was real, avoidable mental load, and the shape rule above (request-
+shaped vs. closed-keyword-shaped) already tells `pure` apart from an actual row member without
+needing a second clause to do it. Concretely, `: add-two ( S int -- S int ! pure ) 2 + ;` — the form
+already used by every conformance fixture predating this revision — was correct all along under this
+reading; nothing here requires migrating that syntax. `total`, `deterministic`, `nothrow`, `throws
+A|B`, `suspends`, and `non-suspending` all move into the same `!`-list the same way; `guarantees`
+as a distinct clause keyword is retired.
+
+**Added 2026-09-17: writing any predicate explicitly commits you to the complete, atomic contract —
+never a partial one.** `pure`, `total`, and `deterministic` are assert-only: no "impure," "partial,"
+or "nondeterministic" keyword exists, so their absence from an explicit list already has one
+unambiguous meaning ("not claimed") regardless of what else is stated, and asserting one adds no
+ambiguity by itself. The two symmetric contracts are different: every callable truly is one or the
+other (`nothrow` or some `throws` bound; `non-suspending` or `suspends`), so leaving one unstated in
+an otherwise-explicit `!`-list is genuinely ambiguous — does the omission mean "inferred," or does it
+mean the other value implicitly held? To remove that ambiguity: the moment either symmetric contract,
+or any assertion, appears explicitly in a callable's `!`-list, **both** symmetric contracts must be
+resolved explicitly too — the signature is either fully inferred (nothing written) or a fully stated,
+atomic contract, never a hybrid a reader has to disentangle. This generalizes, rather than
+contradicts, the publication rule already given below ("a published callable must choose `nothrow`,
+an explicit `throws A | B` upper bound, or an explicit `throws infer` contract"): publication is
+simply the one case where "nothing written" is not an available option. Whichever form is chosen,
+private or published, the verifier proves every stated predicate against the resolved row and body —
+proof, not trust, exactly as `pure` already required before this revision. A deterministic function
+may throw and remain pure but partial. Generic constraints can require any of these predicates
+explicitly.
 
 **Added 2026-09-17: what a purity proof actually buys, consolidated from where it's used elsewhere
 in this document.** A `guarantees pure` request is not documentation sealed against later
@@ -2195,6 +2228,27 @@ to a union by hand, and would be excluded until someone remembered to. The conce
 mechanism is what every other generic bound in this document already uses for exactly this openness;
 introducing a second, closed-union constraint shape only for this one case would be its own new
 orthogonal surface, which is the thing being avoided here in the first place.
+
+**Added 2026-09-17: `match-type` over a `dyn Owner<Foo>` value resolves at runtime, not CTFE, and
+that is a different mechanism, not an extension of the one above.** Everything above assumes `O` is
+a static generic parameter — concrete at each instantiation, which is exactly why CTFE branching and
+forced monomorphization apply. A `dyn Owner<Foo>` value has already thrown that concrete type away on
+purpose; there is nothing left at compile time to branch on. Asking "is this actually `Shared<Foo>`"
+against an erased value can only be answered at runtime — the same reason Rust's ordinary generics
+monomorphize at compile time while `dyn Any` needs `downcast_ref` to ask the equivalent question,
+checking a type identity carried alongside the erased value rather than anything known statically.
+
+This needs no new representation: "explicitly erased `dyn` values carry their versioned evidence
+table and runtime type identity" is already established ("Closed variants, representation, and
+destructuring"). `match-type` over a `dyn Owner<Foo>` value compares that already-carried identity
+against each arm's target type at runtime and narrows on the match — same syntax as the static form,
+different resolution strategy, determined by what's being matched (a static generic parameter versus
+an already-erased value), not a second construct to learn. Because `Owner<T>` is an open concept —
+user-defined carriers can implement it, so the erased value's true type is never a closed, fully
+enumerable set — a runtime `match-type` requires a catch-all arm for the same reason open-domain
+value matching already does ("an open domain such as string or integer still requires a catch-all
+arm for exhaustiveness"); the static form needs one for the same underlying reason, since `Owner<T>`
+being open means even a compile-time match can't assume it has seen every possible implementor.
 
 **Revised again, 2026-09-17: there is no separate `static Owner<Foo>` spelling.** An earlier revision
 kept it as an optional explicit form "for a reader who wants representation stated at a glance," but
