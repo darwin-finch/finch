@@ -2138,6 +2138,38 @@ comparison evidence, and segmented text" already rules out for a different mecha
 keeps that same deterministic-resolution property — one source body, no resolution search — even
 though it now costs monomorphization rather than being free the way plain `borrow`-only sharing is.
 
+**Added 2026-09-17: `O` is an ordinary generic type parameter, not a second specialization system
+running alongside the real one.** `steal x: Foo` desugars to the same shape as an explicit `<O :
+Owner<Foo>>(steal x: O)` — the only difference is that the compiler synthesizes that parameter entry
+from the shorthand instead of the programmer writing it, exactly the way an unannotated `x: Foo`
+parameter is sugar for an explicit `borrow` mode, not a different mode. That means `O` participates
+in the *same* "synthetic job keyed by immutable module and definition identity, type/value
+arguments, and resolved concept evidence" that already governs every other generic instantiation
+above — not a parallel cache, not a second resolution pass. A function combining an explicit `<T>`
+with `steal x: T` resolves both in one instantiation job with two type arguments, the same as a
+function explicitly declared `<T, O : Owner<T>>` would; there is no scenario where the shorthand's
+implicit parameter and a hand-written generic parameter are specialized independently and could
+disagree, because they were never two systems to begin with. `match-type` follows from this
+directly: it is an ordinary CTFE-constant condition (the same staging `if` already uses) evaluated
+against type arguments *already resolved* by that one job — not a second place where specialization
+decisions get made, just a place that reads the answer the single instantiation job already produced.
+
+**Refined 2026-09-17: this is sugar for a narrowing generic bound with the payload inferred, using
+vocabulary this document already has — not new inference machinery.** `steal x: Foo` desugars to
+`<O : Owner<Foo>>(steal x: O)`, and `match-type`'s per-arm narrowing is the same `infer` pattern
+already used for structural concept matching elsewhere (`T : Map<K,V>, infer K, infer V`;
+`F : fn(Args...) -> R ! E, infer Args, infer R, infer E` in "Parameter packs..."): each arm
+structurally matches `O` against one of `Owner<Foo>`'s known implementor shapes and narrows to it.
+The one correction worth making explicit: the bound has to stay the open concept `Owner<Foo>`, not
+a closed union like `Shared<R> | Unique<R> | R` naming exactly three shapes. A closed union would
+silently exclude the user-defined arenas, pools, and foreign handles "Library ownership carriers and
+the compiler lifecycle kernel" already promises can implement `Owner<T>` — those satisfy the concept
+bound automatically the moment they provide the evidence, with nothing to edit, but would need adding
+to a union by hand, and would be excluded until someone remembered to. The concept-evidence
+mechanism is what every other generic bound in this document already uses for exactly this openness;
+introducing a second, closed-union constraint shape only for this one case would be its own new
+orthogonal surface, which is the thing being avoided here in the first place.
+
 **Revised again, 2026-09-17: there is no separate `static Owner<Foo>` spelling.** An earlier revision
 kept it as an optional explicit form "for a reader who wants representation stated at a glance," but
 checking that claim: writing it explicitly doesn't force monomorphization either — that stays an
