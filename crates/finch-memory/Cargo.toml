@@ -30,4 +30,15 @@ tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time"] }
 # `#[cfg(test)]`-only behavior this crate had before the extraction; the root
 # crate's [dev-dependencies] enables it so `cargo test --workspace` still
 # exercises the real path.
+#
+# TRAP FOR THE NEXT PAUSE SEAM: plain `#[cfg(test)]` (the idiom used 500+
+# places elsewhere in this codebase, e.g. `src/brain/store.rs`) is *local to
+# the crate being compiled* — it is never set when a dependent crate's own
+# test binary links this crate as an ordinary path dependency. A seam gated
+# on bare `#[cfg(test)]` here compiles fine under `cargo test -p finch-memory`
+# and is then silently absent from `finch`'s test binary, with no compile
+# error and no obvious signal pointing at why the root crate's test can't see
+# it. Any pause/hook meant to be driven from a dependent crate's tests must
+# use `#[cfg(any(test, feature = "test-support"))]` instead, exactly like the
+# existing hydration pauses in src/lib.rs.
 test-support = []
