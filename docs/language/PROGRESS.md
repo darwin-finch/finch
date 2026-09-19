@@ -921,3 +921,69 @@ passage with this rather than adding a separate one — it's the identical shape
 it), now confirmed at the level of the compiler's own internal data structures instead of inferred
 from surface behavior, and `require(symbol, stage)` giving every symbol one representation
 regardless of provenance is a fix for the category, not a special case for packages.
+
+**Continued 2026-09-18 — Shammah's own historical D concept-checker recovered from GitHub gists,
+its real ideas adapted into the spec, then stress-tested empirically for the const/overload gotchas
+he half-remembered.** Located via `gh gist list` (not memory or guesswork): three gists from
+2015-08-29 — "Concepts checker for D.", "Std.concepts" (a real, once-pitched Phobos submission,
+`std/concepts.d`, authored by Shammah, HTML doc-comment still crediting him), and "Concept
+diagnostic diagnostic messages". Reconciled precisely against Shammah's memory of it: shape declared
+as an abstract class with no bodies (confirmed, `class CInputRange(E) { abstract void popFront();
+... }`); concepts composing via inheritance, checked recursively through the base-class chain
+(confirmed, cleaner than expected); "some checks couldn't be represented" (confirmed, in his own
+doc comment: "Note, templated member functions are not supported currently"); const-vs-non-const
+handling (not evidenced in the saved source itself — flagged as unconfirmed rather than assumed,
+then tested empirically below).
+
+Two ideas from the recovered checker were adapted into `FINCH_LANGUAGE_DESIGN.md`'s concept section
+as a new "Concept axioms and implementation diagnostics" passage, explicitly distinguished from
+structural candidate-matching (which the design doc already forbids as the concept-resolution
+model): an `axiom` clause — a named, `! pure`/`! comptime`-evaluable boolean over a concept's own
+type/value parameters and associated types, checked once at the `implementation` site rather than
+during structural discovery — is the checked sibling of the document's existing `symmetric`/
+`commutative` law modifiers, which are explicitly *trusted, not verified*, because verifying them in
+general is undecidable. The scope is written deliberately narrow: an axiom can only depend on
+compile-time-known quantities, and cannot verify a property of arbitrary runtime instance behavior
+— stated by direct analogy to the real `isInputRange` doc comment's own admission that its rules are
+"not checkable at compile-time." Also adapted: per-requirement diagnostic reporting (name the
+concept, the requirement, and the expected-vs-provided signature/value for every unmet requirement
+individually) as an explicit diagnostic-quality commitment on the adapter-checking pass, rather than
+an opt-in mode a caller must request the way `conceptDiagnostic` required a separate mixin in D.
+Worked example added as `feature_tour.md` §19 (`Codec<Wire,Value>` with a `wire-and-value-differ`
+axiom), including a deliberately-surfaced negative result: the axiom only catches an *identity*
+codec, not a merely-useless one (`Codec<bytes,bytes>` with two different-named but behaviorally
+identical operations still compiles) — because "the types differ" is decidable and "the codec does
+something meaningful" is not, the same class of gap as `isInputRange`'s.
+
+Then stress-tested the *actual recovered D code* (not a fresh reimplementation) against
+const/non-const and overload scenarios, per Shammah's request to verify rather than trust the
+memory. Compiled with LDC against `/tmp/d-test/concepts.d` (the "Concept diagnostic diagnostic
+messages" gist, unmodified):
+
+- A candidate providing only a **const** member satisfies a concept requiring a **non-const**
+  member (`true`); a candidate providing only a **non-const** member does **not** satisfy a concept
+  requiring **const** (`false`). Confirmed real and asymmetric — not the naive-intuitive direction
+  (a "more restricted" const method reads as though it should be harder to satisfy, not easier).
+- The sharpest finding: an overloaded member (`front() const` and a differently-typed `front()`
+  side by side) does not behave as "the checker looks at the first declared overload." Direct probe:
+  `typeof(__traits(getMember, T, "front")[0])` — indexing the overload set — evaluates to D's
+  internal `_error_` placeholder, not a real type; `&member` on the same expression fails to
+  compile. That `_error_` silently propagates into `getPropertyType`'s `is()` comparison inside the
+  concept checker, which is the actual reason a real match gets reported as a mismatch — but the
+  diagnostic prints the *other* half of the compound OR condition instead, whose two operands
+  (`CheckType`/`ConceptMemberType`) happen to stringify **identically**
+  (`"int function() const @property" vs. "int function() const @property"`) while being reported as
+  incompatible. This is Shammah's exact half-remembered complaint, freshly reproduced: the
+  diagnostic mode cannot actually explain *this* failure, because the compound structural check's
+  real failing branch is invisible to the code that prints the message.
+- Root cause is the same disease named directly in conversation: `__traits`/`AliasSeq` are not
+  uniform, ordinary data — the same expression's meaning (a normal single symbol vs. an unusable
+  overload-set fragment vs. `_error_`) depends on which operation touches it and how, exactly the
+  category of bug already logged for `core`/`core.thread` and `is()`/constraint-clause binding. This
+  is the strongest single piece of evidence yet for why Finch requires one explicit, already-resolved
+  `operation front = my-front#NN` mapping per requirement instead of overload-set discovery at the
+  evidence site: there is no point at which Finch's checker needs to index into an ambiguous overload
+  set the way this bug requires, not because Finch's hypothetical resolver is smarter, but because
+  the explicit-mapping design has no such step to get wrong. Not yet written into the spec as new
+  prose — logged here as supporting evidence for the design decision already made, pending whether a
+  dedicated worked example is worth adding alongside §19's `Codec` example.

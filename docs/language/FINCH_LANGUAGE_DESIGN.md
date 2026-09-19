@@ -4132,6 +4132,54 @@ identity and the sealed module's versioned evidence registry, returning `option`
 new evidence may extend a new verified composition epoch but never retrofits an existing view in
 place.
 
+### Concept axioms and implementation diagnostics
+
+A concept may declare an `axiom`: a named, `! pure`, `! comptime`-evaluable boolean expression over
+the concept's own type/value parameters and associated types. An axiom states a property that is
+actually decidable at compile time — unlike `symmetric`/`commutative` above, which name laws the
+compiler *trusts* and uses for evidence generation precisely because verifying them in general
+(`equal(a,b)` for arbitrary future `a,b`) is undecidable. An axiom is the checked sibling of that
+same idea, restricted to what compile-time evaluation can actually decide — a relationship between
+type parameters, associated types, or associated constants, not a claim about arbitrary runtime
+instance behavior:
+
+```text
+concept DistinctPair<L, R> {
+    axiom types-differ = not (L == R)
+}
+
+implementation StringIntPair : DistinctPair<string, i64> { }   ; axiom holds, compiles
+implementation BadPair : DistinctPair<i64, i64> { }             ; axiom fails: compile error
+```
+
+An axiom is never part of candidate selection. Finch already requires exactly one explicit,
+named `operation`/`associated` mapping per requirement (above); an axiom adds no second, implicit
+path to conformance and never disqualifies a candidate the way D's `static bool Axioms(T)()`
+silently disqualifies a structurally-matching type from an implicit match. Instead, the verifier
+evaluates each declared axiom once, at the point a matching `implementation` block is checked,
+using the same CTFE-of-values evaluation as any other `! pure` compile-time constant. An axiom
+that is false, or that does not typecheck against the implementation's bound parameters, is a hard
+compile error naming the concept, the implementation, and the failed axiom — never a silently
+discarded candidate or an ambient fallback to a different implementation.
+
+This is deliberately narrower than it may first look: an axiom can only depend on quantities the
+compiler already knows in full at the `implementation` site (types, associated types, associated
+constants, and other `! pure` compile-time constants). It cannot verify a property of arbitrary
+runtime instance state — an axiom that called an ordinary instance method to inspect a live value's
+behavior would be making exactly the same unprovable promise the real `isInputRange` documentation
+in Phobos admits it is making ("these rules are not checkable at compile-time"; violating them is
+undefined behavior). Finch's axiom differs from that only in being explicit, named, and checked
+where it *can* be checked — not in gaining new proof power over semantics compile-time evaluation
+cannot decide.
+
+When an `implementation` block fails to satisfy its concept for any reason, the verifier reports
+every unmet requirement individually — for each `operation`/`associated`/`axiom` the concept
+declares, whether it is unmapped, mapped with an incompatible receiver or signature, or (for an
+axiom) mapped but rejected — naming the concept, the requirement, and the expected versus provided
+signature or value, rather than one aggregate failure. This is a diagnostic-quality commitment on
+the adapter-checking pass already described above, not an opt-in second checking mode a caller must
+request.
+
 ### Explicit dynamic property and invocation hooks
 
 Ordinary member failure remains a compile error unless the receiver explicitly supplies dynamic

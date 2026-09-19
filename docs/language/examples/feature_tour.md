@@ -771,3 +771,50 @@ ordinary `! pure` functions, since embedding is never meaningful at runtime at a
 distinction from `fib`-style CTFE-of-values eligibility) and the question of what happens to an
 unhandled `throw` during compile-time execution (a compile error, reusing the same correctness-
 signal logic an unhandled `result` error already has, not a new failure mode).
+
+## 19. Concept axioms — a checked law, distinguished from `symmetric`/`commutative`'s trusted ones
+
+Provenance for this one is unusual: it comes from a real, previously-shipped D `std.concepts`
+proposal (`isConcept`/`Axioms`/`conceptDiagnostic`, once pitched at Phobos), located and read for
+this pass rather than reconstructed from memory. Its `Axioms` mechanism — an optional static
+predicate a concept declares, checked against a candidate type during structural matching — is
+genuinely useful, but it matches during *structural* candidate discovery, which Finch's model
+explicitly does not use (concept satisfaction is always an explicit, named `implementation` block).
+The adaptation checked here: keep the "declare a compile-time-checkable law" idea, drop the
+structural-matching half, and attach the check to the already-explicit `implementation` site
+instead.
+
+```text
+concept Codec<Wire, Value> {
+    operation encode(borrow value: Value) -> Wire
+    operation decode(borrow wire: Wire) -> result<Value, DecodeError>
+    axiom wire-and-value-differ = not (Wire == Value)
+}
+
+implementation MsgpackUserCodec : Codec<bytes, User> {
+    operation encode = msgpack-encode-user#82
+    operation decode = msgpack-decode-user#83
+}
+
+implementation BrokenIdentityCodec : Codec<User, User> {
+    operation encode = identity#1
+    operation decode = wrap-ok#2
+}
+```
+
+`MsgpackUserCodec` typechecks: `bytes == User` is false, so the axiom holds. `BrokenIdentityCodec`
+is a compile error at its own declaration — not a silently-skipped candidate the way a failing
+`Axioms(T)()` would silently disqualify `User` from an implicit match in the D version. The error
+names the concept (`Codec<User, User>`), the implementation (`BrokenIdentityCodec`), and the failed
+axiom (`wire-and-value-differ`), per the diagnostic-quality commitment in the design doc.
+
+This also produced a real, useful negative result worth keeping: an axiom checking
+`not (Wire == Value)` only catches an *identity* codec, not a merely-useless one — nothing stops
+`implementation UselessCodec : Codec<bytes, bytes> { operation encode = id-copy#3; operation decode
+= wrap-ok-copy#4; }` (distinct-in-name but behaviorally identical wire/value types) from compiling
+and satisfying the concept, because "the types differ" is the only thing actually decidable here at
+compile time — "the codec does something meaningful" is exactly the kind of runtime-semantic
+property compile-time evaluation cannot decide, the same class of unprovable promise `isInputRange`
+makes about `.empty`/`.front`/`.popFront`'s real behavior. The design doc's own new axiom section
+says this in the abstract ("not a claim about arbitrary runtime instance behavior"); this example
+is what that limitation actually looks like in a concrete program, not just in the caveat prose.
