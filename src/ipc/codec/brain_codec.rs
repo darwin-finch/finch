@@ -2,8 +2,9 @@ use crate::brain::{
     AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
     BrainEvent, BrainEventKind, BrainId, BrainProgram, BrainRun, BrainRunKind, BrainRunStatus,
     BrainRunnerHandoff, BrainRunnerLease, BrainSchedule, BrainScheduleDeliveryPolicy,
-    BrainScheduleDue, BrainScheduleModuleIdentity, BrainSnapshot, BrainWireMessage, ConnectionId,
-    ProgramLanguage, PromptAttachment, RunId, RunnerHandoffId, RunnerLeaseId, ScheduleId,
+    BrainScheduleDue, BrainScheduleModuleIdentity, BrainSnapshot, BrainWireMessage,
+    CommittedMemoryRecord, ConnectionId, ProgramLanguage, PromptAttachment, RunId, RunnerHandoffId,
+    RunnerLeaseId, ScheduleId,
 };
 use crate::brain::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
@@ -60,6 +61,45 @@ fn decode_task_list(
         .get_tasks()?
         .iter()
         .map(decode_task)
+        .collect::<anyhow::Result<Vec<_>>>()
+}
+
+fn encode_committed_memory(
+    mut builder: finch_ipc_capnp::brain_committed_memory::Builder<'_>,
+    memory: &CommittedMemoryRecord,
+) {
+    builder.set_node_id(memory.node_id);
+    builder.set_text(&memory.text);
+    builder.set_score(memory.score);
+}
+
+fn decode_committed_memory(
+    reader: finch_ipc_capnp::brain_committed_memory::Reader<'_>,
+) -> anyhow::Result<CommittedMemoryRecord> {
+    Ok(CommittedMemoryRecord {
+        node_id: reader.get_node_id(),
+        text: text(reader.get_text()?)?,
+        score: reader.get_score(),
+    })
+}
+
+fn encode_committed_memory_list(
+    mut builder: finch_ipc_capnp::brain_committed_memory_list::Builder<'_>,
+    memories: &[CommittedMemoryRecord],
+) {
+    let mut encoded = builder.reborrow().init_memories(memories.len() as u32);
+    for (index, memory) in memories.iter().enumerate() {
+        encode_committed_memory(encoded.reborrow().get(index as u32), memory);
+    }
+}
+
+fn decode_committed_memory_list(
+    reader: finch_ipc_capnp::brain_committed_memory_list::Reader<'_>,
+) -> anyhow::Result<Vec<CommittedMemoryRecord>> {
+    reader
+        .get_memories()?
+        .iter()
+        .map(decode_committed_memory)
         .collect::<anyhow::Result<Vec<_>>>()
 }
 
@@ -629,6 +669,9 @@ pub(crate) fn encode_brain_submission(
         BrainEventKind::TaskListReplaced { tasks } => {
             encode_task_list(builder.init_task_list_replaced(), tasks);
         }
+        BrainEventKind::CommittedMemoriesReplaced { memories } => {
+            encode_committed_memory_list(builder.init_committed_memories_replaced(), memories);
+        }
         BrainEventKind::Program { language, source } => {
             let mut program = builder.init_program();
             program.set_language(language_to_capnp(*language));
@@ -673,6 +716,9 @@ pub(crate) fn decode_brain_submission(
         },
         Which::TaskListReplaced(tasks) => BrainEventKind::TaskListReplaced {
             tasks: decode_task_list(tasks?)?,
+        },
+        Which::CommittedMemoriesReplaced(memories) => BrainEventKind::CommittedMemoriesReplaced {
+            memories: decode_committed_memory_list(memories?)?,
         },
         Which::Program(program) => {
             let program = program?;
@@ -1098,6 +1144,12 @@ pub(crate) fn encode_snapshot(
     for (index, task) in snapshot.tasks.iter().enumerate() {
         encode_task(tasks.reborrow().get(index as u32), task);
     }
+    let mut committed_memories = builder
+        .reborrow()
+        .init_committed_memories(snapshot.committed_memories.len() as u32);
+    for (index, memory) in snapshot.committed_memories.iter().enumerate() {
+        encode_committed_memory(committed_memories.reborrow().get(index as u32), memory);
+    }
     let mut audits = builder
         .reborrow()
         .init_effect_audits(snapshot.effect_audits.len() as u32);
@@ -1145,6 +1197,11 @@ pub(crate) fn decode_snapshot(
         .iter()
         .map(decode_task)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let committed_memories = reader
+        .get_committed_memories()?
+        .iter()
+        .map(decode_committed_memory)
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let effect_audits = reader
         .get_effect_audits()?
         .iter()
@@ -1175,6 +1232,7 @@ pub(crate) fn decode_snapshot(
             .transpose()?,
         runs,
         tasks,
+        committed_memories,
         schedules,
         pending_schedule_dues,
         effect_audits,
@@ -1599,6 +1657,9 @@ pub(crate) fn encode_event(
         BrainEventKind::TaskListReplaced { tasks } => {
             encode_task_list(builder.init_task_list_replaced(), tasks);
         }
+        BrainEventKind::CommittedMemoriesReplaced { memories } => {
+            encode_committed_memory_list(builder.init_committed_memories_replaced(), memories);
+        }
         BrainEventKind::ToolCall {
             request_seq,
             tool_id,
@@ -1850,6 +1911,9 @@ pub(crate) fn decode_event(
         },
         Which::TaskListReplaced(tasks) => BrainEventKind::TaskListReplaced {
             tasks: decode_task_list(tasks?)?,
+        },
+        Which::CommittedMemoriesReplaced(memories) => BrainEventKind::CommittedMemoriesReplaced {
+            memories: decode_committed_memory_list(memories?)?,
         },
         Which::ToolCall(call) => {
             let call = call?;
@@ -2159,6 +2223,14 @@ mod tests {
                     content: "Verify restart".into(),
                     status: BrainTaskStatus::InProgress,
                     priority: BrainTaskPriority::High,
+                }],
+            },
+            BrainEventKind::CommittedMemoriesReplaced {
+                memories: vec![CommittedMemoryRecord {
+                    node_id: 7,
+                    text: "user: What's the release process?\nassistant: See CONTRIBUTING.md."
+                        .into(),
+                    score: 0.42,
                 }],
             },
             BrainEventKind::Program {
@@ -2709,6 +2781,11 @@ mod tests {
             status: BrainTaskStatus::InProgress,
             priority: BrainTaskPriority::High,
         };
+        let committed_memory = CommittedMemoryRecord {
+            node_id: 42,
+            text: "user: Where is the deploy key?\nassistant: In the Employee vault.".into(),
+            score: 0.83,
+        };
         let expected = BrainWireMessage::Snapshot {
             brain: BrainSnapshot {
                 brain_id,
@@ -2718,7 +2795,7 @@ mod tests {
                     workspace: "/workspace/project".into(),
                     generation: 7,
                 },
-                revision: 2,
+                revision: 3,
                 events: vec![
                     event(
                         brain_id,
@@ -2733,6 +2810,13 @@ mod tests {
                         2,
                         BrainEventKind::TaskListReplaced {
                             tasks: vec![task.clone()],
+                        },
+                    ),
+                    event(
+                        brain_id,
+                        3,
+                        BrainEventKind::CommittedMemoriesReplaced {
+                            memories: vec![committed_memory.clone()],
                         },
                     ),
                 ],
@@ -2768,6 +2852,7 @@ mod tests {
                     scheduled_run,
                 ],
                 tasks: vec![task],
+                committed_memories: vec![committed_memory],
                 schedules: vec![schedule],
                 pending_schedule_dues: vec![pending_due],
                 effect_audits: Vec::new(),

@@ -12,7 +12,7 @@ Everything below is what callers outside this module can reach. Implementation m
 ```rust
 pub struct BrainApprovalDecisionReservation { … }
 pub struct BrainEvent { … }
-pub enum BrainEventKind { MutationRecorded, RunnerLeaseAcquired, RunnerLeaseReleased, RunnerHandoffRequested, RunnerHandoffCompleted, RunnerHandoffCancelled, ClientAttached, ClientDetached, RunStarted, RunStatusChanged, Prompt, SpeculativePrompt, ParticipantMessage, TaskListReplaced, ToolCall, ToolResult, ApprovalRequested, ApprovalDecided, Program, ProgramPopped, Result, RuntimeCommitted, EffectRecorded, EffectAuditTransition, ScheduleChanged, ScheduleDue }
+pub enum BrainEventKind { MutationRecorded, RunnerLeaseAcquired, RunnerLeaseReleased, RunnerHandoffRequested, RunnerHandoffCompleted, RunnerHandoffCancelled, ClientAttached, ClientDetached, RunStarted, RunStatusChanged, Prompt, SpeculativePrompt, ParticipantMessage, TaskListReplaced, CommittedMemoriesReplaced, ToolCall, ToolResult, ApprovalRequested, ApprovalDecided, Program, ProgramPopped, Result, RuntimeCommitted, EffectRecorded, EffectAuditTransition, ScheduleChanged, ScheduleDue }
 pub struct BrainExecutableMutationAppend { … }
 /// Stable identity of one durable Brain.
 pub struct BrainId(pub uuid::Uuid);
@@ -24,6 +24,8 @@ pub enum BrainMutationOutcome { RunCancellationReserved, RunCancellationDispatch
 /// Durable identity and preconditions for one authorized Brain mutation.
 pub struct BrainMutationReceipt { … }
 pub struct BrainProgram { … }
+/// One MemTree leaf the query processor has promoted into this Brain's durable, byte-stable recall prefix (#940).
+pub struct CommittedMemoryRecord { … }
 /// Append-only event log rooted at a Brain store directory.
 pub struct EventJournal { … }
 impl EventJournal {

@@ -55,6 +55,8 @@ pub struct ToolParts {
     pub todo_list: Arc<RwLock<crate::tools::TodoList>>,
     pub todo_journal_target: crate::tools::TodoJournalTarget,
     pub todo_journal_receiver: crate::tools::TodoJournalReceiver,
+    pub memory_commitment_target: super::memory_commitment::MemoryCommitmentTarget,
+    pub memory_commitment_receiver: super::memory_commitment::MemoryCommitmentReceiver,
 }
 
 /// How this frontend reaches a daemon, and why it could not.
@@ -82,6 +84,16 @@ pub struct RuntimeParts {
     pub program_runtime: Arc<crate::runtime::ProgramRuntime>,
     pub agent_scheduler: Arc<crate::scheduler::AgentScheduler>,
     pub memory_system: Option<Arc<finch_memory::MemorySystem>>,
+    /// Local mirror of the selected Brain's committed (byte-stable) memory
+    /// set (#940), shared with `LlmRuntime`'s copy so both the attach-time
+    /// hydration (`EventLoop`) and the per-turn render (`LlmLoop`) see the
+    /// same state.
+    pub committed_memories:
+        Arc<RwLock<Vec<crate::cli::repl_event::memory_commitment::CommittedMemoryRecord>>>,
+    /// `EventLoop` does not push through this itself; it only holds it to
+    /// hand to each `LlmLoop` it constructs, which is the task that
+    /// actually decides and requests committed-set replacements.
+    pub memory_commitment_writer: super::memory_commitment::MemoryCommitmentWriter,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,4 +153,8 @@ pub struct LlmRuntime {
     pub memory_system: Option<Arc<finch_memory::MemorySystem>>,
     pub current_graph: Arc<Mutex<crate::graph::ExecutionGraph>>,
     pub wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
+    /// Shared with `RuntimeParts`'s copy -- see its doc comment.
+    pub committed_memories:
+        Arc<RwLock<Vec<crate::cli::repl_event::memory_commitment::CommittedMemoryRecord>>>,
+    pub memory_commitment_writer: super::memory_commitment::MemoryCommitmentWriter,
 }

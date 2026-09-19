@@ -440,6 +440,15 @@ pub struct EventLoop {
     todo_list: Arc<tokio::sync::RwLock<crate::tools::TodoList>>,
     todo_journal_target: crate::tools::TodoJournalTarget,
 
+    /// Local mirror of the selected Brain's committed (byte-stable) memory
+    /// set (#940), hydrated from `BrainSnapshot.committed_memories` on
+    /// attach and read by the query processor every turn.
+    committed_memories: Arc<
+        tokio::sync::RwLock<Vec<crate::cli::repl_event::memory_commitment::CommittedMemoryRecord>>,
+    >,
+    memory_commitment_target: crate::cli::repl_event::memory_commitment::MemoryCommitmentTarget,
+    memory_commitment_writer: crate::cli::repl_event::memory_commitment::MemoryCommitmentWriter,
+
     /// Whether to summarise dropped messages (Infinite Context Phase 2).
     /// From config.features.enable_summarization.
     enable_summarization: bool,
@@ -1823,6 +1832,8 @@ impl EventLoop {
                 memory_system: self.memory_system.clone(),
                 current_graph: Arc::clone(&self.current_graph),
                 wire_metrics_logger: self.metrics_logger.clone(),
+                committed_memories: Arc::clone(&self.committed_memories),
+                memory_commitment_writer: self.memory_commitment_writer.clone(),
             },
             ContextLimits {
                 lines: self.context_lines,
@@ -1876,6 +1887,8 @@ impl EventLoop {
             todo_list,
             todo_journal_target,
             todo_journal_receiver,
+            memory_commitment_target,
+            memory_commitment_receiver,
         } = tools;
         let crate::cli::repl_event::parts::DaemonParts {
             ipc_client,
@@ -1894,9 +1907,12 @@ impl EventLoop {
             program_runtime,
             agent_scheduler,
             memory_system,
+            committed_memories,
+            memory_commitment_writer,
         } = runtime;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         todo_journal_receiver.spawn();
+        memory_commitment_receiver.spawn();
         let (llm_tx, llm_rx) = mpsc::unbounded_channel::<LlmRequest>();
 
         let agent_events = agent_scheduler.subscribe();
@@ -2086,6 +2102,9 @@ impl EventLoop {
             context_recall_k,
             todo_list,
             todo_journal_target,
+            committed_memories,
+            memory_commitment_target,
+            memory_commitment_writer,
             enable_summarization,
             auto_compact_enabled,
             pending_dialog_tx: None,
@@ -3736,6 +3755,7 @@ impl EventLoop {
                 .write_info(format!("detached from {}", client.target.display_name()));
         }
         self.todo_journal_target.set(self.home_brain.clone());
+        self.memory_commitment_target.set(self.home_brain.clone());
         if let Some(home) = self.home_brain.as_ref() {
             let snapshot = home.snapshot().await?;
             self.render_remote_brain_message(crate::brain::BrainWireMessage::Snapshot {

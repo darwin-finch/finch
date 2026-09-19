@@ -94,6 +94,18 @@ pub struct PromptAttachment {
     pub content: String,
 }
 
+/// One MemTree leaf the query processor has promoted into this Brain's
+/// durable, byte-stable recall prefix (#940). `score` is the weighted score
+/// (`cosine_similarity * importance_boost`) at the time it last (re)joined
+/// or was reconfirmed, so a client renders the same deterministic block
+/// without recomputing anything.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommittedMemoryRecord {
+    pub node_id: u64,
+    pub text: String,
+    pub score: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrainEventKind {
@@ -160,6 +172,14 @@ pub enum BrainEventKind {
     /// authoritative; frontend lists are projections rebuilt from snapshots.
     TaskListReplaced {
         tasks: Vec<super::tasks::BrainTask>,
+    },
+    /// Atomically replace the Brain's committed (byte-stable) recall set
+    /// (#940). Whole-set replace, mirroring `TaskListReplaced`, rather than
+    /// per-item add/remove events -- the query processor always decides the
+    /// full resulting set for a turn, so one event per change is enough and
+    /// reuses an already-proven event/projection/wire shape.
+    CommittedMemoriesReplaced {
+        memories: Vec<CommittedMemoryRecord>,
     },
     ToolCall {
         request_seq: u64,

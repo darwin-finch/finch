@@ -1332,6 +1332,20 @@ struct BrainTaskList {
   tasks @0 :List(BrainTask);
 }
 
+# One MemTree leaf the query processor has promoted into the Brain's durable,
+# byte-stable recall prefix (#940). `score` is the weighted score at the time
+# it last (re)joined or was reconfirmed, so a client can render the same
+# deterministic block without recomputing anything.
+struct BrainCommittedMemory {
+  nodeId @0 :UInt64;
+  text   @1 :Text;
+  score  @2 :Float32;
+}
+
+struct BrainCommittedMemoryList {
+  memories @0 :List(BrainCommittedMemory);
+}
+
 # Prompt text plus the file/directory snapshots selected with it. Replay uses
 # these bytes and digests; it must not reread the project files.
 struct BrainPromptAttachment {
@@ -1386,6 +1400,7 @@ struct BrainEvent {
     speculativePrompt      @29 :Text;
     mutationRecorded       @34 :BrainMutationOutcome;
     effectAuditTransition  @35 :BrainEffectAuditTransition;
+    committedMemoriesReplaced @36 :BrainCommittedMemoryList;
   }
   hasMutation @32 :Bool;
   mutation    @33 :BrainMutationReceipt;
@@ -1440,6 +1455,7 @@ struct BrainSnapshot {
   pendingScheduleDues @13 :List(BrainScheduleDue);
   tasks           @14 :List(BrainTask);
   effectAudits    @15 :List(Text);
+  committedMemories @16 :List(BrainCommittedMemory);
 }
 
 struct BrainWireMessage {
@@ -1537,6 +1553,7 @@ struct BrainSubmission {
     participantMessage @4 :Text;
     taskListReplaced @5 :BrainTaskList;
     speculativePrompt @6 :Text;
+    committedMemoriesReplaced @7 :BrainCommittedMemoryList;
   }
 }
 

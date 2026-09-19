@@ -343,6 +343,36 @@ pub struct MemoryConfig {
     /// Directory where the embedding model is cached / downloaded.
     /// Composition reads this; memory does not download or load models.
     pub embedding_cache_dir: PathBuf,
+    /// Minimum weighted score (`cosine_similarity * importance_boost`,
+    /// boost in {1.0, 1.2, 1.4} -- see `MemTree::retrieve`) a recall result
+    /// must clear to be returned at all, independent of the `top_k` count
+    /// cap. Below this, a result is dropped rather than injected.
+    ///
+    /// Default `0.15` is deliberately conservative: it only excludes a
+    /// result that is weak even at the highest importance boost (cosine
+    /// similarity below ~0.107 at boost 1.4, ~0.15 at boost 1.0), so only
+    /// clearly-irrelevant matches are filtered. Revisit once retrieval
+    /// quality work (#415) lands and scores become more trustworthy.
+    ///
+    /// This one number applies to whichever `EmbeddingEngine` the
+    /// composition root injected -- the sparse TF-IDF fallback and a dense
+    /// neural engine do not necessarily produce comparable cosine-similarity
+    /// distributions for unrelated text, so a threshold reasoned about
+    /// algebraically here has not been validated against either engine's
+    /// actual score distribution. Treat `0.15` as a starting point to
+    /// recalibrate per engine once real distributions are measured, not as
+    /// an empirically-derived constant.
+    pub min_relevance_score: f32,
+    /// Maximum number of memories the committed (Brain-persisted, byte-
+    /// stable) recall set may hold at once. A newly-qualifying memory
+    /// above this cap must out-score the current lowest-scoring committed
+    /// entry to join, evicting it.
+    pub max_committed_memories: usize,
+    /// A committed memory is dropped once it goes this many consecutive
+    /// turns without reappearing in that turn's fresh recall. Deliberately
+    /// generous: premature eviction defeats the point of a stable,
+    /// cacheable prefix, so this biases toward keeping a memory committed.
+    pub stale_after_turns: u32,
 }
 
 impl Default for MemoryConfig {
@@ -356,6 +386,9 @@ impl Default for MemoryConfig {
             checkpoint_interval_secs: 300, // 5 minutes
             use_neural_embeddings: true,
             embedding_cache_dir: home.join(".finch").join("embeddings"),
+            min_relevance_score: 0.15,
+            max_committed_memories: 8,
+            stale_after_turns: 20,
         }
     }
 }
@@ -759,6 +792,19 @@ pub struct MemorySearchResult {
     pub text: String,
     pub score: f32,
     pub source: Option<MemorySourceMetadata>,
+}
+
+/// One rendered, attributed recall result with its identity and weighted
+/// score retained, so a caller can track it across turns (e.g. to decide
+/// whether it should join a committed memory set).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecalledMemory {
+    pub node_id: NodeId,
+    /// Rendered, attributed text -- the same string `query()` returns.
+    pub text: String,
+    /// Weighted score (`cosine_similarity * importance_boost`) at recall
+    /// time; already cleared `MemoryConfig::min_relevance_score`.
+    pub score: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1759,10 +1805,30 @@ impl MemorySystem {
     /// render as that one exchange, so a question never arrives severed from
     /// its answer and never occupies two entries.
     pub async fn query(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<String>> {
+        Ok(self
+            .query_recall(query_text, top_k)
+            .await?
+            .into_iter()
+            .map(|recalled| recalled.text)
+            .collect())
+    }
+
+    /// Query memory for relevant context, retaining each result's `node_id`
+    /// and weighted score alongside its rendered, attributed text.
+    ///
+    /// This is what a caller needing to track recall identity across turns
+    /// (the committed-memory-set decision in the query processor) should
+    /// call instead of `query()`; `query()` is a thin wrapper over this for
+    /// callers that only need rendered text.
+    pub async fn query_recall(
+        &self,
+        query_text: &str,
+        top_k: Option<usize>,
+    ) -> Result<Vec<RecalledMemory>> {
         let results = self.query_with_sources(query_text, top_k).await?;
         let classifier = MemoryClassifier::new();
         let conn = self.db.lock().await;
-        let mut rendered: Vec<String> = Vec::with_capacity(results.len());
+        let mut rendered: Vec<RecalledMemory> = Vec::with_capacity(results.len());
         let mut seen: HashSet<String> = HashSet::with_capacity(results.len());
         for result in results {
             // The salience gate at recall, not only at insert (#415). A store
@@ -1791,7 +1857,11 @@ impl MemorySystem {
             // One entry per distinct rendered memory: duplicated leaf rows and
             // both halves of one exchange render the same string.
             if seen.insert(entry.clone()) {
-                rendered.push(entry);
+                rendered.push(RecalledMemory {
+                    node_id: result.node_id,
+                    text: entry,
+                    score: result.score,
+                });
             }
         }
         drop(conn);
@@ -1814,9 +1884,16 @@ impl MemorySystem {
             let tree = self.tree.lock().await;
             tree.retrieve(&query_embedding, k)
         };
+        let min_score = self.config.min_relevance_score;
         let conn = self.db.lock().await;
         let mut results = Vec::with_capacity(retrieved.len());
         for (node_id, text, score) in retrieved {
+            // Applied once here so every caller (rendered `query`/`query_recall`
+            // and any direct `query_with_sources` caller) drops a weak match
+            // instead of only ever capping by count (#940).
+            if score < min_score {
+                continue;
+            }
             let source = source_metadata_for_node(&conn, node_id)?;
             let memory_id = source
                 .as_ref()
@@ -2409,6 +2486,13 @@ impl MemorySystem {
     /// Progress of the background hydration, for status surfaces.
     pub fn hydration_status(&self) -> HydrationStatus {
         self.hydration.status()
+    }
+
+    /// The configuration this instance was constructed with -- callers that
+    /// need the relevance threshold, committed-set cap, or staleness grace
+    /// period (#940) read it from here rather than duplicating it.
+    pub fn config(&self) -> &MemoryConfig {
+        &self.config
     }
 
     /// Wait until every persisted node is in memory.
@@ -5814,6 +5898,13 @@ mod tests {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
+            // This test is about the leaf/internal-node hydration boundary,
+            // not relevance: `seed_tree_nodes` gives every leaf the same
+            // synthetic constant embedding, which is not guaranteed to
+            // clear the default relevance floor against the query text
+            // below and would make an unrelated assertion fail for the
+            // wrong reason (#940).
+            min_relevance_score: 0.0,
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);

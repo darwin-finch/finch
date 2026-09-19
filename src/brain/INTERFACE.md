@@ -111,7 +111,7 @@ pub struct BrainEnvironment { … }
 /// Re-exported from `brain::journal`.
 pub struct BrainEvent { … }
 /// Re-exported from `brain::journal`.
-pub enum BrainEventKind { MutationRecorded, RunnerLeaseAcquired, RunnerLeaseReleased, RunnerHandoffRequested, RunnerHandoffCompleted, RunnerHandoffCancelled, ClientAttached, ClientDetached, RunStarted, RunStatusChanged, Prompt, SpeculativePrompt, ParticipantMessage, TaskListReplaced, ToolCall, ToolResult, ApprovalRequested, ApprovalDecided, Program, ProgramPopped, Result, RuntimeCommitted, EffectRecorded, EffectAuditTransition, ScheduleChanged, ScheduleDue }
+pub enum BrainEventKind { MutationRecorded, RunnerLeaseAcquired, RunnerLeaseReleased, RunnerHandoffRequested, RunnerHandoffCompleted, RunnerHandoffCancelled, ClientAttached, ClientDetached, RunStarted, RunStatusChanged, Prompt, SpeculativePrompt, ParticipantMessage, TaskListReplaced, CommittedMemoriesReplaced, ToolCall, ToolResult, ApprovalRequested, ApprovalDecided, Program, ProgramPopped, Result, RuntimeCommitted, EffectRecorded, EffectAuditTransition, ScheduleChanged, ScheduleDue }
 /// Stable identity of one durable Brain. Re-exported from `brain::journal`.
 pub struct BrainId(pub uuid::Uuid);
 /// Reviewed, immutable program that establishes a Brain's initial typed state. Re-exported from `brain::schedule`.
@@ -264,6 +264,8 @@ pub enum BrainTaskPriority { High, Medium, Low }
 pub enum BrainTaskStatus { Pending, InProgress, Completed }
 /// Re-exported from `brain::projection`.
 pub enum BrainWireMessage { Snapshot, Event }
+/// One MemTree leaf the query processor has promoted into this Brain's durable, byte-stable recall prefix (#940). Re-exported from `brain::journal`.
+pub struct CommittedMemoryRecord { … }
 /// Identity of one live transport connection for a durable attachment. Re-exported from `brain::attachment`.
 pub struct ConnectionId(pub uuid::Uuid);
 /// Opaque daemon-side authority for one runner capability.

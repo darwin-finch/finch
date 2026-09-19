@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use super::attachment::{AttachmentRole, BrainAttachment};
 use super::journal::{
     scan_readonly, BrainEvent, BrainEventKind, BrainId, BrainMetadata, BrainProgram,
-    BRAIN_METADATA_VERSION,
+    CommittedMemoryRecord, BRAIN_METADATA_VERSION,
 };
 use super::run::{
     BrainRun, BrainRunKind, BrainRunStatus, BrainRunnerHandoff, BrainRunnerLease, RunId,
@@ -43,6 +43,10 @@ pub struct BrainSnapshot {
     /// Current task-list projection derived from `TaskListReplaced` events.
     #[serde(default)]
     pub tasks: Vec<BrainTask>,
+    /// Current committed (byte-stable) recall-set projection derived from
+    /// `CommittedMemoriesReplaced` events (#940).
+    #[serde(default)]
+    pub committed_memories: Vec<CommittedMemoryRecord>,
     #[serde(default)]
     pub schedules: Vec<BrainSchedule>,
     #[serde(default)]

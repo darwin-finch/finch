@@ -19,6 +19,11 @@ impl EventLoop {
         let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
         let (_todo_writer, todo_target, todo_receiver) =
             crate::tools::todo_journal(Arc::clone(&todo_list));
+        let committed_memories = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (memory_commitment_writer, memory_commitment_target, memory_commitment_receiver) =
+            crate::cli::repl_event::memory_commitment::memory_commitment_journal(Arc::clone(
+                &committed_memories,
+            ));
         let provider_resolver = crate::scheduler::ProviderResolver::new(Arc::clone(&generator));
         let agent_scheduler = crate::scheduler::AgentScheduler::new(
             provider_resolver.clone(),
@@ -58,6 +63,8 @@ impl EventLoop {
                 todo_list,
                 todo_journal_target: todo_target,
                 todo_journal_receiver: todo_receiver,
+                memory_commitment_target,
+                memory_commitment_receiver,
             },
             DaemonParts {
                 ipc_client: None,
@@ -76,6 +83,8 @@ impl EventLoop {
                 program_runtime,
                 agent_scheduler,
                 memory_system: None,
+                committed_memories,
+                memory_commitment_writer,
             },
         )
     }
@@ -655,6 +664,8 @@ impl EventLoop {
         self.active_remote_brain = Some(client);
         self.todo_journal_target
             .set(self.active_remote_brain.clone());
+        self.memory_commitment_target
+            .set(self.active_remote_brain.clone());
         self.update_remote_brain_status(runner_online);
         self.render_remote_brain_message(crate::brain::BrainWireMessage::Snapshot {
             brain: snapshot,
@@ -766,6 +777,13 @@ impl EventLoop {
                     .write()
                     .await
                     .replace_all(brain.tasks.clone());
+                // Hydrate the committed memory set wholesale from the
+                // snapshot -- this is what makes it survive `finch attach`
+                // / restart (#940). No incremental sync from the live event
+                // stream (see `CommittedMemoriesReplaced` in
+                // `render_remote_brain_event` below): only re-attaching
+                // refreshes this mirror.
+                *self.committed_memories.write().await = brain.committed_memories.clone();
                 project_brain_context(
                     &self.status_bar,
                     &brain.events,
@@ -1012,6 +1030,14 @@ impl EventLoop {
             BrainEventKind::TaskListReplaced { tasks } => {
                 self.todo_list.write().await.replace_all(tasks.clone());
             }
+            // Not transcript content, and not synced live from the event
+            // stream (#940): the committed memory set is hydrated wholesale
+            // from `BrainSnapshot.committed_memories` on attach
+            // (`render_remote_brain_message`'s `Snapshot` branch), which is
+            // what makes it survive `finch attach` / restart. Live cross-
+            // client sync of another attached console's commits is a
+            // deliberate non-goal for this change.
+            BrainEventKind::CommittedMemoriesReplaced { .. } => {}
             BrainEventKind::ToolCall {
                 tool_id,
                 name,
