@@ -9,6 +9,8 @@
 
 use std::ops::Range;
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::cli::messages::MessageId;
 
 /// Stable identity for one expandable row within the transcript.
@@ -67,47 +69,33 @@ pub struct RenderedTranscriptLine {
 
 /// Return the terminal display width (in columns) of a single character.
 ///
-/// CJK / fullwidth characters occupy 2 columns; everything else occupies 1.
-/// This covers the Unicode ranges that crossterm / terminal emulators treat as
-/// double-width without pulling in an extra crate.
+/// Delegates to the [`unicode-width`](https://docs.rs/unicode-width) tables —
+/// the same model the test-only `vt_oracle` terminal uses — so this
+/// vocabulary and the terminal model agree by construction (#934):
+///
+/// - **Emoji and other wide codepoints measure 2 columns**: characters with
+///   the `Emoji_Presentation` property and East Asian `Wide`/`Fullwidth`
+///   codepoints (CJK, Hangul, fullwidth forms).
+/// - **East-Asian-Ambiguous glyphs stay 1 column by design** (° ± → α Ω, box
+///   drawing, Finch's `❯` prompt): that is what xterm and Western-locale
+///   terminals render. Finch tracks no locale, so ambiguous widths are never
+///   widened.
+/// - Combining marks, the zero-width joiner, and variation selectors measure
+///   0, so a ZWJ emoji sequence measures as the sum of its emoji.
+///   Measurement stays per character — there is no grapheme clustering here,
+///   matching the terminal model.
+/// - Control characters measure 0; callers strip escape sequences before
+///   measuring.
 #[inline]
 pub(crate) fn char_display_width(c: char) -> usize {
-    match c as u32 {
-        // Hangul Jamo
-        0x1100..=0x115F |
-        // CJK Radicals Supplement … CJK Symbols and Punctuation
-        0x2E80..=0x303E |
-        // Hiragana … CJK Compatibility
-        0x3040..=0x33FF |
-        // CJK Unified Ideographs Extension A
-        0x3400..=0x4DBF |
-        // CJK Unified Ideographs (covers all common Chinese, Japanese, Korean)
-        0x4E00..=0xA4CF |
-        // Hangul Jamo Extended-A
-        0xA960..=0xA97F |
-        // Hangul Syllables … Hangul Jamo Extended-B
-        0xAC00..=0xD7FF |
-        // CJK Compatibility Ideographs
-        0xF900..=0xFAFF |
-        // Vertical forms
-        0xFE10..=0xFE19 |
-        // CJK Compatibility Forms … Small Form Variants
-        0xFE30..=0xFE6F |
-        // Fullwidth Latin and Halfwidth Katakana
-        0xFF01..=0xFF60 |
-        // Fullwidth Signs
-        0xFFE0..=0xFFE6 |
-        // CJK Unified Ideographs Extension B–F (supplementary planes)
-        0x20000..=0x2FFFD |
-        0x30000..=0x3FFFD => 2,
-        _ => 1,
-    }
+    UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
 /// Calculate visible display-column width of string (excluding ANSI escape codes).
 ///
-/// CJK / fullwidth characters (Chinese, Japanese, Korean) occupy 2 terminal columns
-/// each.  All other printable characters occupy 1 column.
+/// Emoji and other wide codepoints (CJK / fullwidth: Chinese, Japanese,
+/// Korean) occupy 2 terminal columns each; zero-width marks add none. All
+/// other printable characters occupy 1 column. See [`char_display_width`].
 pub fn visible_length(s: &str) -> usize {
     let mut len = 0;
     let mut chars = s.chars().peekable();
@@ -1108,5 +1096,172 @@ mod tests {
             );
             assert_eq!(physical_rows(&lines[*index].text, 40), *rows);
         }
+    }
+
+    // ─── Display-width regressions (#934) ─────────────────────────────────────
+
+    fn styled_emoji_line_at_eighty_columns() -> String {
+        // 76 ASCII columns + 4 emoji × 2 columns = 84 visible columns.
+        format!("\x1b[32m{}\x1b[0m", "x".repeat(76) + "🔥🔥🔥🔥")
+    }
+
+    #[test]
+    fn test_char_display_width_emoji_measures_two_columns() {
+        // #934: emoji are two terminal columns in every modern terminal; the
+        // vocabulary must measure them at 2, exactly like the test-only
+        // vt_oracle terminal model does.
+        for emoji in ['😀', '🦀', '🔥', '🎉', '✅', '⏳', '⭐', '🟢', '🤖', '🚀'] {
+            assert_eq!(
+                char_display_width(emoji),
+                2,
+                "emoji {emoji} (U+{:04X}) must measure 2 columns",
+                emoji as u32
+            );
+        }
+    }
+
+    #[test]
+    fn test_char_display_width_east_asian_ambiguous_stays_one_column() {
+        // #934 changes only wide/emoji codepoints. East-Asian-Ambiguous
+        // glyphs stay 1 column by design (xterm, Western locales); Finch's
+        // prompt (`❯`), status glyphs, and box drawing depend on it.
+        for ambiguous in ['°', '±', '·', 'α', 'Ω', '→', '∞', '✓', '▶', '❯'] {
+            assert_eq!(
+                char_display_width(ambiguous),
+                1,
+                "East-Asian-Ambiguous {ambiguous} (U+{:04X}) must stay 1 column by design",
+                ambiguous as u32
+            );
+        }
+    }
+
+    #[test]
+    fn test_char_display_width_zero_width_marks_and_joiners_measure_zero() {
+        // Combining marks, the zero-width joiner, and variation selectors add
+        // no columns, so a ZWJ family emoji measures as the sum of its emoji.
+        assert_eq!(char_display_width('\u{0301}'), 0, "combining acute");
+        assert_eq!(char_display_width('\u{200D}'), 0, "zero-width joiner");
+        assert_eq!(
+            char_display_width('\u{FE0F}'),
+            0,
+            "emoji-presentation variation selector"
+        );
+        assert_eq!(
+            visible_length("👨\u{200D}👩\u{200D}👧"),
+            6,
+            "three 2-column emoji plus zero-width joiners = 6 columns"
+        );
+    }
+
+    #[test]
+    fn test_visible_length_styled_emoji_line_measures_eighty_four_columns() {
+        let line = styled_emoji_line_at_eighty_columns();
+        assert_eq!(
+            visible_length(&line),
+            84,
+            "76 ANSI-stripped ASCII columns + 4 emoji × 2 columns"
+        );
+    }
+
+    #[test]
+    fn test_physical_rows_styled_emoji_line_wraps_at_eighty_columns() {
+        // #934 regression: before the fix the emoji counted 1 column each, the
+        // line measured 80, and the live area claimed (and later erased) one
+        // row while the terminal painted two — leaving stale rows behind.
+        let line = styled_emoji_line_at_eighty_columns();
+        assert_eq!(
+            physical_rows(&line, 80),
+            2,
+            "84 visible columns wrap into 2 physical rows at width 80"
+        );
+        assert_eq!(
+            physical_rows(&line, 90),
+            1,
+            "the same line fits one row on a 90-column terminal"
+        );
+    }
+
+    #[test]
+    fn test_physical_rows_line_of_only_emoji_measures_correctly() {
+        let forty = "🎉".repeat(40);
+        let forty_one = "🎉".repeat(41);
+        assert_eq!(visible_length(&forty), 80, "40 emoji × 2 columns");
+        assert_eq!(
+            physical_rows(&forty, 80),
+            1,
+            "exactly 80 columns fill one row at width 80"
+        );
+        assert_eq!(visible_length(&forty_one), 82, "41 emoji × 2 columns");
+        assert_eq!(
+            physical_rows(&forty_one, 80),
+            2,
+            "82 columns overflow one row at width 80"
+        );
+    }
+
+    #[test]
+    fn test_truncate_to_columns_drops_emoji_straddling_the_boundary() {
+        assert_eq!(
+            visible_length(&truncate_to_columns("a🔥b", 2)),
+            1,
+            "the emoji needs columns 2-3, so a 2-column budget keeps only 'a'"
+        );
+        assert_eq!(
+            truncate_to_columns("a🔥b", 4),
+            "a🔥b",
+            "4 columns fit the whole 4-column line"
+        );
+        let styled = format!("\x1b[1m{}🔥🔥", "x".repeat(78));
+        let truncated = truncate_to_columns(&styled, 80);
+        assert_eq!(
+            truncated,
+            format!("\x1b[1m{}🔥", "x".repeat(78)),
+            "78 styled x's + one emoji fill 80 columns; the second emoji is dropped, \
+             escape sequences copied through"
+        );
+        assert_eq!(visible_length(&truncated), 80);
+    }
+
+    #[test]
+    fn test_claiming_boundary_emoji_line_claims_its_wrapped_rows() {
+        // #934 at the claiming boundary: the live area's transcript viewport
+        // and natural Text widgets measure rows with this vocabulary, so a
+        // styled emoji line must claim 2 rows at 80 columns — both for height
+        // and for the disclosure hit rect.
+        let line = styled_emoji_line_at_eighty_columns();
+        let text = Widget::Text {
+            lines: vec![line.clone()],
+        };
+        assert_eq!(
+            natural_height(&text, 80),
+            2,
+            "natural height of an 84-column emoji line at 80 columns is 2 rows"
+        );
+
+        let header = RenderedTranscriptLine {
+            text: line,
+            row_id: Some(RowId {
+                message_id: crate::cli::messages::MessageId::new(),
+                path: vec![1],
+            }),
+            component_owned: true,
+            ..RenderedTranscriptLine::default()
+        };
+        let result = layout(
+            &Widget::Viewport {
+                lines: vec![header],
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 2,
+            },
+        );
+        assert_eq!(
+            result.nodes[0].hit_lines,
+            vec![(0usize, 0usize, 2usize)],
+            "the component-owned emoji header claims both of its physical rows"
+        );
     }
 }

@@ -500,9 +500,10 @@ mod tests {
 
     #[test]
     fn test_visible_length_unicode_counts_chars() {
-        // Each Unicode character counts as 1 (codepoint, not byte)
+        // Most Unicode characters count 1 (codepoint, not byte)
         assert_eq!(visible_length("café"), 4);
-        assert_eq!(visible_length("🦀"), 1);
+        // #934: emoji occupy two terminal columns, not one
+        assert_eq!(visible_length("🦀"), 2);
     }
 
     #[test]
@@ -730,5 +731,48 @@ mod tests {
         // "你好世界" at width 6 needs 2 rows; visible_length = 8, ceil(8/6) = 2
         let cols = 8_usize.div_ceil(6);
         assert_eq!(cols, 2);
+    }
+
+    // ─── emoji / wide-codepoint wrap agreement (#934) ─────────────────────────
+
+    #[test]
+    fn test_write_line_emoji_line_wraps_and_pads_as_physical_rows_plans() {
+        // INVARIANT (#934): the erasure/claiming side (`physical_rows`) and
+        // the painting side (`write_line`) must agree on a styled emoji line
+        // at 80 columns, or the live area erases fewer rows than the terminal
+        // actually shows (the #926 wizard mid-row bleed-through class).
+        // 76 ASCII columns + 4 emoji × 2 columns = 84 columns.
+        let line = format!("\x1b[32m{}\x1b[0m", "x".repeat(76) + "🔥🔥🔥🔥");
+        assert_eq!(
+            physical_rows(&line, 80),
+            2,
+            "84 visible columns wrap into 2 physical rows at width 80"
+        );
+        let mut buf = ShadowBuffer::new(80, 3);
+        let rows = buf.write_line(0, &line, Style::default());
+        assert_eq!(
+            rows, 2,
+            "write_line must wrap the same line into the same 2 rows physical_rows planned"
+        );
+        assert_eq!(buf.get(75, 0).unwrap().ch, 'x');
+        assert_eq!(buf.get(76, 0).unwrap().ch, '🔥');
+        assert_eq!(
+            buf.get(77, 0).unwrap().ch,
+            '\u{200B}',
+            "the second column of a wide emoji carries the occupancy marker"
+        );
+        assert_eq!(buf.get(78, 0).unwrap().ch, '🔥');
+        assert_eq!(buf.get(79, 0).unwrap().ch, '\u{200B}');
+        assert_eq!(
+            buf.get(0, 1).unwrap().ch,
+            '🔥',
+            "the third emoji wraps to row 1"
+        );
+        assert_eq!(buf.get(2, 1).unwrap().ch, '🔥');
+        assert_eq!(
+            buf.get(79, 1).unwrap().ch,
+            ' ',
+            "the wrapped tail row is padded to the terminal width"
+        );
     }
 }
