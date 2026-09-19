@@ -124,6 +124,8 @@ impl MemorySystem {
     pub fn new_with_connection(db: Arc<Mutex<Connection>>, config: MemoryConfig, embedding_engine: Arc<dyn EmbeddingEngine>) -> Result<Self>;
     /// Create a memory system that embeds with the caller-supplied engine.
     pub fn new_with_engine(config: MemoryConfig, embedding_engine: Arc<dyn EmbeddingEngine>) -> Result<Self>;
+    /// Open (or create) `db_path` with WAL mode enabled.
+    pub fn open_connection(db_path: &std::path::Path) -> Result<Connection>;
     /// Root containing user-readable program sources beside the memory database.
     pub fn program_source_root(&self) -> PathBuf;
 }

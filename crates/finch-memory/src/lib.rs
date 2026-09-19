@@ -900,6 +900,26 @@ impl MemorySystem {
         Self::new_with_engine(config, Arc::new(TfIdfEmbedding::new()))
     }
 
+    /// Open (or create) `db_path` with WAL mode enabled.
+    ///
+    /// The shared open sequence behind [`Self::new_with_engine`]: create the
+    /// parent directory if needed, open the file, enable WAL. Exposed so a
+    /// composition root that wants to call [`Self::new_with_connection`]
+    /// directly -- to actually exercise the injected path, rather than
+    /// going through the path-based wrapper -- does not have to duplicate
+    /// this sequence and risk it drifting (e.g. a future pragma change
+    /// applied to one copy and not the other).
+    pub fn open_connection(db_path: &std::path::Path) -> Result<Connection> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+        }
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        Ok(conn)
+    }
+
     /// Create a memory system that embeds with the caller-supplied engine.
     ///
     /// The engine's dimension parameterizes the MemTree. Constructors never
@@ -912,19 +932,7 @@ impl MemorySystem {
         config: MemoryConfig,
         embedding_engine: Arc<dyn EmbeddingEngine>,
     ) -> Result<Self> {
-        // Ensure directory exists
-        if let Some(parent) = config.db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
-        }
-
-        // Open SQLite connection with WAL mode
-        let conn = Connection::open(&config.db_path)
-            .with_context(|| format!("Failed to open database: {}", config.db_path.display()))?;
-
-        // Enable WAL mode for concurrency
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-
+        let conn = Self::open_connection(&config.db_path)?;
         Self::new_with_connection(Arc::new(Mutex::new(conn)), config, embedding_engine)
     }
 
@@ -937,15 +945,34 @@ impl MemorySystem {
     /// same idempotent `schema.sql` initialization and migrations as
     /// [`Self::new_with_engine`] against whatever connection it is handed,
     /// then hydrates the `MemTree` from it.
+    ///
+    /// `db` must be uncontended when this is called -- the constructor holds
+    /// its lock throughout schema initialization and the synchronous
+    /// hydration path. A caller sharing the same `Arc<Mutex<Connection>>`
+    /// with something else that might be holding the lock at this moment
+    /// gets a clean `Err`, not a panic.
     pub fn new_with_connection(
         db: Arc<Mutex<Connection>>,
         config: MemoryConfig,
         embedding_engine: Arc<dyn EmbeddingEngine>,
     ) -> Result<Self> {
         let (node_count, max_node_id) = {
-            let conn = db
-                .try_lock()
-                .expect("a freshly injected connection cannot be contended");
+            let conn = db.try_lock().context(
+                "new_with_connection requires the injected connection to be \
+                 uncontended on entry",
+            )?;
+
+            // `db` and `config` are independent parameters here -- unlike
+            // before this constructor took an injected connection, when both
+            // always came from one `Connection::open(&config.db_path)` call.
+            // A caller is free to pass a `db` that does not back
+            // `config.db_path` at all (the regression test below does
+            // exactly that). Ask the connection itself what file it has
+            // open rather than assuming `config.db_path` is it, so the
+            // remediation text below never names the wrong file. `path()`
+            // is `None` for `:memory:` or an already-closed connection, in
+            // which case there is no file to move aside at all.
+            let db_file = conn.path().map(str::to_string);
 
             // Refuse a database created before `memory_sources.node_id UNIQUE` was
             // dropped. There is deliberately no migration — Finch has no users and
@@ -963,20 +990,28 @@ impl MemorySystem {
                         |row| row.get(0),
                     )
                     .unwrap_or(0);
-                anyhow::ensure!(
-                    stale == 0,
-                    "{} predates the current memory schema and cannot be upgraded \
-                 in place. Storing the same content twice would fail with a \
-                 UNIQUE constraint error.\n\n\
-                 Move it aside and Finch will create a fresh store, keeping \
-                 the old one readable with any SQLite client:\n\
-                 \x20\x20mv {} {}.pre-schema-change\n\n\
-                 Do not delete it unless you are certain the history is not \
-                 wanted — there is no export path yet.",
-                    config.db_path.display(),
-                    config.db_path.display(),
-                    config.db_path.display()
-                );
+                match (&db_file, stale == 0) {
+                    (_, true) => {}
+                    (Some(path), false) => anyhow::bail!(
+                        "{path} predates the current memory schema and cannot be \
+                         upgraded in place. Storing the same content twice would \
+                         fail with a UNIQUE constraint error.\n\n\
+                         Move it aside and Finch will create a fresh store, \
+                         keeping the old one readable with any SQLite client:\n\
+                         \x20\x20mv {path} {path}.pre-schema-change\n\n\
+                         Do not delete it unless you are certain the history is \
+                         not wanted — there is no export path yet.",
+                    ),
+                    (None, false) => anyhow::bail!(
+                        "the injected connection predates the current memory \
+                         schema and cannot be upgraded in place. Storing the \
+                         same content twice would fail with a UNIQUE constraint \
+                         error. This connection reports no backing file \
+                         (in-memory or already closed), so there is nothing for \
+                         Finch to move aside automatically -- the caller must \
+                         supply a connection against a fresh database."
+                    ),
+                }
             }
 
             // Migration A: detect old tree_nodes schema (primary key was 'id AUTOINCREMENT',
@@ -1040,7 +1075,10 @@ impl MemorySystem {
              WHERE brain_id IS NOT NULL AND run_id IS NOT NULL;",
             )?;
 
-            tracing::debug!("Memory system initialized: {}", config.db_path.display());
+            tracing::debug!(
+                "Memory system initialized: {}",
+                db_file.as_deref().unwrap_or("<in-memory or unknown>")
+            );
 
             // Hydrate the MemTree from `tree_nodes`.
             //
@@ -1148,9 +1186,10 @@ impl MemorySystem {
                     let mut guard = tree
                         .try_lock()
                         .expect("a newly constructed MemTree cannot be contended");
-                    let conn = db
-                        .try_lock()
-                        .expect("a newly opened connection cannot be contended");
+                    let conn = db.try_lock().context(
+                        "new_with_connection requires the injected connection to be \
+                         uncontended during synchronous hydration",
+                    )?;
                     if let Err(error) = Self::load_tree_from_db_conn(&conn, &mut guard) {
                         // Broken, not fresh.
                         //

@@ -790,26 +790,17 @@ impl Repl {
             // rather than going through the path-based `new_with_engine`
             // convenience wrapper -- this is the one call site where the
             // injected constructor actually matters in production.
-            let opened = (|| -> Result<finch_memory::MemorySystem> {
-                if let Some(parent) = config.memory.db_path.parent() {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("Failed to create directory: {}", parent.display())
-                    })?;
-                }
-                let conn =
-                    rusqlite::Connection::open(&config.memory.db_path).with_context(|| {
-                        format!(
-                            "Failed to open database: {}",
-                            config.memory.db_path.display()
-                        )
-                    })?;
-                conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-                finch_memory::MemorySystem::new_with_connection(
-                    Arc::new(tokio::sync::Mutex::new(conn)),
-                    config.memory.clone(),
-                    engine,
-                )
-            })();
+            // `open_connection` is the same dir-creation + open + WAL
+            // sequence `new_with_engine` uses internally, shared so the two
+            // paths cannot silently diverge.
+            let opened = finch_memory::MemorySystem::open_connection(&config.memory.db_path)
+                .and_then(|conn| {
+                    finch_memory::MemorySystem::new_with_connection(
+                        Arc::new(tokio::sync::Mutex::new(conn)),
+                        config.memory.clone(),
+                        engine,
+                    )
+                });
             drop(memory_open);
             match opened {
                 Ok(system) => {
