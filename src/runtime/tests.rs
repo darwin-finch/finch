@@ -3754,34 +3754,48 @@ fn read_workbook_rows_still_reads_an_ordinary_sheet() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn typed_mcp_call_uses_concrete_authority_and_managed_json() {
-    let script = r#"
-IFS= read -r discover
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fixture","version":"1"}}}}'
-IFS= read -r list
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo_value","description":"untrusted fixture prose","inputSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]},"outputSchema":{"type":"object","properties":{"ok":{"type":"boolean"},"typed":{"type":"boolean"},"forth":{"type":"boolean"}}}}]}}'
-IFS= read -r call
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"fixture result"}],"structuredContent":{"ok":true},"isError":false}}'
-IFS= read -r typed_call
-printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"typed fixture result"}],"structuredContent":{"typed":true},"isError":false}}'
-IFS= read -r forth_call
-printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"forth fixture result"}],"structuredContent":{"forth":true},"isError":false}}'
-"#;
-    let config = std::collections::HashMap::from([(
-        "fixture".to_string(),
-        crate::tools::McpServerConfig {
-            command: Some("sh".to_string()),
-            args: vec!["-c".to_string(), script.to_string()],
-            transport: crate::tools::TransportType::Stdio,
-            url: None,
-            env: std::collections::HashMap::new(),
-            enabled: true,
-            timeout_secs: 5,
-        },
-    )]);
-    let client = Arc::new(crate::tools::McpClient::from_config(&config).await.unwrap());
+    struct FixtureMcpClient;
+
+    #[async_trait::async_trait]
+    impl RuntimeMcpClient for FixtureMcpClient {
+        async fn tool_descriptors(&self) -> Vec<RuntimeMcpToolDescriptor> {
+            vec![RuntimeMcpToolDescriptor {
+                server: "fixture".into(),
+                tool: "echo_value".into(),
+                description: Some("untrusted fixture prose".into()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "typed": {"type": "boolean"},
+                        "forth": {"type": "boolean"}
+                    }
+                })),
+            }]
+        }
+
+        async fn execute_tool_value(
+            &self,
+            _tool_name: &str,
+            params: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            let value = params["value"].as_str().unwrap_or_default();
+            let field = if value == "hello" { "ok" } else { value };
+            Ok(serde_json::json!({
+                "structuredContent": {(field): true},
+                "isError": false
+            }))
+        }
+    }
+
+    let client: Arc<dyn RuntimeMcpClient> = Arc::new(FixtureMcpClient);
     let runtime = ProgramRuntime::new();
     assert!(!runtime.has_mcp_client());
     assert!(runtime.bind_mcp_client(client).await.unwrap().is_empty());
@@ -5733,14 +5747,8 @@ async fn typed_output_handles_are_owned_by_their_program_run() {
 }
 
 #[tokio::test]
-async fn synchronous_output_open_projects_one_sequence_ordered_create_event() {
+async fn synchronous_output_open_emits_one_sequence_ordered_create_event() {
     let runtime = ProgramRuntime::new();
-    let output_manager = Arc::new(crate::cli::OutputManager::default());
-    output_manager.disable_stdout();
-    let response = output_manager.start_work_unit("VM program output");
-    response.set_program_output();
-    let projection =
-        crate::cli::VmOutputProjection::new(Arc::clone(&output_manager), Arc::clone(&response));
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink: TypedEffectSink = {
         let events = Arc::clone(&events);
@@ -5790,21 +5798,6 @@ async fn synchronous_output_open_projects_one_sequence_ordered_create_event() {
             ..
         })
     ));
-    for event in events.iter() {
-        assert!(
-            !projection.project_envelope(event.clone()).is_empty(),
-            "the UI projection must not discard a same-sequence create event"
-        );
-    }
-    let messages = output_manager.get_messages();
-    assert_eq!(messages.len(), 2, "response port plus output handle");
-    assert_eq!(
-        messages[1].status(),
-        crate::cli::messages::MessageStatus::Complete
-    );
-    assert!(messages[1]
-        .format(&crate::theme::ColorScheme::default())
-        .contains("download"));
 }
 
 #[tokio::test]

@@ -384,6 +384,29 @@ pub struct ResourceRootAuditEntry {
     pub actor: String,
 }
 
+/// Untrusted MCP discovery data presented to the runtime by an
+/// application-owned transport.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeMcpToolDescriptor {
+    pub server: String,
+    pub tool: String,
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
+    pub output_schema: Option<serde_json::Value>,
+}
+
+/// Host-injected MCP transport. Runtime owns validation and typed vocabulary;
+/// the application layer owns connections and protocol I/O.
+#[async_trait::async_trait]
+pub trait RuntimeMcpClient: Send + Sync {
+    async fn tool_descriptors(&self) -> Vec<RuntimeMcpToolDescriptor>;
+    async fn execute_tool_value(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value>;
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ResourceRootState {
     bindings: BTreeMap<crate::vm::ResourceRoot, Arc<ResourceRootBindingRecord>>,
@@ -408,7 +431,7 @@ pub struct ProgramRuntime {
     memory: RwLock<Option<Arc<finch_memory::MemorySystem>>>,
     /// Host-owned MCP transport. Installing it makes configured servers
     /// callable but never grants authority to any server or tool.
-    mcp_client: RwLock<Option<Arc<crate::tools::McpClient>>>,
+    mcp_client: RwLock<Option<Arc<dyn RuntimeMcpClient>>>,
     host_vocabulary: RwLock<BTreeMap<String, HostVocabularyMetadata>>,
     network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
     /// Output handles are opaque, per-execution presentation resources.  They
@@ -885,10 +908,7 @@ impl ProgramRuntime {
     /// Install the application-owned MCP transport and atomically replace its
     /// discovered, validated namespaced vocabulary. This changes availability
     /// and the manifest generation, never capability grants.
-    pub async fn bind_mcp_client(
-        &self,
-        client: Arc<crate::tools::McpClient>,
-    ) -> Result<Vec<String>> {
+    pub async fn bind_mcp_client(&self, client: Arc<dyn RuntimeMcpClient>) -> Result<Vec<String>> {
         let mut rejected = Vec::new();
         let mut signatures = BTreeMap::new();
         let mut metadata = BTreeMap::new();

@@ -35,7 +35,7 @@ pub struct RunnerEffectAuditControl {
 
 /// The tool API carries this authority opaquely; only the runtime's concrete
 /// control can be injected, and construction stays `pub(crate)`.
-impl crate::tools::EffectAuditAuthority for RunnerEffectAuditControl {
+impl finch_tools_api::EffectAuditAuthority for RunnerEffectAuditControl {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
