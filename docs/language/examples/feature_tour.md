@@ -818,3 +818,35 @@ property compile-time evaluation cannot decide, the same class of unprovable pro
 makes about `.empty`/`.front`/`.popFront`'s real behavior. The design doc's own new axiom section
 says this in the abstract ("not a claim about arbitrary runtime instance behavior"); this example
 is what that limitation actually looks like in a concrete program, not just in the caveat prose.
+
+## 20. Checked-once bodies, template-style generation — resolving templates vs. generics
+
+Directly from a design conversation about where Shammah actually sits on templates vs. generics:
+not per-instantiation specialization/pattern-matching (declined), but the other thing templates give
+you — distinct compiled code per instantiation so the optimizer can specialize, which plain
+dictionary-passing generics can't offer. Confirmed this is separable rather than a contradiction:
+checking (generic, proof-required, no SFINAE) and code generation (template-style, lazy,
+per-instantiation) are independent axes, and Rust is the standing existence proof that combining
+them is coherent.
+
+```text
+; Rejected outright -- not a runtime type error, not a per-instantiation SFINAE failure.
+; Nothing declares that T supports +, so the body cannot be checked at all:
+(define (foo (x : T)) : int
+  (+ x x))
+
+; Checked once against the declared bound; generates like a template thereafter --
+; foo<i64> and foo<f64> are two distinct compiled functions, discovered lazily from
+; whichever concrete calls actually exist in the program, each fully inlinable/specializable:
+(define (foo <T : Add<T,T,Output=int>> (x : T)) : int
+  (+ x x))
+```
+
+The first form is rejected the same way regardless of whether anyone ever calls `foo` with a
+concrete type — there is no instantiation to try compiling, because there is nothing to compile
+until a bound exists to check the body against. This is the load-bearing distinction from D's model:
+D would accept the unconstrained form and defer the failure to whichever instantiation site first
+tries `x + x` on a `T` that doesn't support it (or silently exclude `foo` as a non-viable overload
+candidate via SFINAE if another overload exists). Finch's body is either provably valid under its
+declared bound or it does not exist as a candidate at all — there is no "maybe it'll work out for
+some future caller" state for a generic body to be in.

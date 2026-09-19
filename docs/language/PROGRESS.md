@@ -1002,3 +1002,32 @@ messages" gist, unmodified):
   the explicit-mapping design has no such step to get wrong. Not yet written into the spec as new
   prose — logged here as supporting evidence for the design decision already made, pending whether a
   dedicated worked example is worth adding alongside §19's `Codec` example.
+
+**Continued 2026-09-18 — the templates-vs-generics thread resolved: checked-once bodies, template-
+style generation.** Shammah confirmed he doesn't want D-style per-instantiation specialization/
+pattern-matching, but does want the other power of templates: distinct compiled code per
+instantiation so the optimizer can specialize, which the document's own prior text explicitly
+rejected. Resolved as two independent axes rather than a contradiction, with Rust as the standing
+proof they compose: checking stays generic (proof-required against a declared bound, never SFINAE);
+code generation becomes template-style and lazy (one compiled native function per concrete
+type/evidence combination, discovered from real call sites, never by eagerly enumerating a
+signature's combinatorial space).
+
+This directly reverses the document's previous "Static evidence does not require unconditional
+Rust-style monomorphization... one uniform evidence/dictionary ABI... selectively specializes...
+when there is a proven benefit" passage, which is now corrected in place rather than left to
+contradict the new decision. The passage's own stated reason for rejecting monomorphization — `2^n`
+static/dynamic blowup for a mixed-dispatch signature — turned out to assume *eager* generation; it
+dissolves under laziness, since a real call only ever asks for the one combination it actually uses,
+never the cross product. The existing "versioned verified parametric artifact" mechanism (already
+in the document, unchanged) turns out to be exactly the right shape for this already: a downstream
+compiler instantiates lazily against it, template-style, without needing the original source —
+which also speaks to a real concern Shammah raised (C++/D's on-demand instantiation is why template
+libraries must ship source) without yet fully resolving it: the artifact's "source origins" field is
+still unconfirmed as diagnostic-only provenance versus full re-parseable source, and if it's the
+latter the closed-source-library property doesn't actually hold. Left open rather than guessed.
+
+Worked example added as `feature_tour.md` §20: `foo!(T)(x: T) => x + x` is rejected outright with no
+bound declared (not a per-instantiation SFINAE failure — there is nothing to compile until a bound
+exists to check against), and accepted once `T : Add<T,T,Output=int>` is declared, generating one
+distinct compiled function per concrete `T` thereafter.

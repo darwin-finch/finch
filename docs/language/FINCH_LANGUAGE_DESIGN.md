@@ -4102,14 +4102,24 @@ global back-solving system. For example, `T : Map<K,V>, infer K, infer V` derive
 the selected `Map` implementation, while callable evidence may similarly derive an argument pack,
 result, and effect row.
 
-Static evidence does not require unconditional Rust-style monomorphization. The baseline generic
-body uses one uniform evidence/dictionary ABI: a static argument supplies a constant evidence table
-and a dynamic argument supplies its runtime table. This avoids eagerly producing up to `2^n`
-static/dynamic variants for mixed arguments. The compiler selectively specializes static,
-layout-dependent, or hot combinations when there is a proven benefit; direct calls and constant
-evidence may still be inlined. Cache keys include the generic definition, type/value arguments,
-evidence identities, effects, target, and ABI so identical uses do not repeat semantic work or
-native compilation.
+Static evidence generates like a template, not through a shared dictionary-passing ABI: a call
+supplying statically-known evidence for a parameter compiles or reuses one ordinary, fixed-signature
+native function specialized to that concrete type/evidence combination, exactly as C++, Rust, and D
+already instantiate templates — discovered lazily from real call sites, never by eagerly enumerating
+the combinatorial space a signature could theoretically be called with. Laziness is what keeps a
+mixed static/dynamic signature (above) from the `2^n` blowup eager generation would invite: a real
+call only ever asks for the one combination it actually uses, never the full cross product of what
+it could use. Checking stays generic regardless of how generation behaves — the body is verified
+once against its declared concept bounds before any instantiation exists, so generating "like a
+template" changes only how many compiled copies of an already-checked body exist, never whether an
+unconstrained body is provisionally accepted and only rejected per instantiation; D-style
+per-instantiation re-checking stays out of scope. A dynamic-evidence parameter has no concrete type
+to specialize against, so it alone stays on one shared, non-specialized path; only a call's
+statically-evidenced parameters drive a distinct compiled body. Cache keys include the generic
+definition, type/value arguments, evidence identities, effects, target, and ABI so identical uses
+do not repeat semantic work or native compilation, and an exported generic's versioned parametric
+artifact (above) is exactly the form a downstream compiler instantiates against lazily, without
+needing the original source.
 
 A dynamic concept packages an existential value or generation-checked resource handle with a
 versioned evidence table. Associated types needed by callers are bound, and every exposed operation
