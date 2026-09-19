@@ -107,6 +107,8 @@ impl MemorySystem {
     pub async fn program_registry_generation(&self) -> Result<u64>;
     /// Query memory for relevant context.
     pub async fn query(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<String>>;
+    /// Query memory for relevant context, retaining each result's `node_id` and weighted score alongside its rendered, attributed text.
+    pub async fn query_recall(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<RecalledMemory>>;
     /// Query semantic memory while retaining a stable reference to the canonical stored turn behind every new-format leaf.
     pub async fn query_with_sources(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<MemorySearchResult>>;
     /// Project every conversation that was stored but never indexed, and report how many were repaired.
@@ -117,6 +119,8 @@ impl MemorySystem {
     pub async fn search_program_indexes(&self, query: &str, limit: usize) -> Result<Vec<ProgramIndexRecord>>;
     /// Get memory statistics
     pub async fn stats(&self) -> Result<MemoryStats>;
+    /// The configuration this instance was constructed with -- callers that need the relevance threshold, committed-set cap, or staleness grace period (#940) read i…
+    pub fn config(&self) -> &MemoryConfig;
     /// Progress of the background hydration, for status surfaces.
     pub fn hydration_status(&self) -> HydrationStatus;
     /// Create a new memory system with the TF-IDF fallback engine.
@@ -136,6 +140,8 @@ pub type NodeId = u64;
 pub struct ProgramIndexRecord { … }
 /// Identity of one immutable program-index version.
 pub struct ProgramIndexRef { … }
+/// One rendered, attributed recall result with its identity and weighted score retained, so a caller can track it across turns (e.g.
+pub struct RecalledMemory { … }
 /// Word + character n-gram TF-IDF embedding engine  Dramatically better than a pure hash approach: - Tokenises into words (lowercase, alphanumeric) - Generates…
 pub struct TfIdfEmbedding { … }
 impl TfIdfEmbedding {

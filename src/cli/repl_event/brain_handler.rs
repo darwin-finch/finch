@@ -1587,6 +1587,7 @@ mod brain_handler_tests {
             runner_handoff: None,
             runs: Vec::new(),
             tasks: Vec::new(),
+            committed_memories: Vec::new(),
             schedules: Vec::new(),
             pending_schedule_dues: Vec::new(),
             effect_audits: Vec::new(),

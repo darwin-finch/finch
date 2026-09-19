@@ -680,6 +680,7 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
             BrainEventKind::MutationRecorded { .. }
             | BrainEventKind::ParticipantMessage { .. }
             | BrainEventKind::TaskListReplaced { .. }
+            | BrainEventKind::CommittedMemoriesReplaced { .. }
             | BrainEventKind::ProgramPopped { .. }
             | BrainEventKind::ToolCall { .. }
             | BrainEventKind::ToolResult { .. }
@@ -1434,6 +1435,7 @@ fn named_brain_provider_messages_at(
                 BrainEventKind::MutationRecorded { .. }
                     | BrainEventKind::RuntimeCommitted { .. }
                     | BrainEventKind::TaskListReplaced { .. }
+                    | BrainEventKind::CommittedMemoriesReplaced { .. }
                     | BrainEventKind::ApprovalRequested { .. }
                     | BrainEventKind::ApprovalDecided { .. }
                     | BrainEventKind::EffectRecorded { .. }
@@ -1585,6 +1587,7 @@ fn named_brain_provider_messages_at(
             BrainEventKind::MutationRecorded { .. }
             | BrainEventKind::RuntimeCommitted { .. }
             | BrainEventKind::TaskListReplaced { .. }
+            | BrainEventKind::CommittedMemoriesReplaced { .. }
             | BrainEventKind::EffectRecorded { .. }
             | BrainEventKind::EffectAuditTransition { .. }
             | BrainEventKind::ApprovalRequested { .. }

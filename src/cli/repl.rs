@@ -297,6 +297,7 @@ mod disabled_training_tests {
                 checkpoint_interval_secs: 300,
                 use_neural_embeddings: false,
                 embedding_cache_dir: temp.path().join("embedding-cache"),
+                ..Default::default()
             },
             license: crate::config::LicenseConfig::default(),
             diagnostics: crate::config::DiagnosticsConfig::default(),
@@ -651,6 +652,17 @@ pub struct Repl {
     todo_list: Arc<tokio::sync::RwLock<crate::tools::TodoList>>,
     todo_journal_target: crate::tools::TodoJournalTarget,
     todo_journal_receiver: Option<crate::tools::TodoJournalReceiver>,
+
+    // Local mirror of the selected Brain's committed (byte-stable) memory
+    // set (#940); the writer/target/receiver trio mirrors the task-list
+    // journal above.
+    committed_memories: Arc<
+        tokio::sync::RwLock<Vec<crate::cli::repl_event::memory_commitment::CommittedMemoryRecord>>,
+    >,
+    memory_commitment_writer: crate::cli::repl_event::memory_commitment::MemoryCommitmentWriter,
+    memory_commitment_target: crate::cli::repl_event::memory_commitment::MemoryCommitmentTarget,
+    memory_commitment_receiver:
+        Option<crate::cli::repl_event::memory_commitment::MemoryCommitmentReceiver>,
 
     // Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
@@ -1014,6 +1026,14 @@ impl Repl {
             )));
             tool_registry.register(Box::new(TodoReadTool::new(Arc::clone(&todo_list))));
         }
+        // Committed (byte-stable) memory-recall set (#940). Unlike the task
+        // list, nothing registers a tool over this journal: the query
+        // processor decides and requests replacements directly each turn.
+        let committed_memories = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let (memory_commitment_writer, memory_commitment_target, memory_commitment_receiver) =
+            crate::cli::repl_event::memory_commitment::memory_commitment_journal(Arc::clone(
+                &committed_memories,
+            ));
         // Historical vocabulary spellings remain executable for persisted
         // turns and external clients, but providers must see one coherent
         // discovery surface. Aliases are registered after every canonical
@@ -1323,6 +1343,12 @@ impl Repl {
             todo_list,
             todo_journal_target,
             todo_journal_receiver: Some(todo_journal_receiver),
+
+            // Committed (byte-stable) memory-recall set
+            committed_memories,
+            memory_commitment_writer,
+            memory_commitment_target,
+            memory_commitment_receiver: Some(memory_commitment_receiver),
 
             // Session identity
             session_label,
@@ -2433,6 +2459,11 @@ impl Repl {
                     .todo_journal_receiver
                     .take()
                     .expect("task journal receiver is consumed by one event loop"),
+                memory_commitment_target: self.memory_commitment_target.clone(),
+                memory_commitment_receiver: self
+                    .memory_commitment_receiver
+                    .take()
+                    .expect("memory commitment receiver is consumed by one event loop"),
             },
             DaemonParts {
                 ipc_client: self.ipc_client.take(),
@@ -2454,6 +2485,8 @@ impl Repl {
                 program_runtime: Arc::clone(&self.program_runtime),
                 agent_scheduler,
                 memory_system: self.memory_system.clone(),
+                committed_memories: Arc::clone(&self.committed_memories),
+                memory_commitment_writer: self.memory_commitment_writer.clone(),
             },
         );
         drop(event_loop_phase);

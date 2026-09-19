@@ -59,6 +59,16 @@ pub struct LlmLoop {
     tui_renderer: Arc<Mutex<TuiRenderer>>,
     active_tool_uses: ActiveToolUsesMap,
     memory_system: Option<Arc<finch_memory::MemorySystem>>,
+    /// Local mirror of the selected Brain's committed memory set, shared
+    /// with `EventLoop`'s copy -- see `parts::RuntimeParts` doc comment.
+    committed_memories:
+        Arc<RwLock<Vec<crate::cli::repl_event::memory_commitment::CommittedMemoryRecord>>>,
+    memory_commitment_writer: crate::cli::repl_event::memory_commitment::MemoryCommitmentWriter,
+    /// Process-local staleness clock for the committed set's decay policy.
+    /// Owned here, not threaded through `parts::LlmRuntime`, because it is
+    /// scratch state private to the decision this loop makes each turn --
+    /// see `MemoryCommitmentHandle`'s doc comment for why it is not durable.
+    memory_commitment_stale_counts: Arc<RwLock<std::collections::HashMap<u64, u32>>>,
     current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>,
     /// Live persona selection. Each provider round trip snapshots this value,
     /// so tool continuations and named-Brain turns receive the current persona
@@ -132,6 +142,8 @@ impl LlmLoop {
             memory_system,
             current_graph,
             wire_metrics_logger,
+            committed_memories,
+            memory_commitment_writer,
         } = runtime;
         let crate::cli::repl_event::parts::ContextLimits {
             lines: context_lines,
@@ -160,6 +172,9 @@ impl LlmLoop {
             tui_renderer,
             active_tool_uses,
             memory_system,
+            committed_memories,
+            memory_commitment_writer,
+            memory_commitment_stale_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             current_graph,
             active_persona,
             session_label,
@@ -253,6 +268,11 @@ impl LlmLoop {
         let status_bar = Arc::clone(&self.status_bar);
         let active_tool_uses = Arc::clone(&self.active_tool_uses);
         let memory_system = self.memory_system.clone();
+        let memory_commitment = crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle {
+            mirror: Arc::clone(&self.committed_memories),
+            writer: self.memory_commitment_writer.clone(),
+            stale_counts: Arc::clone(&self.memory_commitment_stale_counts),
+        };
         let session_label = self.session_label.clone();
         let cwd = self.cwd.clone();
         let context_lines = self.context_lines;
@@ -295,6 +315,7 @@ impl LlmLoop {
                 status_bar,
                 active_tool_uses,
                 memory_system,
+                memory_commitment,
                 session_label,
                 cwd,
                 context_lines,

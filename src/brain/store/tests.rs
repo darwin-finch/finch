@@ -4148,6 +4148,111 @@ fn task_list_projection_survives_daemon_restart() {
     ));
 }
 
+/// #940: the committed (byte-stable) memory-recall set is Brain-durable
+/// state, following the exact `TaskListReplaced` / `task_list_projection_
+/// survives_daemon_restart` precedent above -- a whole-set-replace event,
+/// materialised on `BrainSnapshot.committed_memories`, and readable after
+/// the store (and therefore the daemon hosting it) restarts.
+#[test]
+fn committed_memories_survive_daemon_restart() {
+    use crate::brain::CommittedMemoryRecord;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let memories = vec![
+        CommittedMemoryRecord {
+            node_id: 7,
+            text: "user: Where is the deploy key?\nassistant: In the Employee vault.".into(),
+            score: 0.83,
+        },
+        CommittedMemoryRecord {
+            node_id: 12,
+            text: "user: What's the release process?\nassistant: See CONTRIBUTING.md.".into(),
+            score: 0.41,
+        },
+    ];
+    store
+        .push(
+            "durable-memories",
+            "provider",
+            BrainEventKind::CommittedMemoriesReplaced {
+                memories: memories.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .snapshot("durable-memories")
+            .unwrap()
+            .committed_memories,
+        memories
+    );
+    drop(store);
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let snapshot = restarted.snapshot("durable-memories").unwrap();
+    assert_eq!(
+        snapshot.committed_memories, memories,
+        "committed memory set must round-trip byte-identical through a daemon \
+         restart; got {:?}",
+        snapshot.committed_memories
+    );
+    assert!(
+        matches!(
+            &snapshot.events.last().unwrap().kind,
+            BrainEventKind::CommittedMemoriesReplaced { memories: restored } if restored == &memories
+        ),
+        "the durable event itself must also survive replay unchanged; last event = {:?}",
+        snapshot.events.last()
+    );
+}
+
+/// A second `CommittedMemoriesReplaced` event must replace the whole set
+/// (matching `TaskListReplaced`'s whole-list-replace semantics), not merge
+/// with the first -- otherwise a dropped/evicted memory would resurrect on
+/// the next commit.
+#[test]
+fn committed_memories_replaced_event_replaces_rather_than_merges() {
+    use crate::brain::CommittedMemoryRecord;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let first = vec![CommittedMemoryRecord {
+        node_id: 1,
+        text: "first memory".into(),
+        score: 0.9,
+    }];
+    let second = vec![CommittedMemoryRecord {
+        node_id: 2,
+        text: "second memory".into(),
+        score: 0.5,
+    }];
+    store
+        .push(
+            "replacing-memories",
+            "provider",
+            BrainEventKind::CommittedMemoriesReplaced { memories: first },
+        )
+        .unwrap();
+    store
+        .push(
+            "replacing-memories",
+            "provider",
+            BrainEventKind::CommittedMemoriesReplaced {
+                memories: second.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .snapshot("replacing-memories")
+            .unwrap()
+            .committed_memories,
+        second,
+        "the second event must fully replace the first, not append to it"
+    );
+}
+
 #[test]
 fn legacy_events_are_projected_into_the_persisted_brain_identity() {
     let temp = tempfile::tempdir().unwrap();

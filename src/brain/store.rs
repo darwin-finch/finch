@@ -25,7 +25,7 @@ pub(super) use super::journal::{create_dir_all_durable, sync_directory};
 pub use super::journal::{
     BrainApprovalDecisionReservation, BrainEvent, BrainEventKind, BrainExecutableMutationAppend,
     BrainId, BrainMetadata, BrainMutationAppend, BrainMutationOutcome, BrainMutationReceipt,
-    BrainProgram, BRAIN_EVENT_SCHEMA_VERSION,
+    BrainProgram, CommittedMemoryRecord, BRAIN_EVENT_SCHEMA_VERSION,
 };
 use super::projection::{self, observer_effect_audit_event};
 pub use super::projection::{
@@ -62,6 +62,7 @@ struct BrainState {
     attachments: HashMap<AttachmentId, BrainAttachment>,
     runs: HashMap<RunId, BrainRun>,
     tasks: Vec<super::tasks::BrainTask>,
+    committed_memories: Vec<CommittedMemoryRecord>,
     schedules: HashMap<ScheduleId, BrainSchedule>,
     pending_schedule_dues: HashMap<RunId, BrainScheduleDue>,
     runner_lease: Option<BrainRunnerLease>,
@@ -172,6 +173,7 @@ impl BrainState {
             attachments: HashMap::new(),
             runs: HashMap::new(),
             tasks: Vec::new(),
+            committed_memories: Vec::new(),
             schedules: HashMap::new(),
             pending_schedule_dues: HashMap::new(),
             runner_lease: None,
@@ -295,6 +297,9 @@ impl BrainState {
             }
             BrainEventKind::TaskListReplaced { tasks } => {
                 self.tasks.clone_from(tasks);
+            }
+            BrainEventKind::CommittedMemoriesReplaced { memories } => {
+                self.committed_memories.clone_from(memories);
             }
             BrainEventKind::Program { language, source } => {
                 self.program_stack.push(BrainProgram {
@@ -1049,6 +1054,7 @@ impl BrainStore {
                 .filter(|handoff| handoff.expires_ms > unix_millis()),
             runs: sorted_runs(&state.runs),
             tasks: state.tasks.clone(),
+            committed_memories: state.committed_memories.clone(),
             schedules: sorted_schedules(&state.schedules),
             pending_schedule_dues: sorted_schedule_dues(&state.pending_schedule_dues),
             effect_audits: state
@@ -3962,6 +3968,17 @@ impl BrainStore {
             // between the check and deletion of the provisional directory.
             let mut brains = self.brains.write().expect("shared brain lock poisoned");
             let state = brains.get(name).context("Brain was removed concurrently")?;
+            // `CommittedMemoriesReplaced` (#940) is deliberately not listed
+            // here, unlike its closest sibling `TaskListReplaced`: a task
+            // list is user-facing work product a participant authored,
+            // while a committed memory set is a derived cache the query
+            // processor writes as a side effect of an ordinary turn -- and
+            // that turn already appends its own `Prompt` (or
+            // `ParticipantMessage`/`SpeculativePrompt`) event, which is
+            // already substantive on its own. A Brain can never carry a
+            // `CommittedMemoriesReplaced` event without one of those
+            // alongside it, so excluding it here does not risk losing a
+            // participant's real work.
             let has_substantive_history = state.events.iter().any(|event| {
                 matches!(
                     event.kind,

@@ -1305,6 +1305,7 @@ pub(crate) async fn process_query_with_tools(
     status_bar: Arc<crate::cli::StatusBar>,
     active_tool_uses: ActiveToolUsesMap,
     memory_system: Option<Arc<finch_memory::MemorySystem>>,
+    memory_commitment: crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle,
     session_label: String,
     cwd: String,
     context_lines: usize,
@@ -1380,39 +1381,94 @@ pub(crate) async fn process_query_with_tools(
             apply_sliding_window(all_msgs, max_verbatim)
         };
         if let Some(ref mem) = memory_system {
-            // Sample the index before the query as well as after. Hydration
-            // advances while the query runs, so an after-only sample can read
-            // `Ready` for a search that covered a fraction of the store --
-            // failing open, in the one direction that matters.
-            let before = mem.hydration_status();
-            let recalled = mem.query(&query, Some(recall_k)).await;
-            memory_recall.index =
-                finch_memory::memory_status::observed(before, mem.hydration_status());
-            if let Ok(memories) = recalled {
-                if !memories.is_empty() {
-                    memory_recall.count = memories.len();
-                    let mem_block = memories.join("\n\n---\n\n");
-                    // Inject into the last user message so the LLM sees the recalled context
-                    if let Some(last_user) = msgs.iter_mut().rev().find(|m| m.role == "user") {
-                        if let Some(ContentBlock::Text { ref mut text }) =
-                            last_user.content.first_mut()
-                        {
-                            *text = format!(
-                                "[Relevant memories from past sessions:\n\n{}]\n\n{}",
-                                mem_block, text
-                            );
-                        }
+            // The committed (byte-stable) set renders regardless of whether
+            // this is a fresh user turn or a tool-continuation round trip
+            // (`query == ""`), so the model keeps the same long-term
+            // grounding through an entire multi-tool task rather than
+            // losing it between continuations.
+            let committed_before = memory_commitment.mirror.read().await.clone();
+            if let Some(stable_block) = render_committed_memories(&committed_before) {
+                inject_committed_memories_prefix(stable_block, &mut msgs);
+            }
+
+            // Fresh recall, the transient tail, and the commit/decay
+            // decision are tied to a genuine new question, not to every
+            // provider round trip. `process_query_with_tools` also runs
+            // once per tool-continuation with `query == ""`: querying
+            // memory for an empty string is meaningless, and -- because
+            // `decide_committed_memories` counts a turn without a
+            // reconfirming match as a staleness miss -- treating every
+            // continuation as its own turn made one tool-heavy task (dozens
+            // of continuations between two real user messages) evict the
+            // whole committed set well inside a single conversational turn,
+            // silently defeating `stale_after_turns` (#940).
+            if !query.is_empty() {
+                // Sample the index before the query as well as after.
+                // Hydration advances while the query runs, so an after-only
+                // sample can read `Ready` for a search that covered a
+                // fraction of the store -- failing open, in the one
+                // direction that matters.
+                let before = mem.hydration_status();
+                let recalled = mem.query_recall(&query, Some(recall_k)).await;
+                memory_recall.index =
+                    finch_memory::memory_status::observed(before, mem.hydration_status());
+                if let Ok(fresh) = recalled {
+                    memory_recall.count = fresh.len();
+
+                    // Only genuinely new, not-yet-committed recall goes in
+                    // the transient trailing message -- content already
+                    // represented in the stable block above is not
+                    // repeated.
+                    let committed_ids: std::collections::HashSet<u64> =
+                        committed_before.iter().map(|m| m.node_id).collect();
+                    let transient: Vec<&finch_memory::RecalledMemory> = fresh
+                        .iter()
+                        .filter(|r| !committed_ids.contains(&r.node_id))
+                        .collect();
+                    if !transient.is_empty() {
+                        let mem_block = transient
+                            .iter()
+                            .map(|r| r.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n\n---\n\n");
+                        inject_recall_prefix(mem_block, &mut msgs);
+                    }
+
+                    let config = mem.config();
+                    let stale_before = memory_commitment.stale_counts.read().await.clone();
+                    let (committed_after, stale_after) = decide_committed_memories(
+                        &committed_before,
+                        &fresh,
+                        &stale_before,
+                        config.max_committed_memories,
+                        config.stale_after_turns,
+                    );
+                    *memory_commitment.stale_counts.write().await = stale_after;
+                    if committed_after != committed_before {
+                        // Awaited, not spawned: a tool-continuation turn can
+                        // follow within milliseconds and reads
+                        // `memory_commitment.mirror` synchronously. A
+                        // detached push raced that read, letting a fast
+                        // follow-up turn compute its own decision from this
+                        // turn's now-stale `committed_before` and silently
+                        // overwrite this turn's commit with one that never
+                        // accounted for it. Best-effort still applies to the
+                        // *outcome*: a failed push (no Brain attached, or a
+                        // transient IPC error) just means the same decision
+                        // is retried next turn from the same starting point.
+                        let _ = memory_commitment.writer.replace(committed_after).await;
                     }
                 }
+                // Outside the emptiness guard on purpose. An unusable index
+                // recalls nothing, so nesting the update inside
+                // `!memories.is_empty()` left the previous turn's line
+                // standing at exactly the moment the strip needed to say
+                // the memory was unavailable.
+                status_bar.update_line(
+                    crate::cli::status_bar::StatusLineType::MemoryContext,
+                    memory_recall.line(),
+                );
             }
-            // Outside the emptiness guard on purpose. An unusable index recalls
-            // nothing, so nesting the update inside `!memories.is_empty()` left
-            // the previous turn's line standing at exactly the moment the strip
-            // needed to say the memory was unavailable.
-            status_bar.update_line(
-                crate::cli::status_bar::StatusLineType::MemoryContext,
-                memory_recall.line(),
-            );
         }
         // This execution contract is required on *every* provider inference,
         // including internal empty-query continuations after tool results.
@@ -2122,6 +2178,198 @@ fn should_stream_responses(streaming_enabled: bool, provider_supports_streaming:
     streaming_enabled && provider_supports_streaming
 }
 
+/// Append `mem_block` as an `[assistant-ack, user]` pair strictly *after*
+/// the current user turn, rather than splicing it into that message's own
+/// text (#413).
+///
+/// The previous behaviour mutated the last user message's `ContentBlock`
+/// text in place. Because that mutation only ever touched the per-request
+/// copy returned by `ConversationHistory::get_messages()` -- the decorated
+/// bytes were never written back to stored history -- the *next* turn's
+/// history replay presented that same message undecorated. The byte
+/// sequence actually sent for turn N was therefore never the byte sequence
+/// replayed as history on turn N+1, breaking the shared request prefix at
+/// exactly that point on every turn recall fired.
+///
+/// **Position is load-bearing, not cosmetic.** Anything transient placed
+/// *before* the current user message breaks the very same prefix, one
+/// message earlier: whatever sits between the last stored message and the
+/// current user message in the bytes actually sent this turn is exactly
+/// what will be *absent* from that position when this same user message is
+/// replayed as history next turn (nothing transient is ever stored). Only
+/// content appended *after* the current user message leaves that message's
+/// own adjacency to prior history untouched, so the shared prefix extends
+/// through it. A same-message second content block does not help either --
+/// the issue's own reasoning applies: a second block still changes that
+/// message's serialized bytes, so on replay (single clean block) it would
+/// no longer match what was sent, reproducing the original defect.
+///
+/// A bare trailing message with `role: "user"` -- appended directly after
+/// the real user turn with nothing between them -- was considered and
+/// rejected: this codebase already treats consecutive `user`-role messages
+/// as a defect with a concrete provider consequence
+/// (`assert_no_consecutive_user_roles` in `event_loop/tests.rs`:
+/// "consecutive user roles would Claude 400 / hang"), so it would be unsafe
+/// for every provider path, not just Claude's. Instead this appends an
+/// `[assistant-ack, user]` pair: the ack keeps role alternation intact
+/// (user, assistant, user), and ending on `user` keeps the request valid
+/// for generation. The recall block stays transient (never written to
+/// stored history), matching prior behaviour.
+fn inject_recall_prefix(mem_block: String, messages: &mut Vec<crate::providers::Message>) {
+    if messages.is_empty() {
+        return;
+    }
+    messages.push(crate::providers::Message::assistant(
+        "Noted -- continuing to address your message above.",
+    ));
+    messages.push(crate::providers::Message::user(format!(
+        "[Relevant memories from past sessions, provided as context for your \
+         previous message:\n\n{}]",
+        mem_block
+    )));
+}
+
+/// Render the committed (byte-stable) memory set as the text of the stable
+/// prefix block, or `None` when the set is empty.
+///
+/// Deterministic given the same `committed` slice: `decide_committed_memories`
+/// always returns its result sorted by `node_id`, so this block's bytes only
+/// change when the committed set itself changes -- the `SummaryCache`
+/// invariant shape (`src/cli/conversation_compactor.rs`), applied to recall
+/// instead of conversation summary (#940).
+fn render_committed_memories(committed: &[crate::brain::CommittedMemoryRecord]) -> Option<String> {
+    if committed.is_empty() {
+        return None;
+    }
+    Some(
+        committed
+            .iter()
+            .map(|memory| memory.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n"),
+    )
+}
+
+/// Inject the committed-memory stable block as its own `[user, assistant-ack]`
+/// pair at the very front of `messages` -- ahead of the summary pair (if
+/// any) and the window. Position relative to the summary block is not load-
+/// bearing for stability: both blocks are independently deterministic given
+/// their own inputs, and this function always inserts at the front in the
+/// same place in the turn's assembly, so their relative order stays fixed
+/// turn over turn either way.
+fn inject_committed_memories_prefix(
+    stable_block: String,
+    messages: &mut Vec<crate::providers::Message>,
+) {
+    messages.insert(0, crate::providers::Message::assistant("Noted."));
+    messages.insert(
+        0,
+        crate::providers::Message::user(format!(
+            "[Committed memories from past sessions:\n\n{}]",
+            stable_block
+        )),
+    );
+}
+
+/// Decide this turn's committed memory set from the current committed set,
+/// this turn's fresh recall, and the staleness/cap policy (#940).
+///
+/// Pure and side-effect free so it is independently testable; the caller
+/// applies the returned staleness counters and issues the replacement push.
+/// The result is always sorted by `node_id` so its rendering is
+/// deterministic given the same members, regardless of encounter order.
+///
+/// - *Join*: a fresh result not already committed joins when the set is
+///   under `max_committed`, or evicts the current lowest-scoring committed
+///   entry when its score beats it.
+/// - *Stay*: an already-committed entry reconfirmed by this turn's fresh
+///   recall has its text/score refreshed and its staleness counter reset.
+/// - *Leave*: an already-committed entry not reconfirmed this turn has its
+///   staleness counter incremented, and is dropped once it exceeds
+///   `stale_after_turns` consecutive unconfirmed turns.
+fn decide_committed_memories(
+    committed: &[crate::brain::CommittedMemoryRecord],
+    fresh: &[finch_memory::RecalledMemory],
+    stale_counts: &std::collections::HashMap<u64, u32>,
+    max_committed: usize,
+    stale_after_turns: u32,
+) -> (
+    Vec<crate::brain::CommittedMemoryRecord>,
+    std::collections::HashMap<u64, u32>,
+) {
+    use crate::brain::CommittedMemoryRecord;
+    use std::collections::HashMap;
+
+    let fresh_by_id: HashMap<u64, &finch_memory::RecalledMemory> =
+        fresh.iter().map(|r| (r.node_id, r)).collect();
+
+    let mut next_stale = HashMap::new();
+    let mut kept: Vec<CommittedMemoryRecord> = Vec::new();
+    for entry in committed {
+        match fresh_by_id.get(&entry.node_id) {
+            Some(reconfirmed) => {
+                next_stale.insert(entry.node_id, 0);
+                kept.push(CommittedMemoryRecord {
+                    node_id: entry.node_id,
+                    text: reconfirmed.text.clone(),
+                    score: reconfirmed.score,
+                });
+            }
+            None => {
+                let misses = stale_counts.get(&entry.node_id).copied().unwrap_or(0) + 1;
+                if misses <= stale_after_turns {
+                    next_stale.insert(entry.node_id, misses);
+                    kept.push(entry.clone());
+                }
+                // else: dropped for staleness.
+            }
+        }
+    }
+
+    // Mutated as `kept` changes, not snapshotted once: `fresh` is not
+    // structurally guaranteed to carry distinct `node_id`s (`query_recall`
+    // dedups by rendered text, not identity), so a stale snapshot could let
+    // a second occurrence of the same id re-enter the join/evict branch
+    // below and either duplicate an entry or evict an unrelated one.
+    let mut kept_ids: std::collections::HashSet<u64> = kept.iter().map(|m| m.node_id).collect();
+    for candidate in fresh {
+        if kept_ids.contains(&candidate.node_id) {
+            continue;
+        }
+        if kept.len() < max_committed {
+            next_stale.insert(candidate.node_id, 0);
+            kept_ids.insert(candidate.node_id);
+            kept.push(CommittedMemoryRecord {
+                node_id: candidate.node_id,
+                text: candidate.text.clone(),
+                score: candidate.score,
+            });
+            continue;
+        }
+        let lowest = kept.iter().enumerate().min_by(|a, b| {
+            a.1.score
+                .partial_cmp(&b.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some((idx, lowest_entry)) = lowest {
+            if candidate.score > lowest_entry.score {
+                next_stale.remove(&kept[idx].node_id);
+                next_stale.insert(candidate.node_id, 0);
+                kept_ids.remove(&kept[idx].node_id);
+                kept_ids.insert(candidate.node_id);
+                kept[idx] = CommittedMemoryRecord {
+                    node_id: candidate.node_id,
+                    text: candidate.text.clone(),
+                    score: candidate.score,
+                };
+            }
+        }
+    }
+
+    kept.sort_by_key(|m| m.node_id);
+    (kept, next_stale)
+}
+
 fn inject_persona_system_prompt(
     messages: &mut Vec<crate::providers::Message>,
     persona_system_prompt: String,
@@ -2640,6 +2888,7 @@ mod tests {
                 status,
                 Arc::new(RwLock::new(HashMap::new())),
                 None,
+                crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
                 "test-brain".to_string(),
                 "/test/workspace".to_string(),
                 4,
@@ -6054,6 +6303,7 @@ mod tests {
             status,
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             None,
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
             "test-session".to_string(),
             "/test/workspace".to_string(),
             4,
@@ -6064,6 +6314,102 @@ mod tests {
             false,
             summary_gen,
             summary_cache,
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            None,
+            "test persona".to_string(),
+        ));
+        SummarizedTurnHarness {
+            task,
+            events,
+            _tempdir: tempdir,
+        }
+    }
+
+    /// Run one turn through the real `process_query_with_tools` with memory
+    /// recall active and summarisation off, so the recall-injection path
+    /// (#413) can be exercised in isolation from the summary-cache path
+    /// already covered by `spawn_summarized_turn`.
+    async fn spawn_turn_with_memory(
+        conversation: Arc<RwLock<ConversationHistory>>,
+        query: &str,
+        main_gen: Arc<dyn Generator>,
+        memory_system: Arc<finch_memory::MemorySystem>,
+        recall_k: usize,
+        memory_commitment: crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle,
+    ) -> SummarizedTurnHarness {
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        output.disable_stdout();
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        conversation
+            .write()
+            .await
+            .add_user_message(query.to_string());
+
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+
+        let tempdir = tempfile::tempdir().expect("create isolated tool-pattern directory");
+        let executor = ToolExecutor::new(
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("construct inert tool executor");
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let tool_coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output),
+            Arc::clone(&conversation),
+            Arc::new(tokio::sync::RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
+            Arc::new(tokio::sync::RwLock::new(ReplMode::Normal)),
+            Arc::new(tokio::sync::RwLock::new(None)),
+        );
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let no_summary_gen: Arc<dyn Generator> = Arc::clone(&main_gen);
+        let task = tokio::spawn(process_query_with_tools(
+            query_id,
+            query.to_string(),
+            event_tx,
+            Arc::clone(&main_gen),
+            Arc::clone(&main_gen),
+            Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+            Arc::new(tokio::sync::RwLock::new(GeneratorState::NotAvailable)),
+            Arc::new(Vec::new()),
+            conversation,
+            Arc::clone(&query_states),
+            tool_coordinator,
+            Arc::clone(&runtime),
+            tui_renderer,
+            Arc::new(tokio::sync::RwLock::new(ReplMode::Normal)),
+            Arc::clone(&output),
+            status,
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            Some(memory_system),
+            memory_commitment,
+            "test-session".to_string(),
+            "/test/workspace".to_string(),
+            4,
+            // max_verbatim large enough that summarisation never activates,
+            // isolating the recall-prefix path from the summary-prefix path.
+            10_000,
+            recall_k,
+            false,
+            false,
+            false,
+            no_summary_gen,
+            Arc::new(std::sync::Mutex::new(
+                crate::cli::conversation_compactor::SummaryCache::new(),
+            )),
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             None,
             "test persona".to_string(),
@@ -6233,6 +6579,158 @@ mod tests {
         );
     }
 
+    /// Content long enough to survive the memory quality classifier's noise
+    /// filter and specific enough that TF-IDF retrieval reliably ranks it
+    /// for a matching query.
+    fn substantive_memory(tag: &str) -> String {
+        format!(
+            "The deploy key for the {tag} environment lives in the Employee \
+             vault under the Finch signing item, not in the repository."
+        )
+    }
+
+    async fn memory_system_with_seed_for_test(
+        tag: &str,
+    ) -> (Arc<finch_memory::MemorySystem>, tempfile::NamedTempFile) {
+        let temp = tempfile::NamedTempFile::new().expect("create temp memory db");
+        let memory = finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })
+        .expect("construct test memory system");
+        memory
+            .insert_conversation(
+                "user",
+                &format!("Where is the deploy key for the {tag} environment?"),
+                None,
+                None,
+            )
+            .await
+            .expect("seed recall question");
+        memory
+            .insert_conversation("assistant", &substantive_memory(tag), None, None)
+            .await
+            .expect("seed recall answer");
+        (Arc::new(memory), temp)
+    }
+
+    /// #413 production-boundary regression: recall must not mutate the
+    /// current user message's bytes, so the message that gets replayed as
+    /// history next turn is byte-identical to what was actually sent this
+    /// turn. Before the fix, turn 1 spliced `[Relevant memories...]` into
+    /// the user message's own text -- bytes never written back to stored
+    /// history -- so turn 2's replay of that same message (now clean) never
+    /// matched what turn 1 actually sent, breaking the shared request
+    /// prefix at that message on every turn recall fired.
+    #[tokio::test]
+    async fn test_recalled_memory_does_not_mutate_user_message_bytes_across_turns() {
+        let recorder = Arc::new(RecordingTurnGenerator::default());
+        let (memory, _memory_db) = memory_system_with_seed_for_test("staging").await;
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+
+        let turn1 = spawn_turn_with_memory(
+            Arc::clone(&conversation),
+            "Where is the deploy key for the staging environment?",
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&memory),
+            3,
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+        )
+        .await;
+        turn1.task.await.expect("turn 1 query task panicked");
+        drop(turn1.events);
+
+        let turn2 = spawn_turn_with_memory(
+            Arc::clone(&conversation),
+            "second question",
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&memory),
+            3,
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::inert(),
+        )
+        .await;
+        turn2.task.await.expect("turn 2 query task panicked");
+        drop(turn2.events);
+
+        let requests = recorder.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "each turn must issue exactly one provider request; got {}: {:?}",
+            requests.len(),
+            requests
+                .iter()
+                .map(|r| request_shape(r))
+                .collect::<Vec<_>>()
+        );
+
+        // Locate turn 1's own message both in what was actually sent (it is
+        // no longer necessarily the trailing element -- recall is appended
+        // *after* it now, per the placement fix below) and in how turn 2
+        // replays it from stored history.
+        let turn1_idx_sent = requests[0]
+            .iter()
+            .position(|m| {
+                m.role == "user"
+                    && m.text_content() == "Where is the deploy key for the staging environment?"
+            })
+            .expect("turn 1 request must carry the current user message unmutated");
+        let turn1_sent_user = &requests[0][turn1_idx_sent];
+        assert_eq!(
+            turn1_sent_user.text_content(),
+            "Where is the deploy key for the staging environment?",
+            "turn 1's current user message must not have recall spliced into \
+             its own text; shape {:?}",
+            request_shape(&requests[0])
+        );
+
+        let turn1_idx_replayed = requests[1]
+            .iter()
+            .position(|m| m.role == "user" && m.text_content().contains("staging environment"))
+            .expect("turn 2 request must replay turn 1's user message from history");
+        assert_eq!(
+            requests[0][turn1_idx_sent], requests[1][turn1_idx_replayed],
+            "invariant: the message actually sent for turn 1 must be byte- \
+             identical to how history replays it on turn 2; \
+             turn 1 sent = {:?}, turn 2 replayed = {:?}",
+            requests[0][turn1_idx_sent], requests[1][turn1_idx_replayed]
+        );
+
+        // The invariant #413 is actually about: the *whole prefix* up to and
+        // including turn 1's own message -- not just that one message's own
+        // bytes -- must be identical between what was actually sent for
+        // turn 1 and how turn 2 presents that same range on replay. Content
+        // placed *before* the current user message in a request that is
+        // never written back to stored history breaks this one message
+        // earlier than the message itself; only content placed *after* it
+        // leaves this prefix intact.
+        assert_eq!(
+            requests[0][..=turn1_idx_sent],
+            requests[1][..=turn1_idx_replayed],
+            "invariant: the shared request prefix through turn 1's own \
+             message must be byte-identical across turns, or prompt caching \
+             gets zero reuse on every turn recall fires; \
+             turn 1 sent shape = {:?}, turn 2 replayed shape = {:?}",
+            request_shape(&requests[0][..=turn1_idx_sent]),
+            request_shape(&requests[1][..=turn1_idx_replayed])
+        );
+
+        // No consecutive user-role messages anywhere in either request --
+        // the recall pair must alternate correctly even though it now
+        // follows the real user turn instead of preceding it.
+        for (turn, request) in requests.iter().enumerate() {
+            for window in request.windows(2) {
+                assert!(
+                    !(window[0].role == "user" && window[1].role == "user"),
+                    "turn {}: consecutive user roles would Claude 400 / hang; \
+                     shape {:?}",
+                    turn + 1,
+                    request_shape(request)
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_request_below_verbatim_threshold_carries_no_summary() {
         let recorder = Arc::new(RecordingTurnGenerator::default());
@@ -6357,6 +6855,316 @@ mod tests {
              first = {:?}, second = {:?}",
             summary_text_of(&first[0]),
             summary_text_of(&second[0])
+        );
+    }
+
+    /// #940: the committed-memory stable block must be byte-identical across
+    /// turns when the committed set is unchanged -- the `SummaryCache`
+    /// invariant shape (`test_summarised_request_prefix_is_byte_stable_
+    /// across_turns` above), applied to the committed recall prefix instead
+    /// of the conversation summary.
+    #[tokio::test]
+    async fn test_committed_memory_prefix_is_byte_stable_across_turns_when_unchanged() {
+        let recorder = Arc::new(RecordingTurnGenerator::default());
+        let (memory, _memory_db) = memory_system_with_seed_for_test("staging").await;
+
+        // Look up the real node id/text/score the store assigns so the
+        // pre-seeded committed set matches exactly what a reconfirming
+        // recall will find -- the committed set is meant to already be
+        // settled at the start of this test, not to change mid-test.
+        // `top_k = 1` keeps this deterministic: the user/assistant halves of
+        // the seeded exchange are two distinct leaves, and a wider recall_k
+        // can surface both under slightly different renderings (one paired
+        // with its counterpart, one not) -- a real, separate behaviour this
+        // test is not about.
+        let seeded = memory
+            .query_recall(
+                "Where is the deploy key for the staging environment?",
+                Some(1),
+            )
+            .await
+            .expect("seed query must succeed");
+        let committed_entry = seeded
+            .into_iter()
+            .next()
+            .expect("seeded memory must be recalled");
+        let memory_commitment =
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::with_committed(
+                vec![crate::brain::CommittedMemoryRecord {
+                    node_id: committed_entry.node_id,
+                    text: committed_entry.text.clone(),
+                    score: committed_entry.score,
+                }],
+            );
+
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+
+        let turn1 = spawn_turn_with_memory(
+            Arc::clone(&conversation),
+            "Where is the deploy key for the staging environment?",
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&memory),
+            1,
+            memory_commitment.clone(),
+        )
+        .await;
+        turn1.task.await.expect("turn 1 query task panicked");
+        drop(turn1.events);
+
+        let turn2 = spawn_turn_with_memory(
+            Arc::clone(&conversation),
+            "second question",
+            Arc::clone(&recorder) as Arc<dyn Generator>,
+            Arc::clone(&memory),
+            1,
+            memory_commitment.clone(),
+        )
+        .await;
+        turn2.task.await.expect("turn 2 query task panicked");
+        drop(turn2.events);
+
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 2, "each turn must issue one request");
+
+        let stable_block_of = |request: &[crate::providers::Message]| -> String {
+            request
+                .iter()
+                .find(|m| {
+                    m.role == "user"
+                        && m.text_content()
+                            .contains("[Committed memories from past sessions:")
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "request must carry the committed-memory stable block; shape {:?}",
+                        request_shape(request)
+                    )
+                })
+                .text_content()
+        };
+        let turn1_block = stable_block_of(&requests[0]);
+        let turn2_block = stable_block_of(&requests[1]);
+        assert_eq!(
+            turn1_block, turn2_block,
+            "invariant: the committed-memory prefix must be byte-stable across \
+             turns when the committed set is unchanged, so the request prefix \
+             stays cacheable; turn 1 = {turn1_block:?}, turn 2 = {turn2_block:?}"
+        );
+
+        // No fresh-but-uncommitted duplicate of the same memory in the
+        // transient tail -- it is already represented by the stable block.
+        for (turn, request) in requests.iter().enumerate() {
+            let recall_tail_count = request
+                .iter()
+                .filter(|m| {
+                    m.role == "user"
+                        && m.text_content()
+                            .contains("[Relevant memories from past sessions,")
+                })
+                .count();
+            assert_eq!(
+                recall_tail_count,
+                0,
+                "turn {}: a memory already in the committed stable block must \
+                 not also appear in the transient recall tail; shape {:?}",
+                turn + 1,
+                request_shape(request)
+            );
+        }
+    }
+
+    /// #940 production-boundary regression: a tool-continuation round trip
+    /// (`process_query_with_tools` invoked with `query == ""`, the real
+    /// shape a multi-tool-call task drives repeatedly between two actual
+    /// user messages) must not count as a staleness "miss" against the
+    /// committed set. Before this fix, the commit/decay decision ran on
+    /// every invocation regardless of `query`, so a single tool-heavy task
+    /// (routinely dozens of continuations) evicted an entry with
+    /// `stale_after_turns = 20` well inside one conversational turn,
+    /// defeating the staleness grace period entirely.
+    #[tokio::test]
+    async fn test_tool_continuation_turns_do_not_decay_committed_memory_staleness() {
+        let recorder = Arc::new(RecordingTurnGenerator::default());
+        let (memory, _memory_db) = memory_system_with_seed_for_test("staging").await;
+        let seeded = memory
+            .query_recall(
+                "Where is the deploy key for the staging environment?",
+                Some(1),
+            )
+            .await
+            .expect("seed query must succeed");
+        let committed_entry = seeded
+            .into_iter()
+            .next()
+            .expect("seeded memory must be recalled");
+        let memory_commitment =
+            crate::cli::repl_event::memory_commitment::MemoryCommitmentHandle::with_committed(
+                vec![crate::brain::CommittedMemoryRecord {
+                    node_id: committed_entry.node_id,
+                    text: committed_entry.text.clone(),
+                    score: committed_entry.score,
+                }],
+            );
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+
+        // 25 empty-query "tool continuation" round trips -- comfortably
+        // past the default `stale_after_turns = 20` -- interleaved with no
+        // real user turn in between.
+        for _ in 0..25 {
+            let turn = spawn_turn_with_memory(
+                Arc::clone(&conversation),
+                "",
+                Arc::clone(&recorder) as Arc<dyn Generator>,
+                Arc::clone(&memory),
+                1,
+                memory_commitment.clone(),
+            )
+            .await;
+            turn.task.await.expect("continuation query task panicked");
+            drop(turn.events);
+        }
+
+        let mirror_after = memory_commitment.mirror.read().await.clone();
+        assert_eq!(
+            mirror_after.len(),
+            1,
+            "25 tool-continuation round trips must not evict the committed \
+             memory; committed set = {mirror_after:?}"
+        );
+        assert_eq!(
+            mirror_after[0].node_id, committed_entry.node_id,
+            "the surviving entry must be the one originally committed; \
+             committed set = {mirror_after:?}"
+        );
+        let stale_after = memory_commitment.stale_counts.read().await.clone();
+        assert_eq!(
+            stale_after
+                .get(&committed_entry.node_id)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "continuation turns must not advance the staleness clock at all; \
+             stale_counts = {stale_after:?}"
+        );
+    }
+
+    // ── decide_committed_memories: pure add/keep/drop policy ────────────────
+
+    fn recalled(node_id: u64, score: f32) -> finch_memory::RecalledMemory {
+        finch_memory::RecalledMemory {
+            node_id,
+            text: format!("memory {node_id}"),
+            score,
+        }
+    }
+
+    fn committed(node_id: u64, score: f32) -> crate::brain::CommittedMemoryRecord {
+        crate::brain::CommittedMemoryRecord {
+            node_id,
+            text: format!("memory {node_id}"),
+            score,
+        }
+    }
+
+    #[test]
+    fn test_decide_committed_memories_joins_a_fresh_result_under_cap() {
+        let (kept, stale) =
+            decide_committed_memories(&[], &[recalled(1, 0.9)], &HashMap::new(), 8, 20);
+        assert_eq!(kept, vec![committed(1, 0.9)], "the fresh result must join");
+        assert_eq!(
+            stale.get(&1),
+            Some(&0),
+            "a newly joined entry starts with a zero staleness counter"
+        );
+    }
+
+    #[test]
+    fn test_decide_committed_memories_reconfirmed_entry_stays_and_resets_staleness() {
+        let mut stale = HashMap::new();
+        stale.insert(1, 3);
+        let (kept, next_stale) =
+            decide_committed_memories(&[committed(1, 0.5)], &[recalled(1, 0.6)], &stale, 8, 20);
+        assert_eq!(
+            kept,
+            vec![committed(1, 0.6)],
+            "a reconfirmed entry stays and its score/text refresh to the fresh values"
+        );
+        assert_eq!(
+            next_stale.get(&1),
+            Some(&0),
+            "reconfirmation must reset the staleness counter, not merely cap it"
+        );
+    }
+
+    #[test]
+    fn test_decide_committed_memories_unconfirmed_entry_survives_within_grace() {
+        let (kept, stale) =
+            decide_committed_memories(&[committed(1, 0.5)], &[], &HashMap::new(), 8, 20);
+        assert_eq!(
+            kept,
+            vec![committed(1, 0.5)],
+            "an entry missing from one turn's fresh recall must not be dropped \
+             immediately; premature eviction defeats prefix stability"
+        );
+        assert_eq!(stale.get(&1), Some(&1), "the miss must be recorded");
+    }
+
+    #[test]
+    fn test_decide_committed_memories_drops_entry_once_stale_grace_exceeded() {
+        let mut stale = HashMap::new();
+        stale.insert(1, 20);
+        let (kept, next_stale) =
+            decide_committed_memories(&[committed(1, 0.5)], &[], &stale, 8, 20);
+        assert!(
+            kept.is_empty(),
+            "an entry unconfirmed for more than stale_after_turns must be dropped; kept={kept:?}"
+        );
+        assert!(
+            !next_stale.contains_key(&1),
+            "a dropped entry's staleness counter must not linger; next_stale={next_stale:?}"
+        );
+    }
+
+    #[test]
+    fn test_decide_committed_memories_evicts_lowest_score_on_cap_overflow() {
+        let committed_set = vec![committed(1, 0.9), committed(2, 0.3)];
+        let (kept, _stale) =
+            decide_committed_memories(&committed_set, &[recalled(3, 0.5)], &HashMap::new(), 2, 20);
+        assert_eq!(
+            kept,
+            vec![committed(1, 0.9), committed(3, 0.5)],
+            "the highest-scoring newcomer must evict the current lowest-scoring \
+             committed entry when the set is already at cap; kept={kept:?}"
+        );
+    }
+
+    #[test]
+    fn test_decide_committed_memories_does_not_evict_when_newcomer_scores_lower() {
+        let committed_set = vec![committed(1, 0.9), committed(2, 0.3)];
+        let (kept, _stale) =
+            decide_committed_memories(&committed_set, &[recalled(3, 0.1)], &HashMap::new(), 2, 20);
+        assert_eq!(
+            kept,
+            vec![committed(1, 0.9), committed(2, 0.3)],
+            "a newcomer scoring below every committed entry must not evict anything"
+        );
+    }
+
+    #[test]
+    fn test_decide_committed_memories_result_is_sorted_by_node_id_for_determinism() {
+        let (kept, _stale) = decide_committed_memories(
+            &[committed(5, 0.5)],
+            &[recalled(2, 0.9), recalled(9, 0.8)],
+            &HashMap::new(),
+            8,
+            20,
+        );
+        let ids: Vec<u64> = kept.iter().map(|m| m.node_id).collect();
+        assert_eq!(
+            ids,
+            vec![2, 5, 9],
+            "result must be sorted by node_id regardless of encounter order, so \
+             rendering is deterministic across turns; ids={ids:?}"
         );
     }
 }

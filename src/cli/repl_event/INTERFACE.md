@@ -126,6 +126,7 @@ pub mod activity_view;
 pub mod event_loop;
 pub mod events;
 pub mod llm_loop;
+pub mod memory_commitment;
 pub(crate) mod model_selection;
 pub mod parts;
 pub mod plan_handler;

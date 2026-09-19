@@ -115,6 +115,7 @@ fn test_runner_lease_was_handed_off_requires_matching_completion() {
         runner_handoff: None,
         runs: Vec::new(),
         tasks: Vec::new(),
+        committed_memories: Vec::new(),
         schedules: Vec::new(),
         pending_schedule_dues: Vec::new(),
         effect_audits: Vec::new(),
