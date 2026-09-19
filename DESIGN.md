@@ -115,7 +115,9 @@ files, every workflow under `.github/workflows/` (including [`release.yml`](.git
 see the [release process](CONTRIBUTING.md#release-process) and open work on signed packages and rollback,
 [#119](https://github.com/darwin-finch/finch/issues/119), and newer-release notification,
 [#144](https://github.com/darwin-finch/finch/issues/144)), the Brain test launchers and isolation
-harness, and the [Cargo slot wrapper](.agents/skills/finch-backlog/scripts/with-cargo-slot).
+harness, the [Cargo slot wrapper](.agents/skills/finch-backlog/scripts/with-cargo-slot), and the
+[retired-target reclaimer](.agents/skills/finch-backlog/scripts/reclaim-cargo-targets) that deletes
+a worktree's generated Cargo output once Git no longer registers it.
 
 **Excluded**: `docs/archive/` (history).
 

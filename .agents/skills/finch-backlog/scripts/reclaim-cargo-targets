@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: reclaim-cargo-targets [--apply] [--repo <path>]
+
+Reclaims generated Cargo target leaves under the shared cache
+(.agents/skills/finch-backlog/scripts/with-cargo-slot's
+$cache/cargo-target/<repository-namespace>/<worktree-namespace> layout) that
+belong to a worktree Git no longer registers for the given repository.
+
+Default is a dry-run inventory. Pass --apply to actually delete eligible
+leaves. Never removes a branch, a commit, source changes, or a leaf whose
+worktree is still registered, still exists with uncommitted changes, exists
+but is not a Git checkout, or is referenced by a live process. Never follows
+or deletes a symlinked leaf, and only ever considers leaf names that are
+exactly the 64-hex-character namespace this tool derives itself.
+USAGE
+}
+
+apply=0
+repo="$PWD"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --apply)
+            apply=1
+            shift
+            ;;
+        --repo)
+            repo="${2:?--repo requires a path}"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "reclaim-cargo-targets: unrecognized argument: $1" >&2
+            usage
+            exit 64
+            ;;
+    esac
+done
+
+canonical_directory() {
+    cd -- "$1" 2>/dev/null && pwd -P
+}
+
+# Plain command substitution strips every trailing newline, including bytes
+# that belong to a valid pathname (POSIX permits one). with-cargo-slot guards
+# its own captures against this for exactly that reason; reclaim-cargo-targets
+# must derive byte-identical namespaces from the same directories or a leaf
+# it created is simply never found here.
+capture_record_line() {
+    local destination="$1" record marker='finch-reclaim-path-record-v1'
+    shift
+    if ! record="$("$@"; command_status=$?; printf '%s' "$marker"; exit "$command_status")"; then
+        return 1
+    fi
+    [[ "$record" == *"$marker" ]] || return 1
+    record="${record%"$marker"}"
+    [[ "$record" == *$'\n' ]] || return 1
+    record="${record%$'\n'}"
+    printf -v "$destination" '%s' "$record"
+}
+
+if ! capture_record_line git_common_dir \
+    git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null; then
+    echo "reclaim-cargo-targets: run against a Finch Git repository: repo=$repo" >&2
+    exit 69
+fi
+if ! capture_record_line git_common_dir canonical_directory "$git_common_dir"; then
+    echo "reclaim-cargo-targets: could not canonicalize the Git common directory: path=$git_common_dir" >&2
+    exit 69
+fi
+
+# Mirrors with-cargo-slot's own cache-root selection exactly; the two must
+# agree or a leaf it created would never be found here.
+if [[ -n "${XDG_CACHE_HOME:-}" && "$XDG_CACHE_HOME" == /* ]]; then
+    cargo_cache_root="$XDG_CACHE_HOME"
+else
+    if [[ -z "${HOME:-}" || "$HOME" != /* ]]; then
+        echo "reclaim-cargo-targets: HOME must be an absolute path when XDG_CACHE_HOME is unset or relative" >&2
+        exit 69
+    fi
+    cargo_cache_root="$HOME/.cache"
+fi
+
+if ! repository_namespace="$(perl -MDigest::SHA=sha256_hex -e \
+    'print sha256_hex($ARGV[0])' "$git_common_dir")"; then
+    echo "reclaim-cargo-targets: could not derive the Cargo repository namespace" >&2
+    exit 69
+fi
+
+repository_root="$cargo_cache_root/cargo-target/$repository_namespace"
+if [[ -L "$repository_root" ]]; then
+    echo "reclaim-cargo-targets: refused: symlinked repository namespace: path=$repository_root" >&2
+    exit 1
+fi
+if [[ ! -d "$repository_root" ]]; then
+    echo "reclaim-cargo-targets: nothing to inventory: no cargo-target namespace for this repository yet: path=$repository_root"
+    exit 0
+fi
+
+# Enumerate every worktree Git still administers, including one whose
+# checkout directory was deleted without `git worktree remove`. Comparing a
+# leaf's recorded worktree path against this list, rather than against what
+# currently exists on disk, is what "retired" means here: Git's own registry
+# is the fact this tool trusts, not directory presence. A failed listing must
+# abort the whole run rather than silently look like an empty, all-retired
+# registry -- that would make every still-registered worktree's target look
+# eligible for deletion.
+declare -a registered_worktrees=()
+worktree_list_output=""
+if ! worktree_list_output="$(git --git-dir="$git_common_dir" worktree list --porcelain 2>&1)"; then
+    echo "reclaim-cargo-targets: could not list registered worktrees, refusing to guess which targets are retired: git-common-dir=$git_common_dir" >&2
+    printf '%s\n' "$worktree_list_output" >&2
+    exit 69
+fi
+while IFS= read -r line; do
+    case "$line" in
+        worktree\ *)
+            registered_worktrees+=("${line#worktree }")
+            ;;
+    esac
+done <<<"$worktree_list_output"
+
+worktree_is_registered() {
+    local candidate="$1" entry
+    for entry in "${registered_worktrees[@]+"${registered_worktrees[@]}"}"; do
+        [[ "$entry" == "$candidate" ]] && return 0
+    done
+    return 1
+}
+
+reclaim_leaf() {
+    local lock_path="$1" leaf_path="$2"
+    perl -MFcntl=:flock -e '
+        my ($lock_path, $target) = @ARGV;
+        open(my $lock, ">>", $lock_path) or exit 2;
+        exit 3 unless flock($lock, LOCK_EX | LOCK_NB);
+        exit 4 if -l $target;
+        exit 4 unless -d $target;
+        system("rm", "-rf", "--", $target);
+        my $wait_status = $?;
+        exit 6 if ($wait_status & 127) != 0;
+        exit(($wait_status >> 8) == 0 ? 0 : 5);
+    ' "$lock_path" "$leaf_path"
+}
+
+reclaimable_bytes() {
+    local path="$1" kib
+    kib="$(du -sk -- "$path" 2>/dev/null | awk '{print $1}')"
+    [[ "$kib" =~ ^[0-9]+$ ]] || kib=0
+    printf '%s' $((kib * 1024))
+}
+
+eligible_count=0
+reclaimed_count=0
+total_bytes=0
+exit_status=0
+
+for leaf_path in "$repository_root"/*; do
+    [[ -e "$leaf_path" || -L "$leaf_path" ]] || continue
+    leaf_name="$(basename -- "$leaf_path")"
+
+    if [[ ! "$leaf_name" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "reclaim-cargo-targets: skipped: not a namespace leaf this tool owns: path=$leaf_path"
+        continue
+    fi
+    if [[ -L "$leaf_path" ]]; then
+        echo "reclaim-cargo-targets: refused: symlinked leaf, refusing to follow or delete: path=$leaf_path"
+        exit_status=1
+        continue
+    fi
+    if [[ ! -d "$leaf_path" ]]; then
+        echo "reclaim-cargo-targets: refused: leaf is not a plain directory: path=$leaf_path"
+        exit_status=1
+        continue
+    fi
+
+    metadata_path="$leaf_path/.finch-cargo-target-owner-v1"
+    if [[ -L "$metadata_path" || ! -f "$metadata_path" ]]; then
+        echo "reclaim-cargo-targets: preserved: no durable ownership metadata (predates this tool or was removed): path=$leaf_path"
+        continue
+    fi
+
+    metadata_git_common_dir=""
+    metadata_worktree_root=""
+    while IFS= read -r metadata_line || [[ -n "$metadata_line" ]]; do
+        metadata_key="${metadata_line%%:*}"
+        metadata_value="${metadata_line#*:}"
+        case "$metadata_key" in
+            git-common-dir) metadata_git_common_dir="$metadata_value" ;;
+            worktree-root) metadata_worktree_root="$metadata_value" ;;
+        esac
+    done <"$metadata_path"
+
+    if [[ -z "$metadata_git_common_dir" || -z "$metadata_worktree_root" ]]; then
+        echo "reclaim-cargo-targets: preserved: ownership metadata missing required fields: path=$leaf_path"
+        continue
+    fi
+    if [[ "$metadata_git_common_dir" != "$git_common_dir" ]]; then
+        echo "reclaim-cargo-targets: preserved: ownership metadata names a different repository: path=$leaf_path expected=$git_common_dir actual=$metadata_git_common_dir"
+        continue
+    fi
+    if ! recorded_namespace="$(perl -MDigest::SHA=sha256_hex -e \
+        'print sha256_hex($ARGV[0])' "$metadata_worktree_root")"; then
+        echo "reclaim-cargo-targets: refused: could not re-derive worktree namespace from metadata: path=$leaf_path"
+        exit_status=1
+        continue
+    fi
+    if [[ "$recorded_namespace" != "$leaf_name" ]]; then
+        echo "reclaim-cargo-targets: refused: ownership metadata does not match this namespace leaf, possible tampering: path=$leaf_path recorded-worktree=$metadata_worktree_root expected-namespace=$leaf_name actual-namespace=$recorded_namespace"
+        exit_status=1
+        continue
+    fi
+
+    if worktree_is_registered "$metadata_worktree_root"; then
+        echo "reclaim-cargo-targets: preserved: worktree is still registered: path=$leaf_path worktree=$metadata_worktree_root"
+        continue
+    fi
+
+    if [[ -e "$metadata_worktree_root" ]]; then
+        if [[ ! -d "$metadata_worktree_root/.git" && ! -f "$metadata_worktree_root/.git" ]]; then
+            echo "reclaim-cargo-targets: refused: worktree path exists but is not a Git checkout, refusing to guess: path=$leaf_path worktree=$metadata_worktree_root"
+            exit_status=1
+            continue
+        fi
+        worktree_status=""
+        if ! worktree_status="$(git -C "$metadata_worktree_root" status --porcelain 2>/dev/null)"; then
+            echo "reclaim-cargo-targets: refused: worktree exists but its status could not be confirmed clean: path=$leaf_path worktree=$metadata_worktree_root"
+            git -C "$metadata_worktree_root" status --porcelain >/dev/null
+            exit_status=1
+            continue
+        fi
+        if [[ -n "$worktree_status" ]]; then
+            echo "reclaim-cargo-targets: preserved: worktree exists with uncommitted changes: path=$leaf_path worktree=$metadata_worktree_root"
+            continue
+        fi
+    fi
+
+    # Fails-closed process check: refuse whenever anything (Cargo, rustc, a
+    # supervisor, Brain, daemon, TUI, or test process) still has an open file
+    # or working directory under the leaf.
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "reclaim-cargo-targets: refused: lsof is unavailable, cannot verify no process references the target: path=$leaf_path"
+        exit_status=1
+        continue
+    fi
+    lsof_output=""
+    lsof_output="$(lsof +D "$leaf_path" 2>/dev/null || true)"
+    if [[ -n "$lsof_output" ]]; then
+        echo "reclaim-cargo-targets: refused: a live process references the target: path=$leaf_path"
+        printf '%s\n' "$lsof_output" >&2
+        exit_status=1
+        continue
+    fi
+
+    leaf_bytes="$(reclaimable_bytes "$leaf_path")"
+    eligible_count=$((eligible_count + 1))
+
+    if [[ "$apply" -eq 0 ]]; then
+        total_bytes=$((total_bytes + leaf_bytes))
+        echo "reclaim-cargo-targets: eligible (dry run; pass --apply to reclaim): path=$leaf_path worktree=$metadata_worktree_root bytes=$leaf_bytes"
+        continue
+    fi
+
+    lock_path="$git_common_dir/finch-cargo-slot.lock"
+    if reclaim_leaf "$lock_path" "$leaf_path"; then
+        echo "reclaim-cargo-targets: reclaimed: path=$leaf_path worktree=$metadata_worktree_root bytes=$leaf_bytes"
+        reclaimed_count=$((reclaimed_count + 1))
+        total_bytes=$((total_bytes + leaf_bytes))
+    else
+        reclaim_status=$?
+        case "$reclaim_status" in
+            3) reclaim_reason="the shared Cargo slot is currently held by a build; try again once it finishes" ;;
+            4) reclaim_reason="the leaf changed shape between inventory and deletion" ;;
+            6) reclaim_reason="deletion was killed by a signal partway through and may be incomplete" ;;
+            *) reclaim_reason="deletion failed (status=$reclaim_status)" ;;
+        esac
+        echo "reclaim-cargo-targets: refused: $reclaim_reason: path=$leaf_path"
+        exit_status=1
+    fi
+done
+
+if [[ "$apply" -eq 1 ]]; then
+    echo "reclaim-cargo-targets: reclaimed $reclaimed_count of $eligible_count eligible namespace(s), $total_bytes bytes total"
+else
+    echo "reclaim-cargo-targets: dry run: $eligible_count namespace(s) eligible, $total_bytes bytes total (pass --apply to reclaim)"
+fi
+
+exit "$exit_status"

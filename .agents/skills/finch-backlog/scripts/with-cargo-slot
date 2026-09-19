@@ -89,6 +89,41 @@ if [[ "${CARGO_TARGET_DIR+x}" != x && -z "${CI:-}" ]]; then
         echo "with-cargo-slot: could not create Cargo target directory: path=$CARGO_TARGET_DIR" >&2
         exit 69
     fi
+
+    # Durable ownership metadata (#392, reclaiming retired-worktree Cargo
+    # targets): the leaf's directory name is a SHA-256 digest, so nothing on
+    # disk otherwise names the worktree that owns it. A retired-target
+    # reclaimer needs that binding to tell an orphaned leaf from one whose
+    # worktree is still alive without guessing from mtimes or last-writer
+    # order. Format is deliberately flat key:value text, one record per line,
+    # no embedded newlines in values (git rejects newline-containing worktree
+    # paths) — reclaim-cargo-targets parses this exact shape and re-derives
+    # both namespaces to detect tampering or drift.
+    # Every dependency here stays inside the wrapper's existing minimal
+    # utility set (perl and shell builtins only, no mktemp/mv/date): a hosted
+    # macOS runner already proved it must not gain a new required binary.
+    # A write/publish failure here degrades to a warning rather than exit 69:
+    # this block now runs on every build that reaches an existing, already
+    # perfectly usable target directory, not only on first-time creation, and
+    # a leaf simply left without metadata just stays permanently preserved
+    # (never guessed at) by reclaim-cargo-targets rather than blocking Cargo.
+    owner_metadata_path="$CARGO_TARGET_DIR/.finch-cargo-target-owner-v1"
+    owner_metadata_tmp="$owner_metadata_path.tmp.$$"
+    if ! {
+        printf 'git-common-dir:%s\n' "$git_common_dir"
+        printf 'worktree-root:%s\n' "$worktree_root"
+        printf 'repository-namespace:%s\n' "$repository_namespace"
+        printf 'worktree-namespace:%s\n' "$worktree_namespace"
+        printf 'recorded:%s\n' "$(perl -e \
+            'my @t = gmtime(time); printf "%04d-%02d-%02dT%02d:%02d:%02dZ", $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]')"
+    } >"$owner_metadata_tmp" 2>/dev/null; then
+        rm -f -- "$owner_metadata_tmp"
+        echo "with-cargo-slot: warning: could not write ownership metadata, continuing without it: path=$owner_metadata_tmp" >&2
+    elif ! perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' \
+        "$owner_metadata_tmp" "$owner_metadata_path"; then
+        rm -f -- "$owner_metadata_tmp"
+        echo "with-cargo-slot: warning: could not publish ownership metadata, continuing without it: path=$owner_metadata_path" >&2
+    fi
     export CARGO_TARGET_DIR
 fi
 

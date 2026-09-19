@@ -75,8 +75,11 @@ jobs:
       run: |
         bash -n \
           .agents/skills/finch-backlog/scripts/with-cargo-slot \
-          .agents/skills/finch-backlog/scripts/test-with-cargo-slot
+          .agents/skills/finch-backlog/scripts/test-with-cargo-slot \
+          .agents/skills/finch-backlog/scripts/reclaim-cargo-targets \
+          .agents/skills/finch-backlog/scripts/test-reclaim-cargo-targets
         .agents/skills/finch-backlog/scripts/test-with-cargo-slot
+        .agents/skills/finch-backlog/scripts/test-reclaim-cargo-targets
 
     - name: Install capnproto (Ubuntu)
       run: sudo apt-get update && sudo apt-get install -y capnproto
