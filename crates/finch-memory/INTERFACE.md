@@ -14,6 +14,7 @@ Everything below is what callers outside this module can reach. Implementation m
 pub struct BrainConversationProvenance { … }
 /// Summary of conversation topics derived from MemTree centroid queries.
 pub struct ConversationSummaryLines { … }
+/// Guard returned by [`register_hydration_batch_pause`].
 #[cfg(any(test, feature = "test-support"))]
 pub struct HydrationBatchPauseRegistration { … }
 /// Progress of the background MemTree hydration.
