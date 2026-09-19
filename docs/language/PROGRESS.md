@@ -627,3 +627,23 @@ discussion, both fixed with real spec additions rather than just conceded in cha
   tracking already required for expansions generally, applied to private-field touches specifically.
   Whether additional sandboxing should exist beyond this is explicitly left open, not resolved,
   per direct instruction not to guess at it.
+
+**Continued 2026-09-18 — stacked-decorator composability worked through properly, and it found a
+real gap in tonight's own `! comptime`/`syntax`-capture rule, not just in the decorator sugar.**
+Shammah proposed `@JSONSerializable @BSONSerializable @Foo (Record ...)`, each layer a `syntax ->
+syntax` transform, auto-mixed in. Tracing the naive desugaring (nested nested calls, each relying on
+`syntax`-typed auto-capture) breaks: a `syntax`-typed parameter captures *whatever's written at its
+call site* uninterpreted, so nesting one decorator call inside another's argument position captures
+the literal, unexecuted call expression, not the inner decorator's actual output — chaining never
+runs past the first layer. Shammah's fix, proposed as `(mixin (JSONSerializable (mixin
+(BSONSerializable (mixin (Foo (Record ...)))))))`: nest `mixin` at every layer. That only works given
+one more rule, made explicit and written in: `mixin` always evaluates its own argument eagerly, even
+nested inside another `syntax`-typed parameter's otherwise-capturing argument — the same role `,`
+(unquote) already plays inside a quasiquoted template, reused rather than invented. With that rule,
+the nested-`mixin` chain composes correctly, innermost-first (matching Python's real decorator order,
+not a new convention). The `@`-stacking sugar itself is still unratified spelling — only the
+desugared, nested-`mixin` mechanics underneath it are now settled.
+
+**Now working through msgpack/protobuf-style derive serialization as an end-to-end composability
+stress test**, per direct instruction to "be creative with the AST system" and invent whatever
+`__traits`-equivalent compile-time reflection turns out to be needed. In progress below.

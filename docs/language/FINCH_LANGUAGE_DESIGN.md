@@ -3478,6 +3478,32 @@ is lists plus spans, not text to re-parse). Those forms are then compiled as if 
 written at that site. `mixin` is not runtime `eval`, not `,@`, and not D `mixin(string)`. It is
 not valid as the body of a `define` that is supposed to return a function.
 
+**Added 2026-09-18: `mixin` always evaluates its argument eagerly, even nested inside a `syntax`-
+typed parameter's otherwise-capturing argument — a real interaction the parameter-typed-capture
+rule below didn't originally account for.** That rule says a `syntax`-typed parameter captures its
+argument expression unevaluated, uniformly, for any function. Taken completely literally, `mixin`
+itself has a `syntax`-shaped argument, so a naive reading would have `(mixin (Foo record))`, written
+as *another* function's `syntax`-typed argument, get captured whole and unevaluated too — `Foo` never
+actually running. That can't be right: every use of `mixin` all along (`(mixin (timed require-pkg))`
+included) already assumes the call inside it executes. So `mixin` is exempt from the surrounding
+capture, unconditionally, wherever it appears — structurally the same role `,` (unquote) already
+plays inside a quasiquoted template: a deliberate, marked escape from the surrounding "don't
+evaluate, just capture" default, saying "run *this one thing* now regardless of what's capturing
+around it." This is what makes stacking multiple `syntax -> syntax` transforms actually compose:
+
+```lisp
+(mixin (JSONSerializable (mixin (BSONSerializable (mixin (Foo (Record ...)))))))
+```
+
+reads correctly with this rule: the innermost `mixin` forces `Foo` to run and produce an ordinary
+`syntax` value; without that forced evaluation, `BSONSerializable`'s own `syntax`-typed parameter
+would otherwise have swallowed the whole `(Foo (Record ...))` expression uncaptured-and-unevaluated,
+one layer relocated rather than fixed. Each `mixin` up the chain does the same for the layer below
+it, with only the outermost one performing the actual splice-in. `@JSONSerializable @BSONSerializable
+@Foo (Record ...)` — stacked decorator sugar, floated in conversation, not yet given its own ratified
+spelling — would desugar to exactly this nested form, applied innermost-first, matching Python's real
+decorator-composition order (`@a @b def f()` is `a(b(f))`) rather than inventing a new convention.
+
 **Revised 2026-09-18: `define-syntax` is retired. A parameter typed `syntax` captures its argument
 automatically — no separate macro-registration mechanism needed.** The previous design needed two
 names for one idea: an ordinary CTFE function (`expand-timed`) plus a `define-syntax` registration
