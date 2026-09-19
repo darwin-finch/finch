@@ -167,6 +167,7 @@ pub trait ProviderBackend: ProviderConcreteType + Send + Sync {
     fn name(&self) -> &str;
     fn default_model(&self) -> &str;
     fn capabilities(&self, model: &str) -> ModelCapabilities;
+    async fn refresh_capabilities(&self, _model: &str);
     fn requested_reasoning_effort(&self, _request: &ProviderRequest) -> Option<ReasoningEffort>;
 }
 /// Non-overridable concrete type identity used by validated dispatch tokens. Re-exported from `finch-providers`.

@@ -56,7 +56,7 @@ impl FallbackChain {
             let mut candidate = request.clone();
             candidate.model = provider.default_model().to_string();
             let (mut provider_request, capabilities) =
-                match resolve_effective_request(provider.as_ref(), &candidate) {
+                match resolve_effective_request(provider.as_ref(), &candidate).await {
                     Ok(resolved) => resolved,
                     Err(error) => {
                         tracing::info!(
@@ -90,14 +90,19 @@ impl FallbackChain {
                 }
             }
             provider_request.sanitize_messages();
-            let validated =
-                match validate_provider_request(provider.as_ref(), &provider_request, false) {
-                    Ok(validated) => validated,
-                    Err(error) => {
-                        last_error = Some(error);
-                        continue;
-                    }
-                };
+            let validated = match validate_provider_request(
+                provider.as_ref(),
+                &provider_request,
+                false,
+            )
+            .await
+            {
+                Ok(validated) => validated,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
 
             match provider.send_message_validated(validated).await {
                 Ok(response) => {
@@ -149,7 +154,9 @@ impl FallbackChain {
             let (mut provider_request, capabilities) = match resolve_effective_request(
                 provider.as_ref(),
                 &candidate,
-            ) {
+            )
+            .await
+            {
                 Ok(resolved) => resolved,
                 Err(error) => {
                     tracing::info!(
@@ -184,7 +191,7 @@ impl FallbackChain {
             }
             provider_request.sanitize_messages();
             let validated =
-                match validate_provider_request(provider.as_ref(), &provider_request, true) {
+                match validate_provider_request(provider.as_ref(), &provider_request, true).await {
                     Ok(validated) => validated,
                     Err(error) => {
                         last_error = Some(error);

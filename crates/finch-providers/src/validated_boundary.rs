@@ -57,12 +57,12 @@ impl ValidatedProviderRequest {
     }
 }
 
-pub(crate) fn validate_provider_request(
+pub(crate) async fn validate_provider_request(
     provider: &(impl ProviderBackend + ?Sized),
     request: &ProviderRequest,
     streaming: bool,
 ) -> Result<ValidatedProviderRequest> {
-    let (effective, capabilities) = resolve_effective_request(provider, request)?;
+    let (effective, capabilities) = resolve_effective_request(provider, request).await?;
     capabilities.validate_request(
         &effective,
         streaming,
