@@ -13,22 +13,23 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 mod corpus;
-pub use crate::vm::{classify_wire_failure, wire_diagnostic_code, WireFailureClass};
 pub use corpus::{
     audit, capture_from_env, capture_with_compiler_context_from_env, ProgramCompilerContext,
     WireCorpusAttempt, WireCorpusAudit, WireCorpusCounts,
 };
+pub use finch_vm::{classify_wire_failure, wire_diagnostic_code, WireFailureClass};
 
 /// Version of the model/runtime vocabulary handshake.
 pub const MANIFEST_PROTOCOL_VERSION: u32 = 1;
 
 /// Minimal language/runtime definition supplied to every fresh model context.
-pub const BOOT_CAPSULE: &str = include_str!("../../vocabulary/BOOT.md");
-pub const VM_LANGUAGE_DEFINITION: &str = include_str!("../../vocabulary/language/FINCH_VM.md");
+pub const BOOT_CAPSULE: &str = include_str!("../../../vocabulary/BOOT.md");
+pub const VM_LANGUAGE_DEFINITION: &str = include_str!("../../../vocabulary/language/FINCH_VM.md");
 pub const FORTH_LANGUAGE_DEFINITION: &str =
-    include_str!("../../vocabulary/language/FINCH_FORTH.md");
-pub const LISP_LANGUAGE_DEFINITION: &str = include_str!("../../vocabulary/language/FINCH_LISP.md");
-pub const LANGUAGE_SCHEMA: &str = include_str!("../../vocabulary/language/schema.json");
+    include_str!("../../../vocabulary/language/FINCH_FORTH.md");
+pub const LISP_LANGUAGE_DEFINITION: &str =
+    include_str!("../../../vocabulary/language/FINCH_LISP.md");
+pub const LANGUAGE_SCHEMA: &str = include_str!("../../../vocabulary/language/schema.json");
 
 /// Whether a rejected wire program is eligible for one source-only repair.
 ///
@@ -302,11 +303,11 @@ pub fn language_package_identities() -> Vec<LanguagePackageIdentity> {
 /// Upper bound on what executing a program or tool may affect.
 ///
 /// Defined in the dependency-free `finch-tools-api` crate so the tool
-/// surface can name it; re-exported here, so `crate::programs::ExecutionEffect`
+/// surface can name it; re-exported here, so `finch_programs::ExecutionEffect`
 /// is the same type it always was.
 pub use finch_tools_api::ExecutionEffect;
 
-pub use crate::vm::ProgramLanguage;
+pub use finch_vm::ProgramLanguage;
 
 /// A self-executing Finch source file after its shebang has been removed.
 ///
@@ -520,8 +521,8 @@ pub enum ProgramValue {
     /// by a later turn in the same Brain/runtime generation.
     Fiber {
         id: String,
-        yield_type: crate::vm::Type,
-        result_type: crate::vm::Type,
+        yield_type: finch_vm::Type,
+        result_type: finch_vm::Type,
     },
     Resource {
         kind: String,
@@ -804,11 +805,8 @@ pub fn hash_text(text: &str) -> String {
 }
 
 fn lisp_definition_identity(source: &str) -> Option<(String, Option<String>)> {
-    use crate::language::Val;
-    let expression = crate::language::parse_str(source)
-        .ok()?
-        .into_iter()
-        .next()?;
+    use finch_language::Val;
+    let expression = finch_language::parse_str(source).ok()?.into_iter().next()?;
     let Val::List(parts) = expression else {
         return None;
     };
@@ -832,11 +830,8 @@ fn lisp_definition_identity(source: &str) -> Option<(String, Option<String>)> {
 /// The typed compiler treats the first body string as metadata and omits it
 /// from the emitted IR, so this parser deliberately follows the same rule.
 fn lisp_definition_documentation(source: &str) -> Option<String> {
-    use crate::language::Val;
-    let expression = crate::language::parse_str(source)
-        .ok()?
-        .into_iter()
-        .next()?;
+    use finch_language::Val;
+    let expression = finch_language::parse_str(source).ok()?.into_iter().next()?;
     let Val::List(parts) = expression else {
         return None;
     };
@@ -947,7 +942,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::vm::{TypedExecutionStatus, TypedRuntime};
+    use finch_vm::{TypedExecutionStatus, TypedRuntime};
 
     #[test]
     fn executable_lisp_script_envelope_enters_the_shared_typed_runtime() {
@@ -959,7 +954,7 @@ mod tests {
         assert_eq!(script.language, ProgramLanguage::Lisp);
 
         let mut runtime = TypedRuntime::new();
-        let module = crate::language::compile(
+        let module = finch_language::compile(
             script.language,
             "reply.lisp",
             &script.source,
@@ -1321,7 +1316,7 @@ mod tests {
 
     #[test]
     fn wire_failure_classification_is_source_free_and_stable() {
-        use crate::vm::WireFailureClass;
+        use finch_vm::WireFailureClass;
 
         assert_eq!(
             classify_wire_failure("```lisp\n(say \"hi\")\n```", "E-WIRE-002: fenced"),

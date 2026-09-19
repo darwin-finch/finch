@@ -4205,8 +4205,8 @@ impl crate::tools::Tool for PlanningWriteProbe {
         "write"
     }
 
-    fn effect(&self) -> crate::programs::ExecutionEffect {
-        crate::programs::ExecutionEffect::WorkspaceWrite
+    fn effect(&self) -> finch_programs::ExecutionEffect {
+        finch_programs::ExecutionEffect::WorkspaceWrite
     }
 
     fn description(&self) -> &str {
@@ -5110,7 +5110,7 @@ fn completed_execution_outcome(output: &str) -> crate::runtime::ExecutionOutcome
         approval_prompts: Vec::new(),
         input_revision: 0,
         output_revision: 0,
-        effect: crate::programs::ExecutionEffect::Pure,
+        effect: finch_programs::ExecutionEffect::Pure,
         backend: crate::runtime::ExecutionBackend::TypedVm,
         elapsed_ms: 0,
     }

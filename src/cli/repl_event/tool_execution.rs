@@ -741,12 +741,12 @@ async fn publish_tool_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::programs::ExecutionEffect;
     use crate::providers::{ContentBlock, Message};
     use crate::theme::ColorScheme;
     use crate::tools::{
         PermissionManager, Tool, ToolExecutor, ToolInputSchema, ToolRegistry, ToolUse,
     };
+    use finch_programs::ExecutionEffect;
 
     struct AutoAcceptWriteProbe;
 

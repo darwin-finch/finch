@@ -1,6 +1,5 @@
 //! Structured provider tools for bounded child-agent fork/join.
 
-use crate::programs::ExecutionEffect;
 use crate::scheduler::{
     AgentBudget, AgentContextReference, AgentIdentity, AgentRole, AgentScheduler, AgentTaskSpec,
 };
@@ -8,6 +7,7 @@ use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;

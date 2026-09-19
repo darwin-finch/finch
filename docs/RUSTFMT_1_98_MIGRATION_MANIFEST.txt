@@ -20,7 +20,7 @@ src/lisp/reader.rs
 src/lisp/types.rs
 src/memory/program_registry.rs
 src/poset/executor.rs
-src/programs/mod.rs
+crates/finch-programs/src/lib.rs
 src/runtime/effect_log.rs
 src/runtime/fiber.rs
 src/runtime/mcp.rs

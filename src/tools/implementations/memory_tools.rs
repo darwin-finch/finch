@@ -6,12 +6,12 @@
 // - create_memory: Store important facts/notes explicitly
 // - list_recent: Show recent conversation history
 
-use crate::programs::ExecutionEffect;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
 use finch_memory::MemorySystem;
+use finch_programs::ExecutionEffect;
 use serde_json::Value;
 use std::sync::Arc;
 

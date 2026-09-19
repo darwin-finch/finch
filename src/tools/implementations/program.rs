@@ -1,6 +1,5 @@
 //! Provider-facing adapters for the shared Forth/Lisp runtime.
 
-use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramRef};
 use crate::runtime::{ProgramRuntime, ProgramSubmission, TypedEffectSink};
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
@@ -8,6 +7,7 @@ use crate::vm::core_word_documentation as vm_core_word_documentation;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use finch_memory::MemorySystem;
+use finch_programs::{ExecutionEffect, ProgramLanguage, ProgramRef};
 use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -48,10 +48,10 @@ impl Tool for GetLanguageDefinitionTool {
             .as_str()
             .context("get_language_definition: missing language")?;
         Ok(match language {
-            "shared" => crate::programs::VM_LANGUAGE_DEFINITION,
-            "lisp" => crate::programs::LISP_LANGUAGE_DEFINITION,
-            "forth" => crate::programs::FORTH_LANGUAGE_DEFINITION,
-            "schema" => crate::programs::LANGUAGE_SCHEMA,
+            "shared" => finch_programs::VM_LANGUAGE_DEFINITION,
+            "lisp" => finch_programs::LISP_LANGUAGE_DEFINITION,
+            "forth" => finch_programs::FORTH_LANGUAGE_DEFINITION,
+            "schema" => finch_programs::LANGUAGE_SCHEMA,
             _ => anyhow::bail!("unknown Finch language definition: {language}"),
         }
         .to_string())
@@ -720,7 +720,7 @@ impl Tool for InspectWordTool {
     }
 }
 
-fn persisted_definition_contract(definition: crate::programs::ProgramDefinition) -> Value {
+fn persisted_definition_contract(definition: finch_programs::ProgramDefinition) -> Value {
     json!({
         "kind": "program",
         "id": definition.reference.id,

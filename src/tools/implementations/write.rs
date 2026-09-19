@@ -4,11 +4,11 @@
 //   Created src/foo.rs (42 lines)
 //   Updated src/bar.rs (Added 10 lines, removed 3 lines)
 
-use crate::programs::ExecutionEffect;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::Value;
 #[cfg(unix)]
 use std::ffi::OsString;

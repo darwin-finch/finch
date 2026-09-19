@@ -13,11 +13,11 @@
 // bounded typed patch, bound to the reviewed target, and applied here in
 // Rust. Nothing on this path is handed to a shell.
 
-use crate::programs::ExecutionEffect;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};

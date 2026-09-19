@@ -3,11 +3,11 @@
 // Supports optional offset (1-indexed start line) and limit (max lines)
 // so the AI can read large files in focused chunks.
 
-use crate::programs::ExecutionEffect;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::Value;
 use std::fs;
 

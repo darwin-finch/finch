@@ -4587,14 +4587,14 @@ mod tests {
             let runtime = crate::runtime::ProgramRuntime::new();
             let outcome = runtime
                 .submit_typed_only(crate::runtime::ProgramSubmission {
-                    language: crate::programs::ProgramLanguage::Lisp,
+                    language: finch_programs::ProgramLanguage::Lisp,
                     source_id: Some("remote-idempotency".into()),
                     // The fixture runner supplies an authoritative checkpoint and
                     // the acknowledged effect journal separately, as a real
                     // frontend runner does after executing the submitted effect.
                     source: "(define (checkpoint) : int 1)".into(),
                     intent: "remote idempotency fixture".into(),
-                    effect: crate::programs::ExecutionEffect::Pure,
+                    effect: finch_programs::ExecutionEffect::Pure,
                     declared_capabilities: Vec::new(),
                     manifest_generation: runtime.manifest_generation(),
                     expected_revision: Some(runtime.revision()),
@@ -5094,11 +5094,11 @@ mod tests {
             let runtime = crate::runtime::ProgramRuntime::new();
             let outcome = runtime
                 .submit_typed_only(crate::runtime::ProgramSubmission {
-                    language: crate::programs::ProgramLanguage::Lisp,
+                    language: finch_programs::ProgramLanguage::Lisp,
                     source_id: Some("live-remote-approval".into()),
                     source: "(define (approved) : int 1)".into(),
                     intent: "finish approved remote Prompt".into(),
-                    effect: crate::programs::ExecutionEffect::Pure,
+                    effect: finch_programs::ExecutionEffect::Pure,
                     declared_capabilities: Vec::new(),
                     manifest_generation: runtime.manifest_generation(),
                     expected_revision: Some(runtime.revision()),

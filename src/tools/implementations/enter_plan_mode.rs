@@ -1,10 +1,10 @@
 // EnterPlanMode - Tool for Claude to signal entering read-only planning mode
 
-use crate::programs::ExecutionEffect;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::Value;
 use std::sync::Arc;
 

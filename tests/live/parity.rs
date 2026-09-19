@@ -7,14 +7,14 @@
 //
 // Run: ./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_parity
 
-use finch::programs::{
-    wire_repair_request, ExecutionEffect, ProgramLanguage, BOOT_CAPSULE, FORTH_LANGUAGE_DEFINITION,
-    LISP_LANGUAGE_DEFINITION, VM_LANGUAGE_DEFINITION,
-};
 use finch::providers::Message;
 use finch::providers::ProviderRequest;
 use finch::runtime::ExecutionStatus;
 use finch::runtime::{ProgramRuntime, ProgramSubmission};
+use finch_programs::{
+    wire_repair_request, ExecutionEffect, ProgramLanguage, BOOT_CAPSULE, FORTH_LANGUAGE_DEFINITION,
+    LISP_LANGUAGE_DEFINITION, VM_LANGUAGE_DEFINITION,
+};
 use std::time::Duration;
 
 use crate::{all_available_providers, live_tests_enabled};
@@ -248,11 +248,11 @@ async fn live_parity_finch_wire_programs() {
                     continue;
                 }
             };
-            finch::programs::capture_from_env(
+            finch_programs::capture_from_env(
                 name,
                 provider.default_model(),
                 "live_conformance",
-                finch::programs::WireCorpusAttempt::FirstPass,
+                finch_programs::WireCorpusAttempt::FirstPass,
                 &initial,
             );
             match execute_wire_source(&initial).await {
@@ -293,11 +293,11 @@ async fn live_parity_finch_wire_programs() {
                             continue;
                         }
                     };
-                    finch::programs::capture_from_env(
+                    finch_programs::capture_from_env(
                         name,
                         provider.default_model(),
                         "live_conformance",
-                        finch::programs::WireCorpusAttempt::Repair,
+                        finch_programs::WireCorpusAttempt::Repair,
                         &replacement,
                     );
                     match execute_wire_source(&replacement).await {
@@ -358,12 +358,12 @@ async fn live_parity_finch_wire_stateful_session() {
         .unwrap_or_else(|_| panic!("{name}: first stateful turn exceeded 60 seconds"))
         .unwrap_or_else(|error| panic!("{name}: first stateful turn failed: {error}"))
         .text();
-        finch::programs::capture_with_compiler_context_from_env(
+        finch_programs::capture_with_compiler_context_from_env(
             || runtime.compiler_context(),
             name,
             provider.default_model(),
             "live_conformance_stateful",
-            finch::programs::WireCorpusAttempt::FirstPass,
+            finch_programs::WireCorpusAttempt::FirstPass,
             &first,
         );
         let first_output = execute_wire_source_in(&runtime, &first)
@@ -392,12 +392,12 @@ async fn live_parity_finch_wire_stateful_session() {
         .unwrap_or_else(|_| panic!("{name}: second stateful turn exceeded 60 seconds"))
         .unwrap_or_else(|error| panic!("{name}: second stateful turn failed: {error}"))
         .text();
-        finch::programs::capture_with_compiler_context_from_env(
+        finch_programs::capture_with_compiler_context_from_env(
             || runtime.compiler_context(),
             name,
             provider.default_model(),
             "live_conformance_stateful",
-            finch::programs::WireCorpusAttempt::FirstPass,
+            finch_programs::WireCorpusAttempt::FirstPass,
             &second,
         );
         let second_output = execute_wire_source_in(&runtime, &second)
@@ -448,12 +448,12 @@ async fn live_parity_finch_wire_diagnostic_repair() {
         .unwrap_or_else(|_| panic!("{name}: diagnostic repair exceeded 60 seconds"))
         .unwrap_or_else(|error| panic!("{name}: diagnostic repair failed: {error}"))
         .text();
-        finch::programs::capture_with_compiler_context_from_env(
+        finch_programs::capture_with_compiler_context_from_env(
             || runtime.compiler_context(),
             name,
             provider.default_model(),
             "live_conformance_repair",
-            finch::programs::WireCorpusAttempt::Repair,
+            finch_programs::WireCorpusAttempt::Repair,
             &replacement,
         );
         let output = execute_wire_source_in(&runtime, &replacement)

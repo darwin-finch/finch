@@ -1484,9 +1484,9 @@ fn named_brain_wire_source(
         !source.trim().is_empty(),
         "named Brain turn produced no wire source"
     );
-    let language = match crate::programs::ProgramLanguage::infer_wire_source(&source)? {
-        crate::programs::ProgramLanguage::Forth => crate::brain::ProgramLanguage::Forth,
-        crate::programs::ProgramLanguage::Lisp => crate::brain::ProgramLanguage::Lisp,
+    let language = match finch_programs::ProgramLanguage::infer_wire_source(&source)? {
+        finch_programs::ProgramLanguage::Forth => crate::brain::ProgramLanguage::Forth,
+        finch_programs::ProgramLanguage::Lisp => crate::brain::ProgramLanguage::Lisp,
     };
     Ok((source, language, continuation_messages))
 }
@@ -2870,7 +2870,7 @@ impl EventLoop {
     /// Finch-Lisp program and must receive typed diagnostics.
     async fn execute_interactive_typed_program(
         &mut self,
-        language: crate::programs::ProgramLanguage,
+        language: finch_programs::ProgramLanguage,
         source: String,
     ) -> Result<()> {
         let source_unit = self.output_manager.start_work_unit("typed program");
@@ -2897,7 +2897,7 @@ impl EventLoop {
             source_id: Some(format!("interactive.{}", language.as_str())),
             source,
             intent: "interactive typed source".into(),
-            effect: crate::programs::ExecutionEffect::Unclassified,
+            effect: finch_programs::ExecutionEffect::Unclassified,
             declared_capabilities: Vec::new(),
             manifest_generation: self.program_runtime.manifest_generation(),
             expected_revision: Some(self.program_runtime.revision()),

@@ -182,11 +182,11 @@ async fn run_compiled(
         }
     }
     let language = match lang {
-        "forth" => crate::programs::ProgramLanguage::Forth,
-        "lisp" => crate::programs::ProgramLanguage::Lisp,
+        "forth" => finch_programs::ProgramLanguage::Forth,
+        "lisp" => finch_programs::ProgramLanguage::Lisp,
         other => anyhow::bail!("unsupported typed poset node language '{other}'"),
     };
-    let source = if language == crate::programs::ProgramLanguage::Forth {
+    let source = if language == finch_programs::ProgramLanguage::Forth {
         format!("{prelude}{code}")
     } else {
         code.to_string()
@@ -202,7 +202,7 @@ async fn run_compiled(
             source_id: Some("poset-node".into()),
             source,
             intent: "execute approved poset node".into(),
-            effect: crate::programs::ExecutionEffect::Unclassified,
+            effect: finch_programs::ExecutionEffect::Unclassified,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: Some(runtime.revision()),
@@ -229,8 +229,8 @@ async fn run_compiled(
         .join(" "))
 }
 
-fn display_program_value(value: &crate::programs::ProgramValue) -> String {
-    use crate::programs::ProgramValue;
+fn display_program_value(value: &finch_programs::ProgramValue) -> String {
+    use finch_programs::ProgramValue;
     match value {
         ProgramValue::Nil => "nil".into(),
         ProgramValue::Bool(value) => value.to_string(),

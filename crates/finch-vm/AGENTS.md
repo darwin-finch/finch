@@ -9,7 +9,7 @@ Source compilation lives in [`finch-language`](../finch-language/AGENTS.md); thi
 `ModuleVerified` and does not select or invoke a frontend.
 Shared typed IR, verification, capability/effect descriptions, and vocabulary contracts live in
 [`finch-vm-core`](../finch-vm-core/AGENTS.md). The program runtime service is `src/runtime/`; the
-program catalog is `src/programs/`.
+program-definition and corpus metadata live in `crates/finch-programs/`.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature;
 it is generated from the `pub use` list in `src/lib.rs`, which is the whole public surface. Child

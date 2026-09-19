@@ -1,8 +1,8 @@
-use crate::programs::{ExecutionEffect, ProgramValue};
 use crate::vm::{
     ApprovalPrompt, CapabilityRequirement, EffectJournalEntry, HostSideEffect, VmDiagnostic,
     VmSideEffect,
 };
+use finch_programs::{ExecutionEffect, ProgramValue};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

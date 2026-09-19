@@ -1,8 +1,8 @@
-# programs — public interface
+# finch-programs — public interface
 
-Generated from [`src/programs/mod.rs`](mod.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
+Generated from [`crates/finch-programs/src/lib.rs`](src/lib.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
 
-- **Facade:** `src/programs/mod.rs`
+- **Facade:** `crates/finch-programs/src/lib.rs`
 - **Capsule:** [`AGENTS.md`](AGENTS.md)
 
 Everything below is what callers outside this module can reach. Implementation modules are private; their contents are deliberately absent.
@@ -12,6 +12,10 @@ Everything below is what callers outside this module can reach. Implementation m
 ```rust
 /// Upper bound on what executing a program may affect. Re-exported from `finch-tools-api`.
 pub enum ExecutionEffect { Pure, VmRead, VmWrite, WorkspaceRead, ExternalRead, WorkspaceWrite, ExternalWrite, Destructive, Unclassified }
+impl ExecutionEffect {
+    pub fn as_str(self) -> &'static str;
+    pub fn runs_autonomously(self) -> bool;
+}
 /// A self-executing Finch source file after its shebang has been removed.
 pub struct FinchScript { … }
 /// Incremental lexical receiver for the compact Co-Forth wire form.
@@ -39,6 +43,13 @@ impl ProgramDefinition {
 }
 /// Language in which a stored program's canonical source is written. Re-exported from `finch-vm-core`.
 pub enum ProgramLanguage { Forth, Lisp }
+impl ProgramLanguage {
+    pub fn as_str(self) -> &'static str;
+    /// Compact wire-format inference used only when the submission envelope omits `language`; the resolved value is recorded before execution.
+    pub fn infer_source(source: &str) -> Self;
+    /// Resolve the compact provider wire form before parsing.
+    pub fn infer_wire_source(source: &str) -> Result<Self>;
+}
 /// Immutable address of a stored program version.
 pub struct ProgramRef { … }
 /// Persistence and visibility boundary for a definition.
@@ -98,11 +109,11 @@ pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String { 
 
 ```rust
 /// Minimal language/runtime definition supplied to every fresh model context.
-pub const BOOT_CAPSULE: &str = include_str!("../../vocabulary/BOOT.md");
-pub const FORTH_LANGUAGE_DEFINITION: &str = include_str!("../../vocabulary/language/FINCH_FORTH.md");
-pub const LANGUAGE_SCHEMA: &str = include_str!("../../vocabulary/language/schema.json");
-pub const LISP_LANGUAGE_DEFINITION: &str = include_str!("../../vocabulary/language/FINCH_LISP.md");
+pub const BOOT_CAPSULE: &str = include_str!("../../../vocabulary/BOOT.md");
+pub const FORTH_LANGUAGE_DEFINITION: &str = include_str!("../../../vocabulary/language/FINCH_FORTH.md");
+pub const LANGUAGE_SCHEMA: &str = include_str!("../../../vocabulary/language/schema.json");
+pub const LISP_LANGUAGE_DEFINITION: &str = include_str!("../../../vocabulary/language/FINCH_LISP.md");
 /// Version of the model/runtime vocabulary handshake.
 pub const MANIFEST_PROTOCOL_VERSION: u32 = 1;
-pub const VM_LANGUAGE_DEFINITION: &str = include_str!("../../vocabulary/language/FINCH_VM.md");
+pub const VM_LANGUAGE_DEFINITION: &str = include_str!("../../../vocabulary/language/FINCH_VM.md");
 ```

@@ -74,11 +74,11 @@ async fn extracts_the_exact_suspended_proposal_handle() {
     let outcome = runtime
         .submit_with_deferred_program_effects(
             crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("proposal-test.lisp".into()),
                 source: "(proposal-open \"python\" \"inspect artifact\" \"print('ok')\")".into(),
                 intent: "proposal test".into(),
-                effect: crate::programs::ExecutionEffect::ExternalWrite,
+                effect: finch_programs::ExecutionEffect::ExternalWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -111,11 +111,11 @@ async fn extracts_the_exact_submit_program_approval_prompt() {
     let outcome = runtime
         .submit_with_deferred_program_effects(
             crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("approval-tool-test.lisp".into()),
                 source: "(file-read (path \"Cargo.toml\"))".into(),
                 intent: "read the manifest".into(),
-                effect: crate::programs::ExecutionEffect::WorkspaceRead,
+                effect: finch_programs::ExecutionEffect::WorkspaceRead,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -151,12 +151,12 @@ async fn proposal_decision_resumes_the_saved_effect_without_replaying_source() {
     let outcome = runtime
         .submit_with_deferred_program_effects(
             crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("proposal-test.lisp".into()),
                 source: "(proposal-open \"python\" \"inspect artifact\" \"print('original')\")"
                     .into(),
                 intent: "proposal test".into(),
-                effect: crate::programs::ExecutionEffect::ExternalWrite,
+                effect: finch_programs::ExecutionEffect::ExternalWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -184,9 +184,9 @@ async fn proposal_decision_resumes_the_saved_effect_without_replaying_source() {
     assert_eq!(completed.vm_side_effects.len(), 1);
     assert!(matches!(
         completed.values.as_slice(),
-        [crate::programs::ProgramValue::Option(Some(value))]
-            if matches!(value.as_ref(), crate::programs::ProgramValue::Result { ok: false, value }
-                if matches!(value.as_ref(), crate::programs::ProgramValue::String(context)
+        [finch_programs::ProgramValue::Option(Some(value))]
+            if matches!(value.as_ref(), finch_programs::ProgramValue::Result { ok: false, value }
+                if matches!(value.as_ref(), finch_programs::ProgramValue::String(context)
                     if context == "Please explain the artifact first."))
     ));
     assert!(runtime

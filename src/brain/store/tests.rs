@@ -3970,11 +3970,11 @@ async fn reviewed_initialization_module_is_typed_and_pure() {
     let runtime = crate::runtime::ProgramRuntime::new();
     let outcome = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Lisp,
+            language: finch_programs::ProgramLanguage::Lisp,
             source_id: Some(format!("brain-initialization:{}", contract.source_sha256)),
             source: contract.source,
             intent: "reviewed Brain initialization module".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: Some(runtime.revision()),
@@ -5298,11 +5298,11 @@ async fn named_brain_restores_one_typed_runtime_without_replaying_source() {
     let runtime = store.program_runtime("brain").unwrap();
     let outcome = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: Some("brain:event:1".into()),
             source: ": square ( S n:int -- S int ! pure ) n n * ;".into(),
             intent: "define square".into(),
-            effect: crate::programs::ExecutionEffect::VmWrite,
+            effect: finch_programs::ExecutionEffect::VmWrite,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: Some(runtime.revision()),
@@ -5344,11 +5344,11 @@ async fn named_brain_restores_one_typed_runtime_without_replaying_source() {
     assert_eq!(restored.revision(), committed_revision);
     let outcome = restored
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Lisp,
+            language: finch_programs::ProgramLanguage::Lisp,
             source_id: Some("brain:event:2".into()),
             source: "(square 7)".into(),
             intent: "call restored definition".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: restored.manifest_generation(),
             expected_revision: Some(restored.revision()),
@@ -5357,7 +5357,7 @@ async fn named_brain_restores_one_typed_runtime_without_replaying_source() {
         .await
         .unwrap();
     assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
-    assert_eq!(outcome.values, vec![crate::programs::ProgramValue::Int(49)]);
+    assert_eq!(outcome.values, vec![finch_programs::ProgramValue::Int(49)]);
     assert_eq!(outcome.output_revision, committed_revision + 1);
 }
 
@@ -5369,11 +5369,11 @@ async fn named_brain_reads_legacy_json_checkpoint_without_rewriting_history() {
     let runtime = crate::runtime::ProgramRuntime::new();
     let outcome = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Lisp,
+            language: finch_programs::ProgramLanguage::Lisp,
             source_id: Some("legacy-checkpoint.lisp".into()),
             source: "(define (double (n : int)) (* n 2))".into(),
             intent: "create legacy checkpoint".into(),
-            effect: crate::programs::ExecutionEffect::VmWrite,
+            effect: finch_programs::ExecutionEffect::VmWrite,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: Some(runtime.revision()),
@@ -5414,11 +5414,11 @@ async fn named_brain_reads_legacy_json_checkpoint_without_rewriting_history() {
     let restored = restarted.program_runtime("brain").unwrap();
     let called = restored
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: Some("legacy-checkpoint.forth".into()),
             source: "21 double".into(),
             intent: "restore legacy checkpoint".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: restored.manifest_generation(),
             expected_revision: Some(restored.revision()),
@@ -5426,7 +5426,7 @@ async fn named_brain_reads_legacy_json_checkpoint_without_rewriting_history() {
         })
         .await
         .unwrap();
-    assert_eq!(called.values, vec![crate::programs::ProgramValue::Int(42)]);
+    assert_eq!(called.values, vec![finch_programs::ProgramValue::Int(42)]);
     assert!(runtime_directory
         .join(format!("{checkpoint_sha256}.json"))
         .is_file());
@@ -5443,11 +5443,11 @@ async fn named_brain_commits_a_validated_frontend_runner_checkpoint() {
     let runner = crate::runtime::ProgramRuntime::new();
     let outcome = runner
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Lisp,
+            language: finch_programs::ProgramLanguage::Lisp,
             source_id: Some("runner:event:1".into()),
             source: "(define (triple (n : int)) (* n 3))".into(),
             intent: "frontend runner definition".into(),
-            effect: crate::programs::ExecutionEffect::VmWrite,
+            effect: finch_programs::ExecutionEffect::VmWrite,
             declared_capabilities: Vec::new(),
             manifest_generation: runner.manifest_generation(),
             expected_revision: Some(runner.revision()),
@@ -5470,11 +5470,11 @@ async fn named_brain_commits_a_validated_frontend_runner_checkpoint() {
     let restored = restarted.program_runtime("brain").unwrap();
     let called = restored
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: Some("test:restored-runner".into()),
             source: "14 triple".into(),
             intent: "call frontend definition after daemon restart".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: restored.manifest_generation(),
             expected_revision: Some(restored.revision()),
@@ -5482,7 +5482,7 @@ async fn named_brain_commits_a_validated_frontend_runner_checkpoint() {
         })
         .await
         .unwrap();
-    assert_eq!(called.values, vec![crate::programs::ProgramValue::Int(42)]);
+    assert_eq!(called.values, vec![finch_programs::ProgramValue::Int(42)]);
 }
 
 #[tokio::test]
@@ -5506,11 +5506,11 @@ async fn frontend_replacement_reacquires_the_same_durable_brain() {
     let runner = crate::runtime::ProgramRuntime::new();
     let outcome = runner
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Lisp,
+            language: finch_programs::ProgramLanguage::Lisp,
             source_id: Some("dogfood:define".into()),
             source: "(define (next-step (n : int)) (+ n 1))".into(),
             intent: "retain work across frontend replacement".into(),
-            effect: crate::programs::ExecutionEffect::VmWrite,
+            effect: finch_programs::ExecutionEffect::VmWrite,
             declared_capabilities: Vec::new(),
             manifest_generation: runner.manifest_generation(),
             expected_revision: Some(runner.revision()),
@@ -5556,11 +5556,11 @@ async fn frontend_replacement_reacquires_the_same_durable_brain() {
     let restored = restarted.program_runtime("dogfood").unwrap();
     let called = restored
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: Some("dogfood:resume".into()),
             source: "41 next-step".into(),
             intent: "resume after frontend replacement".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: restored.manifest_generation(),
             expected_revision: Some(restored.revision()),
@@ -5568,7 +5568,7 @@ async fn frontend_replacement_reacquires_the_same_durable_brain() {
         })
         .await
         .unwrap();
-    assert_eq!(called.values, vec![crate::programs::ProgramValue::Int(42)]);
+    assert_eq!(called.values, vec![finch_programs::ProgramValue::Int(42)]);
 }
 
 #[tokio::test]
@@ -5590,11 +5590,11 @@ async fn named_brain_restores_scoped_authority_from_its_separate_policy_record()
         .unwrap();
     let outcome = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: Some("brain:event:1".into()),
             source: "42".into(),
             intent: "create a durable revision".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: Some(runtime.revision()),
@@ -5731,11 +5731,11 @@ async fn named_brain_persists_denial_without_a_vm_commit() {
     let runtime = store.program_runtime("brain").unwrap();
     let pending = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Lisp,
+            language: finch_programs::ProgramLanguage::Lisp,
             source_id: None,
             source: "(file-read (path \"Cargo.toml\"))".into(),
             intent: "test durable denial".into(),
-            effect: crate::programs::ExecutionEffect::WorkspaceRead,
+            effect: finch_programs::ExecutionEffect::WorkspaceRead,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: Some(runtime.revision()),
@@ -5786,11 +5786,11 @@ async fn named_brain_persists_host_authorization_even_when_the_run_rolls_back() 
         .unwrap();
     let failed = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: None,
             source: "s\"Cargo.toml\" path file-read drop 1 0 /".into(),
             intent: "read then fail".into(),
-            effect: crate::programs::ExecutionEffect::WorkspaceRead,
+            effect: finch_programs::ExecutionEffect::WorkspaceRead,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: Some(runtime.revision()),
@@ -5826,11 +5826,11 @@ async fn named_brain_checkpoint_without_authority_record_restores_without_grants
         .unwrap();
     let outcome = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: None,
             source: "7".into(),
             intent: "checkpoint without authority".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: Some(runtime.revision()),
@@ -5861,11 +5861,11 @@ async fn named_brain_rejects_a_tampered_authority_record() {
     let runtime = store.program_runtime("brain").unwrap();
     let outcome = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: None,
             source: "1".into(),
             intent: "persist authority envelope".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: Some(runtime.revision()),
@@ -5897,11 +5897,11 @@ async fn out_of_order_checkpoint_events_never_regress_a_brain_runtime() {
     let store = BrainStore::with_root("box.local", Some(temp.path().into()));
     let runtime = store.program_runtime("brain").unwrap();
     let submit = |source: &str, revision| crate::runtime::ProgramSubmission {
-        language: crate::programs::ProgramLanguage::Forth,
+        language: finch_programs::ProgramLanguage::Forth,
         source_id: None,
         source: source.into(),
         intent: "concurrent checkpoint ordering".into(),
-        effect: crate::programs::ExecutionEffect::Pure,
+        effect: finch_programs::ExecutionEffect::Pure,
         declared_capabilities: Vec::new(),
         manifest_generation: runtime.manifest_generation(),
         expected_revision: Some(revision),
@@ -5930,8 +5930,8 @@ async fn out_of_order_checkpoint_events_never_regress_a_brain_runtime() {
     assert_eq!(
         values,
         vec![
-            crate::programs::ProgramValue::Int(1),
-            crate::programs::ProgramValue::Int(2),
+            finch_programs::ProgramValue::Int(1),
+            finch_programs::ProgramValue::Int(2),
         ]
     );
 }
@@ -5942,11 +5942,11 @@ async fn legacy_restart_revision_reset_keeps_the_latest_request_state() {
     let store = BrainStore::with_root("box.local", Some(temp.path().into()));
     let runtime = crate::runtime::ProgramRuntime::new();
     let submit = |source: &str, revision| crate::runtime::ProgramSubmission {
-        language: crate::programs::ProgramLanguage::Forth,
+        language: finch_programs::ProgramLanguage::Forth,
         source_id: None,
         source: source.into(),
         intent: "legacy revision migration".into(),
-        effect: crate::programs::ExecutionEffect::Pure,
+        effect: finch_programs::ExecutionEffect::Pure,
         declared_capabilities: Vec::new(),
         manifest_generation: runtime.manifest_generation(),
         expected_revision: Some(revision),
@@ -5978,11 +5978,11 @@ async fn legacy_restart_revision_reset_keeps_the_latest_request_state() {
     let legacy_restarted = crate::runtime::ProgramRuntime::from_checkpoint(checkpoint).unwrap();
     let legacy_commit = legacy_restarted
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: None,
             source: ": cube ( S n:int -- S int ! pure ) n n * n * ;".into(),
             intent: "new state after legacy restart".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: legacy_restarted.manifest_generation(),
             expected_revision: Some(0),
@@ -6000,11 +6000,11 @@ async fn legacy_restart_revision_reset_keeps_the_latest_request_state() {
     assert_eq!(restored.revision(), 3);
     let called = restored
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Lisp,
+            language: finch_programs::ProgramLanguage::Lisp,
             source_id: None,
             source: "(cube 4)".into(),
             intent: "call latest migrated definition".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: restored.manifest_generation(),
             expected_revision: Some(3),
@@ -6012,7 +6012,7 @@ async fn legacy_restart_revision_reset_keeps_the_latest_request_state() {
         })
         .await
         .unwrap();
-    assert_eq!(called.values, vec![crate::programs::ProgramValue::Int(64)]);
+    assert_eq!(called.values, vec![finch_programs::ProgramValue::Int(64)]);
     assert_eq!(called.output_revision, 4);
 }
 
@@ -7679,11 +7679,11 @@ async fn program_runtime_from_brain_store_binds_the_delivery_log() {
     );
     let outcome = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Lisp,
+            language: finch_programs::ProgramLanguage::Lisp,
             source_id: Some("brain-delivery".into()),
             source: "(let ((handle (output-open \"download\"))) (output-complete handle))".into(),
             intent: "bind production delivery log".into(),
-            effect: crate::programs::ExecutionEffect::VmRead,
+            effect: finch_programs::ExecutionEffect::VmRead,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: Some(runtime.revision()),

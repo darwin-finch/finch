@@ -16,8 +16,8 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use crate::language::compile_with_functions;
-use crate::vm::Function;
+use finch_language::compile_with_functions;
+use finch_vm::Function;
 
 pub const WIRE_CORPUS_FORMAT_VERSION: u32 = 1;
 pub const WIRE_CORPUS_PATH_ENV: &str = "FINCH_WIRE_CORPUS_PATH";
@@ -71,7 +71,7 @@ impl WireCorpusEntry {
         Self {
             format_version: WIRE_CORPUS_FORMAT_VERSION,
             manifest_protocol_version: super::MANIFEST_PROTOCOL_VERSION,
-            vm_type_system_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            vm_type_system_version: finch_vm::VM_TYPE_SYSTEM_VERSION,
             captured_at: Utc::now(),
             provider: provider.into(),
             model: model.into(),
@@ -280,7 +280,7 @@ pub fn audit(path: &Path) -> Result<WireCorpusAudit> {
         *audit.source_versions.entry(source_version).or_default() += 1;
 
         let key = format!("{}/{}", entry.provider, entry.model);
-        let mut vocabulary = crate::vm::core_vocabulary();
+        let mut vocabulary = finch_vm::core_vocabulary();
         let linked_functions = entry
             .compiler_context
             .as_ref()
@@ -344,11 +344,11 @@ mod tests {
     use super::*;
 
     fn compiler_context_with_double() -> ProgramCompilerContext {
-        let verified = crate::language::compile_lisp(
+        let verified = finch_language::compile_lisp(
             "corpus-context.lisp",
             "(define (double (n : int)) : int (* n 2))",
             Vec::new(),
-            &crate::vm::core_vocabulary(),
+            &finch_vm::core_vocabulary(),
         )
         .expect("pure compiler fixture should produce a verified definition");
         let verified = verified.into_verified();

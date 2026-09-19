@@ -1670,11 +1670,11 @@ async fn execute_typed_forth_ipc(program: String) -> Result<(Vec<i64>, String)> 
     })?;
     let outcome = runtime
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: Some("capnp:evalForth".to_string()),
             source: program,
             intent: "execute typed Co-Forth over the local IPC boundary".to_string(),
-            effect: crate::programs::ExecutionEffect::Unclassified,
+            effect: finch_programs::ExecutionEffect::Unclassified,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: None,
@@ -1693,7 +1693,7 @@ async fn execute_typed_forth_ipc(program: String) -> Result<(Vec<i64>, String)> 
         .values
         .iter()
         .map(|value| match value {
-            crate::programs::ProgramValue::Int(value) => Ok(*value),
+            finch_programs::ProgramValue::Int(value) => Ok(*value),
             other => {
                 anyhow::bail!("evalForth IPC supports only integer stack results; found {other:?}")
             }
