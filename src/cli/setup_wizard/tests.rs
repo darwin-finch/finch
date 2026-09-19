@@ -6453,3 +6453,59 @@ fn grok_sub_does_not_accept_console_api_key_edits() {
         "SuperGrok must not open the API-key editor; rendered={rendered}"
     );
 }
+
+#[test]
+fn test_wizard_view_borders_are_glyph_runs_of_exact_frame_width_at_80_and_120() {
+    // INVARIANT (#926): every boxed border row in every section's frame is a
+    // glyph-only run of exactly the frame width — the interior gap is never
+    // interpolated as digits, and no border overflows or falls short of the
+    // frame. The row-diff blit depends on that exactness.
+    for (width, height) in [(80usize, 24usize), (120, 40)] {
+        for section in WizardSection::all() {
+            let mut state = WizardState::new(None);
+            state.current_section = section;
+            let view = wizard_view_with_permission_target(&state, "", width, height);
+            let frame = crate::cli::tui::plan_wizard_frame(&view, width, height);
+            for line in &frame.lines {
+                if !(line.starts_with('┌') || line.starts_with('└')) {
+                    continue;
+                }
+                let visible = crate::cli::tui::wizard_visible_length(line);
+                assert_eq!(
+                    visible,
+                    width,
+                    "border row of the {} section at {width} columns must fill the frame \
+                     exactly; got {line:?}",
+                    section.name()
+                );
+                let digits: Vec<char> = line.chars().filter(|ch| ch.is_ascii_digit()).collect();
+                assert!(
+                    digits.is_empty(),
+                    "border row of the {} section at {width} columns must not carry the \
+                     gap count as digits; got {line:?} (digits {digits:?})",
+                    section.name()
+                );
+                assert!(
+                    line.trim_end().ends_with('┐') || line.trim_end().ends_with('┘'),
+                    "border row of the {} section must close its box; got {line:?}",
+                    section.name()
+                );
+            }
+            // A frame that stops short of the terminal height is the stale-row
+            // defect class: the previous frame's rows would stay painted below
+            // it and the diff would never revisit them.
+            let covered = frame
+                .row_spans
+                .last()
+                .map(|(start, rows)| start + rows)
+                .unwrap_or(0);
+            assert_eq!(
+                covered,
+                height,
+                "the {} section's frame at {width}x{height} must cover every row so the \
+                 blit erases the previous frame; covered {covered}",
+                section.name()
+            );
+        }
+    }
+}

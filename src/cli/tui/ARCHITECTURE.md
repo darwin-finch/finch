@@ -92,7 +92,11 @@ overlay card); `plan_wizard_frame` projects it into the claiming `widgets` tree 
 column whose 3-row tab block and 1-row help claim natural extents and whose section
 claims the leftover — and `WizardHost::paint` renders the frame into a `ShadowBuffer`,
 diffs rows against the previous frame, and rewrites only the logical lines whose visible
-rows changed. Device-code/add-provider/cancel overlays are `Widget::DialogCard` children
+rows changed. Wizard lines measure with `wizard_visible_length`/`wizard_physical_rows`
+(#926): the emoji-aware widths a terminal actually renders, so planned rows equal
+terminal rows and the row diff stays exact; box and tab top borders are glyph-only `─`
+runs of exactly the frame width. Device-code/add-provider/cancel overlays are
+`Widget::DialogCard` children
 (the #807 contract: claimed rect, chrome pinned inside the card, help yields while the
 card owns keys). The wizard keeps its own terminal lifecycle (raw mode, alternate
 screen, mouse capture), so the #265 editor/PTY handoff is unchanged; the view props are

@@ -18,8 +18,9 @@
 
 use std::io::Write;
 
-use super::shadow_buffer::{self, ShadowBuffer};
+use super::shadow_buffer::ShadowBuffer;
 use super::widgets::{self, Axis, Rect, Track, Widget};
+use crate::cli::components::vocab::char_display_width;
 use anyhow::Result;
 use crossterm::{
     cursor::Hide,
@@ -61,6 +62,123 @@ pub enum WizardColor {
 
 /// SGR reset closing every styled wizard span.
 const WIZ_RESET: &str = "\x1b[0m";
+
+// ─── Terminal-accurate measurement (#926) ────────────────────────────────────
+//
+// The wizard's frames are blitted by row diff: what the planner thinks a row
+// occupies must equal what the terminal actually renders, or a wrapped row
+// shifts everything below it and the diff starts repainting the wrong rows.
+// The shared vocabulary's `char_display_width` counts emoji-presentation
+// codepoints as one column; xterm-class terminals render them as two, and the
+// wizard's own content (theme previews, feature checkboxes) uses them. These
+// wizard-local measurements are the ones every wizard line builder, the frame
+// planner, and the view projection must agree on.
+
+/// Terminal display width of one character as xterm-class terminals render it.
+///
+/// The vocabulary's CJK/fullwidth ranges plus the emoji-presentation
+/// codepoints a terminal paints double-width.
+fn wizard_char_width(c: char) -> usize {
+    match c as u32 {
+        // Emoji presentation (East Asian Width Wide / double-width emoji):
+        // the wizard's own content uses 🔧 ❌ ✅ 🧠.
+        0x231A..=0x231B
+        | 0x2614
+        | 0x2615
+        | 0x2705
+        | 0x270A..=0x270B
+        | 0x2728
+        | 0x274C
+        | 0x274E
+        | 0x2753..=0x2755
+        | 0x2757
+        | 0x2795..=0x2797
+        | 0x27B0
+        | 0x27BF
+        | 0x2B1B..=0x2B1C
+        | 0x2B50
+        | 0x2B55
+        | 0x1F000..=0x1FAFF => 2,
+        _ => char_display_width(c),
+    }
+}
+
+/// Visible display-column width of `text` as a terminal renders it
+/// (ANSI-stripped, emoji-aware). Wizard line builders must pad and centre
+/// with this, not with the engine's narrower measure.
+pub fn wizard_visible_length(text: &str) -> usize {
+    let mut len = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for ch in chars.by_ref() {
+                        if ch.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else if chars.peek() == Some(&']') {
+                    chars.next();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' || (ch == '\x1b' && chars.peek() == Some(&'\\')) {
+                            if ch == '\x1b' {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+            }
+            '\r' | '\x08' | '\x7f' => {}
+            _ => len += wizard_char_width(c),
+        }
+    }
+    len
+}
+
+/// Physical terminal rows `text` occupies at `width` as a terminal renders it.
+pub fn wizard_physical_rows(text: &str, width: usize) -> usize {
+    wizard_visible_length(text).max(1).div_ceil(width.max(1))
+}
+
+/// The boxed-region top border: `┌─ {title} ` followed by a `─` glyph run and
+/// `┐`, exactly `width` visible columns (#926: the gap count must be glyphs,
+/// not digits, and the run must fill the row — the frame's row-diff depends on
+/// every border row being exactly one terminal row).
+fn wizard_title_border(title: &str, width: usize, accent: WizardColor, bold: bool) -> String {
+    if width < 5 {
+        // A row too small for a title still closes the box without overflow.
+        let dashes = width.saturating_sub(2);
+        let glyphs = if width == 1 {
+            "┌".to_string()
+        } else if width == 0 {
+            String::new()
+        } else {
+            format!("┌{}┐", "─".repeat(dashes))
+        };
+        return wizard_paint(&glyphs, Some(accent), bold);
+    }
+    // `┌─ ` + title + ` ` + dashes + `┐` = exactly `width` columns.
+    let title_budget = width - 5;
+    let mut fitted = String::new();
+    for ch in title.chars() {
+        let next = wizard_visible_length(&format!("{fitted}{ch}"));
+        if next > title_budget {
+            break;
+        }
+        fitted.push(ch);
+    }
+    let dashes = width - 5 - wizard_visible_length(&fitted);
+    wizard_paint(
+        &format!("┌─ {fitted} {}┐", "─".repeat(dashes)),
+        Some(accent),
+        bold,
+    )
+}
 
 impl From<ratatui::style::Color> for WizardColor {
     fn from(color: ratatui::style::Color) -> Self {
@@ -134,12 +252,14 @@ pub fn wizard_plain(text: &str) -> String {
 
 /// Centre `text` (ANSI-aware) in `width` display columns.
 pub fn wizard_centered(text: &str, width: usize) -> String {
-    let lead = width.saturating_sub(shadow_buffer::visible_length(text)) / 2;
+    let lead = width.saturating_sub(wizard_visible_length(text)) / 2;
     format!("{}{}", " ".repeat(lead), text)
 }
 
 /// Word-wrap `text` at `width` display columns, keeping any single leading
-/// SGR span on every fragment so wrapped box rows keep their style.
+/// SGR span on every fragment so wrapped box rows keep their style. An
+/// embedded `\n` breaks the line hard, so user text (a persona's system
+/// prompt) can never feed the terminal a raw linefeed mid-row.
 ///
 /// A boxed body must wrap like the old painter's `Paragraph`, not truncate —
 /// truncation is exactly how an accessibility string loses its last words.
@@ -161,35 +281,68 @@ pub fn wizard_wrap(text: &str, width: usize) -> Vec<String> {
     }
     let inner = rest.strip_suffix(WIZ_RESET).unwrap_or(rest);
 
-    // Greedy word wrap over display columns.
+    // Greedy word wrap over display columns. The char walk consumes escape
+    // sequences at zero width (#926): counting their bytes as visible columns
+    // over-wrapped every styled string and, once the help line's claim came
+    // from the same wrap, desynced the claim from the painted extent. An
+    // embedded newline is a hard break: a literal linefeed inside a painted
+    // fragment feeds the terminal real linefeeds and desyncs the row-diff
+    // blit just the same.
     let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut column = 0usize;
-    for word in inner.split(' ') {
-        if column > 0 && column + shadow_buffer::visible_length(word) > width {
-            lines.push(format!("{prefix}{}{WIZ_RESET}", current.trim_end()));
-            current.clear();
-            column = 0;
-        }
-        for ch in word.chars() {
-            let char_width = shadow_buffer::visible_length(&ch.to_string());
-            if column + char_width > width {
-                lines.push(format!("{prefix}{current}{WIZ_RESET}"));
+    for paragraph in inner.split('\n') {
+        let paragraph = paragraph.trim_end_matches('\r');
+        let mut current = String::new();
+        let mut column = 0usize;
+        for word in paragraph.split(' ') {
+            if column > 0 && column + wizard_visible_length(word) > width {
+                lines.push(format!("{prefix}{}{WIZ_RESET}", current.trim_end()));
                 current.clear();
                 column = 0;
             }
-            current.push(ch);
-            column += char_width;
+            let chars: Vec<char> = word.chars().collect();
+            let mut index = 0usize;
+            while index < chars.len() {
+                let ch = chars[index];
+                if ch == '\x1b' {
+                    // Copy the escape sequence through untouched; it renders
+                    // zero columns.
+                    current.push(ch);
+                    index += 1;
+                    if index < chars.len() && chars[index] == '[' {
+                        current.push('[');
+                        index += 1;
+                        while index < chars.len() {
+                            let terminator = chars[index].is_ascii_alphabetic();
+                            current.push(chars[index]);
+                            index += 1;
+                            if terminator {
+                                break;
+                            }
+                        }
+                    } else if index < chars.len() {
+                        current.push(chars[index]);
+                        index += 1;
+                    }
+                    continue;
+                }
+                let char_width = wizard_char_width(ch);
+                if column + char_width > width {
+                    lines.push(format!("{prefix}{current}{WIZ_RESET}"));
+                    current.clear();
+                    column = 0;
+                }
+                current.push(ch);
+                column += char_width;
+                index += 1;
+            }
+            current.push(' ');
+            column += 1;
         }
-        current.push(' ');
-        column += 1;
-    }
-    if current.trim().is_empty() {
-        if lines.is_empty() {
+        if current.trim().is_empty() {
             lines.push(String::new());
+        } else {
+            lines.push(format!("{prefix}{}{WIZ_RESET}", current.trim_end()));
         }
-    } else {
-        lines.push(format!("{prefix}{}{WIZ_RESET}", current.trim_end()));
     }
     lines
         .into_iter()
@@ -208,17 +361,12 @@ pub fn wizard_boxed(
     let width = width.max(4);
     let inner = width - 2;
     let border = "─".repeat(inner);
-    let title_gap = inner.saturating_sub(title.chars().count() + 2);
-    let mut out = vec![wizard_paint(
-        &format!("┌─ {title} ─{title_gap}─┐"),
-        Some(accent),
-        false,
-    )];
+    let mut out = vec![wizard_title_border(title, width, accent, false)];
     for line in body {
         for fragment in wizard_wrap(line, inner.saturating_sub(2)) {
             let pad = inner
                 .saturating_sub(2)
-                .saturating_sub(shadow_buffer::visible_length(&fragment));
+                .saturating_sub(wizard_visible_length(&fragment));
             out.push(format!(
                 "{} {}{} {}",
                 wizard_paint("│", Some(accent), false),
@@ -279,7 +427,7 @@ impl WizardCard {
         let inner = width - 2;
         let pad = inner
             .saturating_sub(2)
-            .saturating_sub(shadow_buffer::visible_length(fragment));
+            .saturating_sub(wizard_visible_length(fragment));
         format!(
             "{} {}{} {}",
             wizard_paint("│", Some(self.accent), false),
@@ -295,11 +443,7 @@ impl WizardCard {
         let inner = width - 2;
         let border = "─".repeat(inner);
         let mut lines = Vec::new();
-        let title_gap = inner.saturating_sub(self.title.chars().count() + 2);
-        lines.push(wizard_bold(
-            &format!("┌─ {} ─{title_gap}─┐", self.title),
-            self.accent,
-        ));
+        lines.push(wizard_title_border(&self.title, width, self.accent, true));
         for fragment in self.wrapped_body(width) {
             lines.push(self.boxed_fragment(width, &fragment));
         }
@@ -332,7 +476,7 @@ impl WizardCard {
         // body and says how much it clipped, so the way out stays reachable.
         let width = width.max(4);
         let inner = width - 2;
-        let top_row = wizard_bold(&format!("┌─ {} ─┐", self.title), self.accent);
+        let top_row = wizard_title_border(&self.title, width, self.accent, true);
         let bottom_row = wizard_paint(
             &format!("└{}┘", "─".repeat(inner)),
             Some(self.accent),
@@ -437,11 +581,7 @@ pub struct WizardView {
 fn tab_row_lines(view: &WizardView, width: usize) -> Vec<String> {
     let width = width.max(4);
     let inner = width - 2;
-    let title_gap = inner.saturating_sub(view.title.chars().count() + 2);
-    let top = wizard_bold(
-        &format!("┌─ {} ─{title_gap}─┐", view.title),
-        WizardColor::Blue,
-    );
+    let top = wizard_title_border(&view.title, width, WizardColor::Blue, true);
     let mut tabs = String::new();
     for (index, name) in view.tab_titles.iter().enumerate() {
         if index > 0 {
@@ -459,7 +599,7 @@ fn tab_row_lines(view: &WizardView, width: usize) -> Vec<String> {
         wizard_paint("│", Some(WizardColor::Blue), false),
         tabs,
         {
-            let used = shadow_buffer::visible_length(&tabs);
+            let used = wizard_visible_length(&tabs);
             format!(
                 "{}{}",
                 " ".repeat(inner.saturating_sub(used)),
@@ -511,12 +651,16 @@ fn project_wizard_root(view: &WizardView, width: usize, card_lines: Option<Vec<S
             Widget::Marked(wizard_keys::CARD, Box::new(Widget::DialogCard { lines })),
         ));
     } else if let Some(help) = &view.help {
+        // The help line wraps to the frame width: it names every recovery key
+        // (#812 accessibility contract), so it must never overflow the frame
+        // (which scrolls the whole screen) nor be truncated. Its natural
+        // claim is its wrapped extent, the same lines the paint emits.
         children.push((
             Track::Natural,
             Widget::Marked(
                 wizard_keys::HELP,
                 Box::new(Widget::Text {
-                    lines: vec![help.clone()],
+                    lines: wizard_wrap(help, width),
                 }),
             ),
         ));
@@ -580,7 +724,7 @@ fn section_window(content: &WizardSectionContent, width: usize, budget: usize) -
     let rows: Vec<usize> = content
         .lines
         .iter()
-        .map(|line| shadow_buffer::physical_rows(line, width))
+        .map(|line| wizard_physical_rows(line, width))
         .collect();
 
     // Range of line indices currently visible starting at `start`.
@@ -662,7 +806,7 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
                 row: &mut usize,
                 add: Vec<String>| {
         for line in add {
-            let rows = shadow_buffer::physical_rows(&line, width).min(height.saturating_sub(*row));
+            let rows = wizard_physical_rows(&line, width).min(height.saturating_sub(*row));
             if *row >= height || rows == 0 {
                 continue;
             }
@@ -684,12 +828,17 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
         );
     }
 
-    // Section: the leftover rows, windowed and padded to exactly the claim,
-    // so the help line and any card sit on the rows the pass handed them
-    // (the same pinned-box discipline the conversation card follows).
+    // Section: the leftover rows, windowed and padded to exactly the claim
+    // (by physical rows, the unit the claim and the blit count), so the help
+    // line and any card sit on the rows the pass handed them (the same
+    // pinned-box discipline the conversation card follows).
     if rects.section.height > 0 {
         let mut window = section_window(&view.section, width, rects.section.height);
-        while window.len() < rects.section.height {
+        let used: usize = window
+            .iter()
+            .map(|line| wizard_physical_rows(line, width))
+            .sum();
+        for _ in used..rects.section.height {
             window.push(String::new());
         }
         push(&mut lines, &mut row_spans, &mut row, window);
@@ -703,7 +852,14 @@ pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> Wiza
         }
     } else if rects.help.height > 0 {
         if let Some(help) = &view.help {
-            push(&mut lines, &mut row_spans, &mut row, vec![help.clone()]);
+            // The same wrapped lines the claim was sized from, so the paint
+            // and the claiming pass see one help block.
+            push(
+                &mut lines,
+                &mut row_spans,
+                &mut row,
+                wizard_wrap(help, width),
+            );
         }
     }
 
@@ -1117,5 +1273,458 @@ mod tests {
                 "every painted line carries a row span for the blit diff"
             );
         }
+    }
+
+    // ─── #926 regressions: the blit must agree with a real terminal ──────────
+
+    /// A minimal xterm-class terminal: exactly the sequences `WizardHost::paint`
+    /// emits — cursor addressing, erase in display/line, deferred autowrap,
+    /// linefeed scroll — plus the double-width emoji cells a real terminal
+    /// renders. Synchronized-update brackets and SGR are consumed as noise.
+    #[derive(Default)]
+    struct BlitVt {
+        width: usize,
+        height: usize,
+        screen: Vec<Vec<char>>,
+        scrolled: usize,
+        row: usize,
+        col: usize,
+        pending_wrap: bool,
+    }
+
+    impl BlitVt {
+        fn new(width: usize, height: usize) -> Self {
+            Self {
+                width,
+                height,
+                screen: vec![vec![' '; width]; height],
+                scrolled: 0,
+                row: 0,
+                col: 0,
+                pending_wrap: false,
+            }
+        }
+
+        /// Replay a whole byte stream.
+        fn feed_all(width: usize, height: usize, bytes: &[u8]) -> Self {
+            let mut vt = Self::new(width, height);
+            vt.feed(&String::from_utf8_lossy(bytes));
+            vt
+        }
+
+        fn feed(&mut self, text: &str) {
+            let chars: Vec<char> = text.chars().collect();
+            let mut index = 0;
+            while index < chars.len() {
+                index = self.step(&chars, index);
+            }
+        }
+
+        fn step(&mut self, chars: &[char], index: usize) -> usize {
+            match chars[index] {
+                '\x1b' => self.escape(chars, index + 1),
+                '\r' => {
+                    self.col = 0;
+                    self.pending_wrap = false;
+                    index + 1
+                }
+                '\n' => {
+                    self.line_feed();
+                    index + 1
+                }
+                c if (c as u32) < 0x20 => index + 1,
+                c => {
+                    self.put(c);
+                    index + 1
+                }
+            }
+        }
+
+        fn escape(&mut self, chars: &[char], index: usize) -> usize {
+            match chars.get(index) {
+                Some('[') => {
+                    let mut cursor = index + 1;
+                    let start = cursor;
+                    while cursor < chars.len() && !('\u{40}'..='\u{7e}').contains(&chars[cursor]) {
+                        cursor += 1;
+                    }
+                    if cursor >= chars.len() {
+                        return chars.len();
+                    }
+                    let body: String = chars[start..cursor].iter().collect();
+                    self.csi(&body, chars[cursor]);
+                    cursor + 1
+                }
+                Some(']') => {
+                    let mut cursor = index + 1;
+                    while cursor < chars.len() {
+                        if chars[cursor] == '\u{7}'
+                            || (chars[cursor] == '\x1b' && chars.get(cursor + 1) == Some(&'\\'))
+                        {
+                            return cursor + 2;
+                        }
+                        cursor += 1;
+                    }
+                    chars.len()
+                }
+                Some(_) => index + 1,
+                None => index,
+            }
+        }
+
+        fn csi(&mut self, body: &str, final_byte: char) {
+            if body.starts_with('?') || body.starts_with('>') {
+                return; // mode sets, synchronized updates, mouse: screen noise
+            }
+            let params: Vec<usize> = body
+                .split(';')
+                .map(|part| part.parse::<usize>().unwrap_or(0))
+                .collect();
+            let first = params.first().copied().unwrap_or(0);
+            let count = first.max(1);
+            match final_byte {
+                'H' | 'f' => {
+                    self.row = first.saturating_sub(1).min(self.height - 1);
+                    self.col = params
+                        .get(1)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_sub(1)
+                        .min(self.width - 1);
+                    self.pending_wrap = false;
+                }
+                'J' => {
+                    if first >= 2 {
+                        self.screen = vec![vec![' '; self.width]; self.height];
+                    } else if first == 0 {
+                        for column in self.col..self.width {
+                            self.screen[self.row][column] = ' ';
+                        }
+                        for row in (self.row + 1)..self.height {
+                            self.screen[row] = vec![' '; self.width];
+                        }
+                    }
+                }
+                'K' => {
+                    match first {
+                        0 => {
+                            for column in self.col..self.width {
+                                self.screen[self.row][column] = ' ';
+                            }
+                        }
+                        2 => self.screen[self.row] = vec![' '; self.width],
+                        _ => {}
+                    }
+                    self.pending_wrap = false;
+                }
+                'A' => self.row = self.row.saturating_sub(count),
+                'B' => self.row = (self.row + count).min(self.height - 1),
+                'C' => self.col = (self.col + count).min(self.width - 1),
+                'D' => self.col = self.col.saturating_sub(count),
+                _ => {}
+            }
+        }
+
+        fn line_feed(&mut self) {
+            self.pending_wrap = false;
+            if self.row + 1 < self.height {
+                self.row += 1;
+            } else {
+                self.screen.remove(0);
+                self.screen.push(vec![' '; self.width]);
+                self.scrolled += 1;
+            }
+        }
+
+        fn put(&mut self, c: char) {
+            let wide = wizard_char_width(c) == 2;
+            if self.pending_wrap {
+                self.pending_wrap = false;
+                self.col = 0;
+                self.line_feed();
+            }
+            if wide && self.col + 2 > self.width {
+                self.col = 0;
+                self.line_feed();
+            }
+            if self.row < self.height && self.col < self.width {
+                self.screen[self.row][self.col] = c;
+            }
+            self.col += 1;
+            if wide {
+                if self.col < self.width && self.row < self.height {
+                    self.screen[self.row][self.col] = ' ';
+                }
+                self.col += 1;
+            }
+            if self.col >= self.width {
+                self.pending_wrap = true;
+            }
+        }
+
+        /// The visible screen, trailing blanks trimmed per row.
+        fn rows(&self) -> Vec<String> {
+            self.screen
+                .iter()
+                .map(|row| row.iter().collect::<String>().trim_end().to_string())
+                .collect()
+        }
+
+        /// First differing row between two screens, with both payloads.
+        fn first_difference(&self, expected: &Self) -> Option<String> {
+            let mine = self.rows();
+            let theirs = expected.rows();
+            for row in 0..self.height.max(expected.height) {
+                let actual = mine.get(row).map(String::as_str).unwrap_or("");
+                let wanted = theirs.get(row).map(String::as_str).unwrap_or("");
+                if actual != wanted {
+                    return Some(format!(
+                        "row {row}: terminal holds {actual:?}, a fresh paint of the same \
+                         frame holds {wanted:?}"
+                    ));
+                }
+            }
+            None
+        }
+    }
+
+    fn emoji_section_view(section_lines: Vec<String>) -> WizardView {
+        WizardView {
+            title: " Finch Setup ".to_string(),
+            tab_titles: vec![
+                "Look & Feel".to_string(),
+                "Model Setup".to_string(),
+                "Style".to_string(),
+                "Settings".to_string(),
+                "Finish".to_string(),
+            ],
+            selected_tab: 0,
+            section: WizardSectionContent::plain(section_lines),
+            help: Some("↑/↓: Choose | Enter: Next | Tab: Next".to_string()),
+            card: None,
+        }
+    }
+
+    /// The border lines are wrapped in SGR spans; strip them so assertions can
+    /// look at the glyphs a reader sees.
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for ch in chars.by_ref() {
+                        if ch.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_host_blit_screen_matches_a_fresh_paint_and_never_scrolls() {
+        // INVARIANT (#926): the row-diff blit's net effect on a terminal is a
+        // fresh paint of the same frame — nothing scrolls, no row is shifted,
+        // no stale row survives. The wizard's own content renders emoji
+        // double-width; measurement that disagrees with the terminal makes the
+        // first frame scroll and the diff then never repairs the tab row.
+        let width = 100;
+        let height = 24;
+        let tall = vec![wizard_centered(
+            &wizard_bold("Theme Selection", WizardColor::Blue),
+            width,
+        )]
+        .into_iter()
+        .chain(wizard_boxed(
+            "Available Themes",
+            &[
+                wizard_plain("🔧 Tool: Reading file..."),
+                wizard_plain("❌ Error: File not found"),
+                wizard_plain("Solarized - Solarized Dark color palette"),
+                wizard_plain(
+                    "A much longer description line that must wrap inside the box \
+                              because it exceeds the interior width of the box by far",
+                ),
+            ],
+            WizardColor::Blue,
+            width,
+        ))
+        .collect::<Vec<_>>();
+        let shorter = wizard_boxed(
+            "AI Providers",
+            &[wizard_plain("★ Primary: claude [Not configured]")],
+            WizardColor::Blue,
+            width,
+        );
+
+        let frames: Vec<WizardFrame> = [
+            emoji_section_view(tall.clone()),
+            emoji_section_view(tall),
+            emoji_section_view(shorter.clone()),
+            emoji_section_view(vec![wizard_plain("tiny")]),
+        ]
+        .iter()
+        .map(|view| plan_wizard_frame(view, width, height))
+        .collect();
+
+        let mut host = WizardHost::new();
+        let mut sink: Vec<u8> = Vec::new();
+        for (step, frame) in frames.iter().enumerate() {
+            host.paint(&mut sink, frame, width, height).unwrap();
+            let terminal = BlitVt::feed_all(width, height, &sink);
+            assert_eq!(
+                terminal.scrolled,
+                0,
+                "frame {step} scrolled the terminal; the wizard planned rows that do \
+                 not match what a terminal renders. Screen:\n{}",
+                terminal.rows().join("\n")
+            );
+            let mut expected = BlitVt::new(width, height);
+            let mut ideal = String::new();
+            for (index, line) in frame.lines.iter().enumerate() {
+                if index > 0 {
+                    ideal.push_str("\r\n");
+                }
+                ideal.push_str(line);
+            }
+            expected.feed(&ideal);
+            if let Some(difference) = terminal.first_difference(&expected) {
+                panic!(
+                    "INVARIANT (#926): after frame {step} the blitted screen must equal a \
+                     fresh paint of the same frame; {difference}\nterminal:\n{}\nexpected:\n{}",
+                    terminal.rows().join("\n"),
+                    expected.rows().join("\n")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_wizard_title_border_is_a_glyph_run_of_exact_width() {
+        // INVARIANT (#926): box/tab top borders repeat the ─ glyph to exactly
+        // the frame width — never the gap count as digits, never a row that
+        // overflows or falls short of the frame.
+        for width in [5, 6, 10, 40, 80, 100, 120, 124, 200] {
+            for title in [
+                "",
+                "Available Themes",
+                " Finch Setup ",
+                "Full GUI automation status (read/scroll only)",
+            ] {
+                for (accent, bold) in [(WizardColor::Blue, false), (WizardColor::Cyan, true)] {
+                    let border = wizard_title_border(title, width, accent, bold);
+                    let visible = wizard_visible_length(&border);
+                    assert_eq!(
+                        visible, width,
+                        "border for {title:?} at width {width} must be exactly {width} columns; got {border:?}"
+                    );
+                    let plain = strip_ansi(&border);
+                    assert!(
+                        plain.starts_with('┌') && plain.ends_with('┐'),
+                        "border must close its box; got {border:?}"
+                    );
+                    let digits = plain.chars().any(|ch| ch.is_ascii_digit());
+                    assert!(
+                        !digits,
+                        "border for {title:?} at width {width} must not carry the gap \
+                         count as digits; got {border:?}"
+                    );
+                }
+            }
+        }
+        // A row too small for a title still closes without overflowing.
+        for width in [1, 2, 4] {
+            let border = wizard_title_border("Available Themes", width, WizardColor::Blue, false);
+            assert!(
+                wizard_visible_length(&border) <= width,
+                "border at width {width} overflows the frame: {border:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wizard_emoji_rows_measure_terminal_columns() {
+        // INVARIANT (#926): the wizard's measurement must match what a
+        // terminal renders — emoji-presentation characters occupy two columns,
+        // so padded box rows stay inside the frame instead of wrapping onto
+        // the next row and desyncing the row-diff blit.
+        assert_eq!(wizard_char_width('🔧'), 2);
+        assert_eq!(wizard_char_width('❌'), 2);
+        assert_eq!(wizard_char_width('✅'), 2);
+        assert_eq!(
+            wizard_char_width('★'),
+            1,
+            "ambiguous width stays one column"
+        );
+        assert_eq!(wizard_visible_length("🔧 Tool: "), 9);
+        let width = 100;
+        let boxed = wizard_boxed(
+            "Preview",
+            &[
+                wizard_plain("🔧 Tool: Reading file..."),
+                wizard_plain("❌ Error: File not found"),
+            ],
+            WizardColor::Blue,
+            width,
+        );
+        for line in &boxed {
+            assert!(
+                wizard_visible_length(line) <= width,
+                "box row must fit the frame as a terminal measures it: {line:?}"
+            );
+            assert_eq!(
+                wizard_physical_rows(line, width),
+                1,
+                "box row must occupy one terminal row: {line:?}"
+            );
+        }
+        // The old measurement counted the emoji as one column and padded the
+        // row past the frame; the widest row pins the two-column accounting.
+        let body = &boxed[2];
+        assert_eq!(
+            wizard_visible_length(body),
+            width,
+            "padded box rows fill the frame exactly; got {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_tab_row_marks_the_active_tab() {
+        // INVARIANT (#926): the tab row renders every label and marks the
+        // active section (bold + magenta) so navigation is visible.
+        let view = emoji_section_view(vec!["content".to_string()]);
+        let selected = &view.tab_titles[view.selected_tab];
+        let rows = tab_row_lines(&view, 100);
+        let tabs = &rows[1];
+        for name in &view.tab_titles {
+            assert!(
+                tabs.contains(name.as_str()),
+                "tab label {name:?} must be painted in the tab row; got {tabs:?}"
+            );
+        }
+        let marked = wizard_bold(selected, WizardColor::Magenta);
+        assert!(
+            tabs.contains(&marked),
+            "the active tab must be the bold magenta span {marked:?}; tab row: {tabs:?}"
+        );
+        let inactive = view
+            .tab_titles
+            .iter()
+            .enumerate()
+            .find(|(index, _)| *index != view.selected_tab)
+            .map(|(_, name)| wizard_line(name, WizardColor::Blue))
+            .unwrap();
+        assert!(
+            tabs.contains(&inactive),
+            "inactive tabs must not carry the active marking; tab row: {tabs:?}"
+        );
     }
 }

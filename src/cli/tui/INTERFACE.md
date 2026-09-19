@@ -288,8 +288,14 @@ pub fn wizard_centered(text: &str, width: usize) -> String { … }
 pub fn wizard_line(text: &str, fg: WizardColor) -> String { … }
 /// One styled wizard span: optional foreground colour plus bold.
 pub fn wizard_paint(text: &str, fg: Option<WizardColor>, bold: bool) -> String { … }
+/// Physical terminal rows `text` occupies at `width` as a terminal renders it.
+pub fn wizard_physical_rows(text: &str, width: usize) -> usize { … }
 /// A plain wizard span.
 pub fn wizard_plain(text: &str) -> String { … }
+/// Visible display-column width of `text` as a terminal renders it (ANSI-stripped, emoji-aware).
+pub fn wizard_visible_length(text: &str) -> usize { … }
+/// Word-wrap `text` at `width` display columns, keeping any single leading SGR span on every fragment so wrapped box rows keep their style.
+pub fn wizard_wrap(text: &str, width: usize) -> Vec<String> { … }
 ```
 
 ## Modules
