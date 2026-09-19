@@ -245,6 +245,18 @@ impl Session {
         screen.text()
     }
 
+    /// The native scrollback a real terminal would hold above the live area:
+    /// the raw byte stream replayed through the same VT parser, with every
+    /// row that scrolled off the grid top retained. Rows in scrollback were
+    /// written exactly once — a row can never be erased after it scrolls.
+    fn scrollback_text(&self) -> String {
+        let mut screen = vt::Screen::new(ROWS, COLS);
+        let mut parser = vte::Parser::new();
+        let bytes = self.transcript_bytes();
+        parser.advance(&mut screen, &bytes);
+        screen.scrollback_text()
+    }
+
     /// Wait until the live screen carries the needle, then return the screen.
     fn wait_for_screen(&mut self, needle: &str, deadline: Duration, what: &str) -> String {
         let expiry = Instant::now() + deadline;
@@ -337,6 +349,10 @@ mod vt {
         rows: usize,
         cols: usize,
         grid: Vec<Vec<char>>,
+        /// Rows pushed off the grid top by scrolling — a real terminal's
+        /// native scrollback. Once a row leaves the grid it can never be
+        /// erased again: erases and repaints only ever touch the grid.
+        scrollback: Vec<Vec<char>>,
         row: usize,
         col: usize,
         pending_wrap: bool,
@@ -347,6 +363,7 @@ mod vt {
             let (rows, cols) = (rows as usize, cols as usize);
             Self {
                 grid: vec![vec![' '; cols]; rows],
+                scrollback: Vec::new(),
                 rows,
                 cols,
                 row: 0,
@@ -366,6 +383,20 @@ mod vt {
                 .join("\n")
         }
 
+        /// The native scrollback this session accumulated: every row a real
+        /// terminal would hold above the live area, exactly as it was when it
+        /// scrolled off the grid top.
+        pub fn scrollback_text(&self) -> String {
+            self.scrollback
+                .iter()
+                .map(|line| {
+                    let text = line.iter().collect::<String>();
+                    text.trim_end().to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
         fn line_feed(&mut self) {
             self.pending_wrap = false;
             if self.row + 1 >= self.rows {
@@ -376,7 +407,8 @@ mod vt {
         }
 
         fn scroll_up(&mut self) {
-            self.grid.remove(0);
+            let top = self.grid.remove(0);
+            self.scrollback.push(top);
             self.grid.push(vec![' '; self.cols]);
         }
 
@@ -1216,6 +1248,181 @@ fn durable_attach_prints_one_command_and_reattaches_the_same_brain() {
     assert!(
         uuid_only_lines(&second_text).is_empty(),
         "reattach must not print a UUID-only resume line.\nterminal:\n{second_text}"
+    );
+}
+
+#[test]
+fn completed_typed_program_turn_spools_its_canonical_record_into_native_scrollback() {
+    const SAY_TEXT: &str = "attach-say-935";
+    const SOURCE_LINE: &str = "(say \"attach-say-935\")";
+    const CANONICAL_SOURCE_LABEL: &str = "Program source (lisp)";
+
+    let fixture = Fixture::new();
+    let mut session = Session::spawn(&fixture, &["attach", BRAIN]);
+    session.wait_for("finch v", READY_DEADLINE, "the startup header was drawn");
+    session.send_line(SOURCE_LINE);
+    session.wait_for_screen(
+        SAY_TEXT,
+        ECHO_DEADLINE,
+        "the completed say rendered its prose on the live screen",
+    );
+    session.wait_for(
+        "(ran ",
+        ECHO_DEADLINE,
+        "the completed say card carries its `(ran Ns)` elapsed annotation",
+    );
+
+    // The canonical commit is the only writer of the source unit's record:
+    // the live viewport consolidates it away (stage 2, #882), so the byte
+    // stream gaining `Program source (lisp)` means the spool ran. Bounded —
+    // a liveness gate on the commit trigger, not a latency assertion.
+    let commit_deadline = Instant::now() + ECHO_DEADLINE;
+    loop {
+        if session
+            .readable_transcript()
+            .contains(CANONICAL_SOURCE_LABEL)
+        {
+            break;
+        }
+        if Instant::now() >= commit_deadline {
+            panic!(
+                "INVARIANT: a completed typed-program turn must spool its canonical \
+                 record into native scrollback while the app is live (root AGENTS.md, \
+                 TUI invariant: native history is the copyable record). The source \
+                 unit's canonical label {CANONICAL_SOURCE_LABEL:?} never reached the \
+                 terminal. Live screen was:\n{}\nscrollback was:\n{}\nterminal:\n{}",
+                session.screen_text(),
+                session.scrollback_text(),
+                session.readable_transcript()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The raw program and the say bytes must live in native scrollback,
+    // written exactly once, and must not sit in the live area as the record.
+    let scrollback = session.scrollback_text();
+    let source_hits = scrollback.matches(SOURCE_LINE).count();
+    assert!(
+        source_hits == 1,
+        "INVARIANT: the canonical record must carry the raw program exactly once in \
+         native scrollback; found {source_hits} occurrence(s). Program={SOURCE_LINE:?}\n\
+         scrollback:\n{scrollback}"
+    );
+    let say_hits = scrollback
+        .lines()
+        .filter(|line| line.trim() == SAY_TEXT)
+        .count();
+    assert!(
+        say_hits == 1,
+        "INVARIANT: the canonical record must carry the say output exactly once in \
+         native scrollback; found {say_hits} prose line(s).\nscrollback:\n{scrollback}"
+    );
+    assert!(
+        scrollback.contains(CANONICAL_SOURCE_LABEL),
+        "INVARIANT: the spooled record is the canonical form with its source label.\n\
+         scrollback:\n{scrollback}"
+    );
+    assert!(
+        !session.screen_text().contains(SOURCE_LINE),
+        "INVARIANT: after the spool the live area must not be the record — the raw \
+         program belongs above the live area.\nlive screen:\n{}",
+        session.screen_text()
+    );
+
+    session.send_line("/exit");
+    let status = session.wait_for_exit();
+    assert!(
+        status.success(),
+        "a clean /exit must succeed after the say turn, status={status:?}, \
+         live screen:\n{}",
+        session.screen_text()
+    );
+}
+
+#[test]
+fn attached_typed_program_turn_spools_its_canonical_record_into_native_scrollback() {
+    const SAY_TEXT: &str = "attach-say-935";
+    const SOURCE_LINE: &str = "(say \"attach-say-935\")";
+
+    let daemon = IsolatedDaemon::start();
+    let mut session = Session::spawn_on(&daemon.home, &["attach", BRAIN]);
+    session.wait_for("finch v", READY_DEADLINE, "the startup header was drawn");
+    session.wait_for(BRAIN, READY_DEADLINE, "the named Brain label was drawn");
+    // The typed program only executes when this frontend holds the runner
+    // lease; the header names it.
+    session.wait_for_screen(
+        "· runner",
+        READY_DEADLINE,
+        "the attach drew the active runner lease header",
+    );
+
+    session.send_line(SOURCE_LINE);
+    session.wait_for(
+        "attach-say-935",
+        ECHO_DEADLINE,
+        "the completed say bytes reached the terminal",
+    );
+
+    // The canonical record must spool while the app is live, promptly enough
+    // to observe. Poll until the say prose lands in native scrollback; a
+    // bounded liveness gate on the whole chain (commit trigger through
+    // delivery), not a latency assertion.
+    let spool_start = Instant::now();
+    let spool_deadline = spool_start + Duration::from_secs(30);
+    let mut elapsed_at_spool = None;
+    while Instant::now() < spool_deadline {
+        if session
+            .scrollback_text()
+            .lines()
+            .any(|line| line.trim() == SAY_TEXT)
+        {
+            elapsed_at_spool = Some(spool_start.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let scrollback = session.scrollback_text();
+    if elapsed_at_spool.is_none() {
+        let journal = std::fs::read_to_string(daemon.events_path()).unwrap_or_default();
+        panic!(
+            "INVARIANT: a completed typed-program turn in an attached session must \
+             spool its canonical record into native scrollback while the app is live \
+             (root AGENTS.md, TUI invariant: native history is the copyable record). \
+             The say prose never reached scrollback within the wait window.\n\
+             journal:\n{journal}\nscrollback:\n{scrollback}\n\
+             live screen:\n{}\nterminal:\n{}",
+            session.screen_text(),
+            session.readable_transcript()
+        );
+    }
+
+    // The raw program and the say bytes must live in native scrollback,
+    // written exactly once.
+    let source_hits = scrollback.matches(SOURCE_LINE).count();
+    assert!(
+        source_hits == 1,
+        "INVARIANT: the canonical record must carry the raw program exactly once in \
+         native scrollback; found {source_hits} occurrence(s). Program={SOURCE_LINE:?}\n\
+         scrollback:\n{scrollback}"
+    );
+    let say_hits = scrollback
+        .lines()
+        .filter(|line| line.trim() == SAY_TEXT)
+        .count();
+    assert!(
+        say_hits == 1,
+        "INVARIANT: the canonical record must carry the say output exactly once in \
+         native scrollback; found {say_hits} prose line(s).\nscrollback:\n{scrollback}"
+    );
+
+    session.send_line("/exit");
+    let status = session.wait_for_exit();
+    assert!(
+        status.success(),
+        "a clean /exit must succeed after the attached say turn, status={status:?}, \
+         live screen:\n{}",
+        session.screen_text()
     );
 }
 
