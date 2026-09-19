@@ -1,8 +1,78 @@
 use super::{
     decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc,
-    require_approval_connection, BrainRpcService, BrainRunnerControlImpl, FinchDaemonImpl,
+    ipc_call_span, require_approval_connection, BrainRpcService, BrainRunnerControlImpl,
+    FinchDaemonImpl,
 };
 use crate::ipc::codec::encode_approval_audience;
+
+/// #223: the local Cap'n Proto IPC path had no tracing correlation of any
+/// kind. `ipc_call_span` must carry a `request_id` and the method name as
+/// named fields (not just interpolated into an opaque message), so a
+/// `tracing_subscriber::fmt` layer renders them as filterable/greppable
+/// `key=value` pairs.
+#[test]
+fn test_ipc_call_span_carries_named_fields() {
+    let span = ipc_call_span("query");
+    let metadata = span
+        .metadata()
+        .expect("span must be enabled and have metadata");
+    let field_names: Vec<&str> = metadata.fields().iter().map(|f| f.name()).collect();
+    assert!(field_names.contains(&"method"));
+    assert!(field_names.contains(&"request_id"));
+    assert_eq!(metadata.name(), "ipc_call");
+}
+
+/// The recorded `request_id` value must actually be a fresh UUID each call,
+/// not a placeholder or a value reused across calls (multiple concurrent IPC
+/// calls on one connection must be individually distinguishable in the
+/// log). Captured through a real subscriber layer since a bare `Span`
+/// handle does not expose the values recorded into it.
+#[test]
+fn test_ipc_call_span_request_id_is_a_fresh_uuid_each_call() {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct CapturedIds(Arc<Mutex<Vec<String>>>);
+
+    struct CaptureLayer(CapturedIds);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor(CapturedIds);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "request_id" {
+                        self.0 .0.lock().unwrap().push(format!("{value:?}"));
+                    }
+                }
+            }
+            attrs.record(&mut Visitor(self.0.clone()));
+        }
+    }
+
+    let captured = CapturedIds::default();
+    let subscriber = tracing_subscriber::registry().with(CaptureLayer(captured.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        let _first = ipc_call_span("query");
+        let _second = ipc_call_span("query");
+    });
+
+    let ids = captured.0.lock().unwrap();
+    assert_eq!(ids.len(), 2, "both calls must record a request_id: {ids:?}");
+    assert_ne!(
+        ids[0], ids[1],
+        "each call must get a fresh request_id, not a reused/cached one: {ids:?}"
+    );
+}
 
 #[test]
 fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
