@@ -255,6 +255,7 @@ EXPECTED_FIXTURES = {
 
 RUST_CACHE_ACTION = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
 ACTIONS_CACHE_ACTION = "actions/cache@v4"
+SCCACHE_ACTION = "mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba"  # v0.0.11
 SUPERVISOR_IMAGE_CACHE_NAME = "Restore pinned isolation supervisor"
 SUPERVISOR_IMAGE_CACHE_KEY = (
     "isolation-supervisor-${{ runner.os }}-${{ runner.arch }}-rust-1.98.0-"
@@ -313,7 +314,12 @@ TEST_JOB_ENV = {
     "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
     "CARGO_TERM_COLOR": "always",
     "RUST_BACKTRACE": 1,
+    "RUSTC_WRAPPER": "sccache",
 }
+
+# test-macos and build take no job-level CARGO_BUILD_JOBS override, so their
+# effective environment is the workflow-level default plus sccache (#938).
+NO_OVERRIDE_JOB_ENV = {**CI_SHARED_ENV, "RUSTC_WRAPPER": "sccache"}
 
 CACHE_SPECS = {
     ("ci.yml", "test"): {
@@ -337,6 +343,7 @@ CACHE_SPECS = {
         "shared-key": literal_cache_key("macos-14", "aarch64-apple-darwin", MACOS_FAMILY),
         "save-if": MAIN_SAVE_IF,
         "before": "Build binary",
+        "env": NO_OVERRIDE_JOB_ENV,
     },
     ("ci.yml", "runtime-authority"): {
         "name": "Restore Linux default-family Cargo state",
@@ -356,6 +363,7 @@ CACHE_SPECS = {
         ),
         "save-if": MAIN_SAVE_IF,
         "before": "Build release binary",
+        "env": NO_OVERRIDE_JOB_ENV,
     },
     ("ci.yml", "security"): {
         "name": "Restore cargo-audit 0.22.2",
@@ -396,6 +404,21 @@ CACHE_SPECS = {
         "save-if": False,
         "before": "Install Linux dependencies",
     },
+}
+
+# The five canonical ci.yml Cargo-compiling jobs additionally run sccache as a
+# compilation-unit cache, complementary to the CACHE_SPECS target-tree cache
+# (#938). Bounded to ci.yml: issue-56-brain-isolation.yml and release.yml are
+# left to a focused follow-up rather than widened here.
+SCCACHE_SPECS = {
+    location: {"name": "Set up sccache"}
+    for location in (
+        ("ci.yml", "test"),
+        ("ci.yml", "test-no-default"),
+        ("ci.yml", "test-macos"),
+        ("ci.yml", "runtime-authority"),
+        ("ci.yml", "build"),
+    )
 }
 
 
@@ -711,6 +734,7 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     errors: list[str] = []
     found: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
     supervisor_image_found: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
+    sccache_found: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
     for workflow, document in documents.items():
         jobs = document.get("jobs", {})
         if not isinstance(jobs, dict):
@@ -727,6 +751,8 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
                     found.setdefault(location, []).append((index, step))
                 elif uses == ACTIONS_CACHE_ACTION:
                     supervisor_image_found.setdefault(location, []).append((index, step))
+                elif isinstance(uses, str) and "sccache-action@" in uses.lower():
+                    sccache_found.setdefault(location, []).append((index, step))
                 else:
                     errors.append(
                         f"{workflow}: job {job_id!r} uses unreviewed cache action {uses!r}"
@@ -822,6 +848,54 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
                     f"{workflow}: job {job_id!r} effective Cargo/Rust environment changed; "
                     f"expected={spec['env']!r} actual={effective!r}"
                 )
+
+    expected_sccache_locations = set(SCCACHE_SPECS)
+    actual_sccache_locations = set(sccache_found)
+    if actual_sccache_locations != expected_sccache_locations:
+        errors.append(
+            "sccache allocation changed; "
+            f"missing={sorted(expected_sccache_locations - actual_sccache_locations)!r} "
+            f"unexpected={sorted(actual_sccache_locations - expected_sccache_locations)!r}"
+        )
+
+    for location in sorted(expected_sccache_locations & actual_sccache_locations):
+        workflow, job_id = location
+        matches = sccache_found[location]
+        if len(matches) != 1:
+            errors.append(
+                f"{workflow}: job {job_id!r} must contain exactly one sccache setup step; "
+                f"actual={len(matches)}"
+            )
+            continue
+        sccache_index, step = matches[0]
+        spec = SCCACHE_SPECS[location]
+        if step.get("name") != spec["name"]:
+            errors.append(
+                f"{workflow}: job {job_id!r} sccache step name changed; "
+                f"expected={spec['name']!r} actual={step.get('name')!r}"
+            )
+        if step.get("uses") != SCCACHE_ACTION:
+            errors.append(
+                f"{workflow}: job {job_id!r} must pin the reviewed sccache action; "
+                f"actual={step.get('uses')!r}"
+            )
+        steps = documents[workflow]["jobs"][job_id]["steps"]
+        toolchains = [
+            index for index, candidate in enumerate(steps)
+            if isinstance(candidate, dict)
+            and candidate.get("uses") == "dtolnay/rust-toolchain@1.98.0"
+        ]
+        cargo_cache_matches = found.get(location, [])
+        if len(toolchains) != 1 or len(cargo_cache_matches) != 1:
+            errors.append(
+                f"{workflow}: job {job_id!r} sccache ordering boundary is ambiguous; "
+                f"toolchains={toolchains!r} cargo_cache={cargo_cache_matches!r}"
+            )
+        elif not toolchains[0] < sccache_index < cargo_cache_matches[0][0]:
+            errors.append(
+                f"{workflow}: job {job_id!r} sccache must run after the pinned toolchain "
+                "and before the Cargo target-tree cache restore"
+            )
 
     expected_supervisor_image_jobs = {
         (ISOLATION_WORKFLOW, "isolation-boundaries"),
