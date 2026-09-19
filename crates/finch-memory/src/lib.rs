@@ -7,6 +7,7 @@
 // - Cross-session context recall
 
 mod embeddings;
+pub mod memory_status;
 mod memtree;
 mod program_registry;
 mod quality;
@@ -25,7 +26,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct HydrationBatchPause {
     after_loaded: usize,
@@ -33,14 +34,14 @@ struct HydrationBatchPause {
     release: watch::Receiver<bool>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct HydrationCompletionPause {
     reached: watch::Sender<bool>,
     release: watch::Receiver<bool>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl HydrationCompletionPause {
     async fn after_completion(&self) {
         self.reached.send_replace(true);
@@ -62,7 +63,7 @@ impl HydrationCompletionPause {
 /// cancels a sweep that has already committed `after_repaired` rows and is
 /// about to start the next: the only place a partially-applied backlog could
 /// exist.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct ProjectionSweepPause {
     /// Fires when the sweep is about to project the row at this zero-based
@@ -72,7 +73,7 @@ struct ProjectionSweepPause {
     release: watch::Receiver<bool>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ProjectionSweepPause {
     async fn before_row(&self, repaired: usize) {
         if repaired != self.after_repaired {
@@ -88,7 +89,7 @@ impl ProjectionSweepPause {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl HydrationBatchPause {
     async fn after_batch(&self, loaded: usize) {
         if loaded < self.after_loaded {
@@ -105,40 +106,40 @@ impl HydrationBatchPause {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static HYDRATION_BATCH_PAUSES: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, Arc<HydrationBatchPause>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static HYDRATION_COMPLETION_PAUSES: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, Arc<HydrationCompletionPause>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static PROJECTION_SWEEP_PAUSES: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, Arc<ProjectionSweepPause>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-#[cfg(test)]
-pub(crate) struct HydrationBatchPauseRegistration {
+#[cfg(any(test, feature = "test-support"))]
+pub struct HydrationBatchPauseRegistration {
     path: PathBuf,
     pause: Arc<HydrationBatchPause>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct HydrationCompletionPauseRegistration {
     path: PathBuf,
     pause: Arc<HydrationCompletionPause>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct ProjectionSweepPauseRegistration {
     path: PathBuf,
     pause: Arc<ProjectionSweepPause>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for HydrationBatchPauseRegistration {
     fn drop(&mut self) {
         let mut pauses = HYDRATION_BATCH_PAUSES
@@ -153,7 +154,7 @@ impl Drop for HydrationBatchPauseRegistration {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for HydrationCompletionPauseRegistration {
     fn drop(&mut self) {
         let mut pauses = HYDRATION_COMPLETION_PAUSES
@@ -168,7 +169,7 @@ impl Drop for HydrationCompletionPauseRegistration {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for ProjectionSweepPauseRegistration {
     fn drop(&mut self) {
         let mut pauses = PROJECTION_SWEEP_PAUSES
@@ -184,10 +185,14 @@ impl Drop for ProjectionSweepPauseRegistration {
 }
 
 /// Hold the production loader after `after_loaded` nodes so a test can
-/// observe a genuinely `Loading` index. Visible to `src/runtime` so the typed
-/// `mem-index-status` regression can drive the state #295 is about.
-#[cfg(test)]
-pub(crate) fn register_hydration_batch_pause(
+/// observe a genuinely `Loading` index. Visible to `src/runtime` (a
+/// dependent crate as of the finch-memory extraction, #870) so the typed
+/// `mem-index-status` regression can drive the state #295 is about; gated on
+/// the `test-support` feature, not bare `cfg(test)`, because `cfg(test)` is
+/// local to the crate being compiled and would never be set when a dependent
+/// crate's own test binary links this one as an ordinary dependency.
+#[cfg(any(test, feature = "test-support"))]
+pub fn register_hydration_batch_pause(
     path: PathBuf,
     after_loaded: usize,
 ) -> (
@@ -218,7 +223,7 @@ pub(crate) fn register_hydration_batch_pause(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn register_hydration_completion_pause(
     path: PathBuf,
 ) -> (
@@ -250,7 +255,7 @@ fn register_hydration_completion_pause(
 
 /// Hold the pending-projection sweep once `after_repaired` rows have committed,
 /// so a test can cancel it with a backlog genuinely half-applied.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn register_projection_sweep_pause(
     path: PathBuf,
     after_repaired: usize,
@@ -282,7 +287,7 @@ fn register_projection_sweep_pause(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn take_hydration_batch_pause(path: &std::path::Path) -> Option<Arc<HydrationBatchPause>> {
     HYDRATION_BATCH_PAUSES
         .lock()
@@ -290,7 +295,7 @@ fn take_hydration_batch_pause(path: &std::path::Path) -> Option<Arc<HydrationBat
         .remove(path)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn take_hydration_completion_pause(
     path: &std::path::Path,
 ) -> Option<Arc<HydrationCompletionPause>> {
@@ -300,7 +305,7 @@ fn take_hydration_completion_pause(
         .remove(path)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn take_projection_sweep_pause(path: &std::path::Path) -> Option<Arc<ProjectionSweepPause>> {
     PROJECTION_SWEEP_PAUSES
         .lock()
@@ -386,14 +391,14 @@ struct HydrationState {
     /// removes the window rather than narrowing it.
     done: watch::Sender<bool>,
     failure: std::sync::Mutex<Option<Failure>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     batch_pause: std::sync::Mutex<Option<Arc<HydrationBatchPause>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     completion_pause: std::sync::Mutex<Option<Arc<HydrationCompletionPause>>>,
     /// Carried here rather than on `ProjectionContext` only because this is
     /// where the other two seams already live and `ProjectionContext` holds
     /// this `Arc`; the sweep is not part of hydration.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     sweep_pause: std::sync::Mutex<Option<Arc<ProjectionSweepPause>>>,
 }
 
@@ -431,16 +436,16 @@ impl HydrationState {
             total: AtomicUsize::new(total),
             done: watch::channel(total == 0).0,
             failure: std::sync::Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             batch_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             completion_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             sweep_pause: std::sync::Mutex::new(None),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn install_batch_pause(&self, pause: Option<Arc<HydrationBatchPause>>) {
         *self
             .batch_pause
@@ -448,7 +453,7 @@ impl HydrationState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = pause;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     async fn pause_after_batch(&self, loaded: usize) {
         let pause = self
             .batch_pause
@@ -460,7 +465,7 @@ impl HydrationState {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn install_completion_pause(&self, pause: Option<Arc<HydrationCompletionPause>>) {
         *self
             .completion_pause
@@ -468,7 +473,7 @@ impl HydrationState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = pause;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     async fn pause_after_completion(&self) {
         let pause = self
             .completion_pause
@@ -480,7 +485,7 @@ impl HydrationState {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn install_sweep_pause(&self, pause: Option<Arc<ProjectionSweepPause>>) {
         *self
             .sweep_pause
@@ -488,7 +493,7 @@ impl HydrationState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = pause;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     async fn pause_in_projection_sweep(&self, repaired: usize) {
         let pause = self
             .sweep_pause
@@ -605,7 +610,7 @@ enum Failure {
 
 /// Nodes hydrated per batch. Small enough that the tree and database locks are
 /// released frequently, so an interactive turn never waits on one long hold.
-pub(crate) const HYDRATION_BATCH: usize = 512;
+pub const HYDRATION_BATCH: usize = 512;
 
 /// Memory system with MemTree and SQLite storage
 pub struct MemorySystem {
@@ -1046,7 +1051,7 @@ impl MemorySystem {
         tree.set_next_id(max_node_id as u64 + 1);
 
         let hydration = Arc::new(HydrationState::new(node_count.max(0) as usize));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             hydration.install_batch_pause(take_hydration_batch_pause(&config.db_path));
             hydration.install_completion_pause(take_hydration_completion_pause(&config.db_path));
@@ -1582,7 +1587,7 @@ impl MemorySystem {
             // therefore the only cancellation point worth testing. It is inside
             // the loop rather than around it precisely because a seam outside
             // the loop proves nothing about the loop.
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             ctx.hydration.pause_in_projection_sweep(repaired).await;
             Self::project_stored_conversation(ctx, conversation)
                 .await
@@ -2196,7 +2201,7 @@ impl MemorySystem {
                 }
             }
             state.loaded.fetch_add(count, Ordering::SeqCst);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             state
                 .pause_after_batch(state.loaded.load(Ordering::SeqCst))
                 .await;
@@ -2207,7 +2212,7 @@ impl MemorySystem {
 
         Self::link_loaded_children(&tree).await;
         state.complete();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         state.pause_after_completion().await;
     }
 

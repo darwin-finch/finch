@@ -210,10 +210,10 @@ fn test_bash_readonly_refinement_still_rejects_shell_operators() {
 fn vm_discovery_tools_are_autonomous_vm_reads() {
     let memory_dir = tempfile::TempDir::new().expect("temp dir for memory catalog");
     let memory = Arc::new(
-        crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path: memory_dir.path().join("memory.db"),
             use_neural_embeddings: false,
-            ..crate::memory::MemoryConfig::default()
+            ..finch_memory::MemoryConfig::default()
         })
         .expect("memory system for vm discovery classification"),
     );

@@ -1,12 +1,12 @@
 //! Read-only model tools for discovering the persistent program vocabulary.
 
-use crate::memory::MemorySystem;
 use crate::programs::ExecutionEffect;
 use crate::programs::ProgramRef;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
+use finch_memory::MemorySystem;
 use serde_json::Value;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -167,10 +167,10 @@ mod tests {
     fn test_vocabulary_tools_have_read_only_discovery_schemas() {
         let temp = tempfile::TempDir::new().unwrap();
         let memory = Arc::new(
-            MemorySystem::new(crate::memory::MemoryConfig {
+            MemorySystem::new(finch_memory::MemoryConfig {
                 db_path: temp.path().join("memory.db"),
                 use_neural_embeddings: false,
-                ..crate::memory::MemoryConfig::default()
+                ..finch_memory::MemoryConfig::default()
             })
             .unwrap(),
         );

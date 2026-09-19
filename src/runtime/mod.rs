@@ -405,7 +405,7 @@ pub struct ProgramRuntime {
     /// policy state, not part of reducible VM checkpoints.
     session_id: uuid::Uuid,
     project_id: String,
-    memory: RwLock<Option<Arc<crate::memory::MemorySystem>>>,
+    memory: RwLock<Option<Arc<finch_memory::MemorySystem>>>,
     /// Host-owned MCP transport. Installing it makes configured servers
     /// callable but never grants authority to any server or tool.
     mcp_client: RwLock<Option<Arc<crate::tools::McpClient>>>,
@@ -1148,7 +1148,7 @@ impl ProgramRuntime {
     /// Attach the host's MemTree service to the typed capability boundary.
     /// Keeping this explicit prevents a VM from accidentally acquiring a
     /// second memory database or an ambient memory authority.
-    pub fn attach_memory(&self, memory: Arc<crate::memory::MemorySystem>) {
+    pub fn attach_memory(&self, memory: Arc<finch_memory::MemorySystem>) {
         *self.memory.write().expect("memory binding lock poisoned") = Some(memory);
     }
 

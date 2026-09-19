@@ -9,8 +9,8 @@
 // Distribution: downloaded from HuggingFace (Xenova/all-MiniLM-L6-v2-ONNX)
 // ~23MB quantized ONNX model; cached in standard HF cache after first download.
 
-use crate::memory::{EmbeddingEngine, TfIdfEmbedding};
 use anyhow::{anyhow, bail, Context, Result};
+use finch_memory::{EmbeddingEngine, TfIdfEmbedding};
 use ndarray::Array2;
 use ort::{
     memory::MemoryInfo,
@@ -490,8 +490,8 @@ mod tests {
             let e2 = engine.embed("Rust systems programming").unwrap();
             let e3 = engine.embed("Python machine learning").unwrap();
 
-            let sim_related = crate::memory::cosine_similarity(&e1, &e2);
-            let sim_unrelated = crate::memory::cosine_similarity(&e1, &e3);
+            let sim_related = finch_memory::cosine_similarity(&e1, &e2);
+            let sim_unrelated = finch_memory::cosine_similarity(&e1, &e3);
 
             assert!(
                 sim_related > sim_unrelated,

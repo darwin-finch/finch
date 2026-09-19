@@ -17,7 +17,7 @@
 //! is shared by the TUI status strip, the agent-facing memory tools, and the
 //! typed runtime's `mem-recall` without any of them depending on each other.
 
-use crate::memory::HydrationStatus;
+use crate::HydrationStatus;
 
 /// How incomplete a status is, for picking the worse of two samples.
 fn severity(status: &HydrationStatus) -> u8 {
@@ -46,7 +46,7 @@ fn severity(status: &HydrationStatus) -> u8 {
 /// for a read whose true coverage was somewhere in [100, 1536]. The earlier
 /// count is the only honest figure, and every string that prints it says "at
 /// least" for that reason.
-pub(crate) fn observed(before: HydrationStatus, after: HydrationStatus) -> HydrationStatus {
+pub fn observed(before: HydrationStatus, after: HydrationStatus) -> HydrationStatus {
     if severity(&after) <= severity(&before) {
         return before;
     }
@@ -76,7 +76,7 @@ pub(crate) fn observed(before: HydrationStatus, after: HydrationStatus) -> Hydra
 /// search tool, the inspect tool, `/memory`, and `mem-recall`'s warning log --
 /// because a sentence written for one and reused by the others is how several
 /// rounds of this change produced false claims of their own.
-pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
+pub fn caveat(status: &HydrationStatus) -> Option<String> {
     match status {
         HydrationStatus::Ready { .. } => None,
         // No count at all when the bound is zero.
@@ -147,22 +147,22 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
 /// the *last* writer to the strip, so on the ordinary startup path it replaced
 /// an accurate line with a bare one at the moment the user read it.
 #[derive(Clone, Debug)]
-pub(crate) struct Recall {
-    pub(crate) count: usize,
-    pub(crate) index: HydrationStatus,
+pub struct Recall {
+    pub count: usize,
+    pub index: HydrationStatus,
 }
 
 impl Recall {
     /// A turn with no memory system attached: nothing recalled, nothing to
     /// qualify.
-    pub(crate) fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             count: 0,
             index: HydrationStatus::Ready { nodes: 0 },
         }
     }
 
-    pub(crate) fn line(&self) -> String {
+    pub fn line(&self) -> String {
         status_line(self.count, &self.index)
     }
 
@@ -173,7 +173,7 @@ impl Recall {
     /// claim a more complete index than the recall saw, and still surfaces a
     /// failure that happened after the recall rather than holding the old state
     /// until the next turn.
-    pub(crate) fn line_against(&self, live: HydrationStatus) -> String {
+    pub fn line_against(&self, live: HydrationStatus) -> String {
         status_line(self.count, &observed(self.index.clone(), live))
     }
 }
@@ -186,7 +186,7 @@ impl Recall {
 /// a wrong number about their own data. `/memory` has room to say so; the
 /// provider-switch line and `/model show` do not, and printing the number bare
 /// is what this change exists to stop.
-pub(crate) fn count_qualifier(status: &HydrationStatus) -> Option<&'static str> {
+pub fn count_qualifier(status: &HydrationStatus) -> Option<&'static str> {
     match status {
         HydrationStatus::Ready { .. } => None,
         HydrationStatus::Loading { .. } => Some("so far; the index was still loading"),
@@ -200,7 +200,7 @@ pub(crate) fn count_qualifier(status: &HydrationStatus) -> Option<&'static str> 
 /// `entries` rather than `memories` on purpose. The counts are `tree_nodes`
 /// rows, which include the synthetic root and every internal aggregation node,
 /// so they are not the number of things the user would call a memory.
-pub(crate) fn status_line(recalled: usize, status: &HydrationStatus) -> String {
+pub fn status_line(recalled: usize, status: &HydrationStatus) -> String {
     match status {
         HydrationStatus::Ready { .. } => format!("🧠 recalled {recalled}"),
         // Say what fraction was searched, not just that something is happening:

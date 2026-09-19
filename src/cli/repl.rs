@@ -290,7 +290,7 @@ mod disabled_training_tests {
             colors: crate::theme::ColorScheme::default(),
             features,
             mcp_servers: HashMap::new(),
-            memory: crate::memory::MemoryConfig {
+            memory: finch_memory::MemoryConfig {
                 db_path: temp.path().join("canonical-memory.db"),
                 enabled: true,
                 max_context_items: 5,
@@ -645,7 +645,7 @@ pub struct Repl {
     active_persona: Arc<RwLock<crate::config::Persona>>,
 
     // Phase 4: Hierarchical memory system
-    memory_system: Option<Arc<crate::memory::MemorySystem>>,
+    memory_system: Option<Arc<finch_memory::MemorySystem>>,
 
     // Projection of the selected Brain task list (TodoWrite / TodoRead tools)
     todo_list: Arc<tokio::sync::RwLock<crate::tools::TodoList>>,
@@ -786,8 +786,7 @@ impl Repl {
             let memory_open = crate::startup::phase(crate::startup::PHASE_MEMORY_OPEN);
             let engine =
                 crate::models::select_memory_embedding_engine(config.memory.use_neural_embeddings);
-            let opened =
-                crate::memory::MemorySystem::new_with_engine(config.memory.clone(), engine);
+            let opened = finch_memory::MemorySystem::new_with_engine(config.memory.clone(), engine);
             drop(memory_open);
             match opened {
                 Ok(system) => {
@@ -4354,8 +4353,9 @@ impl Repl {
                 // stored. No room for a sentence here, so a parenthetical.
                 let before = memory.hydration_status();
                 let stats = memory.stats().await?;
-                let index = crate::memory_status::observed(before, memory.hydration_status());
-                match crate::memory_status::count_qualifier(&index) {
+                let index =
+                    finch_memory::memory_status::observed(before, memory.hydration_status());
+                match finch_memory::memory_status::count_qualifier(&index) {
                     None => format!(" (💾 {} nodes in memory)", stats.tree_node_count),
                     Some(note) => {
                         format!(" (💾 {} nodes in memory — {note})", stats.tree_node_count)
@@ -4408,8 +4408,8 @@ impl Repl {
         if let Some(ref memory) = self.memory_system {
             let before = memory.hydration_status();
             let stats = memory.stats().await?;
-            let index = crate::memory_status::observed(before, memory.hydration_status());
-            self.output_status(match crate::memory_status::count_qualifier(&index) {
+            let index = finch_memory::memory_status::observed(before, memory.hydration_status());
+            self.output_status(match finch_memory::memory_status::count_qualifier(&index) {
                 None => format!("Memory: {} nodes", stats.tree_node_count),
                 Some(note) => format!("Memory: {} nodes ({note})", stats.tree_node_count),
             });
@@ -4427,7 +4427,7 @@ impl Repl {
             // no qualification at all (#275).
             let before = memory.hydration_status();
             let stats = memory.stats().await?;
-            let index = crate::memory_status::observed(before, memory.hydration_status());
+            let index = finch_memory::memory_status::observed(before, memory.hydration_status());
 
             self.output_status("📚 Memory System Statistics:\n");
             self.output_status(format!(
@@ -4439,7 +4439,7 @@ impl Repl {
             // hydration it is a count of what has loaded, not of what the user
             // has stored -- a flatly wrong number about their own data, shown
             // without qualification (#275).
-            if let Some(caveat) = crate::memory_status::caveat(&index) {
+            if let Some(caveat) = finch_memory::memory_status::caveat(&index) {
                 self.output_status(caveat);
             }
             self.output_status("");
