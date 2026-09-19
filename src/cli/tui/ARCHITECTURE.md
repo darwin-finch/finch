@@ -57,15 +57,21 @@ native history is not the reader; drag-selection under capture remains open on
   after every frame and resize. Never persist terminal coordinates as row identity.
 
 **Component-owned say turn (#882)** (`src/cli/components/`): a successful untitled `say`
-turn renders through its component — the chrome (status glyph + elapsed + a disclosure arrow
-that exists only while the program source can be shown) plus the `ProgramSource`/`Output`
-subwidgets, both built from the say turn's retained ViewModel
-(`WorkUnitViewModel`, on the WorkUnit behind its own lock). A click resolves the chrome
-hitbox to `(RowId, opaque action)` and routes to the component's handle, which toggles
-`show_program` through the lock; the next frame re-renders from the mutated ViewModel. The
-renderer's RowId-keyed open-set maps never hold component rows. The canonical record is
-unchanged, and the say-turn suppression (deleting the program-source row) is deleted — the
-program source is show_program-gated card content, not a deleted row. The widget vocabulary
+turn renders through its component as **one representation per state** (stage 2 of
+`docs/TUI_DESIGN.md`): Generating (no program yet) is one animated progress line; Running is
+the program source inline, with any already-arrived output bytes beneath it (never hidden);
+Completed is the output prose inline plus the `(ran Ns)` annotation — no Program source row,
+no Brain run row, no result row, no card chrome. The stage-1 chrome (glyph + arrow + the `[0]`
+hitbox) is deleted; the toggle hit target is the completed output region itself (semantic path
+`[1]`), clicked or focused (F6/Enter) to swap prose↔program through `show_program` on the
+retained ViewModel (`WorkUnitViewModel`, on the WorkUnit behind its own lock). The
+`ProgramSource`/`Output` subwidgets are still built from the outer ViewModel each frame and a
+hidden one claims zero rows. The legacy source-group row does not render beside the card: the
+viewport pairing (`say_turn_consolidated_source_ids` in `tui/mod.rs`) suppresses the adjacent
+completed Program-source unit whose bytes are the turn's program — byte identity holds by
+construction in every producer path and a mismatch suppresses nothing — while the canonical
+record keeps the raw program exactly once (`commit_complete_messages` is untouched). The
+renderer's RowId-keyed open-set maps never hold component rows. The widget vocabulary
 (`Rect`/`Track`/`Axis`/`Widget`/`RenderedTranscriptLine`/`RowId`/line metrics) lives in
 `cli::components::vocab` so components build subtrees without `crossterm` or the shadow
 buffer; the engine re-exports it under its stable paths.

@@ -11,7 +11,18 @@ arrow that renders only while the program source can be shown) and the `ProgramS
 `src/cli/components/vocab.rs`; clicks routed through opaque component actions to
 `handle_transcript_action`; the renderer's RowId-keyed maps hold no say-turn disclosure; and
 the say-turn suppression is deleted (the canonical record keeps its exactly-once semantics
-and pinned invariant). Stage 2+ remains open below.
+and pinned invariant).
+
+**Stage-2 outcome (#882, 2026-09-18): landed.** The say turn renders one representation per
+state, verbatim below: Generating is one animated line; Running is the program source inline
+(already-arrived output bytes render beneath it — never hidden); Completed is the prose plus
+`(ran Ns)`. The stage-1 chrome is deleted; the toggle hit target is the completed output
+region (path `[1]`; the chrome's `[0]` retired with it). The legacy source-group row stops
+rendering beside the card through a viewport pairing rule (`say_turn_consolidated_source_ids`:
+the adjacent completed Program-source unit whose bytes are the turn's program; a mismatch
+suppresses nothing) while the canonical record keeps the raw program exactly once. The
+remaining stage-2 scope (other WorkUnit presentations, thinking section #749, agent activity)
+and stages 3+ stay open below.
 
 ## The maintainer's constraints, verbatim
 
