@@ -324,13 +324,40 @@ specified, generating real serialize/deserialize code from a record's own field 
 ```lisp
 (concept MsgPackSerializable
   (operation serialize (&self) -> bytes))
+
+(define (write-msgpack-field <T : MsgPackSerializable> (buf : MsgpackBuffer) (name : string) (value : T)) : unit
+  (buf.write-tagged name (value.serialize)))
 ```
 
-**Serialize direction — reads any observable value, `kind` filter includes properties:**
+**The safety property this whole exercise was actually testing:** `write-msgpack-field` is an
+ordinary generic function bounded on the concept, not "write anything blindly." A type that holds a
+raw OS resource — a file descriptor, a socket — simply doesn't implement `MsgPackSerializable`,
+the same way `std::fs::File` in Rust doesn't implement `serde::Serialize` at all. That's a library
+design choice, not a language restriction, and it's already fully sufficient: the moment
+`derive-msgpack-serialize` (below) generates a call to `write-msgpack-field` for a field whose type
+doesn't satisfy `T : MsgPackSerializable`, that's an ordinary, already-existing concept-bound
+violation — a compile error at the derive site, not silent corruption discovered later when a
+deserialized `FileHandle` turns out to reference a completely unrelated OS resource in whatever
+process reads it back. No new "record vs. class" split needed for this — the concept-bound check
+already *is* the distinction between safely-serializable and not.
+
+```lisp
+; extends §1's Account with one more field for this section specifically — not a literal
+; continuation of the same declaration, which would be a duplicate-definition error
+(record Account
+  pub id: string
+  balance: int
+  handle: FileHandle)   ; FileHandle deliberately does NOT implement MsgPackSerializable
+```
+
+**Serialize direction — widens `fields-of` to include get-only properties, since serialize has every
+reason to read one; `handle`'s field type not satisfying `T : MsgPackSerializable` is exactly the
+compile error `write-msgpack-field`'s bound already produces, not something `derive-msgpack-serialize`
+itself needs to check for separately:**
 
 ```lisp
 (define (derive-msgpack-serialize (rec : syntax)) : syntax
-  (let [flds (filter (lambda (f) (not (eq? (. f kind) 'property-writeonly))) (fields-of rec))]
+  (let [flds (fields-of rec :include-properties-readonly #t)]
     (let [writes (map (lambda (f)
                          (let [name-stx (datum->syntax (. f name) rec)]
                            `(write-msgpack-field buf ,(. f name) (. self ,name-stx))))
@@ -342,17 +369,30 @@ specified, generating real serialize/deserialize code from a record's own field 
              (msgpack-buffer-to-bytes buf)))))))
 
 (mixin (derive-msgpack-serialize Account))
+; GAP, not glossed: this line should fail to compile, once `write-msgpack-field`'s bound and
+; `handle`'s type are both real — `handle : FileHandle` has no `MsgPackSerializable` implementation,
+; so the generated `(write-msgpack-field buf "handle" (. self handle))` should be rejected the same
+; way any other unsatisfied concept bound is. Included specifically to show the failure is real and
+; located at the derive site, not to claim this repository has verified it actually rejects today.
 ```
 
-**Deserialize direction — filters to only writable `kind`s, builds a fresh constructor rather than
-reusing an existing one (sidesteps the `ParameterSpec -> syntax` gap entirely — a fresh constructor
-needs no existing signature to reconstruct):**
+**Deserialize direction — default `fields-of` call (no widening) already excludes get-only properties
+builds a fresh constructor rather than reusing an existing one, sidestepping the
+`ParameterSpec -> syntax` gap entirely:**
 
 ```lisp
 (define (derive-msgpack-deserialize (rec : syntax)) : syntax
-  (let [flds (filter (lambda (f) (or (eq? (. f kind) 'field)
-                                      (eq? (. f kind) 'property-read-write)))
-                      (fields-of rec))]
+  (let [flds (fields-of rec :include-private #t)]   ; NOT the narrow default — checked against
+                                                       ; §1's `Account.balance`, module-private:
+                                                       ; the default would silently drop it from
+                                                       ; the reconstructed record, a real round-trip
+                                                       ; bug, not just an access-control nicety.
+                                                       ; Consistent with mixin's own established
+                                                       ; rule (full access "as if written at that
+                                                       ; site") — a generated constructor already
+                                                       ; has this access; readonly properties are
+                                                       ; still excluded, since nothing changed about
+                                                       ; not being able to write through those.
     (let [kw-pairs (map (lambda (f)
                           (list (keyword-syntax-of (. f name))
                                 `(read-msgpack-field buf ,(. f name))))
@@ -386,15 +426,23 @@ record contradicts it. **Every genuinely new gap this surfaced is named precisel
   record-literal construction (`(rec :name val ...)`). Whether `:x` is the *same* kind of token
   `datum->syntax` already promotes symbols into, or a genuinely different atom shape the reader
   handles specially, is unconfirmed — flagged rather than assumed identical.
-- **`filter`/`map`/`flatten`/`list`** — assumed stdlib names, same category as `to-string`/`append`/
-  `join` flagged in §9; plausible, not confirmed.
-- **`eq?`/`'property-writeonly`-style quoted-symbol comparison** — assumes plain `'` (bare datum,
-  per the quote/quasiquote split) is the right way to write a comparison tag; not verified against
-  any real enum/tag-comparison example, since none exists in the document to check against.
+- **`map`/`flatten`/`list`** — assumed stdlib names, same category as `to-string`/`append`/`join`
+  flagged in §9; plausible, not confirmed. (`filter`/`eq?` dropped from this list — no longer used
+  once `fields-of` gained explicit `:include-private`/`:include-properties-readonly` parameters,
+  itself found while working through this section: the first draft returned everything
+  unconditionally and expected every caller to filter, which meant private fields were visible to
+  any derive by default with no way to opt out.)
 - **Record-literal construction from a *spliced, variable-length* keyword-argument list**
   (`(,rec ,@(flatten kw-pairs))`) — `,@` splicing into a value position inside an ordinary call is
   established for the `render-all`/pack-forwarding case (§9), but never specifically shown feeding a
   *record constructor's* keyword-argument list; a plausible, not confirmed, extension.
+
+**A real round-trip bug also caught and fixed while writing this, not left in:** the first draft of
+`derive-msgpack-deserialize` used `fields-of`'s narrow default (pub fields only), which would have
+silently dropped `Account.balance` (module-private) from every reconstructed record — a real
+correctness bug in the derive, not just an access-control question, since a mixin-generated
+constructor already has full module access per the earlier-established "as if written at that site"
+rule. Fixed to `:include-private #t`, matching what the constructor is actually allowed to do.
 
 None of these are the kind of gap that suggests the design doesn't hold up — every one is a small,
 nameable missing utility function around an already-solid core (`fields-of`'s `kind` filter,

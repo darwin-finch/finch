@@ -3646,12 +3646,23 @@ entirely (what can this type *do*, not what does it *hold*) and conflating the t
 stringly-moded hook would be exactly the `__traits` mistake this catalog exists to avoid:
 
 ```
-(fields-of Account)   ; ! comptime — an ordered list of {name, type, visibility, kind}
-                       ; kind: field | property-readonly | property-read-write
-                       ; visibility: pub | private (for `kind = field`); a property's own
-                       ;   visibility is whatever its get/set operations' own visibility is —
-                       ;   UNVERIFIED, since no example anywhere shows `pub` on an operation
+(fields-of Account)                                          ; pub fields, plain + writable
+                                                               ; properties only — the narrow default
+(fields-of Account :include-private #t)                       ; widen to private fields too
+(fields-of Account :include-properties-readonly #t)            ; widen to get-only properties too
+; ! comptime — returns an ordered list of {name, type, visibility, kind}
+; kind: field | property-readonly | property-read-write
+; visibility: pub | private (for `kind = field`); a property's own visibility is whatever its
+;   get/set operations' own visibility is — UNVERIFIED, no example shows `pub` on an operation
 ```
+
+**Revised 2026-09-18, before this had a chance to ship with the wrong default:** the first draft
+returned everything unconditionally and expected every caller to filter afterward. That has a real
+cost beyond ergonomics: it means a third-party derive sees private fields *by default*, with no way
+to ask for only what it actually needs — the opposite of the "curated, not a blanket HIR-access
+opener" principle the whole hook mechanism was built on. Explicit widening parameters, narrowest
+case default, keep that principle intact instead of quietly relying on every caller to filter
+responsibly on their own.
 
 **Corrected while designing this, not after:** a plain field and a `get`/`set` property already
 resolve identically through `.` (established when `get`/`set` were added), so a naive `fields-of`

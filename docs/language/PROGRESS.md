@@ -673,3 +673,33 @@ and it added a real hook, corrected before it shipped wrong, plus a batch of sma
 - **Overall shape of this stress test**: the request was to find out whether the CTFE machinery
   built tonight actually holds up for something real. It does — every gap found is a missing named
   utility, not a defect in `fields-of`/`FunctionSpec`/`mixin`/hygiene/`! comptime` themselves.
+
+**Continued 2026-09-18 — the file-descriptor/round-trip-safety question, and it resolved cleanly
+into something already built rather than needing a new mechanism, plus caught a real bug in the
+process of answering it.**
+
+- **The question**: if a record holds a raw OS resource (Shammah's example: a file descriptor) and
+  gets round-tripped through a generic derive, what actually handles that field on deserialize —
+  and shouldn't that be an obvious, ideally compile-time error rather than a silent hazard? Also
+  raised: whether `fields-of` needs filtering modifiers, and whether "everything is a record" needs
+  a structural split from something class-like for this reason.
+- **Resolution**: no new mechanism, no structural split — the concept-bound system already provides
+  exactly this distinction. `write-msgpack-field` written as an ordinary generic function bounded on
+  `T : MsgPackSerializable`, not "write anything blindly"; a resource-holding type like `FileHandle`
+  simply doesn't implement that concept, the same way `std::fs::File` in Rust doesn't implement
+  `serde::Serialize` at all. The moment a derive tries to generate a call for such a field, that's an
+  ordinary, already-existing concept-bound violation — a real compile error located at the derive
+  site, not silent corruption discovered later in whatever process reads the bytes back. Written
+  into `feature_tour.md` §12 as a real record field (`handle : FileHandle`) with an explicit note
+  that this line is expected to fail to compile, rather than just asserted in prose.
+- **`fields-of` gained explicit filtering parameters** (`:include-private`,
+  `:include-properties-readonly`), narrow-case default, rather than "return everything, every caller
+  filters" — the previous shape meant a third-party derive saw private fields by default with no way
+  to opt out, against the "curated, not a blanket access opener" principle the hook mechanism was
+  built on. Caught and fixed before it shipped as the default, not after.
+- **Real bug caught applying the new narrow default**: `derive-msgpack-deserialize`'s first draft
+  used the new narrow default (pub-only), which would have silently dropped a module-private field
+  (`Account.balance`) from every reconstructed record — an actual round-trip correctness bug, not
+  just an access-control question, since a mixin-generated constructor already has full module
+  access per the earlier "as if written at that site" rule. Fixed to explicitly widen with
+  `:include-private #t`, matching what the generated constructor is genuinely allowed to do.
