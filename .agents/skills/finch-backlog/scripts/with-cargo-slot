@@ -173,6 +173,66 @@ if [[ "${CARGO_TARGET_DIR+x}" != x && -z "${CI:-}" ]]; then
             export SCCACHE_BASEDIRS="$sccache_basedirs"
         fi
     fi
+
+    # SCCACHE_BASEDIRS above cannot make an otherwise-identical compile hash
+    # identically across worktrees on its own: sccache's Rust cache key also
+    # unconditionally hashes every CARGO_-prefixed environment variable
+    # except a small hardcoded exclusion list that does not include
+    # CARGO_TARGET_DIR (generate_hash_key in sccache's src/compiler/rust.rs;
+    # verified directly against a running sccache 0.17.0, and tracked
+    # upstream as mozilla/sccache#2652, "Wire SCCACHE_BASEDIRS into Rust
+    # hash key" -- SCCACHE_BASEDIRS there is documented as C-compiler-only).
+    # Cargo passes this worktree's own real, isolated CARGO_TARGET_DIR
+    # (needed for #680) to every rustc invocation, and that is exactly what
+    # breaks the hash.
+    #
+    # Rewriting the value sccache sees is safe: Cargo already resolved
+    # --out-dir, -L dependency=, and --extern to this worktree's real target
+    # directory as literal command-line arguments before invoking the
+    # wrapper, and sccache excludes exactly those arguments from its hash
+    # (they are necessarily different per invocation location and are not
+    # content-relevant) -- rewriting the CARGO_TARGET_DIR value does not
+    # change where anything is actually read from or written to. Verified
+    # directly, both ways: an external dependency and a local crate that
+    # legitimately differ between worktrees (source read via
+    # include_str!(concat!(env!("CARGO_MANIFEST_DIR"), ...))) still miss and
+    # recompile with the correct, worktree-specific content; only genuinely
+    # identical compiles hit, and the resulting artifact never contains
+    # another worktree's embedded paths or file content.
+    #
+    # A thin RUSTC_WRAPPER shim sits in front of the real sccache binary and
+    # overrides only the CARGO_TARGET_DIR value it forwards, to one fixed
+    # placeholder shared by every worktree and every repository -- sccache's
+    # own content hashing of sources, externs, and static libraries is what
+    # keeps this safe, not the placeholder's value. A caller-supplied
+    # RUSTC_WRAPPER always wins, matching the SCCACHE_BASEDIRS convention
+    # above. Absent an sccache binary on PATH, this is a silent no-op: a
+    # contributor who has not opted into sccache gets ordinary uncached
+    # Cargo builds either way.
+    if [[ -z "${RUSTC_WRAPPER:-}" ]] && real_sccache_path="$(command -v sccache 2>/dev/null)"; then
+        sccache_shim_path="$cargo_cache_root/finch-sccache-target-normalize-shim"
+        sccache_shim_tmp="$sccache_shim_path.tmp.$$"
+        {
+            printf '#!/usr/bin/env bash\n'
+            printf 'set -euo pipefail\n'
+            printf 'export CARGO_TARGET_DIR=/finch-sccache-target-normalize-placeholder\n'
+            printf 'real_sccache="$(command -v sccache 2>/dev/null)" || {\n'
+            printf '    echo "finch-sccache-target-normalize-shim: sccache not found on PATH" >&2\n'
+            printf '    exit 69\n'
+            printf '}\n'
+            printf 'exec "$real_sccache" "$@"\n'
+        } >"$sccache_shim_tmp" 2>/dev/null || true
+        if [[ ! -s "$sccache_shim_tmp" ]]; then
+            rm -f -- "$sccache_shim_tmp"
+            echo "with-cargo-slot: warning: could not write sccache target-normalizing shim, continuing without it: path=$sccache_shim_path" >&2
+        elif ! chmod 0755 "$sccache_shim_tmp" 2>/dev/null || ! perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' \
+            "$sccache_shim_tmp" "$sccache_shim_path"; then
+            rm -f -- "$sccache_shim_tmp"
+            echo "with-cargo-slot: warning: could not publish sccache target-normalizing shim, continuing without it: path=$sccache_shim_path" >&2
+        else
+            export RUSTC_WRAPPER="$sccache_shim_path"
+        fi
+    fi
 fi
 
 lock_marker="${FINCH_CARGO_SLOT_HELD:-}"
