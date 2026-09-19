@@ -1710,7 +1710,19 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
     // An isolated daemon must authenticate the supervisor before logging,
     // loading config, probing lifecycle state, or creating any Finch files.
+    // Runs before tracing is initialized below, so timing goes to stderr
+    // (captured by the integration-test harness) rather than daemon.log.
+    // This is the first of several call sites that validate the supervisor
+    // proof over a daemon's startup (#858); the validation itself is cached
+    // for the process, so only whichever call site runs first pays the cost
+    // of reading and hashing the supervisor executable.
+    let proof_start = std::time::Instant::now();
     let isolated_proof = finch::brain::isolated_test_proof_if_present()?;
+    eprintln!(
+        "isolated_test_proof_if_present (run_daemon entry): {}ms, present={}",
+        proof_start.elapsed().as_millis(),
+        isolated_proof.is_some()
+    );
     let bind_address = if let Some(proof) = &isolated_proof {
         anyhow::ensure!(
             bind_address == proof.daemon_address(),

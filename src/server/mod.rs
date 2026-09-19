@@ -515,7 +515,15 @@ impl AgentServer {
         // Validate inherited supervisor authority before channels, credential
         // files, Brain stores, or configuration clones are created. A
         // malformed opt-in environment therefore has no server-side effects.
+        // Cached per-process (#858); this call is free unless it is the
+        // first one the daemon reaches.
+        let proof_start = std::time::Instant::now();
         let isolated_proof = crate::brain::isolated_test_proof_if_present()?;
+        tracing::debug!(
+            elapsed_ms = proof_start.elapsed().as_millis(),
+            present = isolated_proof.is_some(),
+            "isolated_test_proof_if_present (AgentServer::new)"
+        );
         if let Some(proof) = &isolated_proof {
             server_config.bind_address = proof.daemon_address().to_owned();
             server_config.brain_bind_address = None;
@@ -574,7 +582,15 @@ impl AgentServer {
     /// Takes `Arc<Self>` so the same server instance can be shared with the
     /// Cap'n Proto IPC server that runs concurrently.
     pub async fn serve(self: Arc<Self>) -> Result<()> {
+        // Cached per-process (#858); this call is free unless it is the
+        // first one the daemon reaches.
+        let proof_start = std::time::Instant::now();
         let isolated_proof = crate::brain::isolated_test_proof_if_present()?;
+        tracing::debug!(
+            elapsed_ms = proof_start.elapsed().as_millis(),
+            present = isolated_proof.is_some(),
+            "isolated_test_proof_if_present (AgentServer::serve)"
+        );
         let addr: SocketAddr = self.config.bind_address.parse()?;
         let listener = if let Some(proof) = isolated_proof {
             anyhow::ensure!(

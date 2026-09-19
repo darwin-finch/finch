@@ -1164,4 +1164,51 @@ status=$?
 set -e
 [[ "$status" -eq 69 ]] || fail "unsupported platform should fail closed with 69: actual=$status"
 
+# Regression for #858 (macOS isolation-gate exit 69 with no test output): the
+# lock-holding child's proof-descriptor setup used to `exit 69` on five
+# separate failures with zero diagnostic text, indistinguishable from every
+# other silent failure on a loaded CI runner. Force two of those five stages
+# to fail and require the actionable message each now prints before exiting.
+mktemp_fail_bin="$fixture_root/mktemp-fail-bin"
+mkdir "$mktemp_fail_bin"
+for utility in bash chmod git mkdir perl rm sh tr true uname; do
+    ln -s "$(command -v "$utility")" "$mktemp_fail_bin/$utility"
+done
+cat >"$mktemp_fail_bin/mktemp" <<'FAIL_MKTEMP'
+#!/usr/bin/env bash
+exit 1
+FAIL_MKTEMP
+chmod 0755 "$mktemp_fail_bin/mktemp"
+set +e
+(cd "$repo" && PATH="$mktemp_fail_bin" /bin/bash "$wrapper" true \
+    >"$fixture_root/mktemp-failure.out" 2>&1)
+status=$?
+set -e
+[[ "$status" -eq 69 ]] || fail \
+    "proof-descriptor mktemp failure should still fail closed with 69: actual=$status"
+assert_contains "$fixture_root/mktemp-failure.out" \
+    'could not create the cargo-slot proof descriptor' \
+    'silent proof-descriptor mktemp failure lacked an actionable diagnostic'
+
+chmod_fail_bin="$fixture_root/chmod-fail-bin"
+mkdir "$chmod_fail_bin"
+for utility in bash git mkdir mktemp perl rm sh tr true uname; do
+    ln -s "$(command -v "$utility")" "$chmod_fail_bin/$utility"
+done
+cat >"$chmod_fail_bin/chmod" <<'FAIL_CHMOD'
+#!/usr/bin/env bash
+exit 1
+FAIL_CHMOD
+chmod 0755 "$chmod_fail_bin/chmod"
+set +e
+(cd "$repo" && PATH="$chmod_fail_bin" /bin/bash "$wrapper" true \
+    >"$fixture_root/chmod-failure.out" 2>&1)
+status=$?
+set -e
+[[ "$status" -eq 69 ]] || fail \
+    "proof-descriptor chmod failure should still fail closed with 69: actual=$status"
+assert_contains "$fixture_root/chmod-failure.out" \
+    'could not seal the cargo-slot proof descriptor read-only' \
+    'silent proof-descriptor chmod failure lacked an actionable diagnostic'
+
 echo 'with-cargo-slot and worktree-target launcher regressions passed'

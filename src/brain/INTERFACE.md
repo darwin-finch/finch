@@ -390,11 +390,17 @@ pub fn isolated_test_proof() -> anyhow::Result<IsolatedTestProof> { … }
 pub fn isolated_test_proof_if_present() -> anyhow::Result<Option<IsolatedTestProof>> { … }
 /// Maximum scopes this participant credential endpoint may mint for a role.
 pub fn permitted_participant_scopes(role: AttachmentRole) -> BTreeSet<BrainCredentialScope> { … }
+/// Number of times the full FD9 restore-and-verify transaction actually ran in this process.
+#[cfg(test)]
+pub(crate) fn proof_validation_call_count_for_tests() -> usize { … }
 /// A Brain with one recurring schedule, created through the real API so the index is populated the way production populates it.
 #[cfg(test)]
 pub(crate) fn seed_scheduled_brain_for_tests(store: &BrainStore, name: &str, next_due_ms: u64) -> (AttachmentId, ScheduleId) { … }
 #[cfg(all(test, unix))]
 pub(crate) fn supervised_test_subprocess_command() -> std::process::Command { … }
+/// Number of times the supervisor executable was read and hashed in this process.
+#[cfg(test)]
+pub(crate) fn supervisor_image_hash_count_for_tests() -> usize { … }
 pub(crate) fn unix_millis() -> u64 { … }
 #[cfg(all(test, unix))]
 pub(crate) fn validate_isolated_test_socket(proof: &IsolatedTestProof, path: &std::path::Path) -> anyhow::Result<IsolatedTestSocketIdentity> { … }

@@ -170,8 +170,14 @@ jobs:
         tests/worker_node_isolation_contract.sh
         ./scripts/test_brains.sh cargo test --test worker_integration_test -- --nocapture
 
+    # Coarse liveness bound, not a latency claim (#476): the harness's
+    # per-spawn cadence measured 20-30s on a degraded shared runner (CI run
+    # 35445177624 reached the manifest-guard phases ~9 minutes in and was
+    # killed by the previous 15m step timeout before any phase failed).
+    # 40m matches the neighboring supervised steps and keeps the failure
+    # signal (hung, not slow) while absorbing the degradation.
     - name: Exercise the complete synthetic isolation harness
-      timeout-minutes: 15
+      timeout-minutes: 40
       run: ./scripts/test_brain_isolation.sh
 
   isolation-boundaries-macos:
@@ -277,6 +283,8 @@ jobs:
         tests/worker_node_isolation_contract.sh
         ./scripts/test_brains.sh cargo test --test worker_integration_test -- --nocapture
 
+    # Coarse liveness bound, not a latency claim (#476): see the matching
+    # ubuntu step above.
     - name: Exercise the complete synthetic isolation harness
-      timeout-minutes: 15
+      timeout-minutes: 40
       run: ./scripts/test_brain_isolation.sh

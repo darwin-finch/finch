@@ -30,6 +30,17 @@ else
   supervisor="$FINCH_TEST_SUPERVISOR_BIN"
   selected_cargo_target="${CARGO_TARGET_DIR:-}"
 fi
+# An inherited supervisor carries its Cargo target with it: the pinned
+# supervisor lives at "$target/debug/<name>", so the target directory is
+# derivable when the caller did not export CARGO_TARGET_DIR (the CI harness
+# step sets FINCH_TEST_SUPERVISOR_BIN alone — issue #858's silent exit 69).
+if [[ -n "$supervisor" && -z "$selected_cargo_target" ]]; then
+  case "$supervisor" in
+    */target/debug/*|*/target/release/*)
+      selected_cargo_target="${supervisor%/*}/.."
+      ;;
+  esac
+fi
 [[ -x "$supervisor" ]] || { echo 'inherited test supervisor is not executable' >&2; exit 69; }
 if [[ -z "$selected_cargo_target" || "$selected_cargo_target" != /* ||
   ! -d "$selected_cargo_target" ]]; then
@@ -51,6 +62,8 @@ supervisor_backup=''
 supervisor_backup_target=''
 substitution_restored=''
 shell_wrong_digest_supervisor=''
+pin_launcher_pid_one=''
+pin_launcher_pid_two=''
 cleanup_regression() {
   if [[ -n "$signaler_pid" ]]; then wait "$signaler_pid" 2>/dev/null || true; fi
   if [[ -n "$sentinel_pid" ]]; then printf '\n' >&7 2>/dev/null || true; wait "$sentinel_pid" 2>/dev/null || true; fi
@@ -64,6 +77,14 @@ cleanup_regression() {
   fi
   if [[ -n "$shell_wrong_digest_supervisor" ]]; then
     rm -f -- "$shell_wrong_digest_supervisor"
+  fi
+  if [[ -n "$pin_launcher_pid_one" ]]; then
+    kill "$pin_launcher_pid_one" 2>/dev/null || true
+    wait "$pin_launcher_pid_one" 2>/dev/null || true
+  fi
+  if [[ -n "$pin_launcher_pid_two" ]]; then
+    kill "$pin_launcher_pid_two" 2>/dev/null || true
+    wait "$pin_launcher_pid_two" 2>/dev/null || true
   fi
   exec 7>&- 2>/dev/null || true
   rm -rf -- "$scratch"
@@ -94,6 +115,17 @@ exercise_supervisor_substitution() {
   local substitution_ready="$scratch/substitution-$label.ready"
   local substitution_continue="$scratch/substitution-$label.continue"
   local substitution_rejected="$scratch/substitution-$label.rejected"
+  # A poll bound here is a hang detector, not a precision timing oracle: the
+  # candidate is a freshly spawned, freshly isolated supervisor child, and by
+  # the time this phase runs the 2-vCPU ubuntu-24.04 CI runner has already
+  # forked every process every earlier phase in this script used. This phase
+  # never ran on CI before the freshness/target-derivation fixes in #858 got
+  # the script past its earlier silent exit 69, so a fixed 400x10ms=4s bound
+  # (right for a quiet workstation) had never been measured against a loaded
+  # runner. 3000x10ms=30s matches the coarse bounds this codebase already
+  # accepts for supervised-process startup under load (e.g. `wait_for_health`
+  # in tests/daemon_integration_test.rs).
+  local poll_attempts=3000
 
   phase="supervisor-substitution-rejected-$label"
   substitution_restored="$scratch/substitution-$label.restored"
@@ -104,37 +136,50 @@ exercise_supervisor_substitution() {
   FINCH_SUBSTITUTION_CONTINUE="$substitution_continue" \
   FINCH_SUBSTITUTION_REJECTED="$substitution_rejected" \
   FINCH_SUBSTITUTION_RESTORED="$substitution_restored" \
+  FINCH_SUBSTITUTION_POLL_ATTEMPTS="$poll_attempts" \
     FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" "$candidate" bash -ec '
       : >"$FINCH_SUBSTITUTION_READY"
-      for _ in {1..400}; do
+      for ((_i = 0; _i < FINCH_SUBSTITUTION_POLL_ATTEMPTS; _i++)); do
         [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]] && break
         sleep 0.01
       done
-      test -e "$FINCH_SUBSTITUTION_CONTINUE"
+      if [[ ! -e "$FINCH_SUBSTITUTION_CONTINUE" ]]; then
+        echo "substitution probe: timed out after ${FINCH_SUBSTITUTION_POLL_ATTEMPTS}x10ms awaiting the continue signal at $FINCH_SUBSTITUTION_CONTINUE" >&2
+        exit 1
+      fi
       if "$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof >/dev/null 2>&1; then
+        echo "substitution probe: --verify-inherited-proof unexpectedly accepted the substituted image" >&2
         exit 1
       fi
       : >"$FINCH_SUBSTITUTION_REJECTED"
-      for _ in {1..400}; do
+      for ((_i = 0; _i < FINCH_SUBSTITUTION_POLL_ATTEMPTS; _i++)); do
         [[ -e "$FINCH_SUBSTITUTION_RESTORED" ]] && exit 0
         sleep 0.01
       done
+      echo "substitution probe: timed out after ${FINCH_SUBSTITUTION_POLL_ATTEMPTS}x10ms awaiting the restored signal at $FINCH_SUBSTITUTION_RESTORED" >&2
       exit 1
     ' & substitution_pid=$!
-  for _ in {1..400}; do
+  local attempt
+  for ((attempt = 0; attempt < poll_attempts; attempt++)); do
     [[ -e "$substitution_ready" ]] && break
     sleep 0.01
   done
-  test -e "$substitution_ready"
+  if [[ ! -e "$substitution_ready" ]]; then
+    echo "$phase: timed out after ${poll_attempts}x10ms awaiting the substituted child's readiness marker at $substitution_ready" >&2
+    exit 1
+  fi
   mv -- "$candidate" "$supervisor_backup"
   install -m 0555 "$supervisor_backup" "$candidate"
   test "$(brain_isolation_file_identity "$candidate")" != "$candidate_identity"
   : >"$substitution_continue"
-  for _ in {1..400}; do
+  for ((attempt = 0; attempt < poll_attempts; attempt++)); do
     [[ -e "$substitution_rejected" ]] && break
     sleep 0.01
   done
-  test -e "$substitution_rejected"
+  if [[ ! -e "$substitution_rejected" ]]; then
+    echo "$phase: timed out after ${poll_attempts}x10ms awaiting the substitution-rejected marker at $substitution_rejected" >&2
+    exit 1
+  fi
   mv -f -- "$supervisor_backup" "$candidate"
   supervisor_backup=''
   supervisor_backup_target=''
@@ -363,13 +408,44 @@ run_concurrent_launcher() {
 }
 run_concurrent_launcher "$pin_result_one" "$pin_diagnostic_one" & pin_pid_one=$!
 run_concurrent_launcher "$pin_result_two" "$pin_diagnostic_two" & pin_pid_two=$!
-for _ in {1..1000}; do
+pin_launcher_pid_one="$pin_pid_one"
+pin_launcher_pid_two="$pin_pid_two"
+# A poll bound here is a hang detector, not a precision timing oracle: each
+# launcher's whole lifetime (Cargo freshness build, immutable publication, and
+# its supervised command) holds the repository-wide cargo slot, so the two
+# launchers serialize behind each other and behind any other slot holder. A
+# fixed wall budget cannot distinguish "externally blocked by a live slot
+# holder" from "hung", so the base bound covers the uncontended case and the
+# wait extends only while the slot is held, capped at the slot's own default
+# acquisition timeout (900s in with-cargo-slot). The phase still fails,
+# naming the ready count and the slot holders, if the markers never appear.
+slot_lock_path="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/finch-cargo-slot.lock"
+slot_holder_pids() {
+  lsof -F p -- "$slot_lock_path" 2>/dev/null | sed -n 's/^p//p' | tr '\n' ' '
+}
+for _ in {1..12000}; do
   ready_count="$(find "$pin_ready_dir" -type f | wc -l | tr -d ' ')"
   [[ "$ready_count" -eq 2 ]] && break
   sleep 0.01
 done
+concurrent_slot_holders=''
 if [[ "${ready_count:-0}" -ne 2 ]]; then
-  echo "concurrent maintained launchers did not both reach immutable publication; ready=${ready_count:-0}" >&2
+  concurrent_slot_holders="$(slot_holder_pids)"
+  if [[ -n "$concurrent_slot_holders" ]]; then
+    for _ in {1..90000}; do
+      ready_count="$(find "$pin_ready_dir" -type f | wc -l | tr -d ' ')"
+      [[ "$ready_count" -eq 2 ]] && break
+      sleep 0.01
+    done
+    concurrent_slot_holders="$(slot_holder_pids)"
+  fi
+fi
+if [[ "${ready_count:-0}" -ne 2 ]]; then
+  if [[ -n "$concurrent_slot_holders" ]]; then
+    echo "concurrent maintained launchers did not both reach immutable publication within their 120s base bound plus the 900s slot-extension; ready=${ready_count:-0}; repository cargo slot held by pids: $concurrent_slot_holders (hung)" >&2
+  else
+    echo "concurrent maintained launchers did not both reach immutable publication within 12000x10ms with no cargo-slot holder; ready=${ready_count:-0} (hung)" >&2
+  fi
   sed 's/^/launcher one: /' "$pin_diagnostic_one" >&2 || true
   sed 's/^/launcher two: /' "$pin_diagnostic_two" >&2 || true
   exit 1
@@ -379,6 +455,8 @@ pin_status_one=0
 pin_status_two=0
 wait "$pin_pid_one" || pin_status_one=$?
 wait "$pin_pid_two" || pin_status_two=$?
+pin_launcher_pid_one=''
+pin_launcher_pid_two=''
 if [[ "$pin_status_one" -ne 0 || "$pin_status_two" -ne 0 ]]; then
   echo "concurrent maintained launchers failed after publication: one=$pin_status_one two=$pin_status_two" >&2
   sed 's/^/launcher one: /' "$pin_diagnostic_one" >&2 || true
@@ -533,14 +611,23 @@ timeout_target_file="$scratch/timeout-target"
 timeout_descendant_pid_file="$scratch/timeout-descendant.pid"
 timeout_home_file="$scratch/timeout-home"
 phase=timeout-descendant-cleanup
+# A poll bound here is a hang detector, not a precision timing oracle: the
+# isolated leader can publish its supervisor PID only after this supervisor
+# spawn finished its own startup, and this phase never ran on CI before the
+# earlier #858 fixes let the script past its prior failures. The fixed
+# 400x5ms=2s bound exhausted on the 2-vCPU ubuntu runner (CI run
+# 35420222687 failed at the signaler status check). 3000x10ms=30s matches the
+# coarse bounds this codebase already accepts for supervised-process startup
+# under load.
 (
-  for _ in {1..400}; do
+  for _ in {1..3000}; do
     if [[ -s "$timeout_target_file" ]]; then
       kill -TERM "$(cat "$timeout_target_file")"
       exit 0
     fi
-    sleep 0.005
+    sleep 0.01
   done
+  echo "timeout-descendant signaler: timed out after 3000x10ms awaiting the isolated leader's supervisor PID at $timeout_target_file (hung)" >&2
   exit 91
 ) & signaler_pid=$!
 timeout_status=0
@@ -555,6 +642,9 @@ FINCH_TIMEOUT_HOME_FILE="$timeout_home_file" run_isolated bash -ec '
 signaler_status=0
 wait "$signaler_pid" || signaler_status=$?
 signaler_pid=''
+if [[ "$signaler_status" -ne 0 ]]; then
+  echo "timeout-descendant signaler exited $signaler_status; its own message above names the marker that never appeared" >&2
+fi
 test "$signaler_status" -eq 0
 test "$timeout_status" -eq 143
 timeout_descendant_pid="$(cat "$timeout_descendant_pid_file")"
@@ -576,13 +666,25 @@ mkdir "$inspection_bin"
 printf '%s\n' '#!/bin/sh' ': >"$FINCH_SHADOW_PS_CALLED"' 'exit 0' >"$inspection_bin/ps"
 chmod +x "$inspection_bin/ps"
 (
-  while [[ ! -s "$inspection_pid" || ! -s "$inspection_home" ]]; do sleep 0.01; done
+  for _ in {1..3000}; do
+    [[ -s "$inspection_pid" && -s "$inspection_home" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -s "$inspection_pid" || ! -s "$inspection_home" ]]; then
+    echo "shadow-ps observer: timed out after 3000x10ms awaiting the descendant PID and HOME markers at $inspection_pid and $inspection_home (hung)" >&2
+    exit 91
+  fi
   observed_pid="$(cat "$inspection_pid")"
   observed_home="$(cat "$inspection_home")"
-  while /bin/ps -p "$observed_pid" -o pid= 2>/dev/null | grep -q '[0-9]'; do
+  for _ in {1..3000}; do
+    /bin/ps -p "$observed_pid" -o pid= 2>/dev/null | grep -q '[0-9]' || break
     test -d "$observed_home" || exit 1
     sleep 0.01
   done
+  if /bin/ps -p "$observed_pid" -o pid= 2>/dev/null | grep -q '[0-9]'; then
+    echo "shadow-ps observer: timed out after 3000x10ms awaiting the descendant's teardown while confirming $observed_home stayed present (hung)" >&2
+    exit 91
+  fi
   printf survived >"$inspection_observer"
 ) &
 inspection_observer_pid=$!
@@ -793,16 +895,21 @@ phase=manifest-swap-to-fifo-status
 race_name=manifest-race-node
 race_path="$fake_home/.finch/brains/$race_name"
 (
-  # Paired with PROBE_CONTINUATION_BOUND in finch-test-supervisor.rs. The probe
-  # parks waiting for the continuation this subshell publishes, so a shorter
-  # window here means the probe waits out a bound for a file that was already
-  # abandoned. Raising one side alone is worse than raising neither (#328).
-  race_deadline=$(( $(date +%s) + 8 ))
+  # Paired with PROBE_CONTINUATION_BOUND in finch-test-supervisor.rs: the two
+  # deadlines must move together (#328) because the probe parks waiting for
+  # the continuation this subshell publishes. This is the harness's only
+  # wall-clock deadline -- the attempts-counted polls elsewhere stretch with
+  # load, a fixed wall budget does not -- so it must cover the measured
+  # 20-30s supervisor spawn cadence of a degraded shared runner (the 8s
+  # deadline expired on CI run 35437807757 while each supervisor spawn took
+  # tens of seconds; earlier phases in the same run spanned the gap in
+  # silence between 11:01:43 and 11:04:43).
+  race_deadline=$(( $(date +%s) + 120 ))
   while :; do
     race_ready="$(find "$temp_parent" -maxdepth 2 -name .manifest-race-ready -print -quit)"
     [[ -n "$race_ready" ]] && break
     if (( $(date +%s) >= race_deadline )); then
-      echo "manifest race swapper: probe never published .manifest-race-ready under $temp_parent within 8s; the probe is waiting on a continuation this subshell will not write" >&2
+      echo "manifest race swapper: probe never published .manifest-race-ready under $temp_parent within 120s (hung); the probe is waiting on a continuation this subshell will not write" >&2
       exit 1
     fi
     sleep 0.005
@@ -863,15 +970,16 @@ stubborn_later_pause_file="$scratch/stubborn.later-paused"
 late_signal_file="$scratch/late-signal.observed"
 phase=signal-during-teardown
 (
-  for _ in {1..400}; do
+  for _ in {1..3000}; do
     if [[ -s "$stubborn_target_file" && -s "$stubborn_term_file" ]]; then
       read -r supervisor_pid leader_pid <"$stubborn_target_file"
       printf '%s\n' "$leader_pid" >"$late_signal_file"
       kill -TERM "$supervisor_pid"
       exit 0
     fi
-    sleep 0.005
+    sleep 0.01
   done
+  echo "late teardown signaler: timed out after 3000x10ms awaiting the stubborn probe's target and first TERM markers at $stubborn_target_file and $stubborn_term_file (hung)" >&2
   exit 91
 ) & signaler_pid=$!
 signal_status=0
@@ -881,7 +989,14 @@ FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" \
 FINCH_STUBBORN_TERM_PAUSE_AFTER_FIRST_FILE="$stubborn_later_pause_file" run_isolated bash -ec '
   leader_pid=$BASHPID
   "$FINCH_TEST_SUPERVISOR_BIN" --child-stubborn-probe &
-  while [[ ! -s "$FINCH_STUBBORN_READY_FILE" ]]; do sleep 0.005; done
+  for ((_i = 0; _i < 3000; _i++)); do
+    [[ -s "$FINCH_STUBBORN_READY_FILE" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -s "$FINCH_STUBBORN_READY_FILE" ]]; then
+    echo "stubborn leader: timed out after 3000x10ms awaiting the stubborn-probe ready marker at $FINCH_STUBBORN_READY_FILE (hung)" >&2
+    exit 1
+  fi
   printf "%s %s\n" "$FINCH_TEST_SUPERVISOR_PID" "$leader_pid" >"$FINCH_STUBBORN_TARGET_FILE"
   printf "%s\n" "$HOME" >"$FINCH_STUBBORN_HOME_FILE"
   printf "%s\n" "$leader_pid" >"$FINCH_STUBBORN_PID_FILE"
@@ -891,7 +1006,7 @@ signaler_status=0
 wait "$signaler_pid" || signaler_status=$?
 signaler_pid=''
 if [[ "$signaler_status" -ne 0 ]]; then
-  echo "late teardown signaler returned $signaler_status before observing the first stubborn-child TERM marker" >&2
+  echo "late teardown signaler returned $signaler_status after its 3000x10ms bound without observing the first stubborn-child TERM marker" >&2
   ls -l "$stubborn_target_file" "$stubborn_term_file" "$late_signal_file" >&2 || true
   exit 1
 fi
@@ -1076,7 +1191,9 @@ integration_inventory="$(
 expected_integration_inventory="$(cat <<'EOF'
 tests/daemon_integration_test.rs
 tests/daemon_log_rotation.rs
+tests/daemon_status_live_socket.rs
 tests/daemon_stdio_binding.rs
+tests/daemon_stop_stale.rs
 tests/daemon_upgrade_preflight_test.rs
 tests/live.rs
 tests/live/impcpd.rs
@@ -1085,6 +1202,8 @@ tests/live/providers.rs
 tests/named_brain_attach.rs
 tests/no_external_provider_binary_test.rs
 tests/service_discovery_test.rs
+tests/setup_wizard_widget_host.rs
+tests/startup_is_readonly_on_config.rs
 tests/startup_time_to_ready.rs
 tests/tui_scrollback_commit.rs
 tests/worker_integration_test.rs
