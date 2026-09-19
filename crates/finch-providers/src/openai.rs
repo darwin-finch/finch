@@ -1062,6 +1062,10 @@ pub struct OpenAIProvider {
 /// &self.profile` exhaustively (no `_` wildcard arm), so adding a variant
 /// forces every call site to decide what it means there instead of quietly
 /// falling through to `ModelCapabilities::unknown(...)`.
+///
+/// Crate-private to this module, not to be confused with the unrelated
+/// `finch::providers::ProviderProfile` (a configured provider handle plus
+/// its selector name, in the outer `finch` crate's `src/providers/factory.rs`).
 #[derive(Clone)]
 enum ProviderProfile {
     /// openai/grok/mistral/groq: a static, dated per-model capability table
@@ -2084,6 +2088,137 @@ impl OpenAIProvider {
         Ok(rx)
     }
 
+    /// Build capabilities for a `ProviderProfile::Static` instance
+    /// (openai/grok/mistral/groq) from the dated per-model table below,
+    /// gated on the provider's configured endpoints still being the exact
+    /// canonical URL for that provider — a custom endpoint, or a
+    /// provider/model pair with no table row, stays fail-closed `Unknown`.
+    fn static_table_capabilities(&self, model: &str) -> ModelCapabilities {
+        let canonical_endpoints = match self.provider_name.as_str() {
+            "openai" => self.canonical_openai_endpoint,
+            "grok" => {
+                self.endpoints.chat_url == "https://api.x.ai/v1/chat/completions"
+                    && self.endpoints.models_url == "https://api.x.ai/v1/models"
+            }
+            "mistral" => {
+                self.endpoints.chat_url == "https://api.mistral.ai/v1/chat/completions"
+                    && self.endpoints.models_url == "https://api.mistral.ai/v1/models"
+            }
+            "groq" => {
+                self.endpoints.chat_url == "https://api.groq.com/openai/v1/chat/completions"
+                    && self.endpoints.models_url == "https://api.groq.com/openai/v1/models"
+            }
+            _ => false,
+        };
+        if !canonical_endpoints {
+            return ModelCapabilities::unknown(self.name(), model);
+        }
+
+        let (source, streaming, tools, reasoning, max_tokens, max_output_tokens) =
+            match (self.provider_name.as_str(), model) {
+                ("openai", "gpt-5.6-sol" | "gpt-5.6") => (
+                    "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+                    CapabilitySupport::Supported,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::allowed(
+                        [
+                            ReasoningEffort::None,
+                            ReasoningEffort::Low,
+                            ReasoningEffort::Medium,
+                            ReasoningEffort::High,
+                            ReasoningEffort::Xhigh,
+                            ReasoningEffort::Max,
+                        ],
+                        "2026-08-26",
+                        "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+                    ),
+                    1_050_000,
+                    Some(128_000),
+                ),
+                ("openai", "gpt-4o") => (
+                    "https://developers.openai.com/api/docs/models/gpt-4o",
+                    CapabilitySupport::Supported,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::unsupported(
+                        "2026-08-26",
+                        "https://developers.openai.com/api/docs/models/gpt-4o",
+                    ),
+                    128_000,
+                    Some(16_384),
+                ),
+                ("grok", "grok-4.6") => (
+                    "https://docs.x.ai/developers/grok-4-6; https://docs.x.ai/developers/model-capabilities/text/streaming",
+                    CapabilitySupport::Supported,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::allowed(
+                        [
+                            ReasoningEffort::Low,
+                            ReasoningEffort::Medium,
+                            ReasoningEffort::High,
+                            ReasoningEffort::Xhigh,
+                        ],
+                        "2026-08-26",
+                        "https://docs.x.ai/developers/grok-4-6",
+                    ),
+                    500_000,
+                    None,
+                ),
+                ("mistral", "mistral-large-2512") => (
+                    "https://docs.mistral.ai/models/mistral-large-3-25-12",
+                    CapabilitySupport::Unknown,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::unknown(),
+                    256_000,
+                    None,
+                ),
+                ("groq", "openai/gpt-oss-120b") => (
+                    "https://console.groq.com/docs/model/openai/gpt-oss-120b; https://console.groq.com/docs/production-readiness/optimizing-latency",
+                    CapabilitySupport::Supported,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::allowed(
+                        [
+                            ReasoningEffort::Low,
+                            ReasoningEffort::Medium,
+                            ReasoningEffort::High,
+                        ],
+                        "2026-08-26",
+                        "https://console.groq.com/docs/model/openai/gpt-oss-120b",
+                    ),
+                    131_072,
+                    Some(65_536),
+                ),
+                // No static-table row for this exact provider/model pair:
+                // stay fail-closed rather than assume support.
+                _ => return ModelCapabilities::unknown(self.name(), model),
+            };
+        let mut capabilities = ModelCapabilities::static_metadata(
+            self.name(),
+            model,
+            "2026-08-26",
+            source,
+            streaming,
+            tools,
+            CapabilitySupport::Unsupported,
+            reasoning,
+            Some(max_tokens),
+            max_output_tokens,
+            None,
+        )
+        .with_wire_protocol(
+            WireProtocol::OpenAiChatCompletions,
+            "2026-08-26",
+            "Finch OpenAI-compatible chat-completions adapter",
+        );
+        if self.provider_name == "openai" && matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
+            capabilities.image_input = ModelFeature::static_metadata(
+                CapabilitySupport::Supported,
+                "2026-08-27",
+                "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+            );
+        }
+        capabilities
+    }
+
     /// Build capabilities for an Ollama-backed instance from whatever live
     /// attestation `refresh_capabilities` has already cached for `model`.
     ///
@@ -2167,131 +2302,7 @@ impl ProviderBackend for OpenAIProvider {
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         match &self.profile {
-            ProviderProfile::Static => {
-                let canonical_endpoints = match self.provider_name.as_str() {
-                    "openai" => self.canonical_openai_endpoint,
-                    "grok" => {
-                        self.endpoints.chat_url == "https://api.x.ai/v1/chat/completions"
-                            && self.endpoints.models_url == "https://api.x.ai/v1/models"
-                    }
-                    "mistral" => {
-                        self.endpoints.chat_url == "https://api.mistral.ai/v1/chat/completions"
-                            && self.endpoints.models_url == "https://api.mistral.ai/v1/models"
-                    }
-                    "groq" => {
-                        self.endpoints.chat_url == "https://api.groq.com/openai/v1/chat/completions"
-                            && self.endpoints.models_url == "https://api.groq.com/openai/v1/models"
-                    }
-                    _ => false,
-                };
-                if !canonical_endpoints {
-                    return ModelCapabilities::unknown(self.name(), model);
-                }
-
-                let (source, streaming, tools, reasoning, max_tokens, max_output_tokens) =
-                    match (self.provider_name.as_str(), model) {
-                        ("openai", "gpt-5.6-sol" | "gpt-5.6") => (
-                            "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
-                            CapabilitySupport::Supported,
-                            CapabilitySupport::Supported,
-                            ReasoningCapability::allowed(
-                                [
-                                    ReasoningEffort::None,
-                                    ReasoningEffort::Low,
-                                    ReasoningEffort::Medium,
-                                    ReasoningEffort::High,
-                                    ReasoningEffort::Xhigh,
-                                    ReasoningEffort::Max,
-                                ],
-                                "2026-08-26",
-                                "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
-                            ),
-                            1_050_000,
-                            Some(128_000),
-                        ),
-                        ("openai", "gpt-4o") => (
-                            "https://developers.openai.com/api/docs/models/gpt-4o",
-                            CapabilitySupport::Supported,
-                            CapabilitySupport::Supported,
-                            ReasoningCapability::unsupported(
-                                "2026-08-26",
-                                "https://developers.openai.com/api/docs/models/gpt-4o",
-                            ),
-                            128_000,
-                            Some(16_384),
-                        ),
-                        ("grok", "grok-4.6") => (
-                            "https://docs.x.ai/developers/grok-4-6; https://docs.x.ai/developers/model-capabilities/text/streaming",
-                            CapabilitySupport::Supported,
-                            CapabilitySupport::Supported,
-                            ReasoningCapability::allowed(
-                                [
-                                    ReasoningEffort::Low,
-                                    ReasoningEffort::Medium,
-                                    ReasoningEffort::High,
-                                    ReasoningEffort::Xhigh,
-                                ],
-                                "2026-08-26",
-                                "https://docs.x.ai/developers/grok-4-6",
-                            ),
-                            500_000,
-                            None,
-                        ),
-                        ("mistral", "mistral-large-2512") => (
-                            "https://docs.mistral.ai/models/mistral-large-3-25-12",
-                            CapabilitySupport::Unknown,
-                            CapabilitySupport::Supported,
-                            ReasoningCapability::unknown(),
-                            256_000,
-                            None,
-                        ),
-                        ("groq", "openai/gpt-oss-120b") => (
-                            "https://console.groq.com/docs/model/openai/gpt-oss-120b; https://console.groq.com/docs/production-readiness/optimizing-latency",
-                            CapabilitySupport::Supported,
-                            CapabilitySupport::Supported,
-                            ReasoningCapability::allowed(
-                                [
-                                    ReasoningEffort::Low,
-                                    ReasoningEffort::Medium,
-                                    ReasoningEffort::High,
-                                ],
-                                "2026-08-26",
-                                "https://console.groq.com/docs/model/openai/gpt-oss-120b",
-                            ),
-                            131_072,
-                            Some(65_536),
-                        ),
-                        // No static-table row for this exact provider/model
-                        // pair: stay fail-closed rather than assume support.
-                        _ => return ModelCapabilities::unknown(self.name(), model),
-                    };
-                let mut capabilities = ModelCapabilities::static_metadata(
-                    self.name(),
-                    model,
-                    "2026-08-26",
-                    source,
-                    streaming,
-                    tools,
-                    CapabilitySupport::Unsupported,
-                    reasoning,
-                    Some(max_tokens),
-                    max_output_tokens,
-                    None,
-                )
-                .with_wire_protocol(
-                    WireProtocol::OpenAiChatCompletions,
-                    "2026-08-26",
-                    "Finch OpenAI-compatible chat-completions adapter",
-                );
-                if self.provider_name == "openai" && matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
-                    capabilities.image_input = ModelFeature::static_metadata(
-                        CapabilitySupport::Supported,
-                        "2026-08-27",
-                        "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
-                    );
-                }
-                capabilities
-            }
+            ProviderProfile::Static => self.static_table_capabilities(model),
             ProviderProfile::Ollama {
                 capability_endpoint,
                 capabilities,
