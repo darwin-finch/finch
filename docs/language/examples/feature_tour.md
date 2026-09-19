@@ -55,7 +55,7 @@ a feature.
 Stress-tests the `.` resolution order (fields → get/set → inherent `operation` → concept dispatch)
 added alongside the constructor/property fix. Concept/implementation blocks have no ratified CoLisp
 form anywhere in the document yet (only pseudocode paired with a real Co-Forth form, e.g.
-`JsonSerializable`/`UserJson` in "Generics, concepts, dispatch, and metaprogramming") — that's a
+`JsonSerializable`/`User` in "Generics, concepts, dispatch, and metaprogramming") — that's a
 pre-existing gap, logged in `PROGRESS.md`, out of scope to close in this file. The concept half below
 is written in that same pseudocode, matching existing document convention rather than inventing a
 third style:
@@ -65,7 +65,7 @@ concept Describable {
     operation describe(&self) -> string
 }
 
-implementation AccountDescribable for Account : Describable {
+implementation Account : Describable {
     operation describe(&self) => format("Account({})", self.id)
 }
 ```
@@ -140,7 +140,7 @@ concept JsonSerializable {
     operation serialize(&self, options: &JsonOptions) -> Output
 }
 
-implementation UserJson for User : JsonSerializable {
+implementation User : JsonSerializable {
     operation serialize(&self, options) => UserCodec.serialize(options, self)
 }
 ```
@@ -150,9 +150,9 @@ implementation UserJson for User : JsonSerializable {
 
 (define (save-user (u : User) (opts : borrow JsonOptions)) : (result unit IoError)
   ! throws IoError
-  (let [bytes (serialize u opts)]          ; bare-name concept dispatch + one default-imported evidence,
-    (? (fs-write "user.json" bytes))         ; per "Every implementation has a stable qualified name..." —
-    (ok unit)))                              ; NOT `Type.operation`; `using UserJson` would disambiguate
+  (let [bytes (serialize u opts)]          ; bare-name concept dispatch — coherence guarantees exactly
+    (? (fs-write "user.json" bytes))         ; one JsonSerializable implementation for User, so this is
+    (ok unit)))                              ; unambiguous without naming anything, unlike an earlier pass
 
 (define (save-user-pure-check ()) : unit
   ! pure
@@ -551,10 +551,10 @@ precisely rather than assumed:**
 **The easy case first — two unrelated concepts, no naming question at all:**
 
 ```text
-implementation AccountJson for Account : JsonSerializable {
+implementation Account : JsonSerializable {
     operation serialize(&self) => json.of(self.id, self.balance)
 }
-implementation AccountMsgPack for Account : MsgPackSerializable {
+implementation Account : MsgPackSerializable {
     operation serialize(&self) -> bytes => (mixin (derive-msgpack-serialize Account))
 }
 ```
@@ -562,37 +562,42 @@ implementation AccountMsgPack for Account : MsgPackSerializable {
 Both operations happen to be spelled `serialize`. No collision, because names live in their
 concept's own evidence, not one shared method table — already established, confirmed again here.
 
-**The genuinely interesting case — the *same* concept implemented twice for the *same* type:**
+**The case that originally motivated named, multiple implementations — and why it's rejected
+instead, not accommodated:**
 
 ```text
-implementation AccountEqualById for Account : Equal<Account, Account> {
-    operation equal(borrow left, borrow right) => (== (. left id) (. right id))
-}
-implementation AccountEqualByAllFields for Account : Equal<Account, Account> {
+implementation Account : Equal<Account, Account> {
     operation equal(borrow left, borrow right) =>
         (and (== (. left id) (. right id)) (== (. left balance) (. right balance)))
 }
 
-(equal a b using AccountEqualById)          ; explicit — compares by id only
-(equal a b using AccountEqualByAllFields)   ; explicit — different evidence, different answer
-(equal a b)                                  ; resolves only if exactly one of these was published
-                                              ; as *the* default for this lexical context (only
-                                              ; Account's or Equal's own defining module may do
-                                              ; that); otherwise an ambiguity error, not a guess
+; REJECTED — coherence: Account already has an Equal<Account,Account> implementation above.
+implementation Account : Equal<Account, Account> {
+    operation equal(borrow left, borrow right) => (== (. left id) (. right id))
+}
 ```
 
-**This is the actual, precise difference from Rust traits, and it's worth being exact about it
-rather than hand-waving "concepts are like traits":** Rust enforces global coherence — at most one
-`impl Trait for Type` can exist anywhere in a program, checked at compile time, so `Equal` for
-`Account` could only ever mean one thing everywhere it's used. Finch deliberately doesn't do this.
-Multiple named implementations of the same (concept, type) pair are allowed to coexist, and
-disambiguation happens by name (`using`) or by which single one (if any) a type's or concept's own
-module chose to publish as ambient default — closer to explicit-dictionary-passing (Haskell's
-`newtype`-wrapped alternate instances, e.g. `Down` for reverse `Ord`) than to Rust's one-instance-
-per-type coherence rule. Rust's model buys you "no dispatch ambiguity is even possible"; Finch's
-buys you "a type can have more than one legitimate notion of equality without needing a wrapper
-type to hold the second one" — genuinely different tradeoffs, not the same idea with different
-spelling.
+This document originally used exactly this example — a same-concept, same-type, "equal by id" vs.
+"equal by all fields" split — as the running justification for letting multiple named
+implementations of one (concept, type) pair coexist, closer to Haskell's `newtype`-wrapped alternate
+instances (`Down` for reverse `Ord`) than to Rust's coherence rule. It doesn't survive scrutiny: it's
+the same shape as the canonical/compact-JSON example that motivated the same feature elsewhere in
+this document, and collapses the same way once actually needed — "equal by id" is a different,
+narrower notion than "equal by all fields," not a second, competing definition of the same one, so
+it belongs on a wrapper type, the same as Rust would do it:
+
+```text
+record ById(Account)
+
+implementation ById : Equal<ById, ById> {
+    operation equal(borrow left, borrow right) => (== (. (. left 0) id) (. (. right 0) id))
+}
+```
+
+`Account` keeps exactly one, unambiguous notion of equality; "equal by id" becomes a distinct type
+with its own single implementation, never a second implementation competing for the same slot.
+Finch's coherence rule is now the same as Rust's, not a deliberately different tradeoff — this
+section originally argued the opposite, and that argument is what changed, not just this example.
 
 **The difference from classes:** a class fuses data, behavior, and identity (inheritance) into one
 declaration — a subclass inherits its parent's methods automatically, and dynamic (virtual) dispatch
@@ -713,6 +718,19 @@ subdirectory has no example to check against.
 
 ## 18. Open gaps, current as of this pass — what's still missing and why
 
+- **Conditional/bounded generic implementations** (coherence-rewrite pass, new) — whether a generic
+  implementation may itself require a bound on its own type parameter (Rust's `impl<T: PartialEq>
+  PartialEq for Vec<T>` shape: `implementation List<T : Equal<T,T>> : Equal<List<T>, List<T>> {
+  ... }`) has no established syntax anywhere in this document. Separate from the specialization
+  question already settled — this gates whether the one body exists for a given `T` at all, never
+  chooses between competing bodies for different `T`.
+- **Coherence across independently-compiled modules** (coherence-rewrite pass, new) — "at most one
+  implementation of a concept per type" is stated as a rule, but not *where* it's checked. Two
+  modules that never see each other, each implementing a foreign concept for a foreign type (the
+  scenario Rust's orphan rule exists specifically to make rare), could in principle both compile
+  cleanly alone and only conflict once a third module depends on both. Whether Finch restricts who
+  may implement a concept for a type it doesn't own (Rust's actual answer) or defers the conflict to
+  whole-program/link time is undecided.
 - **`join`/`narrow` selector-expression syntax** — named in the grammar, never shown concretely.
 - **`root<host-machine>` combined with `path<R>`'s refinement syntax** — named separately, never
   shown combined in one worked declaration.
@@ -806,27 +824,31 @@ concept Codec<Wire, Value> {
     axiom wire-and-value-differ = not (Wire == Value)
 }
 
-implementation MsgpackUserCodec : Codec<bytes, User> {
+implementation Codec<bytes, User> {
     operation encode = msgpack-encode-user
     operation decode = msgpack-decode-user
 }
 
-implementation BrokenIdentityCodec : Codec<User, User> {
-    operation encode = identity
-    operation decode = wrap-ok
+implementation Codec<User, User> {   ; REJECTED — axiom, not coherence: bytes != User doesn't apply
+    operation encode = identity      ; here since Wire=Value=User; this is one legal instantiation
+    operation decode = wrap-ok       ; of Codec, distinct from Codec<bytes,User> above, just a bad one
 }
 ```
 
-`MsgpackUserCodec` typechecks: `bytes == User` is false, so the axiom holds. `BrokenIdentityCodec`
+`Codec<bytes, User>` typechecks: `bytes == User` is false, so the axiom holds. `Codec<User, User>`
 is a compile error at its own declaration — not a silently-skipped candidate the way a failing
 `Axioms(T)()` would silently disqualify `User` from an implicit match in the D version. The error
-names the concept (`Codec<User, User>`), the implementation (`BrokenIdentityCodec`), and the failed
-axiom (`wire-and-value-differ`), per the diagnostic-quality commitment in the design doc.
+names the concept instantiation (`Codec<User, User>`) and the failed axiom
+(`wire-and-value-differ`), per the diagnostic-quality commitment in the design doc. This rejection
+is the axiom failing, not coherence — `Codec<bytes, User>` and `Codec<User, User>` are different
+instantiations of the generic concept (different type arguments), not two implementations
+competing for the same one; coherence would only fire if two implementations tried to satisfy the
+exact same instantiation.
 
 This also produced a real, useful negative result worth keeping: an axiom checking
 `not (Wire == Value)` only catches an *identity* codec, not a merely-useless one — nothing stops
-`implementation UselessCodec : Codec<bytes, bytes> { operation encode = id-copy; operation decode
-= wrap-ok-copy; }` (distinct-in-name but behaviorally identical wire/value types) from compiling
+`implementation Codec<bytes, bytes> { operation encode = id-copy; operation decode = wrap-ok-copy;
+}` (a distinct, legal instantiation with behaviorally identical wire/value types) from compiling
 and satisfying the concept, because "the types differ" is the only thing actually decidable here at
 compile time — "the codec does something meaningful" is exactly the kind of runtime-semantic
 property compile-time evaluation cannot decide, the same class of unprovable promise `isInputRange`
@@ -890,11 +912,11 @@ concept Measurable {
 (define (rect-perimeter (r : &Rectangle)) : f64
   (* 2.0 (+ r.width r.height)))
 
-implementation RectangleHasArea for Rectangle : HasArea {
+implementation Rectangle : HasArea {
     operation area = rect-area
 }
 
-implementation RectangleMeasurable for Rectangle : Measurable {
+implementation Rectangle : Measurable {
     operation area      = rect-area
     operation perimeter = rect-perimeter
 }
@@ -940,35 +962,39 @@ get read by code that wasn't recompiled with it. `Range` used only within one pr
 compilation, needs nothing extra. A `Range` handed across an RPC boundary or loaded from a plugin
 built against last month's revision of the concept does.
 
-## 23. Naming an implementation cuts both ways — real duplicate detection, not just use-site ambiguity
+## 23. Superseded by coherence — kept as design history, not as the current rule
 
-Directly from a question about the exact failure mode naming was introduced to fix: if a
-programmer can name implementations freely, what stops `RectangleMeasurable2` from being an
-accidental copy-paste duplicate of `RectangleMeasurable` rather than a deliberate second choice?
-The document's existing ambiguity rule ("competing equally valid evidence is an ambiguity error")
-turned out to only cover the *use* site — a call with no `using` and no default — and says nothing
-about the *declaration* site, which is where this specific mistake actually happens.
+This section originally asked what stops an accidental copy-paste duplicate (`RectangleMeasurable2`,
+identical to `RectangleMeasurable` in every binding) from coexisting with the original under a
+different name, and answered it with a structural-identity check: reject two named implementations
+of the same concept for the same type only when every binding matches, accept them the moment even
+one genuinely differs (the same freedom canonical/compact JSON was assumed to need).
+
+That whole premise is gone, not just patched further. A later conversation asked the more basic
+question directly — why would anyone implement the same concept twice for the same type, doing
+different things, on purpose? — and no surviving example was found; canonical/compact JSON collapses
+into `JsonSerializable`'s own `options` parameter, and every other candidate (orderings, hashing
+strategies) collapses into a parameter, a compile-time strategy, or a genuinely different concept the
+same way. Once no real case remained, the whole naming apparatus this section's check was built on
+went with it: implementations are unnamed, and coherence rejects a *second* implementation of a
+concept for a type outright, regardless of whether its bindings differ from the first's:
 
 ```text
-implementation RectangleMeasurable for Rectangle : Measurable {
+implementation Rectangle : Measurable {
     operation area      = rect-area
     operation perimeter = rect-perimeter
 }
 
-implementation RectangleMeasurable2 for Rectangle : Measurable {
-    operation area      = rect-area        ; REJECTED — identical to RectangleMeasurable in every
-    operation perimeter = rect-perimeter   ; binding; nothing could ever distinguish the two
-}
-
-implementation RectangleCompactMeasurable for Rectangle : Measurable {
-    operation area      = rect-area-fast-approx   ; ACCEPTED — genuinely differs in one binding
+; REJECTED, unconditionally — not because the bindings happen to match, because Rectangle already
+; has a Measurable implementation. A genuinely different area calculation still doesn't get in;
+; it belongs on a distinct wrapper type instead (§15's ById(Account) is the worked version of this).
+implementation Rectangle : Measurable {
+    operation area      = rect-area-fast-approx
     operation perimeter = rect-perimeter
 }
 ```
 
-The check is purely structural (do the two implementations bind every requirement to the same
-callable), never a judgment about whether the difference is *meaningful* — that question is
-undecidable in general, the same reason the compiler can't verify `isInputRange`-style semantic
-promises elsewhere in this document. `RectangleCompactMeasurable` is accepted the moment even one
-binding differs, exactly the same freedom the canonical/compact-JSON case relies on, with the
-degenerate, no-possible-difference case now rejected instead of silently permitted.
+Worth keeping the superseded version on record rather than deleting it silently: the structural
+check above was a real, reasonable answer to the question actually asked at the time, and it took a
+sharper, more basic question — not a flaw found in the check itself — to reveal that the question
+should never have been "how do we tell duplicates apart" at all.

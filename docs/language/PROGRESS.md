@@ -1161,3 +1161,64 @@ can't verify `isInputRange`-style semantic promises. If even one operation binds
 callable, both implementations stand; canonical-vs-compact-JSON keeps working exactly as designed.
 Worked example added as `feature_tour.md` §23, showing both the rejected identical case and an
 accepted genuinely-differing one side by side.
+
+**Continued 2026-09-18 — coherence adopted, named/multiple implementations reversed entirely, not
+patched further.** The largest single-thread reversal this session. Traced across several rounds,
+each one a real question rather than a restatement:
+
+1. Whether implementations even need names — answered from principle (disambiguating competing
+   implementations of the same concept/type, the thing Rust's coherence rule forecloses).
+2. Whether `using Json for User` is just `using UserJson` with the type pulled out — confirmed yes,
+   a real surface-grammar improvement, not evidence naming is skippable.
+3. Whether the structural-identity duplicate check (§23, previous entry) actually closes the gap it
+   was meant to — it doesn't: a differently-named, differently-written but behaviorally redundant
+   free function defeats it completely, and proving two functions equivalent is undecidable in
+   general (same limit already established for `isInputRange` and the `Codec` axiom). No amount of
+   checking closes this; it's a hard ceiling, not an oversight.
+4. The question that actually resolved it, asked directly: why would anyone implement the same
+   concept twice for the same type, doing different things, on purpose? No surviving example was
+   found. `JsonSerializable`'s own `JsonOptions` parameter was already the right place for
+   canonical-vs-compact, the running justification for the whole feature since this document's
+   original draft — it never needed two implementations. Fast-vs-stable hashing/serialization
+   collapses the same way (a parameter). Two orderings for a type is Rust's own established practice
+   already avoiding this (`Reverse<T>` wrapper, `sort_by` comparator, never two `impl Ord for T`).
+
+Once no case survived, adopted the full reversal rather than a narrower patch: coherence (borrowing
+Rust's term directly) — at most one implementation of a concept per type, full stop, rejected
+outright at declaration regardless of whether bindings would differ — and implementations became
+unnamed, addressed by their (concept, type) pair alone, since naming only ever existed to
+disambiguate multiples. `using` for evidence selection is gone with it. Rewrote the "Generics,
+concepts, dispatch" section's core paragraphs in place rather than appending a correction on top:
+the canonical/compact-JSON justification, the ambiguity-vs-declaration-site distinction, the
+structural duplicate check, and every `using Name`/named-implementation reference throughout the
+document (§1 inherent-implementation cross-reference, the `.` resolution-order passage, the CTFE
+derive-coherence paragraph, the axiom examples, the dynamic-evidence-erasure passage, the
+MissingProperty hook) — updated in place rather than left inconsistent with the new rule.
+
+`feature_tour.md` updated to match: §15's `AccountEqualById`/`AccountEqualByAllFields` (the original
+source of the canonical/compact-style justification, predating this session) rewritten to show the
+rejection and its real resolution — a distinct wrapper type (`ById(Account)`), the Rust-idiomatic
+answer — with the section's own former claim ("Finch deliberately doesn't do this... genuinely
+different tradeoffs from Rust") corrected in place rather than left standing next to a contradicting
+rule elsewhere in the same document. §19/§21/§22 updated mechanically (different concepts or
+different generic instantiations for the same type were never affected by coherence, only stripped
+of now-pointless names). §23 kept but reframed as design history — the structural-identity check it
+described was a reasonable answer to the question actually asked at the time; a sharper, more basic
+question, not a flaw in the check, is what superseded it.
+
+Two new questions surfaced along the way, resolved without touching coherence: generic
+implementations are exactly one declaration over the whole parametric family (not one per concrete
+`T`), composing directly with the already-decided no-specialization rule rather than needing new
+machinery — checked once against the family, immediately closing what would otherwise have reopened
+D-style per-instantiation matching. And wanting per-type-shape optimization (a fast path
+specifically for `u64`) without reopening specialization or coherence resolves through `match-type`
+inside one implementation's body — already-established machinery, zero-cost once instantiated, since
+static evidence already generates like a template and a `match-type` on a statically-known `T`
+compiles to a dead-code-eliminated branch, not a runtime check; whether the remaining direct call
+inlines away is ordinary backend inlining, no different from any other small direct call.
+
+Two new gaps logged rather than guessed at: conditional/bounded generic implementations (Rust's
+`impl<T: PartialEq> PartialEq for Vec<T>` shape — no established syntax), and coherence checking
+across independently-compiled modules (whether Finch needs Rust's orphan-rule restriction on
+implementing foreign concepts for foreign types, or defers the conflict to link time) — both added
+to `feature_tour.md` §18.

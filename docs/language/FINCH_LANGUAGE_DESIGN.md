@@ -980,9 +980,9 @@ different aggregate type.
 there is no separate "associated function" category.** The first draft of this section used
 "associated function" as if a record could have its own methods directly; nothing else in this
 document supports that — every other `implementation` in this document is
-`implementation X for Y : Concept {...}`. Rather than add a parallel mechanism, drop the concept
+`implementation Y : Concept {...}`. Rather than add a parallel mechanism, drop the concept
 bound: `implementation Foo { ... }` is an *inherent implementation*, the same declaration shape as a
-concept implementation with the `for Y : Concept` clause simply omitted. It hosts three kinds of
+concept implementation with the `: Concept` clause simply omitted. It hosts three kinds of
 member, told apart by leading keyword rather than by an attribute — `constructor`, `get`/`set`, and
 plain `operation`.
 
@@ -1124,13 +1124,14 @@ concept-dispatched operations.** Inherent implementations (above) introduce a se
 `foo.name` besides fields: `foo.name` now resolves, in order, against (1) a plain field, (2) a
 `get`/`set` property, (3) an inherent `operation` — all three already mutually exclusive by name
 within one record — and only then (4) a concept-dispatched operation, resolved from whichever
-`implementation _ for Foo : Concept` bodies are in scope. An inherent hit at (1)-(3) shadows a
-same-named concept operation rather than conflicting with it, matching Rust's inherent-vs-trait-
-method precedence: adding a concept implementation to a type can never silently change behavior a
-caller was already getting from that type's own field, property, or operation. Two or more concept
+`implementation Foo : Concept` bodies (necessarily for different concepts, since coherence below
+permits at most one per concept) are in scope. An inherent hit at (1)-(3) shadows a same-named
+concept operation rather than conflicting with it, matching Rust's inherent-vs-trait-method
+precedence: adding a concept implementation to a type can never silently change behavior a caller
+was already getting from that type's own field, property, or operation. Two or more concept
 implementations in scope that both provide the same name at step (4) is an ambiguity error — the
 call site must qualify it (`Drawable.draw(&x)`), the same explicit-disambiguation shape already used
-in `implementation WidgetDrawable for Widget : Drawable` above (`using PresentationDrawable`).
+for `JsonSerializable.serialize`/`BinarySerializable.serialize` below.
 
 Records and maps remain different representations. A record field has a compile-time type and
 offset and cannot be absent. A `map<K,V>` performs runtime key lookup. Repeated dynamic shapes may
@@ -3958,9 +3959,11 @@ private identities, so two derives may both implement an operation spelled `seri
 creating a global-name collision. Diagnostics retain both the derive invocation and generated
 implementation origins.
 Each generated implementation/evidence binding also receives a stable module-qualified identity.
-Two expansions that publish the same evidence identity are a duplicate-definition error; differently
-named implementations for the same concept and concrete type remain distinct and make unqualified
-ambient resolution ambiguous. Expansion or import order never replaces or selects evidence.
+Two expansions that both implement the same concept for the same concrete type conflict exactly as
+two handwritten `implementation` blocks would — coherence (at most one implementation per concept
+and type, below) does not relax for generated code merely because neither expansion could see the
+other coming. Expansion or import order never decides which one wins; there is no "which one wins,"
+only a rejected conflict.
 
 **Added 2026-09-18: no CTFE-emitted declaration may replace one someone else already published —
 extending the rule just stated for evidence to declarations generally, not a new carve-out.**
@@ -4020,14 +4023,14 @@ concept JsonSerializable {
     operation serialize(&self, options: &JsonOptions) -> Output
 }
 
-implementation UserJson for User : JsonSerializable {
+implementation User : JsonSerializable {
     operation serialize(&self, options) =>
         UserCodec.serialize(options, self)
 }
 
-implementation WidgetDrawable for Widget : Drawable {
+implementation Widget : Drawable {
     operation draw(&self, canvas) =>
-        Drawable.draw(&self.presentation, canvas) using PresentationDrawable
+        Drawable.draw(&self.presentation, canvas)
 }
 ```
 
@@ -4040,7 +4043,7 @@ concept: JsonSerializable
   operation: serialize ( S borrow Self borrow JsonOptions -- S Self JsonOptions Output ) ;
 ;
 
-implementation: UserJson for User : JsonSerializable
+implementation: User : JsonSerializable
   associated: Output = bytes ;
   operation: serialize { self options -- }
     options self UserCodec.serialize
@@ -4048,11 +4051,10 @@ implementation: UserJson for User : JsonSerializable
   dynamic-evidence-version: 1 ;
 ;
 
-user options JsonSerializable.serialize using UserJson
+user options JsonSerializable.serialize
 ```
 
-The implementation operation body is a checked receiver adapter with named inputs; `using` is
-compile-time evidence selection and does not consume a runtime stack value.
+The implementation operation body is a checked receiver adapter with named inputs.
 
 The adapter may explicitly reorder arguments or project a composed receiver. A direct
 `operation serialize = encode-user-json` shorthand is valid only when the callable already has the
@@ -4081,39 +4083,61 @@ not whether any step is mechanical — this sugar never lets a type become an im
 declaration naming the concept; it only elides which already-existing callable fills an operation
 whose answer cannot be ambiguous.
 
-Exported evidence is named and stable.
-Each requirement has exactly one selected mapping in a compilation context; competing equally valid
-evidence is an ambiguity error, never an import-order decision.
+Exported evidence is stable, addressed by its (concept, type) pair rather than by a chosen name.
+**Coherence**, borrowing Rust's term for the same property: a type has at most one implementation of
+a given concept, full stop — never two, regardless of whether their bindings would differ. A second
+`implementation` of a concept already implemented for that type is rejected outright at its own
+declaration, unconditionally, not merely when its bindings happen to coincide with the first's.
 
-That ambiguity rule governs the *use* site — a call with no `using` and no applicable default. It
-does not, by itself, catch a different mistake at the *declaration* site: naming an implementation
-is what lets two genuinely different ways of satisfying the same concept for the same type coexist
-(canonical and compact JSON), but the same freedom to name one also lets a programmer declare two
-implementations that are not different at all — a duplicate, most plausibly from copy-paste, that
-happens to carry a different name. The verifier rejects this: two named implementations of the same
-concept for the same type whose operation and associated mappings are all identically bound are a
-compile error, not two legitimate choices for a caller. This needs no judgment about *meaningful*
-difference, which is undecidable in general (a compiler cannot know whether "compact" JSON actually
-encodes differently from "canonical" JSON) — only whether every requirement resolves to the same
-callable in both, which is a plain equality check. If even one operation differs, the two stand.
+This was not the original design and is worth being honest about reversing rather than silently
+restating as though it were always the rule. Naming every implementation was first justified by
+letting genuinely different ways of satisfying the same concept for the same type coexist — canonical
+and compact JSON was the running example. That example does not survive scrutiny: `JsonSerializable`
+already takes a `JsonOptions` parameter, which is exactly where "compact vs. canonical" belongs, and
+every other candidate examined the same way collapsed the same direction — two orderings for a type
+is Rust's `Reverse<T>` wrapper or an explicit comparator, never two `impl Ord for T`; fast vs. secure
+hashing is two different concepts wearing one casual name, not one concept twice. No case survived
+where "the same concept, the same type, two competing implementations chosen by name" was actually
+the right tool rather than a parameter, a compile-time strategy argument, or a separately-named
+concept. Once no real justification remained, naming itself lost its only purpose — a name existed
+solely to disambiguate between multiples, so once multiples are forbidden, keeping named
+implementations would be vestigial ceremony with nothing left to point at. Implementations are
+therefore addressed the way Rust's anonymous `impl Trait for Type` are: by their (concept, type)
+pair alone, with no separate identifier.
 
-Concept evidence is never made ambient merely by loading or importing its defining module. Every
-implementation has a stable qualified name. A call either names it with `using`, receives it through
-a generic evidence parameter, or uses one default explicitly imported into that lexical compilation
-context. Initially only the module that defines the concept or the concrete type may publish such a
-default; third-party implementations remain named. A module records every selected evidence identity
-in its sealed interface, so adding another import cannot retrospectively change dispatch or make an
-already compiled call ambiguous.
+A generic implementation is exactly one declaration over its whole parametric family, not one per
+concrete instantiation — `implementation List<T> : Container<T> { ... }` covers every `T`, and a
+would-be `implementation List<i64> : Container<i64> { ... }` alongside it is rejected on two
+independent grounds at once: it is the per-instantiation specialization already ruled out elsewhere
+in this document, and it is a second implementation of the same concept for the same type family.
+Uniqueness is checked against the whole family, never per instantiation.
+
+**Left open, not yet specified: conditional implementations.** Whether a generic implementation may
+itself require a bound on its own type parameter — `implementation List<T : Equal<T,T>> :
+Equal<List<T>, List<T>> { ... }`, the shape of Rust's `impl<T: PartialEq> PartialEq for Vec<T>` — has
+no established syntax anywhere in this document. This is a real, separate gap from the specialization
+question above, not a restatement of it: it is not choosing between competing bodies for different
+`T`, only gating whether the single body is available at all for a given `T`.
+
+Concept evidence is never made ambient merely by loading or importing its defining module. A call
+either names the concept-qualified operation directly, since there is at most one implementation to
+resolve to, or receives evidence through a generic evidence parameter for a statically- or
+dynamically-dispatched bound. A module records every implementation it depends on in its sealed
+interface, so adding another import elsewhere cannot retrospectively change what an already-compiled
+call resolves to — there being at most one implementation per (concept, type) already rules out the
+kind of ambiguity that language existed to prevent, but the sealed-interface record still matters:
+it is what lets an implementation appearing for the first time somewhere in the dependency graph
+become visible to a call site without recompiling everything that could possibly be affected.
 
 Operation names live in their concept evidence rather than one shared method namespace. For
 example, independent derives may map both `JsonSerializable.serialize` and
 `BinarySerializable.serialize` for the same record to different hygienic callables. Static code
-selects the intended evidence explicitly with a concept-qualified operation or a named evidence
-argument; it does not need to erase or cast the value merely to disambiguate a name:
+selects the intended evidence explicitly with a concept-qualified operation; it does not need to
+erase or cast the value merely to disambiguate a name:
 
 ```text
-JsonSerializable.serialize(user) using UserJson
-BinarySerializable.serialize(user) using UserBinary
+JsonSerializable.serialize(user)
+BinarySerializable.serialize(user)
 ```
 
 This is what avoids a real, known Rust trait-ergonomics complaint: two unrelated concepts that
@@ -4121,34 +4145,30 @@ happen to require operations with identical behavior — `HasArea.area` and `Mea
 force two hand-written, identical method bodies, and never force reaching for a free function as a
 workaround for the fact that a trait method is otherwise expected to be its own body. An `operation`
 mapping is *always* a binding to something that already exists — a free function, a member, another
-implementation's evidence via `using` — never an obligatory freshly-authored inline body, so the
-same free function binds into as many `implementation` blocks, for as many unrelated concepts, as
-actually need it, with zero duplication and no separate "escape to a free function" mechanism to
-reach for, because binding to one *is* the ordinary case:
+concept's evidence — never an obligatory freshly-authored inline body, so the same free function
+binds into as many `implementation` blocks, for as many unrelated concepts, as actually need it,
+with zero duplication and no separate "escape to a free function" mechanism to reach for, because
+binding to one *is* the ordinary case:
 
 ```text
 (define (rect-area (r : &Rectangle)) : f64
   (* r.width r.height))
 
-implementation RectangleHasArea for Rectangle : HasArea {
+implementation Rectangle : HasArea {
     operation area = rect-area
 }
 
-implementation RectangleMeasurable for Rectangle : Measurable {
+implementation Rectangle : Measurable {
     operation area      = rect-area   ; same identity, bound again — not rewritten
     operation perimeter = rect-perimeter
 }
 ```
 
-Erasing `user` as `dyn JsonSerializable using UserJson` is the corresponding deliberate runtime-
-dispatch choice: the erasure site names the evidence, policy, or wrapper type, and the resulting
-existential carries `UserJson`'s evidence table, so its `serialize` slot is
-unambiguous. A runtime checked `as-concept` lookup serves an already erased/dynamic value whose
-concrete evidence is not statically known; it is not ordinary static overload resolution. If a type
-has several implementations of the *same* concept (for example canonical and compact JSON), none is
-ambiently preferred: the caller must supply a named implementation, policy value, or wrapper type,
-including at a dynamic-erasure site. The expected result type, generated helper spelling, and import
-order never choose between them.
+Erasing `user` as `dyn JsonSerializable` is the corresponding deliberate runtime-dispatch choice:
+the resulting existential carries `User`'s evidence table for that concept, so its `serialize` slot
+is unambiguous by construction, not by naming. A runtime checked `as-concept` lookup serves an
+already erased/dynamic value whose concrete evidence is not statically known; it is not ordinary
+static overload resolution.
 
 Dispatch mode is explicit in each template or function type contract, independently for every
 argument. `R : Range<Item=T>` has one defined mode—static evidence; `static Range<Item=T>` (or
@@ -4214,10 +4234,10 @@ Dynamic evidence belongs to the erased view, not the concrete record layout. A b
 conceptually `(data pointer, selected evidence-table pointer)`; an owned existential additionally
 retains the actual owner/lifecycle evidence required to destroy its storage. The evidence table is
 immutable shared module data, not copied into each object. Consequently a concrete record contains
-no mandatory vptr, may remain inline, and may simultaneously form different concept views or use
-different named implementations without mutation. An implementation declared in another module
-emits its own stable evidence table; forming `dyn C using Implementation` selects that table and
-does not rewrite existing values. Conversion from an already erased value uses its runtime type
+no mandatory vptr, may remain inline, and may simultaneously form different concept views without
+mutation. An implementation declared in another module emits its own stable evidence table; forming
+`dyn C` selects that table and does not rewrite existing values. Conversion from an already erased
+value uses its runtime type
 identity and the sealed module's versioned evidence registry, returning `option`/`result`; loading
 new evidence may extend a new verified composition epoch but never retrofits an existing view in
 place.
@@ -4238,8 +4258,8 @@ concept DistinctPair<L, R> {
     axiom types-differ = not (L == R)
 }
 
-implementation StringIntPair : DistinctPair<string, i64> { }   ; axiom holds, compiles
-implementation BadPair : DistinctPair<i64, i64> { }             ; axiom fails: compile error
+implementation DistinctPair<string, i64> { }   ; axiom holds, compiles
+implementation DistinctPair<i64, i64> { }      ; axiom fails: compile error
 ```
 
 An axiom is never part of candidate selection. Finch already requires exactly one explicit,
@@ -4283,9 +4303,10 @@ concept MissingProperty<V> {
 }
 ```
 
-`JSONValue`, a string-keyed map wrapper, row, proxy, or similar type may opt in with a named
-implementation. Resolution tries real fields/members first and then the uniquely selected
-`MissingProperty` evidence; arbitrary keys remain available through indexing. A constant member
+`JSONValue`, a string-keyed map wrapper, row, proxy, or similar type may opt in with an
+implementation. Resolution tries real fields/members first and then that type's `MissingProperty`
+evidence, which coherence already guarantees is unique; arbitrary keys remain available through
+indexing. A constant member
 name may carry a precomputed hash or receive a JIT shape/offset fast path, but absence still returns
 the declared `option`/`result`. This hook never establishes concept satisfaction, rescues failed
 overload resolution, suppresses errors in its implementation, or manufactures JavaScript-style
