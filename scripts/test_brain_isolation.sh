@@ -1191,7 +1191,9 @@ integration_inventory="$(
 expected_integration_inventory="$(cat <<'EOF'
 tests/daemon_integration_test.rs
 tests/daemon_log_rotation.rs
+tests/daemon_status_live_socket.rs
 tests/daemon_stdio_binding.rs
+tests/daemon_stop_stale.rs
 tests/daemon_upgrade_preflight_test.rs
 tests/live.rs
 tests/live/impcpd.rs
@@ -1200,6 +1202,8 @@ tests/live/providers.rs
 tests/named_brain_attach.rs
 tests/no_external_provider_binary_test.rs
 tests/service_discovery_test.rs
+tests/setup_wizard_widget_host.rs
+tests/startup_is_readonly_on_config.rs
 tests/startup_time_to_ready.rs
 tests/tui_scrollback_commit.rs
 tests/worker_integration_test.rs

@@ -62,6 +62,18 @@ hand every process they are responsible for to a launcher that is isolated.
 - `tests/daemon_log_rotation.rs` is non-Brain: it drives the daemon log
   retention writer over a `tempfile` directory. It constructs no Brain, spawns
   no daemon, binds no endpoint, and never touches the user's Finch state.
+- `tests/daemon_status_live_socket.rs` is non-Brain: it binds one Unix listener
+  inside a disposable tempfile HOME and drops it, leaving the socket pathname,
+  then runs the built `finch daemon-status` once as a plain `Command` child
+  with `HOME` pointed at that directory. The regression pins that a live
+  listener's socket is reported as live rather than crash leftovers. It spawns
+  no daemon, creates no session or process group, and never touches the user's
+  Finch state.
+- `tests/daemon_stop_stale.rs` is non-Brain: it hand-writes a crashed daemon's
+  leftover pid file and socket pathname in a disposable tempfile HOME and runs
+  the built `finch daemon-stop` once as a plain `Command` child with `HOME`
+  pointed there. It spawns no daemon, creates no session or process group, and
+  never touches the user's Finch state.
 - `tests/daemon_upgrade_preflight_test.rs` is non-Brain: it supplies an explicit
   `tempfile` stage and empty Brain root to a production preflight boundary.
 - `tests/worker_integration_test.rs` is non-Brain: it drives stateless Axum
@@ -114,6 +126,27 @@ hand every process they are responsible for to a launcher that is isolated.
   loopback address and for the socket to exist, then runs two isolated PTY
   `finch attach` children against the same HOME with `auto_spawn = false` and
   `auto_discover = false`. No child creates a session or process group.
+- `tests/setup_wizard_widget_host.rs` drives `finch setup` through the widget
+  host on one pty per run (#812). Each run uses a disposable empty HOME,
+  removes every provider credential and every inherited
+  `FINCH_BRAIN_TEST_*`/`FINCH_TEST_*` variable from the child's environment,
+  and spawns a plain `Command` child with no session or process group, so it
+  stays inside the supervisor's owned group; the harness's drop kills and
+  reaps only the child it started and signals no pid it did not create. The
+  wizard constructs no Brain, binds no endpoint, and never touches the user's
+  Finch state. The pty is deliberately not made a controlling terminal.
+- `tests/startup_is_readonly_on_config.rs` pins that ordinary startup and
+  `finch attach` treat a hand-written config as read-only. Its in-process
+  cases drive library boundaries and the built binary over a disposable
+  tempfile HOME (one case rewrites its own process `HOME`; the integration
+  binary owns that environment, and later cases pass `HOME` to their children
+  explicitly). Its pty cases seed a disposable HOME whose config sets
+  `use_daemon = false`, remove every provider credential and every inherited
+  `FINCH_BRAIN_TEST_*`/`FINCH_TEST_*` variable from the child's environment,
+  and spawn plain `Command` children with no session or process group, so they
+  stay inside the supervisor's owned group; `Session::drop` kills and reaps
+  only the child it started. It constructs no Brain and never touches the
+  user's Finch state. The pty is deliberately not made a controlling terminal.
 - `tests/live.rs` and `tests/live/{impcpd,parity,providers}.rs` are ignored,
   credentialed live-provider tests. They do not construct Brains, and their
   documented invocation still uses `scripts/test_brains.sh` so config/cache
