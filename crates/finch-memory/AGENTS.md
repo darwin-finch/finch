@@ -24,6 +24,14 @@ Program identity types stay in `programs`; memory stores `ProgramIndexRecord` ro
 excludes ONNX, Candle, tokenizers, and Hugging Face — `src/models/neural_embedding.rs` owns those
 and implements the injected `EmbeddingEngine` port.
 
+The SQLite connection is injectable the same way: `MemorySystem::new_with_connection` takes an
+already-open `Arc<Mutex<Connection>>` and never calls `Connection::open` itself — it requires that
+connection to be uncontended on entry and returns `Err`, not a panic, if it isn't. `new_with_engine`
+is a thin wrapper around the shared `MemorySystem::open_connection(db_path)` (dir creation, open,
+WAL) plus `new_with_connection`. The composition root (`src/cli/repl.rs`) calls
+`open_connection` and `new_with_connection` directly so the injected path is actually exercised;
+test call sites may keep using the path-based `new`/`new_with_engine` convenience constructors.
+
 **Durability:** changes to `schema.sql`, persistence, or retrieval order need the restart and
 replay cases from the root [testing rules](../../CLAUDE.md#testing-mandatory).
 

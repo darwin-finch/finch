@@ -786,7 +786,21 @@ impl Repl {
             let memory_open = crate::startup::phase(crate::startup::PHASE_MEMORY_OPEN);
             let engine =
                 crate::models::select_memory_embedding_engine(config.memory.use_neural_embeddings);
-            let opened = finch_memory::MemorySystem::new_with_engine(config.memory.clone(), engine);
+            // Open the connection here, at the composition root, and inject it
+            // rather than going through the path-based `new_with_engine`
+            // convenience wrapper -- this is the one call site where the
+            // injected constructor actually matters in production.
+            // `open_connection` is the same dir-creation + open + WAL
+            // sequence `new_with_engine` uses internally, shared so the two
+            // paths cannot silently diverge.
+            let opened = finch_memory::MemorySystem::open_connection(&config.memory.db_path)
+                .and_then(|conn| {
+                    finch_memory::MemorySystem::new_with_connection(
+                        Arc::new(tokio::sync::Mutex::new(conn)),
+                        config.memory.clone(),
+                        engine,
+                    )
+                });
             drop(memory_open);
             match opened {
                 Ok(system) => {
