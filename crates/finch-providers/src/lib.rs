@@ -177,6 +177,17 @@ pub trait ProviderBackend: ProviderConcreteType + Send + Sync {
         ModelCapabilities::unknown(self.name(), model)
     }
 
+    /// Give a backend a chance to refresh a live capability attestation for
+    /// `model` before [`resolve_effective_request`] reads [`Self::capabilities`].
+    ///
+    /// Most backends have nothing to refresh (their capabilities are dated,
+    /// static metadata already returned by `capabilities()`), so the default
+    /// is a no-op. A deployment-specific backend — currently only Ollama —
+    /// overrides this to query its own live catalog. Any failure to refresh
+    /// must leave `capabilities()` fail-closed (`Unknown`), never assume
+    /// support.
+    async fn refresh_capabilities(&self, _model: &str) {}
+
     /// Whether the selected profile implicitly requests reasoning controls.
     #[doc(hidden)]
     fn requested_reasoning_effort(&self, _request: &ProviderRequest) -> Option<ReasoningEffort> {
@@ -184,7 +195,7 @@ pub trait ProviderBackend: ProviderConcreteType + Send + Sync {
     }
 }
 
-pub(crate) fn resolve_effective_request(
+pub(crate) async fn resolve_effective_request(
     provider: &(impl ProviderBackend + ?Sized),
     request: &ProviderRequest,
 ) -> Result<(ProviderRequest, ModelCapabilities)> {
@@ -192,6 +203,7 @@ pub(crate) fn resolve_effective_request(
     if effective.model.trim().is_empty() {
         effective.model = provider.default_model().to_string();
     }
+    provider.refresh_capabilities(&effective.model).await;
     let capabilities = provider.capabilities(&effective.model);
     if capabilities.provider != provider.name() || capabilities.model != effective.model {
         anyhow::bail!(
@@ -210,7 +222,7 @@ pub(crate) fn resolve_effective_request(
 pub trait LlmProvider: ProviderBackend {
     /// Send a message and get a complete response.
     async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let validated = validate_provider_request(self, request, false)?;
+        let validated = validate_provider_request(self, request, false).await?;
         self.send_message_validated(validated).await
     }
 
@@ -219,7 +231,7 @@ pub trait LlmProvider: ProviderBackend {
         &self,
         request: &ProviderRequest,
     ) -> Result<Receiver<Result<StreamChunk>>> {
-        let validated = validate_provider_request(self, request, true)?;
+        let validated = validate_provider_request(self, request, true).await?;
         self.send_message_stream_validated(validated).await
     }
 

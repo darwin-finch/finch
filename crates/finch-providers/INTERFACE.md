@@ -558,6 +558,7 @@ pub trait ProviderBackend: ProviderConcreteType + Send + Sync {
     fn name(&self) -> &str;
     fn default_model(&self) -> &str;
     fn capabilities(&self, model: &str) -> ModelCapabilities;
+    async fn refresh_capabilities(&self, _model: &str);
     fn requested_reasoning_effort(&self, _request: &ProviderRequest) -> Option<ReasoningEffort>;
 }
 /// Non-overridable concrete type identity used by validated dispatch tokens.
@@ -602,13 +603,13 @@ pub async fn refresh(profile: &ModelCatalogProfile, cache_dir: &Path) -> Result<
 pub async fn refresh_with_fallback(profile: &ModelCatalogProfile, cache_dir: &Path) -> (ModelCatalog, Option<String>) { … }
 /// Determine the binding required by a provider profile and endpoint.
 pub fn required_audience(provider: CredentialProvider, endpoint: Option<&str>) -> Result<AudienceBinding> { … }
-pub(crate) fn resolve_effective_request(provider: &(impl ProviderBackend + ?Sized), request: &ProviderRequest) -> Result<(ProviderRequest, ModelCapabilities)> { … }
+pub(crate) async fn resolve_effective_request(provider: &(impl ProviderBackend + ?Sized), request: &ProviderRequest) -> Result<(ProviderRequest, ModelCapabilities)> { … }
 pub fn static_fallback(provider: &str) -> Vec<String> { … }
 /// Reject absolute authenticated path overrides that leave the bound origin.
 pub fn validate_authenticated_endpoints(provider: CredentialProvider, base_url: Option<&str>, overrides: &[Option<&str>]) -> Result<()> { … }
 /// Validate a profile reference against one named credential without resolving secret material or performing external activity.
 pub fn validate_binding(provider: CredentialProvider, endpoint: Option<&str>, binding: &CredentialBinding, credential: &ProviderCredential, now: DateTime<Utc>) -> Result<()> { … }
-pub(crate) fn validate_provider_request(provider: &(impl ProviderBackend + ?Sized), request: &ProviderRequest, streaming: bool) -> Result<ValidatedProviderRequest> { … }
+pub(crate) async fn validate_provider_request(provider: &(impl ProviderBackend + ?Sized), request: &ProviderRequest, streaming: bool) -> Result<ValidatedProviderRequest> { … }
 pub(crate) fn validate_response_model(model: &str) -> Result<()> { … }
 /// Inject the alignment prompt into an existing system prompt, or return it standalone.
 pub fn with_alignment(system: Option<&str>) -> String { … }

@@ -6,17 +6,19 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use super::endpoints::ProviderEndpoints;
+use super::endpoints::{resolve_endpoint, ProviderEndpoints};
 use super::types::{
-    CapabilitySupport, EventProvenance, ModelCapabilities, ModelFeature, ProviderRequest,
-    ProviderResponse, StreamChunk, WireProtocol,
+    CapabilityProvenance, CapabilitySupport, EventProvenance, ModelCapabilities, ModelFeature,
+    ProviderRequest, ProviderResponse, StreamChunk, WireProtocol,
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::retry::{with_retry, NonRetriableError};
@@ -1040,6 +1042,69 @@ pub struct OpenAIProvider {
     reasoning_effort: Option<ReasoningEffort>,
     canonical_openai_endpoint: bool,
     auth_header: AuthHeader,
+    /// Set only by [`Self::new_ollama`]. When present, this is the live
+    /// Ollama-native `/api/show` endpoint (distinct from the OpenAI-compatible
+    /// `/v1/...` surface used for chat) that `capabilities()` attests model
+    /// features from. Left `None` for every other provider, including
+    /// `remote_daemon`, which stays out of scope for issue #925.
+    ollama_capability_endpoint: Option<String>,
+    /// Per-model live capability attestations already fetched from Ollama.
+    /// Populated by `refresh_capabilities`, read synchronously by
+    /// `capabilities()`. Shared across clones of the same provider instance
+    /// so a `with_model`/`with_reasoning_effort` clone reuses the cache.
+    ollama_capabilities: Arc<std::sync::Mutex<HashMap<String, OllamaLiveCapabilities>>>,
+}
+
+/// One model's live capability attestation, fetched from Ollama's own
+/// `/api/show` endpoint rather than assumed from a static allowlist.
+#[derive(Debug, Clone)]
+struct OllamaLiveCapabilities {
+    /// Exact strings Ollama reported, e.g. `["completion", "tools"]`. This is
+    /// treated as a complete listing: a feature absent from it is reported
+    /// `Unsupported`, not `Unknown` — Ollama itself is the authority here.
+    capabilities: Vec<String>,
+    fetched_at: DateTime<Utc>,
+}
+
+/// Timeout for the capability-attestation call, kept short and independent
+/// of the main chat client's timeout so a slow or hung Ollama daemon cannot
+/// stall every query behind a 60s wait before falling back to `Unknown`.
+const OLLAMA_CAPABILITY_CHECK_TIMEOUT_SECS: u64 = 5;
+
+#[derive(Debug, Deserialize)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+/// Fetch one model's self-reported capabilities from Ollama's native
+/// `/api/show` endpoint (distinct from the OpenAI-compatible surface Finch
+/// uses for chat). Any transport, status, or decode failure is returned as
+/// an `Err` so the caller fails closed instead of assuming support.
+async fn fetch_ollama_capabilities(
+    client: &Client,
+    endpoint: &str,
+    model: &str,
+) -> Result<Vec<String>> {
+    let response = client
+        .post(endpoint)
+        .timeout(Duration::from_secs(OLLAMA_CAPABILITY_CHECK_TIMEOUT_SECS))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .context("failed to reach Ollama /api/show for capability attestation")?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "Ollama /api/show returned status {} for model '{}'",
+            response.status(),
+            model
+        );
+    }
+    let body: OllamaShowResponse = response
+        .json()
+        .await
+        .context("Ollama /api/show returned a response Finch could not parse")?;
+    Ok(body.capabilities)
 }
 
 impl OpenAIProvider {
@@ -1104,15 +1169,22 @@ impl OpenAIProvider {
     ///
     /// Ollama exposes `/v1/chat/completions` at `base_url` (default: `http://localhost:11434`).
     /// No API key is required — "ollama" is sent as a placeholder.
+    ///
+    /// Capabilities are not assumed from a static allowlist: Finch attests
+    /// them live from Ollama's own `/api/show` endpoint the first time each
+    /// model is resolved (see `refresh_capabilities`), and fails closed
+    /// (`Unknown`) until that attestation succeeds.
     pub fn new_ollama(base_url: String, model: String) -> Result<Self> {
-        Self::new(
+        let mut provider = Self::new(
             "ollama".to_string(), // Ollama ignores the Authorization header
-            base_url,
+            base_url.clone(),
             "/v1/chat/completions",
             "/v1/models",
             model,
             "ollama".to_string(),
-        )
+        )?;
+        provider.ollama_capability_endpoint = Some(resolve_endpoint(&base_url, "/api/show"));
+        Ok(provider)
     }
 
     /// Create a provider that talks to a remote finch daemon's OpenAI-compatible endpoint.
@@ -1189,6 +1261,8 @@ impl OpenAIProvider {
             reasoning_effort: None,
             canonical_openai_endpoint,
             auth_header: AuthHeader::Bearer,
+            ollama_capability_endpoint: None,
+            ollama_capabilities: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -1970,6 +2044,55 @@ impl OpenAIProvider {
 
         Ok(rx)
     }
+
+    /// Build capabilities for an Ollama-backed instance from whatever live
+    /// attestation `refresh_capabilities` has already cached for `model`.
+    ///
+    /// The wire protocol is always known — Finch's Ollama transport always
+    /// speaks OpenAI-compatible chat completions, a fact about the adapter,
+    /// not the model — but every model-specific optional feature stays
+    /// `Unknown` until a live `/api/show` attestation for this exact model
+    /// has been cached.
+    fn ollama_model_capabilities(&self, endpoint: &str, model: &str) -> ModelCapabilities {
+        let mut capabilities = ModelCapabilities::unknown(self.name(), model).with_wire_protocol(
+            WireProtocol::OpenAiChatCompletions,
+            "2026-09-19",
+            "Finch Ollama adapter always uses the OpenAI-compatible chat-completions transport",
+        );
+        let attested = self
+            .ollama_capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(model)
+            .cloned();
+        let Some(attested) = attested else {
+            return capabilities;
+        };
+        let source = format!(
+            "live Ollama /api/show at {} (fetched {})",
+            endpoint,
+            attested.fetched_at.to_rfc3339()
+        );
+        let reports = |name: &str| attested.capabilities.iter().any(|c| c == name);
+        let support_for = |present: bool| {
+            if present {
+                CapabilitySupport::Supported
+            } else {
+                CapabilitySupport::Unsupported
+            }
+        };
+        capabilities.tools = ModelFeature {
+            support: support_for(reports("tools")),
+            provenance: CapabilityProvenance::RuntimeDiscovery {
+                source: source.clone(),
+            },
+        };
+        capabilities.image_input = ModelFeature {
+            support: support_for(reports("vision")),
+            provenance: CapabilityProvenance::RuntimeDiscovery { source },
+        };
+        capabilities
+    }
 }
 
 #[async_trait]
@@ -2016,6 +2139,9 @@ impl ProviderBackend for OpenAIProvider {
             _ => false,
         };
         if !canonical_endpoints {
+            if let Some(endpoint) = self.ollama_capability_endpoint.as_deref() {
+                return self.ollama_model_capabilities(endpoint, model);
+            }
             return ModelCapabilities::unknown(self.name(), model);
         }
 
@@ -2126,6 +2252,47 @@ impl ProviderBackend for OpenAIProvider {
 
     fn requested_reasoning_effort(&self, _request: &ProviderRequest) -> Option<ReasoningEffort> {
         self.reasoning_effort
+    }
+
+    async fn refresh_capabilities(&self, model: &str) {
+        let Some(endpoint) = self.ollama_capability_endpoint.as_deref() else {
+            // Not an Ollama-backed instance (includes remote_daemon, which
+            // stays out of scope for issue #925): nothing to refresh.
+            return;
+        };
+        let already_attested = self
+            .ollama_capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(model);
+        if already_attested {
+            return;
+        }
+        match fetch_ollama_capabilities(&self.client, endpoint, model).await {
+            Ok(capabilities) => {
+                self.ollama_capabilities
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        model.to_string(),
+                        OllamaLiveCapabilities {
+                            capabilities,
+                            fetched_at: Utc::now(),
+                        },
+                    );
+            }
+            Err(error) => {
+                // Fail closed: leave the model absent from the cache so
+                // `capabilities()` keeps returning `Unknown` for it, and try
+                // again on the next request rather than caching the failure.
+                tracing::debug!(
+                    provider = self.provider_name,
+                    model,
+                    error = %error,
+                    "Ollama capability attestation unavailable; capability remains unknown"
+                );
+            }
+        }
     }
 }
 
@@ -2734,8 +2901,8 @@ mod tests {
         mock.assert_async().await;
     }
 
-    #[test]
-    fn canonical_and_compatible_rules_are_explicit_and_separate() {
+    #[tokio::test]
+    async fn canonical_and_compatible_rules_are_explicit_and_separate() {
         let canonical = OpenAIProvider::new_openai("key".into()).unwrap();
         assert_eq!(
             canonical.transport_rule("gpt-5.6-sol"),
@@ -2783,6 +2950,7 @@ mod tests {
             )]),
             true,
         )
+        .await
         .unwrap();
         assert_eq!(validated.capabilities().model, "gpt-5.6");
     }
@@ -4632,6 +4800,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ollama_capabilities_supported_when_live_attestation_reports_tools() {
+        // Issue #925 regression (a): a model whose live Ollama attestation
+        // includes "tools" must be declared Supported, not fail-closed
+        // Unknown, so a plain query that offers tools is not refused.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/show")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"capabilities":["completion","tools"]}"#)
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_ollama(server.url(), "qwen2.5:7b".to_string()).unwrap();
+
+        provider.refresh_capabilities("qwen2.5:7b").await;
+        let capabilities = provider.capabilities("qwen2.5:7b");
+
+        mock.assert_async().await;
+        assert_eq!(
+            capabilities.tools.support,
+            CapabilitySupport::Supported,
+            "expected tools Supported from a live attestation reporting \"tools\", got {:?}",
+            capabilities.tools
+        );
+        assert!(
+            matches!(
+                capabilities.tools.provenance,
+                CapabilityProvenance::RuntimeDiscovery { .. }
+            ),
+            "expected a live RuntimeDiscovery provenance distinct from StaticMetadata, got {:?}",
+            capabilities.tools.provenance
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ollama_capabilities_unsupported_when_live_attestation_omits_tools() {
+        // Issue #925 regression (b): a model whose live Ollama attestation
+        // does not list "tools" must be declared Unsupported (Ollama's own
+        // capability list is authoritative), not left Unknown.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/show")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"capabilities":["completion"]}"#)
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_ollama(server.url(), "llama3.2:1b".to_string()).unwrap();
+
+        provider.refresh_capabilities("llama3.2:1b").await;
+        let capabilities = provider.capabilities("llama3.2:1b");
+
+        assert_eq!(
+            capabilities.tools.support,
+            CapabilitySupport::Unsupported,
+            "expected tools Unsupported when a live attestation omits \"tools\", got {:?}",
+            capabilities.tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ollama_capabilities_stay_unknown_when_api_show_connection_refused() {
+        // Issue #925 regression (c), transport failure: a capability check
+        // that cannot reach Ollama must fail closed, never assume Supported.
+        let provider =
+            OpenAIProvider::new_ollama("http://127.0.0.1:1".to_string(), "qwen2.5:7b".to_string())
+                .unwrap();
+
+        provider.refresh_capabilities("qwen2.5:7b").await;
+        let capabilities = provider.capabilities("qwen2.5:7b");
+
+        assert_eq!(
+            capabilities.tools.support,
+            CapabilitySupport::Unknown,
+            "a connection failure reaching /api/show must leave tools Unknown, not assume support; got {:?}",
+            capabilities.tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ollama_capabilities_stay_unknown_when_api_show_returns_malformed_json() {
+        // Issue #925 regression (c), decode failure: a malformed /api/show
+        // body must also fail closed rather than assume support.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/show")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("not valid json")
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_ollama(server.url(), "qwen2.5:7b".to_string()).unwrap();
+
+        provider.refresh_capabilities("qwen2.5:7b").await;
+        let capabilities = provider.capabilities("qwen2.5:7b");
+
+        assert_eq!(
+            capabilities.tools.support,
+            CapabilitySupport::Unknown,
+            "a malformed /api/show body must leave tools Unknown, not assume support; got {:?}",
+            capabilities.tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ollama_capabilities_stay_unknown_when_api_show_returns_server_error() {
+        // Issue #925 regression (c), non-2xx status: an error status from
+        // /api/show must also fail closed rather than assume support.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/show")
+            .with_status(500)
+            .with_body("internal error")
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_ollama(server.url(), "qwen2.5:7b".to_string()).unwrap();
+
+        provider.refresh_capabilities("qwen2.5:7b").await;
+        let capabilities = provider.capabilities("qwen2.5:7b");
+
+        assert_eq!(
+            capabilities.tools.support,
+            CapabilitySupport::Unknown,
+            "a 500 status from /api/show must leave tools Unknown, not assume support; got {:?}",
+            capabilities.tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ollama_wire_protocol_known_even_without_live_attestation() {
+        // The wire protocol is a fact about Finch's Ollama adapter (it always
+        // speaks OpenAI-compatible chat completions), not about the model, so
+        // it must be known even before any live attestation succeeds —
+        // otherwise tool-binding compilation would fail closed for a
+        // reason unrelated to the model's real capabilities.
+        let provider =
+            OpenAIProvider::new_ollama("http://127.0.0.1:1".to_string(), "qwen2.5:7b".to_string())
+                .unwrap();
+
+        assert_eq!(
+            provider.capabilities("qwen2.5:7b").wire_protocol.protocol,
+            Some(WireProtocol::OpenAiChatCompletions),
+            "Ollama's wire protocol should be known statically regardless of live capability attestation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ollama_query_with_tools_succeeds_after_live_capability_attestation() {
+        // Production-boundary reproduction of the reported bug: a plain
+        // request that offers tools (Finch offers tools on essentially every
+        // request) used to be refused for every Ollama model with
+        // "has unknown tool calls capability; refusing to assume support".
+        // After a live attestation reports "tools", the same request must
+        // pass validation at the real dispatch boundary.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/show")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"capabilities":["completion","tools"]}"#)
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_ollama(server.url(), "qwen2.5:7b".to_string()).unwrap();
+        let request = ProviderRequest::new(vec![crate::Message::user("hello")]).with_tools(vec![
+            crate::ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: crate::ToolInputSchema::simple(vec![("path", "string")]),
+            },
+        ]);
+
+        let validated = crate::validate_provider_request(&provider, &request, false)
+            .await
+            .expect(
+                "a tool-offering request must validate once Ollama's live attestation reports \"tools\"",
+            );
+        assert_eq!(
+            validated.capabilities().tools.support,
+            CapabilitySupport::Supported
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_daemon_capabilities_unaffected_by_ollama_live_attestation() {
+        // Issue #925 is Ollama-only: remote_daemon must keep returning a bare
+        // fail-closed descriptor, with no live capability endpoint and no
+        // wire protocol implied, exactly as before this change.
+        let remote = OpenAIProvider::new_remote_daemon("http://127.0.0.1:1".to_string()).unwrap();
+
+        remote.refresh_capabilities(remote.default_model()).await;
+        let capabilities = remote.capabilities(remote.default_model());
+
+        assert_eq!(capabilities.tools.support, CapabilitySupport::Unknown);
+        assert_eq!(capabilities.wire_protocol.protocol, None);
+    }
+
+    #[tokio::test]
     async fn configured_reasoning_rejects_ineligible_model_before_http() {
         let provider = OpenAIProvider::new_compatible(
             "key".to_string(),
@@ -4692,8 +5057,8 @@ mod tests {
             .contains("does not support reasoning effort 'minimal'"));
     }
 
-    #[test]
-    fn gpt_5_6_sol_reasoning_efforts_are_exact() {
+    #[tokio::test]
+    async fn gpt_5_6_sol_reasoning_efforts_are_exact() {
         let base = OpenAIProvider::new_openai("key".to_string()).unwrap();
         let capabilities = base.capabilities("gpt-5.6-sol");
         let allowed = vec![
@@ -4714,6 +5079,7 @@ mod tests {
                 .with_model("gpt-5.6-sol")
                 .with_reasoning_effort(effort);
             crate::validate_provider_request(&provider, &ProviderRequest::new(vec![]), false)
+                .await
                 .unwrap();
         }
     }
