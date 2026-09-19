@@ -398,13 +398,13 @@ run_concurrent_launcher() {
 }
 run_concurrent_launcher "$pin_result_one" "$pin_diagnostic_one" & pin_pid_one=$!
 run_concurrent_launcher "$pin_result_two" "$pin_diagnostic_two" & pin_pid_two=$!
-for _ in {1..1000}; do
+for _ in {1..3000}; do
   ready_count="$(find "$pin_ready_dir" -type f | wc -l | tr -d ' ')"
   [[ "$ready_count" -eq 2 ]] && break
   sleep 0.01
 done
 if [[ "${ready_count:-0}" -ne 2 ]]; then
-  echo "concurrent maintained launchers did not both reach immutable publication; ready=${ready_count:-0}" >&2
+  echo "concurrent maintained launchers did not both reach immutable publication within 3000x10ms; ready=${ready_count:-0} (hung)" >&2
   sed 's/^/launcher one: /' "$pin_diagnostic_one" >&2 || true
   sed 's/^/launcher two: /' "$pin_diagnostic_two" >&2 || true
   exit 1
@@ -568,14 +568,23 @@ timeout_target_file="$scratch/timeout-target"
 timeout_descendant_pid_file="$scratch/timeout-descendant.pid"
 timeout_home_file="$scratch/timeout-home"
 phase=timeout-descendant-cleanup
+# A poll bound here is a hang detector, not a precision timing oracle: the
+# isolated leader can publish its supervisor PID only after this supervisor
+# spawn finished its own startup, and this phase never ran on CI before the
+# earlier #858 fixes let the script past its prior failures. The fixed
+# 400x5ms=2s bound exhausted on the 2-vCPU ubuntu runner (CI run
+# 35420222687 failed at the signaler status check). 3000x10ms=30s matches the
+# coarse bounds this codebase already accepts for supervised-process startup
+# under load.
 (
-  for _ in {1..400}; do
+  for _ in {1..3000}; do
     if [[ -s "$timeout_target_file" ]]; then
       kill -TERM "$(cat "$timeout_target_file")"
       exit 0
     fi
-    sleep 0.005
+    sleep 0.01
   done
+  echo "timeout-descendant signaler: timed out after 3000x10ms awaiting the isolated leader's supervisor PID at $timeout_target_file (hung)" >&2
   exit 91
 ) & signaler_pid=$!
 timeout_status=0
@@ -590,6 +599,9 @@ FINCH_TIMEOUT_HOME_FILE="$timeout_home_file" run_isolated bash -ec '
 signaler_status=0
 wait "$signaler_pid" || signaler_status=$?
 signaler_pid=''
+if [[ "$signaler_status" -ne 0 ]]; then
+  echo "timeout-descendant signaler exited $signaler_status; its own message above names the marker that never appeared" >&2
+fi
 test "$signaler_status" -eq 0
 test "$timeout_status" -eq 143
 timeout_descendant_pid="$(cat "$timeout_descendant_pid_file")"
@@ -611,13 +623,25 @@ mkdir "$inspection_bin"
 printf '%s\n' '#!/bin/sh' ': >"$FINCH_SHADOW_PS_CALLED"' 'exit 0' >"$inspection_bin/ps"
 chmod +x "$inspection_bin/ps"
 (
-  while [[ ! -s "$inspection_pid" || ! -s "$inspection_home" ]]; do sleep 0.01; done
+  for _ in {1..3000}; do
+    [[ -s "$inspection_pid" && -s "$inspection_home" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -s "$inspection_pid" || ! -s "$inspection_home" ]]; then
+    echo "shadow-ps observer: timed out after 3000x10ms awaiting the descendant PID and HOME markers at $inspection_pid and $inspection_home (hung)" >&2
+    exit 91
+  fi
   observed_pid="$(cat "$inspection_pid")"
   observed_home="$(cat "$inspection_home")"
-  while /bin/ps -p "$observed_pid" -o pid= 2>/dev/null | grep -q '[0-9]'; do
+  for _ in {1..3000}; do
+    /bin/ps -p "$observed_pid" -o pid= 2>/dev/null | grep -q '[0-9]' || break
     test -d "$observed_home" || exit 1
     sleep 0.01
   done
+  if /bin/ps -p "$observed_pid" -o pid= 2>/dev/null | grep -q '[0-9]'; then
+    echo "shadow-ps observer: timed out after 3000x10ms awaiting the descendant's teardown while confirming $observed_home stayed present (hung)" >&2
+    exit 91
+  fi
   printf survived >"$inspection_observer"
 ) &
 inspection_observer_pid=$!
@@ -898,15 +922,16 @@ stubborn_later_pause_file="$scratch/stubborn.later-paused"
 late_signal_file="$scratch/late-signal.observed"
 phase=signal-during-teardown
 (
-  for _ in {1..400}; do
+  for _ in {1..3000}; do
     if [[ -s "$stubborn_target_file" && -s "$stubborn_term_file" ]]; then
       read -r supervisor_pid leader_pid <"$stubborn_target_file"
       printf '%s\n' "$leader_pid" >"$late_signal_file"
       kill -TERM "$supervisor_pid"
       exit 0
     fi
-    sleep 0.005
+    sleep 0.01
   done
+  echo "late teardown signaler: timed out after 3000x10ms awaiting the stubborn probe's target and first TERM markers at $stubborn_target_file and $stubborn_term_file (hung)" >&2
   exit 91
 ) & signaler_pid=$!
 signal_status=0
@@ -916,7 +941,14 @@ FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" \
 FINCH_STUBBORN_TERM_PAUSE_AFTER_FIRST_FILE="$stubborn_later_pause_file" run_isolated bash -ec '
   leader_pid=$BASHPID
   "$FINCH_TEST_SUPERVISOR_BIN" --child-stubborn-probe &
-  while [[ ! -s "$FINCH_STUBBORN_READY_FILE" ]]; do sleep 0.005; done
+  for ((_i = 0; _i < 3000; _i++)); do
+    [[ -s "$FINCH_STUBBORN_READY_FILE" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -s "$FINCH_STUBBORN_READY_FILE" ]]; then
+    echo "stubborn leader: timed out after 3000x10ms awaiting the stubborn-probe ready marker at $FINCH_STUBBORN_READY_FILE (hung)" >&2
+    exit 1
+  fi
   printf "%s %s\n" "$FINCH_TEST_SUPERVISOR_PID" "$leader_pid" >"$FINCH_STUBBORN_TARGET_FILE"
   printf "%s\n" "$HOME" >"$FINCH_STUBBORN_HOME_FILE"
   printf "%s\n" "$leader_pid" >"$FINCH_STUBBORN_PID_FILE"
@@ -926,7 +958,7 @@ signaler_status=0
 wait "$signaler_pid" || signaler_status=$?
 signaler_pid=''
 if [[ "$signaler_status" -ne 0 ]]; then
-  echo "late teardown signaler returned $signaler_status before observing the first stubborn-child TERM marker" >&2
+  echo "late teardown signaler returned $signaler_status after its 3000x10ms bound without observing the first stubborn-child TERM marker" >&2
   ls -l "$stubborn_target_file" "$stubborn_term_file" "$late_signal_file" >&2 || true
   exit 1
 fi
