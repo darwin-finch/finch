@@ -3372,6 +3372,19 @@ The frontend performs:
 
 1. parse with exact source spans;
 2. CTFE of values (`if`/`foreach` unroll) then, where needed, hygienic `syntax -> syntax` CTFE, not a second evaluator;
+
+**Added 2026-09-18: CTFE-of-values eligibility is gated by a function's declared effect row, never
+by whether its inputs happen to be compile-time constants.** Left unstated, a naive "inputs are
+known, so fold it" optimizer could try to run something like `read-file` at compile time merely
+because its path argument was a literal — executing real I/O against the build machine's
+filesystem, a different and potentially not-yet-existent environment from the actual runtime one, a
+correctness and security hazard, not an edge case. `! pure` is the eligibility bar; anything with a
+capability-gated or throwing effect is never eligible for this kind of folding, full stop, regardless
+of how constant its arguments are. Purity alone doesn't guarantee termination, and requiring proven
+totality would be undecidable in general, so termination isn't a static precondition here — the
+safety net is a fuel/step limit, reusing the scheduler's own existing "cycle/fuel failure" concept
+(`require`, above) rather than a second mechanism, producing a compile error on exhaustion instead of
+hanging the compiler on a runaway computation.
 3. name resolution and lexical binding;
 4. directional local inference plus explicit effect rows and practical subtyping/refinement checks;
 5. desugaring of `let`, `begin`, `if`, pattern matching, and named functions;
