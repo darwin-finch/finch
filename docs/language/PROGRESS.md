@@ -703,3 +703,26 @@ process of answering it.**
   just an access-control question, since a mixin-generated constructor already has full module
   access per the earlier "as if written at that site" rule. Fixed to explicitly widen with
   `:include-private #t`, matching what the generated constructor is genuinely allowed to do.
+
+**Continued 2026-09-18 — Shammah asked for more CTFE examples (fibonacci, n-choose-k) plus a
+specific, important negative case: things like I/O must never execute at compile time even when
+their inputs happen to be known.** Checked first rather than assumed addressed: the document says
+"CTFE of values" is a pipeline step but never states which functions are eligible for it — a real,
+previously unnoticed gap, and exactly the shape of hazard flagged: a naive "inputs are constant, so
+fold it" optimizer could have executed `read-file` against the build machine's filesystem merely
+because its path argument was a literal. Fixed: eligibility is `! pure`, unconditionally, regardless
+of argument constancy; termination isn't a static precondition (undecidable in general), so a
+fuel/step limit is the safety net, reusing the scheduler's own existing cycle/fuel-failure concept
+rather than a second mechanism. Written into the spec, then `fib`/`choose` (positive) and
+`read-file` (negative) written into `feature_tour.md` §13 to confirm the rule actually produces the
+intended distinction.
+
+Two further, unrelated questions raised in the same stretch, answered and logged as open items
+rather than resolved on the spot: tail-call guarantees ("proper tail calls where marked by the IR"
+is the only mention anywhere — doesn't say guarantee-vs-best-effort, what marks tail position, or
+mutual-recursion coverage), and compile-time file/data embedding (a real, safe, additive gap,
+carefully distinguished from the already-correct "no string mixin" prohibition, which is specifically
+about feeding bytes to the reader to be parsed as source — embedding a file's raw content as an
+inert value never does that). The downstream "generate tests from an embedded JSON fixture" use case
+needs nothing further once the embedding primitive exists — `json/parse` is already real and
+per-entry declaration generation is the already-established derive pattern.

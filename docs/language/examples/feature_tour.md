@@ -449,7 +449,54 @@ nameable missing utility function around an already-solid core (`fields-of`'s `k
 `datum->syntax`, `mixin`'s eager-escape composition, hygiene's no-collision guarantee). That's a
 meaningfully different, better outcome than finding the *mechanism* itself doesn't compose.
 
-## 13. Open gaps, current as of this pass — what's still missing and why
+## 13. CTFE-of-values: what folds, what never should, however constant its inputs look
+
+Testing the eligibility rule just added to the spec directly: `! pure` gates folding, not whether
+arguments happen to be literals.
+
+```lisp
+(define (fib (n : int)) : int
+  ! pure
+  (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+
+(define answer (fib 10))   ; eligible: fib is ! pure — folds to 55 at compile time
+```
+
+```lisp
+(define (factorial (n : int)) : int
+  ! pure
+  (if (<= n 1) 1 (* n (factorial (- n 1)))))
+
+(define (choose (n : int) (k : int)) : int
+  ! pure
+  (/ (factorial n) (* (factorial k) (factorial (- n k)))))
+
+(define c (choose 10 3))   ; eligible for the same reason — folds to 120
+```
+
+**The negative case this section was actually written to test:**
+
+```lisp
+(define (read-file (path : string)) : string
+  ! throws IoError
+  (fs-read-to-string path))
+
+(define config (read-file "config.txt"))
+; NOT eligible for CTFE-of-values folding — "config.txt" being a literal is irrelevant. read-file's
+; effect row (! throws IoError, and in a fuller example a capability requirement like
+; {fs.read(path=path)} alongside it) disqualifies it regardless of argument constancy. This call
+; happens at ordinary runtime, when `config` is actually initialized — never silently executed
+; against the build machine's filesystem just because the compiler could see a constant path.
+```
+
+No gap in the rule itself — `fib`/`choose`/`read-file` are exactly the case the eligibility
+addition was written to distinguish, and all three behave the way the rule says they should.
+**UNVERIFIED, not glossed:** the exact combined spelling for a capability requirement alongside
+`throws` in one effect row (`! {fs.read(path=path)} throws IoError`, guessed by analogy to the
+`!`-unification work) isn't shown together anywhere in a single real example — `read-file` above
+uses only `throws IoError` to stay inside confirmed syntax.
+
+## 14. Open gaps, current as of this pass — what's still missing and why
 
 - **Capability requests with wildcarded paths** (`read{path="~/**"}`) — still ungrammared; unchanged
   since first flagged.
@@ -487,3 +534,20 @@ meaningfully different, better outcome than finding the *mechanism* itself doesn
   `list`, `to-string`, `eq?`) — every one plausible, none confirmed against a real example. Worth
   resolving as a batch at some point rather than one at a time per new example, since the pattern of
   "invent a stdlib name, flag it, move on" is now recurring rather than incidental.
+- **Tail call guarantee, unresolved** (§13 area, raised directly rather than found by an example) —
+  "proper tail calls where marked by the IR" is the only mention anywhere in the document. Doesn't
+  say whether TCO is a guarantee (matching Scheme's actual defining property) or a best-effort
+  optimization, what marks a call as tail-position, or whether it covers mutual recursion between two
+  functions, not just self-recursion. A very different language depending on the answer.
+- **Compile-time file/data embedding** (raised directly) — no `include_str!`/`include_bytes!`
+  equivalent exists anywhere. Distinct from the already-correct "no string mixin" prohibition (that
+  rule is specifically about feeding bytes to the *reader* to be parsed as Finch source, which stays
+  forbidden) — embedding a file's raw content as an inert string/byte value never touches the reader
+  and is a safe, additive gap, not a conflict with an existing rule. The downstream use case (parse
+  the embedded text as JSON, generate one test declaration per entry via CTFE) needs nothing further
+  once the embedding primitive exists: `json/parse` is already real, and per-entry declaration
+  generation is exactly the already-established derive/`mixin` pattern.
+- **Combined capability-requirement-plus-`throws` effect-row spelling** (§13, new this pass) — a
+  function like `read-file` plausibly needs both a capability requirement (`{fs.read(path=path)}`)
+  and `throws IoError` in one effect row; no real example shows both together, so §13's `read-file`
+  intentionally uses only the confirmed half.
