@@ -939,3 +939,36 @@ distinction that decides which one a real concept needs: does any `dyn` value fo
 get read by code that wasn't recompiled with it. `Range` used only within one program, one
 compilation, needs nothing extra. A `Range` handed across an RPC boundary or loaded from a plugin
 built against last month's revision of the concept does.
+
+## 23. Naming an implementation cuts both ways — real duplicate detection, not just use-site ambiguity
+
+Directly from a question about the exact failure mode naming was introduced to fix: if a
+programmer can name implementations freely, what stops `RectangleMeasurable2` from being an
+accidental copy-paste duplicate of `RectangleMeasurable` rather than a deliberate second choice?
+The document's existing ambiguity rule ("competing equally valid evidence is an ambiguity error")
+turned out to only cover the *use* site — a call with no `using` and no default — and says nothing
+about the *declaration* site, which is where this specific mistake actually happens.
+
+```text
+implementation RectangleMeasurable for Rectangle : Measurable {
+    operation area      = rect-area
+    operation perimeter = rect-perimeter
+}
+
+implementation RectangleMeasurable2 for Rectangle : Measurable {
+    operation area      = rect-area        ; REJECTED — identical to RectangleMeasurable in every
+    operation perimeter = rect-perimeter   ; binding; nothing could ever distinguish the two
+}
+
+implementation RectangleCompactMeasurable for Rectangle : Measurable {
+    operation area      = rect-area-fast-approx   ; ACCEPTED — genuinely differs in one binding
+    operation perimeter = rect-perimeter
+}
+```
+
+The check is purely structural (do the two implementations bind every requirement to the same
+callable), never a judgment about whether the difference is *meaningful* — that question is
+undecidable in general, the same reason the compiler can't verify `isInputRange`-style semantic
+promises elsewhere in this document. `RectangleCompactMeasurable` is accepted the moment even one
+binding differs, exactly the same freedom the canonical/compact-JSON case relies on, with the
+degenerate, no-possible-difference case now rejected instead of silently permitted.

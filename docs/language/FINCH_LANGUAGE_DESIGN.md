@@ -4085,6 +4085,18 @@ Exported evidence is named and stable.
 Each requirement has exactly one selected mapping in a compilation context; competing equally valid
 evidence is an ambiguity error, never an import-order decision.
 
+That ambiguity rule governs the *use* site — a call with no `using` and no applicable default. It
+does not, by itself, catch a different mistake at the *declaration* site: naming an implementation
+is what lets two genuinely different ways of satisfying the same concept for the same type coexist
+(canonical and compact JSON), but the same freedom to name one also lets a programmer declare two
+implementations that are not different at all — a duplicate, most plausibly from copy-paste, that
+happens to carry a different name. The verifier rejects this: two named implementations of the same
+concept for the same type whose operation and associated mappings are all identically bound are a
+compile error, not two legitimate choices for a caller. This needs no judgment about *meaningful*
+difference, which is undecidable in general (a compiler cannot know whether "compact" JSON actually
+encodes differently from "canonical" JSON) — only whether every requirement resolves to the same
+callable in both, which is a plain equality check. If even one operation differs, the two stand.
+
 Concept evidence is never made ambient merely by loading or importing its defining module. Every
 implementation has a stable qualified name. A call either names it with `using`, receives it through
 a generic evidence parameter, or uses one default explicitly imported into that lexical compilation

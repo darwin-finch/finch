@@ -1141,3 +1141,23 @@ implementations still need two different names (`Json`/`CompactJson`) since `for
 shared between them. Not yet applied across the document's existing examples (`UserJson`,
 `WidgetDrawable`, `RectangleHasArea`, `RectangleMeasurable`), which still use the compound-name
 convention — worth a follow-up pass once confirmed as the direction to take everywhere.
+
+**Continued 2026-09-18 — real gap found in named-implementation freedom: nothing caught a
+declaration-site duplicate.** Shammah's question cut straight to the tension in the justification
+given a few turns earlier for why implementations need names at all (disambiguating genuinely
+different implementations of the same concept for the same type): the same naming freedom that
+permits `RectangleMeasurable`/`RectangleCompactMeasurable` to coexist also permits
+`RectangleMeasurable`/`RectangleMeasurable2` to coexist, with nothing distinguishing "deliberately
+different" from "accidental copy-paste duplicate under a different name." Checked the document's
+existing ambiguity rule ("competing equally valid evidence is an ambiguity error") and confirmed it
+doesn't cover this — that rule governs the *use* site (a call with no `using` and no default), not
+the *declaration* site, which is where this specific mistake happens.
+
+Added a real check rather than leaving it implied: two named implementations of the same concept for
+the same type whose operation/associated mappings are all identically bound are a compile error.
+Deliberately scoped to structural identity only, never a judgment call about whether a difference is
+*meaningful* — undecidable in general, the same limitation already established for why the compiler
+can't verify `isInputRange`-style semantic promises. If even one operation binds to a different
+callable, both implementations stand; canonical-vs-compact-JSON keeps working exactly as designed.
+Worked example added as `feature_tour.md` §23, showing both the rejected identical case and an
+accepted genuinely-differing one side by side.
