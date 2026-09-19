@@ -30,6 +30,17 @@ else
   supervisor="$FINCH_TEST_SUPERVISOR_BIN"
   selected_cargo_target="${CARGO_TARGET_DIR:-}"
 fi
+# An inherited supervisor carries its Cargo target with it: the pinned
+# supervisor lives at "$target/debug/<name>", so the target directory is
+# derivable when the caller did not export CARGO_TARGET_DIR (the CI harness
+# step sets FINCH_TEST_SUPERVISOR_BIN alone — issue #858's silent exit 69).
+if [[ -n "$supervisor" && -z "$selected_cargo_target" ]]; then
+  case "$supervisor" in
+    */target/debug/*|*/target/release/*)
+      selected_cargo_target="${supervisor%/*}/.."
+      ;;
+  esac
+fi
 [[ -x "$supervisor" ]] || { echo 'inherited test supervisor is not executable' >&2; exit 69; }
 if [[ -z "$selected_cargo_target" || "$selected_cargo_target" != /* ||
   ! -d "$selected_cargo_target" ]]; then
