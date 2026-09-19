@@ -726,3 +726,36 @@ about feeding bytes to the reader to be parsed as source — embedding a file's 
 inert value never does that). The downstream "generate tests from an embedded JSON fixture" use case
 needs nothing further once the embedding primitive exists — `json/parse` is already real and
 per-entry declaration generation is the already-established derive pattern.
+
+**Continued 2026-09-18 — Shammah composed the last few finding into one pipeline himself
+("include_str into a JSON parser at compile time, CTFE-generate a bunch of test cases, mixin a
+unit test... which I think is awesome") and it caught a real bug in the rule written minutes
+earlier, plus settled two more design questions cleanly.**
+
+- **Bug caught in my own just-written CTFE-eligibility rule**: it excluded anything that `throws`
+  in addition to anything capability-gated — contradicting the `!`-unification work from much
+  earlier this session, where `! pure` and `throws` were established as orthogonal axes, not
+  mutually exclusive. A `! pure throws ParseError` function (`json/parse`) is exactly as eligible as
+  a totally pure one; throwing on bad compile-time input is an ordinary correctness signal, nothing
+  like the hazard a real capability effect creates by touching something external. Fixed in the spec
+  and in `feature_tour.md`'s `read-file` example, which had attributed its disqualification to the
+  wrong half of its effect row.
+- **`json/parse` should return `result<JSON, Error>`, not `throws`** — Shammah's direct correction,
+  matching the value-based-failure design already established for `result<T,E>` generally (never
+  alters control flow until explicitly converted). Used this way in the new §14 example: `?`
+  propagates the `result` out of the generating function, which is declared `! throws JsonError` —
+  reusing `?`/`throws` exactly as already specified, not inventing a `panic`-in-CTFE mechanism to
+  handle the failure path.
+- **Unhandled `throw` during CTFE execution is a compile error** — genuinely unstated until asked
+  about directly; added as its own explicit rule, reusing the same correctness-signal logic an
+  unhandled `result` error or failed `match` already carries, rather than leaving it undefined.
+- **`include-str`/`include-bytes` modeled as `! comptime` hooks, per direct correction** — not
+  ordinary `! pure` functions riding the general CTFE-eligibility rule. Real distinction: `fib` can
+  still be called at runtime with a non-constant argument and behave sensibly; embedding a file's
+  contents is never meaningful at runtime at all, so it belongs in the same hook catalog as
+  `members-of`/`fields-of` rather than depending on argument-constancy the way ordinary CTFE-of-
+  values folding does.
+- **Full pipeline written end to end** (`feature_tour.md` §14): `include-str` → `json/parse` →
+  `?`/`throws` propagation → `map` building `syntax` forms via quasiquote → `mixin`. Every piece
+  fits together exactly as specified; two narrower things flagged unconfirmed rather than assumed
+  (JSON-value field access shape, `test`/`test-suite`'s exact argument order).

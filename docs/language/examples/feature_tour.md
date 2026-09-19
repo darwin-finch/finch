@@ -498,7 +498,55 @@ rule says they should. **UNVERIFIED, not glossed:** the exact combined spelling 
 `!`-unification work, not confirmed against a single real example showing a capability and `throws`
 together in one row.
 
-## 14. Open gaps, current as of this pass — what's still missing and why
+## 14. `include-str` + `json/parse` + CTFE + `mixin` — generate a test suite from a data file
+
+The composition Shammah pointed out directly, worked all the way through: embed a JSON fixture at
+compile time, parse it, generate one test per entry, splice the whole suite in.
+
+```lisp
+(define (generate-tests-from-json (path : string)) : syntax
+  ! throws JsonError
+  (let [text (include-str path)]
+    (let [cases (? (json/parse text))]
+      (let [test-forms (map (lambda (c)
+                               `(test ,(. c name)
+                                  (lambda (ctx)
+                                    (assert-eq (compute (. c input)) (. c expected)))))
+                             cases)]
+        `(test-suite ,path ,@test-forms)))))
+
+(mixin (generate-tests-from-json "test-cases.json"))
+```
+
+**Deliberately uses `?`/`throws` for the failure path, not an invented `panic`-in-CTFE mechanism —
+this is the point worth being precise about.** `json/parse` returns `result<JSON, Error>`, per
+Shammah's correction to prefer that over `throws` for the parser itself (a value-based failure that
+never alters control flow until explicitly converted, rather than an exception). `?` propagates that
+`result` out of `generate-tests-from-json`, which is why the function is declared `! throws
+JsonError` — ordinary, already-established mechanics, reused rather than reinvented. Since this
+whole call happens at compile time (`include-str` taints the function `! comptime`, discharged by
+`mixin`, and `include-str`'s own eligibility — established just for it — doesn't depend on the
+general `! pure` rule at all, since embedding a file is never meaningful at runtime in the first
+place), a malformed fixture file surfaces as an ordinary compile error at this `mixin` call, per the
+just-added "unhandled throw during CTFE is a compile error" rule — not a runtime surprise on
+whichever machine happens to load the fixture later, and not a silently-generated empty test suite.
+
+**No gap in the composition itself** — `include-str`, `json/parse`'s `result` shape, `?`/`throws`
+propagation, `map` building a list of `syntax` forms via quasiquote, and `mixin` discharging the
+whole chain all fit together exactly as each piece was specified. **What's still unconfirmed, named
+precisely rather than assumed:**
+
+- **Field access on a parsed JSON value** (`(. c name)`, `(. c input)`) — assumes a parsed JSON
+  object supports the same `.`-access CoLisp records already do; plausible (JSON objects are
+  map-shaped, and maps are mentioned as exposing traversal operations through concepts), not
+  confirmed against any real example of accessing one.
+- **`(test name (lambda (ctx) ...))` and `(test-suite name form...)`'s exact CoLisp call shape** —
+  the parity ledger confirms these exist (`(test ...)`, `(test-suite ...)`), the same abstract level
+  of confirmation as `match`/`variant`'s ledger entries; the concrete argument shape used here
+  (name first, then a context-taking lambda) is inferred from the real `test-suite`/`test` example
+  used for `json/parse` itself earlier in the document, not independently confirmed.
+
+## 15. Open gaps, current as of this pass — what's still missing and why
 
 - **Capability requests with wildcarded paths** (`read{path="~/**"}`) — still ungrammared; unchanged
   since first flagged.
@@ -541,15 +589,19 @@ together in one row.
   say whether TCO is a guarantee (matching Scheme's actual defining property) or a best-effort
   optimization, what marks a call as tail-position, or whether it covers mutual recursion between two
   functions, not just self-recursion. A very different language depending on the answer.
-- **Compile-time file/data embedding** (raised directly) — no `include_str!`/`include_bytes!`
-  equivalent exists anywhere. Distinct from the already-correct "no string mixin" prohibition (that
-  rule is specifically about feeding bytes to the *reader* to be parsed as Finch source, which stays
-  forbidden) — embedding a file's raw content as an inert string/byte value never touches the reader
-  and is a safe, additive gap, not a conflict with an existing rule. The downstream use case (parse
-  the embedded text as JSON, generate one test declaration per entry via CTFE) needs nothing further
-  once the embedding primitive exists: `json/parse` is already real, and per-entry declaration
-  generation is exactly the already-established derive/`mixin` pattern.
-- **Combined capability-requirement-plus-`throws` effect-row spelling** (§13, new this pass) — a
-  function like `read-file` plausibly needs both a capability requirement (`{fs.read(path=path)}`)
-  and `throws IoError` in one effect row; no real example shows both together, so §13's `read-file`
+- **Combined capability-requirement-plus-`throws` effect-row spelling** (§13) — a function like
+  `read-file` plausibly needs both a capability requirement (`{fs.read(path=path)}`) and
+  `throws IoError` in one effect row; no real example shows both together, so §13's `read-file`
   intentionally uses only the confirmed half.
+- **Field access on a parsed JSON value, and `test`/`test-suite`'s exact call shape** (§14, new this
+  pass) — `(. c name)` on a parsed JSON object is plausible but unconfirmed; `(test name (lambda
+  (ctx) ...))` is inferred from the real `json/parse` test example elsewhere in the document, at the
+  same confirmation level as the parity ledger's abstract `(test ...)` entry, not independently
+  verified.
+
+**Resolved this pass, removed from this list rather than left stale:** compile-time file/data
+embedding (added as `include-str`/`include-bytes`, modeled as `! comptime` hooks rather than
+ordinary `! pure` functions, since embedding is never meaningful at runtime at all — a real
+distinction from `fib`-style CTFE-of-values eligibility) and the question of what happens to an
+unhandled `throw` during compile-time execution (a compile error, reusing the same correctness-
+signal logic an unhandled `result` error already has, not a new failure mode).

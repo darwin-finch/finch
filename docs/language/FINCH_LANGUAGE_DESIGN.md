@@ -3699,6 +3699,39 @@ to promote it into a syntax identifier — this is the narrower, single-symbol c
 already covers, distinct from the still-open `ParameterSpec -> syntax` gap, which is specifically
 about reconstructing a whole *parameter list* with types and ownership modes, not one bare name.
 
+**Added 2026-09-18: `include-str`/`include-bytes`, compile-time-only hooks for embedding an
+external file's contents as a constant — not ordinary `! pure` functions that merely happen to be
+foldable.** Distinct in kind from `fib`-style CTFE-of-values eligibility: `fib` can still be called
+at runtime with a non-constant argument and behave sensibly; `include-str` cannot — there is no
+meaningful runtime fallback for "embed this file's content," the operation only ever makes sense at
+compile time, so it belongs in the same `! comptime` catalog as `members-of`/`fields-of` rather than
+riding on the general eligibility rule above. The path argument must itself be a compile-time
+constant for the same reason `include-str`'s result is meant to be one.
+
+```
+(include-str "test-cases.json")     ; ! comptime — the file's contents, as a string, embedded at
+                                      ; compile time. Never touches the reader — no parsing as
+                                      ; Finch source happens, so this doesn't reopen "no string
+                                      ; mixin, no compile(text)" (above); it's data, the same
+                                      ; category as any other string literal, just file-sourced.
+(include-bytes "logo.png")           ; ! comptime — the same, for raw bytes
+```
+
+Discharges the same way any other `! comptime` hook whose result is an ordinary value does: full
+constant-folding, once the result is a concrete string/bytes constant, not `syntax` — no new
+discharge point needed.
+
+**Added 2026-09-18: an unhandled `throw` during CTFE-of-values execution is a compile error, not
+undefined or silently propagated to nowhere.** Genuinely unstated until asked about directly. A
+`! pure throws E` function evaluated at compile time (`json/parse`, say, given a compile-time
+constant string) either produces an ordinary value or throws `E` — and since there is no caller at
+runtime to catch it, an uncaught throw during this evaluation surfaces as an ordinary compile-time
+diagnostic, the same correctness signal an unhandled `result<T,E>` error or a failed `match` would
+give. This is exactly why `! pure`-and-`throws` staying eligible (corrected above) is safe rather
+than surprising: failure at compile time on bad compile-time input is the expected outcome, not a
+new hazard — the hazard this whole eligibility rule exists to prevent is a *capability* effect
+reaching outside the compiler, which `throws` alone never does.
+
 **Added 2026-09-18: mixin-spliced code's private-field access, confirmed rather than left implicit.**
 "Compiled as if they had been written at that site" (`mixin`, above) means a mixin's generated
 declaration takes on the module-membership of *where it lands*, not of whichever module defined the
