@@ -52,8 +52,17 @@ const TEARDOWN_SIGTERM_BOUND: Duration = Duration::from_secs(TEARDOWN_SIGTERM_SE
 const TEARDOWN_SIGKILL_BOUND: Duration = Duration::from_secs(TEARDOWN_SIGKILL_SECS);
 const STUBBORN_FIXTURE_PAUSE: Duration = Duration::from_secs(STUBBORN_FIXTURE_PAUSE_SECS);
 
-/// How long a probe waits for its continuation before giving up.
-const PROBE_CONTINUATION_BOUND: Duration = Duration::from_secs(TEARDOWN_BOUND_SECS);
+/// How long a probe waits for its continuation before giving up. This is a
+/// coordination bound, not an ownership bound: it must move together with the
+/// paired wall-clock deadline in `scripts/test_brain_isolation.sh`'s manifest
+/// race swapper (#328) -- raising one side alone means the probe waits out a
+/// bound for a file the swapper already abandoned, or the swapper gives up on
+/// a probe that is still parked. The paired deadline must absorb the measured
+/// 20-30s supervisor spawn cadence of a degraded shared runner (the 8s
+/// deadline expired on CI run 35437807757 while each supervisor spawn took
+/// tens of seconds), so 120s covers that with the same headroom the
+/// attempts-counted polls get from their load-stretched attempts.
+const PROBE_CONTINUATION_BOUND: Duration = Duration::from_secs(120);
 
 /// Poll spacing for every bounded wait in this binary.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);

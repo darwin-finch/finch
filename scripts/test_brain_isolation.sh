@@ -62,6 +62,8 @@ supervisor_backup=''
 supervisor_backup_target=''
 substitution_restored=''
 shell_wrong_digest_supervisor=''
+pin_launcher_pid_one=''
+pin_launcher_pid_two=''
 cleanup_regression() {
   if [[ -n "$signaler_pid" ]]; then wait "$signaler_pid" 2>/dev/null || true; fi
   if [[ -n "$sentinel_pid" ]]; then printf '\n' >&7 2>/dev/null || true; wait "$sentinel_pid" 2>/dev/null || true; fi
@@ -75,6 +77,14 @@ cleanup_regression() {
   fi
   if [[ -n "$shell_wrong_digest_supervisor" ]]; then
     rm -f -- "$shell_wrong_digest_supervisor"
+  fi
+  if [[ -n "$pin_launcher_pid_one" ]]; then
+    kill "$pin_launcher_pid_one" 2>/dev/null || true
+    wait "$pin_launcher_pid_one" 2>/dev/null || true
+  fi
+  if [[ -n "$pin_launcher_pid_two" ]]; then
+    kill "$pin_launcher_pid_two" 2>/dev/null || true
+    wait "$pin_launcher_pid_two" 2>/dev/null || true
   fi
   exec 7>&- 2>/dev/null || true
   rm -rf -- "$scratch"
@@ -398,13 +408,44 @@ run_concurrent_launcher() {
 }
 run_concurrent_launcher "$pin_result_one" "$pin_diagnostic_one" & pin_pid_one=$!
 run_concurrent_launcher "$pin_result_two" "$pin_diagnostic_two" & pin_pid_two=$!
-for _ in {1..3000}; do
+pin_launcher_pid_one="$pin_pid_one"
+pin_launcher_pid_two="$pin_pid_two"
+# A poll bound here is a hang detector, not a precision timing oracle: each
+# launcher's whole lifetime (Cargo freshness build, immutable publication, and
+# its supervised command) holds the repository-wide cargo slot, so the two
+# launchers serialize behind each other and behind any other slot holder. A
+# fixed wall budget cannot distinguish "externally blocked by a live slot
+# holder" from "hung", so the base bound covers the uncontended case and the
+# wait extends only while the slot is held, capped at the slot's own default
+# acquisition timeout (900s in with-cargo-slot). The phase still fails,
+# naming the ready count and the slot holders, if the markers never appear.
+slot_lock_path="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/finch-cargo-slot.lock"
+slot_holder_pids() {
+  lsof -F p -- "$slot_lock_path" 2>/dev/null | sed -n 's/^p//p' | tr '\n' ' '
+}
+for _ in {1..12000}; do
   ready_count="$(find "$pin_ready_dir" -type f | wc -l | tr -d ' ')"
   [[ "$ready_count" -eq 2 ]] && break
   sleep 0.01
 done
+concurrent_slot_holders=''
 if [[ "${ready_count:-0}" -ne 2 ]]; then
-  echo "concurrent maintained launchers did not both reach immutable publication within 3000x10ms; ready=${ready_count:-0} (hung)" >&2
+  concurrent_slot_holders="$(slot_holder_pids)"
+  if [[ -n "$concurrent_slot_holders" ]]; then
+    for _ in {1..90000}; do
+      ready_count="$(find "$pin_ready_dir" -type f | wc -l | tr -d ' ')"
+      [[ "$ready_count" -eq 2 ]] && break
+      sleep 0.01
+    done
+    concurrent_slot_holders="$(slot_holder_pids)"
+  fi
+fi
+if [[ "${ready_count:-0}" -ne 2 ]]; then
+  if [[ -n "$concurrent_slot_holders" ]]; then
+    echo "concurrent maintained launchers did not both reach immutable publication within their 120s base bound plus the 900s slot-extension; ready=${ready_count:-0}; repository cargo slot held by pids: $concurrent_slot_holders (hung)" >&2
+  else
+    echo "concurrent maintained launchers did not both reach immutable publication within 12000x10ms with no cargo-slot holder; ready=${ready_count:-0} (hung)" >&2
+  fi
   sed 's/^/launcher one: /' "$pin_diagnostic_one" >&2 || true
   sed 's/^/launcher two: /' "$pin_diagnostic_two" >&2 || true
   exit 1
@@ -414,6 +455,8 @@ pin_status_one=0
 pin_status_two=0
 wait "$pin_pid_one" || pin_status_one=$?
 wait "$pin_pid_two" || pin_status_two=$?
+pin_launcher_pid_one=''
+pin_launcher_pid_two=''
 if [[ "$pin_status_one" -ne 0 || "$pin_status_two" -ne 0 ]]; then
   echo "concurrent maintained launchers failed after publication: one=$pin_status_one two=$pin_status_two" >&2
   sed 's/^/launcher one: /' "$pin_diagnostic_one" >&2 || true
@@ -852,16 +895,21 @@ phase=manifest-swap-to-fifo-status
 race_name=manifest-race-node
 race_path="$fake_home/.finch/brains/$race_name"
 (
-  # Paired with PROBE_CONTINUATION_BOUND in finch-test-supervisor.rs. The probe
-  # parks waiting for the continuation this subshell publishes, so a shorter
-  # window here means the probe waits out a bound for a file that was already
-  # abandoned. Raising one side alone is worse than raising neither (#328).
-  race_deadline=$(( $(date +%s) + 8 ))
+  # Paired with PROBE_CONTINUATION_BOUND in finch-test-supervisor.rs: the two
+  # deadlines must move together (#328) because the probe parks waiting for
+  # the continuation this subshell publishes. This is the harness's only
+  # wall-clock deadline -- the attempts-counted polls elsewhere stretch with
+  # load, a fixed wall budget does not -- so it must cover the measured
+  # 20-30s supervisor spawn cadence of a degraded shared runner (the 8s
+  # deadline expired on CI run 35437807757 while each supervisor spawn took
+  # tens of seconds; earlier phases in the same run spanned the gap in
+  # silence between 11:01:43 and 11:04:43).
+  race_deadline=$(( $(date +%s) + 120 ))
   while :; do
     race_ready="$(find "$temp_parent" -maxdepth 2 -name .manifest-race-ready -print -quit)"
     [[ -n "$race_ready" ]] && break
     if (( $(date +%s) >= race_deadline )); then
-      echo "manifest race swapper: probe never published .manifest-race-ready under $temp_parent within 8s; the probe is waiting on a continuation this subshell will not write" >&2
+      echo "manifest race swapper: probe never published .manifest-race-ready under $temp_parent within 120s (hung); the probe is waiting on a continuation this subshell will not write" >&2
       exit 1
     fi
     sleep 0.005
