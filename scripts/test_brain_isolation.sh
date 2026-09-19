@@ -105,6 +105,17 @@ exercise_supervisor_substitution() {
   local substitution_ready="$scratch/substitution-$label.ready"
   local substitution_continue="$scratch/substitution-$label.continue"
   local substitution_rejected="$scratch/substitution-$label.rejected"
+  # A poll bound here is a hang detector, not a precision timing oracle: the
+  # candidate is a freshly spawned, freshly isolated supervisor child, and by
+  # the time this phase runs the 2-vCPU ubuntu-24.04 CI runner has already
+  # forked every process every earlier phase in this script used. This phase
+  # never ran on CI before the freshness/target-derivation fixes in #858 got
+  # the script past its earlier silent exit 69, so a fixed 400x10ms=4s bound
+  # (right for a quiet workstation) had never been measured against a loaded
+  # runner. 3000x10ms=30s matches the coarse bounds this codebase already
+  # accepts for supervised-process startup under load (e.g. `wait_for_health`
+  # in tests/daemon_integration_test.rs).
+  local poll_attempts=3000
 
   phase="supervisor-substitution-rejected-$label"
   substitution_restored="$scratch/substitution-$label.restored"
@@ -115,37 +126,50 @@ exercise_supervisor_substitution() {
   FINCH_SUBSTITUTION_CONTINUE="$substitution_continue" \
   FINCH_SUBSTITUTION_REJECTED="$substitution_rejected" \
   FINCH_SUBSTITUTION_RESTORED="$substitution_restored" \
+  FINCH_SUBSTITUTION_POLL_ATTEMPTS="$poll_attempts" \
     FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" "$candidate" bash -ec '
       : >"$FINCH_SUBSTITUTION_READY"
-      for _ in {1..400}; do
+      for ((_i = 0; _i < FINCH_SUBSTITUTION_POLL_ATTEMPTS; _i++)); do
         [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]] && break
         sleep 0.01
       done
-      test -e "$FINCH_SUBSTITUTION_CONTINUE"
+      if [[ ! -e "$FINCH_SUBSTITUTION_CONTINUE" ]]; then
+        echo "substitution probe: timed out after ${FINCH_SUBSTITUTION_POLL_ATTEMPTS}x10ms awaiting the continue signal at $FINCH_SUBSTITUTION_CONTINUE" >&2
+        exit 1
+      fi
       if "$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof >/dev/null 2>&1; then
+        echo "substitution probe: --verify-inherited-proof unexpectedly accepted the substituted image" >&2
         exit 1
       fi
       : >"$FINCH_SUBSTITUTION_REJECTED"
-      for _ in {1..400}; do
+      for ((_i = 0; _i < FINCH_SUBSTITUTION_POLL_ATTEMPTS; _i++)); do
         [[ -e "$FINCH_SUBSTITUTION_RESTORED" ]] && exit 0
         sleep 0.01
       done
+      echo "substitution probe: timed out after ${FINCH_SUBSTITUTION_POLL_ATTEMPTS}x10ms awaiting the restored signal at $FINCH_SUBSTITUTION_RESTORED" >&2
       exit 1
     ' & substitution_pid=$!
-  for _ in {1..400}; do
+  local attempt
+  for ((attempt = 0; attempt < poll_attempts; attempt++)); do
     [[ -e "$substitution_ready" ]] && break
     sleep 0.01
   done
-  test -e "$substitution_ready"
+  if [[ ! -e "$substitution_ready" ]]; then
+    echo "$phase: timed out after ${poll_attempts}x10ms awaiting the substituted child's readiness marker at $substitution_ready" >&2
+    exit 1
+  fi
   mv -- "$candidate" "$supervisor_backup"
   install -m 0555 "$supervisor_backup" "$candidate"
   test "$(brain_isolation_file_identity "$candidate")" != "$candidate_identity"
   : >"$substitution_continue"
-  for _ in {1..400}; do
+  for ((attempt = 0; attempt < poll_attempts; attempt++)); do
     [[ -e "$substitution_rejected" ]] && break
     sleep 0.01
   done
-  test -e "$substitution_rejected"
+  if [[ ! -e "$substitution_rejected" ]]; then
+    echo "$phase: timed out after ${poll_attempts}x10ms awaiting the substitution-rejected marker at $substitution_rejected" >&2
+    exit 1
+  fi
   mv -f -- "$supervisor_backup" "$candidate"
   supervisor_backup=''
   supervisor_backup_target=''
