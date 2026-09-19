@@ -1031,3 +1031,31 @@ Worked example added as `feature_tour.md` §20: `foo!(T)(x: T) => x + x` is reje
 bound declared (not a per-instantiation SFINAE failure — there is nothing to compile until a bound
 exists to check against), and accepted once `T : Add<T,T,Output=int>` is declared, generating one
 distinct compiled function per concrete `T` thereafter.
+
+**Continued 2026-09-18 — two concept-design questions resolved by confirming already-established
+mechanics, no new decisions needed.** First, Shammah's imagined UFCS-based route for "add a concept
+to an existing type" (write free functions with the right names, let UFCS resolve them as methods)
+identified as structurally incapable of the "required groupings" himself: UFCS is a per-call,
+scope-sensitive name-resolution rule with no unit that could bundle a concept's several required
+operations into one atomic, checked, named claim — it would silently accept a partially-satisfied
+type until first use (structural discovery again, not explicit declaration), reintroduce the
+import-scope dependence the document already forbids elsewhere, and has no way to name or select
+between two competing satisfactions of the same concept. The ergonomic win UFCS was chasing (call a
+plain free function as if it were a method) is already native via `operation front = my-list-front
+#73` inside an `implementation` block — same benefit, none of the structural failure, because the
+binding is a one-time grouped declaration rather than an ambient per-call rule.
+
+Second, a direct, real Rust complaint: two traits requiring operations that happen to do the exact
+same thing force either duplicated method bodies or manually routing both through a free function as
+a workaround. Checked against the already-established adapter model (`operation X = callable`,
+never an obligatory freshly-authored inline body) and confirmed the complaint doesn't apply: binding
+to an existing callable is Finch's ordinary case, not a workaround reached for when the trait-body
+expectation gets in the way, so the same free function binds into as many concepts as need it with
+zero duplication. Not previously stated explicitly anywhere in the document despite following
+directly from the existing `JsonSerializable`/`Drawable` adapter examples — added as an explicit
+design-rationale paragraph plus a `HasArea`/`Measurable`/`rect-area` worked example
+(`feature_tour.md` §21) rather than left merely inferable.
+
+Neither of these needed a new decision or a changed mechanism — both were the existing
+explicit-evidence model answering questions it was already positioned to answer, just not yet
+pointed at these two specific, real complaints before now.

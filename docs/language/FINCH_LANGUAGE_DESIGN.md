@@ -4060,6 +4060,30 @@ JsonSerializable.serialize(user) using UserJson
 BinarySerializable.serialize(user) using UserBinary
 ```
 
+This is what avoids a real, known Rust trait-ergonomics complaint: two unrelated concepts that
+happen to require operations with identical behavior — `HasArea.area` and `Measurable.area` — never
+force two hand-written, identical method bodies, and never force reaching for a free function as a
+workaround for the fact that a trait method is otherwise expected to be its own body. An `operation`
+mapping is *always* a binding to something that already exists — a free function, a member, another
+implementation's evidence via `using` — never an obligatory freshly-authored inline body, so the
+same free function binds into as many `implementation` blocks, for as many unrelated concepts, as
+actually need it, with zero duplication and no separate "escape to a free function" mechanism to
+reach for, because binding to one *is* the ordinary case:
+
+```text
+(define (rect-area (r : &Rectangle)) : f64
+  (* r.width r.height))
+
+implementation RectangleHasArea for Rectangle : HasArea {
+    operation area = rect-area#10
+}
+
+implementation RectangleMeasurable for Rectangle : Measurable {
+    operation area      = rect-area#10   ; same identity, bound again — not rewritten
+    operation perimeter = rect-perimeter#11
+}
+```
+
 Erasing `user` as `dyn JsonSerializable using UserJson` is the corresponding deliberate runtime-
 dispatch choice: the erasure site names the evidence, policy, or wrapper type, and the resulting
 existential carries `UserJson`'s evidence table, so its `serialize` slot is

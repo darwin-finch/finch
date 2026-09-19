@@ -850,3 +850,45 @@ tries `x + x` on a `T` that doesn't support it (or silently exclude `foo` as a n
 candidate via SFINAE if another overload exists). Finch's body is either provably valid under its
 declared bound or it does not exist as a candidate at all — there is no "maybe it'll work out for
 some future caller" state for a generic body to be in.
+
+## 21. Two concepts, one shared free function — the Rust trait-duplication complaint doesn't apply
+
+From a direct complaint about Rust traits: two traits can require operations that happen to do
+exactly the same thing, and Rust forces either two identical method bodies or manually routing both
+through a free function as a workaround. Checked against the concept model already established this
+session (`operation X = some-callable`, never an obligatory inline body): the workaround Rust makes
+you reach for is Finch's ordinary case, so the complaint doesn't arise in the first place.
+
+```text
+concept HasArea {
+    operation area(&self) -> f64
+}
+
+concept Measurable {
+    operation area(&self) -> f64
+    operation perimeter(&self) -> f64
+}
+
+(define (rect-area (r : &Rectangle)) : f64
+  (* r.width r.height))
+
+(define (rect-perimeter (r : &Rectangle)) : f64
+  (* 2.0 (+ r.width r.height)))
+
+implementation RectangleHasArea for Rectangle : HasArea {
+    operation area = rect-area#10
+}
+
+implementation RectangleMeasurable for Rectangle : Measurable {
+    operation area      = rect-area#10
+    operation perimeter = rect-perimeter#11
+}
+```
+
+Both `area` operations bind the identical `rect-area#10` callable — one function, written once,
+referenced twice. `HasArea.area(rect)` and `Measurable.area(rect)` are two distinct, concept-
+qualified calls (per the document's own "operation names live in their concept evidence" rule
+above), so the shared name (`area`) across the two concepts never collides or needs disambiguating
+at the call site either. Nothing here is new machinery — it falls directly out of the adapter model
+already established for `JsonSerializable`/`Drawable`; it just hadn't been pointed at this specific,
+real complaint before.
