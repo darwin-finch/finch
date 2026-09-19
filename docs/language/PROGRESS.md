@@ -603,3 +603,27 @@ established, working method from earlier in the session, just run unattended. Ne
 roughly in order of how load-bearing they are: `ParameterSpec -> syntax` (blocks any further
 structural-CTFE example), the compile-time-hook catalog (mechanism is specified, nothing concrete
 uses it yet), and `borrow-mut`/mutable-locals (two names for what may be one underlying gap).
+
+**Continued 2026-09-18 — Shammah back, corrected two things I got wrong in the constructor/mixin
+discussion, both fixed with real spec additions rather than just conceded in chat.**
+
+- **"Default is not the same as a constructor."** Proposed `Default<T>` as the standard way for
+  mixins to instantiate an unknown type; wrong category — `Default` means "the zero/empty-value
+  case specifically," and most of what a mixin actually needs (construct from parsed fields,
+  construct a copy) isn't that at all. Also separately corrected: the *actual* question wasn't "how
+  does a mixin construct something," it was "how does a CTFE function discover what constructors
+  already exist" — a type-level enumeration question, not a construction-privilege question. Added
+  `members-of` as the first concrete entry in the compile-time hook catalog (unscoped since the
+  mechanism was written): `(members-of Account)` returns `{kind, name, spec}` for every member,
+  `spec` reusing `FunctionSpec` directly. Filtering for `kind = constructor` and inspecting
+  `ParameterSpec` answers "what already exists" directly; composes with the existing
+  "expansions may emit additional declarations" rule for the "add one if none fit" half — no new
+  mechanism needed for that part, `members-of` was the actual missing piece.
+- **Field visibility for third-party mixins, decided rather than left as my open question:**
+  Shammah's answer — yes, full private-field access, "with notes about their visibility." Written in
+  as: `mixin`'s existing "compiled as if written at that site" clause already implies full access
+  (module-membership follows the splice site, not the defining module), so no new visibility rule
+  was needed, just applying the existing one consistently; the "notes" are the diagnostic/origin-
+  tracking already required for expansions generally, applied to private-field touches specifically.
+  Whether additional sandboxing should exist beyond this is explicitly left open, not resolved,
+  per direct instruction not to guess at it.

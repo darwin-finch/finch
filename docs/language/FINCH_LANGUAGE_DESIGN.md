@@ -3593,6 +3593,40 @@ A `! comptime` effect that reaches a boundary requiring ordinary runtime callabi
 discharged by either point is a compile error — not a new rule, the same consequence an unhandled
 `throws` already has at a boundary that can't accept it.
 
+**Added 2026-09-18: `members-of`, the first concrete entry in the compile-time hook catalog** (the
+catalog itself was left unscoped when the mechanism above was written). `FunctionSpec` inspects one
+function once its name is already known; it has nothing to say about discovering *which* functions
+exist in the first place. A CTFE function that wants to know how a type can already be constructed
+— to decide whether an existing constructor already does what it needs, or whether to `mixin` a new
+one only if none fits — needs to enumerate a type's members without knowing their names in advance,
+the same job D's `__traits(allMembers, ...)` does, kept to the same "distinct, properly-typed
+function, not a stringly-dispatched keyword" fix already applied to every other hook:
+
+```
+(members-of Account)   ; ! comptime — an ordered list of {kind, name, spec}
+                        ; kind: constructor | get | set | operation
+                        ; spec: that member's FunctionSpec, reused directly, not a parallel shape
+```
+
+Filtering the result for `kind = constructor` and inspecting each one's `ParameterSpec` answers the
+instantiation-introspection question directly, composing with the already-established "expansions
+may emit additional declarations" rule rather than needing anything new for the "add one if none
+fit" half.
+
+**Added 2026-09-18: mixin-spliced code's private-field access, confirmed rather than left implicit.**
+"Compiled as if they had been written at that site" (`mixin`, above) means a mixin's generated
+declaration takes on the module-membership of *where it lands*, not of whichever module defined the
+CTFE function that produced it — so a third-party derive-mixin applied to a record with
+module-private fields gets ordinary access to them, the same as anything else actually declared in
+that module, regardless of where the mixin function itself lives. This needs no new visibility rule,
+only applying the existing one consistently. What it does need, and already has a mechanism for: an
+audit trail. "Notes about their visibility" are the diagnostic/origin-tracking already required for
+expansions generally ("diagnostics retain both the derive invocation and generated implementation
+origins") — applied here too, so a private-field touch can always be traced to which mixin, from
+which module, produced it. Left explicitly open, not resolved: whether some *additional* sandboxing
+beyond this — restricting a mixin's access to less than full module membership — should exist. No
+resolution either way; flagged as a real question rather than quietly decided.
+
 Syntax values are not bare lists. They retain source origin, expansion ancestry, lexical scope
 marks, and stable module/symbol identity. Public syntax constructors and projections preserve those
 properties so ordinary structural Finch code can be hygienic without receiving ambient host access.
