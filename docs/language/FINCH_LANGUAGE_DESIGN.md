@@ -3639,6 +3639,35 @@ instantiation-introspection question directly, composing with the already-establ
 may emit additional declarations" rule rather than needing anything new for the "add one if none
 fit" half.
 
+**Added 2026-09-18: `fields-of`, a second hook, distinct from `members-of` rather than a mode of it.**
+Derive-style serialization (msgpack, protobuf, JSON) needs to enumerate a record's *fields* — name,
+type, visibility — not an implementation's operations; `members-of` answers a different question
+entirely (what can this type *do*, not what does it *hold*) and conflating the two into one
+stringly-moded hook would be exactly the `__traits` mistake this catalog exists to avoid:
+
+```
+(fields-of Account)   ; ! comptime — an ordered list of {name, type, visibility, kind}
+                       ; kind: field | property-readonly | property-read-write
+                       ; visibility: pub | private (for `kind = field`); a property's own
+                       ;   visibility is whatever its get/set operations' own visibility is —
+                       ;   UNVERIFIED, since no example anywhere shows `pub` on an operation
+```
+
+**Corrected while designing this, not after:** a plain field and a `get`/`set` property already
+resolve identically through `.` (established when `get`/`set` were added), so a naive `fields-of`
+that only reported stored fields would be wrong for exactly the reason it matters most — a derive
+function generating *serialization* code has every reason to want a get-only computed property
+included (there's a value to read, the same as any field), but generating *deserialization* code
+must not try to write through one (there's nowhere to put a restored value; a get-only property has
+no setter). One list, one `kind` discriminator, filtered differently by each direction, rather than
+two separate hooks or one hook silently wrong for half its callers.
+
+A derive function walks this list to generate per-field code; splicing a field's *name* (held as
+plain data in this list) into a `.`-access expression needs the already-established `datum->syntax`
+to promote it into a syntax identifier — this is the narrower, single-symbol case that operation
+already covers, distinct from the still-open `ParameterSpec -> syntax` gap, which is specifically
+about reconstructing a whole *parameter list* with types and ownership modes, not one bare name.
+
 **Added 2026-09-18: mixin-spliced code's private-field access, confirmed rather than left implicit.**
 "Compiled as if they had been written at that site" (`mixin`, above) means a mixin's generated
 declaration takes on the module-membership of *where it lands*, not of whichever module defined the
