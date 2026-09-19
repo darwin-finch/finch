@@ -1211,4 +1211,37 @@ assert_contains "$fixture_root/chmod-failure.out" \
     'could not seal the cargo-slot proof descriptor read-only' \
     'silent proof-descriptor chmod failure lacked an actionable diagnostic'
 
+# Issue #392: a failure writing or publishing the per-leaf ownership metadata
+# must degrade to a warning, never fail the build -- this block now runs on
+# every invocation that reaches an already-usable target, not only the first
+# one that creates it. Make the leaf directory itself read-only so the write
+# of a new file inside it fails, and prove the wrapped command still runs.
+metadata_fail_repo="$fixture_root/metadata-fail-repo"
+mkdir -p "$metadata_fail_repo"
+git -C "$metadata_fail_repo" init -q
+git -C "$metadata_fail_repo" -c user.name=Finch -c user.email=finch@example.invalid \
+    commit -qm fixture --allow-empty
+metadata_fail_cache="$fixture_root/metadata-fail-cache"
+mkdir -p "$metadata_fail_cache"
+metadata_fail_target="$(cd "$metadata_fail_repo" && XDG_CACHE_HOME="$metadata_fail_cache" \
+    env -u CARGO_TARGET_DIR "$wrapper" sh -c 'printf %s "$CARGO_TARGET_DIR"')"
+[[ -f "$metadata_fail_target/.finch-cargo-target-owner-v1" ]] || fail \
+    "ownership metadata was not written on the first, unobstructed invocation: target=$metadata_fail_target"
+chmod 0555 "$metadata_fail_target"
+metadata_fail_marker="$fixture_root/metadata-fail-executed"
+set +e
+(cd "$metadata_fail_repo" && XDG_CACHE_HOME="$metadata_fail_cache" \
+    MARKER="$metadata_fail_marker" env -u CARGO_TARGET_DIR "$wrapper" sh -c \
+    'printf executed >"$MARKER"' >"$fixture_root/metadata-fail.out" 2>&1)
+status=$?
+set -e
+chmod 0755 "$metadata_fail_target"
+[[ "$status" -eq 0 ]] || fail \
+    "a metadata-write failure on an already-usable target should not fail the build: actual=$status"
+[[ -f "$metadata_fail_marker" ]] || fail \
+    "the wrapped command did not run when ownership metadata could not be written"
+assert_contains "$fixture_root/metadata-fail.out" \
+    'warning: could not write ownership metadata, continuing without it' \
+    'a metadata-write failure produced no actionable warning'
+
 echo 'with-cargo-slot and worktree-target launcher regressions passed'

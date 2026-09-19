@@ -1017,8 +1017,12 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     errors.extend(required_step_errors(
         documents, "ci.yml", "test", "Check and exercise the Cargo slot",
         "matrix.feature_name == 'default'", "bash", (
-            "bash -n .agents/skills/finch-backlog/scripts/with-cargo-slot .agents/skills/finch-backlog/scripts/test-with-cargo-slot",
+            "bash -n .agents/skills/finch-backlog/scripts/with-cargo-slot "
+            ".agents/skills/finch-backlog/scripts/test-with-cargo-slot "
+            ".agents/skills/finch-backlog/scripts/reclaim-cargo-targets "
+            ".agents/skills/finch-backlog/scripts/test-reclaim-cargo-targets",
             ".agents/skills/finch-backlog/scripts/test-with-cargo-slot",
+            ".agents/skills/finch-backlog/scripts/test-reclaim-cargo-targets",
         ),
     ))
     errors.extend(step_order_errors(

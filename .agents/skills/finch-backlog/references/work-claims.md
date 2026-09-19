@@ -86,3 +86,9 @@ outside the system temporary directory so a reboot cannot discard uncommitted wo
 - Before removing a workspace that has uncommitted changes or a commit no ref reaches, record that
   state under `refs/salvage/`.
 - Stop disposable databases and containers with the workspace that created them.
+- Once a worktree itself is removed, its generated Cargo output under the shared
+  `cargo-target` cache (`.agents/skills/finch-backlog/scripts/with-cargo-slot`) is not
+  removed with it and can reach tens of gigabytes per worktree. Run
+  `.agents/skills/finch-backlog/scripts/reclaim-cargo-targets` (dry run by default; pass
+  `--apply` to delete) to reclaim it; it fails closed on any worktree still registered,
+  dirty, tampered ownership metadata, or referenced by a live process.

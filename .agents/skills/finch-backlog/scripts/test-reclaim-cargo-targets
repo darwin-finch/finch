@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# with-cargo-slot only derives/creates CARGO_TARGET_DIR (and writes ownership
+# metadata) when CI is unset (see its own comment: hosted CI owns its target
+# layout separately). This regression's fixtures depend on that derivation
+# running unconditionally, exactly like test-with-cargo-slot unsets it too.
+unset CI
+
+script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+slot_wrapper="${FINCH_CARGO_SLOT_WRAPPER_UNDER_TEST:-$script_dir/with-cargo-slot}"
+reclaim_tool="${FINCH_RECLAIM_TOOL_UNDER_TEST:-$script_dir/reclaim-cargo-targets}"
+fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/finch reclaim cargo targets [test].XXXXXX")"
+background_pids=()
+
+cleanup() {
+    set +e
+    local pid
+    for pid in "${background_pids[@]+"${background_pids[@]}"}"; do
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    rm -rf -- "$fixture_root"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "reclaim-cargo-targets regression: $*" >&2
+    exit 1
+}
+
+assert_contains() {
+    local haystack="$1" needle="$2" context="$3"
+    if [[ "$haystack" != *"$needle"* ]]; then
+        echo "reclaim-cargo-targets regression: $context" >&2
+        echo "expected substring: $needle" >&2
+        echo "--- actual output ---" >&2
+        printf '%s\n' "$haystack" >&2
+        exit 1
+    fi
+}
+
+monotonic_now() { date +%s; }
+
+if [[ ! -x "$slot_wrapper" ]]; then
+    fail "with-cargo-slot is not executable under test: path=$slot_wrapper"
+fi
+if [[ ! -x "$reclaim_tool" ]]; then
+    fail "reclaim-cargo-targets is not executable under test: path=$reclaim_tool"
+fi
+if ! command -v lsof >/dev/null 2>&1; then
+    fail "this regression requires lsof to exercise the live-process guard"
+fi
+
+repo="$fixture_root/repo"
+mkdir -p "$repo"
+git -C "$repo" init -q
+printf 'fixture\n' >"$repo/README"
+git -C "$repo" add README
+git -C "$repo" -c user.name=Finch -c user.email=finch@example.invalid commit -qm fixture
+
+cache_root="$fixture_root/cache-root"
+mkdir -p "$cache_root"
+export XDG_CACHE_HOME="$cache_root"
+
+# Build (and return, on stdout) the target leaf for a worktree exactly the
+# way with-cargo-slot would for a real build, including its ownership
+# metadata. The wrapped command is a no-op; nothing here ever runs Cargo.
+build_target() {
+    local worktree="$1"
+    (cd "$worktree" && env -u CARGO_TARGET_DIR "$slot_wrapper" true >/dev/null)
+    (cd "$worktree" && env -u CARGO_TARGET_DIR "$slot_wrapper" \
+        sh -c 'printf %s "$CARGO_TARGET_DIR"')
+}
+
+run_reclaim() {
+    (cd "$repo" && "$reclaim_tool" --repo "$repo" "$@")
+}
+
+### Fixture A: an active worktree with uncommitted (dirty) source is
+### preserved, in both dry run and --apply.
+worktree_a="$fixture_root/worktree-a"
+git -C "$repo" worktree add -q -b worktree-a "$worktree_a"
+target_a="$(build_target "$worktree_a")"
+[[ -d "$target_a" ]] || fail "fixture A did not create its target: path=$target_a"
+printf 'dirty\n' >"$worktree_a/dirty.txt"
+git -C "$worktree_a" add dirty.txt
+
+dry_run_a="$(run_reclaim)"
+assert_contains "$dry_run_a" "preserved: worktree is still registered" \
+    "an active, dirty, registered worktree's target was not reported as preserved"
+[[ -d "$target_a" ]] || fail "dry run deleted an active worktree's target: path=$target_a"
+
+set +e
+apply_a_output="$(run_reclaim --apply)"
+apply_a_status=$?
+set -e
+[[ "$apply_a_status" -eq 0 ]] || fail "an apply run with nothing eligible should exit 0: status=$apply_a_status output=$apply_a_output"
+[[ -d "$target_a" ]] || fail "--apply deleted an active, dirty worktree's target: path=$target_a"
+
+### Fixture B: a retired (Git-unregistered), clean worktree's target is
+### reclaimed under --apply, and reclaiming it leaves fixture A's still-
+### registered sibling namespace and uncommitted source untouched.
+worktree_b="$fixture_root/worktree-b"
+git -C "$repo" worktree add -q -b worktree-b "$worktree_b"
+target_b="$(build_target "$worktree_b")"
+[[ -d "$target_b" ]] || fail "fixture B did not create its target: path=$target_b"
+marker_b="$target_b/marker"
+printf 'marker\n' >"$marker_b"
+git -C "$repo" worktree remove --force "$worktree_b"
+
+dry_run_b="$(run_reclaim)"
+assert_contains "$dry_run_b" "eligible (dry run" "a retired, clean worktree's target was not reported eligible"
+[[ -f "$marker_b" ]] || fail "dry run deleted a retired worktree's target before --apply: path=$target_b"
+
+apply_b="$(run_reclaim --apply)"
+assert_contains "$apply_b" "reclaimed: path=$target_b" "the retired worktree's target was not reclaimed under --apply"
+[[ ! -e "$target_b" ]] || fail "retired worktree's target survived --apply: path=$target_b"
+[[ -d "$target_a" ]] || fail "reclaiming worktree B's target deleted worktree A's sibling namespace: path=$target_a"
+[[ -f "$worktree_a/dirty.txt" ]] || fail "reclaim touched fixture A's uncommitted source"
+
+### Fixture C: repeated --apply after B's target is already gone is
+### idempotent -- it exits 0 and reclaims nothing further.
+set +e
+apply_b_again="$(run_reclaim --apply)"
+apply_b_again_status=$?
+set -e
+[[ "$apply_b_again_status" -eq 0 ]] || \
+    fail "repeat --apply after reclaim exited nonzero: status=$apply_b_again_status output=$apply_b_again"
+assert_contains "$apply_b_again" "reclaimed 0 of 0 eligible" "repeat --apply was not idempotent"
+
+### Fixture D: a symlinked leaf is refused rather than followed or deleted,
+### a leaf name that isn't this tool's namespace shape is skipped rather
+### than inspected, and a legitimate retired leaf alongside them still
+### reclaims normally.
+worktree_d="$fixture_root/worktree-d"
+git -C "$repo" worktree add -q -b worktree-d "$worktree_d"
+target_d="$(build_target "$worktree_d")"
+repository_namespace_dir="$(dirname "$target_d")"
+git -C "$repo" worktree remove --force "$worktree_d"
+
+foreign_leaf="$repository_namespace_dir/not-a-namespace-leaf"
+mkdir -p "$foreign_leaf"
+printf 'not owned by this tool\n' >"$foreign_leaf/marker"
+
+symlink_destination="$fixture_root/outside-cache-target"
+mkdir -p "$symlink_destination"
+printf 'must survive\n' >"$symlink_destination/marker"
+symlink_leaf="$repository_namespace_dir/$(printf '%064d' 9)"
+ln -s "$symlink_destination" "$symlink_leaf"
+
+set +e
+dry_run_d="$(run_reclaim)"
+dry_run_d_status=$?
+set -e
+[[ "$dry_run_d_status" -ne 0 ]] || fail "a symlinked leaf present should make the run report a refusal: output=$dry_run_d"
+assert_contains "$dry_run_d" "refused: symlinked leaf" "a symlinked leaf was not refused"
+assert_contains "$dry_run_d" "skipped: not a namespace leaf" \
+    "a non-namespace-shaped directory was not skipped rather than inspected"
+[[ -f "$symlink_destination/marker" ]] || \
+    fail "dry run followed a symlinked leaf and reached its target: path=$symlink_destination"
+[[ -L "$symlink_leaf" ]] || fail "dry run removed the symlink entry itself rather than merely refusing it"
+[[ -f "$foreign_leaf/marker" ]] || fail "reclaim touched a directory whose name was not this tool's namespace shape: path=$foreign_leaf"
+
+set +e
+apply_d="$(run_reclaim --apply)"
+apply_d_status=$?
+set -e
+[[ "$apply_d_status" -ne 0 ]] || fail "--apply with a symlinked leaf present should still exit nonzero: output=$apply_d"
+assert_contains "$apply_d" "reclaimed: path=$target_d" \
+    "the legitimate retired worktree D target was not reclaimed alongside the refused symlink"
+[[ ! -e "$target_d" ]] || fail "legitimate retired worktree D target survived --apply: path=$target_d"
+[[ -f "$symlink_destination/marker" ]] || \
+    fail "--apply followed a symlinked leaf and deleted its target: path=$symlink_destination"
+[[ -L "$symlink_leaf" ]] || fail "--apply removed the symlink entry itself rather than merely refusing it"
+rm -f "$symlink_leaf"
+rm -rf "$foreign_leaf"
+
+### Fixture E: ownership metadata that no longer matches its namespace leaf
+### (tampering or corruption) is refused, never deleted.
+worktree_e="$fixture_root/worktree-e"
+git -C "$repo" worktree add -q -b worktree-e "$worktree_e"
+target_e="$(build_target "$worktree_e")"
+git -C "$repo" worktree remove --force "$worktree_e"
+metadata_e="$target_e/.finch-cargo-target-owner-v1"
+sed -i.bak "s#worktree-root:.*#worktree-root:$fixture_root/somewhere-else#" "$metadata_e"
+rm -f "$metadata_e.bak"
+
+set +e
+dry_run_e="$(run_reclaim)"
+dry_run_e_status=$?
+set -e
+[[ "$dry_run_e_status" -ne 0 ]] || fail "mismatched ownership metadata should report a refusal: output=$dry_run_e"
+assert_contains "$dry_run_e" "refused: ownership metadata does not match this namespace leaf" \
+    "tampered ownership metadata was not refused"
+[[ -d "$target_e" ]] || fail "reclaim deleted a leaf with mismatched ownership metadata: path=$target_e"
+rm -rf -- "$target_e"
+
+### Fixture F: a leaf with no ownership metadata (predates this tool, or the
+### file was removed) is preserved rather than guessed at.
+worktree_f="$fixture_root/worktree-f"
+git -C "$repo" worktree add -q -b worktree-f "$worktree_f"
+target_f="$(build_target "$worktree_f")"
+git -C "$repo" worktree remove --force "$worktree_f"
+rm -f "$target_f/.finch-cargo-target-owner-v1"
+
+dry_run_f="$(run_reclaim)"
+assert_contains "$dry_run_f" "preserved: no durable ownership metadata" \
+    "a leaf without ownership metadata was not preserved"
+[[ -d "$target_f" ]] || fail "reclaim deleted a leaf with no ownership metadata: path=$target_f"
+
+### Fixture G: a live process holding the leaf open blocks deletion, in
+### both dry run and --apply, with a diagnostic that names the blocking
+### process; once it exits, the same leaf reclaims normally.
+worktree_g="$fixture_root/worktree-g"
+git -C "$repo" worktree add -q -b worktree-g "$worktree_g"
+target_g="$(build_target "$worktree_g")"
+git -C "$repo" worktree remove --force "$worktree_g"
+
+(
+    cd "$target_g"
+    exec sleep 30
+) &
+holder_pid=$!
+background_pids+=("$holder_pid")
+holder_deadline=$(( $(monotonic_now) + 5 ))
+while [[ -z "$(lsof +D "$target_g" 2>/dev/null)" ]]; do
+    if [[ "$(monotonic_now)" -ge "$holder_deadline" ]]; then
+        fail "live-process holder never became visible to lsof: pid=$holder_pid target=$target_g"
+    fi
+    sleep 0.1
+done
+
+set +e
+dry_run_g="$(run_reclaim)"
+dry_run_g_status=$?
+set -e
+[[ "$dry_run_g_status" -ne 0 ]] || fail "a live process referencing the target should report a refusal: output=$dry_run_g"
+assert_contains "$dry_run_g" "refused: a live process references the target" \
+    "a live process was not reported as blocking reclamation"
+[[ -d "$target_g" ]] || fail "dry run deleted a target still referenced by a live process: path=$target_g"
+
+set +e
+apply_g="$(run_reclaim --apply)"
+apply_g_status=$?
+set -e
+[[ "$apply_g_status" -ne 0 ]] || fail "--apply with a live process referencing the target should exit nonzero: output=$apply_g"
+[[ -d "$target_g" ]] || fail "--apply deleted a target still referenced by a live process: path=$target_g"
+
+kill -TERM "$holder_pid" 2>/dev/null || true
+wait "$holder_pid" 2>/dev/null || true
+background_pids=()
+
+release_deadline=$(( $(monotonic_now) + 5 ))
+while [[ -n "$(lsof +D "$target_g" 2>/dev/null)" ]]; do
+    if [[ "$(monotonic_now)" -ge "$release_deadline" ]]; then
+        fail "live-process holder did not release the target within five seconds: pid=$holder_pid"
+    fi
+    sleep 0.1
+done
+
+apply_g_after="$(run_reclaim --apply)"
+assert_contains "$apply_g_after" "reclaimed: path=$target_g" \
+    "the target was not reclaimed once its blocking process exited"
+[[ ! -e "$target_g" ]] || fail "target survived --apply once its blocking process exited: path=$target_g"
+
+### Fixture H: the shared finch-cargo-slot.lock (the same repository-wide
+### flock with-cargo-slot uses to serialize builds) being held nonblocking-
+### refuses reclamation instead of waiting for or racing an in-progress
+### build, and the leaf reclaims normally once the lock is released.
+worktree_h="$fixture_root/worktree-h"
+git -C "$repo" worktree add -q -b worktree-h "$worktree_h"
+target_h="$(build_target "$worktree_h")"
+git -C "$repo" worktree remove --force "$worktree_h"
+
+git_common_dir="$(cd "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)" && pwd -P)"
+lock_path="$git_common_dir/finch-cargo-slot.lock"
+lock_holder_ready="$fixture_root/lock-holder.ready"
+lock_holder_release="$fixture_root/lock-holder.release"
+perl -MFcntl=:flock -e '
+    my ($lock_path, $ready, $release) = @ARGV;
+    open(my $lock, ">>", $lock_path) or exit 2;
+    flock($lock, LOCK_EX) or exit 3;
+    open(my $readyfh, ">", $ready) or exit 4;
+    print {$readyfh} "ready\n";
+    close $readyfh;
+    while (!-e $release) {
+        select(undef, undef, undef, 0.02);
+    }
+' "$lock_path" "$lock_holder_ready" "$lock_holder_release" &
+lock_holder_pid=$!
+background_pids+=("$lock_holder_pid")
+
+lock_holder_deadline=$(( $(monotonic_now) + 5 ))
+while [[ ! -s "$lock_holder_ready" ]]; do
+    if [[ "$(monotonic_now)" -ge "$lock_holder_deadline" ]]; then
+        fail "lock-holder process never acquired the shared Cargo slot: pid=$lock_holder_pid lock=$lock_path"
+    fi
+    sleep 0.1
+done
+
+set +e
+apply_h="$(run_reclaim --apply)"
+apply_h_status=$?
+set -e
+[[ "$apply_h_status" -ne 0 ]] || fail "--apply while the shared Cargo slot is held should exit nonzero: output=$apply_h"
+assert_contains "$apply_h" "refused: the shared Cargo slot is currently held by a build" \
+    "lock contention was not reported with an actionable diagnostic"
+[[ -d "$target_h" ]] || fail "--apply deleted a target while the shared Cargo slot was held by another process: path=$target_h"
+
+: >"$lock_holder_release"
+wait "$lock_holder_pid" 2>/dev/null || true
+background_pids=()
+
+apply_h_after="$(run_reclaim --apply)"
+assert_contains "$apply_h_after" "reclaimed: path=$target_h" \
+    "the target was not reclaimed once the shared Cargo slot was released"
+[[ ! -e "$target_h" ]] || fail "target survived --apply once the shared Cargo slot was released: path=$target_h"
+
+### Fixture I: a worktree whose Git registration is corrupted (its checkout
+### and .git file still exist on disk, but the admin dir under
+### .git/worktrees/<name> is gone, so `git status` there fails rather than
+### reporting dirty or clean) must refuse only that one leaf -- not abort the
+### whole run under `set -e` and silently strand every leaf ordered after it.
+worktree_i="$fixture_root/worktree-i"
+git -C "$repo" worktree add -q -b worktree-i "$worktree_i"
+target_i="$(build_target "$worktree_i")"
+admin_dir_i="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)/worktrees/worktree-i"
+rm -rf -- "$admin_dir_i"
+
+worktree_j="$fixture_root/worktree-j"
+git -C "$repo" worktree add -q -b worktree-j "$worktree_j"
+target_j="$(build_target "$worktree_j")"
+git -C "$repo" worktree remove --force "$worktree_j"
+
+set +e
+apply_i="$(run_reclaim --apply)"
+apply_i_status=$?
+set -e
+[[ "$apply_i_status" -eq 1 ]] || \
+    fail "a corrupted worktree registration should refuse cleanly (status 1), not crash the whole run: status=$apply_i_status output=$apply_i"
+assert_contains "$apply_i" "refused: worktree exists but its status could not be confirmed clean" \
+    "the corrupted-registration worktree was not reported as an explicit refusal"
+assert_contains "$apply_i" "reclaimed: path=$target_j" \
+    "a legitimately retired sibling leaf ordered after the corrupted one was never reached"
+[[ -d "$target_i" ]] || fail "reclaim deleted a leaf whose worktree status could not be confirmed: path=$target_i"
+[[ ! -e "$target_j" ]] || fail "the legitimately retired sibling leaf was not reclaimed: path=$target_j"
+rm -rf -- "$target_i"
+
+### Fixture K: Git properly stops registering a worktree (`git worktree
+### remove`), but by the time this tool runs, something else -- a fresh,
+### independent, dirty Git checkout -- occupies that exact path. `git status`
+### there succeeds and is genuinely dirty, so the leaf must be preserved. This
+### is the tool's single most safety-critical guarantee (never delete a dirty
+### worktree's target just because Git stopped registering the path) and had
+### zero regression coverage until this fixture: every other "retired"
+### fixture leaves that path empty afterward, so none of them exercise the
+### still-present-and-dirty branch at all. (Corrupting a worktree's own admin
+### directory, as Fixture I does, breaks `git status` there outright -- it
+### cannot produce a confirmable-dirty result, only an unconfirmable one.)
+worktree_k="$fixture_root/worktree-k"
+git -C "$repo" worktree add -q -b worktree-k "$worktree_k"
+target_k="$(build_target "$worktree_k")"
+git -C "$repo" worktree remove --force "$worktree_k"
+mkdir -p "$worktree_k"
+git -C "$worktree_k" init -q
+printf 'dirty\n' >"$worktree_k/dirty.txt"
+
+dry_run_k="$(run_reclaim)"
+assert_contains "$dry_run_k" "preserved: worktree exists with uncommitted changes" \
+    "an unregistered-but-present, dirty worktree's target was not preserved"
+[[ -d "$target_k" ]] || fail "dry run deleted an unregistered-but-present, dirty worktree's target: path=$target_k"
+
+set +e
+apply_k="$(run_reclaim --apply)"
+apply_k_status=$?
+set -e
+[[ "$apply_k_status" -eq 0 ]] || fail "an apply run with only a preserved leaf should exit 0: status=$apply_k_status output=$apply_k"
+[[ -d "$target_k" ]] || fail "--apply deleted an unregistered-but-present, dirty worktree's target: path=$target_k"
+
+### Fixture L: a directory sitting at a recorded worktree path that is not a
+### Git checkout at all (no .git) is refused, not guessed at as clean.
+worktree_l="$fixture_root/worktree-l"
+git -C "$repo" worktree add -q -b worktree-l "$worktree_l"
+target_l="$(build_target "$worktree_l")"
+admin_dir_l="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)/worktrees/worktree-l"
+rm -rf -- "$admin_dir_l" "$worktree_l/.git"
+
+set +e
+dry_run_l="$(run_reclaim)"
+dry_run_l_status=$?
+set -e
+[[ "$dry_run_l_status" -ne 0 ]] || fail "a non-Git-checkout directory at a recorded worktree path should report a refusal: output=$dry_run_l"
+assert_contains "$dry_run_l" "refused: worktree path exists but is not a Git checkout" \
+    "a non-Git-checkout directory at a recorded worktree path was not refused"
+[[ -d "$target_l" ]] || fail "reclaim deleted a leaf whose recorded worktree path is not a Git checkout: path=$target_l"
+rm -rf -- "$target_l"
+
+### Fixture M: ownership metadata whose git-common-dir field names a
+### different repository entirely (as opposed to Fixture E's tampered
+### worktree-root/namespace mismatch) is preserved, not treated as this
+### repository's own leaf.
+worktree_m="$fixture_root/worktree-m"
+git -C "$repo" worktree add -q -b worktree-m "$worktree_m"
+target_m="$(build_target "$worktree_m")"
+git -C "$repo" worktree remove --force "$worktree_m"
+metadata_m="$target_m/.finch-cargo-target-owner-v1"
+sed -i.bak "s#git-common-dir:.*#git-common-dir:$fixture_root/some-other-repo/.git#" "$metadata_m"
+rm -f "$metadata_m.bak"
+
+dry_run_m="$(run_reclaim)"
+assert_contains "$dry_run_m" "preserved: ownership metadata names a different repository" \
+    "ownership metadata naming a different repository was not preserved"
+[[ -d "$target_m" ]] || fail "reclaim deleted a leaf whose ownership metadata names a different repository: path=$target_m"
+
+echo "reclaim-cargo-targets regression: all fixtures passed"
