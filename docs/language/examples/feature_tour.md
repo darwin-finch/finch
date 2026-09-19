@@ -1081,7 +1081,8 @@ accounts/
 
 ```forth
 \ accounts/ledger.coforth
-import: accounts.account ;
+import: pkg.account ;   \ relative to this package, not accounts.account -- immune to accounts/
+                          \ ever being renamed or relocated, since `pkg` names no package itself
 
 : record-transaction ( S Account int -- S bool )
   \ calls the pkg-visible CoLisp helper directly — cross-frontend, no adapter, no ceremony

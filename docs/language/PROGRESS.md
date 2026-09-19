@@ -1365,3 +1365,28 @@ Deno's (where the import statement itself is the literal fetch URL, no separate 
 The "decentralized, hash-pinned, no mandatory registry" philosophy already in the document matches
 both languages' shared spirit, but the specific mechanism is Go's, not Deno's — worth being precise
 about since the two solve the same problem with a genuinely different abstraction boundary.
+
+**Continued 2026-09-19 — relative imports and local dependency overrides added to the module system,
+both real gaps in what was just designed.** Shammah asked about relative imports directly, and
+separately raised local-override-for-a-remote-dependency without naming it — recognized as Go's
+`replace` directive, a well-precedented feature (local development against an unpublished fork/fix).
+
+Relative imports: `pkg` added as a relative anchor keyword (`pkg.foo` for a sibling module,
+`pkg.super.foo` for the enclosing package), getting right what Rust's `crate::`/`super::` get right
+and Go's actual modules do not — a Go internal import is always the module's full declared path, so
+renaming a module means rewriting every internal absolute import. Deliberately did not adopt Go's
+"same directory implicitly sees itself, no import needed" rule — an import is always required, kept
+consistent with the explicit-over-implicit posture already established for concept implementations,
+`cast`, and axioms. `pub`/`pkg` visibility apply identically whether a module is named absolutely or
+relatively — `pkg.foo` is a different spelling of the same module, never a more permissive view of it.
+
+Local override: the same manifest declaring the main project's own name/root may map a specific
+dependency's locator to a local path instead of its normal source, matching Go's `replace`. The
+scoping detail stated precisely since getting it wrong would leak local machine state into others'
+builds: an override applies only when that manifest is the build's actual root — a dependency several
+levels down whose own manifest records its own author's local override has that override ignored
+entirely once consumed as a library, never inherited transitively.
+
+`feature_tour.md` §25 updated in place: `ledger.coforth`'s import of its sibling `account.colisp`
+changed from the absolute `accounts.account` to the relative `pkg.account`, demonstrating the new
+form on the exact case it was designed for (a same-package, cross-frontend import).

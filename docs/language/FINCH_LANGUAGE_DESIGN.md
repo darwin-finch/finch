@@ -492,10 +492,38 @@ per-file declaration to answer the same question, because the package-retrieval 
 answers it at the right granularity: every package in the build — the main project and each
 dependency alike — has exactly one declared root, resolved once from the lockfile/dependency graph
 (a dependency's locator and content hash already fix its root directory; the main project's own
-name and root come from its own manifest, the one place this is stated, not per file). A file's full
-module path is therefore `<owning package>.<path relative to that package's root>`, computed from
-information the compiler already has authoritatively, never from which of several `-I`-equivalent
+name and root come from its own manifest, the one place this is stated, not per file). This is
+closer to Go's module mechanism than Deno's — an abstractly-named root plus paths computed from it,
+fetching handled underneath — not Deno's, where the import statement itself is the literal fetch
+URL with no separate abstract-name layer at all. A file's full module path is therefore `<owning
+package>.<path relative to that package's root>`, computed from information the compiler already
+has authoritatively, never from which of several `-I`-equivalent
 search roots happens to contain a matching file first.
+
+**Imports within a package are relative to the package, not to its declared name.** `pkg` is a
+relative anchor keyword, not a name: `(import pkg.foo)` refers to the sibling module `foo` in the
+same package regardless of what that package is actually called, and `(import pkg.super.foo)`
+reaches the immediately enclosing package the same way (matching what Rust's `crate::`/`super::`
+get right and Go's actual modules do not — an internal Go import is always the module's *full*
+declared path, so renaming a module means finding and rewriting every internal absolute import that
+spelled it out). An import is always required, even for a sibling in the same directory — Finch does
+not adopt Go's "same directory implicitly sees itself with no import" rule, matching the explicit-
+over-implicit posture already established for concept implementations, `cast`, and axioms elsewhere
+in this document. `pub`/`pkg` visibility rules apply identically whether a module is reached through
+its absolute or its relative spelling; `pkg.foo` is a different way to *name* the same module, not a
+different, more permissive way to *see into* it.
+
+**A project may locally override where a declared dependency's source actually comes from, scoped
+to that project's own build only.** The same manifest that declares the main project's own name and
+root may also map a specific dependency's locator to a local path instead of its normal
+git/HTTPS/content-addressed source — Go's `replace` directive is the direct precedent, kept for the
+same reason: developing against an in-progress fork or an unpublished local fix without needing to
+publish it first. The scoping detail worth stating precisely, because getting it wrong would leak a
+developer's local machine state into other people's builds: an override applies only when that
+manifest is the *root* of the build. A dependency several levels down the graph that itself has a
+local override recorded in its own manifest (from *its* author's local development) has that
+override ignored entirely once it is consumed as a library by someone else — only the actual root
+project's own overrides ever take effect, never a transitively inherited one.
 
 The repository now contains the first verified typed path: both frontends lower directly to typed
 IR, the typed runtime owns a `Vec<TypedValue>` stack, effects are resource-scoped capability
