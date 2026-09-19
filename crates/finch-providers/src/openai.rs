@@ -1038,21 +1038,56 @@ pub struct OpenAIProvider {
     api_key: String,
     endpoints: ProviderEndpoints,
     default_model: String,
+    /// Display/identity name — used for `name()`, logging, and the
+    /// canonical-endpoint/static-table lookups below, all of which are
+    /// about *which* provider this is. Kept as a plain field, separate from
+    /// `profile`, because those concerns are orthogonal to the capability-
+    /// attestation *strategy* `profile` selects: two providers can share a
+    /// strategy (openai/grok/mistral/groq all use `ProviderProfile::Static`)
+    /// while needing distinct names, and `new_compatible`/
+    /// `new_compatible_named_header` let a caller supply an arbitrary name
+    /// with no attestation story of its own.
     provider_name: String,
     reasoning_effort: Option<ReasoningEffort>,
     canonical_openai_endpoint: bool,
     auth_header: AuthHeader,
-    /// Set only by [`Self::new_ollama`]. When present, this is the live
-    /// Ollama-native `/api/show` endpoint (distinct from the OpenAI-compatible
-    /// `/v1/...` surface used for chat) that `capabilities()` attests model
-    /// features from. Left `None` for every other provider, including
-    /// `remote_daemon`, which stays out of scope for issue #925.
-    ollama_capability_endpoint: Option<String>,
-    /// Per-model live capability attestations already fetched from Ollama.
-    /// Populated by `refresh_capabilities`, read synchronously by
-    /// `capabilities()`. Shared across clones of the same provider instance
-    /// so a `with_model`/`with_reasoning_effort` clone reuses the cache.
-    ollama_capabilities: Arc<std::sync::Mutex<HashMap<String, OllamaLiveCapabilities>>>,
+    /// How this instance's model capabilities are attested. See
+    /// [`ProviderProfile`].
+    profile: ProviderProfile,
+}
+
+/// Strategy this provider instance uses to answer `capabilities()` /
+/// `refresh_capabilities()`. Each `new_*` constructor picks the variant
+/// matching its actual capability story; the two methods below `match
+/// &self.profile` exhaustively (no `_` wildcard arm), so adding a variant
+/// forces every call site to decide what it means there instead of quietly
+/// falling through to `ModelCapabilities::unknown(...)`.
+#[derive(Clone)]
+enum ProviderProfile {
+    /// openai/grok/mistral/groq: a static, dated per-model capability table
+    /// declared inline in `capabilities()`, gated on the provider's
+    /// configured endpoints still being the exact canonical URL for that
+    /// provider (a custom endpoint falls back to `Unknown`).
+    Static,
+    /// Ollama: capabilities are attested live against `/api/show` and
+    /// cached per model; an unattested model stays `Unknown` (fail closed)
+    /// rather than assuming support.
+    Ollama {
+        /// The live Ollama-native `/api/show` endpoint (distinct from the
+        /// OpenAI-compatible `/v1/...` surface used for chat) that
+        /// `capabilities()` attests model features from.
+        capability_endpoint: String,
+        /// Per-model live capability attestations already fetched from
+        /// Ollama. Populated by `refresh_capabilities`, read synchronously
+        /// by `capabilities()`. Shared across clones of the same provider
+        /// instance so a `with_model`/`with_reasoning_effort` clone reuses
+        /// the cache.
+        capabilities: Arc<std::sync::Mutex<HashMap<String, OllamaLiveCapabilities>>>,
+    },
+    /// A remote Finch daemon's OpenAI-compatible endpoint: deployment-
+    /// specific, with no attestation path at all, so capabilities are
+    /// always `Unknown`.
+    RemoteDaemon,
 }
 
 /// One model's live capability attestation, fetched from Ollama's own
@@ -1183,7 +1218,10 @@ impl OpenAIProvider {
             model,
             "ollama".to_string(),
         )?;
-        provider.ollama_capability_endpoint = Some(resolve_endpoint(&base_url, "/api/show"));
+        provider.profile = ProviderProfile::Ollama {
+            capability_endpoint: resolve_endpoint(&base_url, "/api/show"),
+            capabilities: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
         Ok(provider)
     }
 
@@ -1191,14 +1229,16 @@ impl OpenAIProvider {
     ///
     /// The daemon exposes `/v1/chat/completions` at `address`.
     pub fn new_remote_daemon(address: String) -> Result<Self> {
-        Self::new(
+        let mut provider = Self::new(
             String::new(), // no API key for the local/remote daemon
             address,
             "/v1/chat/completions",
             "/v1/models",
             "default".to_string(),
             "remote_daemon".to_string(),
-        )
+        )?;
+        provider.profile = ProviderProfile::RemoteDaemon;
+        Ok(provider)
     }
 
     /// Set custom model for this provider
@@ -1261,8 +1301,7 @@ impl OpenAIProvider {
             reasoning_effort: None,
             canonical_openai_endpoint,
             auth_header: AuthHeader::Bearer,
-            ollama_capability_endpoint: None,
-            ollama_capabilities: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            profile: ProviderProfile::Static,
         })
     }
 
@@ -2053,20 +2092,25 @@ impl OpenAIProvider {
     /// not the model — but every model-specific optional feature stays
     /// `Unknown` until a live `/api/show` attestation for this exact model
     /// has been cached.
-    fn ollama_model_capabilities(&self, endpoint: &str, model: &str) -> ModelCapabilities {
-        let mut capabilities = ModelCapabilities::unknown(self.name(), model).with_wire_protocol(
-            WireProtocol::OpenAiChatCompletions,
-            "2026-09-19",
-            "Finch Ollama adapter always uses the OpenAI-compatible chat-completions transport",
-        );
-        let attested = self
-            .ollama_capabilities
+    fn ollama_model_capabilities(
+        &self,
+        endpoint: &str,
+        capabilities: &Arc<std::sync::Mutex<HashMap<String, OllamaLiveCapabilities>>>,
+        model: &str,
+    ) -> ModelCapabilities {
+        let mut capabilities_result = ModelCapabilities::unknown(self.name(), model)
+            .with_wire_protocol(
+                WireProtocol::OpenAiChatCompletions,
+                "2026-09-19",
+                "Finch Ollama adapter always uses the OpenAI-compatible chat-completions transport",
+            );
+        let attested = capabilities
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(model)
             .cloned();
         let Some(attested) = attested else {
-            return capabilities;
+            return capabilities_result;
         };
         let source = format!(
             "live Ollama /api/show at {} (fetched {})",
@@ -2081,17 +2125,17 @@ impl OpenAIProvider {
                 CapabilitySupport::Unsupported
             }
         };
-        capabilities.tools = ModelFeature {
+        capabilities_result.tools = ModelFeature {
             support: support_for(reports("tools")),
             provenance: CapabilityProvenance::RuntimeDiscovery {
                 source: source.clone(),
             },
         };
-        capabilities.image_input = ModelFeature {
+        capabilities_result.image_input = ModelFeature {
             support: support_for(reports("vision")),
             provenance: CapabilityProvenance::RuntimeDiscovery { source },
         };
-        capabilities
+        capabilities_result
     }
 }
 
@@ -2122,132 +2166,138 @@ impl ProviderBackend for OpenAIProvider {
     }
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
-        let canonical_endpoints = match self.provider_name.as_str() {
-            "openai" => self.canonical_openai_endpoint,
-            "grok" => {
-                self.endpoints.chat_url == "https://api.x.ai/v1/chat/completions"
-                    && self.endpoints.models_url == "https://api.x.ai/v1/models"
-            }
-            "mistral" => {
-                self.endpoints.chat_url == "https://api.mistral.ai/v1/chat/completions"
-                    && self.endpoints.models_url == "https://api.mistral.ai/v1/models"
-            }
-            "groq" => {
-                self.endpoints.chat_url == "https://api.groq.com/openai/v1/chat/completions"
-                    && self.endpoints.models_url == "https://api.groq.com/openai/v1/models"
-            }
-            _ => false,
-        };
-        if !canonical_endpoints {
-            if let Some(endpoint) = self.ollama_capability_endpoint.as_deref() {
-                return self.ollama_model_capabilities(endpoint, model);
-            }
-            return ModelCapabilities::unknown(self.name(), model);
-        }
+        match &self.profile {
+            ProviderProfile::Static => {
+                let canonical_endpoints = match self.provider_name.as_str() {
+                    "openai" => self.canonical_openai_endpoint,
+                    "grok" => {
+                        self.endpoints.chat_url == "https://api.x.ai/v1/chat/completions"
+                            && self.endpoints.models_url == "https://api.x.ai/v1/models"
+                    }
+                    "mistral" => {
+                        self.endpoints.chat_url == "https://api.mistral.ai/v1/chat/completions"
+                            && self.endpoints.models_url == "https://api.mistral.ai/v1/models"
+                    }
+                    "groq" => {
+                        self.endpoints.chat_url == "https://api.groq.com/openai/v1/chat/completions"
+                            && self.endpoints.models_url == "https://api.groq.com/openai/v1/models"
+                    }
+                    _ => false,
+                };
+                if !canonical_endpoints {
+                    return ModelCapabilities::unknown(self.name(), model);
+                }
 
-        let (source, streaming, tools, reasoning, max_tokens, max_output_tokens) =
-            match (self.provider_name.as_str(), model) {
-                ("openai", "gpt-5.6-sol" | "gpt-5.6") => (
-                    "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
-                    CapabilitySupport::Supported,
-                    CapabilitySupport::Supported,
-                    ReasoningCapability::allowed(
-                        [
-                            ReasoningEffort::None,
-                            ReasoningEffort::Low,
-                            ReasoningEffort::Medium,
-                            ReasoningEffort::High,
-                            ReasoningEffort::Xhigh,
-                            ReasoningEffort::Max,
-                        ],
-                        "2026-08-26",
+                let (source, streaming, tools, reasoning, max_tokens, max_output_tokens) =
+                    match (self.provider_name.as_str(), model) {
+                        ("openai", "gpt-5.6-sol" | "gpt-5.6") => (
+                            "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+                            CapabilitySupport::Supported,
+                            CapabilitySupport::Supported,
+                            ReasoningCapability::allowed(
+                                [
+                                    ReasoningEffort::None,
+                                    ReasoningEffort::Low,
+                                    ReasoningEffort::Medium,
+                                    ReasoningEffort::High,
+                                    ReasoningEffort::Xhigh,
+                                    ReasoningEffort::Max,
+                                ],
+                                "2026-08-26",
+                                "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+                            ),
+                            1_050_000,
+                            Some(128_000),
+                        ),
+                        ("openai", "gpt-4o") => (
+                            "https://developers.openai.com/api/docs/models/gpt-4o",
+                            CapabilitySupport::Supported,
+                            CapabilitySupport::Supported,
+                            ReasoningCapability::unsupported(
+                                "2026-08-26",
+                                "https://developers.openai.com/api/docs/models/gpt-4o",
+                            ),
+                            128_000,
+                            Some(16_384),
+                        ),
+                        ("grok", "grok-4.6") => (
+                            "https://docs.x.ai/developers/grok-4-6; https://docs.x.ai/developers/model-capabilities/text/streaming",
+                            CapabilitySupport::Supported,
+                            CapabilitySupport::Supported,
+                            ReasoningCapability::allowed(
+                                [
+                                    ReasoningEffort::Low,
+                                    ReasoningEffort::Medium,
+                                    ReasoningEffort::High,
+                                    ReasoningEffort::Xhigh,
+                                ],
+                                "2026-08-26",
+                                "https://docs.x.ai/developers/grok-4-6",
+                            ),
+                            500_000,
+                            None,
+                        ),
+                        ("mistral", "mistral-large-2512") => (
+                            "https://docs.mistral.ai/models/mistral-large-3-25-12",
+                            CapabilitySupport::Unknown,
+                            CapabilitySupport::Supported,
+                            ReasoningCapability::unknown(),
+                            256_000,
+                            None,
+                        ),
+                        ("groq", "openai/gpt-oss-120b") => (
+                            "https://console.groq.com/docs/model/openai/gpt-oss-120b; https://console.groq.com/docs/production-readiness/optimizing-latency",
+                            CapabilitySupport::Supported,
+                            CapabilitySupport::Supported,
+                            ReasoningCapability::allowed(
+                                [
+                                    ReasoningEffort::Low,
+                                    ReasoningEffort::Medium,
+                                    ReasoningEffort::High,
+                                ],
+                                "2026-08-26",
+                                "https://console.groq.com/docs/model/openai/gpt-oss-120b",
+                            ),
+                            131_072,
+                            Some(65_536),
+                        ),
+                        // No static-table row for this exact provider/model
+                        // pair: stay fail-closed rather than assume support.
+                        _ => return ModelCapabilities::unknown(self.name(), model),
+                    };
+                let mut capabilities = ModelCapabilities::static_metadata(
+                    self.name(),
+                    model,
+                    "2026-08-26",
+                    source,
+                    streaming,
+                    tools,
+                    CapabilitySupport::Unsupported,
+                    reasoning,
+                    Some(max_tokens),
+                    max_output_tokens,
+                    None,
+                )
+                .with_wire_protocol(
+                    WireProtocol::OpenAiChatCompletions,
+                    "2026-08-26",
+                    "Finch OpenAI-compatible chat-completions adapter",
+                );
+                if self.provider_name == "openai" && matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
+                    capabilities.image_input = ModelFeature::static_metadata(
+                        CapabilitySupport::Supported,
+                        "2026-08-27",
                         "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
-                    ),
-                    1_050_000,
-                    Some(128_000),
-                ),
-                ("openai", "gpt-4o") => (
-                    "https://developers.openai.com/api/docs/models/gpt-4o",
-                    CapabilitySupport::Supported,
-                    CapabilitySupport::Supported,
-                    ReasoningCapability::unsupported(
-                        "2026-08-26",
-                        "https://developers.openai.com/api/docs/models/gpt-4o",
-                    ),
-                    128_000,
-                    Some(16_384),
-                ),
-                ("grok", "grok-4.6") => (
-                    "https://docs.x.ai/developers/grok-4-6; https://docs.x.ai/developers/model-capabilities/text/streaming",
-                    CapabilitySupport::Supported,
-                    CapabilitySupport::Supported,
-                    ReasoningCapability::allowed(
-                        [
-                            ReasoningEffort::Low,
-                            ReasoningEffort::Medium,
-                            ReasoningEffort::High,
-                            ReasoningEffort::Xhigh,
-                        ],
-                        "2026-08-26",
-                        "https://docs.x.ai/developers/grok-4-6",
-                    ),
-                    500_000,
-                    None,
-                ),
-                ("mistral", "mistral-large-2512") => (
-                    "https://docs.mistral.ai/models/mistral-large-3-25-12",
-                    CapabilitySupport::Unknown,
-                    CapabilitySupport::Supported,
-                    ReasoningCapability::unknown(),
-                    256_000,
-                    None,
-                ),
-                ("groq", "openai/gpt-oss-120b") => (
-                    "https://console.groq.com/docs/model/openai/gpt-oss-120b; https://console.groq.com/docs/production-readiness/optimizing-latency",
-                    CapabilitySupport::Supported,
-                    CapabilitySupport::Supported,
-                    ReasoningCapability::allowed(
-                        [
-                            ReasoningEffort::Low,
-                            ReasoningEffort::Medium,
-                            ReasoningEffort::High,
-                        ],
-                        "2026-08-26",
-                        "https://console.groq.com/docs/model/openai/gpt-oss-120b",
-                    ),
-                    131_072,
-                    Some(65_536),
-                ),
-                // Ollama and remote-daemon catalogs are deployment-specific;
-                // all optional capabilities remain unknown until attested.
-                _ => return ModelCapabilities::unknown(self.name(), model),
-            };
-        let mut capabilities = ModelCapabilities::static_metadata(
-            self.name(),
-            model,
-            "2026-08-26",
-            source,
-            streaming,
-            tools,
-            CapabilitySupport::Unsupported,
-            reasoning,
-            Some(max_tokens),
-            max_output_tokens,
-            None,
-        )
-        .with_wire_protocol(
-            WireProtocol::OpenAiChatCompletions,
-            "2026-08-26",
-            "Finch OpenAI-compatible chat-completions adapter",
-        );
-        if self.provider_name == "openai" && matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
-            capabilities.image_input = ModelFeature::static_metadata(
-                CapabilitySupport::Supported,
-                "2026-08-27",
-                "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
-            );
+                    );
+                }
+                capabilities
+            }
+            ProviderProfile::Ollama {
+                capability_endpoint,
+                capabilities,
+            } => self.ollama_model_capabilities(capability_endpoint, capabilities, model),
+            ProviderProfile::RemoteDaemon => ModelCapabilities::unknown(self.name(), model),
         }
-        capabilities
     }
 
     fn requested_reasoning_effort(&self, _request: &ProviderRequest) -> Option<ReasoningEffort> {
@@ -2255,13 +2305,21 @@ impl ProviderBackend for OpenAIProvider {
     }
 
     async fn refresh_capabilities(&self, model: &str) {
-        let Some(endpoint) = self.ollama_capability_endpoint.as_deref() else {
-            // Not an Ollama-backed instance (includes remote_daemon, which
-            // stays out of scope for issue #925): nothing to refresh.
-            return;
+        let (endpoint, capabilities) = match &self.profile {
+            ProviderProfile::Static => {
+                // No live attestation path for the static table.
+                return;
+            }
+            ProviderProfile::Ollama {
+                capability_endpoint,
+                capabilities,
+            } => (capability_endpoint.as_str(), capabilities),
+            ProviderProfile::RemoteDaemon => {
+                // No attestation path at all (issue #925 scope was Ollama-only).
+                return;
+            }
         };
-        let already_attested = self
-            .ollama_capabilities
+        let already_attested = capabilities
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(model);
@@ -2269,14 +2327,14 @@ impl ProviderBackend for OpenAIProvider {
             return;
         }
         match fetch_ollama_capabilities(&self.client, endpoint, model).await {
-            Ok(capabilities) => {
-                self.ollama_capabilities
+            Ok(fetched) => {
+                capabilities
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(
                         model.to_string(),
                         OllamaLiveCapabilities {
-                            capabilities,
+                            capabilities: fetched,
                             fetched_at: Utc::now(),
                         },
                     );
@@ -4994,6 +5052,101 @@ mod tests {
 
         assert_eq!(capabilities.tools.support, CapabilitySupport::Unknown);
         assert_eq!(capabilities.wire_protocol.protocol, None);
+    }
+
+    // Issue #929 regression: `capabilities()` and `refresh_capabilities()`
+    // both `match &self.profile { ProviderProfile::Static => ..., Ollama {
+    // .. } => ..., RemoteDaemon => ... }` with no `_` wildcard arm. That
+    // absence is what makes the dispatch exhaustive: `cargo build` for this
+    // crate already refuses to compile if a fourth `ProviderProfile` variant
+    // is added without a matching arm in both methods, because a `match`
+    // without a wildcard over a non-exhaustively-covered enum is itself a
+    // compiler error (E0004). A runtime test cannot independently re-prove
+    // "this fails to compile without a fix" without either duplicating the
+    // enum in test-only code (which would prove nothing about the real
+    // `capabilities()`/`refresh_capabilities()` dispatch) or literally
+    // deleting an arm, which would fail this file's own build rather than
+    // one isolated test. So the practical regression coverage kept here is
+    // per-variant: lock in the exact `capabilities()` shape each existing
+    // `ProviderProfile` variant produces today, so a future edit that
+    // changes what one variant's arm returns — including a change that
+    // accidentally merges two arms' behavior — is caught by a failing
+    // assertion instead of by re-reading the match.
+    #[tokio::test]
+    async fn test_capabilities_dispatch_covers_every_provider_profile_variant() {
+        // ProviderProfile::Static (openai/grok/mistral/groq): a known
+        // provider/model pair resolves from the static table with a known
+        // wire protocol and Supported tools.
+        let openai = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        let static_capabilities = openai.capabilities("gpt-4o");
+        assert_eq!(
+            static_capabilities.tools.support,
+            CapabilitySupport::Supported,
+            "Static profile: known provider/model pair must resolve from the static table, got {:?}",
+            static_capabilities.tools
+        );
+        assert_eq!(
+            static_capabilities.wire_protocol.protocol,
+            Some(WireProtocol::OpenAiChatCompletions),
+            "Static profile: wire protocol is a static adapter fact, must be known"
+        );
+        assert!(
+            matches!(
+                static_capabilities.tools.provenance,
+                CapabilityProvenance::StaticMetadata { .. }
+            ),
+            "Static profile: provenance must be StaticMetadata, not live attestation, got {:?}",
+            static_capabilities.tools.provenance
+        );
+
+        // ProviderProfile::Ollama, before any live attestation: fails closed
+        // to Unknown for the model-specific feature, but the wire protocol
+        // is still known because it is a fact about the adapter, not a
+        // per-model attestation.
+        let ollama =
+            OpenAIProvider::new_ollama("http://127.0.0.1:1".to_string(), "qwen2.5:7b".to_string())
+                .unwrap();
+        let ollama_capabilities = ollama.capabilities("qwen2.5:7b");
+        assert_eq!(
+            ollama_capabilities.tools.support,
+            CapabilitySupport::Unknown,
+            "Ollama profile: unattested model must stay Unknown, not assume support, got {:?}",
+            ollama_capabilities.tools
+        );
+        assert_eq!(
+            ollama_capabilities.wire_protocol.protocol,
+            Some(WireProtocol::OpenAiChatCompletions),
+            "Ollama profile: wire protocol is known even without live attestation"
+        );
+
+        // ProviderProfile::RemoteDaemon: always Unknown, no wire protocol
+        // implied — there is no attestation path at all for this variant.
+        let remote_daemon =
+            OpenAIProvider::new_remote_daemon("http://127.0.0.1:1".to_string()).unwrap();
+        let remote_daemon_capabilities = remote_daemon.capabilities(remote_daemon.default_model());
+        assert_eq!(
+            remote_daemon_capabilities.tools.support,
+            CapabilitySupport::Unknown,
+            "RemoteDaemon profile: no attestation path, must stay Unknown, got {:?}",
+            remote_daemon_capabilities.tools
+        );
+        assert_eq!(
+            remote_daemon_capabilities.wire_protocol.protocol, None,
+            "RemoteDaemon profile: no wire protocol should be implied"
+        );
+
+        // The three variants must be distinguishable from each other by
+        // their capability shape alone — that is the property the
+        // exhaustive match exists to preserve.
+        assert_ne!(
+            static_capabilities.tools.support, ollama_capabilities.tools.support,
+            "Static and Ollama profiles must not collapse to the same capability shape for these fixtures"
+        );
+        assert_eq!(
+            ollama_capabilities.tools.support, remote_daemon_capabilities.tools.support,
+            "Ollama-before-attestation and RemoteDaemon happen to agree on Unknown tools support today, \
+             but only the wire_protocol assertions above prove they took different match arms to get there"
+        );
     }
 
     #[tokio::test]
