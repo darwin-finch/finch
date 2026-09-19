@@ -779,4 +779,24 @@ that states it outright anywhere in the document.
 **Also launching a research pass on template/type-specialization/inference syntax** — flagged
 directly as "totally unspecified," with TypeScript's conditional/inferred types and D's template
 specialization named as the two systems to compare against. Genuinely large, separate topic;
-handling as its own effort rather than folding into this entry.
+handling as its own effort rather than folding into this entry — see the standalone research report
+at `reports/TypeScript vs D type specialization.md` once delivered.
+
+**Continued 2026-09-18 — capability-request wildcarding, and this is a real correction to
+something claimed wrong earlier tonight and earlier in this conversation, not just a new example.**
+Multiple earlier passes (this file's §5/§8/§10 and the pre-compaction summary) claimed capability
+wildcarding was "ungrammared" — checked properly this time, and that was wrong. `path<workspace:
+"generated/**">` is a real, working type-level refinement already used in the document's own
+`save-report` example, and there's a real named grammar for the whole selector-expression language
+("root, literal relative path, refined path argument, join, and narrow"). Written into
+`feature_tour.md` §16 as a working `publish-asset` declaration, composing exactly like
+`save-report` already does.
+
+Also corrected, not just extended: the user's original motivating example (`read{path="~/**"}`)
+needs more than a syntax fix — `~` (home directory) is outside the workspace root entirely, and
+the document is explicit that `path<R>` is scoped to "an immutable workspace/project root." Reaching
+outside it needs a distinct, more-privileged root (`root<host-machine>`, named in the document),
+not a wider pattern on the same root. Composed a corrected `backup-home` example using that root,
+flagged honestly as inferred-by-analogy rather than confirmed, since no single example combines
+`root<host-machine>` with `path<R>`'s refinement syntax. `join`/`narrow` remain genuinely
+ungrammared — named as real grammar nodes, never shown with concrete syntax anywhere.

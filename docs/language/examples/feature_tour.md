@@ -616,10 +616,56 @@ the subject of arbitrarily many concept implementations, and neither role taxes 
 shape a serializer walks is identical to the data shape sitting in memory, whether the record
 implements zero concepts or twenty.
 
-## 16. Open gaps, current as of this pass — what's still missing and why
+## 16. Capability templating, exercised properly — a real correction, not just a gap
 
-- **Capability requests with wildcarded paths** (`read{path="~/**"}`) — still ungrammared; unchanged
-  since first flagged.
+**A real mistake worth stating plainly: earlier passes in this file, and earlier in this
+conversation, claimed capability wildcarding was "ungrammared."** That was wrong, or at least badly
+incomplete — checked properly this time rather than trusted from memory. `path<workspace:
+"generated/**">` is a real, working type-level refinement, used concretely in the document's own
+`save-report` example, not a hypothetical. There is a named grammar for the whole selector
+language: "function effects may contain a restricted selector expression over immutable typed
+arguments. The allowed expression nodes are root, literal relative path, refined path argument,
+join, and narrow; general string interpolation and user-defined evaluation are forbidden." Five
+named node kinds — this is a real, if terse, specification, not a wildcard heuristic bolted on.
+
+```lisp
+(define (publish-asset (path : path<workspace:"assets/**">) (data : bytes)) : unit
+  ! {fs.write(root=workspace, path="assets/**")}
+  (file.write path data))
+```
+
+This composes exactly like `save-report` already does — wildcarding lives in the *type* of the
+path argument, not as a separate runtime string check, and the effect row names the same pattern.
+Calling `publish-asset` with a path outside `assets/**` is a type error at the call site, not a
+runtime permission check that might be forgotten.
+
+**The user's original example, `read{path="~/**"}`, needs a real correction, not a small syntax
+fix.** `~` means the home directory — outside the workspace root entirely — and the document is
+explicit that `path<R>` "is relative to an immutable workspace/project root and rejects traversal
+or symlink escape." Reaching outside that root isn't a wider pattern on the same root; it's a
+different, more privileged root altogether: `root<host-machine>`, a "distinct host-issued root
+resource" a user must deliberately grant, with "the same type and selector rules... apply[ing]
+below that root." So the corrected shape is closer to:
+
+```lisp
+(define (backup-home (path : path<root<host-machine>:"~/**">) (dest : path<workspace:"backups/**">)) : unit
+  ! {fs.read(root=host-machine, path="~/**")} {fs.write(root=workspace, path="backups/**")}
+  (file.copy path dest))
+```
+
+**UNVERIFIED, flagged precisely rather than presented as confirmed:** `root<host-machine>` and
+`path<root<host-machine>:"...">` are inferred compositions from "for example `root<host-machine>`"
+and "the same type and selector rules then apply below that root" — the document names the concept
+and gives that one example identifier, but never shows a full, worked declaration combining it with
+`path<R>` the way `path<workspace:...>` is shown combined. Plausible by direct analogy, not
+independently confirmed. Likewise, `join` and `narrow` are named as real grammar nodes but have no
+concrete CoLisp syntax anywhere — only "refined path argument" (the `path<workspace:"...">` form)
+is ever shown worked out; composing two path fragments or narrowing an existing grant to a
+subdirectory has no example to check against.
+
+- **`join`/`narrow` selector-expression syntax** — named in the grammar, never shown concretely.
+- **`root<host-machine>` combined with `path<R>`'s refinement syntax** — named separately, never
+  shown combined in one worked declaration.
 - **`borrow-mut` and in-place field mutation** — one combined open item (§1); a mutable-borrow
   keyword with nothing legal to write through it once you have one is half a feature.
 - **Explicit discriminant/`repr` for variants** — not specified, so `WebEvent` (§4) has no `repr`
