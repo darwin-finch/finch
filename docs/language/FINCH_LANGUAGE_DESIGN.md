@@ -3972,9 +3972,9 @@ source spellings:
 implementation MyListRange<T> : Range {
     associated Item = T
     associated Effects = {}
-    operation empty?    = my-list-empty?#41
-    operation front     = my-list-front#73
-    operation pop-front = my-list-pop-front#74
+    operation empty?    = my-list-empty?
+    operation front     = my-list-front
+    operation pop-front = my-list-pop-front
     dynamic-evidence-version = 1
 }
 ```
@@ -4037,7 +4037,22 @@ These spellings are illustrative until the surface grammar is frozen. The declar
 not inherited implementation or an implicit method search. It may publish only static evidence, or
 additionally publish a versioned dynamic evidence table when the concept has a fixed runtime ABI. A
 derive tool may generate the declaration, but the compiler still consumes an explicit mapping
-rather than silently treating matching names as conformance. Exported evidence is named and stable.
+rather than silently treating matching names as conformance.
+
+One narrow, deliberate exception: an `implementation` block may omit an operation entirely when the
+record it is written for already has an inherent member of that exact name with the concept's exact
+canonical signature, receiver form included — equivalent to writing `operation area = Rectangle.area`
+by hand, never inferred by searching. This does not reopen implicit conformance, because none of the
+reasons that rule exists apply here: the `implementation ... : Concept` declaration itself is still
+mandatory, so intent is never inferred, only a provably unique detail of an already-explicit act;
+there is no import-scope dependence, since an inherent member is in scope wherever the record itself
+is nameable; and there is exactly one legal candidate, the same uniqueness the direct shorthand
+above already requires. The distinction that matters is *whether conformance itself is inferred*,
+not whether any step is mechanical — this sugar never lets a type become an implementer without a
+declaration naming the concept; it only elides which already-existing callable fills an operation
+whose answer cannot be ambiguous.
+
+Exported evidence is named and stable.
 Each requirement has exactly one selected mapping in a compilation context; competing equally valid
 evidence is an ambiguity error, never an import-order decision.
 
@@ -4075,12 +4090,12 @@ reach for, because binding to one *is* the ordinary case:
   (* r.width r.height))
 
 implementation RectangleHasArea for Rectangle : HasArea {
-    operation area = rect-area#10
+    operation area = rect-area
 }
 
 implementation RectangleMeasurable for Rectangle : Measurable {
-    operation area      = rect-area#10   ; same identity, bound again — not rewritten
-    operation perimeter = rect-perimeter#11
+    operation area      = rect-area   ; same identity, bound again — not rewritten
+    operation perimeter = rect-perimeter
 }
 ```
 

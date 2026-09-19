@@ -1059,3 +1059,49 @@ design-rationale paragraph plus a `HasArea`/`Measurable`/`rect-area` worked exam
 Neither of these needed a new decision or a changed mechanism — both were the existing
 explicit-evidence model answering questions it was already positioned to answer, just not yet
 pointed at these two specific, real complaints before now.
+
+**Continued 2026-09-18 — `#NN` resolved (removed, not relocated), inherent-member sugar added after
+correcting an overcautious call, `repr` gap widened from variants to records.** Three related
+threads, same session:
+
+First, the undefined `#NN` free-function suffix from earlier this pass (`my-list-front#41` etc.) was
+run to ground rather than left as "open, ask the user." Shammah's own architectural point settled
+it: if a stable slot number meant anything, it would live on the *concept's* operation declaration,
+never on the bound free function — a concept owns the evidence table's shape, an implementation just
+fills already-numbered slots. That placement test is decisive against the current text either way,
+since every existing use puts the number on the implementation side. Then checked whether the
+number should be *moved* to the concept (a real, protobuf-precedented feature, motivated by
+`dynamic-evidence-version`/"composition epoch" sitting nearby) or dropped outright: Shammah's
+question — "no similar stability for ordering of record fields declared" — is the correct test, and
+re-reading the composition-epoch sentence in full confirmed it's about registry growth (more named
+implementations becoming available over time) and immutability of already-erased values, not about
+one concept's own operation list changing shape while old compiled code needs a stable index into
+it. No mechanism anywhere actually needs per-operation slot stability. Real precedent: Rust's
+`repr(Rust)` — default, for both structs *and* trait-object vtables — is explicitly unspecified;
+only `repr(C)`, an explicit, rare, FFI-motivated opt-in, gets a stable layout. Removed `#NN` from
+all five occurrences across both documents (three in the original `MyListRange` example, two in this
+pass's own `Codec`/`HasArea` examples — the pattern had already been copied forward uncorrected
+before Shammah caught it) rather than relocating it. `dynamic-evidence-version` itself survives but
+is now flagged in §18 as still genuinely unexplained — probably an implementation-level version/
+cache-identity tag, unrelated to slot numbering, but that is inference, not confirmation.
+
+Second, a call from earlier this pass was reversed after Shammah asked "why do we care about this?"
+about the inherent-record-method auto-fill question. The original objection ("same shape of problem
+as UFCS, just narrower scope") didn't survive checking against the actual reasons the explicit-
+mapping rule exists: accidental conformance, import-scope dependence, no written record of intent,
+and candidate ambiguity. None of those manifest when an `implementation ... : Concept` declaration
+is still mandatory (so conformance itself is never inferred, only which already-existing callable
+fills a provably unique operation), the inherent member is in scope wherever the record itself is
+nameable (no import dependence), and the exact-signature match has exactly one legal candidate (the
+same uniqueness the existing direct-shorthand form already requires). Corrected in place as a real
+addition, written immediately after the "not... an implicit method search" sentence it might
+otherwise appear to contradict, explaining precisely why it doesn't: the rule is about not
+inferring *that* a type conforms, not about forbidding every mechanical step once conformance is
+already explicit.
+
+Third, Shammah raised a real remaining need directly: Finch does need an explicit, opt-in C-ABI-
+compatible layout mechanism for records — not a reversal of "no default layout stability," but the
+deliberate exception to it, exactly matching Rust's `repr(C)` half of the same precedent just cited
+against `#NN`. Found the existing "Explicit discriminant/`repr` for variants" gap entry (§18) already
+named this for tagged unions but not for plain records, despite the missing mechanism being
+identical for both; widened the entry rather than logging a duplicate.

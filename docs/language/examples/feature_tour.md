@@ -718,8 +718,19 @@ subdirectory has no example to check against.
   shown combined in one worked declaration.
 - **`borrow-mut` and in-place field mutation** — one combined open item (§1); a mutable-borrow
   keyword with nothing legal to write through it once you have one is half a feature.
-- **Explicit discriminant/`repr` for variants** — not specified, so `WebEvent` (§4) has no `repr`
-  clause.
+- **Explicit, opt-in C-compatible layout (`repr`), widened from variants to records generally** —
+  originally logged narrowly ("discriminant/`repr` for variants," so `WebEvent` in §4 has no `repr`
+  clause), but the same missing mechanism applies equally to plain records: default layout has no
+  stability guarantee at all (confirmed this pass — deliberately, matching Rust's `repr(Rust)`), so
+  systems-language C-ABI interop and manual packing optimization both need the explicit opt-in half
+  of that same precedent, `repr(C)`-equivalent, on both records and variants. Neither the annotation
+  syntax nor the packing rules it would follow are specified yet.
+- **`dynamic-evidence-version` on an `implementation` block** (§19/§20 area, new this pass) — appears
+  in two illustrative examples, never explained anywhere. Ruled out as a per-operation vtable-slot
+  mechanism (§21's `#NN` finding — the numbers were on the wrong declaration to be that, and no
+  mechanism anywhere actually needs one, by the same reasoning that record fields have no analogous
+  stability requirement); most likely an implementation-level version/cache-identity tag unrelated
+  to slot numbering, but that's inference, not confirmation. What it actually versions is still open.
 - **`ParameterSpec -> syntax` reconstruction** (§7, new this pass) — needed to rebuild a signature
   from its introspected form; without it, "same signature, different body" CTFE can't be written.
   This is the concrete, load-bearing case; §1's `borrow-mut` is the other half of the same family
@@ -792,13 +803,13 @@ concept Codec<Wire, Value> {
 }
 
 implementation MsgpackUserCodec : Codec<bytes, User> {
-    operation encode = msgpack-encode-user#82
-    operation decode = msgpack-decode-user#83
+    operation encode = msgpack-encode-user
+    operation decode = msgpack-decode-user
 }
 
 implementation BrokenIdentityCodec : Codec<User, User> {
-    operation encode = identity#1
-    operation decode = wrap-ok#2
+    operation encode = identity
+    operation decode = wrap-ok
 }
 ```
 
@@ -810,8 +821,8 @@ axiom (`wire-and-value-differ`), per the diagnostic-quality commitment in the de
 
 This also produced a real, useful negative result worth keeping: an axiom checking
 `not (Wire == Value)` only catches an *identity* codec, not a merely-useless one — nothing stops
-`implementation UselessCodec : Codec<bytes, bytes> { operation encode = id-copy#3; operation decode
-= wrap-ok-copy#4; }` (distinct-in-name but behaviorally identical wire/value types) from compiling
+`implementation UselessCodec : Codec<bytes, bytes> { operation encode = id-copy; operation decode
+= wrap-ok-copy; }` (distinct-in-name but behaviorally identical wire/value types) from compiling
 and satisfying the concept, because "the types differ" is the only thing actually decidable here at
 compile time — "the codec does something meaningful" is exactly the kind of runtime-semantic
 property compile-time evaluation cannot decide, the same class of unprovable promise `isInputRange`
@@ -876,16 +887,16 @@ concept Measurable {
   (* 2.0 (+ r.width r.height)))
 
 implementation RectangleHasArea for Rectangle : HasArea {
-    operation area = rect-area#10
+    operation area = rect-area
 }
 
 implementation RectangleMeasurable for Rectangle : Measurable {
-    operation area      = rect-area#10
-    operation perimeter = rect-perimeter#11
+    operation area      = rect-area
+    operation perimeter = rect-perimeter
 }
 ```
 
-Both `area` operations bind the identical `rect-area#10` callable — one function, written once,
+Both `area` operations bind the identical `rect-area` callable — one function, written once,
 referenced twice. `HasArea.area(rect)` and `Measurable.area(rect)` are two distinct, concept-
 qualified calls (per the document's own "operation names live in their concept evidence" rule
 above), so the shared name (`area`) across the two concepts never collides or needs disambiguating
