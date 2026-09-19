@@ -230,8 +230,14 @@ for leaf_path in "$repository_root"/*; do
         fi
         worktree_status=""
         if ! worktree_status="$(git -C "$metadata_worktree_root" status --porcelain 2>/dev/null)"; then
+            # The diagnostic re-run below is only for its stderr text (the
+            # `2>&1 >/dev/null` swap captures stderr alone); `|| true`
+            # matters here specifically -- under `set -e` a second bare,
+            # unguarded git failure on this path would abort the whole run
+            # instead of falling through to refuse-and-continue.
+            worktree_status_error="$(git -C "$metadata_worktree_root" status --porcelain 2>&1 >/dev/null || true)"
             echo "reclaim-cargo-targets: refused: worktree exists but its status could not be confirmed clean: path=$leaf_path worktree=$metadata_worktree_root"
-            git -C "$metadata_worktree_root" status --porcelain >/dev/null
+            printf '%s\n' "$worktree_status_error" >&2
             exit_status=1
             continue
         fi

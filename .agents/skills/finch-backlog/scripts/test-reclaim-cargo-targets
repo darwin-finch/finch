@@ -317,4 +317,100 @@ assert_contains "$apply_h_after" "reclaimed: path=$target_h" \
     "the target was not reclaimed once the shared Cargo slot was released"
 [[ ! -e "$target_h" ]] || fail "target survived --apply once the shared Cargo slot was released: path=$target_h"
 
+### Fixture I: a worktree whose Git registration is corrupted (its checkout
+### and .git file still exist on disk, but the admin dir under
+### .git/worktrees/<name> is gone, so `git status` there fails rather than
+### reporting dirty or clean) must refuse only that one leaf -- not abort the
+### whole run under `set -e` and silently strand every leaf ordered after it.
+worktree_i="$fixture_root/worktree-i"
+git -C "$repo" worktree add -q -b worktree-i "$worktree_i"
+target_i="$(build_target "$worktree_i")"
+admin_dir_i="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)/worktrees/worktree-i"
+rm -rf -- "$admin_dir_i"
+
+worktree_j="$fixture_root/worktree-j"
+git -C "$repo" worktree add -q -b worktree-j "$worktree_j"
+target_j="$(build_target "$worktree_j")"
+git -C "$repo" worktree remove --force "$worktree_j"
+
+set +e
+apply_i="$(run_reclaim --apply)"
+apply_i_status=$?
+set -e
+[[ "$apply_i_status" -eq 1 ]] || \
+    fail "a corrupted worktree registration should refuse cleanly (status 1), not crash the whole run: status=$apply_i_status output=$apply_i"
+assert_contains "$apply_i" "refused: worktree exists but its status could not be confirmed clean" \
+    "the corrupted-registration worktree was not reported as an explicit refusal"
+assert_contains "$apply_i" "reclaimed: path=$target_j" \
+    "a legitimately retired sibling leaf ordered after the corrupted one was never reached"
+[[ -d "$target_i" ]] || fail "reclaim deleted a leaf whose worktree status could not be confirmed: path=$target_i"
+[[ ! -e "$target_j" ]] || fail "the legitimately retired sibling leaf was not reclaimed: path=$target_j"
+rm -rf -- "$target_i"
+
+### Fixture K: Git properly stops registering a worktree (`git worktree
+### remove`), but by the time this tool runs, something else -- a fresh,
+### independent, dirty Git checkout -- occupies that exact path. `git status`
+### there succeeds and is genuinely dirty, so the leaf must be preserved. This
+### is the tool's single most safety-critical guarantee (never delete a dirty
+### worktree's target just because Git stopped registering the path) and had
+### zero regression coverage until this fixture: every other "retired"
+### fixture leaves that path empty afterward, so none of them exercise the
+### still-present-and-dirty branch at all. (Corrupting a worktree's own admin
+### directory, as Fixture I does, breaks `git status` there outright -- it
+### cannot produce a confirmable-dirty result, only an unconfirmable one.)
+worktree_k="$fixture_root/worktree-k"
+git -C "$repo" worktree add -q -b worktree-k "$worktree_k"
+target_k="$(build_target "$worktree_k")"
+git -C "$repo" worktree remove --force "$worktree_k"
+mkdir -p "$worktree_k"
+git -C "$worktree_k" init -q
+printf 'dirty\n' >"$worktree_k/dirty.txt"
+
+dry_run_k="$(run_reclaim)"
+assert_contains "$dry_run_k" "preserved: worktree exists with uncommitted changes" \
+    "an unregistered-but-present, dirty worktree's target was not preserved"
+[[ -d "$target_k" ]] || fail "dry run deleted an unregistered-but-present, dirty worktree's target: path=$target_k"
+
+set +e
+apply_k="$(run_reclaim --apply)"
+apply_k_status=$?
+set -e
+[[ "$apply_k_status" -eq 0 ]] || fail "an apply run with only a preserved leaf should exit 0: status=$apply_k_status output=$apply_k"
+[[ -d "$target_k" ]] || fail "--apply deleted an unregistered-but-present, dirty worktree's target: path=$target_k"
+
+### Fixture L: a directory sitting at a recorded worktree path that is not a
+### Git checkout at all (no .git) is refused, not guessed at as clean.
+worktree_l="$fixture_root/worktree-l"
+git -C "$repo" worktree add -q -b worktree-l "$worktree_l"
+target_l="$(build_target "$worktree_l")"
+admin_dir_l="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)/worktrees/worktree-l"
+rm -rf -- "$admin_dir_l" "$worktree_l/.git"
+
+set +e
+dry_run_l="$(run_reclaim)"
+dry_run_l_status=$?
+set -e
+[[ "$dry_run_l_status" -ne 0 ]] || fail "a non-Git-checkout directory at a recorded worktree path should report a refusal: output=$dry_run_l"
+assert_contains "$dry_run_l" "refused: worktree path exists but is not a Git checkout" \
+    "a non-Git-checkout directory at a recorded worktree path was not refused"
+[[ -d "$target_l" ]] || fail "reclaim deleted a leaf whose recorded worktree path is not a Git checkout: path=$target_l"
+rm -rf -- "$target_l"
+
+### Fixture M: ownership metadata whose git-common-dir field names a
+### different repository entirely (as opposed to Fixture E's tampered
+### worktree-root/namespace mismatch) is preserved, not treated as this
+### repository's own leaf.
+worktree_m="$fixture_root/worktree-m"
+git -C "$repo" worktree add -q -b worktree-m "$worktree_m"
+target_m="$(build_target "$worktree_m")"
+git -C "$repo" worktree remove --force "$worktree_m"
+metadata_m="$target_m/.finch-cargo-target-owner-v1"
+sed -i.bak "s#git-common-dir:.*#git-common-dir:$fixture_root/some-other-repo/.git#" "$metadata_m"
+rm -f "$metadata_m.bak"
+
+dry_run_m="$(run_reclaim)"
+assert_contains "$dry_run_m" "preserved: ownership metadata names a different repository" \
+    "ownership metadata naming a different repository was not preserved"
+[[ -d "$target_m" ]] || fail "reclaim deleted a leaf whose ownership metadata names a different repository: path=$target_m"
+
 echo "reclaim-cargo-targets regression: all fixtures passed"

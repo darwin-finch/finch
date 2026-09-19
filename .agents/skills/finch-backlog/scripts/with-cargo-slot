@@ -109,14 +109,22 @@ if [[ "${CARGO_TARGET_DIR+x}" != x && -z "${CI:-}" ]]; then
     # (never guessed at) by reclaim-cargo-targets rather than blocking Cargo.
     owner_metadata_path="$CARGO_TARGET_DIR/.finch-cargo-target-owner-v1"
     owner_metadata_tmp="$owner_metadata_path.tmp.$$"
-    if ! {
+    # `|| true` matters: under `set -e`, a bare failing statement would abort
+    # the build here even though the intent is warn-and-continue. It also
+    # sidesteps a real bash surprise -- when the `>` target itself can't be
+    # opened (e.g. the directory lost write permission), bash reports that as
+    # a shell-level error but the group's own exit status is 0, so checking
+    # `$?` here cannot distinguish "opened but wrote nothing" from "wrote
+    # everything"; checking that the file is non-empty afterward can.
+    {
         printf 'git-common-dir:%s\n' "$git_common_dir"
         printf 'worktree-root:%s\n' "$worktree_root"
         printf 'repository-namespace:%s\n' "$repository_namespace"
         printf 'worktree-namespace:%s\n' "$worktree_namespace"
         printf 'recorded:%s\n' "$(perl -e \
             'my @t = gmtime(time); printf "%04d-%02d-%02dT%02d:%02d:%02dZ", $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]')"
-    } >"$owner_metadata_tmp" 2>/dev/null; then
+    } >"$owner_metadata_tmp" 2>/dev/null || true
+    if [[ ! -s "$owner_metadata_tmp" ]]; then
         rm -f -- "$owner_metadata_tmp"
         echo "with-cargo-slot: warning: could not write ownership metadata, continuing without it: path=$owner_metadata_tmp" >&2
     elif ! perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' \
