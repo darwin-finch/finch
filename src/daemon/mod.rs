@@ -14,7 +14,10 @@ mod upgrade;
 /// keep writing to the terminal or the journal.
 pub const DETACHED_DAEMON_ENV: &str = "FINCH_DAEMON_DETACHED";
 
-pub use self::log::{daemon_log_path, log_status, LogStatus, RotatingLog, RotationPolicy};
+pub use self::log::{
+    daemon_log_path, frontend_log_dir, frontend_log_identity, frontend_log_path, log_status,
+    prune_frontend_logs, LogStatus, RotatingLog, RotationPolicy, DEFAULT_MAX_FRONTEND_LOG_FILES,
+};
 pub use lifecycle::{DaemonInstanceGuard, DaemonLifecycle, DaemonStopOutcome};
 pub use spawn::{ensure_daemon_running, spawn_daemon};
 pub use upgrade::{DaemonUpgradePlan, VerifiedDaemonUpgrade};

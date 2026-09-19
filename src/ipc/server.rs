@@ -10,6 +10,7 @@ use capnp::capability::Promise;
 use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tracing::Instrument;
 
 use crate::ipc::codec::{
     decode_approval_audience, decode_brain_submission, decode_environment,
@@ -1706,6 +1707,27 @@ async fn execute_typed_forth_ipc(program: String) -> Result<(Vec<i64>, String)> 
 // RPC method implementations
 // ---------------------------------------------------------------------------
 
+/// Fresh per-call tracing span for a local Cap'n Proto IPC method (#223: the
+/// local IPC path had no tracing correlation of any kind).
+///
+/// capnp-rpc's own internal `QuestionId`/`AnswerId` (which it clearly must
+/// maintain to match a `Return` to its `Call`) is a private implementation
+/// detail of the connection state machine (`capnp-rpc/src/rpc.rs`, not
+/// `pub`), so there is no protocol-level id to read from application code.
+/// This generates a fresh id server-side, the same way the daemon's HTTP
+/// surface assigns `x-request-id` (`request_tracing_span` in
+/// `server/mod.rs`) — every `tracing` event emitted while the returned span
+/// is entered (including from deep inside provider calls) is tagged with it.
+/// It is independent of, and not equal to, whatever id (if any) the calling
+/// client generated for its own side of this same call — nothing here is
+/// transmitted back, so this correlates events *within* the daemon's own
+/// log, not across daemon and client logs. Getting the identical id on both
+/// sides would need the value to travel over the wire (a schema field, or
+/// reusing `connectionId` where a method already carries one).
+fn ipc_call_span(method: &'static str) -> tracing::Span {
+    tracing::info_span!("ipc_call", method, request_id = %uuid::Uuid::new_v4())
+}
+
 impl finch_daemon::Server for FinchDaemonImpl {
     // ---- query (non-streaming) -------------------------------------------
 
@@ -1720,33 +1742,36 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let tools = pry!(read_tools(pry!(p.get_tools())));
         let server = Arc::clone(&self.server);
 
-        Promise::from_future(async move {
-            let provider = server
-                .primary_provider()
-                .ok_or_else(|| capnp::Error::failed("no provider configured".into()))?;
+        Promise::from_future(
+            async move {
+                let provider = server
+                    .primary_provider()
+                    .ok_or_else(|| capnp::Error::failed("no provider configured".into()))?;
 
-            let mut req = crate::providers::ProviderRequest::new(messages);
-            if !tools.is_empty() {
-                req = req.with_tools(tools);
+                let mut req = crate::providers::ProviderRequest::new(messages);
+                if !tools.is_empty() {
+                    req = req.with_tools(tools);
+                }
+
+                let response = provider
+                    .send_message(&req)
+                    .await
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+                let tool_uses = response.tool_uses();
+                write_query_response(
+                    results.get().init_response(),
+                    &response.text(),
+                    &tool_uses,
+                    &response.model,
+                    None,
+                    None,
+                    None,
+                )?;
+                Ok(())
             }
-
-            let response = provider
-                .send_message(&req)
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-            let tool_uses = response.tool_uses();
-            write_query_response(
-                results.get().init_response(),
-                &response.text(),
-                &tool_uses,
-                &response.model,
-                None,
-                None,
-                None,
-            )?;
-            Ok(())
-        })
+            .instrument(ipc_call_span("query")),
+        )
     }
 
     // ---- query_stream (streaming) ----------------------------------------
@@ -1763,145 +1788,151 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let receiver = pry!(p.get_receiver());
         let server = Arc::clone(&self.server);
 
-        Promise::from_future(async move {
-            let provider = server
-                .primary_provider()
-                .ok_or_else(|| capnp::Error::failed("no provider configured".into()))?;
+        Promise::from_future(
+            async move {
+                let provider = server
+                    .primary_provider()
+                    .ok_or_else(|| capnp::Error::failed("no provider configured".into()))?;
 
-            let mut req = crate::providers::ProviderRequest::new(messages);
-            if !tools.is_empty() {
-                req = req.with_tools(tools);
-            }
+                let mut req = crate::providers::ProviderRequest::new(messages);
+                if !tools.is_empty() {
+                    req = req.with_tools(tools);
+                }
 
-            if !provider.supports_streaming() {
-                // Fall back to blocking send; emit one text chunk then done.
-                let response = provider
-                    .send_message(&req)
+                if !provider.supports_streaming() {
+                    // Fall back to blocking send; emit one text chunk then done.
+                    let response = provider
+                        .send_message(&req)
+                        .await
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
+                    let text = response.text();
+                    if !text.is_empty() {
+                        let mut r = receiver.on_chunk_request();
+                        r.get().init_chunk().set_text_delta(text.as_str());
+                        r.send().promise.await?;
+                    }
+                    let mut r = receiver.on_chunk_request();
+                    r.get().init_chunk().set_done(());
+                    r.send().promise.await?;
+                    return Ok(());
+                }
+
+                let mut rx = provider
+                    .send_message_stream(&req)
                     .await
                     .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                let text = response.text();
-                if !text.is_empty() {
-                    let mut r = receiver.on_chunk_request();
-                    r.get().init_chunk().set_text_delta(text.as_str());
-                    r.send().promise.await?;
+
+                use crate::generators::StreamChunk;
+                while let Some(result) = rx.recv().await {
+                    match result {
+                        Ok(StreamChunk::TextDelta(delta)) => {
+                            let mut r = receiver.on_chunk_request();
+                            r.get().init_chunk().set_text_delta(delta.as_str());
+                            r.send().promise.await?;
+                        }
+                        Ok(StreamChunk::Usage {
+                            input_tokens,
+                            output_tokens,
+                        }) => {
+                            let mut r = receiver.on_chunk_request();
+                            let mut upd = r.get().init_chunk().init_usage_update();
+                            upd.set_input_tokens(input_tokens);
+                            upd.set_output_tokens(output_tokens);
+                            r.send().promise.await?;
+                        }
+                        Ok(StreamChunk::ResponseMetadata { model }) => {
+                            crate::generators::validate_response_model(&model).map_err(|_| {
+                                capnp::Error::failed(
+                                    "IPC response model metadata was invalid".into(),
+                                )
+                            })?;
+                            let mut r = receiver.on_chunk_request();
+                            r.get()
+                                .init_chunk()
+                                .init_response_metadata()
+                                .set_model(model.as_str());
+                            r.send().promise.await?;
+                        }
+                        Ok(StreamChunk::Allowance {
+                            primary_used_percent,
+                            secondary_used_percent,
+                        }) => {
+                            let mut r = receiver.on_chunk_request();
+                            let mut allowance = r.get().init_chunk().init_allowance_update();
+                            allowance.set_has_primary(primary_used_percent.is_some());
+                            allowance
+                                .set_primary_used_percent(primary_used_percent.unwrap_or_default());
+                            allowance.set_has_secondary(secondary_used_percent.is_some());
+                            allowance.set_secondary_used_percent(
+                                secondary_used_percent.unwrap_or_default(),
+                            );
+                            r.send().promise.await?;
+                        }
+                        Ok(StreamChunk::ThinkingDelta { .. })
+                        | Ok(StreamChunk::ToolCallDelta { .. })
+                        | Ok(StreamChunk::ToolCallComplete { .. }) => {
+                            // Adapters do not emit these yet. IPC projection is #776/#777;
+                            // this schema is unchanged.
+                            continue;
+                        }
+                        Ok(StreamChunk::ContentBlockComplete(block)) => {
+                            let mut r = receiver.on_chunk_request();
+                            let mut encoded = r.get().init_chunk().init_content_block_complete();
+                            match block {
+                                crate::providers::ContentBlock::Text { text } => {
+                                    encoded.set_text(&text)
+                                }
+                                crate::providers::ContentBlock::Image { source } => {
+                                    let mut image = encoded.init_image();
+                                    image.set_source_type(&source.source_type);
+                                    image.set_media_type(&source.media_type);
+                                    image.set_data(&source.data);
+                                }
+                                crate::providers::ContentBlock::ToolUse { id, name, input } => {
+                                    let mut tool = encoded.init_tool_use();
+                                    tool.set_id(&id);
+                                    tool.set_name(&name);
+                                    super::codec::encode_json_value(
+                                        tool.reborrow().init_input(),
+                                        &input,
+                                    )
+                                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                                }
+                                crate::providers::ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content,
+                                    is_error,
+                                } => {
+                                    let mut result = encoded.init_tool_result();
+                                    result.set_tool_use_id(&tool_use_id);
+                                    result.set_content(&content);
+                                    result.set_is_error(is_error.unwrap_or(false));
+                                }
+                                crate::providers::ContentBlock::OpaqueReasoning {
+                                    encrypted_content,
+                                } => {
+                                    encoded.set_thinking(&encrypted_content);
+                                }
+                            }
+                            r.send().promise.await?;
+                        }
+                        Err(e) => {
+                            let mut r = receiver.on_chunk_request();
+                            r.get().init_chunk().set_error(e.to_string().as_str());
+                            r.send().promise.await?;
+                            return Ok(());
+                        }
+                    }
                 }
+
+                // Done sentinel
                 let mut r = receiver.on_chunk_request();
                 r.get().init_chunk().set_done(());
                 r.send().promise.await?;
-                return Ok(());
+                Ok(())
             }
-
-            let mut rx = provider
-                .send_message_stream(&req)
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-            use crate::generators::StreamChunk;
-            while let Some(result) = rx.recv().await {
-                match result {
-                    Ok(StreamChunk::TextDelta(delta)) => {
-                        let mut r = receiver.on_chunk_request();
-                        r.get().init_chunk().set_text_delta(delta.as_str());
-                        r.send().promise.await?;
-                    }
-                    Ok(StreamChunk::Usage {
-                        input_tokens,
-                        output_tokens,
-                    }) => {
-                        let mut r = receiver.on_chunk_request();
-                        let mut upd = r.get().init_chunk().init_usage_update();
-                        upd.set_input_tokens(input_tokens);
-                        upd.set_output_tokens(output_tokens);
-                        r.send().promise.await?;
-                    }
-                    Ok(StreamChunk::ResponseMetadata { model }) => {
-                        crate::generators::validate_response_model(&model).map_err(|_| {
-                            capnp::Error::failed("IPC response model metadata was invalid".into())
-                        })?;
-                        let mut r = receiver.on_chunk_request();
-                        r.get()
-                            .init_chunk()
-                            .init_response_metadata()
-                            .set_model(model.as_str());
-                        r.send().promise.await?;
-                    }
-                    Ok(StreamChunk::Allowance {
-                        primary_used_percent,
-                        secondary_used_percent,
-                    }) => {
-                        let mut r = receiver.on_chunk_request();
-                        let mut allowance = r.get().init_chunk().init_allowance_update();
-                        allowance.set_has_primary(primary_used_percent.is_some());
-                        allowance
-                            .set_primary_used_percent(primary_used_percent.unwrap_or_default());
-                        allowance.set_has_secondary(secondary_used_percent.is_some());
-                        allowance
-                            .set_secondary_used_percent(secondary_used_percent.unwrap_or_default());
-                        r.send().promise.await?;
-                    }
-                    Ok(StreamChunk::ThinkingDelta { .. })
-                    | Ok(StreamChunk::ToolCallDelta { .. })
-                    | Ok(StreamChunk::ToolCallComplete { .. }) => {
-                        // Adapters do not emit these yet. IPC projection is #776/#777;
-                        // this schema is unchanged.
-                        continue;
-                    }
-                    Ok(StreamChunk::ContentBlockComplete(block)) => {
-                        let mut r = receiver.on_chunk_request();
-                        let mut encoded = r.get().init_chunk().init_content_block_complete();
-                        match block {
-                            crate::providers::ContentBlock::Text { text } => {
-                                encoded.set_text(&text)
-                            }
-                            crate::providers::ContentBlock::Image { source } => {
-                                let mut image = encoded.init_image();
-                                image.set_source_type(&source.source_type);
-                                image.set_media_type(&source.media_type);
-                                image.set_data(&source.data);
-                            }
-                            crate::providers::ContentBlock::ToolUse { id, name, input } => {
-                                let mut tool = encoded.init_tool_use();
-                                tool.set_id(&id);
-                                tool.set_name(&name);
-                                super::codec::encode_json_value(
-                                    tool.reborrow().init_input(),
-                                    &input,
-                                )
-                                .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                            }
-                            crate::providers::ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            } => {
-                                let mut result = encoded.init_tool_result();
-                                result.set_tool_use_id(&tool_use_id);
-                                result.set_content(&content);
-                                result.set_is_error(is_error.unwrap_or(false));
-                            }
-                            crate::providers::ContentBlock::OpaqueReasoning {
-                                encrypted_content,
-                            } => {
-                                encoded.set_thinking(&encrypted_content);
-                            }
-                        }
-                        r.send().promise.await?;
-                    }
-                    Err(e) => {
-                        let mut r = receiver.on_chunk_request();
-                        r.get().init_chunk().set_error(e.to_string().as_str());
-                        r.send().promise.await?;
-                        return Ok(());
-                    }
-                }
-            }
-
-            // Done sentinel
-            let mut r = receiver.on_chunk_request();
-            r.get().init_chunk().set_done(());
-            r.send().promise.await?;
-            Ok(())
-        })
+            .instrument(ipc_call_span("query_stream")),
+        )
     }
 
     // ---- Typed Co-Forth --------------------------------------------------
@@ -1916,19 +1947,22 @@ impl finch_daemon::Server for FinchDaemonImpl {
             .unwrap_or("")
             .to_owned();
 
-        Promise::from_future(async move {
-            let (stack, output) = execute_typed_forth_ipc(program)
-                .await
-                .map_err(|error| capnp::Error::failed(error.to_string()))?;
-            let mut response = results.get();
-            let mut list = response.reborrow().init_stack(stack.len() as u32);
-            for (index, value) in stack.into_iter().enumerate() {
-                list.set(index as u32, value);
+        Promise::from_future(
+            async move {
+                let (stack, output) = execute_typed_forth_ipc(program)
+                    .await
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let mut response = results.get();
+                let mut list = response.reborrow().init_stack(stack.len() as u32);
+                for (index, value) in stack.into_iter().enumerate() {
+                    list.set(index as u32, value);
+                }
+                response.reborrow().set_output(&output);
+                response.set_error("");
+                Ok(())
             }
-            response.reborrow().set_output(&output);
-            response.set_error("");
-            Ok(())
-        })
+            .instrument(ipc_call_span("eval_forth")),
+        )
     }
 
     fn register_brain_runner(
@@ -2784,6 +2818,13 @@ async fn handle_connection(stream: tokio::net::UnixStream, server: Arc<AgentServ
     handle_connection_with_id(stream, server, uuid::Uuid::new_v4()).await
 }
 
+/// #223: the local Cap'n Proto IPC path had no connection-level tracing
+/// correlation. This spans the connection's entire lifecycle — setup, every
+/// RPC call processed on it (each already carries its own nested
+/// `request_id` from `ipc_call_span`), and teardown — so every log line for
+/// one connection can be told apart from every other concurrently connected
+/// frontend's, without touching capnp-rpc's own transport internals.
+#[tracing::instrument(name = "ipc_connection", skip(stream, server), fields(%connection_id))]
 async fn handle_connection_with_id(
     stream: tokio::net::UnixStream,
     server: Arc<AgentServer>,

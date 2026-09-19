@@ -875,16 +875,30 @@ mod script_tests {
     }
 }
 
+/// Suppress ONNX Runtime's verbose native logging by default, without
+/// overriding an operator's own `ORT_LOGGING_LEVEL`.
+///
+/// Both call sites used to hardcode this to `"3"` unconditionally, which made
+/// it impossible to get ORT's own diagnostic output (0=Verbose..4=Fatal) for
+/// debugging a CoreML/ORT session-construction problem (#223) — setting the
+/// env var before launching had no effect because this line stomped it right
+/// back. Must still run before any ONNX library code, same as before.
+fn suppress_ort_logs_unless_overridden() {
+    if std::env::var_os("ORT_LOGGING_LEVEL").is_none() {
+        std::env::set_var("ORT_LOGGING_LEVEL", "3"); // Error and Fatal only
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     // Start the startup clock first, so t0 is as close to process entry as a
     // statement in `main` can be (#364).
     finch::startup::begin();
 
-    // Suppress ONNX Runtime verbose logs BEFORE any initialization
-    // Must be set early, before any ONNX library code runs
-    // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
-    std::env::set_var("ORT_LOGGING_LEVEL", "3"); // Error and Fatal only
+    // Suppress ONNX Runtime verbose logs BEFORE any initialization, unless the
+    // operator asked for more (#223 diagnostics). Must be set early, before
+    // any ONNX library code runs.
+    suppress_ort_logs_unless_overridden();
 
     // Install panic handler to cleanup terminal on panic
     install_panic_handler();
@@ -1370,15 +1384,48 @@ fn init_tracing() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mdns_sd=error"));
 
+    // #223: a per-process frontend diagnostic log, separate from any other
+    // concurrently running frontend and from daemon.log, so the two can be
+    // traced together after the fact. This is a plain file sink — it never
+    // touches OutputManager and therefore never appears in the TUI
+    // scrollback; it is debug/trace material for a person reading the file,
+    // not conversation content.
+    let frontend_file_layer = frontend_log_file().map(|log| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(move || log.clone())
+            .with_ansi(false)
+    });
+
     // Build the subscriber with our custom layer
     tracing_subscriber::registry()
         .with(env_filter)
         .with(output_layer)
+        .with(frontend_file_layer)
         .init();
 
     // Bridge log crate → tracing (for dependencies using log crate)
     // Do this after subscriber is set up
     tracing_log::LogTracer::init().ok();
+}
+
+/// Best-effort per-process frontend diagnostic log (#223). Never blocks or
+/// fails interactive startup: a frontend that cannot create its log
+/// directory or file still runs, just without this diagnostic sink.
+fn frontend_log_file() -> Option<finch::daemon::RotatingLog> {
+    let dir = finch::daemon::frontend_log_dir().ok()?;
+    finch::daemon::prune_frontend_logs(&dir, finch::daemon::DEFAULT_MAX_FRONTEND_LOG_FILES);
+    let identity = finch::daemon::frontend_log_identity();
+    let path = finch::daemon::frontend_log_path(&identity).ok()?;
+    match finch::daemon::RotatingLog::open(&path, finch::daemon::RotationPolicy::default()) {
+        Ok(log) => {
+            eprintln!("Frontend logs: {}", path.display());
+            Some(log)
+        }
+        Err(error) => {
+            eprintln!("Could not open frontend log file ({error:#}); continuing without it");
+            None
+        }
+    }
 }
 
 /// Run HTTP daemon server
@@ -1788,9 +1835,9 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
     eprintln!("Daemon logs: {}", log_status.summary());
 
-    // Suppress ONNX Runtime verbose logs (must be set before library initialization)
-    // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
-    std::env::set_var("ORT_LOGGING_LEVEL", "3"); // Error and Fatal only
+    // Suppress ONNX Runtime verbose logs (must be set before library
+    // initialization), unless the operator asked for more (#223 diagnostics).
+    suppress_ort_logs_unless_overridden();
 
     // Note: init_tracing() is NOT called in daemon mode - we set up file logging above instead
 
@@ -3536,10 +3583,43 @@ fn remove_named_brain(
 mod tests {
     use super::{
         execute_brain_command, finish_first_run_setup, register_query_vm_tools,
-        reject_retired_session_flags, resolve_brain_name, Args, AuthCommand, BrainCommand, Command,
+        reject_retired_session_flags, resolve_brain_name, suppress_ort_logs_unless_overridden,
+        Args, AuthCommand, BrainCommand, Command,
     };
     use clap::{CommandFactory, Parser};
     use std::sync::Arc;
+
+    /// #223: the daemon and interactive-mode call sites used to hardcode
+    /// `ORT_LOGGING_LEVEL=3` unconditionally, so an operator setting it
+    /// themselves for diagnostics had no effect. Both now call this shared
+    /// helper, which must default to suppressed but never override a value
+    /// the operator already set.
+    #[test]
+    fn suppress_ort_logs_defaults_but_does_not_override_operator_choice() {
+        let before = std::env::var_os("ORT_LOGGING_LEVEL");
+
+        std::env::remove_var("ORT_LOGGING_LEVEL");
+        suppress_ort_logs_unless_overridden();
+        assert_eq!(
+            std::env::var("ORT_LOGGING_LEVEL").as_deref(),
+            Ok("3"),
+            "with no operator override, ORT_LOGGING_LEVEL must default to suppressed (Error/Fatal only)"
+        );
+
+        std::env::set_var("ORT_LOGGING_LEVEL", "0");
+        suppress_ort_logs_unless_overridden();
+        assert_eq!(
+            std::env::var("ORT_LOGGING_LEVEL").as_deref(),
+            Ok("0"),
+            "an operator-set ORT_LOGGING_LEVEL must survive the daemon/interactive startup call, \
+             not be silently stomped back to \"3\""
+        );
+
+        match before {
+            Some(value) => std::env::set_var("ORT_LOGGING_LEVEL", value),
+            None => std::env::remove_var("ORT_LOGGING_LEVEL"),
+        }
+    }
 
     #[test]
     fn run_daemon_installs_model_progress_before_loading() {
