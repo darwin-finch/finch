@@ -1055,3 +1055,58 @@ were used in a few places earlier this session (§19's `Codec` axiom, the `Disti
 example) before this vocabulary existed — those are now genuinely valid type names rather than
 errors needing a fix, since `int`/`uint`/`float` are aliases for `i64`/`u64`/`f64`, not the only
 names that exist.
+
+## 25. Module identity from file path, `pkg` visibility, cross-frontend package tree
+
+Directly from a design conversation about wanting D's disk-layout cleanliness without its actual
+verified gap (a hand-written `module` declaration that can silently omit or drift from the file's
+real location), plus a stated goal that CoLisp and Co-Forth be fully interoperable rather than two
+separate module systems glued together.
+
+```text
+accounts/
+  package.colisp        ; this directory's re-export surface — one canonical file, either frontend
+  account.colisp        ; module accounts.account
+  ledger.coforth         ; module accounts.ledger — Co-Forth, same package, no conflict
+```
+
+```lisp
+; accounts/account.colisp
+(record Account pub id: string balance: int)
+
+(pkg (define (validate-balance (a : &Account)) : bool   ; visible anywhere under accounts/, not
+  (>= (. a balance) 0)))                                  ; outside it — no separate `module` line
+                                                            ; needed; this file's path IS accounts.account
+```
+
+```forth
+\ accounts/ledger.coforth
+import: accounts.account ;
+
+: record-transaction ( S Account int -- S bool )
+  \ calls the pkg-visible CoLisp helper directly — cross-frontend, no adapter, no ceremony
+  over validate-balance
+;
+```
+
+```lisp
+; accounts/package.colisp
+(export (from accounts.account :import (Account))
+        (from accounts.ledger :import (record-transaction)))
+```
+
+```lisp
+; outside accounts/ entirely
+(import accounts)
+(import accounts.account)
+
+; (validate-balance some-account)   ; REJECTED — pkg-visible, not pub; only Account and
+                                     ; record-transaction were exported from package.colisp
+```
+
+The interoperability claim is not aspirational sugar here — `ledger.coforth` calling
+`validate-balance` (a CoLisp-defined, `pkg`-visible function) works because both frontends already
+submit through one common elaborator into one typed IR (established in "One parse boundary, modules,
+and packages"); by the time either symbol is resolvable, which frontend wrote it isn't part of what
+resolution sees. The only new rule this needed was where `pkg` visibility's boundary sits — the
+directory, checked the same way regardless of which file inside it is asking.

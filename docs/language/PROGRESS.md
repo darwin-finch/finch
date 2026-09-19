@@ -1293,3 +1293,40 @@ calls from a foreign thread the scheduler never spawned, and confirming `resourc
 mechanism for opaque foreign-handle wrapping rather than assuming it or inventing a second one later.
 Build-time linking/library discovery noted as out of scope for this document (build tooling, not
 language semantics), not logged as a gap.
+
+**Continued 2026-09-19 — module/package/disk-layout system designed from scratch, D's real behavior
+verified against LDC rather than trusted on reputation.** Shammah wanted D's package/module-to-disk
+cleanliness specifically, and wanted CoLisp/Co-Forth fully interoperable rather than two separate
+module systems. Checked existing coverage first: the document's own "modules and packages" section
+turned out to be entirely about compiler-pipeline architecture (parse boundary, scheduler), and
+"Initial module layout" turned out to be about the Rust *implementation's* own source tree, not a
+Finch program's module system at all — genuinely nothing addressed file-to-module-path mapping
+anywhere.
+
+Verified D's actual behavior with real test files against LDC rather than assuming the reputation
+was earned uniformly: `package.d` and `package`-level visibility are real and enforced (a nested
+sub-package reading a parent's `package`-visible symbol compiled; a module outside the package tree
+got a real "undefined identifier" error, not a warning) — genuinely worth adopting. But the "lays out
+cleanly on disk" property turned out to be convention, not an enforced invariant, confirmed two
+ways: normal `-I`-search compilation does resolve `import mypkg.foo` strictly by translating the
+dotted path to `mypkg/foo.d`, but a file's own `module` declaration is a separate, hand-maintained
+statement that can silently claim the wrong path (compiled with zero error when passed directly), and
+*omitting* the declaration entirely falls back to the bare filename instead of the directory-derived
+dotted path (confirmed: `import mypkg2.noheader` failed with "must be imported with 'import
+noheader'"), quietly breaking the very property being relied on.
+
+Design: module identity is derived entirely from file path relative to a source root — no separate,
+restatable `module` declaration to write, omit, or let drift, closing the exact gap found in D rather
+than copying it. `.colisp`/`.coforth` extensions established (neither existed before). A directory is
+a package, importable via `package.colisp`/`package.coforth` (one per directory, either frontend).
+`pkg` added as a third visibility tier between the existing module-private default and `pub`, checked
+against directory-tree containment exactly as verified against LDC. Cross-frontend interoperability
+falls directly out of already-established architecture rather than needing new machinery: since both
+frontends already submit through one common elaborator into one typed IR ("One parse boundary,
+modules, and packages"), a symbol's resolvability never depends on which frontend produced it — the
+only genuinely new rule needed was that two files claiming the same module path in different syntaxes
+(`mypkg/foo.colisp` and `mypkg/foo.coforth` both present) is a compile-time ambiguity error, the same
+shape as coherence's one-implementation-per-(concept,type) rule. Worked example added as
+`feature_tour.md` §25: a CoLisp module with a `pkg`-visible helper called directly from a Co-Forth
+module in the same package, re-exported through `package.colisp`, with the `pkg` boundary enforced
+against a caller outside the package.

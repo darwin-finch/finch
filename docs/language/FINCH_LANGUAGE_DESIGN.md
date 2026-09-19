@@ -450,6 +450,42 @@ or cache but must not be required infrastructure or the authority for package id
 verifies hashes and, when available, signatures/provenance before compilation, prevents dependency
 confusion, and never runs ambient install scripts or grants runtime authority.
 
+### Module identity is the file's path, never a restatable declaration
+
+A module's dotted identity is derived entirely from its location relative to a source root — a file
+at `mypkg/foo.colisp` is module `mypkg.foo`; there is no separate `module mypkg.foo;`-style
+declaration inside the file to write, omit, or let drift from where the file actually lives. This is
+a deliberate correction verified against D's own real behavior rather than assumed from its
+reputation for laying out cleanly on disk: D's `module` statement is a separate, hand-maintained
+declaration that a normal `-I`-search compile *does* resolve by path, but omitting the declaration
+silently falls back to the bare filename rather than the directory-derived dotted path (confirmed
+against LDC), quietly breaking the very property being relied on. Making the file's location the
+sole source of truth removes the declaration that could ever drift from it, rather than adding a
+check that it hasn't.
+
+CoLisp and Co-Forth source share one module tree and are fully interoperable, not two parallel
+systems: a `.colisp` file and a `.coforth` file may sit side by side in the same directory as
+different modules (`mypkg/foo.colisp` and `mypkg/bar.coforth` coexist without conflict), and
+`(import mypkg.bar)` from CoLisp or `import: mypkg.foo ;` from Co-Forth resolves identically
+regardless of which frontend implemented the target — this falls directly out of "every frontend
+submits the same types, ownership transitions, effects, and capability requirements through common
+elaboration" (above): by the time a symbol is resolvable at all, which frontend produced it is not
+part of its identity. What is not allowed is two files claiming the *same* module path in different
+syntaxes — `mypkg/foo.colisp` and `mypkg/foo.coforth` both present is a compile-time ambiguity error,
+the same shape as two implementations of one concept for one type (coherence, "Generics, concepts,
+dispatch"): a module has exactly one canonical source file, in exactly one syntax, never a silent
+per-importer choice between them.
+
+A directory is a package, importable as one unit through a `package.colisp` or `package.coforth`
+file inside it (D's `package.d`, in either frontend) — at most one per directory, following the same
+one-canonical-file rule as an ordinary module. Visibility gains a third tier between the existing
+module-private default and `pub`: a `pkg`-marked declaration is visible to every module whose file
+lives anywhere under that package's directory, including nested sub-packages, but not outside it —
+verified against LDC's actual enforcement of the equivalent D behavior (a nested sub-package's module
+could read a parent package's `package`-visible symbol; a module outside the package tree entirely
+got a real "undefined identifier" error, not a warning). Where a project's source root itself is
+declared is part of the package-retrieval layer above, not restated here.
+
 The repository now contains the first verified typed path: both frontends lower directly to typed
 IR, the typed runtime owns a `Vec<TypedValue>` stack, effects are resource-scoped capability
 requirements, diagnostics carry stable codes, and host execution is transactional. Ordinary
