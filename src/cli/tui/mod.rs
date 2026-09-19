@@ -106,8 +106,8 @@ pub use tabbed_dialog_widget::TabbedDialogWidget;
 // GUI setup surface) will decide what a GUI host consumes.
 pub(crate) use wizard_host::{
     plan_wizard_frame, wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint,
-    wizard_plain, WizardCard, WizardColor, WizardFrame, WizardHost, WizardRects,
-    WizardSectionContent, WizardView,
+    wizard_physical_rows, wizard_plain, wizard_visible_length, wizard_wrap, WizardCard,
+    WizardColor, WizardFrame, WizardHost, WizardRects, WizardSectionContent, WizardView,
 };
 // Re-export ColorScheme so callers can use `crate::cli::tui::ColorScheme`.
 pub use crate::theme::ColorScheme;

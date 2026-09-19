@@ -150,6 +150,16 @@ surface (#808) can consume. `WizardColor` is the view's own colour vocabulary, n
 renderer's. The general z-compositor (#793) stays a follow-up; this is the inline
 dialog-card mechanism only.
 
+**Wizard lines are measured by what a terminal renders (#926).** The row-diff blit is
+only exact when the planner's row count equals the terminal's, so wizard line builders,
+the frame planner, and the view projection all measure with `wizard_visible_length` /
+`wizard_physical_rows` — the vocabulary's widths plus the emoji-presentation codepoints
+terminals paint double-width (🔧 ❌ ✅). Box and tab top borders are glyph-only `─` runs
+of exactly the frame width (`wizard_title_border`); a border carrying its gap count as
+digits, or a padded row one column over the frame, desyncs the blit and mangles every
+frame after it. The shared `visible_length`/`physical_rows` vocabulary keeps the narrower
+measure for the conversation live area; extending it there is not this module's call.
+
 ## View types the renderer owns
 
 The same inversion the todo list and child-agent rows already use (`activity.rs`): the renderer

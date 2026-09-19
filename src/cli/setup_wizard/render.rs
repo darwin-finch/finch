@@ -16,7 +16,7 @@ use super::grok_recovery::{grok_setup_failure_cause, grok_setup_failure_summary}
 use super::*;
 use crate::cli::tui::WizardColor as Color;
 use crate::cli::tui::{
-    physical_rows, wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint,
+    wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint, wizard_physical_rows,
     wizard_plain, WizardCard, WizardSectionContent, WizardView,
 };
 
@@ -40,8 +40,12 @@ pub(super) fn mask_secret(value: &str, keep_start: usize, keep_end: usize) -> St
 }
 
 /// Wrapped rows one logical line occupies at `width`.
+///
+/// The host's claiming pass and the view's windowing must count rows with the
+/// same terminal-accurate arithmetic (#926): emoji-presentation characters
+/// render two columns, and a one-column disagreement shifts a whole frame.
 fn rows_of(line: &str, width: usize) -> usize {
-    physical_rows(line, width)
+    wizard_physical_rows(line, width)
 }
 
 /// `Auto`, `CPU`, or `CoreML (all)` — the execution-target display.
@@ -625,6 +629,7 @@ fn features_section_content(
     #[cfg(target_os = "macos")] gui_automation_settings_feedback: Option<&GuiSettingsFeedback>,
     #[cfg(target_os = "macos")] gui_automation_details_expanded: bool,
     #[cfg(target_os = "macos")] gui_automation_details_scroll: u16,
+    help_rows: usize,
     #[cfg(target_os = "macos")] gui_automation_target_description: &str,
     daemon_only_mode: bool,
     mdns_discovery: bool,
@@ -654,8 +659,10 @@ fn features_section_content(
     let expanded_gui_details = show_gui_details && gui_automation_details_expanded;
 
     // Rows the frame reserves outside the section: the 3-row tab block and
-    // the 1-row help line — the same arithmetic the host's claiming pass runs.
-    let section_rows = height.saturating_sub(4);
+    // the wrapped help line (#926: the help wraps when it exceeds the frame,
+    // so the budget counts its actual extent, not a fixed one row) — the same
+    // arithmetic the host's claiming pass runs.
+    let section_rows = height.saturating_sub(3).saturating_sub(help_rows);
 
     // The expanded status owns the section: its scroll offset skips whole
     // wrapped rows, and the instructions stay visible beneath the box. The
@@ -1479,6 +1486,10 @@ pub(super) fn wizard_view_with_permission_target(
     width: usize,
     height: usize,
 ) -> WizardView {
+    // The help line's wrapped extent (#926): the host wraps the help to the
+    // frame width and claims exactly these rows, so the sections' own window
+    // budgets must reserve the same count.
+    let help_rows = crate::cli::tui::wizard_wrap(&help_line(state, width), width).len();
     let section = match state.sections.get(&state.current_section) {
         Some(SectionState::Themes { selected_theme }) => {
             WizardSectionContent::plain(themes_section_lines(*selected_theme, width))
@@ -1574,6 +1585,7 @@ pub(super) fn wizard_view_with_permission_target(
             *gui_automation_details_expanded,
             #[cfg(target_os = "macos")]
             *gui_automation_details_scroll,
+            help_rows,
             #[cfg(target_os = "macos")]
             permission_target,
             *daemon_only_mode,
