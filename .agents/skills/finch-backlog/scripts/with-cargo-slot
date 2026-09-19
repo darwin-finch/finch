@@ -90,6 +90,46 @@ if [[ "${CARGO_TARGET_DIR+x}" != x && -z "${CI:-}" ]]; then
         exit 69
     fi
     export CARGO_TARGET_DIR
+
+    # rustc embeds each crate's absolute source path in its compiler cache
+    # key, so an identical build from a different worktree checkout misses
+    # sccache entirely. SCCACHE_BASEDIRS strips a known ancestor prefix
+    # before hashing (ccache-style CCACHE_BASEDIR semantics); sccache matches
+    # the longest configured prefix, so exporting every currently registered
+    # worktree's own canonical root — rather than guessing a shared ancestor
+    # convention that may not exist on every contributor's machine — lets
+    # source built under any of them hash identically. `-z` keeps this safe
+    # for a worktree path containing a raw newline, matching the fixture in
+    # test-with-cargo-slot. A caller-supplied value always wins.
+    #
+    # sccache reads SCCACHE_BASEDIRS when its background server process
+    # starts, not per compile request from the caller's environment
+    # (measured directly: exporting it to an already-running server changed
+    # nothing until the server was restarted). A server left running from
+    # before this change, or started by a worktree that predates it, will
+    # not pick this up until `sccache --stop-server` lets the next build
+    # restart it. This wrapper does not restart the server itself — sccache
+    # is a resource shared across every concurrent worktree/agent on this
+    # host, and restarting it out from under another agent's in-flight
+    # compile is exactly the kind of concurrent-timing hazard this
+    # repository's testing rules call out; that risk is not worth taking
+    # from inside a build wrapper for a caching optimization.
+    if [[ -z "${SCCACHE_BASEDIRS:-}" ]]; then
+        sccache_basedirs=""
+        while IFS= read -r -d '' porcelain_line; do
+            [[ "$porcelain_line" == worktree\ * ]] || continue
+            registered_root="${porcelain_line#worktree }"
+            canonical_root="$(canonical_directory "$registered_root")" || continue
+            if [[ -z "$sccache_basedirs" ]]; then
+                sccache_basedirs="$canonical_root"
+            else
+                sccache_basedirs="$sccache_basedirs:$canonical_root"
+            fi
+        done < <(git worktree list --porcelain -z 2>/dev/null)
+        if [[ -n "$sccache_basedirs" ]]; then
+            export SCCACHE_BASEDIRS="$sccache_basedirs"
+        fi
+    fi
 fi
 
 lock_marker="${FINCH_CARGO_SLOT_HELD:-}"
