@@ -759,3 +759,24 @@ earlier, plus settled two more design questions cleanly.**
   `?`/`throws` propagation → `map` building `syntax` forms via quasiquote → `mixin`. Every piece
   fits together exactly as specified; two narrower things flagged unconfirmed rather than assumed
   (JSON-value field access shape, `test`/`test-suite`'s exact argument order).
+
+**Continued 2026-09-18 — `feature_tour.md` §15, multiple concepts on one record, with the
+comparison to traits/classes made precise rather than asserted loosely.** Per direct request to
+show this isn't "traits/classes with different spelling": the real, checkable difference from Rust
+is coherence — Rust enforces at most one `impl Trait for Type` globally; Finch explicitly allows
+multiple named implementations of the same (concept, type) pair to coexist, disambiguated by
+`using` or by which single one (only the concept's or type's own module may choose) gets published
+as ambient default. Worked through concretely: two different `Equal<Account,Account>`
+implementations (by-id, by-all-fields), both legal simultaneously. The difference from classes is
+more structural: no inheritance hierarchy at all (already-established nominal-identity rule), data
+and behavior as separate additive declarations rather than one fused thing, static dispatch by
+default with dynamic dispatch as the already-established explicit `dyn` opt-in. One claim flagged
+UNVERIFIED rather than asserted as confirmed: that adding a concept implementation never touches a
+record's own layout (no implicit vtable pointer) — a reasonable inference from layout and
+concept-implementation being discussed as entirely separate concerns everywhere, not a sentence
+that states it outright anywhere in the document.
+
+**Also launching a research pass on template/type-specialization/inference syntax** — flagged
+directly as "totally unspecified," with TypeScript's conditional/inferred types and D's template
+specialization named as the two systems to compare against. Genuinely large, separate topic;
+handling as its own effort rather than folding into this entry.

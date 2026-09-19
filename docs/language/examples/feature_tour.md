@@ -546,7 +546,77 @@ precisely rather than assumed:**
   (name first, then a context-taking lambda) is inferred from the real `test-suite`/`test` example
   used for `json/parse` itself earlier in the document, not independently confirmed.
 
-## 15. Open gaps, current as of this pass — what's still missing and why
+## 15. One record, multiple concepts — and why the model isn't traits or classes
+
+**The easy case first — two unrelated concepts, no naming question at all:**
+
+```text
+implementation AccountJson for Account : JsonSerializable {
+    operation serialize(&self) => json.of(self.id, self.balance)
+}
+implementation AccountMsgPack for Account : MsgPackSerializable {
+    operation serialize(&self) -> bytes => (mixin (derive-msgpack-serialize Account))
+}
+```
+
+Both operations happen to be spelled `serialize`. No collision, because names live in their
+concept's own evidence, not one shared method table — already established, confirmed again here.
+
+**The genuinely interesting case — the *same* concept implemented twice for the *same* type:**
+
+```text
+implementation AccountEqualById for Account : Equal<Account, Account> {
+    operation equal(borrow left, borrow right) => (== (. left id) (. right id))
+}
+implementation AccountEqualByAllFields for Account : Equal<Account, Account> {
+    operation equal(borrow left, borrow right) =>
+        (and (== (. left id) (. right id)) (== (. left balance) (. right balance)))
+}
+
+(equal a b using AccountEqualById)          ; explicit — compares by id only
+(equal a b using AccountEqualByAllFields)   ; explicit — different evidence, different answer
+(equal a b)                                  ; resolves only if exactly one of these was published
+                                              ; as *the* default for this lexical context (only
+                                              ; Account's or Equal's own defining module may do
+                                              ; that); otherwise an ambiguity error, not a guess
+```
+
+**This is the actual, precise difference from Rust traits, and it's worth being exact about it
+rather than hand-waving "concepts are like traits":** Rust enforces global coherence — at most one
+`impl Trait for Type` can exist anywhere in a program, checked at compile time, so `Equal` for
+`Account` could only ever mean one thing everywhere it's used. Finch deliberately doesn't do this.
+Multiple named implementations of the same (concept, type) pair are allowed to coexist, and
+disambiguation happens by name (`using`) or by which single one (if any) a type's or concept's own
+module chose to publish as ambient default — closer to explicit-dictionary-passing (Haskell's
+`newtype`-wrapped alternate instances, e.g. `Down` for reverse `Ord`) than to Rust's one-instance-
+per-type coherence rule. Rust's model buys you "no dispatch ambiguity is even possible"; Finch's
+buys you "a type can have more than one legitimate notion of equality without needing a wrapper
+type to hold the second one" — genuinely different tradeoffs, not the same idea with different
+spelling.
+
+**The difference from classes:** a class fuses data, behavior, and identity (inheritance) into one
+declaration — a subclass inherits its parent's methods automatically, and dynamic (virtual) dispatch
+is typically the default the moment any method is overridable. Finch keeps these as separate,
+additive declarations: `record Account` owns only data and layout; each `implementation` block is a
+separate, external declaration linking a concept (or nothing, for inherent operations) to that type.
+There's no inheritance hierarchy at all — "named records have nominal identity; matching field names
+do not make independently declared records interchangeable" is already established — so there's no
+IS-A relationship to reason about, and dispatch is statically monomorphized by default; dynamic
+dispatch is the explicit, opt-in `dyn Concept` erasure discussed earlier, never automatic.
+
+**How the two roles stay clean instead of colliding — this is the part worth stating precisely,
+not just asserting:** because concept implementations are external and statically resolved by
+default, adding one to a record never touches the record's own layout — no vtable pointer gets
+implicitly added to every instance the way a C++/Java class picks one up the moment it gains a
+virtual method. **UNVERIFIED, flagged rather than asserted as confirmed:** this is a reasonable
+inference from record layout and concept-implementation being discussed as entirely separate
+concerns everywhere in the document, not a sentence that states it outright anywhere. A record can
+be simultaneously plain, trivially-introspectable data (`fields-of` sees it exactly as declared) and
+the subject of arbitrarily many concept implementations, and neither role taxes the other — the data
+shape a serializer walks is identical to the data shape sitting in memory, whether the record
+implements zero concepts or twenty.
+
+## 16. Open gaps, current as of this pass — what's still missing and why
 
 - **Capability requests with wildcarded paths** (`read{path="~/**"}`) — still ungrammared; unchanged
   since first flagged.
