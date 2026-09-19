@@ -123,12 +123,14 @@ pub struct WorkUnitViewModel {
 }
 
 /// One frame's component snapshot: the retained ViewModel plus the chrome
-/// timing, captured under the same lock read.
+/// timing, captured under the same lock read. The full-resolution elapsed
+/// drives the component's animated generating state; completed turns read the
+/// captured value, so the annotation is stable for scrollback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SayTurnView {
     pub message_id: MessageId,
     pub vm: WorkUnitViewModel,
-    pub elapsed_secs: u64,
+    pub elapsed: std::time::Duration,
 }
 
 /// The say component's action vocabulary. The engine's hit-rect routing
@@ -493,20 +495,21 @@ impl WorkUnit {
         Some(SayTurnView {
             message_id: self.id,
             vm: inner.say_vm.as_ref()?.clone(),
-            elapsed_secs: inner
+            elapsed: inner
                 .elapsed_at_finish
-                .unwrap_or_else(|| self.started_at.elapsed())
-                .as_secs(),
+                .unwrap_or_else(|| self.started_at.elapsed()),
         })
     }
 
-    /// The component-defined action a click on the card row at `path`
-    /// produces. Only the chrome row (semantic path `[0]`) is a hitbox on a
-    /// migrated say turn; rows without a ViewModel produce nothing.
+    /// The component-defined action a click on the turn's output region at
+    /// `path` produces (stage 2, docs/TUI_DESIGN.md): the completed output is
+    /// the toggle hit target — semantic path `[1]`, new since the stage-1
+    /// chrome's `[0]` retired with it. Rows without a ViewModel produce
+    /// nothing.
     pub fn say_turn_action(&self, path: &[u32]) -> Option<ComponentAction> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         inner.say_vm.as_ref()?;
-        if path == [0] {
+        if path == [1] {
             Some(ComponentAction::new(ToggleProgram))
         } else {
             None
@@ -2606,6 +2609,92 @@ mod tests {
         assert_eq!(
             rejected.label, "VM program rejected",
             "invariant: retitling as a handle clears the prose mark; row={rejected:?}"
+        );
+    }
+
+    // ── Say-turn component ViewModel (#882) ─────────────────────────────────
+
+    #[test]
+    fn say_turn_snapshot_carries_the_vm_and_full_resolution_elapsed() {
+        let output = WorkUnit::new("VM program output");
+        assert!(
+            output.say_turn_snapshot().is_none(),
+            "a unit that never began a say turn has no component ViewModel"
+        );
+        output.set_program_output();
+        output.begin_say_turn("lisp", "(say \"hi\")");
+        output.append_response("Hi");
+        let view = output.say_turn_view().expect("migrated say turn");
+        assert_eq!(view.vm.program.lines, vec!["(say \"hi\")".to_string()]);
+        assert_eq!(
+            view.vm.output.as_ref().expect("streamed output").lines,
+            vec!["Hi".to_string()],
+            "streamed say bytes mirror into the component ViewModel under the same lock"
+        );
+        assert!(
+            !view.vm.show_program,
+            "show_program defaults to hidden (#350's prose ruling)"
+        );
+        output.set_complete();
+        let completed = output.say_turn_view().expect("say turn");
+        assert_eq!(
+            completed.vm.status,
+            SayTurnStatus::Completed,
+            "the completion path transitions the component status exactly once"
+        );
+    }
+
+    #[test]
+    fn say_turn_action_targets_the_output_region_and_toggles_show_program() {
+        let output = WorkUnit::new("VM program output");
+        output.set_program_output();
+        output.begin_say_turn("lisp", "(say \"hello\")");
+        assert!(
+            output.say_turn_action(&[0]).is_none(),
+            "INVARIANT (stage 2): the chrome's [0] path retired with the chrome — a \
+             foreign or retired path produces nothing"
+        );
+        let action = output
+            .say_turn_action(&[1])
+            .expect("the output region is the toggle target");
+        assert!(
+            output.handle_say_turn_action(&action),
+            "the component handle accepts its own action payload"
+        );
+        assert!(
+            output.say_turn_view().expect("say turn").vm.show_program,
+            "the toggle flipped show_program under the message lock"
+        );
+
+        // Keyboard equivalence: the same routes the Message trait exposes are
+        // what F6/Enter disclosure drives (src/cli/tui/mod.rs).
+        let trait_action = output.transcript_action(&[1]).expect("trait route");
+        assert!(
+            output.handle_transcript_action(&trait_action),
+            "the trait handle toggles the same ViewModel"
+        );
+        assert!(
+            !output.say_turn_view().expect("say turn").vm.show_program,
+            "the second toggle flipped show_program back"
+        );
+        let foreign = crate::cli::messages::ComponentAction::new(7u32);
+        assert!(
+            !output.handle_say_turn_action(&foreign),
+            "a foreign action payload is rejected, never misinterpreted"
+        );
+    }
+
+    #[test]
+    fn begin_say_turn_twice_replaces_the_view_model_with_the_latest_source() {
+        let output = WorkUnit::new("VM program output");
+        output.set_program_output();
+        output.begin_say_turn("lisp", "(say \"first\")");
+        output.begin_say_turn("lisp", "(say \"second\")");
+        let view = output.say_turn_view().expect("say turn");
+        assert_eq!(
+            view.vm.program.lines,
+            vec!["(say \"second\")".to_string()],
+            "the producer owns the program part; the latest source wins"
         );
     }
 

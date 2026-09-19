@@ -1,37 +1,75 @@
-//! The WorkUnit say-turn component (stage 1 of docs/TUI_DESIGN.md, #882).
+//! The WorkUnit say-turn component (stage 2 of docs/TUI_DESIGN.md, #882).
 //!
-//! One component owns the say turn's presentation: a retained ViewModel on
-//! the message (status, program, output, `show_program` — see
-//! [`crate::cli::messages::WorkUnitViewModel`]), a chrome renderer, and two
-//! subwidgets constructed from the outer ViewModel each frame so they choose
-//! to render or not. A hidden subwidget contributes zero lines and therefore
-//! claims zero rows in the claiming pass. The chrome renders the disclosure
-//! arrow **only while the program source can be shown** — the affordance and
-//! the content are decided in the same function, so a dead arrow over nothing
-//! is impossible by construction.
+//! One say turn renders as **one** representation per state — never a card
+//! stacked beside a legacy source group:
 //!
-//! The engine never matches on the message type: it asks the `Message` trait
-//! for [`crate::cli::messages::SayTurnView`] and hands the snapshot here;
-//! clicks resolve to `(RowId, action)` and route to the component's handle,
-//! which toggles `show_program` under the message's lock. Repaints stay
+//! - **Generating** (model working, no program yet): one animated progress
+//!   line in the spinner style, showing the model is producing the response.
+//! - **Running** (program exists, executing): the program source inline —
+//!   `(say "Hi, Shammah! …")` — no chrome row, no card, no glyph. Output
+//!   bytes that have already arrived (streaming `say` chunks, wire-error
+//!   diagnostics, transient status) render beneath the source; hiding arrived
+//!   say bytes is the pre-#350 defect class, so they are never suppressed.
+//! - **Completed**: the output prose inline, plus the `(ran Ns)` annotation.
+//!   No Program source row, no Brain run row, no result row, no card chrome.
+//!   The program source replaces the prose only while `show_program` —
+//!   clicking (or the keyboard disclosure path on) the completed output
+//!   toggles it.
+//!
+//! The ViewModel (status, program, output, `show_program`) lives on the
+//! message behind its own lock (see
+//! [`crate::cli::messages::WorkUnitViewModel`]); subwidgets are constructed
+//! from it each frame and choose to render or not, so a subwidget with
+//! nothing to show contributes zero lines and claims zero rows. The engine
+//! never matches on the message type: it asks the `Message` trait for
+//! [`crate::cli::messages::SayTurnView`] and hands the snapshot here; clicks
+//! resolve to `(RowId, action)` and route to the component's handle, which
+//! toggles `show_program` under the message's lock. Repaints stay
 //! pull-per-frame — the next frame re-renders from the mutated ViewModel.
+//!
+//! The stage-1 chrome (`chrome_line`, status glyph, the `[0]` disclosure
+//! hitbox) is deleted: the completed output region is the toggle target, so
+//! no chrome furniture exists to carry an affordance.
 
 use crate::cli::components::vocab::{NodeRole, RenderedTranscriptLine, RowId};
-use crate::cli::messages::{SayTurnStatus, SayTurnView};
+use crate::cli::messages::{OutputVm, SayTurnStatus, SayTurnView, WorkUnitViewModel};
 
-/// Semantic path of the say card's chrome row: the disclosure hitbox.
-pub(crate) const CARD_PATH: &[u32] = &[0];
+/// Semantic path of the say turn's output region: the toggle hit target of a
+/// completed turn. New in stage 2 — the chrome's `[0]` retired with the
+/// chrome and is never reused.
+pub(crate) const OUTPUT_PATH: &[u32] = &[1];
 
-/// The status glyph a say card wears. Hollow while the turn is still running,
-/// filled once it completed — a turn that died must never look identical to
-/// one that answered. Wordless shapes are enough on the card only because the
-/// output subwidget below carries the turn's own words; a card with nothing
-/// to show at all still shows the elapsed time, which reads aloud.
-fn say_glyph(status: SayTurnStatus) -> &'static str {
-    match status {
-        SayTurnStatus::Running => "\u{25cb}",
-        SayTurnStatus::Completed => "\u{23fa}",
+/// Braille spinner frames for the animated generating state; the blit tick
+/// re-snapshots every frame, so sub-second elapsed animates the indicator.
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Spinner rotation speed in milliseconds per frame.
+const SPINNER_TICK_MS: u64 = 80;
+
+/// Which single representation the turn renders this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SayTurnState {
+    Generating,
+    Running,
+    Completed,
+}
+
+fn say_state(vm: &WorkUnitViewModel) -> SayTurnState {
+    if vm.program.lines.is_empty() {
+        // No producer reaches a say turn before its program is known today
+        // (`begin_say_turn` carries the source); the state stays total for a
+        // future producer that creates the card during model generation.
+        SayTurnState::Generating
+    } else if vm.status == SayTurnStatus::Running {
+        SayTurnState::Running
+    } else {
+        SayTurnState::Completed
     }
+}
+
+fn spinner_frame(elapsed: std::time::Duration) -> &'static str {
+    SPINNER_FRAMES
+        [(elapsed.as_millis() / u128::from(SPINNER_TICK_MS)) as usize % SPINNER_FRAMES.len()]
 }
 
 fn fmt_elapsed(secs: u64) -> String {
@@ -42,124 +80,159 @@ fn fmt_elapsed(secs: u64) -> String {
     }
 }
 
-/// The card chrome: status glyph + elapsed + the disclosure arrow. The arrow
-/// exists only while the `ProgramSource` subwidget can be shown; without a
-/// program there is nothing behind the arrow, so there is no arrow.
-pub(crate) fn chrome_line(view: &SayTurnView, card: &RowId) -> RenderedTranscriptLine {
-    let can_show_program = !view.vm.program.lines.is_empty();
-    let arrow = match (can_show_program, view.vm.show_program) {
-        (true, true) => " \u{25bc}",
-        (true, false) => " \u{25b6}",
-        (false, _) => "",
-    };
+fn body_line(text: String) -> RenderedTranscriptLine {
     RenderedTranscriptLine {
-        text: format!(
-            "{} {}{arrow}",
-            say_glyph(view.vm.status),
-            fmt_elapsed(view.elapsed_secs)
-        ),
-        row_id: Some(card.clone()),
-        row_expanded: can_show_program.then_some(view.vm.show_program),
+        text,
+        row_id: None,
+        row_expanded: None,
+        role: Some(NodeRole::Output),
+        body_of: None,
+        component_owned: false,
+    }
+}
+
+/// A completed turn's toggle-target line: the whole output region is the hit
+/// target, and `row_expanded` carries the disclosure state for assistive
+/// consumers (`true` while the program source is shown).
+fn toggle_line(text: String, target: &RowId, show_program: bool) -> RenderedTranscriptLine {
+    RenderedTranscriptLine {
+        text,
+        row_id: Some(target.clone()),
+        row_expanded: Some(show_program),
         role: Some(NodeRole::Output),
         body_of: None,
         component_owned: true,
     }
 }
 
-/// `ProgramSource`: the exact wire text the turn ran, revealed only while
-/// `show_program`. Constructed from the outer ViewModel each frame; hidden,
-/// it renders nothing and claims zero rows.
+fn output_region(view: &SayTurnView) -> RowId {
+    RowId {
+        message_id: view.message_id,
+        path: OUTPUT_PATH.to_vec(),
+    }
+}
+
+/// The animated generating line: spinner frame + phase + elapsed. No source
+/// exists yet, so none renders and nothing is a hit target.
+fn generating_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
+    vec![body_line(format!(
+        "{} Generating… ({})",
+        spinner_frame(view.elapsed),
+        fmt_elapsed(view.elapsed.as_secs())
+    ))]
+}
+
+/// `ProgramSource`: the exact wire text the turn ran, inline while it
+/// executes (and in place of the prose while a completed turn is toggled).
+/// Constructed from the outer ViewModel each frame; with nothing to show it
+/// renders nothing and claims zero rows.
 pub(crate) struct ProgramSource<'a> {
     lines: &'a [String],
     shown: bool,
 }
 
 impl<'a> ProgramSource<'a> {
-    pub(crate) fn from_vm(vm: &'a crate::cli::messages::WorkUnitViewModel) -> Self {
+    pub(crate) fn from_vm(vm: &'a WorkUnitViewModel) -> Self {
         Self {
             lines: &vm.program.lines,
             shown: vm.show_program,
         }
     }
 
-    pub(crate) fn render(&self) -> Vec<String> {
+    /// Render for the Running state: the source is the representation.
+    pub(crate) fn render_inline(&self) -> Vec<String> {
+        self.lines.to_vec()
+    }
+
+    /// Render for a toggled completed turn: only while `show_program`.
+    pub(crate) fn render_toggled(&self) -> Vec<String> {
         if !self.shown {
             return Vec::new();
         }
-        self.lines.iter().map(|line| format!("  {line}")).collect()
+        self.render_inline()
     }
 }
 
-/// `Output`: what the program said, visible whenever the output part is set —
-/// #350's prose ruling keeps the turn's own words as the primary content.
+/// `Output`: what the program said. Constructed from the outer ViewModel
+/// each frame; an absent or still-empty output renders nothing.
 pub(crate) struct Output<'a> {
     lines: &'a [String],
 }
 
 impl<'a> Output<'a> {
-    pub(crate) fn from_vm(vm: &'a crate::cli::messages::OutputVm) -> Self {
-        Self { lines: &vm.lines }
+    pub(crate) fn from_vm(output: &'a OutputVm) -> Self {
+        Self {
+            lines: &output.lines,
+        }
     }
 
     pub(crate) fn render(&self) -> Vec<String> {
-        self.lines.iter().map(|line| format!("  {line}")).collect()
+        self.lines.to_vec()
     }
 }
 
-/// Render the say card's lines for one frame: the chrome's furniture row, the
-/// `ProgramSource` subwidget (zero rows while hidden), then the `Output`
-/// subwidget. The transcript viewport's claiming pass turns the chrome row
-/// into the disclosure hitbox; a hidden subwidget claims nothing.
-pub(crate) fn card_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
-    let card = RowId {
-        message_id: view.message_id,
-        path: CARD_PATH.to_vec(),
-    };
-    let mut lines = vec![chrome_line(view, &card)];
+/// Running: the program source inline; arrived output bytes render beneath
+/// it and are never hidden.
+fn running_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
     let program = ProgramSource::from_vm(&view.vm);
-    lines.extend(
-        program
-            .render()
-            .into_iter()
-            .map(|text| RenderedTranscriptLine {
-                text,
-                row_id: None,
-                row_expanded: None,
-                role: Some(NodeRole::Output),
-                body_of: None,
-                component_owned: false,
-            }),
-    );
+    let mut lines: Vec<RenderedTranscriptLine> =
+        program.render_inline().into_iter().map(body_line).collect();
     if let Some(output) = &view.vm.output {
-        let output = Output::from_vm(output);
-        lines.extend(
-            output
-                .render()
-                .into_iter()
-                .map(|text| RenderedTranscriptLine {
-                    text,
-                    row_id: None,
-                    row_expanded: None,
-                    role: Some(NodeRole::Output),
-                    body_of: None,
-                    component_owned: false,
-                }),
-        );
+        lines.extend(Output::from_vm(output).render().into_iter().map(body_line));
     }
     lines
+}
+
+/// Completed: the output prose inline (or the program source while toggled),
+/// one blank row, then the `(ran Ns)` annotation. Every content line is the
+/// toggle hit target.
+fn completed_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
+    let target = output_region(view);
+    let content = if view.vm.show_program {
+        ProgramSource::from_vm(&view.vm).render_toggled()
+    } else {
+        view.vm
+            .output
+            .as_ref()
+            .map(|output| Output::from_vm(output).render())
+            .unwrap_or_default()
+    };
+    let mut lines: Vec<RenderedTranscriptLine> = content
+        .into_iter()
+        .map(|text| toggle_line(text, &target, view.vm.show_program))
+        .collect();
+    lines.push(toggle_line(String::new(), &target, view.vm.show_program));
+    lines.push(toggle_line(
+        format!("(ran {})", fmt_elapsed(view.elapsed.as_secs())),
+        &target,
+        view.vm.show_program,
+    ));
+    lines
+}
+
+/// Render the say turn's lines for one frame: exactly one representation for
+/// the turn's current state. The transcript viewport's claiming pass turns
+/// the completed output region into the toggle hitboxes; a hidden subwidget
+/// claims nothing.
+pub(crate) fn card_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
+    match say_state(&view.vm) {
+        SayTurnState::Generating => generating_lines(view),
+        SayTurnState::Running => running_lines(view),
+        SayTurnState::Completed => completed_lines(view),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::components::vocab::{Axis, Rect, Track, Widget};
-    use crate::cli::messages::{MessageId, OutputVm, ProgramSourceVm, WorkUnitViewModel};
+    use crate::cli::messages::{MessageId, ProgramSourceVm};
 
     fn say_view(vm: WorkUnitViewModel) -> SayTurnView {
         SayTurnView {
             message_id: MessageId::new(),
             vm,
-            elapsed_secs: 2,
+            elapsed: std::time::Duration::from_millis(2350),
         }
     }
 
@@ -173,6 +246,24 @@ mod tests {
             output: None,
             show_program: false,
         }
+    }
+
+    fn completed_vm() -> WorkUnitViewModel {
+        WorkUnitViewModel {
+            status: SayTurnStatus::Completed,
+            program: ProgramSourceVm {
+                language: "Co-Forth".into(),
+                lines: vec!["(say \"hello\")".to_string()],
+            },
+            output: Some(OutputVm {
+                lines: vec!["hello".to_string()],
+            }),
+            show_program: false,
+        }
+    }
+
+    fn texts(lines: &[RenderedTranscriptLine]) -> Vec<String> {
+        lines.iter().map(|line| line.text.clone()).collect()
     }
 
     fn viewport_layout(
@@ -189,220 +280,350 @@ mod tests {
         )
     }
 
+    fn hit_rect_count(lines: Vec<RenderedTranscriptLine>) -> usize {
+        viewport_layout(lines).hit_rects().count()
+    }
+
+    // ── Generating ──────────────────────────────────────────────────────────
+
     #[test]
-    fn test_chrome_arrow_is_absent_when_program_source_cannot_show() {
-        // INVARIANT (#882): the disclosure arrow exists only while the
-        // ProgramSource subwidget can be shown — a dead ▼ over nothing is
-        // impossible by construction because the affordance and the content
-        // are decided in the same function.
+    fn test_generating_state_renders_an_animated_line_and_no_source() {
+        // INVARIANT (stage 2): while the model is producing the response and
+        // no program exists yet, the turn is one animated progress line —
+        // never the source (there is none) and never chrome furniture.
+        let view = say_view(WorkUnitViewModel::default());
+        let lines = card_lines(&view);
+        let rendered = texts(&lines);
+        assert_eq!(
+            rendered.len(),
+            1,
+            "generating renders exactly one animated line; got {rendered:?}"
+        );
+        assert!(
+            rendered[0].contains("Generating…") && rendered[0].contains("(2s)"),
+            "the animated line names the phase and the elapsed time; got {rendered:?}"
+        );
+        assert!(
+            SPINNER_FRAMES.contains(&rendered[0].split(' ').next().unwrap_or_default()),
+            "the line leads with a spinner frame; got {:?}",
+            rendered[0]
+        );
+        assert_eq!(
+            hit_rect_count(lines),
+            0,
+            "nothing is toggleable while generating"
+        );
+    }
+
+    #[test]
+    fn test_generating_spinner_frame_advances_with_sub_second_elapsed() {
+        // The indicator animates: the frame is a pure function of elapsed
+        // time, so successive blit frames rotate it without any observer.
+        let early = spinner_frame(std::time::Duration::from_millis(0));
+        let later = spinner_frame(std::time::Duration::from_millis(SPINNER_TICK_MS * 3));
+        assert_ne!(
+            early, later,
+            "the spinner frame must advance with elapsed time"
+        );
+        assert_eq!(
+            spinner_frame(std::time::Duration::from_millis(SPINNER_TICK_MS * 3)),
+            spinner_frame(std::time::Duration::from_millis(SPINNER_TICK_MS * 3 + 17)),
+            "frames are stable within one tick"
+        );
+    }
+
+    // ── Running ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_running_state_renders_the_source_inline_with_no_chrome_or_legacy_rows() {
+        // INVARIANT (stage 2, the maintainer's verbatim target): a running say
+        // turn IS its program source, inline — no chrome row, no glyph, no
+        // card, no elapsed-on-chrome, no legacy `Program source` label.
+        let view = say_view(running_vm());
+        let lines = card_lines(&view);
+        let rendered = texts(&lines);
+        assert_eq!(
+            rendered,
+            vec!["(say \"hello\")"],
+            "the running turn renders only its program source, flush-left; got {rendered:?}"
+        );
+        for line in &rendered {
+            assert!(
+                !line.contains('\u{25cb}')
+                    && !line.contains('\u{23fa}')
+                    && !line.contains('\u{25b6}')
+                    && !line.contains('\u{25bc}')
+                    && !line.contains("(ran")
+                    && !line.contains("Program source"),
+                "the running state must not carry chrome, a glyph, an arrow, or a legacy \
+                 label; got {line:?}"
+            );
+        }
+        assert_eq!(
+            hit_rect_count(card_lines(&view)),
+            0,
+            "nothing is toggleable while the program is still executing"
+        );
+    }
+
+    #[test]
+    fn test_running_never_hides_output_bytes_that_have_already_arrived() {
+        // INVARIANT (#350 class): say chunks that streamed in while the
+        // program is still executing render beneath the source. Hiding them
+        // made chunks appear and then vanish during longer programs.
         let mut vm = running_vm();
-        vm.program.lines.clear();
+        vm.output = Some(OutputVm {
+            lines: vec!["partial greeting".to_string()],
+        });
         let view = say_view(vm);
-        let card = RowId {
-            message_id: view.message_id,
-            path: CARD_PATH.to_vec(),
-        };
-        let chrome = chrome_line(&view, &card);
+        let lines = card_lines(&view);
+        let rendered = texts(&lines);
+        assert_eq!(
+            rendered,
+            vec!["(say \"hello\")", "partial greeting"],
+            "source inline, arrived output beneath, nothing hidden; got {rendered:?}"
+        );
+    }
+
+    // ── Completed ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_completed_state_renders_prose_then_the_ran_annotation_and_no_legacy_rows() {
+        // INVARIANT (stage 2, the maintainer's verbatim target): the completed
+        // say turn is the prose inline plus `(ran Ns)` — no Program source
+        // row, no Brain run row, no UUID, no result row, no card chrome.
+        let view = say_view(completed_vm());
+        let lines = card_lines(&view);
+        let rendered = texts(&lines);
+        assert_eq!(
+            rendered,
+            vec!["hello", "", "(ran 2s)"],
+            "completed renders prose, a blank separator, then the elapsed annotation; \
+             got {rendered:?}"
+        );
+        for line in &rendered {
+            assert!(
+                !line.contains("Program source")
+                    && !line.contains("Brain run")
+                    && !line.contains("(say \"hello\")")
+                    && !line.contains('\u{23fa}')
+                    && !line.contains('\u{25b6}'),
+                "the completed state must not render the legacy source group or chrome; \
+                 got {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_completed_elapsed_annotation_always_renders_and_reads_aloud() {
+        // `(ran 0s)` is the annotation in the maintainer's spec — it renders
+        // even for a same-second turn, and long turns stay readable.
+        let mut vm = completed_vm();
+        vm.output = Some(OutputVm {
+            lines: vec!["hi".to_string()],
+        });
+        let quick = say_view(vm.clone());
         assert!(
-            !chrome.text.contains('\u{25b6}') && !chrome.text.contains('\u{25bc}'),
-            "the chrome must not render a disclosure arrow when no program can be shown; got {:?}",
-            chrome.text
+            texts(&card_lines(&quick))
+                .last()
+                .is_some_and(|line| *line == "(ran 2s)"),
+            "the annotation always renders; got {:?}",
+            texts(&card_lines(&quick))
         );
-        assert_eq!(
-            chrome.row_expanded, None,
-            "a chrome with no toggle affordance is not an expandable row"
-        );
-        let without_program = WorkUnitViewModel::default();
-        assert_eq!(
-            without_program.program.lines,
-            Vec::<String>::new(),
-            "the default say ViewModel carries no program"
+        let long = SayTurnView {
+            elapsed: std::time::Duration::from_secs(75),
+            ..say_view(vm)
+        };
+        assert!(
+            texts(&card_lines(&long))
+                .last()
+                .is_some_and(|line| *line == "(ran 1m 15s)"),
+            "minutes render readably; got {:?}",
+            texts(&card_lines(&long))
         );
     }
 
     #[test]
-    fn test_chrome_arrow_is_present_while_program_source_can_show() {
-        let view = say_view(running_vm());
-        let card = RowId {
-            message_id: view.message_id,
-            path: CARD_PATH.to_vec(),
-        };
-        let chrome = chrome_line(&view, &card);
-        assert!(
-            chrome.text.contains('\u{25b6}'),
-            "a say card whose program can be shown renders the closed disclosure arrow; got {:?}",
-            chrome.text
-        );
-        assert_eq!(
-            chrome.row_expanded,
-            Some(false),
-            "row_expanded carries show_program=false for assistive consumers"
-        );
-        assert!(
-            chrome.text.contains('\u{25cb}') && chrome.text.contains("2s"),
-            "the chrome names status and elapsed: got {:?}",
-            chrome.text
-        );
+    fn test_completed_turn_with_no_prose_still_has_its_annotation_and_target() {
+        // A completed turn whose output never arrived (empty successful say)
+        // still carries the annotation and a focusable toggle target.
+        let mut vm = completed_vm();
+        vm.output = None;
+        let view = say_view(vm);
+        let lines = card_lines(&view);
+        let rendered = texts(&lines);
+        assert_eq!(rendered, vec!["", "(ran 2s)"], "got {rendered:?}");
+        assert!(lines.iter().all(|line| line.row_id.is_some()));
     }
 
-    #[test]
-    fn test_toggle_flips_visibility_and_the_claiming_pass_re_claims() {
-        // INVARIANT (#882): a click toggles show_program on the ViewModel and
-        // the next frame's claiming pass re-claims — the program subwidget's
-        // rect appears where it claimed nothing before.
-        let view = say_view(running_vm());
-        let hidden = viewport_layout(card_lines(&view));
-        let hidden_rects: Vec<_> = hidden.hit_rects().collect();
-        assert_eq!(
-            hidden_rects.len(),
-            1,
-            "only the chrome row is a hitbox while the program is hidden; got {hidden_rects:?}"
-        );
+    // ── Toggle ──────────────────────────────────────────────────────────────
 
-        let mut vm = running_vm();
-        vm.show_program ^= true;
-        let revealed = say_view(vm);
-        let revealed_lines = card_lines(&revealed);
-        let revealed_text: Vec<&str> = revealed_lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect();
+    #[test]
+    fn test_toggle_target_is_the_output_region_and_the_swap_re_claims() {
+        // INVARIANT (stage 2): clicking the completed output swaps it to the
+        // program source and back. Every completed content line carries the
+        // output-region RowId (component-owned), so the whole region is the
+        // hit target, and the claiming pass re-claims the swap.
+        let view = say_view(completed_vm());
+        let lines = card_lines(&view);
+        let target = output_region(&view);
         assert!(
-            revealed_text
+            lines
                 .iter()
-                .any(|line| line.contains("(say \"hello\")")),
-            "toggled on, the card renders the program text; got {revealed_text:?}"
+                .all(|line| line.row_id.as_ref() == Some(&target)),
+            "every completed line is the output-region toggle target; got {lines:?}"
         );
-        let shown = viewport_layout(revealed_lines);
-        let shown_rects: Vec<_> = shown.hit_rects().collect();
+        assert!(
+            lines.iter().all(|line| line.component_owned),
+            "the toggle target is component-owned routing"
+        );
+        assert!(
+            lines.iter().all(|line| line.row_expanded == Some(false)),
+            "row_expanded reports show_program=false for assistive consumers"
+        );
+        let hit_rects: Vec<_> = viewport_layout(card_lines(&view)).hit_rects().collect();
+        assert!(
+            hit_rects.len() >= 3,
+            "the prose rows, the separator, and the annotation are all part of the \
+             output-region hit target; got {hit_rects:?}"
+        );
+
+        // Toggle through the component handle path: prose swaps to source,
+        // the annotation stays, and the region reports the opened state.
+        let mut vm = completed_vm();
+        vm.show_program = true;
+        let toggled = say_view(vm);
+        let toggled_lines = card_lines(&toggled);
+        let rendered = texts(&toggled_lines);
         assert_eq!(
-            shown_rects.len(),
-            1,
-            "the program body lines are not hitboxes; got {shown_rects:?}"
+            rendered,
+            vec!["(say \"hello\")", "", "(ran 2s)"],
+            "toggled on, the program source replaces the prose; the annotation stays; \
+             got {rendered:?}"
+        );
+        assert!(
+            card_lines(&toggled)
+                .iter()
+                .all(|line| line.row_expanded == Some(true)),
+            "row_expanded tracks the opened state"
         );
         assert_eq!(
-            card_lines(&view).len() + 1,
-            card_lines(&revealed).len(),
-            "revealing a one-line program claims exactly one more row"
+            hit_rect_count(card_lines(&view)),
+            hit_rect_count(card_lines(&toggled)),
+            "the swap re-claims one output region either way"
         );
     }
+
+    #[test]
+    fn test_output_region_path_is_derived_and_never_reuses_the_retired_chrome_path() {
+        let view = say_view(completed_vm());
+        let target = output_region(&view);
+        assert_eq!(
+            target.path, OUTPUT_PATH,
+            "the target's path is the declared OUTPUT_PATH"
+        );
+        assert_ne!(
+            target.path,
+            vec![0],
+            "the chrome's [0] path retired with the chrome; the output region never \
+             reuses a path segment"
+        );
+    }
+
+    // ── Subwidgets ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_hidden_subwidget_claims_zero_rows_and_stays_constructible() {
         // INVARIANT (#882): a subwidget with nothing to show claims zero rows
-        // and stays in the tree — constructed from the outer VM each frame,
-        // choosing to render nothing.
+        // and stays in the tree — constructed from the outer VM each frame.
         let vm = running_vm();
-        let program = ProgramSource::from_vm(&vm);
+        let hidden = ProgramSource::from_vm(&vm);
         assert!(
-            program.render().is_empty(),
-            "show_program=false renders no program lines"
+            hidden.render_toggled().is_empty(),
+            "show_program=false renders no program lines behind the toggle"
         );
-        let view = say_view(vm);
-        let lines = card_lines(&view);
+        let shown_vm = WorkUnitViewModel {
+            show_program: true,
+            ..vm.clone()
+        };
         assert_eq!(
-            lines.len(),
-            1,
-            "hidden program and absent output leave only the chrome row; got {:?}",
-            lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+            ProgramSource::from_vm(&shown_vm).render_toggled(),
+            vm.program.lines,
+            "show_program=true renders the exact wire text"
         );
-        let layout = viewport_layout(lines);
-        let claimed: Vec<usize> = layout.hit_rects().map(|(_, rect)| rect.height).collect();
         assert_eq!(
-            claimed,
-            vec![1],
-            "the chrome claims its furniture row; hidden subwidgets claim zero; got {claimed:?}"
+            ProgramSource::from_vm(&shown_vm).render_inline(),
+            vm.program.lines,
+            "the running representation is the source regardless of the toggle"
         );
     }
 
     #[test]
     fn test_output_subwidget_renders_only_when_the_output_part_is_set() {
-        let mut vm = running_vm();
-        vm.output = None;
-        let view = say_view(vm);
+        let view = say_view(running_vm());
+        assert!(view.vm.output.is_none());
         assert_eq!(
-            card_lines(&view).len(),
-            1,
-            "no output part means no output lines"
-        );
-        let mut vm = running_vm();
-        vm.output = Some(OutputVm {
-            lines: vec!["hello".to_string()],
-        });
-        let view = say_view(vm);
-        let lines = card_lines(&view);
-        let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
-        assert!(
-            texts.iter().any(|line| line.contains("hello")),
-            "the output subwidget renders the say bytes; got {texts:?}"
+            texts(&card_lines(&view)),
+            vec!["(say \"hello\")"],
+            "no output part means no output lines beneath the source"
         );
     }
 
     #[test]
     fn test_streaming_vm_updates_render_on_the_next_frame() {
         // Streaming lands under the message's lock; every frame repaints from
-        // the current VM. The component itself is a pure function of the
-        // snapshot, so a growing output part grows the card.
-        let mut vm = running_vm();
+        // the current VM. The component is a pure function of the snapshot,
+        // so a growing output part grows the completed card.
+        let mut vm = completed_vm();
         vm.output = Some(OutputVm {
             lines: vec!["hel".to_string()],
         });
-        let partial = card_lines(&say_view(vm.clone()));
+        let partial_view = say_view(vm.clone());
+        let partial = texts(&card_lines(&partial_view));
         vm.output = Some(OutputVm {
             lines: vec!["hel".to_string(), "lo".to_string()],
         });
-        let streamed = card_lines(&say_view(vm));
+        let streamed_view = say_view(vm);
+        let streamed = texts(&card_lines(&streamed_view));
         assert_eq!(partial.len() + 1, streamed.len());
-        assert!(streamed.last().expect("streamed frame").text.contains("lo"));
-    }
-
-    #[test]
-    fn test_completion_transitions_status_exactly_once_in_the_view_model() {
-        // The completion path owns the transition; the component renders
-        // whatever the VM says. Two completion passes must not distinguish
-        // themselves — and the glyph must change.
-        let mut vm = running_vm();
-        let running = say_glyph(vm.status);
-        vm.status = SayTurnStatus::Completed;
-        let completed = say_glyph(vm.status);
-        vm.status = SayTurnStatus::Completed;
-        assert_ne!(running, completed, "running and completed glyphs differ");
-        assert_eq!(
-            say_glyph(vm.status),
-            completed,
-            "an already-completed status re-renders identically — the transition happened once"
-        );
-    }
-
-    #[test]
-    fn test_card_lines_route_the_chrome_to_the_component_path() {
-        let view = say_view(running_vm());
-        let lines = card_lines(&view);
-        let chrome = &lines[0];
-        assert!(chrome.component_owned, "the chrome row is component-owned");
-        assert_eq!(
-            chrome.row_id.as_ref().map(|id| id.path.as_slice()),
-            Some(CARD_PATH),
-            "the chrome's semantic path is the card's disclosure hitbox"
-        );
         assert!(
-            lines[1..].iter().all(|line| !line.component_owned),
-            "subwidget body lines carry no row identity of their own"
+            streamed.iter().any(|line| *line == "lo"),
+            "the streamed chunk renders; got {streamed:?}"
         );
     }
 
     #[test]
-    fn test_the_card_participates_in_a_claiming_frame_as_a_subtree() {
-        // The engine's claiming pass offers a box; the chrome reserves its
-        // furniture row inside it and the subwidgets take the remainder. Here
-        // the card sits inside a stack the way the transcript viewport hosts
-        // it, and the pass claims exactly the rows the card rendered.
+    fn test_completion_transitions_exactly_once_in_the_view_model() {
+        // The completion path owns the transition; the component renders
+        // whatever the VM says. Re-running completion re-renders identically.
         let mut vm = running_vm();
-        vm.show_program = true;
+        let running_view = say_view(vm.clone());
+        let running = card_lines(&running_view);
+        vm.status = SayTurnStatus::Completed;
         vm.output = Some(OutputVm {
             lines: vec!["hello".to_string()],
         });
-        let view = say_view(vm);
+        let completed_view = say_view(vm.clone());
+        let completed = card_lines(&completed_view);
+        vm.status = SayTurnStatus::Completed;
+        assert_ne!(
+            texts(&running),
+            texts(&completed),
+            "the completed representation differs from the running one"
+        );
+        assert_eq!(
+            texts(&card_lines(&completed_view)),
+            texts(&completed),
+            "an already-completed status re-renders identically — the transition \
+             happened once"
+        );
+    }
+
+    #[test]
+    fn test_the_completed_card_participates_in_a_claiming_frame_as_a_subtree() {
+        // The engine's claiming pass offers a box; the completed card claims
+        // prose + blank + annotation rows inside it.
+        let view = say_view(completed_vm());
         const CARD: u16 = 7;
         let tree = Widget::Stack {
             axis: Axis::Column,
@@ -431,7 +652,7 @@ mod tests {
         let rect = layout.keyed(CARD).expect("the card claims a rect");
         assert_eq!(
             rect.height, 3,
-            "chrome + one program line + one output line claim three rows; got {rect:?}"
+            "prose + blank + annotation claim three rows; got {rect:?}"
         );
     }
 }

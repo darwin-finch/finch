@@ -184,7 +184,7 @@ impl WorkUnit {
     pub fn new(verb: impl Into<String>) -> Self;
     /// Mark successful untitled default-port `say` as assistant prose.
     pub fn present_as_assistant_prose(&self);
-    /// The component-defined action a click on the card row at `path` produces.
+    /// The component-defined action a click on the turn's output region at `path` produces (stage 2, docs/TUI_DESIGN.md): the completed output is the toggle hit tar…
     pub fn say_turn_action(&self, path: &[u32]) -> Option<ComponentAction>;
     /// The component-owned ViewModel snapshot plus chrome timing, read under the message's own lock.
     pub fn say_turn_snapshot(&self) -> Option<SayTurnView>;

@@ -223,45 +223,67 @@ impl Session {
         file.flush().expect("flush the pty");
     }
 
-    /// Wait until the terminal shows one line carrying both glyphs — the say
-    /// card's chrome (completed glyph + disclosure arrow) — and panic with the
-    /// terminal when the deadline passes.
-    fn wait_for_component_line(
-        &mut self,
-        first: char,
-        second: char,
-        deadline: Duration,
-        what: &str,
-    ) {
-        assert!(
-            self.wait_for_component_line_quiet(first, second, deadline),
-            "the run hung: {what} did not happen within {deadline:?} \
-             (a line with {first:?} and {second:?} never reached the terminal). \
-             This deadline is a hang detector, not a latency assertion. \
-             Terminal was:\n{}",
-            self.readable_transcript()
-        );
+    /// Write raw bytes to the pty without a trailing newline — escape
+    /// sequences must not gain an Enter keystroke.
+    fn send_raw(&mut self, bytes: &[u8]) {
+        let mut file =
+            std::fs::File::from(self.master.try_clone().expect("clone master for writing"));
+        file.write_all(bytes).expect("write to the pty");
+        file.flush().expect("flush the pty");
     }
 
-    /// Bounded poll for one terminal line carrying both glyphs. False when the
-    /// deadline passes first — a liveness probe, not a latency assertion.
-    fn wait_for_component_line_quiet(
-        &mut self,
-        first: char,
-        second: char,
-        deadline: Duration,
-    ) -> bool {
+    /// The live screen the reader sees right now: the raw byte stream replayed
+    /// through a VT parser over a fixed `ROWS`×`COLS` grid. Native scrollback
+    /// that already left the viewport is off-grid, exactly as a human reader
+    /// experiences the session. Repaints (absolute cursor moves, erases) are
+    /// honoured, so this is the production surface, not the byte stream.
+    fn screen_text(&self) -> String {
+        let mut screen = vt::Screen::new(ROWS, COLS);
+        let mut parser = vte::Parser::new();
+        let bytes = self.transcript_bytes();
+        parser.advance(&mut screen, &bytes);
+        screen.text()
+    }
+
+    /// Wait until the live screen carries the needle, then return the screen.
+    fn wait_for_screen(&mut self, needle: &str, deadline: Duration, what: &str) -> String {
         let expiry = Instant::now() + deadline;
         loop {
-            if self
-                .readable_transcript()
-                .lines()
-                .any(|line| line.contains(first) && line.contains(second))
-            {
-                return true;
+            let screen = self.screen_text();
+            if screen.contains(needle) {
+                return screen;
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "INVARIANT: {what}\nfinch exited with {status:?} before that happened.\n\
+                     needle={needle:?}\nlive screen:\n{screen}"
+                );
             }
             if Instant::now() >= expiry {
-                return false;
+                panic!(
+                    "the run hung: {what} did not happen within {deadline:?} \
+                     ({needle:?} never reached the live screen). This deadline is a \
+                     hang detector, not a latency assertion. Live screen was:\n{screen}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Bounded poll over the live screen for a predicate. `None` when the
+    /// deadline passes first — a liveness probe, not a latency assertion.
+    fn wait_for_screen_pred<F>(&mut self, mut predicate: F, deadline: Duration) -> Option<String>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let expiry = Instant::now() + deadline;
+        loop {
+            let screen = self.screen_text();
+            if predicate(&screen) {
+                return Some(screen);
+            }
+            if Instant::now() >= expiry {
+                return None;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -298,6 +320,221 @@ impl Drop for Session {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+    }
+}
+
+/// A minimal VT screen model: a fixed grid the raw PTY byte stream repaints
+/// through `vte`. It exists so assertions can read what a human reader sees —
+/// the live screen — instead of the byte stream that also carries erased
+/// repaints and scrolled-away history. Honoured: printable output, CR/LF/BS,
+/// absolute and relative cursor moves, line/display erases, and scrolling at
+/// the bottom margin. SGR, OSC, and private modes are ignored, matching the
+/// assertions' needs (text presence and absence).
+mod vt {
+    use vte::{Params, Perform};
+
+    pub struct Screen {
+        rows: usize,
+        cols: usize,
+        grid: Vec<Vec<char>>,
+        row: usize,
+        col: usize,
+        pending_wrap: bool,
+    }
+
+    impl Screen {
+        pub fn new(rows: u16, cols: u16) -> Self {
+            let (rows, cols) = (rows as usize, cols as usize);
+            Self {
+                grid: vec![vec![' '; cols]; rows],
+                rows,
+                cols,
+                row: 0,
+                col: 0,
+                pending_wrap: false,
+            }
+        }
+
+        pub fn text(&self) -> String {
+            self.grid
+                .iter()
+                .map(|line| {
+                    let text = line.iter().collect::<String>();
+                    text.trim_end().to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        fn line_feed(&mut self) {
+            self.pending_wrap = false;
+            if self.row + 1 >= self.rows {
+                self.scroll_up();
+            } else {
+                self.row += 1;
+            }
+        }
+
+        fn scroll_up(&mut self) {
+            self.grid.remove(0);
+            self.grid.push(vec![' '; self.cols]);
+        }
+
+        fn scroll_down(&mut self) {
+            self.grid.pop();
+            self.grid.insert(0, vec![' '; self.cols]);
+        }
+
+        fn put_char(&mut self, c: char) {
+            if self.pending_wrap {
+                self.col = 0;
+                self.line_feed();
+            }
+            self.grid[self.row][self.col] = c;
+            if self.col + 1 >= self.cols {
+                self.pending_wrap = true;
+            } else {
+                self.col += 1;
+            }
+        }
+
+        fn move_to(&mut self, row: usize, col: usize) {
+            self.pending_wrap = false;
+            self.row = row.min(self.rows - 1);
+            self.col = col.min(self.cols - 1);
+        }
+
+        fn erase_in_line(&mut self, mode: u16) {
+            let line = &mut self.grid[self.row];
+            match mode {
+                0 => {
+                    for cell in line.iter_mut().skip(self.col) {
+                        *cell = ' ';
+                    }
+                }
+                1 => {
+                    for cell in line.iter_mut().take(self.col + 1) {
+                        *cell = ' ';
+                    }
+                }
+                _ => {
+                    for cell in line.iter_mut() {
+                        *cell = ' ';
+                    }
+                }
+            }
+        }
+
+        fn erase_in_display(&mut self, mode: u16) {
+            match mode {
+                0 => {
+                    self.erase_in_line(0);
+                    for line in self.grid.iter_mut().skip(self.row + 1) {
+                        *line = vec![' '; self.cols];
+                    }
+                }
+                1 => {
+                    self.erase_in_line(1);
+                    for line in self.grid.iter_mut().take(self.row) {
+                        *line = vec![' '; self.cols];
+                    }
+                }
+                _ => {
+                    for line in self.grid.iter_mut() {
+                        *line = vec![' '; self.cols];
+                    }
+                }
+            }
+        }
+    }
+
+    fn param(params: &Params, index: usize, default: u16) -> u16 {
+        params
+            .iter()
+            .nth(index)
+            .and_then(|slice| slice.first())
+            .copied()
+            .filter(|value| *value != 0)
+            .unwrap_or(default)
+    }
+
+    impl Perform for Screen {
+        fn print(&mut self, c: char) {
+            self.put_char(c);
+        }
+
+        fn execute(&mut self, byte: u8) {
+            match byte {
+                b'\r' => {
+                    self.pending_wrap = false;
+                    self.col = 0;
+                }
+                b'\n' => self.line_feed(),
+                b'\x08' => {
+                    self.pending_wrap = false;
+                    self.col = self.col.saturating_sub(1);
+                }
+                b'\t' => {
+                    self.col = ((self.col / 8) + 1).min(self.cols - 1) * 8;
+                    self.col = self.col.min(self.cols - 1);
+                }
+                _ => {}
+            }
+        }
+
+        fn csi_dispatch(
+            &mut self,
+            params: &Params,
+            _intermediates: &[u8],
+            _ignore: bool,
+            action: char,
+        ) {
+            match action {
+                'H' | 'f' => {
+                    // CUP is 1-based; the TUI positions rows absolutely.
+                    self.move_to(
+                        (param(params, 0, 1).saturating_sub(1)).into(),
+                        (param(params, 1, 1).saturating_sub(1)).into(),
+                    );
+                }
+                'J' => self.erase_in_display(param(params, 0, 0)),
+                'K' => self.erase_in_line(param(params, 0, 0)),
+                'A' => {
+                    self.move_to(
+                        self.row.saturating_sub(param(params, 0, 1) as usize),
+                        self.col,
+                    );
+                }
+                'B' => self.move_to(self.row + param(params, 0, 1) as usize, self.col),
+                'C' => self.move_to(self.row, self.col + param(params, 0, 1) as usize),
+                'D' => {
+                    self.move_to(
+                        self.row,
+                        self.col.saturating_sub(param(params, 0, 1) as usize),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, action: u8) {
+            match action {
+                b'D' | b'E' => self.line_feed(),
+                b'M' => {
+                    if self.row == 0 {
+                        self.scroll_down();
+                    } else {
+                        self.row -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+        fn put(&mut self, _byte: u8) {}
+        fn unhook(&mut self) {}
+        fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
     }
 }
 
@@ -982,93 +1219,142 @@ fn durable_attach_prints_one_command_and_reattaches_the_same_brain() {
     );
 }
 
-/// A completed say turn is the stage-1 component-owned card (docs/TUI_DESIGN.md,
-/// #882): prose visible with the ProgramSource subwidget hidden, the disclosure
-/// affordance present because the program CAN be shown, no `[expanded]` chrome,
-/// and no running residue after completion. Driving the real keyboard
-/// disclosure path (F6 focus, Enter toggle) reveals the program text through
-/// the component's ViewModel — not a renderer map.
-///
-/// The canonical record itself is pinned at the layout boundary in
-/// `plan_canonical_commit_defers_completed_source_until_paired_output_has_body`
-/// (src/cli/tui/mod.rs): the raw program and the say bytes spool exactly once
-/// through `commit_complete_messages`. The interactive typed-program PTY
-/// session is asserted only on the live card because the typed-turn commit
-/// does not spool in the live app — reproduced identically on the base
-/// revision (b032c08b) with the same probe, so it is a pre-existing pipeline
-/// gap outside this change, not a stage-1 regression.
 #[test]
-fn completed_say_renders_the_component_card_and_reveals_the_program_on_toggle() {
+fn completed_say_renders_one_representation_per_state_and_toggles_to_the_program() {
     const SAY_TEXT: &str = "attach-say-882";
+    const SOURCE_LINE: &str = "(say \"attach-say-882\")";
 
     let fixture = Fixture::new();
     let mut session = Session::spawn(&fixture, &["attach", BRAIN]);
     session.wait_for("finch v", READY_DEADLINE, "the startup header was drawn");
-    session.send_line("(say \"attach-say-882\")");
-    // The Lisp typed-program path writes no user echo row, so the first
-    // occurrence of the say bytes on screen is the card's prose.
-    session.wait_for(
+    session.send_line(SOURCE_LINE);
+    // The Lisp typed-program path writes no user echo row, so the say bytes on
+    // screen are the completed card's prose.
+    session.wait_for_screen(
         SAY_TEXT,
         ECHO_DEADLINE,
-        "the completed say rendered its prose",
+        "the completed say rendered its prose on the live screen",
     );
-    // The card's completed chrome: filled glyph + elapsed + the closed
-    // disclosure arrow on one line. The arrow exists only while the program
-    // source can be shown — its presence proves the affordance is not dead
-    // over nothing.
-    session.wait_for_component_line(
-        '\u{23fa}',
-        '\u{25b6}',
+    session.wait_for(
+        "(ran ",
         ECHO_DEADLINE,
-        "the completed say card shows the disclosure affordance (completed glyph + closed arrow)",
+        "the completed say card carries its `(ran Ns)` elapsed annotation",
     );
 
-    let text = session.readable_transcript();
+    // The completed state on the live screen: prose + `(ran Ns)`, and NOTHING
+    // else — no Program source row, no Brain run row, no UUID, no result row,
+    // no card chrome (the stage-1 transition duplication is dead).
+    let screen = session
+        .wait_for_screen_pred(
+            |screen| screen.matches(SAY_TEXT).count() >= 1,
+            Duration::from_secs(5),
+        )
+        .expect("the completed card settled on the live screen");
     assert!(
-        !text.contains("[expanded]") && !text.contains("[collapsed]"),
+        screen.lines().any(|line| line.contains(SAY_TEXT)),
+        "INVARIANT: the completed say renders its prose on the live screen.\nlive screen:\n{screen}"
+    );
+    assert!(
+        screen.lines().any(|line| line.contains("(ran ")),
+        "INVARIANT: the completed say carries its `(ran Ns)` elapsed annotation \
+         (docs/TUI_DESIGN.md, stage-2 verbatim target).\nlive screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Program source"),
+        "INVARIANT: the legacy Program source row does not render for a say turn \
+         (stage-2 consolidation); the canonical record keeps the raw program.\n\
+         live screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Brain run"),
+        "INVARIANT: no Brain run row renders for a say turn (stage-2 target names the \
+         UUID-carrying row explicitly).\nlive screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("result —"),
+        "INVARIANT: no result row renders for a say turn.\nlive screen:\n{screen}"
+    );
+    assert!(
+        uuid_only_lines(&screen).is_empty(),
+        "INVARIANT: no UUID row renders for a say turn.\nlive screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("[expanded]") && !screen.contains("[collapsed]"),
         "INVARIANT: disclosure never paints an [expanded]/[collapsed] token (#417).\n\
-         terminal:\n{text}"
+         live screen:\n{screen}"
     );
     assert!(
-        !text.contains("running"),
+        !screen
+            .lines()
+            .any(|line| line.contains('\u{25b6}') || line.contains('\u{25bc}')),
+        "INVARIANT: the say card wears no disclosure chrome — one representation per \
+         state (#882 stage 2).\nlive screen:\n{screen}"
+    );
+    assert!(
+        !screen.lines().any(|line| line.contains("running")),
         "INVARIANT: a completed say turn leaves no `running` residue (#820 class).\n\
-         terminal:\n{text}"
-    );
-    assert!(
-        text.contains("Program source"),
-        "INVARIANT: the turn's program-source row stays visible as the record carrier; \
-         the stage-1 ruling made the program show_program-gated card content, not a \
-         deleted row.\nterminal:\n{text}"
+         live screen:\n{screen}"
     );
 
     // Drive the toggle through the real input path: one write is F6 (focus the
-    // next semantic row) followed by Enter (toggle it). Within two iterations
-    // the card itself is focused and toggled, observable as the opened arrow
-    // (▼) joining the completed glyph (⏺) on the chrome line.
-    let mut opened = false;
+    // next semantic row, `\x1b[17~`) followed by Enter (toggle it). The
+    // completed output region is the hit target, so within a couple of
+    // iterations the prose swaps to the program source, observable as a second
+    // rendered occurrence of the exact source line on the live screen.
+    let before = session.screen_text().matches(SOURCE_LINE).count();
+    let mut toggled = None;
     for _ in 0..4 {
-        session.send_line("\x1b[15~"); // F6, then Enter
-        if session.wait_for_component_line_quiet('\u{23fa}', '\u{25bc}', Duration::from_secs(5)) {
-            opened = true;
+        session.send_line("\x1b[17~"); // F6, then Enter
+        if let Some(screen) = session.wait_for_screen_pred(
+            |screen| {
+                let after = screen.matches(SOURCE_LINE).count();
+                after > before && screen.contains("(ran ")
+            },
+            Duration::from_secs(5),
+        ) {
+            toggled = Some(screen);
             break;
         }
     }
-    let text = session.readable_transcript();
-    assert!(
-        opened,
-        "INVARIANT: driving the keyboard disclosure path must toggle the say card's \
-         show_program through the component ViewModel and open the card.\nterminal:\n{text}"
+    let screen = toggled.unwrap_or_else(|| {
+        panic!(
+            "INVARIANT: driving the keyboard disclosure path (F6/Enter) must toggle the \
+             say card's show_program through the component ViewModel and swap the \
+             completed prose to the program source.\nbefore: {before} occurrence(s) of \
+             {SOURCE_LINE:?}.\nlive screen:\n{}",
+            session.screen_text()
+        )
+    });
+    let say_lines: Vec<&str> = screen
+        .lines()
+        .filter(|line| line.contains(SAY_TEXT))
+        .collect();
+    assert_eq!(
+        say_lines.len(),
+        1,
+        "INVARIANT: the completed output swapped to the program source — the prose line \
+         is gone and exactly the source line carries the say bytes.\nlive screen:\n{screen}"
     );
     assert!(
-        text.matches(SAY_TEXT).count() >= 2,
-        "INVARIANT: after the toggle the program text renders in the card in addition to \
-         the say prose.\nterminal:\n{text}"
+        say_lines[0].contains("(say"),
+        "INVARIANT: the visible say bytes are the program source form; line={:?}",
+        say_lines[0]
+    );
+    assert!(
+        screen.lines().any(|line| line.contains("(ran ")),
+        "INVARIANT: the `(ran Ns)` annotation stays through the swap.\nlive screen:\n{screen}"
     );
 
+    // Esc clears keyboard focus (the accordion's documented key), so the
+    // following Enter submits the command instead of toggling the still
+    // focused output region. The Esc byte goes out raw — a trailing newline
+    // would arrive as Alt+Enter.
+    session.send_raw(b"\x1b");
+    std::thread::sleep(Duration::from_millis(300));
     session.send_line("/exit");
     let status = session.wait_for_exit();
     assert!(
         status.success(),
-        "a clean /exit must succeed after the say turn, status={status:?}, terminal:\n{text}"
+        "a clean /exit must succeed after the say turn, status={status:?}, live screen:\n{screen}"
     );
 }

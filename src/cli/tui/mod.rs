@@ -2256,6 +2256,42 @@ fn defer_completed_program_source(messages: &[MessageRef], index: usize) -> bool
         .is_some_and(|(has_body, status)| status == MessageStatus::InProgress && !has_body)
 }
 
+/// The viewport source-group row a component-owned say turn consolidates away
+/// (stage 2 of docs/TUI_DESIGN.md, #882): the completed Program-source unit
+/// immediately preceding a say-VM unit whose response text is byte-identical
+/// to the turn's program. Byte identity holds by construction in every
+/// producer path (interactive typed, wire, repair — the producer passes the
+/// same source string to both units), and a mismatch suppresses nothing, so
+/// the rule can only fail toward rendering more information, never less. The
+/// canonical record keeps the raw program exactly once:
+/// `commit_complete_messages` iterates messages without neighbour context and
+/// is untouched by this rule.
+fn say_turn_consolidated_source_ids(messages: &[MessageRef]) -> HashSet<MessageId> {
+    let mut suppressed = HashSet::new();
+    for pair in messages.windows(2) {
+        let Some(view) = pair[1].say_turn_view() else {
+            continue;
+        };
+        let program = view.vm.program.lines.join("\n");
+        if program.is_empty() {
+            continue;
+        }
+        let Some(head) = pair[0].work_unit_head() else {
+            continue;
+        };
+        if pair[0].status() == MessageStatus::Complete
+            && matches!(
+                head.presentation,
+                WorkUnitPresentation::ProgramSource { .. }
+            )
+            && head.response_text == program
+        {
+            suppressed.insert(pair[0].id());
+        }
+    }
+    suppressed
+}
+
 fn visible_printed_messages(
     messages: &[MessageRef],
     printed_ids: &HashSet<MessageId>,
@@ -2930,9 +2966,18 @@ impl TuiRenderer {
         messages: impl IntoIterator<Item = MessageRef>,
         width: usize,
     ) -> Vec<RenderedTranscriptLine> {
+        let messages = messages.into_iter().collect::<Vec<_>>();
+        // Say-turn consolidation (stage 2 of docs/TUI_DESIGN.md, #882): the
+        // turn's legacy source-group row does not render beside the component
+        // card. The canonical record keeps it — see
+        // `say_turn_consolidated_source_ids`.
+        let consolidated = say_turn_consolidated_source_ids(&messages);
         let mut rendered = Vec::new();
-        for message in messages {
-            rendered.extend(self.projected_message_lines(&message, width));
+        for message in &messages {
+            if consolidated.contains(&message.id()) {
+                continue;
+            }
+            rendered.extend(self.projected_message_lines(message, width));
             rendered.push(RenderedTranscriptLine {
                 ..RenderedTranscriptLine::default()
             });
@@ -6711,58 +6756,134 @@ mod tests {
     }
 
     #[test]
-    fn completed_program_source_stays_visible_beside_its_output() {
-        // INVARIANT (#882, stage 1 of docs/TUI_DESIGN.md): the old say-turn
-        // rule deleted the program-source row once its output had body, which
-        // left a dead disclosure affordance over nothing. The program source
-        // is show_program-gated card content now, never a deleted row — so
-        // the live suffix keeps both rows and only the ordering deferral
-        // (source waits while its paired output is running without body)
-        // remains.
-        let source = Arc::new(WorkUnit::new("source"));
+    fn say_turn_source_group_row_consolidates_into_the_card_in_the_viewport_only() {
+        // INVARIANT (stage 2 of docs/TUI_DESIGN.md): the legacy Program source
+        // row does not render beside the component card — one representation
+        // per state. The pairing is structural: the adjacent, completed,
+        // rowless Program-source unit whose response text is byte-identical to
+        // the say ViewModel's program. The canonical record keeps the raw
+        // program exactly once either way.
+        let colors = ColorScheme::default();
+        let source = Arc::new(WorkUnit::new("typed program"));
         source.set_program_source("lisp");
         source.set_response("(say \"hello\")");
         source.set_complete();
-
-        let output = Arc::new(WorkUnit::new("output"));
+        let output = Arc::new(WorkUnit::new("VM program output"));
         output.set_program_output();
+        output.begin_say_turn("lisp", "(say \"hello\")");
         output.append_response("hello");
+        output.set_complete();
+        let manager_messages: Vec<MessageRef> = vec![source.clone(), output.clone()];
 
-        let source_ref: MessageRef = source.clone();
-        let output_ref: MessageRef = output.clone();
-        let manager_messages = vec![source_ref.clone(), output_ref.clone()];
-        let live = uncommitted_suffix(manager_messages, &HashSet::new());
-        let live_ids: Vec<MessageId> = live.iter().map(|message| message.id()).collect();
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::new(OutputManager::new(colors.clone())),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
+        );
+        renderer.output_manager.disable_stdout();
+        let projected = renderer.projected_lines(manager_messages.clone(), 80);
+        let rendered: Vec<&str> = projected.iter().map(|line| line.text.as_str()).collect();
         assert!(
-            live_ids.contains(&source.id()) && live_ids.contains(&output.id()),
-            "both the program source and its output stay visible in the live suffix; ids={live_ids:?}"
+            !rendered.iter().any(|line| line.contains("Program source")),
+            "INVARIANT: the legacy Program source row must not render beside the say \
+             card (stage-2 consolidation); rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("hello"))
+                && rendered.iter().any(|line| line.contains("(ran ")),
+            "INVARIANT: the card's prose and `(ran Ns)` annotation render; \
+             rendered={rendered:?}"
         );
 
+        // A mismatch fails toward rendering more: a source unit that is not
+        // this turn's program keeps its row.
+        let foreign = Arc::new(WorkUnit::new("other program"));
+        foreign.set_program_source("forth");
+        foreign.set_response("(emit \"different bytes\")");
+        foreign.set_complete();
+        let foreign_say = Arc::new(WorkUnit::new("VM program output"));
+        foreign_say.set_program_output();
+        foreign_say.begin_say_turn("lisp", "(say \"hello\")");
+        foreign_say.append_response("hello");
+        foreign_say.set_complete();
+        let mismatched = vec![
+            foreign.clone() as MessageRef,
+            foreign_say.clone() as MessageRef,
+        ];
+        let projected = renderer.projected_lines(mismatched, 80);
+        let rendered: Vec<&str> = projected.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            rendered.iter().any(|line| line.contains("Program source")),
+            "INVARIANT: a preceding source unit whose bytes are not the say turn's \
+             program keeps rendering — suppression cannot hide unrelated rows; \
+             rendered={rendered:?}"
+        );
+
+        // The canonical plan still emits the source record: the viewport rule
+        // never touches the pinned commit pipeline.
+        let canonical_manager = Arc::new(OutputManager::new(colors.clone()));
+        canonical_manager.disable_stdout();
+        canonical_manager.add_trait_message(source.clone());
+        canonical_manager.add_trait_message(output.clone());
+        let plan = plan_canonical_commit(&canonical_manager.get_messages(), &HashSet::new());
+        assert!(
+            plan.emit.iter().any(|message| message.id() == source.id()),
+            "the canonical record still emits the raw program record; emit={}",
+            plan.emit
+                .iter()
+                .map(|message| message.id().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut staged = Vec::new();
+        commit_complete_messages(
+            &mut staged,
+            &plan.emit,
+            &mut renderer.accordion,
+            &colors,
+            &mut renderer.printed_ids,
+            8,
+            80,
+        )
+        .expect("commit both records");
+        let staged_text = String::from_utf8(staged).unwrap();
+        assert_eq!(
+            staged_text.matches("(say \"hello\")").count(),
+            1,
+            "the raw program spools exactly once through the canonical record; \
+             staged={staged_text:?}"
+        );
+        assert!(
+            staged_text.contains("hello"),
+            "the say bytes spool exactly once through the canonical record; \
+             staged={staged_text:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_source_units_stay_visible_until_the_say_card_exists() {
+        // The consolidation pairs a say turn with its already-completed
+        // source. While the source is still streaming (no card exists yet),
+        // its progressive wire text stays visible — pinned by
+        // `in_progress_program_source_keeps_received_wire_text_visible` in
+        // src/cli/messages/work_unit.rs; here the structural guard is what
+        // keeps a completed-but-unpaired source visible.
+        let colors = ColorScheme::default();
         let streaming = Arc::new(WorkUnit::new("streaming"));
         streaming.set_program_source("lisp");
-        streaming.set_response("(say");
-        let streaming_ref: MessageRef = streaming.clone();
-        let ir_only = uncommitted_suffix(vec![streaming_ref.clone()], &HashSet::new());
-        assert_eq!(
-            ir_only.len(),
-            1,
-            "IR stays visible while it is still streaming"
+        streaming.set_response("(say \"hel");
+        let mut renderer = TuiRenderer::new_headless(
+            Arc::new(OutputManager::new(colors.clone())),
+            Arc::new(StatusBar::new()),
+            colors.clone(),
         );
-
-        let streaming_with_output =
-            uncommitted_suffix(vec![streaming_ref, output_ref], &HashSet::new());
-        assert_eq!(
-            streaming_with_output.len(),
-            2,
-            "InProgress source stays visible beside output that already has a body"
-        );
+        renderer.output_manager.disable_stdout();
+        let projected = renderer.projected_lines(vec![streaming.clone() as MessageRef], 80);
         assert!(
-            crate::cli::tui::view_model::try_project_for_test(
-                streaming.as_ref(),
-                &ColorScheme::default()
-            )
-            .is_some_and(|row| row.default_open),
-            "source stays expanded only while InProgress"
+            projected
+                .iter()
+                .any(|line| line.text.contains("Program source")),
+            "a source unit with no say turn keeps its viewport row"
         );
     }
 
@@ -6783,6 +6904,10 @@ mod tests {
         source.set_complete();
         let output = Arc::new(WorkUnit::new("output"));
         output.set_program_output();
+        // The real say-turn shape: the output unit carries the component
+        // ViewModel, so the canonical record is pinned for exactly the turns
+        // stage 2 consolidates (#882).
+        output.begin_say_turn("lisp", "(say \"hello\")");
         manager.add_trait_message(source.clone());
         manager.add_trait_message(output.clone());
 
@@ -6851,33 +6976,27 @@ mod tests {
             "the output commits exactly once; staged={staged_text:?}"
         );
 
-        // The reconstructed reader shows both rows; each committed exactly once.
+        // The reconstructed reader shows the say card's prose; the legacy
+        // source row no longer renders in the viewport (stage 2), while the
+        // canonical record above kept the raw program.
         let printed = visible_printed_messages(&manager.get_messages(), &renderer.printed_ids);
-        let projected = printed
-            .iter()
-            .flat_map(|message| {
-                if let Some(view) = message.say_turn_view() {
-                    return crate::cli::components::card_lines(&view);
-                }
-                match view_model::project_message(message, &colors) {
-                    view_model::ProjectedMessage::Node(node) => {
-                        renderer.accordion.render_node(&node)
-                    }
-                    view_model::ProjectedMessage::Plain(formatted) => {
-                        renderer.accordion.render_plain(&formatted.join("\n"))
-                    }
-                }
-            })
-            .map(|line| line.text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let projected = renderer.projected_lines(printed, 80);
+        let projected_text: Vec<&str> = projected.iter().map(|line| line.text.as_str()).collect();
         assert!(
-            projected.contains("hello"),
-            "reconstructed viewport must show program output; projected={projected:?}"
+            projected_text.iter().any(|line| line.contains("hello")),
+            "reconstructed viewport must show program output; projected={projected_text:?}"
         );
         assert!(
-            projected.contains("Program source"),
-            "reconstructed viewport keeps the program-source row; projected={projected:?}"
+            !projected_text
+                .iter()
+                .any(|line| line.contains("Program source")),
+            "INVARIANT: the legacy Program source row does not render beside the say \
+             card (stage-2 consolidation); projected={projected_text:?}"
+        );
+        assert!(
+            projected_text.iter().any(|line| line.contains("(ran ")),
+            "the completed card carries its `(ran Ns)` annotation; \
+             projected={projected_text:?}"
         );
 
         let retained = manager.get_messages();
@@ -6920,8 +7039,9 @@ mod tests {
     fn say_card_disclosure_lives_on_the_component_view_model_not_the_renderer_maps() {
         // INVARIANT (#882): a migrated say turn's show_program state lives on
         // the component ViewModel. The renderer's RowId-keyed maps must stay
-        // empty for the card's row, and toggling must go through the
-        // component action, not the accordion.
+        // empty for the card's rows, and toggling must go through the
+        // component action, not the accordion. Stage 2: the toggle hit target
+        // is the completed output region — there is no chrome row.
         let colors = ColorScheme::default();
         let manager = Arc::new(OutputManager::new(colors.clone()));
         manager.disable_stdout();
@@ -6939,37 +7059,51 @@ mod tests {
         manager.add_trait_message(output.clone());
 
         let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
-        let chrome = lines.first().expect("the card renders a chrome line");
-        assert!(
-            chrome.component_owned,
-            "the card's chrome is a component-owned row; lines={lines:?}"
-        );
-        assert!(
-            chrome.text.contains('\u{25b6}'),
-            "program can be shown, so the closed arrow renders; got {:?}",
-            chrome.text
-        );
+        let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
         assert!(
             !lines
                 .iter()
                 .any(|line| line.text.contains("(say \"hello\")")),
-            "show_program defaults to false for a say turn; got {:?}",
-            lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+            "show_program defaults to false for a say turn; got {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("hello"))
+                && rendered.iter().any(|line| line.contains("(ran ")),
+            "the completed card renders prose plus the `(ran Ns)` annotation; got {rendered:?}"
+        );
+        let target = lines
+            .first()
+            .expect("the completed card renders toggle-target lines")
+            .row_id
+            .clone()
+            .expect("completed lines carry the output-region identity");
+        assert_eq!(
+            target.path,
+            vec![1],
+            "the output region is the toggle target; got {:?}",
+            target.path
+        );
+        assert!(
+            lines.iter().all(|line| line.component_owned),
+            "the completed card's lines are component-owned routing"
+        );
+        assert!(
+            !lines.iter().any(|line| line.text.contains('\u{23fa}')),
+            "the completed card wears no chrome glyph; got {rendered:?}"
         );
 
-        // Click the chrome row: the hitbox resolves to the card's RowId and
-        // the routed action toggles the ViewModel.
-        let row_id = chrome.row_id.clone().expect("chrome carries row identity");
+        // Click anywhere in the output region: the hitbox resolves to the
+        // output region's RowId and the routed action toggles the ViewModel.
         renderer
             .accordion
             .rebuild_retained_hit_regions(&lines, 0, 80);
         let clicked = renderer
             .accordion
             .component_region_at(0, 0)
-            .expect("the chrome row registers as a component hit region");
+            .expect("the output region registers as a component hit region");
         assert_eq!(
-            clicked, row_id,
-            "the component hit region is the chrome row"
+            clicked, target,
+            "the component hit region is the output region"
         );
         assert!(
             !renderer
@@ -6986,7 +7120,7 @@ mod tests {
         );
 
         assert!(
-            renderer.dispatch_component_disclosure(&row_id, None),
+            renderer.dispatch_component_disclosure(&target, None),
             "the routed action must reach the component's handle"
         );
         let view = output.say_turn_view().expect("migrated say turn");
@@ -6995,20 +7129,25 @@ mod tests {
             "the component handle toggled show_program through the message lock"
         );
 
-        // The next frame re-renders from the mutated VM.
+        // The next frame re-renders from the mutated VM: the prose swapped to
+        // the program source, the annotation stayed.
         let lines = renderer.projected_message_lines(&manager.get_messages()[0], 80);
+        let rendered: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
         assert!(
-            lines
-                .iter()
-                .any(|line| line.text.contains("(say \"hello\")")),
-            "after the toggle the program text renders; got {:?}",
-            lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+            !rendered.contains(&"hello"),
+            "the prose swapped away; got {rendered:?}"
         );
-        let chrome = lines.first().expect("chrome still first");
         assert!(
-            chrome.text.contains('\u{25bc}'),
-            "the arrow now shows the opened state; got {:?}",
-            chrome.text
+            rendered.iter().any(|line| line.contains("(say \"hello\")")),
+            "the program source renders in the card after the toggle; got {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("(ran ")),
+            "the `(ran Ns)` annotation stays through the swap; got {rendered:?}"
+        );
+        assert!(
+            lines.iter().all(|line| line.row_expanded == Some(true)),
+            "row_expanded reports the opened state for assistive consumers"
         );
     }
 

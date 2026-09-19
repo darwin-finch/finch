@@ -48,22 +48,28 @@ prerequisite of `docs/TUI_DESIGN.md`) so a component can build and claim a subtr
 touching `crossterm` or the shadow buffer. The engine keeps its stable `widgets` /
 `shadow_buffer` paths as re-exports; new surface authors depend on the vocabulary directly.
 
-## Component-owned say turns (#882, stage 1)
+## Component-owned say turns (#882, stages 1–2)
 
-A successful untitled `say` turn renders through its **component**, not the ViewModel
-projection: `TuiRenderer::projected_message_lines` asks the `Message` trait for
-`say_turn_view()` and hands the snapshot to `cli::components::card_lines`, which builds the
-chrome (status glyph + elapsed + disclosure arrow) and the `ProgramSource`/`Output` subwidgets
-from the outer ViewModel each frame. The arrow renders **only while the program source can be
-shown** — the dead-▼ defect is impossible by construction. A click resolves the chrome hitbox
-to `(RowId, action)`; the engine routes the opaque action to the message's
-`handle_transcript_action`, which toggles `show_program` under the message's lock, and the
-next frame re-renders from the mutated ViewModel. The renderer's RowId-keyed open-set maps
-never hold component rows: they register in `AccordionState::component_regions` for routing
-only. Unmigrated rows keep the maps and the projection path. The card is the reader; the
-canonical record is untouched (`render_node_fully_expanded` still writes the settled turn),
-and the old say-turn suppression (deleting the program-source row once the output had body)
-is deleted — the program source is show_program-gated card content, never a deleted row.
+A successful untitled `say` turn renders through its **component** as **one representation per
+state** (stage 2 of `docs/TUI_DESIGN.md`): `TuiRenderer::projected_message_lines` asks the
+`Message` trait for `say_turn_view()` and hands the snapshot to `cli::components::card_lines`,
+which renders Generating as one animated line, Running as the program source inline (arrived
+output bytes beneath it, never hidden), and Completed as the output prose plus `(ran Ns)` —
+no Program source row, no Brain run row, no result row, no card chrome. The stage-1 chrome
+(glyph + arrow + the `[0]` hitbox) is deleted; the toggle hit target is the completed output
+region (semantic path `[1]`, clicked or driven by F6/Enter), routing the opaque action to the
+message's `handle_transcript_action`, which toggles `show_program` under the message's lock;
+the next frame re-renders from the mutated ViewModel. The legacy source-group row does not
+render beside the card: `TuiRenderer::projected_lines` pairs each say-VM unit with the
+adjacent completed Program-source unit whose response text is byte-identical to the turn's
+program (`say_turn_consolidated_source_ids`) and suppresses that row from the viewport only —
+byte identity holds by construction in every producer path and a mismatch suppresses nothing,
+so the rule fails toward rendering more, never less. The canonical record is untouched
+(`commit_complete_messages` has no neighbour context): the raw program and the say bytes still
+spool exactly once, and the pinned canonical-commit invariants pass as-is. The renderer's
+RowId-keyed open-set maps never hold component rows: they register in
+`AccordionState::component_regions` for routing only. Unmigrated rows keep the maps and the
+projection path.
 
 ## Assistant prose markdown renders in the viewport (#756)
 

@@ -10,7 +10,7 @@ Everything below is what callers outside this module can reach. Implementation m
 ## Functions
 
 ```rust
-/// Render the say card's lines for one frame: the chrome's furniture row, the `ProgramSource` subwidget (zero rows while hidden), then the `Output` subwidget.
+/// Render the say turn's lines for one frame: exactly one representation for the turn's current state.
 pub(crate) fn card_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> { … }
 ```
 
