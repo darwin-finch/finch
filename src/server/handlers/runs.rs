@@ -1,4 +1,5 @@
 use super::*;
+use tracing::Instrument;
 
 #[cfg(test)]
 pub(super) async fn take_run_admission_pause(
@@ -784,6 +785,10 @@ pub(super) async fn watch_named_brain(
                 approval_worker,
             )
             .await;
-        })
+        }
+        .instrument(tracing::info_span!(
+            "ipc_ws_connection",
+            connection_id = %connection_id.0
+        )))
         .into_response())
 }
