@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::memory::{MemTree, NodeId};
+use finch_memory::{MemTree, NodeId};
 
 /// A node in the console tree view
 #[derive(Debug, Clone)]

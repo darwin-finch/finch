@@ -685,7 +685,7 @@ pub(crate) type ToolCallHistory =
 /// This is a free function (not `&self`) so it can be called from the static
 /// `process_query_with_tools` closure.
 pub(super) async fn refresh_context_strip(
-    memory_system: &crate::memory::MemorySystem,
+    memory_system: &finch_memory::MemorySystem,
     session_label: &str,
     cwd: &str,
     status_bar: &StatusBar,
@@ -752,7 +752,7 @@ pub(super) async fn refresh_context_strip(
 ///
 /// Do not index the wire source. Memory stores what the turn produced.
 async fn persist_completed_turn_memory(
-    memory_system: &crate::memory::MemorySystem,
+    memory_system: &finch_memory::MemorySystem,
     conversation: &Arc<RwLock<ConversationHistory>>,
     query_id: Uuid,
     query_states: &QueryStateManager,
@@ -763,7 +763,7 @@ async fn persist_completed_turn_memory(
     cwd: &str,
     status_bar: &StatusBar,
     context_lines: usize,
-    memory_recall: crate::memory_status::Recall,
+    memory_recall: finch_memory::memory_status::Recall,
 ) {
     let brain_provenance = query_states
         .get_metadata(query_id)
@@ -987,8 +987,8 @@ pub(super) async fn dispatch_tool_uses(
     output_manager: &Arc<crate::cli::output_manager::OutputManager>,
     query_states: &Arc<super::query_state::QueryStateManager>,
     tool_coordinator: &super::tool_execution::ToolExecutionCoordinator,
-    memory_system: &Option<Arc<crate::memory::MemorySystem>>,
-    memory_recall: crate::memory_status::Recall,
+    memory_system: &Option<Arc<finch_memory::MemorySystem>>,
+    memory_recall: finch_memory::memory_status::Recall,
     session_label: &str,
     cwd: &str,
     status_bar: &Arc<crate::cli::StatusBar>,
@@ -1223,8 +1223,8 @@ async fn dispatch_prepared_calls(
     output_manager: &Arc<crate::cli::output_manager::OutputManager>,
     query_states: &Arc<super::query_state::QueryStateManager>,
     tool_coordinator: &super::tool_execution::ToolExecutionCoordinator,
-    memory_system: &Option<Arc<crate::memory::MemorySystem>>,
-    memory_recall: crate::memory_status::Recall,
+    memory_system: &Option<Arc<finch_memory::MemorySystem>>,
+    memory_recall: finch_memory::memory_status::Recall,
     session_label: &str,
     cwd: &str,
     status_bar: &Arc<crate::cli::StatusBar>,
@@ -1304,7 +1304,7 @@ pub(crate) async fn process_query_with_tools(
     output_manager: Arc<OutputManager>,
     status_bar: Arc<crate::cli::StatusBar>,
     active_tool_uses: ActiveToolUsesMap,
-    memory_system: Option<Arc<crate::memory::MemorySystem>>,
+    memory_system: Option<Arc<finch_memory::MemorySystem>>,
     session_label: String,
     cwd: String,
     context_lines: usize,
@@ -1355,7 +1355,7 @@ pub(crate) async fn process_query_with_tools(
     };
 
     // Get conversation context, optionally injecting relevant memories
-    let mut memory_recall = crate::memory_status::Recall::none();
+    let mut memory_recall = finch_memory::memory_status::Recall::none();
     let messages = {
         let all_msgs = conversation.read().await.get_messages();
         // When summarization is enabled and messages have been dropped by the
@@ -1386,7 +1386,8 @@ pub(crate) async fn process_query_with_tools(
             // failing open, in the one direction that matters.
             let before = mem.hydration_status();
             let recalled = mem.query(&query, Some(recall_k)).await;
-            memory_recall.index = crate::memory_status::observed(before, mem.hydration_status());
+            memory_recall.index =
+                finch_memory::memory_status::observed(before, mem.hydration_status());
             if let Ok(memories) = recalled {
                 if !memories.is_empty() {
                     memory_recall.count = memories.len();
@@ -3279,7 +3280,7 @@ mod tests {
     #[tokio::test]
     async fn test_the_end_of_turn_refresh_keeps_a_partial_recall_qualified() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        let memory = crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        let memory = finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path: temp.path().to_path_buf(),
             use_neural_embeddings: false,
             ..Default::default()
@@ -3311,9 +3312,9 @@ mod tests {
             "/workspace",
             &status,
             4,
-            crate::memory_status::Recall {
+            finch_memory::memory_status::Recall {
                 count: 3,
-                index: crate::memory::HydrationStatus::Loading {
+                index: finch_memory::HydrationStatus::Loading {
                     loaded: 512,
                     total: 2048,
                 },
@@ -3334,7 +3335,7 @@ mod tests {
     #[tokio::test]
     async fn completed_streaming_turn_populates_session_context_strip() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        let memory = crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        let memory = finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path: temp.path().to_path_buf(),
             use_neural_embeddings: false,
             ..Default::default()
@@ -3363,9 +3364,9 @@ mod tests {
             "/workspace",
             &status,
             4,
-            crate::memory_status::Recall {
+            finch_memory::memory_status::Recall {
                 count: 2,
-                index: crate::memory::HydrationStatus::Ready { nodes: 8 },
+                index: finch_memory::HydrationStatus::Ready { nodes: 8 },
             },
         )
         .await;
@@ -3406,7 +3407,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_provider_completion_waits_for_daemon_memory_projection() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        let memory = crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        let memory = finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path: temp.path().to_path_buf(),
             use_neural_embeddings: false,
             ..Default::default()
@@ -3457,9 +3458,9 @@ mod tests {
                 "/workspace",
                 &status,
                 4,
-                crate::memory_status::Recall {
+                finch_memory::memory_status::Recall {
                     count: 2,
-                    index: crate::memory::HydrationStatus::Ready { nodes: 8 },
+                    index: finch_memory::HydrationStatus::Ready { nodes: 8 },
                 },
             )
             .await;
@@ -4403,7 +4404,7 @@ mod tests {
             &query_states,
             &tool_coordinator,
             &None,
-            crate::memory_status::Recall::none(),
+            finch_memory::memory_status::Recall::none(),
             "test-session",
             "/test/workspace",
             &status,
@@ -4674,7 +4675,7 @@ mod tests {
                 &self.query_states,
                 &self.tool_coordinator,
                 &None,
-                crate::memory_status::Recall::none(),
+                finch_memory::memory_status::Recall::none(),
                 "test-session",
                 "/test/workspace",
                 &self.status,
@@ -4735,7 +4736,7 @@ mod tests {
                 &self.query_states,
                 &self.tool_coordinator,
                 &None,
-                crate::memory_status::Recall::none(),
+                finch_memory::memory_status::Recall::none(),
                 "test-session",
                 "/test/workspace",
                 &self.status,
@@ -5189,7 +5190,7 @@ mod tests {
                     &query_states,
                     &tool_coordinator,
                     &None,
-                    crate::memory_status::Recall::none(),
+                    finch_memory::memory_status::Recall::none(),
                     "test-session",
                     "/test/workspace",
                     &status,
@@ -5385,7 +5386,7 @@ mod tests {
                     &query_states,
                     &tool_coordinator,
                     &None,
-                    crate::memory_status::Recall::none(),
+                    finch_memory::memory_status::Recall::none(),
                     "test-session",
                     "/test/workspace",
                     &status,

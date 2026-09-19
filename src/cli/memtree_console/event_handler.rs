@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::cli::memtree_console::MemTreeConsole;
 use crate::cli::repl_event::ReplEvent;
-use crate::memory::NodeId;
+use finch_memory::NodeId;
 
 /// Maps query IDs to their corresponding tree nodes
 pub struct EventHandler {
@@ -289,7 +289,7 @@ fn format_tool_description(tool_use: &crate::tools::ToolUse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemTree;
+    use finch_memory::MemTree;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 

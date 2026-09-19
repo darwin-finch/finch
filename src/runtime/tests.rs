@@ -2569,7 +2569,7 @@ fn typed_mem_store_completes_on_a_single_worker_runtime() {
     // and the test passes whether or not the deadlock is possible — which
     // is exactly what the first version of it did.
     {
-        crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path: path.clone(),
             use_neural_embeddings: false,
             ..Default::default()
@@ -2600,7 +2600,7 @@ fn typed_mem_store_completes_on_a_single_worker_runtime() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     runtime.spawn(async move {
         let memory = Arc::new(
-            crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+            finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
                 db_path: path,
                 use_neural_embeddings: false,
                 ..Default::default()
@@ -2645,7 +2645,7 @@ fn typed_mem_store_completes_on_a_single_worker_runtime() {
 async fn typed_memory_host_reads_and_writes_through_attached_memtree() {
     let database = tempfile::NamedTempFile::new().unwrap();
     let memory = Arc::new(
-        crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path: database.path().to_path_buf(),
             use_neural_embeddings: false,
             ..Default::default()
@@ -2691,7 +2691,7 @@ async fn typed_mem_recall_refuses_an_unusable_index_instead_of_reporting_absence
     let database = tempfile::NamedTempFile::new().unwrap();
     let db_path = database.path().to_path_buf();
     {
-        let memory = crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        let memory = finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path: db_path.clone(),
             use_neural_embeddings: false,
             ..Default::default()
@@ -2711,7 +2711,7 @@ async fn typed_mem_recall_refuses_an_unusable_index_instead_of_reporting_absence
         .unwrap();
 
     let memory = Arc::new(
-        crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path,
             use_neural_embeddings: false,
             ..Default::default()
@@ -2721,7 +2721,7 @@ async fn typed_mem_recall_refuses_an_unusable_index_instead_of_reporting_absence
     assert!(
         matches!(
             memory.hydration_status(),
-            crate::memory::HydrationStatus::Failed { .. }
+            finch_memory::HydrationStatus::Failed { .. }
         ),
         "fixture must actually break hydration, or this test cannot fail: {:?}",
         memory.hydration_status()
@@ -2784,7 +2784,7 @@ async fn typed_mem_recall_refuses_an_unusable_index_instead_of_reporting_absence
 /// projection, which is where the states are enumerated.
 #[test]
 fn test_memory_index_status_projects_every_hydration_state() {
-    use crate::memory::HydrationStatus;
+    use finch_memory::HydrationStatus;
     let origin = crate::vm::SourceOrigin::generated("mem-index-status");
     let int = |value: i64| ProgramValue::Option(Some(Box::new(ProgramValue::Int(value))));
     let text =
@@ -2863,23 +2863,23 @@ fn test_memory_index_status_projects_every_hydration_state() {
 async fn typed_mem_index_status_reports_a_still_loading_index_as_incomplete() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let db_path = temp.path().to_path_buf();
-    let config = crate::memory::MemoryConfig {
+    let config = finch_memory::MemoryConfig {
         db_path: db_path.clone(),
         use_neural_embeddings: false,
         ..Default::default()
     };
-    drop(crate::memory::MemorySystem::new(config.clone()).unwrap());
-    seed_nodes(&db_path, 4 * crate::memory::HYDRATION_BATCH as i64, None);
+    drop(finch_memory::MemorySystem::new(config.clone()).unwrap());
+    seed_nodes(&db_path, 4 * finch_memory::HYDRATION_BATCH as i64, None);
 
     // The loader itself announces that it has committed the first batch
     // and then waits. Polling the tree size cannot establish this window:
     // on a fast runner every batch can land before a polling task is
     // scheduled once.
-    let (_registration, mut batch_reached, release) = crate::memory::register_hydration_batch_pause(
+    let (_registration, mut batch_reached, release) = finch_memory::register_hydration_batch_pause(
         db_path.clone(),
-        crate::memory::HYDRATION_BATCH,
+        finch_memory::HYDRATION_BATCH,
     );
-    let memory = Arc::new(crate::memory::MemorySystem::new(config).unwrap());
+    let memory = Arc::new(finch_memory::MemorySystem::new(config).unwrap());
     let hydrating = {
         let memory = Arc::clone(&memory);
         tokio::spawn(async move { memory.ensure_hydrated().await })
@@ -2984,13 +2984,13 @@ fn seed_nodes(db_path: &std::path::Path, count: i64, corrupt: Option<i64>) {
 /// remains is linked but incomplete. Reaching in and marking the status
 /// directly would let a collapse of `Degraded` into `Ready` at the batch
 /// arm keep this passing.
-async fn degraded_memory(db_path: std::path::PathBuf) -> Arc<crate::memory::MemorySystem> {
-    let config = crate::memory::MemoryConfig {
+async fn degraded_memory(db_path: std::path::PathBuf) -> Arc<finch_memory::MemorySystem> {
+    let config = finch_memory::MemoryConfig {
         db_path: db_path.clone(),
         use_neural_embeddings: false,
         ..Default::default()
     };
-    drop(crate::memory::MemorySystem::new(config.clone()).unwrap());
+    drop(finch_memory::MemorySystem::new(config.clone()).unwrap());
 
     // Invalid UTF-8 in a node belonging to the *second* batch, so the first
     // has already committed when the read fails. That ordering is what
@@ -2998,16 +2998,16 @@ async fn degraded_memory(db_path: std::path::PathBuf) -> Arc<crate::memory::Memo
     // the batch size keeps it true if the batch size changes.
     seed_nodes(
         &db_path,
-        2 * crate::memory::HYDRATION_BATCH as i64,
-        Some(crate::memory::HYDRATION_BATCH as i64 + 4),
+        2 * finch_memory::HYDRATION_BATCH as i64,
+        Some(finch_memory::HYDRATION_BATCH as i64 + 4),
     );
 
-    let memory = Arc::new(crate::memory::MemorySystem::new(config).unwrap());
+    let memory = Arc::new(finch_memory::MemorySystem::new(config).unwrap());
     memory.ensure_hydrated().await.ok();
     assert!(
         matches!(
             memory.hydration_status(),
-            crate::memory::HydrationStatus::Degraded { .. }
+            finch_memory::HydrationStatus::Degraded { .. }
         ),
         "fixture must actually reach a partial index, or this test cannot \
              fail for the reason it exists: {:?}",
@@ -3042,7 +3042,7 @@ async fn ask(runtime: &ProgramRuntime, source: &str) -> ProgramValue {
 }
 
 /// Attach a memory to a runtime that may read it.
-fn runtime_reading(memory: Arc<crate::memory::MemorySystem>) -> ProgramRuntime {
+fn runtime_reading(memory: Arc<finch_memory::MemorySystem>) -> ProgramRuntime {
     let runtime = ProgramRuntime::new();
     runtime.attach_memory(memory);
     runtime
@@ -3077,7 +3077,7 @@ async fn typed_mem_index_status_tells_a_partial_recall_from_a_complete_one() {
     // genuine absence rather than an artifact of hydration.
     let whole_db = tempfile::NamedTempFile::new().unwrap();
     let whole = Arc::new(
-        crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path: whole_db.path().to_path_buf(),
             use_neural_embeddings: false,
             ..Default::default()
@@ -3088,7 +3088,7 @@ async fn typed_mem_index_status_tells_a_partial_recall_from_a_complete_one() {
     assert!(
         matches!(
             whole.hydration_status(),
-            crate::memory::HydrationStatus::Ready { .. }
+            finch_memory::HydrationStatus::Ready { .. }
         ),
         "control must be a complete index: {:?}",
         whole.hydration_status()
@@ -3188,7 +3188,7 @@ async fn typed_mem_index_status_reports_a_failed_index_without_inventing_counts(
     let database = tempfile::NamedTempFile::new().unwrap();
     let db_path = database.path().to_path_buf();
     {
-        let memory = crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        let memory = finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path: db_path.clone(),
             use_neural_embeddings: false,
             ..Default::default()
@@ -3208,7 +3208,7 @@ async fn typed_mem_index_status_reports_a_failed_index_without_inventing_counts(
         .unwrap();
 
     let memory = Arc::new(
-        crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+        finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
             db_path,
             use_neural_embeddings: false,
             ..Default::default()
@@ -3218,7 +3218,7 @@ async fn typed_mem_index_status_reports_a_failed_index_without_inventing_counts(
     assert!(
         matches!(
             memory.hydration_status(),
-            crate::memory::HydrationStatus::Failed { .. }
+            finch_memory::HydrationStatus::Failed { .. }
         ),
         "fixture must actually break hydration: {:?}",
         memory.hydration_status()

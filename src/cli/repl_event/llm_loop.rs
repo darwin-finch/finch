@@ -58,7 +58,7 @@ pub struct LlmLoop {
     status_bar: Arc<StatusBar>,
     tui_renderer: Arc<Mutex<TuiRenderer>>,
     active_tool_uses: ActiveToolUsesMap,
-    memory_system: Option<Arc<crate::memory::MemorySystem>>,
+    memory_system: Option<Arc<finch_memory::MemorySystem>>,
     current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>,
     /// Live persona selection. Each provider round trip snapshots this value,
     /// so tool continuations and named-Brain turns receive the current persona

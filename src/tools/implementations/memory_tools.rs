@@ -6,12 +6,12 @@
 // - create_memory: Store important facts/notes explicitly
 // - list_recent: Show recent conversation history
 
-use crate::memory::MemorySystem;
 use crate::programs::ExecutionEffect;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
+use finch_memory::MemorySystem;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -82,8 +82,9 @@ impl Tool for SearchMemoryTool {
             .memory_system
             .query_with_sources(query, Some(limit))
             .await?;
-        let index = crate::memory_status::observed(before, self.memory_system.hydration_status());
-        let caveat = crate::memory_status::caveat(&index);
+        let index =
+            finch_memory::memory_status::observed(before, self.memory_system.hydration_status());
+        let caveat = finch_memory::memory_status::caveat(&index);
 
         if results.is_empty() {
             return Ok(match caveat {
@@ -213,10 +214,11 @@ impl Tool for InspectMemoryTool {
         let from_index = memory_id.trim().starts_with("node:");
         let before = self.memory_system.hydration_status();
         let found = self.memory_system.inspect_memory(memory_id).await?;
-        let index = crate::memory_status::observed(before, self.memory_system.hydration_status());
+        let index =
+            finch_memory::memory_status::observed(before, self.memory_system.hydration_status());
         let Some(memory) = found else {
             let caveat = from_index
-                .then(|| crate::memory_status::caveat(&index))
+                .then(|| finch_memory::memory_status::caveat(&index))
                 .flatten();
             return Ok(match caveat {
                 None => format!("No memory found for memory_id={memory_id}"),
@@ -385,7 +387,7 @@ impl Tool for ListRecentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryConfig;
+    use finch_memory::MemoryConfig;
     use tempfile::NamedTempFile;
 
     fn test_context<'a>() -> ToolContext<'a> {
@@ -455,10 +457,10 @@ mod tests {
     }
 
     /// Wait for the background loader to stop, rather than racing it.
-    async fn settled_hydration(memory: &MemorySystem) -> crate::memory::HydrationStatus {
+    async fn settled_hydration(memory: &MemorySystem) -> finch_memory::HydrationStatus {
         for _ in 0..200 {
             let status = memory.hydration_status();
-            if !matches!(status, crate::memory::HydrationStatus::Loading { .. }) {
+            if !matches!(status, finch_memory::HydrationStatus::Loading { .. }) {
                 return status;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -509,7 +511,7 @@ mod tests {
         assert!(
             matches!(
                 memory.hydration_status(),
-                crate::memory::HydrationStatus::Failed { .. }
+                finch_memory::HydrationStatus::Failed { .. }
             ),
             "fixture must actually break hydration, or this test cannot fail: {:?}",
             memory.hydration_status()
@@ -588,7 +590,7 @@ mod tests {
         })?);
         let settled = settled_hydration(&memory).await;
         assert!(
-            matches!(settled, crate::memory::HydrationStatus::Failed { .. }),
+            matches!(settled, finch_memory::HydrationStatus::Failed { .. }),
             "the batched loader must actually fail, or this test cannot fail: {settled:?}"
         );
 
@@ -647,7 +649,7 @@ mod tests {
         assert!(
             matches!(
                 memory.hydration_status(),
-                crate::memory::HydrationStatus::Failed { .. }
+                finch_memory::HydrationStatus::Failed { .. }
             ),
             "fixture must break hydration, or neither half of this test can fail"
         );

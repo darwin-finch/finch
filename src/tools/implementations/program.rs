@@ -1,6 +1,5 @@
 //! Provider-facing adapters for the shared Forth/Lisp runtime.
 
-use crate::memory::MemorySystem;
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramRef};
 use crate::runtime::{ProgramRuntime, ProgramSubmission, TypedEffectSink};
 use crate::tools::types::{ToolContext, ToolInputSchema};
@@ -8,6 +7,7 @@ use crate::tools::Tool;
 use crate::vm::core_word_documentation as vm_core_word_documentation;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use finch_memory::MemorySystem;
 use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::Arc;
