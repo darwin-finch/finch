@@ -8,11 +8,11 @@
 // Authority is the same propose/approval path as foreground bash.
 
 use crate::brain::BackgroundTaskManager;
-use crate::programs::ExecutionEffect;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::Value;
 use std::sync::Arc;
 

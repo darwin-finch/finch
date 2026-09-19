@@ -3,7 +3,6 @@
 // Executes tools with permission checks and multi-turn support
 
 use crate::cli::ReplModeState;
-use crate::programs::ExecutionEffect;
 use crate::tools::permissions::{
     bash_command_is_constitutionally_denied, path_argument_for_tool, raw_path_escapes_workspace,
     resolve_workspace_root, PermissionCheck, PermissionManager,
@@ -12,6 +11,7 @@ use crate::tools::types::{EffectAuditAuthority, ToolResult, ToolUse};
 use crate::tools::ToolRegistry;
 use crate::tools::{ExactApproval, MatchType, PersistentPatternStore, ToolPattern, ToolSignature};
 use anyhow::{Context, Result};
+use finch_programs::ExecutionEffect;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -916,8 +916,8 @@ mod tests {
             "mock"
         }
 
-        fn effect(&self) -> crate::programs::ExecutionEffect {
-            crate::programs::ExecutionEffect::Unclassified
+        fn effect(&self) -> finch_programs::ExecutionEffect {
+            finch_programs::ExecutionEffect::Unclassified
         }
 
         fn description(&self) -> &str {
@@ -1523,7 +1523,7 @@ mod tests {
         );
         assert!(
             !crate::tools::invocation_runs_autonomously(
-                crate::programs::ExecutionEffect::WorkspaceRead,
+                finch_programs::ExecutionEffect::WorkspaceRead,
                 "read",
                 &escaped.input,
                 executor.permissions(),
@@ -1552,7 +1552,7 @@ mod tests {
         );
         assert!(
             crate::tools::invocation_runs_autonomously(
-                crate::programs::ExecutionEffect::WorkspaceRead,
+                finch_programs::ExecutionEffect::WorkspaceRead,
                 "read",
                 &contained.input,
                 executor.permissions(),

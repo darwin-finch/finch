@@ -1,12 +1,12 @@
 //! Read-only model tools for discovering the persistent program vocabulary.
 
-use crate::programs::ExecutionEffect;
-use crate::programs::ProgramRef;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
 use finch_memory::MemorySystem;
+use finch_programs::ExecutionEffect;
+use finch_programs::ProgramRef;
 use serde_json::Value;
 use std::str::FromStr;
 use std::sync::Arc;

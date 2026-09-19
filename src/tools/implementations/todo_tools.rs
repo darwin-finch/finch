@@ -4,12 +4,12 @@
 // displayed in the TUI live area.  Both tools capture an
 // Arc<RwLock<TodoList>> directly — no ToolContext fields needed.
 
-use crate::programs::ExecutionEffect;
 use crate::tools::todo::{TodoItem, TodoList};
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;

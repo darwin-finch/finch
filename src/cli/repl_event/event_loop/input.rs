@@ -508,7 +508,7 @@ Rules:\n\
                             .await?;
                         } else {
                             self.execute_interactive_typed_program(
-                                crate::programs::ProgramLanguage::Forth,
+                                finch_programs::ProgramLanguage::Forth,
                                 code,
                             )
                             .await?;
@@ -693,7 +693,7 @@ Rules:\n\
             self.output_manager.write_user(input.clone());
             return self
                 .execute_interactive_typed_program(
-                    crate::programs::ProgramLanguage::Forth,
+                    finch_programs::ProgramLanguage::Forth,
                     input.trim().to_string(),
                 )
                 .await;
@@ -726,7 +726,7 @@ Rules:\n\
                     .await;
             }
             return self
-                .execute_interactive_typed_program(crate::programs::ProgramLanguage::Lisp, input)
+                .execute_interactive_typed_program(finch_programs::ProgramLanguage::Lisp, input)
                 .await;
         }
 

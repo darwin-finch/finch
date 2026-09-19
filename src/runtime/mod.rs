@@ -57,7 +57,7 @@ pub use effect_log::{
 };
 pub use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 
-use crate::programs::{ExecutionEffect, ProgramCompilerContext, ProgramLanguage, ProgramValue};
+use finch_programs::{ExecutionEffect, ProgramCompilerContext, ProgramLanguage, ProgramValue};
 pub(crate) use hostio::workbook_cell_to_string;
 use hostio::{
     hex_digest, list_directory_tree, merkle_directory, read_bounded_csv_record,

@@ -8,7 +8,6 @@
 // Multiple TaskTool calls in a single model response can be executed in
 // parallel by the executor (see executor.rs).
 
-use crate::programs::ExecutionEffect;
 use crate::providers::{ContentBlock, Message};
 use crate::providers::{LlmProvider, ProviderRequest};
 use crate::tools::implementations::bash::BashTool;
@@ -20,6 +19,7 @@ use crate::tools::types::{ToolContext, ToolDefinition, ToolInputSchema, ToolUse}
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{debug, info};

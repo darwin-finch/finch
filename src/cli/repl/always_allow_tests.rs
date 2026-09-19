@@ -1,6 +1,5 @@
 use super::{apply_repl_always_allow_tools, register_repl_tool_aliases, REPL_ALWAYS_ALLOW_TOOLS};
 use crate::generators::{Generator, GeneratorCapabilities, GeneratorResponse};
-use crate::programs::ExecutionEffect;
 use crate::runtime::ProgramRuntime;
 use crate::scheduler::{AgentScheduler, ProviderResolver};
 use crate::tools::{
@@ -13,6 +12,7 @@ use crate::tools::{
     SearchMemoryTool, SearchWordTool, SubmitProgramTool, TodoReadTool, TodoWriteTool, Tool,
     ToolRegistry, WebFetchTool, WriteTool,
 };
+use finch_programs::ExecutionEffect;
 use serde_json::json;
 use std::sync::Arc;
 

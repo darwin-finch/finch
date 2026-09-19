@@ -111,8 +111,8 @@ impl EventLoop {
                 .await;
             let brain_language = request.language;
             let language = match brain_language {
-                crate::brain::ProgramLanguage::Forth => crate::programs::ProgramLanguage::Forth,
-                crate::brain::ProgramLanguage::Lisp => crate::programs::ProgramLanguage::Lisp,
+                crate::brain::ProgramLanguage::Forth => finch_programs::ProgramLanguage::Forth,
+                crate::brain::ProgramLanguage::Lisp => finch_programs::ProgramLanguage::Lisp,
             };
             let submission = crate::runtime::ProgramSubmission {
                 language,
@@ -122,7 +122,7 @@ impl EventLoop {
                 )),
                 source: request.source,
                 intent: format!("named Brain program event {}", request.request_seq),
-                effect: crate::programs::ExecutionEffect::Unclassified,
+                effect: finch_programs::ExecutionEffect::Unclassified,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: Some(runtime.revision()),

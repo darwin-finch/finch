@@ -4,12 +4,12 @@
 // (Claude, GPT-4, Grok, etc.) when needed.
 
 use crate::llms::LLM;
-use crate::programs::ExecutionEffect;
 use crate::providers::Message;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -211,7 +211,7 @@ mod tests {
                 LLMDelegationTool::new(name, Arc::new(NullLlm), format!("delegate to {name}"));
             assert_eq!(
                 crate::tools::Tool::effect(&tool),
-                crate::programs::ExecutionEffect::ExternalWrite,
+                finch_programs::ExecutionEffect::ExternalWrite,
                 "{name} must declare ExternalWrite (worst case)"
             );
             assert!(

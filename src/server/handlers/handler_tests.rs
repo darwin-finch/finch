@@ -1849,11 +1849,11 @@ async fn restarted_queued_prompts_dispatch_task_state_at_their_exact_request_seq
                 let runtime = crate::runtime::ProgramRuntime::new();
                 let outcome = runtime
                     .submit_typed_only(crate::runtime::ProgramSubmission {
-                        language: crate::programs::ProgramLanguage::Lisp,
+                        language: finch_programs::ProgramLanguage::Lisp,
                         source_id: Some("restored-no-tool".into()),
                         source: "(define (restored) : int 1)".into(),
                         intent: "complete restored turn".into(),
-                        effect: crate::programs::ExecutionEffect::Pure,
+                        effect: finch_programs::ExecutionEffect::Pure,
                         declared_capabilities: Vec::new(),
                         manifest_generation: runtime.manifest_generation(),
                         expected_revision: Some(runtime.revision()),
@@ -2828,11 +2828,11 @@ async fn live_prompt_can_be_approved_while_its_turn_lane_is_held() {
         let source = "(say \"approved\")";
         let outcome = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("live-approval-test".into()),
                 source: source.into(),
                 intent: "complete an approved live turn".into(),
-                effect: crate::programs::ExecutionEffect::Pure,
+                effect: finch_programs::ExecutionEffect::Pure,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: Some(runtime.revision()),
@@ -3338,11 +3338,11 @@ async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint(
         let runtime = crate::runtime::ProgramRuntime::new();
         let outcome = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("frontend-test".into()),
                 source: request.source,
                 intent: "frontend runner test".into(),
-                effect: crate::programs::ExecutionEffect::Pure,
+                effect: finch_programs::ExecutionEffect::Pure,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: Some(runtime.revision()),
@@ -3389,11 +3389,11 @@ async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint(
     let restored = store.program_runtime("shared").unwrap();
     let called = restored
         .submit_typed_only(crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Forth,
+            language: finch_programs::ProgramLanguage::Forth,
             source_id: Some("daemon-check".into()),
             source: "21 double".into(),
             intent: "verify committed runner checkpoint".into(),
-            effect: crate::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: restored.manifest_generation(),
             expected_revision: Some(restored.revision()),
@@ -3403,7 +3403,7 @@ async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint(
         .unwrap();
     assert!(matches!(
         called.values.as_slice(),
-        [crate::programs::ProgramValue::Int(42)]
+        [finch_programs::ProgramValue::Int(42)]
     ));
     let snapshot = store.snapshot("shared").unwrap();
     assert!(snapshot.events.iter().any(|event| {
@@ -3518,11 +3518,11 @@ async fn cancelled_late_program_completion_does_not_admit_delivery() {
         let runtime = crate::runtime::ProgramRuntime::new();
         let outcome = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("late-cancel".into()),
                 source: request.source,
                 intent: "late completion after cancel".into(),
-                effect: crate::programs::ExecutionEffect::Pure,
+                effect: finch_programs::ExecutionEffect::Pure,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: Some(runtime.revision()),
@@ -3648,11 +3648,11 @@ async fn named_brain_prompt_runs_the_full_turn_on_the_registered_frontend() {
         let source = "(define (triple (n : int)) : int (* n 3))";
         let outcome = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("frontend-turn-test".into()),
                 source: source.into(),
                 intent: "frontend full turn test".into(),
-                effect: crate::programs::ExecutionEffect::Pure,
+                effect: finch_programs::ExecutionEffect::Pure,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: Some(runtime.revision()),
@@ -4029,11 +4029,11 @@ async fn queued_brain_run_resumes_on_runner_registration_and_survives_restart() 
         let runtime = crate::runtime::ProgramRuntime::new();
         let outcome = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("queued-run-test".into()),
                 source: request.source,
                 intent: "resume queued Brain run".into(),
-                effect: crate::programs::ExecutionEffect::Pure,
+                effect: finch_programs::ExecutionEffect::Pure,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: Some(runtime.revision()),
@@ -4215,11 +4215,11 @@ async fn due_schedule_survives_offline_restart_and_executes_on_runner_registrati
         let runtime = crate::runtime::ProgramRuntime::new();
         let outcome = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("scheduled-run-test".into()),
                 source: request.source,
                 intent: "scheduled Brain run".into(),
-                effect: crate::programs::ExecutionEffect::Unclassified,
+                effect: finch_programs::ExecutionEffect::Unclassified,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: Some(runtime.revision()),
@@ -4635,11 +4635,11 @@ async fn speculative_prompt_is_sent_once_and_only_its_correlated_transcript_is_h
         let source = "(say \"spec-secret-output\")";
         let execution = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("speculative-context-test".into()),
                 source: source.into(),
                 intent: "speculative transcript isolation".into(),
-                effect: crate::programs::ExecutionEffect::Pure,
+                effect: finch_programs::ExecutionEffect::Pure,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: Some(runtime.revision()),
@@ -4983,11 +4983,11 @@ async fn daemon_projects_memory_only_after_the_successful_turn_is_committed() {
         let source = "(say \"remembered\")";
         let outcome = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: Some("memory-projection-test".into()),
                 source: source.into(),
                 intent: "test committed memory projection".into(),
-                effect: crate::programs::ExecutionEffect::Pure,
+                effect: finch_programs::ExecutionEffect::Pure,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: Some(runtime.revision()),

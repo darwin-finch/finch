@@ -17,7 +17,7 @@ the extracted leaf crates `finch-providers` (provider wire types, re-exported un
 outgoing root-crate references; anything else is a regression of this capsule.
 
 **Types are shared, never forked.** `ExecutionEffect` is defined here and re-exported by
-`src/programs`; `VmEffectEnvelope`/`VmEffectHandle` are defined here and re-exported by
+`finch-programs`; `VmEffectEnvelope`/`VmEffectHandle` are defined here and re-exported by
 `src/runtime`. Permission and approval types are the same values the runtime, CLI, and scheduler
 hold. If a caller needs a different shape, extend the shared type here — do not fork it.
 

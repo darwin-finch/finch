@@ -5655,7 +5655,7 @@ async fn typed_forth_s_quote_pushes_text_without_emitting_it() {
     assert_eq!(outcome.backend, ExecutionBackend::TypedVm);
     assert_eq!(
         outcome.values,
-        vec![crate::programs::ProgramValue::String(
+        vec![finch_programs::ProgramValue::String(
             "retained value".into()
         )]
     );
@@ -7724,7 +7724,7 @@ async fn delivery_log_observes_awaited_effect_before_local_resume_and_rejects_st
     assert_eq!(completed.status, ExecutionStatus::Completed);
     assert_eq!(
         completed.values,
-        vec![crate::programs::ProgramValue::Bytes(
+        vec![finch_programs::ProgramValue::Bytes(
             b"embedder bytes".to_vec()
         )]
     );
@@ -8008,9 +8008,7 @@ async fn late_vm_resume_after_observer_disconnect_replays_from_reopened_log() {
     assert_eq!(completed.status, ExecutionStatus::Completed);
     assert_eq!(
         completed.values,
-        vec![crate::programs::ProgramValue::Bytes(
-            b"late resume".to_vec()
-        )]
+        vec![finch_programs::ProgramValue::Bytes(b"late resume".to_vec())]
     );
     assert!(runtime
         .pending_typed_execution(pending.execution_id)

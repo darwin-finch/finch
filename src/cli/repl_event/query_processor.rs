@@ -18,13 +18,13 @@ use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::TuiRenderer;
 use crate::generators::{Generator, StreamChunk};
 use crate::models::GeneratorState;
-use crate::programs::ExecutionEffect;
 use crate::providers::{ContentBlock, EventProvenance};
 use crate::router::Router;
 use crate::tools::{
     refined_effect_for_approval, PreparedCall, ToolCatalog, ToolDefinition, ToolLoop,
     ToolLoopIdentity, ToolLoopResult, ToolUse,
 };
+use finch_programs::ExecutionEffect;
 
 /// Preserve a provider response as submitted wire source.
 ///
@@ -91,13 +91,13 @@ fn direct_wire_submission(
     runtime: &crate::runtime::ProgramRuntime,
     source: String,
 ) -> anyhow::Result<crate::runtime::ProgramSubmission> {
-    let language = crate::programs::ProgramLanguage::infer_wire_source(&source)?;
+    let language = finch_programs::ProgramLanguage::infer_wire_source(&source)?;
     Ok(crate::runtime::ProgramSubmission {
         language,
         source_id: Some(format!("provider-response.{}", language.as_str())),
         source,
         intent: "provider VM-wire response".to_string(),
-        effect: crate::programs::ExecutionEffect::Pure,
+        effect: finch_programs::ExecutionEffect::Pure,
         declared_capabilities: Vec::new(),
         manifest_generation: runtime.manifest_generation(),
         expected_revision: Some(runtime.revision()),
@@ -222,7 +222,7 @@ async fn resume_interactive_yields(
             runtime.pending_typed_execution(outcome.execution_id)?,
             Some(crate::runtime::PendingTypedExecutionInfo {
                 reason: crate::runtime::PendingTypedReason::Yielded,
-                yielded_value: Some(crate::programs::ProgramValue::Nil),
+                yielded_value: Some(finch_programs::ProgramValue::Nil),
                 ..
             })
         )
@@ -261,7 +261,7 @@ fn is_repairable_wire_outcome(outcome: &crate::runtime::ExecutionOutcome) -> boo
 }
 
 fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
-    crate::programs::is_repairable_wire_diagnostic(diagnostic)
+    finch_programs::is_repairable_wire_diagnostic(diagnostic)
 }
 
 fn wire_repair_messages(
@@ -272,7 +272,7 @@ fn wire_repair_messages(
     let mut repair_messages = messages.to_vec();
     repair_messages.push(crate::providers::Message::assistant(rejected_source));
     repair_messages.push(crate::providers::Message::user(
-        crate::programs::wire_repair_request(rejected_source, diagnostic),
+        finch_programs::wire_repair_request(rejected_source, diagnostic),
     ));
     repair_messages
 }
@@ -400,12 +400,12 @@ async fn execute_wire_with_single_repair(
         generator.model_name(),
         "interactive",
     );
-    crate::programs::capture_with_compiler_context_from_env(
+    finch_programs::capture_with_compiler_context_from_env(
         || runtime.compiler_context(),
         generator.name(),
         generator.model_name(),
         "interactive",
-        crate::programs::WireCorpusAttempt::FirstPass,
+        finch_programs::WireCorpusAttempt::FirstPass,
         &source,
     );
     let output_unit = output_manager.start_work_unit("VM program output");
@@ -413,7 +413,7 @@ async fn execute_wire_with_single_repair(
     // The say card owns the turn from here (#882): the producer retains the
     // wire source in the component ViewModel so the reader can reveal it.
     output_unit.begin_say_turn(
-        crate::programs::ProgramLanguage::infer_source(&source).as_str(),
+        finch_programs::ProgramLanguage::infer_source(&source).as_str(),
         &source,
     );
     let initial = execute_direct_wire_response(
@@ -466,8 +466,8 @@ async fn execute_wire_with_single_repair(
     };
 
     metric.first_pass_valid = false;
-    metric.failure_class = Some(crate::programs::classify_wire_failure(&source, &diagnostic));
-    metric.diagnostic_code = crate::programs::wire_diagnostic_code(&diagnostic);
+    metric.failure_class = Some(finch_programs::classify_wire_failure(&source, &diagnostic));
+    metric.diagnostic_code = finch_programs::wire_diagnostic_code(&diagnostic);
 
     output_unit.append_response(&format!("VM wire error: {diagnostic}"));
     if !repairable {
@@ -557,17 +557,17 @@ async fn execute_wire_with_single_repair(
     output_unit.set_complete();
 
     let repaired_source = raw_wire_source(&repair.text);
-    crate::programs::capture_with_compiler_context_from_env(
+    finch_programs::capture_with_compiler_context_from_env(
         || runtime.compiler_context(),
         generator.name(),
         generator.model_name(),
         "interactive",
-        crate::programs::WireCorpusAttempt::Repair,
+        finch_programs::WireCorpusAttempt::Repair,
         &repaired_source,
     );
     let repair_source_unit = output_manager.start_work_unit("VM program repair");
     repair_source_unit.set_program_source(
-        crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
+        finch_programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
     );
     repair_source_unit.set_response(repaired_source.clone());
     repair_source_unit.set_complete();
@@ -575,7 +575,7 @@ async fn execute_wire_with_single_repair(
     let repair_output_unit = output_manager.start_work_unit("VM repaired program output");
     repair_output_unit.set_program_output();
     repair_output_unit.begin_say_turn(
-        crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
+        finch_programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
         &repaired_source,
     );
     match execute_direct_wire_response(
@@ -1539,8 +1539,7 @@ pub(crate) async fn process_query_with_tools(
                             if (!reusing_tool_unit || initial_named_brain_turn)
                                 && has_streamed_wire_source(&text)
                             {
-                                let language =
-                                    crate::programs::ProgramLanguage::infer_source(&text);
+                                let language = finch_programs::ProgramLanguage::infer_source(&text);
                                 work_unit.set_program_source(language.as_str());
                                 work_unit.set_response(&text);
                             }
@@ -1758,7 +1757,7 @@ pub(crate) async fn process_query_with_tools(
                     Arc::clone(&work_unit)
                 };
                 let wire_source = raw_wire_source(&text);
-                let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
+                let wire_language = finch_programs::ProgramLanguage::infer_source(&wire_source);
                 source_unit.set_program_source(wire_language.as_str());
                 source_unit.set_response(wire_source.clone());
                 source_unit.set_complete();
@@ -2018,7 +2017,7 @@ pub(crate) async fn process_query_with_tools(
                 Arc::clone(&work_unit)
             };
             let wire_source = raw_wire_source(&response.text);
-            let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
+            let wire_language = finch_programs::ProgramLanguage::infer_source(&wire_source);
             source_unit.set_program_source(wire_language.as_str());
             source_unit.set_response(wire_source.clone());
             source_unit.set_complete();
@@ -2139,7 +2138,7 @@ fn inject_persona_system_prompt(
 
 fn inject_vm_manifest(
     messages: &mut Vec<crate::providers::Message>,
-    manifest: &crate::programs::VmManifest,
+    manifest: &finch_programs::VmManifest,
 ) -> bool {
     let protocol = manifest.prompt_block();
     let section = format!("## Finch VM wire protocol\n{protocol}");
@@ -2174,16 +2173,16 @@ fn inject_vm_manifest(
     true
 }
 
-fn fallback_vm_manifest() -> crate::programs::VmManifest {
-    crate::programs::VmManifest {
-        protocol_version: crate::programs::MANIFEST_PROTOCOL_VERSION,
+fn fallback_vm_manifest() -> finch_programs::VmManifest {
+    finch_programs::VmManifest {
+        protocol_version: finch_programs::MANIFEST_PROTOCOL_VERSION,
         registry_generation: 0,
         environment_hash: "unavailable".to_string(),
         languages: vec![
-            crate::programs::ProgramLanguage::Forth,
-            crate::programs::ProgramLanguage::Lisp,
+            finch_programs::ProgramLanguage::Forth,
+            finch_programs::ProgramLanguage::Lisp,
         ],
-        language_packages: crate::programs::language_package_identities(),
+        language_packages: finch_programs::language_package_identities(),
         core_effects: vec!["session.emit".to_string(), "vm.read".to_string()],
         relevant_programs: Vec::new(),
     }
@@ -2838,8 +2837,8 @@ mod tests {
             self.name
         }
 
-        fn effect(&self) -> crate::programs::ExecutionEffect {
-            crate::programs::ExecutionEffect::WorkspaceRead
+        fn effect(&self) -> finch_programs::ExecutionEffect {
+            finch_programs::ExecutionEffect::WorkspaceRead
         }
 
         fn description(&self) -> &str {
@@ -3023,8 +3022,8 @@ mod tests {
             fn name(&self) -> &str {
                 "read"
             }
-            fn effect(&self) -> crate::programs::ExecutionEffect {
-                crate::programs::ExecutionEffect::WorkspaceRead
+            fn effect(&self) -> finch_programs::ExecutionEffect {
+                finch_programs::ExecutionEffect::WorkspaceRead
             }
             fn description(&self) -> &str {
                 "blocks until the test releases it"
@@ -3652,13 +3651,13 @@ mod tests {
         let runtime = crate::runtime::ProgramRuntime::new();
 
         let lisp = direct_wire_submission(&runtime, "(say \"hello\")".to_string()).unwrap();
-        assert_eq!(lisp.language, crate::programs::ProgramLanguage::Lisp);
+        assert_eq!(lisp.language, finch_programs::ProgramLanguage::Lisp);
         let outcome = runtime.submit_typed_only(lisp).await.unwrap();
         assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
         assert_eq!(outcome.output, "hello");
 
         let forth = direct_wire_submission(&runtime, "s\"world\" say".to_string()).unwrap();
-        assert_eq!(forth.language, crate::programs::ProgramLanguage::Forth);
+        assert_eq!(forth.language, finch_programs::ProgramLanguage::Forth);
         let outcome = runtime.submit_typed_only(forth).await.unwrap();
         assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
         assert_eq!(outcome.output, "world");
@@ -3839,7 +3838,7 @@ mod tests {
         assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
         assert!(matches!(
             outcome.values.as_slice(),
-            [crate::programs::ProgramValue::Bytes(bytes)] if !bytes.is_empty()
+            [finch_programs::ProgramValue::Bytes(bytes)] if !bytes.is_empty()
         ));
         assert!(runtime
             .pending_typed_execution(outcome.execution_id)
@@ -4243,7 +4242,7 @@ mod tests {
         let mut outcome = crate::runtime::ExecutionOutcome::failed(
             Uuid::nil(),
             0,
-            crate::programs::ExecutionEffect::Pure,
+            finch_programs::ExecutionEffect::Pure,
             crate::runtime::ExecutionBackend::TypedVm,
             "E-TYPE-002: expected int",
             0,

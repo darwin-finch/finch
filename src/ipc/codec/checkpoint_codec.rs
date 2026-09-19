@@ -2710,8 +2710,8 @@ pub(crate) fn decode_checkpoint_bytes(encoded: &[u8]) -> Result<TypedRuntimeChec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::programs::ProgramLanguage;
     use crate::vm::{TypedExecutionStatus, TypedRuntime};
+    use finch_programs::ProgramLanguage;
 
     fn round_trip_value(value: &TypedValue) -> Result<TypedValue> {
         let mut message = capnp::message::Builder::new_default();

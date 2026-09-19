@@ -445,7 +445,7 @@ fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
 async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("read Finch script '{}'", path.display()))?;
-    let script = finch::programs::parse_finch_script(&path, &contents)?;
+    let script = finch_programs::parse_finch_script(&path, &contents)?;
     let runtime = finch::runtime::ProgramRuntime::new();
     // Executing a local script is the user's explicit request to receive its
     // response.  Grant only that presentation capability here; every resource
@@ -464,7 +464,7 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
             // The typed verifier and broker derive the concrete capabilities.
             // This legacy coarse field is intentionally not used to authorize
             // a typed-only script.
-            effect: finch::programs::ExecutionEffect::Unclassified,
+            effect: finch_programs::ExecutionEffect::Unclassified,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: None,
@@ -523,7 +523,7 @@ fn terminal_script_presentation(output: &str) -> Option<String> {
 /// program must have the same verifier, capabilities, and diagnostics as an
 /// LLM-authored program.
 async fn run_direct_typed_source(
-    language: finch::programs::ProgramLanguage,
+    language: finch_programs::ProgramLanguage,
     source: &str,
 ) -> Result<()> {
     run_direct_typed_source_with_json(language, source, false).await
@@ -533,7 +533,7 @@ async fn run_direct_typed_source(
 /// serializes the same `ExecutionOutcome` used by shebang-style `--exec`, so
 /// direct Co-Forth is not a second text-only result protocol.
 async fn run_direct_typed_source_with_json(
-    language: finch::programs::ProgramLanguage,
+    language: finch_programs::ProgramLanguage,
     source: &str,
     json_output: bool,
 ) -> Result<()> {
@@ -548,7 +548,7 @@ async fn run_direct_typed_source_with_json(
             source_id: Some(format!("direct-cli.{}", language.as_str())),
             source: source.to_string(),
             intent: "direct typed command-line program".to_string(),
-            effect: finch::programs::ExecutionEffect::Unclassified,
+            effect: finch_programs::ExecutionEffect::Unclassified,
             declared_capabilities: Vec::new(),
             manifest_generation: runtime.manifest_generation(),
             expected_revision: None,
@@ -656,14 +656,14 @@ mod script_tests {
     #[tokio::test]
     async fn direct_forth_uses_the_typed_runtime_and_rejects_legacy_definitions() {
         run_direct_typed_source(
-            finch::programs::ProgramLanguage::Forth,
+            finch_programs::ProgramLanguage::Forth,
             "6 7 * int-to-string say",
         )
         .await
         .unwrap();
 
         let error =
-            run_direct_typed_source(finch::programs::ProgramLanguage::Forth, ": legacy-only 1 ;")
+            run_direct_typed_source(finch_programs::ProgramLanguage::Forth, ": legacy-only 1 ;")
                 .await
                 .unwrap_err();
         assert!(
@@ -988,7 +988,7 @@ async fn main() -> Result<()> {
     // All public source enters the shared verifier and capability broker.
     if let Some(forth_expr) = &args.forth {
         return run_direct_typed_source_with_json(
-            finch::programs::ProgramLanguage::Forth,
+            finch_programs::ProgramLanguage::Forth,
             forth_expr,
             args.json,
         )
@@ -997,7 +997,7 @@ async fn main() -> Result<()> {
 
     if let Some(lisp_expr) = &args.lisp {
         return run_direct_typed_source_with_json(
-            finch::programs::ProgramLanguage::Lisp,
+            finch_programs::ProgramLanguage::Lisp,
             lisp_expr,
             args.json,
         )
@@ -2262,14 +2262,14 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     // Short-circuit: typed Lisp expressions start with `(` — before Forth check.
     if query.trim_start().starts_with('(') {
         println!("{}", query);
-        run_direct_typed_source(finch::programs::ProgramLanguage::Lisp, query).await?;
+        run_direct_typed_source(finch_programs::ProgramLanguage::Lisp, query).await?;
         return Ok(());
     }
 
     // Short-circuit: run typed Co-Forth directly, no AI involved.
     if is_clearly_forth(query) {
         println!("{}", query);
-        run_direct_typed_source(finch::programs::ProgramLanguage::Forth, query).await?;
+        run_direct_typed_source(finch_programs::ProgramLanguage::Forth, query).await?;
         return Ok(());
     }
 
@@ -2336,12 +2336,12 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             &guard,
         )
         .await?;
-    finch::programs::capture_with_compiler_context_from_env(
+    finch_programs::capture_with_compiler_context_from_env(
         || program_runtime.compiler_context(),
         "daemon",
         "daemon-selected",
         "one_shot",
-        finch::programs::WireCorpusAttempt::FirstPass,
+        finch_programs::WireCorpusAttempt::FirstPass,
         &response,
     );
     if show_program {
@@ -2385,12 +2385,12 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                     &guard,
                 )
                 .await?;
-            finch::programs::capture_with_compiler_context_from_env(
+            finch_programs::capture_with_compiler_context_from_env(
                 || program_runtime.compiler_context(),
                 "daemon",
                 "daemon-selected",
                 "one_shot",
-                finch::programs::WireCorpusAttempt::Repair,
+                finch_programs::WireCorpusAttempt::Repair,
                 &repair,
             );
             if show_program {
@@ -2413,12 +2413,12 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                     &guard,
                 )
                 .await?;
-            finch::programs::capture_with_compiler_context_from_env(
+            finch_programs::capture_with_compiler_context_from_env(
                 || program_runtime.compiler_context(),
                 "daemon",
                 "daemon-selected",
                 "one_shot",
-                finch::programs::WireCorpusAttempt::Repair,
+                finch_programs::WireCorpusAttempt::Repair,
                 &repair,
             );
             if show_program {
@@ -2513,15 +2513,15 @@ async fn run_query_teacher_only(
         // as though it were an ordinary chat response.
         if !response.has_tool_uses() {
             let source = response.text();
-            finch::programs::capture_with_compiler_context_from_env(
+            finch_programs::capture_with_compiler_context_from_env(
                 || program_runtime.compiler_context(),
                 &provider,
                 &model,
                 "one_shot",
                 if wire_repair_requested {
-                    finch::programs::WireCorpusAttempt::Repair
+                    finch_programs::WireCorpusAttempt::Repair
                 } else {
-                    finch::programs::WireCorpusAttempt::FirstPass
+                    finch_programs::WireCorpusAttempt::FirstPass
                 },
                 &source,
             );
@@ -2651,7 +2651,7 @@ async fn run_query_teacher_only(
 /// program's user-visible result, which keeps scripts and shell pipelines
 /// stable. The source is never executed by this helper.
 fn print_wire_program(source: &str) {
-    match finch::programs::ProgramLanguage::infer_wire_source(source) {
+    match finch_programs::ProgramLanguage::infer_wire_source(source) {
         Ok(language) => eprintln!("→ program ({})\n{}", language.as_str(), source),
         Err(error) => eprintln!("→ program (invalid wire source: {error})\n{source}"),
     }
@@ -2677,14 +2677,14 @@ async fn execute_one_shot_wire_source(
     program_runtime: &finch::runtime::ProgramRuntime,
     source: &str,
 ) -> Result<finch::runtime::ExecutionOutcome> {
-    let language = finch::programs::ProgramLanguage::infer_wire_source(source)?;
+    let language = finch_programs::ProgramLanguage::infer_wire_source(source)?;
     program_runtime
         .submit_typed_only(finch::runtime::ProgramSubmission {
             language,
             source_id: Some(format!("provider-response.{}", language.as_str())),
             source: source.to_string(),
             intent: "one-shot provider VM-wire response".to_string(),
-            effect: finch::programs::ExecutionEffect::Pure,
+            effect: finch_programs::ExecutionEffect::Pure,
             declared_capabilities: Vec::new(),
             manifest_generation: program_runtime.manifest_generation(),
             expected_revision: Some(program_runtime.revision()),
@@ -2713,11 +2713,11 @@ fn can_repair_one_shot_wire_outcome(outcome: &finch::runtime::ExecutionOutcome) 
 }
 
 fn is_repairable_one_shot_wire_diagnostic(diagnostic: &str) -> bool {
-    finch::programs::is_repairable_wire_diagnostic(diagnostic)
+    finch_programs::is_repairable_wire_diagnostic(diagnostic)
 }
 
 fn one_shot_wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
-    finch::programs::wire_repair_request(rejected_source, diagnostic)
+    finch_programs::wire_repair_request(rejected_source, diagnostic)
 }
 
 fn default_wire_metrics_logger() -> Option<finch::metrics::MetricsLogger> {
@@ -2732,8 +2732,8 @@ fn mark_wire_rejection(
     diagnostic: &str,
 ) {
     metric.first_pass_valid = false;
-    metric.failure_class = Some(finch::programs::classify_wire_failure(source, diagnostic));
-    metric.diagnostic_code = finch::programs::wire_diagnostic_code(diagnostic);
+    metric.failure_class = Some(finch_programs::classify_wire_failure(source, diagnostic));
+    metric.diagnostic_code = finch_programs::wire_diagnostic_code(diagnostic);
 }
 
 fn finish_wire_metric(
@@ -2961,7 +2961,7 @@ async fn run_node_info() -> Result<()> {
 fn run_wire_corpus_command(cmd: WireCorpusCommand) -> Result<()> {
     match cmd {
         WireCorpusCommand::Audit { corpus, json } => {
-            let report = finch::programs::audit(&corpus)?;
+            let report = finch_programs::audit(&corpus)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 return Ok(());
@@ -3691,11 +3691,11 @@ mod tests {
             let runtime = finch::runtime::ProgramRuntime::new();
             let outcome = runtime
                 .submit_typed_only(finch::runtime::ProgramSubmission {
-                    language: finch::programs::ProgramLanguage::Lisp,
+                    language: finch_programs::ProgramLanguage::Lisp,
                     source_id: Some("samples-instruction.lisp".to_string()),
                     source: line.clone(),
                     intent: "check a printed instruction".to_string(),
-                    effect: finch::programs::ExecutionEffect::Unclassified,
+                    effect: finch_programs::ExecutionEffect::Unclassified,
                     declared_capabilities: Vec::new(),
                     manifest_generation: runtime.manifest_generation(),
                     expected_revision: None,

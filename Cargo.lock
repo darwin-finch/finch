@@ -1658,6 +1658,7 @@ dependencies = [
  "finch-generation",
  "finch-language",
  "finch-memory",
+ "finch-programs",
  "finch-providers",
  "finch-tools-api",
  "finch-vm",
@@ -1778,6 +1779,26 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "finch-programs"
+version = "0.7.31"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "finch-language",
+ "finch-tools-api",
+ "finch-vm",
+ "fs2",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tracing",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]

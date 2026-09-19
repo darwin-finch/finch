@@ -1,7 +1,7 @@
 //! Declared execution authority for a tool or program.
 //!
-//! Moved verbatim from `src/programs`; `programs` re-exports the same type,
-//! so every `crate::programs::ExecutionEffect` path keeps resolving.
+//! Moved verbatim from the former `src/programs`; `finch-programs` re-exports the same type,
+//! so every `finch_programs::ExecutionEffect` path keeps resolving.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};

@@ -2191,11 +2191,11 @@ mod tests {
         );
         let outcome = runtime
             .submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Forth,
+                language: finch_programs::ProgramLanguage::Forth,
                 source_id: None,
                 source: r#"s" inspect the VM" agent-spawn"#.to_string(),
                 intent: "attempt an ungranted child".to_string(),
-                effect: crate::programs::ExecutionEffect::VmWrite,
+                effect: finch_programs::ExecutionEffect::VmWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -2342,11 +2342,11 @@ mod tests {
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: None,
                 source: "(agent-spawn \"snapshot ambient grants\")".into(),
                 intent: "regress reentrant AgentSpawn authority".into(),
-                effect: crate::programs::ExecutionEffect::VmWrite,
+                effect: finch_programs::ExecutionEffect::VmWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -2376,11 +2376,11 @@ mod tests {
         );
         let outcome = runtime
             .submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Forth,
+                language: finch_programs::ProgramLanguage::Forth,
                 source_id: None,
                 source: r#"s" inspect the VM" agent-spawn agent-await"#.to_string(),
                 intent: "fork and join a child".to_string(),
-                effect: crate::programs::ExecutionEffect::VmWrite,
+                effect: finch_programs::ExecutionEffect::VmWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -2432,13 +2432,13 @@ mod tests {
             );
             let outcome = program_runtime
                 .submit(crate::runtime::ProgramSubmission {
-                    language: crate::programs::ProgramLanguage::Lisp,
+                    language: finch_programs::ProgramLanguage::Lisp,
                     source_id: None,
                     source:
                         r#"(let ((task-id (agent-spawn "inspect the VM"))) (agent-await task-id))"#
                             .to_string(),
                     intent: "fork and join on one worker".to_string(),
-                    effect: crate::programs::ExecutionEffect::VmWrite,
+                    effect: finch_programs::ExecutionEffect::VmWrite,
                     declared_capabilities: Vec::new(),
                     manifest_generation: program_runtime.manifest_generation(),
                     expected_revision: None,
@@ -2480,12 +2480,12 @@ mod tests {
         );
         let outcome = runtime
             .submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: None,
                 source: r#"(let ((task-id (agent-spawn "inspect the VM"))) (agent-await task-id))"#
                     .to_string(),
                 intent: "fork and join a child".to_string(),
-                effect: crate::programs::ExecutionEffect::VmWrite,
+                effect: finch_programs::ExecutionEffect::VmWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -2531,11 +2531,11 @@ mod tests {
         );
         let outcome = runtime
             .submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: None,
                 source,
                 intent: "spawn a bounded configured child".to_string(),
-                effect: crate::programs::ExecutionEffect::VmWrite,
+                effect: finch_programs::ExecutionEffect::VmWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -2544,28 +2544,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.status, crate::runtime::ExecutionStatus::Completed);
-        let Some(crate::programs::ProgramValue::Record(fields)) = outcome.values.first() else {
+        let Some(finch_programs::ProgramValue::Record(fields)) = outcome.values.first() else {
             panic!("agent-await must return a typed result record");
         };
         assert!(fields.iter().any(|(name, value)| {
             name == "status"
-                && value == &crate::programs::ProgramValue::String("completed".to_string())
+                && value == &finch_programs::ProgramValue::String("completed".to_string())
         }));
         assert!(fields.iter().any(|(name, value)| {
             name == "final-message"
                 && matches!(
                     value,
-                    crate::programs::ProgramValue::String(message)
+                    finch_programs::ProgramValue::String(message)
                         if message.contains("focus on typed effects")
                 )
         }));
         assert!(fields.iter().any(|(name, value)| {
             name == "provider-model"
-                && value == &crate::programs::ProgramValue::String("echo".to_string())
+                && value == &finch_programs::ProgramValue::String("echo".to_string())
         }));
         assert!(fields.iter().any(|(name, value)| {
             name == "starting-context-hash"
-                && matches!(value, crate::programs::ProgramValue::String(hash) if hash.len() == 64)
+                && matches!(value, finch_programs::ProgramValue::String(hash) if hash.len() == 64)
         }));
         let tasks = scheduler.tasks.read().await;
         let task = tasks.values().next().expect("one structured child task");
@@ -2606,11 +2606,11 @@ mod tests {
                 :max-output-bytes 4096 }))"#;
         let outcome = runtime
             .submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: None,
                 source: source.to_string(),
                 intent: "spawn with one selected grant".to_string(),
-                effect: crate::programs::ExecutionEffect::VmWrite,
+                effect: finch_programs::ExecutionEffect::VmWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -2685,11 +2685,11 @@ mod tests {
             :max-output-bytes 4096 })"#;
         let outcome = runtime
             .submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: None,
                 source: source.to_string(),
                 intent: "reject an unavailable child model".to_string(),
-                effect: crate::programs::ExecutionEffect::VmWrite,
+                effect: finch_programs::ExecutionEffect::VmWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -2727,11 +2727,11 @@ mod tests {
         } agent-spawn-with agent-await"#;
         let outcome = runtime
             .submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Forth,
+                language: finch_programs::ProgramLanguage::Forth,
                 source_id: None,
                 source: source.to_string(),
                 intent: "spawn the same structured child from Co-Forth".to_string(),
-                effect: crate::programs::ExecutionEffect::VmWrite,
+                effect: finch_programs::ExecutionEffect::VmWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -2767,11 +2767,11 @@ mod tests {
         );
         let spawn = runtime
             .submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: None,
                 source: r#"(agent-spawn "inspect the VM")"#.to_string(),
                 intent: "start a child for status polling".to_string(),
-                effect: crate::programs::ExecutionEffect::VmWrite,
+                effect: finch_programs::ExecutionEffect::VmWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -2781,7 +2781,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             spawn.values.first(),
-            Some(crate::programs::ProgramValue::Task(_))
+            Some(finch_programs::ProgramValue::Task(_))
         ));
         let snapshot = runtime.inspect().await.unwrap();
         assert!(matches!(
@@ -2791,11 +2791,11 @@ mod tests {
         ));
         let poll = runtime
             .submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Forth,
+                language: finch_programs::ProgramLanguage::Forth,
                 source_id: None,
                 source: "agent-poll".to_string(),
                 intent: "poll the child".to_string(),
-                effect: crate::programs::ExecutionEffect::VmRead,
+                effect: finch_programs::ExecutionEffect::VmRead,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -2803,18 +2803,18 @@ mod tests {
             })
             .await;
         let poll = poll.expect("polling a typed child task must succeed");
-        let Some(crate::programs::ProgramValue::Record(fields)) = poll.values.first() else {
+        let Some(finch_programs::ProgramValue::Record(fields)) = poll.values.first() else {
             panic!("agent-poll must return a typed snapshot record");
         };
         assert!(fields.iter().any(|(name, value)| {
             name == "task"
-                && value == &crate::programs::ProgramValue::String("inspect the VM".to_string())
+                && value == &finch_programs::ProgramValue::String("inspect the VM".to_string())
         }));
         assert!(fields.iter().any(|(name, value)| {
-            name == "role" && value == &crate::programs::ProgramValue::String("general".to_string())
+            name == "role" && value == &finch_programs::ProgramValue::String("general".to_string())
         }));
         assert!(fields.iter().any(|(name, value)| {
-            name == "complete" && matches!(value, crate::programs::ProgramValue::Bool(_))
+            name == "complete" && matches!(value, finch_programs::ProgramValue::Bool(_))
         }));
         assert_eq!(scheduler.tasks.read().await.len(), 1);
     }
@@ -2986,11 +2986,11 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             runtime.submit(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Lisp,
+                language: finch_programs::ProgramLanguage::Lisp,
                 source_id: None,
                 source: typed_agent_await_source(max_turns, timeout_ms),
                 intent: "report provider attempts through typed agent-await".to_string(),
-                effect: crate::programs::ExecutionEffect::VmWrite,
+                effect: finch_programs::ExecutionEffect::VmWrite,
                 declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
@@ -3004,7 +3004,7 @@ mod tests {
 
     fn typed_result_fields(
         outcome: &crate::runtime::ExecutionOutcome,
-    ) -> Vec<(String, crate::programs::ProgramValue)> {
+    ) -> Vec<(String, finch_programs::ProgramValue)> {
         assert_eq!(
             outcome.status,
             crate::runtime::ExecutionStatus::Completed,
@@ -3014,7 +3014,7 @@ mod tests {
             outcome.values
         );
         match outcome.values.first() {
-            Some(crate::programs::ProgramValue::Record(fields)) => fields.clone(),
+            Some(finch_programs::ProgramValue::Record(fields)) => fields.clone(),
             other => panic!(
                 "invariant: agent-await returns one typed child result record; first_value={other:?} outcome_diagnostics={:?}",
                 outcome.diagnostics
@@ -3040,7 +3040,7 @@ mod tests {
         };
         assert_eq!(
             field("status"),
-            Some(crate::programs::ProgramValue::String(
+            Some(finch_programs::ProgramValue::String(
                 expected_status.to_string()
             )),
             "invariant: the typed child record preserves the child terminal status; expected_status={expected_status} expected_turns={expected_turns} fields={fields:?} outcome_diagnostics={:?}",
@@ -3048,13 +3048,13 @@ mod tests {
         );
         assert_eq!(
             field("turns"),
-            Some(crate::programs::ProgramValue::Int(
+            Some(finch_programs::ProgramValue::Int(
                 i64::try_from(expected_turns).expect("attempt count must fit the typed integer")
             )),
             "invariant: reported turns equal the provider attempts started, on every terminal arm; expected_turns={expected_turns} status={expected_status} fields={fields:?} outcome_diagnostics={:?}",
             outcome.diagnostics
         );
-        let Some(crate::programs::ProgramValue::List(diagnostics)) = field("diagnostics") else {
+        let Some(finch_programs::ProgramValue::List(diagnostics)) = field("diagnostics") else {
             panic!(
                 "invariant: the typed child record carries a diagnostics list; fields={fields:?} outcome_diagnostics={:?}",
                 outcome.diagnostics
@@ -3064,7 +3064,7 @@ mod tests {
             assert!(
                 diagnostics.iter().any(|diagnostic| matches!(
                     diagnostic,
-                    crate::programs::ProgramValue::String(message) if message.contains(fragment)
+                    finch_programs::ProgramValue::String(message) if message.contains(fragment)
                 )),
                 "invariant: child diagnostics distinguish configured budget from consumed attempts; missing_fragment={fragment:?} expected_status={expected_status} expected_turns={expected_turns} child_diagnostics={diagnostics:?} outcome_diagnostics={:?}",
                 outcome.diagnostics

@@ -12,11 +12,11 @@
 //   ExcelSheetsTool — list sheet names in the workbook    excel-sheets
 //   ExcelActivateTool— bring Excel to front, open file   excel-activate
 
-use crate::programs::ExecutionEffect;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::{json, Value};
 
 // ── helpers ──────────────────────────────────────────────────────────────────

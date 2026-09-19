@@ -3,11 +3,11 @@
 // Enables the LLM to display interactive dialogs and collect user input during
 // task execution. Supports single-select, multi-select, and custom text input.
 
-use crate::programs::ExecutionEffect;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::Value;
 
 pub struct AskUserQuestionTool;

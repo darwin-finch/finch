@@ -5,12 +5,12 @@
 //! VM discovery manifests. It is composition glue, not a memory or programs
 //! implementation detail.
 
-use crate::programs::{
+use anyhow::{Context, Result};
+use finch_memory::{MemorySystem, ProgramIndexRecord, ProgramIndexRef};
+use finch_programs::{
     hash_text, language_package_identities, ExecutionEffect, ProgramDefinition, ProgramLanguage,
     ProgramRef, ProgramScope, ProgramSummary, TrustState, VmManifest, MANIFEST_PROTOCOL_VERSION,
 };
-use anyhow::{Context, Result};
-use finch_memory::{MemorySystem, ProgramIndexRecord, ProgramIndexRef};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -169,7 +169,7 @@ impl ProgramRegistry {
 
     /// Load canonical `.forth` and `.lisp` files and update the searchable index.
     pub async fn sync_program_files(&self, root: &Path, scope: ProgramScope) -> Result<usize> {
-        let records = crate::programs::load_program_files(root, scope)?
+        let records = finch_programs::load_program_files(root, scope)?
             .iter()
             .map(record_from_definition)
             .collect::<Result<Vec<_>>>()?;

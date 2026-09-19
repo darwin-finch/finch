@@ -20,6 +20,7 @@ members = [
     "crates/finch-generation",
     "crates/finch-language",
     "crates/finch-memory",
+    "crates/finch-programs",
     "crates/finch-providers",
     "crates/finch-vm",
     "crates/finch-vm-core",
@@ -32,6 +33,7 @@ default-members = [
     "crates/finch-generation",
     "crates/finch-language",
     "crates/finch-memory",
+    "crates/finch-programs",
     "crates/finch-providers",
     "crates/finch-vm",
     "crates/finch-vm-core",
@@ -43,6 +45,7 @@ finch-generation = { path = "crates/finch-generation" }
 finch-tools-api = { path = "crates/finch-tools-api" }
 finch-language = { path = "crates/finch-language" }
 finch-memory = { path = "crates/finch-memory" }
+finch-programs = { path = "crates/finch-programs" }
 finch-providers = { path = "crates/finch-providers" }
 finch-vm = { path = "crates/finch-vm" }
 

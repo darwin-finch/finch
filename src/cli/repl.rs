@@ -700,7 +700,7 @@ impl ReplInitialization {
                 .map(|root| root.join(".finch/conversations.jsonl"))
                 .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl")),
             active_persona: crate::config::Persona::load_by_name(&config.active_persona),
-            project_program_root: crate::programs::project_program_root(&workspace_root),
+            project_program_root: finch_programs::project_program_root(&workspace_root),
             workspace_root,
         }
     }
@@ -815,7 +815,7 @@ impl Repl {
                     if let Some(root) = project_program_root.as_ref() {
                         attempted_roots += 1;
                         if let Err(error) = registry
-                            .sync_program_files(root, crate::programs::ProgramScope::Project)
+                            .sync_program_files(root, finch_programs::ProgramScope::Project)
                             .await
                         {
                             tracing::warn!("Failed to index project program vocabulary: {error}");
@@ -826,7 +826,7 @@ impl Repl {
                     let root = system.program_source_root();
                     attempted_roots += 1;
                     if let Err(error) = registry
-                        .sync_program_files(&root, crate::programs::ProgramScope::Personal)
+                        .sync_program_files(&root, finch_programs::ProgramScope::Personal)
                         .await
                     {
                         tracing::warn!("Failed to index personal program vocabulary: {error}");

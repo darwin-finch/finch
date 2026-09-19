@@ -3,12 +3,12 @@
 //! The implementation lives in the runtime automation broker so direct tools and VM
 //! programs use the same availability checks and host API path.
 
-use crate::programs::ExecutionEffect;
 use crate::runtime::{AutomationBroker, AutomationRequest};
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use finch_programs::ExecutionEffect;
 use serde_json::{json, Value};
 
 pub struct GuiClickTool;

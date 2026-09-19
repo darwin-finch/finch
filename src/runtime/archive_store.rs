@@ -286,9 +286,9 @@ fn sync_parent_directory(_parent: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::programs::{ExecutionEffect, ProgramLanguage};
     use crate::runtime::{ProgramSubmission, ProgramValue};
     use crate::vm::{CapabilityKind, CapabilityRequirement, GrantScope, ResourceSelector};
+    use finch_programs::{ExecutionEffect, ProgramLanguage};
 
     fn submission(runtime: &ProgramRuntime, source: &str) -> ProgramSubmission {
         ProgramSubmission {
