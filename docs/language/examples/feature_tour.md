@@ -1110,3 +1110,39 @@ submit through one common elaborator into one typed IR (established in "One pars
 and packages"); by the time either symbol is resolvable, which frontend wrote it isn't part of what
 resolution sees. The only new rule this needed was where `pkg` visibility's boundary sits — the
 directory, checked the same way regardless of which file inside it is asking.
+
+## 26. Attempting a fixed-size matrix kernel — hits a real, foundational, previously-unnoticed wall
+
+Not a hypothetical: actually tried writing a compile-time-unrolled, monomorphized matrix-multiply
+kernel using only already-established machinery (CTFE, `array<T,N>`, generics, "static evidence
+generates like a template"), to see where a real numerics use case breaks the model — the same
+method that found the templates-vs-generics resolution and the coherence rewrite.
+
+```lisp
+; Attempt 1: a fixed-size matrix record
+(record Matrix<T, R, C>
+  data : array<T, ???>)   ; STOPS HERE
+```
+
+This stops immediately, on the most basic possible step. `array<T,N>` has always implied `N` is
+*some* kind of parameter (value-model table, session start), but there is no established syntax
+anywhere in this document for declaring an ordinary compile-time integer as a generic parameter at
+all — every generic parameter shown anywhere is a *type*. The one compile-time-value mechanism that
+does exist, `values xs : Ts...` (parameter packs), is a heterogeneous pack tied to a corresponding
+type pack — built for variadic argument lists, not for a single scalar dimension like a matrix's
+row/column count, and there's no way to compute `R * C` at the type level from it even if it applied.
+
+This is the actual blocker, not a stylistic gap: without a real value-generic-parameter mechanism,
+nothing about fixed-size numeric types can be written at all — not just matrices, but anything
+sized by a compile-time integer (a fixed-capacity buffer, a stack-allocated small-vector, an
+`array<T,N>` used for anything beyond a literal-sized one). This needs its own resolved design
+before kernel-generation specifically can go anywhere.
+
+**A second, honest limitation worth flagging alongside it, not glossed over:** even once a kernel
+monomorphizes per concrete dimension (which the already-established "generates like a template"
+model would give for free once value parameters exist), turning an unrolled scalar loop into actual
+SIMD instructions is the backend's auto-vectorizer's job, and the document's own stated native
+backend is Cranelift — whose auto-vectorization is real but historically weaker than LLVM's. Whether
+Finch needs explicit SIMD lane types (`f32x4`-style) as a deliberate, hand-tunable escape hatch, the
+way real numerics libraries often want regardless of how good the auto-vectorizer is, is a second,
+separate open question, not something "generates like a template" already answers.

@@ -1342,3 +1342,26 @@ gives an authoritative, non-guessed root-to-package mapping for every package in
 the main project via its own manifest. Corrected the design to resolve a file's path relative to its
 *owning package's* declared root (known from the dependency graph, resolved once per package) rather
 than either D's per-file declaration or unresolved `-I`-order guessing.
+
+**Continued 2026-09-19 — matrix/kernel-generation in CoLisp attempted as a real worked example,
+stopped at the very first step by a genuine, previously-unnoticed foundational gap.** Shammah asked
+about generating numeric kernels (matrix operations) easily in CoLisp. Rather than theorize, actually
+tried writing a fixed-size `Matrix<T,R,C>` record using only already-established machinery and hit a
+wall immediately: `array<T,N>` has always implied `N` is some kind of parameter, but no established
+syntax anywhere declares an ordinary compile-time *integer* as a generic parameter — every generic
+parameter shown anywhere in the document is a type. The one compile-time-value mechanism that exists
+(`values xs : Ts...`) is a heterogeneous pack tied to a corresponding type pack, built for variadic
+argument lists, not a single scalar dimension, and offers no way to compute `R * C` at the type
+level. This blocks not just matrices but anything sized by a compile-time integer at all (fixed-
+capacity buffers, small-vectors). Logged as feature_tour.md #26 rather than guessed past, alongside a
+second, separate honest limitation: Cranelift (the document's own stated native backend) has weaker
+auto-vectorization than LLVM, so whether Finch needs explicit SIMD lane types as a deliberate escape
+hatch is a real, separate open question "generates like a template" doesn't already answer.
+
+Separately, Shammah asked whether the module design mirrors Deno's or Go's system. Checked precisely
+rather than agreeing loosely: it's closer to Go's actual mechanism (one manifest-declared abstract
+module name, internal imports computed from it, fetching kept as a separate underlying concern) than
+Deno's (where the import statement itself is the literal fetch URL, no separate abstract-name layer).
+The "decentralized, hash-pinned, no mandatory registry" philosophy already in the document matches
+both languages' shared spirit, but the specific mechanism is Go's, not Deno's — worth being precise
+about since the two solve the same problem with a genuinely different abstraction boundary.
