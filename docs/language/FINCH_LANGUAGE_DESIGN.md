@@ -813,6 +813,35 @@ their reverse; a numeric library may declare commutativity only where that law i
 `!=` is derived by negating selected equality evidence, and `<`, `<=`, `>`, and `>=` derive from one
 selected comparison operation rather than admitting six unrelated implementations.
 
+**`stable-evidence` is a third concept modifier, opt-in, unrelated to the two laws above.** Ordinary
+concepts have no need for it: static dispatch never depends on a dynamic evidence table's layout,
+and a `dyn` value's table is rebuilt fresh whenever its defining module is recompiled, so nothing
+needs to survive that recompilation. The case that does need it is narrower and genuinely different
+— a `dyn` value's evidence table read by code that was **not** recompiled alongside it: dispatch
+across a network boundary, or a dynamically loaded module upgraded independently of code already
+holding erased values built against an older revision of the same concept. For that case alone, a
+concept may opt in:
+
+```text
+concept Range<T> stable-evidence {
+    associated Item = T
+    operation empty?    #1 -> bool
+    operation front     #2 -> T
+    operation pop-front #3
+}
+```
+
+The number is an arbitrary, author-assigned key, not a position — the same correction that applies
+to protobuf's actual field numbers, which this deliberately follows: reordering `empty?`, `front`,
+and `pop-front` in source changes nothing, gaps are unremarkable, and the keys need not be
+sequential. Once published, a key is permanently retired the moment its operation is removed and is
+never reused by a later operation, even a semantically similar one — checked against the concept's
+previously published, sealed revision, the same versioned-artifact machinery already described for
+exported generics. This is what actually lets old, already-compiled evidence-table lookups keep
+addressing the right operation after the concept gains, loses, or reorders others, which declaration
+order alone cannot provide. A concept without `stable-evidence` has no `#NN` syntax available at
+all, keeping the ordinary case free of ceremony it will never use.
+
 Algebraic structure is expressed by evidence that bundles operations and their laws, not by making
 every operator symmetric or attaching arithmetic inheritance to a record. A `Ring<T>` can require
 additive commutativity while leaving multiplication ordered; a `StarAlgebra<T,Scalar>` can add scalar

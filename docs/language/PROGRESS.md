@@ -1105,3 +1105,39 @@ deliberate exception to it, exactly matching Rust's `repr(C)` half of the same p
 against `#NN`. Found the existing "Explicit discriminant/`repr` for variants" gap entry (§18) already
 named this for tagged unions but not for plain records, despite the missing mechanism being
 identical for both; widened the entry rather than logging a duplicate.
+
+**Continued 2026-09-18 — `stable-evidence` designed as the real, opt-in mechanism `#NN` was groping
+toward; implementation naming and its surface spelling both re-examined and held up.** Shammah
+reopened the dropped `#NN` finding with two real cases the earlier "no mechanism needs this" answer
+didn't cover: network dispatch and dynamic module loading, both scenarios where a `dyn` value's
+evidence table is read by code that was never recompiled alongside it — genuinely different from the
+ordinary case (table rebuilt fresh on every recompilation) the earlier record-field-ordering
+argument was actually about. Insisted it stay opt-in rather than becoming ambient concept ceremony,
+and corrected the mechanism directly: protobuf's real guarantee is an arbitrary, author-assigned key
+per field, decoupled entirely from declaration order — not the positional-stability framing an
+earlier pass had implied. Designed as a third concept modifier, `stable-evidence`, in the same
+syntactic slot as `symmetric`/`commutative`: only a concept declared with it gets `#NN` syntax at
+all; ordinary concepts (everything else in the document, unchanged) have none. Keys are permanently
+retired on removal, checked against the concept's previously published, sealed revision — reusing
+the same versioned-artifact machinery already established for exported generics rather than
+inventing new infrastructure. Worked example added as `feature_tour.md` §22. Revisited the
+`dynamic-evidence-version` open-gap entry (§18) to note the now-plausible (not confirmed) connection:
+it may be the revision identifier `stable-evidence`'s retirement check anchors against.
+
+Separately, two questions about implementation naming: why name an implementation at all (a
+particular concept for a particular type), and whether `using Json for User` is just `using UserJson`
+with the type pulled out of the identifier into its own clause. First question answered from
+principle rather than restated design: the name is the evidence identity multiple competing
+implementations of the same (concept, type) pair need to be distinguished by (`UserJson` vs. a
+hypothetical `UserCompactJson`) — the exact disambiguation Rust's coherence rule forecloses by
+forbidding two such impls outright, which naming is what lets Finch not forbid. It also keeps adding
+a second implementation later purely additive, since the first was never anonymous to begin with.
+Second question resolved as a real, adoptable surface-grammar improvement rather than a challenge to
+whether naming is needed at all: `using Json for User` is the same identity `UserJson` names, just
+spelled with the type pulled into its own clause instead of smashed into the identifier — matching
+the shape the *declaration* side (`implementation UserJson for User : JsonSerializable`) already
+has. Confirmed this doesn't remove the need for a freestanding name: two competing
+implementations still need two different names (`Json`/`CompactJson`) since `for User` alone is
+shared between them. Not yet applied across the document's existing examples (`UserJson`,
+`WidgetDrawable`, `RectangleHasArea`, `RectangleMeasurable`), which still use the compound-name
+convention — worth a follow-up pass once confirmed as the direction to take everywhere.

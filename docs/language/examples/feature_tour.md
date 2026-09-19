@@ -727,10 +727,14 @@ subdirectory has no example to check against.
   syntax nor the packing rules it would follow are specified yet.
 - **`dynamic-evidence-version` on an `implementation` block** (§19/§20 area, new this pass) — appears
   in two illustrative examples, never explained anywhere. Ruled out as a per-operation vtable-slot
-  mechanism (§21's `#NN` finding — the numbers were on the wrong declaration to be that, and no
-  mechanism anywhere actually needs one, by the same reasoning that record fields have no analogous
-  stability requirement); most likely an implementation-level version/cache-identity tag unrelated
-  to slot numbering, but that's inference, not confirmation. What it actually versions is still open.
+  mechanism for an *ordinary* concept (§21's `#NN` finding — the numbers were on the wrong
+  declaration to be that, and an ordinary concept's `dyn` table is rebuilt fresh on every
+  recompilation, so nothing needs to survive across versions of it). Once `stable-evidence` concepts
+  existed as a real, separate, opt-in mechanism (per-operation author-assigned keys, for network
+  dispatch and dynamic module loading specifically), a plausible connection reopened: an
+  `implementation`'s own `dynamic-evidence-version` may be the revision identifier that anchors
+  which published, sealed key set its table was built against — but that is a new plausibility, not
+  a confirmation, and nothing ties the two together explicitly yet.
 - **`ParameterSpec -> syntax` reconstruction** (§7, new this pass) — needed to rebuild a signature
   from its introspected form; without it, "same signature, different body" CTFE can't be written.
   This is the concrete, load-bearing case; §1's `borrow-mut` is the other half of the same family
@@ -903,3 +907,35 @@ above), so the shared name (`area`) across the two concepts never collides or ne
 at the call site either. Nothing here is new machinery — it falls directly out of the adapter model
 already established for `JsonSerializable`/`Drawable`; it just hadn't been pointed at this specific,
 real complaint before.
+
+## 22. `stable-evidence` — opt-in per-operation keys, only for what actually crosses a boundary
+
+Directly reopened from §21's `#NN` finding: Shammah pointed out real cases where slot stability
+does matter — network dispatch and dynamic module loading, both scenarios where a `dyn` value's
+evidence table is read by code that was never recompiled alongside it — but insisted it stay an
+opt-in system, and corrected the mechanism itself: protobuf's actual guarantee is an arbitrary,
+author-assigned key per field, decoupled from declaration order entirely, not positional stability
+as the earlier phrasing implied.
+
+```text
+concept Range<T> stable-evidence {
+    associated Item = T
+    operation empty?    #1 -> bool
+    operation front     #2 -> T
+    operation pop-front #3
+}
+
+implementation MyListRange<T> : Range {
+    operation empty?    = my-list-empty?
+    operation front     = my-list-front
+    operation pop-front = my-list-pop-front
+}
+```
+
+An ordinary concept (no `stable-evidence`) still has no `#NN` syntax at all — this is not the
+default, and §19's `Codec`, §21's `HasArea`/`Measurable`, and the original `Range`-without-modifier
+examples elsewhere in the document are all still correct as plain, unnumbered concepts. The
+distinction that decides which one a real concept needs: does any `dyn` value formed from it ever
+get read by code that wasn't recompiled with it. `Range` used only within one program, one
+compilation, needs nothing extra. A `Range` handed across an RPC boundary or loaded from a plugin
+built against last month's revision of the concept does.
