@@ -64,6 +64,16 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    # Must precede "Check and exercise the Cargo slot": that step's
+    # test-with-cargo-slot fixture runs a real `cargo build` against the
+    # runner's preinstalled default toolchain, before "Install repository
+    # Rust toolchain" even runs. The job-level RUSTC_WRAPPER applies to every
+    # step in the job, so the sccache binary must already be on PATH before
+    # that first real build or Cargo fails trying to exec a wrapper that
+    # was never installed (#938 CI run 35461794218 caught this).
+    - name: Set up sccache
+      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
     - name: Verify shared skill discovery
       if: matrix.feature_name == 'default'
       shell: bash
@@ -90,9 +100,6 @@ jobs:
       uses: dtolnay/rust-toolchain@1.98.0
       with:
         components: clippy
-
-    - name: Set up sccache
-      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
     - name: Restore compatible Cargo dependencies and build artifacts
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6

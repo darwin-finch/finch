@@ -879,22 +879,23 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
                 f"{workflow}: job {job_id!r} must pin the reviewed sccache action; "
                 f"actual={step.get('uses')!r}"
             )
-        steps = documents[workflow]["jobs"][job_id]["steps"]
-        toolchains = [
-            index for index, candidate in enumerate(steps)
-            if isinstance(candidate, dict)
-            and candidate.get("uses") == "dtolnay/rust-toolchain@1.98.0"
-        ]
+        # sccache-action only needs to install the sccache binary before
+        # anything in the job execs a compiler through RUSTC_WRAPPER; unlike
+        # the target-tree cache restore, it has no dependency on the pinned
+        # toolchain step, so no ordering is required against it. In the
+        # 'test' job specifically, sccache must precede the early Cargo-slot
+        # self-test (which builds against the runner's preinstalled default
+        # toolchain before "Install repository Rust toolchain" even runs).
         cargo_cache_matches = found.get(location, [])
-        if len(toolchains) != 1 or len(cargo_cache_matches) != 1:
+        if len(cargo_cache_matches) != 1:
             errors.append(
                 f"{workflow}: job {job_id!r} sccache ordering boundary is ambiguous; "
-                f"toolchains={toolchains!r} cargo_cache={cargo_cache_matches!r}"
+                f"cargo_cache={cargo_cache_matches!r}"
             )
-        elif not toolchains[0] < sccache_index < cargo_cache_matches[0][0]:
+        elif not sccache_index < cargo_cache_matches[0][0]:
             errors.append(
-                f"{workflow}: job {job_id!r} sccache must run after the pinned toolchain "
-                "and before the Cargo target-tree cache restore"
+                f"{workflow}: job {job_id!r} sccache must run before the Cargo "
+                "target-tree cache restore"
             )
 
     expected_supervisor_image_jobs = {
