@@ -27,6 +27,12 @@ cargo test
 python3 scripts/check_docs.py
 ```
 
+`make build`, `make test`, and `make install` do the same through
+`.agents/skills/finch-backlog/scripts/with-cargo-slot`, which gives the build a
+worktree-isolated `CARGO_TARGET_DIR` and the shared, cross-worktree sccache cache
+instead of an unshared default -- useful once more than one worktree of this repo
+exists on the same machine.
+
 Run `cargo fmt --all -- --check` and relevant Clippy checks before submitting. Every bug fix needs a
 deterministic regression test at the boundary where the failure occurred. Keep commits scoped and
 do not rewrite shared branch history.
