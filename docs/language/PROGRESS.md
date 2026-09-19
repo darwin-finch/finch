@@ -800,3 +800,88 @@ not a wider pattern on the same root. Composed a corrected `backup-home` example
 flagged honestly as inferred-by-analogy rather than confirmed, since no single example combines
 `root<host-machine>` with `path<R>`'s refinement syntax. `join`/`narrow` remain genuinely
 ungrammared — named as real grammar nodes, never shown with concrete syntax anywhere.
+
+**Continued 2026-09-18 — a genuinely large empirical detour, installing LDC and testing D's
+template/`is()`/CTFE behavior directly against real compiler output, plus a real external
+codebase, rather than continuing to reason from memory or secondhand research.** Prompted by
+Shammah's push to "stress test it more so we don't end up with a type system where certain things
+simply cannot be expressed." Findings, all empirically verified, not asserted:
+
+- **Templates vs. generics, the distinction made precise after Shammah caught it being blurred**:
+  templates (C++/D) are instantiate-and-check, no abstract contract required upfront (SFINAE,
+  duck-typed-by-compilation-success); generics (TypeScript, Rust, Finch's own existing design) check
+  the body once against a declared bound. Finch already sits at a third, hybrid point — monomorphizes
+  like templates, but checks once against a concept bound like generics, the same point Rust
+  occupies. Worth keeping named explicitly going forward rather than treating "D's specialization"
+  and "TypeScript's `infer`" as the same kind of mechanism with different spelling.
+- **D's constraint-vs-CTFE separation, corrected precisely**: constraints are a separate boolean-gate
+  subsystem, not literally CTFE — but a constraint can call out to an ordinary CTFE-evaluated
+  function, and that's where non-termination risk actually lives. Confirmed a constraint calling a
+  looping function compiles and runs fine; confirmed a genuinely non-terminating one hangs the
+  compiler indefinitely (15+ seconds, no error, no depth limit) — worse than TypeScript's `TS2589`,
+  which at least fails fast. Direct, concrete validation of the `! comptime` fuel-limit rule already
+  written into the spec.
+- **D's specialization-based parameter extraction confirmed working exactly as half-remembered**:
+  `void foo(T : List!R, R)(T arg)` correctly infers `R` from the concrete instantiation — genuinely
+  clean syntax, a real candidate for Finch's own generic-header design.
+- **Type-tuple auto-flattening confirmed as a real, irreversible expressiveness limit**: two
+  differently-constructed nested `AliasSeq`s that flatten to the same sequence become the *identical*
+  template instantiation (proven via `pragma(msg)` caching/dedup behavior) — nesting structure is
+  destroyed before any template logic runs, with no way to recover it. A real, deliberate design
+  question for Finch's own parameter-pack system, not something to inherit silently.
+- **A sharp, verified `is()`-scoping gotcha, then further refined, not overturned, when questioned
+  again**: `is(T : Box!R, R)` binds `R` in a parameter-list specialization; the identical pattern in
+  a function's constraint clause silently discards `R` (real compiler error confirmed:
+  `undefined identifier R`). Pushed further (does `static if` bind it? does that mean `is()` forces
+  static evaluation?) and refined twice more: both `static if` and an *ordinary runtime* `if` bind
+  `R` — confirmed via testing that the runtime `if`'s untaken branch still gets fully type-checked
+  (deliberately-broken code in the `else` branch failed to compile), proving it's a genuine runtime
+  `if`, not secretly a `static if`, that nonetheless picks up a compile-time-only side channel. The
+  actual rule: `is()` binds into whatever body the matched construct *owns* (a parameter list owns
+  the function body; an `if`/`static if` owns its then-branch); a constraint clause owns no body of
+  its own, so its binding is simply discarded. Confirmed as validating Finch's existing choice to
+  give `match-type` its own dedicated construct rather than overloading ordinary `if` with hidden,
+  condition-shape-dependent behavior.
+- **Real external code found and inspected** (`schancel/gameserver`, a real prior D project, after
+  two wrong-repo attempts corrected in good faith by Shammah): `source/messages/core.d` is doing
+  almost exactly what tonight's `members-of`/`fields-of`/derive-serialize work targets. Concretely
+  confirmed: (a) a user-defined attribute struct (`OpCoder`) read back via `__traits(getAttributes,
+  ...)` — real precedent for the `@covered`-style attribute mechanism sketched earlier; (b) hand-
+  written recursive-template member filtering (`GetModuleMessages`), since D has no compile-time
+  `filter`/`map` — direct validation that `members-of`/`fields-of` returning an ordinary, filterable
+  list is a real improvement, not a nice-to-have; (c) a named "hack" in the code's own comment
+  (`alias hack(alias T) = T; //Hack to be able to store __traits stuff in an alias`), correctly
+  attributed by Shammah to "`__traits()` doesn't work bare on an alias," not a red herring; (d) that
+  same historical bug's underlying pattern (module-member reflection filtered by base-type
+  relationship) re-tested clean on a modern compiler, confirming it as a fixed implementation defect
+  from an old D era, not a persistent design flaw; (e) a defensive `__traits(compiles, ...)` guard
+  added out of caution turned out to be unnecessary — `is()` gracefully evaluates to `false` on a
+  non-type member rather than erroring, a genuinely good property worth Finch's own `infer` matching
+  having, corrected as my own over-caution rather than a real D gotcha.
+- **Root-cause explanation for the whole cluster of positional quirks, from Shammah directly**:
+  DMD's frontend doesn't run on a uniform, phase-based scheduler the way SDC does — "some things do
+  in fact need to be certain places, although most don't." This document's `require(symbol, stage)`
+  scheduler was already adopted for unrelated reasons (mutual recursion, parallel module compilation)
+  before any of this D testing happened; every one of `members-of`/`fields-of`/`FunctionSpec` already
+  routes through that same path rather than a separate mechanism per hook, which is what should keep
+  this exact failure mode (works here, not there, for no principled reason) out of Finch by
+  construction, not by luck.
+- **The `GenEnum` comparison, and the sharpest, most concrete design-rationale finding of the whole
+  detour**: `GenEnum` builds an enum as a string (CTFE computing text, then string-mixed in) with
+  manual comma-bookkeeping; corrected from an initial mischaracterization as "not really a macro" —
+  it's CTFE and string-mixin, two independently-designed D features composing, not a unified macro
+  system, and Shammah suspects the composition itself (CTFE-computed, not literal, string-mixin
+  input) may be an accidental capability rather than a deliberate one. Rewritten with `fields-of`-
+  style discovery + `map` + `,@` splice + `mixin`: no separator bookkeeping at all, because it
+  operates on list data rather than text. The actual argument for S-expressions over D's template-
+  mixin/string-mixin split isn't aesthetic — D's safe path is genuinely more awkward to author for
+  this exact case (confirmed via the same file's own `GetModuleMessages`), which is why the easier-
+  but-unsafe path gets reached for in practice, by the same author who otherwise avoids it entirely.
+  Making the safe path also the easy path removes the reason to want an escape hatch, rather than
+  banning the escape hatch and leaving the awkwardness in place. Both this and the scheduler-root-
+  cause finding written into the spec as explicit design-rationale, and the `GenEnum` comparison
+  written into `feature_tour.md` §16 as a worked example.
+- **One real editing mistake caught and fixed in the same pass**: an "Open gaps" section header was
+  accidentally dropped during an earlier insertion this session, leaving its bullet list orphaned
+  under an unrelated section's title with no heading of its own. Found and fixed while renumbering
+  `feature_tour.md`'s sections for this addition — restored as its own `## 18.` heading.

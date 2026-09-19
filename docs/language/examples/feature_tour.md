@@ -616,7 +616,55 @@ the subject of arbitrarily many concept implementations, and neither role taxes 
 shape a serializer walks is identical to the data shape sitting in memory, whether the record
 implements zero concepts or twenty.
 
-## 16. Capability templating, exercised properly — a real correction, not just a gap
+## 16. Why `syntax`+`,@`+`mixin` instead of D's template-mixin/string-mixin split
+
+Checked against a real, external D codebase (Shammah's own `gameserver` project,
+`source/messages/core.d`) rather than a hypothetical. D's `GenEnum` builds an enum declaration from
+a compile-time-discovered list of message types, as a string, then string-mixes it in:
+
+```d
+string GenEnum(string Name) {
+    bool needsComma = false;
+    string code = "enum " ~ Name ~ " {";
+    foreach (messageType; AllMessages) {
+        code ~= (needsComma ? "," : "") ~ __traits(identifier, messageType) ~ "=" ~ to!string(messageType.opCodeStatic);
+        needsComma = true;
+    }
+    code ~= " }";
+    return code;
+}
+mixin(GenEnum("OpCode"));
+```
+
+The Finch equivalent, using exactly `fields-of`/`members-of`-style discovery plus mechanisms already
+built out earlier in this file:
+
+```lisp
+(define (generate-opcode-enum) : syntax
+  (let [entries (map (lambda (mt) `(,(. mt name) ,(. mt opcode))) AllMessages)]
+    `(variant OpCode ,@entries)))
+
+(mixin (generate-opcode-enum))
+```
+
+No `needsComma` bookkeeping — `,@` splicing a list handles "however many entries there are"
+structurally, since it operates on list data rather than text needing manual separator tracking, and
+nothing is ever manufactured as text or re-parsed. **This is the actual, verified argument for
+S-expressions over D's split**, not an aesthetic preference: D's safe path (template mixins) is
+genuinely more awkward to author for this exact case (confirmed separately — `GetModuleMessages` in
+the same file hand-writes recursive-template filtering, since D has no compile-time `filter`/`map`),
+which is why the easier-but-unsafe path (string mixins) gets reached for in practice, by the same
+author who otherwise avoids them. Making the safe path also the easy path removes the reason to want
+an escape hatch, rather than just removing the escape hatch and leaving the awkwardness in place.
+
+**UNVERIFIED, flagged rather than assumed:** `AllMessages`/`.name`/`.opcode` here stand in for
+whatever `members-of`-style discovery would actually produce for this use case — a real version
+would need a records-vs-classes note about what "deriving from a base type" even means in Finch's
+concept-based world (there's no inheritance to filter by), not just a syntax substitution. The point
+being tested is the splice-versus-string-concatenation ergonomics, not a complete port of `GenEnum`'s
+semantics.
+
+## 17. Capability templating, exercised properly — a real correction, not just a gap
 
 **A real mistake worth stating plainly: earlier passes in this file, and earlier in this
 conversation, claimed capability wildcarding was "ungrammared."** That was wrong, or at least badly
@@ -662,6 +710,8 @@ independently confirmed. Likewise, `join` and `narrow` are named as real grammar
 concrete CoLisp syntax anywhere — only "refined path argument" (the `path<workspace:"...">` form)
 is ever shown worked out; composing two path fragments or narrowing an existing grant to a
 subdirectory has no example to check against.
+
+## 18. Open gaps, current as of this pass — what's still missing and why
 
 - **`join`/`narrow` selector-expression syntax** — named in the grammar, never shown concretely.
 - **`root<host-machine>` combined with `path<R>`'s refinement syntax** — named separately, never

@@ -3758,6 +3758,45 @@ the same word: a `syntax -> syntax` function returns declaration nodes (fields, 
 declarations, attributes, or explicit concept evidence); `mixin` of that result is how they enter
 the module. Runtime composition remains record embedding, delegation, and concept evidence.
 
+**Added 2026-09-18: why S-expressions and structured `syntax` instead of D's split between template
+mixins and string mixins — the actual design rationale, verified against real D code rather than
+asserted.** D offers two code-generation paths with a real tension between them: template mixins are
+the safe, structured one, but have a genuinely awkward authoring API for the common case — generating
+a variable number of declarations from a discovered list requires hand-written recursive templates
+(confirmed directly: `GetModuleMessages` in a real D codebase, filtering a module's members down to
+ones deriving from a base class, needed manual recursion peeling one member off at a time, since D
+has no compile-time `filter`/`map`). String mixins are the easy, flexible path — arbitrary text
+concatenation, ordinary control flow — but reopen exactly the "manufacture source bytes and ask a
+frontend to parse them" hazard this document already rejects, and even their own author found this
+combination (CTFE computing a string, fed into a string mixin) surprising enough to suspect it was
+never a deliberately co-designed capability, just two independently-built features that happened to
+compose. The actual lesson isn't "ban the unsafe option and provide a safer one" — a safer option
+nobody wants to use because it's awkward doesn't fix anything, it just moves where people reach for
+an escape hatch, or where they get stuck. The fix is making the safe path also the easy path:
+building a list of `syntax` fragments with ordinary `map` and splicing them with `,@` needs no
+separator bookkeeping, no string escaping, and no text ever gets manufactured or re-parsed —
+`(mixin (generate-opcode-enum))` versus hand-tracking a `needsComma` boolean through a string-
+concatenation loop is not a marginal ergonomic difference, it dissolves the tradeoff D's two-path
+split forces, rather than picking a side of it.
+
+**Added 2026-09-18: the deeper reason D's `__traits`/`is()` positional quirks exist at all, and why
+Finch's architecture already avoids the same root cause, not by accident.** Verified empirically
+(a real D compiler, not documentation alone): `is(T : Box!R, R)` binds `R` when it's a template
+parameter-list specialization or the condition of an `if`/`static if`, but silently discards `R`
+when the identical pattern appears in a function's constraint clause — three grammatically similar
+positions, two different binding behaviors, for a reason invisible at the point of writing any of
+them. Per direct explanation from someone who has hit these compiler-implementation edges directly:
+this stems from DMD's frontend not running on a uniform, phase-based scheduler the way SDC does —
+"some things do in fact need to be certain places, although most don't," a symptom of ad hoc,
+non-uniform phase-handling rather than an inherent property of compile-time reflection. This
+document's own scheduler design ("the SDC lesson," `require(symbol, stage)`, above) was already
+adopted for unrelated reasons — mutual recursion, parallel module compilation — before any of this
+D testing happened. That every one of `members-of`/`fields-of`/`FunctionSpec` already resolves
+through that same `require(identity, stage)` path, rather than a separate, special-cased mechanism
+per hook, is what should keep this specific failure mode out: there is one uniform way to ask for
+something at a given phase, not a scattered set of positions each with their own accidental rules
+about what does or doesn't work there.
+
 **Removed 2026-09-18:** this section previously described a transitional, capture-free `define-syntax`
 template mechanism (substitution before type checking, no CTFE body) as a bridge to be deleted once
 migration fixtures proved `syntax -> syntax` CTFE plus `mixin` preserve hygiene, spans, and IR. That
