@@ -1278,3 +1278,18 @@ retroactively validating rather than requiring a fix for this session's earlier 
 usage. Worked example added as `feature_tour.md` §24. The semantic-profile TODO bullet and the
 "according to language policy" cross-reference in the work-packages section both updated to point at
 the new content instead of a still-unwritten forward reference.
+
+**Continued 2026-09-19 — FFI survey, logged as open questions rather than designed now.** Shammah
+asked what other holes remain, specifically FFI into/out of Finch. Checked existing coverage before
+concluding anything was missing: text/bytes crossing the boundary already has a real, coherent
+architecture (views + owned-handle-with-release, native layouts never crossing the C/stable ABI),
+and C-ABI scalars/variadic calling are already specified. Five real gaps surfaced and logged in
+`feature_tour.md` §18 rather than designed in this pass, per Shammah's request to keep them easily
+findable rather than resolve them immediately: panics/traps unwinding across an FFI boundary (more
+urgent for Finch than for Rust specifically because overflow now traps unconditionally in every
+build, unlike Rust's release-mode wrapping), creating an ordinary (non-variadic) callback from a
+Finch closure, lifting C's sentinel-return-plus-`errno` convention into `result`/`throws`, reentrant
+calls from a foreign thread the scheduler never spawned, and confirming `resource<K>` is the intended
+mechanism for opaque foreign-handle wrapping rather than assuming it or inventing a second one later.
+Build-time linking/library discovery noted as out of scope for this document (build tooling, not
+language semantics), not logged as a gap.

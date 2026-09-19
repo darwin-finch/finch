@@ -718,6 +718,25 @@ subdirectory has no example to check against.
 
 ## 18. Open gaps, current as of this pass — what's still missing and why
 
+- **Panics/traps unwinding across an FFI boundary** (FFI survey pass, new) — a Finch trap occurring
+  inside a callback invoked from foreign code is unaddressed anywhere, and this is a real hazard in
+  most ABIs unless explicitly caught at the boundary (Rust's documented `catch_unwind` requirement is
+  the precedent). More urgent for Finch specifically than for Rust: overflow traps unconditionally in
+  every build (per "Numeric types," above), so ordinary arithmetic in a callback can trap far more
+  often than the equivalent Rust code would in a release build.
+- **Creating a callback: a raw, ABI-stable function pointer from a Finch closure** (FFI survey pass,
+  new) — distinct from the already-specified restriction on *variadic* callees (parameter-packs
+  section); ordinary non-variadic callback creation, and what happens to a closure's captured
+  environment past C's usual `void*`-userdata convention, is unaddressed.
+- **Lifting C-style sentinel-return-plus-`errno` error conventions into `result`/`throws`** (FFI
+  survey pass, new) — no adapter convention exists for this anywhere in the document.
+- **Reentrant calls from a foreign thread the scheduler never spawned** (FFI survey pass, new) — if a
+  C library invokes a registered Finch callback from its own worker thread, how that interacts with
+  the task/fiber scheduler and the borrow checker's concurrency assumptions is unaddressed.
+- **Opaque foreign-handle wrapping** (FFI survey pass, new) — `resource<K>` ("generation-bound
+  runtime handle") looks like the intended mechanism for wrapping a C library's opaque pointer, but
+  nothing states this explicitly; worth confirming rather than assuming, or inventing a second
+  mechanism by accident later.
 - **Conditional/bounded generic implementations** (coherence-rewrite pass, new) — whether a generic
   implementation may itself require a bound on its own type parameter (Rust's `impl<T: PartialEq>
   PartialEq for Vec<T>` shape: `implementation List<T : Equal<T,T>> : Equal<List<T>, List<T>> {
