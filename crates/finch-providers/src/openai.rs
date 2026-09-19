@@ -2222,9 +2222,11 @@ impl OpenAIProvider {
     /// Build capabilities for an Ollama-backed instance from whatever live
     /// attestation `refresh_capabilities` has already cached for `model`.
     ///
-    /// The wire protocol is always known — Finch's Ollama transport always
-    /// speaks OpenAI-compatible chat completions, a fact about the adapter,
-    /// not the model — but every model-specific optional feature stays
+    /// The wire protocol and streaming are always known — Finch's Ollama
+    /// transport always speaks OpenAI-compatible chat completions and always
+    /// streams over it, facts about the adapter, not the model (Ollama's own
+    /// `/api/show` capability list has no "streaming" entry to attest from,
+    /// unlike "tools") — but every model-specific optional feature stays
     /// `Unknown` until a live `/api/show` attestation for this exact model
     /// has been cached.
     fn ollama_model_capabilities(
@@ -2239,6 +2241,11 @@ impl OpenAIProvider {
                 "2026-09-19",
                 "Finch Ollama adapter always uses the OpenAI-compatible chat-completions transport",
             );
+        capabilities_result.streaming = ModelFeature::static_metadata(
+            CapabilitySupport::Supported,
+            "2026-09-19",
+            "Finch Ollama adapter always streams over the OpenAI-compatible chat-completions transport, for every model",
+        );
         let attested = capabilities
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4852,18 +4859,32 @@ mod tests {
         .unwrap();
         let remote =
             OpenAIProvider::new_remote_daemon("http://localhost:11435".to_string()).unwrap();
+        // Streaming is a static fact about Finch's Ollama adapter (it always
+        // streams over the OpenAI-compatible transport), so it's known even
+        // with no live attestation — unlike tools, which is per-model and
+        // stays Unknown until `/api/show` has actually been queried.
         assert_eq!(
             ollama
                 .capabilities(ollama.default_model())
                 .streaming
                 .support,
+            CapabilitySupport::Supported
+        );
+        assert_eq!(
+            ollama.capabilities(ollama.default_model()).tools.support,
             CapabilitySupport::Unknown
         );
+        // remote_daemon is untouched by issue #925: every optional feature,
+        // including streaming, stays Unknown with no live attestation path.
         assert_eq!(
             remote
                 .capabilities(remote.default_model())
                 .streaming
                 .support,
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(
+            remote.capabilities(remote.default_model()).tools.support,
             CapabilitySupport::Unknown
         );
     }
@@ -5062,7 +5083,50 @@ mod tests {
         let capabilities = remote.capabilities(remote.default_model());
 
         assert_eq!(capabilities.tools.support, CapabilitySupport::Unknown);
+        assert_eq!(capabilities.streaming.support, CapabilitySupport::Unknown);
         assert_eq!(capabilities.wire_protocol.protocol, None);
+    }
+
+    #[tokio::test]
+    async fn test_ollama_streaming_is_supported_regardless_of_live_attestation() {
+        // Code-review follow-up on #925: streaming is a fact about Finch's
+        // Ollama adapter (it always streams over the OpenAI-compatible
+        // transport), not a per-model feature Ollama reports in /api/show,
+        // so it must be Supported even with no live attestation at all —
+        // otherwise every streaming Ollama request reproduces the exact bug
+        // this issue was filed for, just for "streaming" instead of "tools".
+        let provider =
+            OpenAIProvider::new_ollama("http://127.0.0.1:1".to_string(), "qwen2.5:7b".to_string())
+                .unwrap();
+
+        assert_eq!(
+            provider.capabilities("qwen2.5:7b").streaming.support,
+            CapabilitySupport::Supported,
+            "Ollama streaming must be known Supported without any live attestation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ollama_streaming_query_succeeds_at_the_dispatch_boundary() {
+        // Production-boundary reproduction of the streaming variant of the
+        // reported bug: a streaming request used to be refused with
+        // "has unknown streaming capability; refusing to assume support"
+        // for every Ollama model, with no live attestation able to fix it
+        // (Ollama's /api/show has no "streaming" entry to report).
+        let provider =
+            OpenAIProvider::new_ollama("http://127.0.0.1:1".to_string(), "qwen2.5:7b".to_string())
+                .unwrap();
+        let request = ProviderRequest::new(vec![crate::Message::user("hello")]).with_stream(true);
+
+        let validated = crate::validate_provider_request(&provider, &request, true)
+            .await
+            .expect(
+                "a streaming request must validate against Ollama without any live attestation",
+            );
+        assert_eq!(
+            validated.capabilities().streaming.support,
+            CapabilitySupport::Supported
+        );
     }
 
     // Issue #929 regression: `capabilities()` and `refresh_capabilities()`
