@@ -3732,6 +3732,44 @@ than surprising: failure at compile time on bad compile-time input is the expect
 new hazard — the hazard this whole eligibility rule exists to prevent is a *capability* effect
 reaching outside the compiler, which `throws` alone never does.
 
+**Added 2026-09-18: `modules-of`, a third hook — whole-program module enumeration, done as a direct
+query rather than reconstructed by fragile recursion.** D has no trait for this at all (checked
+against the current, official `__traits` keyword list directly: no module-enumeration entry exists;
+the closest, `isModule`, only tests whether a given symbol already in hand is a module). The
+practical workaround — `__traits(allMembers, someModule)`, filter for `isModule`, recurse via
+`__traits(getMember, ...)` into each one found — was verified directly, both ways: it genuinely
+works, recursively, but only across a chain of `public import`s; the moment any import along the
+path is not `public`, that branch of the module graph is silently invisible to the query, not an
+error, just absent. A real, whole-program-scanning derive (an `AllMessages`-style "every message
+type across the whole project" discovery, the motivating case) built this way is fragile in exactly
+that silent way — it depends on every module along every path choosing to re-export its imports,
+which most code has no reason to do.
+
+```
+(modules-of Program)   ; ! comptime — every module in the compilation unit, directly, from the
+                         ; compiler's own already-complete view — not reconstructed by recursion
+                         ; through possibly-private imports
+```
+
+Visibility should be an explicit parameter here, not an accidental gate on whether recursion even
+reaches a module: whether `modules-of` defaults to public-surface modules only, or all of them with
+an explicit widening parameter (matching `fields-of`'s own `:include-private` shape), is not yet
+decided — flagged as the next concrete decision for this hook, not resolved here.
+
+**Added 2026-09-18: a derive's selection filter should name every condition a matching type
+actually needs to satisfy, not leave one as an unstated precondition a different check happens to
+enforce later.** Found by comparing an intent ("classes decorated with an `OpCoder` attribute") to
+what the corresponding real D filter actually checked (`is(member : Message)` — inheritance only,
+no attribute check at all) — the two aren't the same condition, and the gap between them was
+previously invisible: a type could satisfy the inheritance filter and still fail, later, at
+`opCodeStatic()`'s `assert(0, "No opcode class")`, for a completely separate, unstated reason. A
+`members-of`/`fields-of`-based derive should filter on every condition a member actually needs to
+satisfy explicitly, in one place — a structural check (implements a concept, derives a shape) and an
+attribute-presence check (carries the right decoration) are both real, independent conditions when a
+use case needs both, and folding one into "something that will just happen to also be true, checked
+somewhere else, later" is exactly how a false assumption survives long enough to become a runtime
+assertion failure instead of a compile-time filter result.
+
 **Added 2026-09-18: mixin-spliced code's private-field access, confirmed rather than left implicit.**
 "Compiled as if they had been written at that site" (`mixin`, above) means a mixin's generated
 declaration takes on the module-membership of *where it lands*, not of whichever module defined the
@@ -3796,6 +3834,19 @@ through that same `require(identity, stage)` path, rather than a separate, speci
 per hook, is what should keep this specific failure mode out: there is one uniform way to ask for
 something at a given phase, not a scattered set of positions each with their own accidental rules
 about what does or doesn't work there.
+
+A second, independently-confirmed case makes the mechanism behind "ad hoc" concrete rather than
+just descriptive. `__traits(allMembers, core)` — `core` being a root package, not a leaf module —
+returns completely empty (`AliasSeq!()`) on a current compiler; `__traits(allMembers, core.thread)`,
+one level deeper, works. Root cause, from someone who filed the actual compiler bug and read the
+implementation: most package symbols get resolved into a uniform internal `Package` representation,
+but root package names specifically stay as unresolved `Import` objects, and `__traits`'s own
+implementation only walks the former correctly. That is exactly "a symbol's representation depends
+on which path resolved it," the identical shape of problem as the `is()`/constraint-clause binding
+gotcha above, now confirmed at the level of the compiler's own internal data structures rather than
+inferred from surface behavior. `require(symbol, stage)` giving every symbol one representation, one
+promise, regardless of what kind of symbol it is or which import path reached it, is what rules this
+specific bug class out structurally — not a specific fix for packages, a fix for the category.
 
 **Removed 2026-09-18:** this section previously described a transitional, capture-free `define-syntax`
 template mechanism (substitution before type checking, no CTFE body) as a bridge to be deleted once

@@ -885,3 +885,39 @@ simply cannot be expressed." Findings, all empirically verified, not asserted:
   accidentally dropped during an earlier insertion this session, leaving its bullet list orphaned
   under an unrelated section's title with no heading of its own. Found and fixed while renumbering
   `feature_tour.md`'s sections for this addition — restored as its own `## 18.` heading.
+
+**Continued 2026-09-18 — whole-program module discovery, empirically pinned down precisely across
+several rounds of correction, each one refining rather than overturning the last.** Verified against
+the current official `__traits` documentation directly (fetched, not assumed): no trait for
+enumerating all modules exists at all; `isModule` only tests a symbol already in hand. Then tested
+D's actual practical workaround empirically, in two passes, each correcting an overstatement of
+mine: first pass showed a module's own `allMembers` does not surface a transitively (non-`public`)
+imported module at all; Shammah correctly pushed back that this didn't test the real technique
+(recursive `getMember` into each discovered module, not just checking one module's flat member
+list); second pass, with the import changed to `public`, confirmed recursive `getMember` +
+`allMembers` genuinely works — but only across an unbroken chain of `public import`s, silently
+missing anything behind a plain import anywhere along the path. Added `modules-of` as a third
+concrete hook: a direct, whole-program enumeration from the compiler's own already-complete view,
+with visibility as an explicit parameter rather than an accidental gate on whether recursion happens
+to reach a module at all — the visibility-default question itself left open rather than guessed.
+
+Also corrected a filter-completeness gap of my own: I'd described a real D derive's selection filter
+as checking only inheritance, matching the code, but Shammah's stated intent was "decorated with an
+attribute" — a different, additional condition the code never actually checked, relying instead on a
+later, unrelated runtime assertion to catch the gap. Written in as a general rule for Finch's own
+`members-of`/`fields-of`-based derives: every condition a matching member actually needs should be
+named explicitly in one filter, not split between an explicit check and an implicit precondition
+enforced elsewhere, later, by something else.
+
+**Continued 2026-09-18 — the exact bug Shammah reported to the D project, confirmed still present
+on a current compiler and traced to its root cause.** `__traits(allMembers, core)` — a root package,
+not a leaf module — returns completely empty (`AliasSeq!()`); `__traits(allMembers, core.thread)`,
+one level deeper, works. Verified directly, not taken on faith. Root cause per Shammah, who filed
+the actual bug and read the implementation: most package symbols resolve into a uniform internal
+`Package` representation, but root package names specifically stay as unresolved `Import` objects,
+and `__traits` only walks the former correctly. Strengthened the existing scheduler-root-cause
+passage with this rather than adding a separate one — it's the identical shape of problem as the
+`is()`/constraint-clause binding gotcha (a symbol's representation depending on which path resolved
+it), now confirmed at the level of the compiler's own internal data structures instead of inferred
+from surface behavior, and `require(symbol, stage)` giving every symbol one representation
+regardless of provenance is a fix for the category, not a special case for packages.
