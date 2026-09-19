@@ -904,6 +904,10 @@ impl MemorySystem {
     ///
     /// The engine's dimension parameterizes the MemTree. Constructors never
     /// probe the HuggingFace cache or download a model.
+    ///
+    /// Opens `config.db_path` itself; a caller that already holds (or wants
+    /// to control the lifetime of) the SQLite connection should call
+    /// [`Self::new_with_connection`] instead.
     pub fn new_with_engine(
         config: MemoryConfig,
         embedding_engine: Arc<dyn EmbeddingEngine>,
@@ -921,25 +925,47 @@ impl MemorySystem {
         // Enable WAL mode for concurrency
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
 
-        // Refuse a database created before `memory_sources.node_id UNIQUE` was
-        // dropped. There is deliberately no migration — Finch has no users and
-        // `schema.sql` is authoritative — but `CREATE TABLE IF NOT EXISTS`
-        // silently leaves an old table in place, and the first repeated memory
-        // then fails with `UNIQUE constraint failed: memory_sources.node_id`
-        // from deep inside an insert. Fail at open, naming the remedy.
-        {
-            let stale: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master
+        Self::new_with_connection(Arc::new(Mutex::new(conn)), config, embedding_engine)
+    }
+
+    /// Create a memory system against an already-open connection.
+    ///
+    /// This is the injectable primitive: it never calls [`Connection::open`]
+    /// itself, so the caller controls how and where the SQLite connection is
+    /// opened (a real file, an in-memory database for a test, or a connection
+    /// whose lifetime the composition root already manages). It applies the
+    /// same idempotent `schema.sql` initialization and migrations as
+    /// [`Self::new_with_engine`] against whatever connection it is handed,
+    /// then hydrates the `MemTree` from it.
+    pub fn new_with_connection(
+        db: Arc<Mutex<Connection>>,
+        config: MemoryConfig,
+        embedding_engine: Arc<dyn EmbeddingEngine>,
+    ) -> Result<Self> {
+        let (node_count, max_node_id) = {
+            let conn = db
+                .try_lock()
+                .expect("a freshly injected connection cannot be contended");
+
+            // Refuse a database created before `memory_sources.node_id UNIQUE` was
+            // dropped. There is deliberately no migration — Finch has no users and
+            // `schema.sql` is authoritative — but `CREATE TABLE IF NOT EXISTS`
+            // silently leaves an old table in place, and the first repeated memory
+            // then fails with `UNIQUE constraint failed: memory_sources.node_id`
+            // from deep inside an insert. Fail at open, naming the remedy.
+            {
+                let stale: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
                      WHERE type='table' AND name='memory_sources'
                        AND sql LIKE '%UNIQUE%'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            anyhow::ensure!(
-                stale == 0,
-                "{} predates the current memory schema and cannot be upgraded \
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                anyhow::ensure!(
+                    stale == 0,
+                    "{} predates the current memory schema and cannot be upgraded \
                  in place. Storing the same content twice would fail with a \
                  UNIQUE constraint error.\n\n\
                  Move it aside and Finch will create a fresh store, keeping \
@@ -947,107 +973,109 @@ impl MemorySystem {
                  \x20\x20mv {} {}.pre-schema-change\n\n\
                  Do not delete it unless you are certain the history is not \
                  wanted — there is no export path yet.",
-                config.db_path.display(),
-                config.db_path.display(),
-                config.db_path.display()
-            );
-        }
+                    config.db_path.display(),
+                    config.db_path.display(),
+                    config.db_path.display()
+                );
+            }
 
-        // Migration A: detect old tree_nodes schema (primary key was 'id AUTOINCREMENT',
-        // not 'node_id').  The old table always had 0 rows because inserts failed with
-        // FK violations, so dropping it is safe.  We detect by checking whether the
-        // 'node_id' column is absent from an existing table.
-        {
-            let table_exists: i64 = conn
+            // Migration A: detect old tree_nodes schema (primary key was 'id AUTOINCREMENT',
+            // not 'node_id').  The old table always had 0 rows because inserts failed with
+            // FK violations, so dropping it is safe.  We detect by checking whether the
+            // 'node_id' column is absent from an existing table.
+            {
+                let table_exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tree_nodes'",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
-            if table_exists > 0 {
-                let has_node_id: i64 = conn
+                if table_exists > 0 {
+                    let has_node_id: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM pragma_table_info('tree_nodes') WHERE name='node_id'",
                         [],
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
-                if has_node_id == 0 {
-                    tracing::info!(
-                        "Dropping stale tree_nodes table (old schema used 'id', not 'node_id')"
-                    );
-                    conn.execute_batch("DROP TABLE IF EXISTS tree_nodes;")?;
+                    if has_node_id == 0 {
+                        tracing::info!(
+                            "Dropping stale tree_nodes table (old schema used 'id', not 'node_id')"
+                        );
+                        conn.execute_batch("DROP TABLE IF EXISTS tree_nodes;")?;
+                    }
                 }
             }
-        }
 
-        // Load schema (CREATE TABLE IF NOT EXISTS — safe to re-run)
-        let schema = include_str!("schema.sql");
-        conn.execute_batch(schema)?;
+            // Load schema (CREATE TABLE IF NOT EXISTS — safe to re-run)
+            let schema = include_str!("schema.sql");
+            conn.execute_batch(schema)?;
 
-        // Migration B: add importance column if the DB predates v0.7.15.
-        // Silently ignored if the column already exists.
-        let _ = conn.execute(
-            "ALTER TABLE tree_nodes ADD COLUMN importance INTEGER NOT NULL DEFAULT 1",
-            [],
-        );
+            // Migration B: add importance column if the DB predates v0.7.15.
+            // Silently ignored if the column already exists.
+            let _ = conn.execute(
+                "ALTER TABLE tree_nodes ADD COLUMN importance INTEGER NOT NULL DEFAULT 1",
+                [],
+            );
 
-        // Migration C: executable vocabulary gained explicit effect declarations.
-        // Unknown legacy definitions remain conservative and require approval.
-        let _ = conn.execute(
+            // Migration C: executable vocabulary gained explicit effect declarations.
+            // Unknown legacy definitions remain conservative and require approval.
+            let _ = conn.execute(
             "ALTER TABLE program_registry ADD COLUMN effect TEXT NOT NULL DEFAULT 'unclassified'",
             [],
         );
 
-        // Correlate projected memory with the authoritative Brain run. Existing
-        // local history remains valid with NULL provenance.
-        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN brain_id TEXT", []);
-        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN run_id TEXT", []);
-        let _ = conn.execute(
-            "ALTER TABLE conversations ADD COLUMN request_seq INTEGER",
-            [],
-        );
-        conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_brain_run_role
+            // Correlate projected memory with the authoritative Brain run. Existing
+            // local history remains valid with NULL provenance.
+            let _ = conn.execute("ALTER TABLE conversations ADD COLUMN brain_id TEXT", []);
+            let _ = conn.execute("ALTER TABLE conversations ADD COLUMN run_id TEXT", []);
+            let _ = conn.execute(
+                "ALTER TABLE conversations ADD COLUMN request_seq INTEGER",
+                [],
+            );
+            conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_brain_run_role
              ON conversations(brain_id, run_id, role)
              WHERE brain_id IS NOT NULL AND run_id IS NOT NULL;",
-        )?;
+            )?;
 
-        tracing::debug!("Memory system initialized: {}", config.db_path.display());
+            tracing::debug!("Memory system initialized: {}", config.db_path.display());
+
+            // Hydrate the MemTree from `tree_nodes`.
+            //
+            // Doing this synchronously blocked startup behind decoding every stored
+            // embedding: on the dogfood host 16,782 nodes at 2048 f32 is 131 MiB,
+            // and the frontend took 3.25 s to first prompt with about 308 MiB
+            // resident (#242). When a Tokio runtime is available the load runs in
+            // the background in bounded batches, so the prompt paints immediately
+            // and memory fills in behind it.
+            //
+            // `next_id` is advanced past the highest stored id BEFORE any batch
+            // lands. Otherwise a turn stored during hydration could be given an id
+            // that a later batch then overwrites.
+            //
+            // These two propagate rather than `unwrap_or(0)`. A failed `COUNT`
+            // silently skipped hydration entirely and reported `Ready { nodes: 0 }`
+            // against a full store, with no log line at all; a failed `MAX` left
+            // `next_id` at 1, so the first write upserted over persisted node 1.
+            // Refusing to open the store is the honest outcome.
+            let node_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))
+                .context("Failed to count stored MemTree nodes")?;
+            let max_node_id: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(node_id), 0) FROM tree_nodes",
+                    [],
+                    |row| row.get(0),
+                )
+                .context("Failed to read the highest stored MemTree node id")?;
+            (node_count, max_node_id)
+        };
 
         // Parameterize MemTree dimension to match the injected engine.
         let dim = embedding_engine.dimension();
         let mut tree = MemTree::new_with_dim(dim);
-
-        // Hydrate the MemTree from `tree_nodes`.
-        //
-        // Doing this synchronously blocked startup behind decoding every stored
-        // embedding: on the dogfood host 16,782 nodes at 2048 f32 is 131 MiB,
-        // and the frontend took 3.25 s to first prompt with about 308 MiB
-        // resident (#242). When a Tokio runtime is available the load runs in
-        // the background in bounded batches, so the prompt paints immediately
-        // and memory fills in behind it.
-        //
-        // `next_id` is advanced past the highest stored id BEFORE any batch
-        // lands. Otherwise a turn stored during hydration could be given an id
-        // that a later batch then overwrites.
-        //
-        // These two propagate rather than `unwrap_or(0)`. A failed `COUNT`
-        // silently skipped hydration entirely and reported `Ready { nodes: 0 }`
-        // against a full store, with no log line at all; a failed `MAX` left
-        // `next_id` at 1, so the first write upserted over persisted node 1.
-        // Refusing to open the store is the honest outcome.
-        let node_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))
-            .context("Failed to count stored MemTree nodes")?;
-        let max_node_id: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(node_id), 0) FROM tree_nodes",
-                [],
-                |row| row.get(0),
-            )
-            .context("Failed to read the highest stored MemTree node id")?;
         tree.set_next_id(max_node_id as u64 + 1);
 
         let hydration = Arc::new(HydrationState::new(node_count.max(0) as usize));
@@ -1057,7 +1085,6 @@ impl MemorySystem {
             hydration.install_completion_pause(take_hydration_completion_pause(&config.db_path));
             hydration.install_sweep_pause(take_projection_sweep_pause(&config.db_path));
         }
-        let db = Arc::new(Mutex::new(conn));
         let tree = Arc::new(Mutex::new(tree));
         // Built before the loader is spawned, because the loader owns half of
         // it: the sweep it runs on completion has to serialize against
@@ -3104,6 +3131,60 @@ mod tests {
             "injected engine dimension must parameterize the store; got {}",
             memory.embedding_engine.dimension()
         );
+    }
+
+    /// Proves `new_with_connection` builds against the connection it is
+    /// handed rather than silently opening one of its own.
+    ///
+    /// `config.db_path` names a directory that does not exist, so
+    /// `Connection::open(&config.db_path)` would fail outright -- if
+    /// `new_with_connection` fell back to opening it internally, this test
+    /// would fail at construction. The connection actually used is an
+    /// in-memory one built here and passed in directly; a write made through
+    /// the returned `MemorySystem` is then read back off that SAME
+    /// `Arc<Mutex<Connection>>` from outside `MemorySystem` entirely, which a
+    /// silently-self-opened connection could never produce because it would
+    /// stay empty.
+    #[tokio::test]
+    async fn test_new_with_connection_uses_the_injected_connection_not_its_own() -> Result<()> {
+        let db = Arc::new(Mutex::new(Connection::open_in_memory()?));
+        let config = MemoryConfig {
+            db_path: std::path::PathBuf::from("/nonexistent-dir-for-di-regression-test/memory.db"),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let memory = MemorySystem::new_with_connection(
+            Arc::clone(&db),
+            config,
+            Arc::new(TfIdfEmbedding::new()),
+        )
+        .context(
+            "new_with_connection must initialize schema and build against the \
+             injected connection without ever calling Connection::open itself",
+        )?;
+
+        let text = "new_with_connection round-trips through the connection it was given";
+        memory.insert_conversation("user", text, None, None).await?;
+
+        let results = memory.query_with_sources(text, Some(5)).await?;
+        assert!(
+            results.iter().any(|r| r.text == text),
+            "the MemorySystem returned by new_with_connection could not read back \
+             its own write; results={results:?}"
+        );
+
+        let stored: i64 = {
+            let conn = db.lock().await;
+            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?
+        };
+        assert_eq!(
+            stored, 1,
+            "the conversation must be visible on the exact connection instance \
+             passed into new_with_connection -- a self-opened fallback \
+             connection would leave this count at 0"
+        );
+
+        Ok(())
     }
 
     /// Content long enough to survive the quality classifier's noise filter.
