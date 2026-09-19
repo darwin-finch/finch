@@ -305,7 +305,7 @@ fn bump_generation(tx: &Transaction<'_>) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryConfig;
+    use crate::MemoryConfig;
     use tempfile::TempDir;
 
     fn memory(temp: &TempDir) -> MemorySystem {

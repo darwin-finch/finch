@@ -16,7 +16,7 @@ pub(super) struct TypedHostHandler {
     output_chunks: Vec<String>,
     side_effects: Vec<crate::vm::HostSideEffect>,
     scheduler: Option<agent_vm::AgentVmBinding>,
-    memory: Option<Arc<crate::memory::MemorySystem>>,
+    memory: Option<Arc<finch_memory::MemorySystem>>,
     mcp_client: Option<Arc<crate::tools::McpClient>>,
     mcp_output_schemas: BTreeMap<String, serde_json::Value>,
     vocabulary: String,
@@ -55,7 +55,7 @@ impl TypedHostHandler {
         automation: Arc<AutomationBroker>,
         resource_roots: Arc<RwLock<ResourceRootState>>,
         scheduler: Option<agent_vm::AgentVmBinding>,
-        memory: Option<Arc<crate::memory::MemorySystem>>,
+        memory: Option<Arc<finch_memory::MemorySystem>>,
         mcp_client: Option<Arc<crate::tools::McpClient>>,
         mcp_output_schemas: BTreeMap<String, serde_json::Value>,
         vocabulary: String,
@@ -546,10 +546,10 @@ pub(super) fn typed_agent_task_result(
 /// status taken before the recall can understate completeness but never
 /// overstate it.
 pub(super) fn typed_memory_index_status(
-    status: crate::memory::HydrationStatus,
+    status: finch_memory::HydrationStatus,
     origin: &SourceOrigin,
 ) -> std::result::Result<TypedValue, VmDiagnostic> {
-    use crate::memory::HydrationStatus;
+    use finch_memory::HydrationStatus;
 
     let count = |value: usize| -> std::result::Result<TypedValue, VmDiagnostic> {
         let value = i64::try_from(value).map_err(|_| {
@@ -1840,8 +1840,8 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                 let values = block_on_host(async move { memory.query(&query, None).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 let observed =
-                    crate::memory_status::observed(before, for_status.hydration_status());
-                if let crate::memory::HydrationStatus::Failed { reason } = &observed {
+                    finch_memory::memory_status::observed(before, for_status.hydration_status());
+                if let finch_memory::HydrationStatus::Failed { reason } = &observed {
                     return Err(host_binding_error(
                         origin,
                         format!(
@@ -1849,7 +1849,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                         ),
                     ));
                 }
-                if let Some(caveat) = crate::memory_status::caveat(&observed) {
+                if let Some(caveat) = finch_memory::memory_status::caveat(&observed) {
                     tracing::warn!(%caveat, "mem-recall answered from a partial memory index");
                 }
                 return Ok(vec![TypedValue::List {

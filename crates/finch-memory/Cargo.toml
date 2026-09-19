@@ -1,0 +1,33 @@
+[package]
+name = "finch-memory"
+version = "0.7.31"
+publish = false
+rust-version = "1.98"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0"
+description = "MemTree hierarchical memory, retrieval quality, TF-IDF fallback, and the injected EmbeddingEngine port — no ONNX, Candle, tokenizer, Hugging Face, HTTP, or TUI dependencies"
+repository = "https://github.com/darwin-finch/finch"
+
+[dependencies]
+anyhow = "1.0"
+chrono = "0.4"
+dirs = "5.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.35", features = ["sync", "rt"] }
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time"] }
+
+[features]
+# Compiles in test-only seams (hydration batch/completion/sweep pauses) that a
+# dependent crate's own tests need to drive real `Loading`/`Degraded` states —
+# see `register_hydration_batch_pause` in src/lib.rs. Off by default so
+# release builds of finch never carry this scaffolding, matching the
+# `#[cfg(test)]`-only behavior this crate had before the extraction; the root
+# crate's [dev-dependencies] enables it so `cargo test --workspace` still
+# exercises the real path.
+test-support = []

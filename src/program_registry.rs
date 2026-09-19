@@ -5,12 +5,12 @@
 //! VM discovery manifests. It is composition glue, not a memory or programs
 //! implementation detail.
 
-use crate::memory::{MemorySystem, ProgramIndexRecord, ProgramIndexRef};
 use crate::programs::{
     hash_text, language_package_identities, ExecutionEffect, ProgramDefinition, ProgramLanguage,
     ProgramRef, ProgramScope, ProgramSummary, TrustState, VmManifest, MANIFEST_PROTOCOL_VERSION,
 };
 use anyhow::{Context, Result};
+use finch_memory::{MemorySystem, ProgramIndexRecord, ProgramIndexRef};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -259,7 +259,7 @@ fn write_program_source(path: &Path, source: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryConfig;
+    use finch_memory::MemoryConfig;
     use tempfile::TempDir;
 
     fn registry(temp: &TempDir) -> ProgramRegistry {

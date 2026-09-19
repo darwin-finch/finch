@@ -81,7 +81,7 @@ pub struct ContextLimits {
 pub struct RuntimeParts {
     pub program_runtime: Arc<crate::runtime::ProgramRuntime>,
     pub agent_scheduler: Arc<crate::scheduler::AgentScheduler>,
-    pub memory_system: Option<Arc<crate::memory::MemorySystem>>,
+    pub memory_system: Option<Arc<finch_memory::MemorySystem>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ pub struct LlmSession {
 /// What executes programs, what remembers, and what records.
 pub struct LlmRuntime {
     pub program_runtime: Arc<crate::runtime::ProgramRuntime>,
-    pub memory_system: Option<Arc<crate::memory::MemorySystem>>,
+    pub memory_system: Option<Arc<finch_memory::MemorySystem>>,
     pub current_graph: Arc<Mutex<crate::graph::ExecutionGraph>>,
     pub wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
 }

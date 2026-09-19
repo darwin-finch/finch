@@ -392,7 +392,7 @@ pub struct EventLoop {
     metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
 
     /// Memory system for semantic recall across sessions
-    memory_system: Option<Arc<crate::memory::MemorySystem>>,
+    memory_system: Option<Arc<finch_memory::MemorySystem>>,
 
     /// Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
@@ -1993,7 +1993,7 @@ impl EventLoop {
 
         // Initialize memtree console (uses a separate dummy tree for the tree-view UI)
         let (memtree_console, memtree_handler) = {
-            let dummy_tree = Arc::new(RwLock::new(crate::memory::MemTree::new()));
+            let dummy_tree = Arc::new(RwLock::new(finch_memory::MemTree::new()));
             let console = crate::cli::memtree_console::MemTreeConsole::new(dummy_tree);
             let handler = crate::cli::memtree_console::EventHandler::new();
             (
@@ -3438,7 +3438,7 @@ impl EventLoop {
                 .memory_system
                 .as_ref()
                 .expect("checked by runner_can_project_memory");
-            let provenance = crate::memory::BrainConversationProvenance {
+            let provenance = finch_memory::BrainConversationProvenance {
                 brain_id: request.brain_id.0.to_string(),
                 run_id: request.run_id.0.to_string(),
                 request_seq: request.request_seq,

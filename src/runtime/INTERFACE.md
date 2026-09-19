@@ -194,7 +194,7 @@ impl ProgramRuntime {
     /// Attach the application-owned agent scheduler, replacing any prior attachment.
     pub fn attach_agent_scheduler<S: agents::AgentSpawning + 'static>(&self, scheduler: &Arc<S>);
     /// Attach the host's MemTree service to the typed capability boundary.
-    pub fn attach_memory(&self, memory: Arc<crate::memory::MemorySystem>);
+    pub fn attach_memory(&self, memory: Arc<finch_memory::MemorySystem>);
     pub fn authority_state(&self) -> Result<ProgramRuntimeAuthorityState>;
     pub fn automation(&self) -> Arc<AutomationBroker>;
     /// Install the application-owned effect delivery log.

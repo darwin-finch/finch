@@ -1657,6 +1657,7 @@ dependencies = [
  "ed25519-dalek",
  "finch-generation",
  "finch-language",
+ "finch-memory",
  "finch-providers",
  "finch-tools-api",
  "finch-vm",
@@ -1762,6 +1763,21 @@ dependencies = [
  "finch-coforth",
  "finch-colisp",
  "finch-vm-core",
+]
+
+[[package]]
+name = "finch-memory"
+version = "0.7.31"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs 5.0.1",
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

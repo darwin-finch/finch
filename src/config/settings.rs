@@ -180,7 +180,7 @@ pub struct Config {
     pub mcp_servers: HashMap<String, crate::tools::McpServerConfig>,
 
     /// Memory system configuration (Phase 4: Hierarchical Memory)
-    pub memory: crate::memory::MemoryConfig,
+    pub memory: finch_memory::MemoryConfig,
 
     /// License configuration (Noncommercial by default; Commercial with a valid key)
     pub license: LicenseConfig,
@@ -925,7 +925,7 @@ impl Config {
             credentials: Vec::new(),
             features,
             mcp_servers: HashMap::new(),
-            memory: crate::memory::MemoryConfig::default(),
+            memory: finch_memory::MemoryConfig::default(),
             license: LicenseConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
         }

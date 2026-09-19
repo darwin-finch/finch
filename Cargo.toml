@@ -19,6 +19,7 @@ members = [
     "crates/finch-colisp",
     "crates/finch-generation",
     "crates/finch-language",
+    "crates/finch-memory",
     "crates/finch-providers",
     "crates/finch-vm",
     "crates/finch-vm-core",
@@ -30,6 +31,7 @@ default-members = [
     "crates/finch-colisp",
     "crates/finch-generation",
     "crates/finch-language",
+    "crates/finch-memory",
     "crates/finch-providers",
     "crates/finch-vm",
     "crates/finch-vm-core",
@@ -40,6 +42,7 @@ resolver = "2"
 finch-generation = { path = "crates/finch-generation" }
 finch-tools-api = { path = "crates/finch-tools-api" }
 finch-language = { path = "crates/finch-language" }
+finch-memory = { path = "crates/finch-memory" }
 finch-providers = { path = "crates/finch-providers" }
 finch-vm = { path = "crates/finch-vm" }
 
@@ -198,6 +201,10 @@ capnpc = "0.24"
 [dev-dependencies]
 semver = "1"
 vte = "0.15"  # ANSI/VT byte parser for production console-writer regressions
+# Enables finch-memory's hydration batch/completion/sweep test pauses only for
+# finch's own dev/test builds (resolver = "2" keeps this out of the release
+# artifact); see the `test-support` feature doc in crates/finch-memory/Cargo.toml.
+finch-memory = { path = "crates/finch-memory", features = ["test-support"] }
 h2 = "0.4.16"  # Raw HTTP/2 protocol fixtures for transport-boundary regressions
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }  # Raw WSS protocol fixtures for TLS transport-boundary regressions
 mockito = "1.2"

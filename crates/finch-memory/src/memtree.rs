@@ -689,7 +689,7 @@ impl Default for MemTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embeddings::{EmbeddingEngine, TfIdfEmbedding};
+    use crate::embeddings::{EmbeddingEngine, TfIdfEmbedding};
 
     /// Unit vector pointing mostly along `axis`, with `noise` spread elsewhere.
     fn vec_on(axis: usize, dim: usize, noise: f32) -> Vec<f32> {

@@ -1,8 +1,8 @@
-# memory — public interface
+# finch-memory — public interface
 
-Generated from [`src/memory/mod.rs`](mod.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
+Generated from [`crates/finch-memory/src/lib.rs`](src/lib.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
 
-- **Facade:** `src/memory/mod.rs`
+- **Facade:** `crates/finch-memory/src/lib.rs`
 - **Capsule:** [`AGENTS.md`](AGENTS.md)
 
 Everything below is what callers outside this module can reach. Implementation modules are private; their contents are deliberately absent.
@@ -14,8 +14,8 @@ Everything below is what callers outside this module can reach. Implementation m
 pub struct BrainConversationProvenance { … }
 /// Summary of conversation topics derived from MemTree centroid queries.
 pub struct ConversationSummaryLines { … }
-#[cfg(test)]
-pub(crate) struct HydrationBatchPauseRegistration { … }
+#[cfg(any(test, feature = "test-support"))]
+pub struct HydrationBatchPauseRegistration { … }
 /// Progress of the background MemTree hydration.
 pub enum HydrationStatus { Ready, Loading, Degraded, Failed }
 pub struct InspectedMemory { … }
@@ -158,15 +158,21 @@ pub fn average_embeddings(embeddings: &[&Vec<f32>]) -> Vec<f32> { … }
 /// Compute cosine similarity between two embedding vectors
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 { … }
 /// Hold the production loader after `after_loaded` nodes so a test can observe a genuinely `Loading` index.
-#[cfg(test)]
-pub(crate) fn register_hydration_batch_pause(path: PathBuf, after_loaded: usize) -> (HydrationBatchPauseRegistration, watch::Receiver<bool>, watch::Sender<bool>) { … }
+#[cfg(any(test, feature = "test-support"))]
+pub fn register_hydration_batch_pause(path: PathBuf, after_loaded: usize) -> (HydrationBatchPauseRegistration, watch::Receiver<bool>, watch::Sender<bool>) { … }
 ```
 
 ## Constants
 
 ```rust
 /// Nodes hydrated per batch.
-pub(crate) const HYDRATION_BATCH: usize = 512;
+pub const HYDRATION_BATCH: usize = 512;
+```
+
+## Modules
+
+```rust
+pub mod memory_status;
 ```
 
 ## Referenced but not exported
