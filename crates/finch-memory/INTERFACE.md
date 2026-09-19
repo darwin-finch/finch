@@ -120,6 +120,8 @@ impl MemorySystem {
     pub fn hydration_status(&self) -> HydrationStatus;
     /// Create a new memory system with the TF-IDF fallback engine.
     pub fn new(config: MemoryConfig) -> Result<Self>;
+    /// Create a memory system against an already-open connection.
+    pub fn new_with_connection(db: Arc<Mutex<Connection>>, config: MemoryConfig, embedding_engine: Arc<dyn EmbeddingEngine>) -> Result<Self>;
     /// Create a memory system that embeds with the caller-supplied engine.
     pub fn new_with_engine(config: MemoryConfig, embedding_engine: Arc<dyn EmbeddingEngine>) -> Result<Self>;
     /// Root containing user-readable program sources beside the memory database.
