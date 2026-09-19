@@ -1330,3 +1330,15 @@ shape as coherence's one-implementation-per-(concept,type) rule. Worked example 
 `feature_tour.md` §25: a CoLisp module with a `pkg`-visible helper called directly from a Co-Forth
 module in the same package, re-exported through `package.colisp`, with the `pkg` boundary enforced
 against a caller outside the package.
+
+**Continued 2026-09-19 — corrected the just-added module-identity design: source root ambiguity is
+real, but the fix is the package-retrieval layer, not D's per-file declaration.** Shammah recalled
+that D's redundant per-file `module` declaration exists for a reason — resolving which of several
+`-I` search roots a file belongs to, including bare/direct file compilation with no search path at
+all. That's a real, legitimate purpose, not one to dismiss the way the previous entry implicitly did
+by proposing pure path-derivation with no declaration anywhere. But Finch already has a stronger
+answer available than D's: the package-retrieval layer (lockfile/dependency declarations) already
+gives an authoritative, non-guessed root-to-package mapping for every package in a build, including
+the main project via its own manifest. Corrected the design to resolve a file's path relative to its
+*owning package's* declared root (known from the dependency graph, resolved once per package) rather
+than either D's per-file declaration or unresolved `-I`-order guessing.

@@ -483,8 +483,19 @@ module-private default and `pub`: a `pkg`-marked declaration is visible to every
 lives anywhere under that package's directory, including nested sub-packages, but not outside it —
 verified against LDC's actual enforcement of the equivalent D behavior (a nested sub-package's module
 could read a parent package's `package`-visible symbol; a module outside the package tree entirely
-got a real "undefined identifier" error, not a warning). Where a project's source root itself is
-declared is part of the package-retrieval layer above, not restated here.
+got a real "undefined identifier" error, not a warning).
+
+A file's path is always resolved relative to *its owning package's* declared root, never guessed
+from search-path order the way D's `-I` flags leave ambiguous once more than one is in play (a real
+reason D's per-file `module` declaration exists, not one to dismiss). Finch does not need that
+per-file declaration to answer the same question, because the package-retrieval layer above already
+answers it at the right granularity: every package in the build — the main project and each
+dependency alike — has exactly one declared root, resolved once from the lockfile/dependency graph
+(a dependency's locator and content hash already fix its root directory; the main project's own
+name and root come from its own manifest, the one place this is stated, not per file). A file's full
+module path is therefore `<owning package>.<path relative to that package's root>`, computed from
+information the compiler already has authoritatively, never from which of several `-I`-equivalent
+search roots happens to contain a matching file first.
 
 The repository now contains the first verified typed path: both frontends lower directly to typed
 IR, the typed runtime owns a `Vec<TypedValue>` stack, effects are resource-scoped capability
