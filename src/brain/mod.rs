@@ -706,19 +706,71 @@ fn verify_supervisor_image(
     // observe two different files.
     let metadata = file.metadata()?;
     let identity = format!("{}:{}", metadata.dev(), metadata.ino());
-    let read_start = std::time::Instant::now();
-    let mut image = Vec::new();
-    file.read_to_end(&mut image)?;
-    let read_elapsed = read_start.elapsed();
-    let hash_start = std::time::Instant::now();
-    let digest = hex::encode(Sha256::digest(&image));
-    tracing::debug!(
-        executable = %executable.display(),
-        image_bytes = image.len(),
-        read_ms = read_elapsed.as_millis(),
-        hash_ms = hash_start.elapsed().as_millis(),
-        "supervisor executable image read and hashed"
-    );
+
+    // The read+SHA-256 of the whole supervisor image is the expensive part of
+    // a proof validation (a multi-megabyte binary; four startup call sites in
+    // one daemon paid it four times — issue #858's consistent ~42s CI delay).
+    // The image cannot be swapped without changing (identity, size, mtime),
+    // so the digest is memoized under a fresh fstat guard and every per-call
+    // security comparison below still runs against the proof actually handed
+    // to this call. A same-inode in-place overwrite changes size or mtime and
+    // invalidates the memo; a relink changes the inode outright.
+    struct MemoizedImageDigest {
+        identity: String,
+        size: u64,
+        mtime: Option<std::time::SystemTime>,
+        digest: String,
+    }
+    static IMAGE_DIGEST_MEMO: std::sync::Mutex<Option<MemoizedImageDigest>> =
+        std::sync::Mutex::new(None);
+
+    let memo_hit = IMAGE_DIGEST_MEMO
+        .lock()
+        .map(|memo| {
+            memo.as_ref().is_some_and(|entry| {
+                entry.identity == identity
+                    && entry.size == metadata.len()
+                    && entry.mtime == metadata.modified().ok()
+            })
+        })
+        .unwrap_or(false);
+
+    let digest = if memo_hit {
+        IMAGE_DIGEST_MEMO
+            .lock()
+            .map(|memo| {
+                memo.as_ref()
+                    .expect("memo hit checked above")
+                    .digest
+                    .clone()
+            })
+            .unwrap_or_default()
+    } else {
+        let read_start = std::time::Instant::now();
+        let mut image = Vec::new();
+        file.read_to_end(&mut image)?;
+        let read_elapsed = read_start.elapsed();
+        let hash_start = std::time::Instant::now();
+        let computed = hex::encode(Sha256::digest(&image));
+        #[cfg(test)]
+        SUPERVISOR_IMAGE_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tracing::debug!(
+            executable = %executable.display(),
+            image_bytes = image.len(),
+            read_ms = read_elapsed.as_millis(),
+            hash_ms = hash_start.elapsed().as_millis(),
+            "supervisor executable image read and hashed"
+        );
+        if let Ok(mut memo) = IMAGE_DIGEST_MEMO.lock() {
+            *memo = Some(MemoizedImageDigest {
+                identity: identity.clone(),
+                size: metadata.len(),
+                mtime: metadata.modified().ok(),
+                digest: computed.clone(),
+            });
+        }
+        computed
+    };
 
     if let Some(path_digest) = content_addressed_supervisor_digest(executable) {
         anyhow::ensure!(
@@ -829,39 +881,44 @@ fn process_executable(pid: u32) -> anyhow::Result<std::path::PathBuf> {
 static PROOF_VALIDATION_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+static SUPERVISOR_IMAGE_HASH_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Number of times the full FD9 restore-and-verify transaction actually ran
-/// in this process, as opposed to being served from the cache below. A
-/// single `finch daemon` process calls into the proof at four separate
-/// sites over its startup (`run_daemon`, `AgentServer::new`,
-/// `AgentServer::serve`, `prepare_ipc_listener`); before caching, each one
-/// re-opened and re-hashed the full supervisor executable (issue #858 — a
-/// consistent ~42s startup delay isolated to exactly this redundant work).
+/// in this process. Every proof-validation call site runs the full
+/// authentication per call — a hostile or replaced proof descriptor must be
+/// judged on its own bytes, never a cached verdict.
 #[cfg(test)]
 pub(crate) fn proof_validation_call_count_for_tests() -> usize {
     PROOF_VALIDATION_CALLS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// FD9, the inherited listeners, and the environment are sealed once at the
-/// supervisor's `exec`, so re-deriving the proof after the first successful
-/// validation only pays disk and CPU cost for the same answer. Cached for
-/// the life of the process, not merely memoized per call site, so all four
-/// production call sites in a daemon's startup share one validation.
+/// Number of times the supervisor executable was read and hashed in this
+/// process. The digest is memoized per (identity, size, mtime) below, so a
+/// daemon that validates its proof at four startup sites pays the multi-MB
+/// read+hash once (issue #858 — the consistent ~42s CI delay), while every
+/// call still authenticates the proof it was actually handed.
+#[cfg(test)]
+pub(crate) fn supervisor_image_hash_count_for_tests() -> usize {
+    SUPERVISOR_IMAGE_HASH_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// FD9, the inherited listeners, and the environment are sealed at the
+/// supervisor's `exec`, but hostile and reconnect paths present different
+/// proof descriptors to the same process — so the *authentication verdict*
+/// is never cached. What is memoized is the expensive part only: the
+/// supervisor executable's read+SHA-256 (see [`verify_supervisor_image`]),
+/// guarded by a fresh fstat so an in-place image swap invalidates it.
 fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<u8>)> {
-    static CACHE: std::sync::OnceLock<Result<(IsolatedTestProof, Vec<u8>), String>> =
-        std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let start = std::time::Instant::now();
-            let result = isolated_test_proof_with_encoded_uncached();
-            tracing::debug!(
-                elapsed_ms = start.elapsed().as_millis(),
-                ok = result.is_ok(),
-                "supervisor proof validated (cached for the remaining process lifetime)"
-            );
-            result.map_err(|error| format!("{error:#}"))
-        })
-        .clone()
-        .map_err(|message| anyhow::anyhow!(message))
+    let start = std::time::Instant::now();
+    let result = isolated_test_proof_with_encoded_uncached();
+    tracing::debug!(
+        elapsed_ms = start.elapsed().as_millis(),
+        ok = result.is_ok(),
+        "supervisor proof validated for this call site"
+    );
+    result
 }
 
 fn isolated_test_proof_with_encoded_uncached() -> anyhow::Result<(IsolatedTestProof, Vec<u8>)> {
@@ -1531,12 +1588,17 @@ mod isolation_tests {
     /// cache; this asserts the structural fact — exactly one validation no
     /// matter how many call sites ask — rather than a wall-clock comparison.
     #[test]
-    fn test_isolated_test_proof_validates_supervisor_image_once_per_process() {
+    fn test_proof_authentication_runs_per_call_while_the_image_digest_is_memoized() {
         if !supervisor_contract_present() {
             return;
         }
+        // Every call runs the full authentication transaction against the
+        // proof it was handed: a hostile or replaced descriptor must never be
+        // judged by a cached verdict (the self-issued-proof rejection path
+        // depends on this).
         isolated_test_proof().expect("first proof validation must succeed");
         let calls_after_first = proof_validation_call_count_for_tests();
+        let hashes_after_first = supervisor_image_hash_count_for_tests();
         assert!(
             calls_after_first >= 1,
             "the proof must have been validated at least once by now; calls={calls_after_first}"
@@ -1548,11 +1610,32 @@ mod isolation_tests {
             .expect("supervisor contract is present, so the proof must be Some");
 
         let calls_after_more = proof_validation_call_count_for_tests();
-        assert_eq!(
-            calls_after_more, calls_after_first,
-            "isolated_test_proof() must be served from the process-lifetime cache after its \
-             first successful validation, not re-open and re-hash the supervisor executable on \
-             every call site; calls_after_first={calls_after_first} calls_after_more={calls_after_more}"
+        assert!(
+            calls_after_more > calls_after_first,
+            "each proof-validation call site must run the authentication transaction \
+             for the proof it was handed; calls_after_first={calls_after_first} \
+             calls_after_more={calls_after_more}"
+        );
+
+        // The expensive part — reading and hashing the whole supervisor
+        // executable — is memoized per (identity, size, mtime): a daemon that
+        // validates its proof at four startup sites pays it once (issue
+        // #858's consistent ~42s CI delay). Other tests may have populated or
+        // evicted the single memo slot with other files, so the invariant is
+        // delta-based: three consecutive validations of the SAME image hash
+        // it at most once.
+        let hashes_before = supervisor_image_hash_count_for_tests();
+        isolated_test_proof().expect("memoized-digest first validation must succeed");
+        isolated_test_proof().expect("memoized-digest second validation must succeed");
+        isolated_test_proof_if_present()
+            .expect("memoized-digest third validation must succeed")
+            .expect("supervisor contract is present, so the proof must be Some");
+        let hashes_after = supervisor_image_hash_count_for_tests();
+        let hashed = hashes_after - hashes_before;
+        assert!(
+            hashed <= 1,
+            "consecutive proof validations of the same supervisor image must hash the \
+             image at most once; hashed {hashed} times across 3 validations"
         );
     }
 
