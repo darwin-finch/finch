@@ -1222,3 +1222,59 @@ Two new gaps logged rather than guessed at: conditional/bounded generic implemen
 across independently-compiled modules (whether Finch needs Rust's orphan-rule restriction on
 implementing foreign concepts for foreign types, or defers the conflict to link time) — both added
 to `feature_tour.md` §18.
+
+**Continued 2026-09-18/19 — primitive numeric types, conversion, and overflow specified from
+scratch, verified against a real D compiler and a real rejected D proposal rather than assumed.**
+Shammah asked directly whether other holes remained, specifically naming primitives; checking turned
+up a real, previously-unnoticed gap: the only integer/float types anywhere in the document were
+`int`/`uint` (both fixed 64-bit, "initially") and `float` (fixed `binary64`, "initially") — no sized
+family, and the semantic-profile section had explicitly flagged "arithmetic overflow" and "numeric
+conversion" as things "the versioned specification must state" without ever actually stating them.
+Also surfaced a real mistake of mine: `i64`/`u64`/`f64` had been used casually in several examples
+this session as though already-established type names, when they weren't.
+
+Design resolved through direct empirical and historical research rather than default assumption,
+each piece checked before being written in:
+
+- **Signed lengths/indices, not unsigned** — Shammah's own recollection of a blog-post argument
+  (unsigned sizes/indices cause underflow-to-huge-value bugs) confirmed as a real, well-known
+  position (Swift/C#/Java all chose signed deliberately; Rust/C++ kept unsigned and are the
+  languages this exact critique targets), distinguished the two real arguments (underflow-to-huge
+  vs. signed/unsigned mixing friction) from the weaker, more C/C++-specific "UB enables optimization"
+  argument Finch's own no-UB ethos doesn't lean on.
+- **D's value-range propagation, verified empirically against LDC, not assumed from memory** —
+  confirmed real and genuinely better than C for width-narrowing (`byte b = 100;` compiles, `byte b
+  = 300;` and non-constant narrowing don't), but confirmed to apply *no* check at all to same-width
+  signed/unsigned conversion (`uint y = -1;` compiles silently) — a real gap in D's own safety story,
+  not a hypothetical.
+- **Walter Bright's actual position, read from the real rejected D proposal
+  ("Deprecate implicit conversion between signed and unsigned integers")** rather than guessed: he
+  declined the fix not because the bugs aren't real (he cites Stroustrup's 2018 "Subscripts and sizes
+  should be signed" paper himself) but because "every proposal... cause[s] an equivalent number of
+  new issues" specific to warnings breaking template-instantiation consistency across differently-
+  configured modules, plus "D is a systems programming language, and trying to hide what the machine
+  actually does usually results in awkwardness." His actual alternative is context-dependent
+  (unsigned for never-negative values and pointer offsets specifically, signed otherwise), not
+  blanket-signed — folded in as the deliberate exception for raw-pointer/FFI-boundary arithmetic
+  rather than eliminating unsigned. Shammah's own framing: this is exactly why a from-scratch
+  language can take the strict rule Bright rejected — no legacy corpus to break, and a hard compile
+  error (not a warning) sidesteps the specific template-consistency problem he cited.
+- **Explicit `cast`, never gated behind `unsafe`** — checked against the document's own already-
+  established scope for `unsafe` (`unsafe.memory`, raw pointers, unverifiable FFI contracts,
+  explicitly "unhosted native profile only") and confirmed numeric truncation belongs in neither
+  category: fully deterministic and memory-safe, never able to corrupt memory or invoke undefined
+  behavior, just potentially not the value intended — a real, different, and much weaker risk
+  category than what `unsafe` actually gates elsewhere in the document. `as` was already taken for
+  an unrelated pattern-binding form, so the new operator is `cast`, not `as`.
+- **Overflow traps unconditionally, the same in every build** — deliberately not Rust's debug/release
+  split, named directly as the same category of inconsistency this document already rejects elsewhere
+  (a value's behavior depending on which path/configuration produced it, per the `core`/`core.thread`
+  root-package bug and the `is()`/constraint-clause binding gotcha). Wrapping/saturating/checked
+  variants remain available as named operations, never as an ambient build-mode toggle on `+` itself.
+
+Added: `i8`/`i16`/`i32`/`i64`, `u8`/`u16`/`u32`/`u64`, `f32`/`f64` as the real sized-numeric family,
+with `int`/`uint`/`float` as aliases for `i64`/`u64`/`f64` rather than the only names that exist —
+retroactively validating rather than requiring a fix for this session's earlier `i64`/`u64`/`f64`
+usage. Worked example added as `feature_tour.md` §24. The semantic-profile TODO bullet and the
+"according to language policy" cross-reference in the work-packages section both updated to point at
+the new content instead of a still-unwritten forward reference.

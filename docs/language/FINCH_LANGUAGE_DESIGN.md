@@ -607,9 +607,15 @@ The language-level value model begins with:
 ```text
 unit             no meaningful result
 bool             true or false
-int              signed 64-bit integer initially
-uint             unsigned 64-bit integer initially
-float            IEEE-754 binary64 initially
+i8, i16, i32, i64    signed integers, explicit width
+u8, u16, u32, u64    unsigned integers, explicit width
+int              alias for i64 — the default signed integer, and the type of an
+                  ordinary-length/index/size value (below)
+uint             alias for u64 — the default unsigned integer, for values that are
+                  never negative by definition (a bitmask, a hash, a raw byte count
+                  at an FFI/pointer boundary) rather than a general-purpose choice
+f32, f64         IEEE-754 binary32/binary64
+float            alias for f64
 char             Unicode scalar value
 string           immutable owned valid-UTF-8 text value
 bytes            immutable owned contiguous byte sequence
@@ -647,6 +653,53 @@ dynamic dispatch cost merely because the Lisp frontend exists.
 
 The serialized `ProgramValue` form is the wire/checkpoint representation, not necessarily the
 in-memory stack layout.
+
+### Numeric types: widths, conversion, overflow, and casts
+
+**Lengths, indices, and sizes are signed (`int`), not unsigned, deliberately diverging from C++
+and Rust.** `.len()`, indexing, and `array<T,N>`'s runtime-facing size are all `int`. This follows
+Swift, C#, and Java rather than C++/Rust's `size_t`/`usize`, for two reasons verified rather than
+assumed: an empty collection's `len() - 1` is `-1` — an obviously-wrong value a comparison catches
+immediately — rather than wrapping to a huge positive number that looks like a valid index and
+walks into a buffer overrun; and mixing signed arithmetic with an unsigned length otherwise forces
+constant casting throughout ordinary code, which compounds. Bjarne Stroustrup's 2018 "Subscripts and
+sizes should be signed" and a rejected D proposal to fix this (Walter Bright declined it — not from
+disagreeing that the bugs are real, but because fixing it after the fact in an existing language with
+warning-based tooling and template-instantiation compatibility to preserve "cause an equivalent
+number of new issues") both informed this. A raw pointer offset at an FFI/unsafe boundary is the one
+deliberate exception — genuinely never negative by construction, distinct from an ordinary length —
+and stays `uint` there, matching Bright's own guideline (unsigned for never-negative-by-definition
+values and pointer offsets specifically, signed otherwise) rather than eliminating unsigned outright.
+
+**Widening is implicit; narrowing requires an explicit `cast`, checked at compile time when
+possible.** `i8 -> i16 -> i32 -> i64` and `u8 -> u16 -> u32 -> u64` and `f32 -> f64` widen without a
+cast, as in every language with sized numerics. Every narrowing direction — smaller width, float to
+integer, and signed to unsigned or unsigned to signed at *any* width including the same one —
+requires `(cast Target expr)`, verified with D's actual value-range propagation confirmed against a
+real compiler rather than assumed: a compile-time-constant expression that provably fits the
+target's range is accepted; a compile-time-constant that does not fit, or a non-constant expression
+without an explicit `cast`, is a compile error. This closes a real, empirically-confirmed gap in D's
+own implementation of this idea: D checks width-narrowing this way but was verified this session to
+apply *no* check at all to signed/unsigned conversion at the same width, silently accepting `uint y
+= -1;` — exactly the bug class its own value-range propagation exists to prevent elsewhere. Finch's
+`cast` covers both cases uniformly, so nothing gets the D-specific pass-through.
+
+`cast` is never gated behind `unsafe`. Narrowing or reinterpreting a number is fully deterministic
+and memory-safe every time — it may not be the value you meant, but it can never corrupt memory or
+invoke undefined behavior, which is what `unsafe` (`unsafe.memory`, raw pointers, unverifiable FFI
+contracts, elsewhere in this document) actually gates. Conflating "semantically surprising but
+well-defined" with "can corrupt memory" would blur a distinction the rest of the design keeps sharp.
+
+**Overflow on an ordinary operator traps, unconditionally — not a debug/release split.** `+`, `-`,
+and `*` on any integer type check for overflow and fail (matching the language's existing
+uncaught-error/trap semantics, not silent UB) the same way in every build, avoiding Rust's own
+well-known wart where `+` wraps in release builds and panics in debug builds — the same operator
+silently meaning two different things depending on how the whole program happened to be compiled is
+exactly the kind of representation-depends-on-provenance inconsistency this document already rejects
+elsewhere (the `core`/`core.thread` root-package bug, is()/constraint-clause binding). A caller who
+actually wants wrapping, saturating, or a checked `result` instead of a trap reaches for a named
+operation (`wrapping-add`, `saturating-add`, `checked-add`) rather than an ambient build flag
+silently changing what an ordinary `+` means.
 
 ### Text, arrays, slices, vectors, and lists
 
@@ -3323,7 +3376,10 @@ versioned specification must state:
 - eager left-to-right argument evaluation;
 - lexical scope;
 - proper tail calls where marked by the IR;
-- exact behavior of truth, `nil`, equality, arithmetic overflow, and numeric conversion;
+- exact behavior of truth and `nil` — **arithmetic overflow and numeric conversion are now specified**
+  ("Numeric types: widths, conversion, overflow, and casts," above): overflow traps unconditionally,
+  narrowing and signed/unsigned conversion require an explicit `cast` checked by value-range
+  propagation where possible; truth/`nil`/equality remain open;
 - immutable-by-default collections;
 - mutation only through typed references with explicit `vm.write` effects;
 - exceptions versus `result<T,E>` behavior;
@@ -5217,7 +5273,8 @@ embedding contract.
   handler activation must cover the protected expression before its first call. Preserve the typed
   payload, runtime type identity, and compact provenance envelope without turning every call into a
   source-level `result` value.
-- Lower checked arithmetic with explicit overflow/division side exits according to language policy.
+- Lower checked arithmetic with explicit overflow/division side exits: unconditional trapping on
+  overflow, the same in every build, per "Numeric types: widths, conversion, overflow, and casts."
 - Call stable portable runtime shims for allocation, capability requests, task operations, and complex
   managed-value operations.
 - Core owners require no tracing safepoints. An explicit tracing-arena owner extension supplies and

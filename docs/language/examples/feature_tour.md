@@ -998,3 +998,41 @@ Worth keeping the superseded version on record rather than deleting it silently:
 check above was a real, reasonable answer to the question actually asked at the time, and it took a
 sharper, more basic question — not a flaw found in the check itself — to reveal that the question
 should never have been "how do we tell duplicates apart" at all.
+
+## 24. Sized numeric types, signed indexing, explicit `cast`, and unconditional overflow traps
+
+The primitive-type gap this section closes was real: before this pass, the only integer/float types
+anywhere in the document were `int`/`uint` (both fixed 64-bit, "initially") and `float` (fixed
+`binary64`, "initially") — no sized family, no stated overflow policy despite the semantic-profile
+section explicitly flagging one as required, and no numeric-conversion rules at all. Verified against
+a real D compiler along the way (not assumed): D's value-range propagation genuinely does check
+width-narrowing better than C, but was confirmed to apply *no* check at all to same-width
+signed/unsigned conversion — `uint y = -1;` compiles silently in D — exactly the bug class Bjarne
+Stroustrup's "Subscripts and sizes should be signed" describes and a rejected D proposal tried and
+failed to fix (Walter Bright declined it for reasons specific to fixing an existing 20-year-old
+language, not because the bugs aren't real).
+
+```lisp
+(define (last-index (v : &vector<int>)) : int
+  (- (len v) 1))                    ; empty vector -> -1, an obviously-wrong sentinel a caller can
+                                     ; check, never a wrapped-to-huge-positive index (uint would)
+
+(define (truncate-to-byte (x : int)) : u8
+  (cast u8 x))                      ; explicit, required — x is a runtime value, not a
+                                     ; compile-time-known constant
+
+(let [ok (cast u8 200)]             ; compiles: literal 200 provably fits u8's range
+  ok)
+
+; (let [bad (cast u8 300)])         ; REJECTED at compile time — 300 provably does not fit u8
+
+(define (checked-sum (a : int) (b : int)) : int
+  (+ a b))                          ; traps on overflow, unconditionally, the same in every build --
+                                     ; never Rust's release-mode silent wraparound
+```
+
+Retroactively confirms rather than corrects several earlier examples: `i64`, `u64`, `f64`, and `f32`
+were used in a few places earlier this session (§19's `Codec` axiom, the `DistinctPair` axiom
+example) before this vocabulary existed — those are now genuinely valid type names rather than
+errors needing a fix, since `int`/`uint`/`float` are aliases for `i64`/`u64`/`f64`, not the only
+names that exist.
