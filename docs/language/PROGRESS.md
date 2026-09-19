@@ -962,9 +962,24 @@ messages" gist, unmodified):
 
 - A candidate providing only a **const** member satisfies a concept requiring a **non-const**
   member (`true`); a candidate providing only a **non-const** member does **not** satisfy a concept
-  requiring **const** (`false`). Confirmed real and asymmetric — not the naive-intuitive direction
-  (a "more restricted" const method reads as though it should be harder to satisfy, not easier).
-- The sharpest finding: an overloaded member (`front() const` and a differently-typed `front()`
+  requiring **const** (`false`). Confirmed real and asymmetric, and — corrected after Shammah's own
+  read — this direction is *sound*, not a quirk: identical to Rust's `&`/`&mut` reborrowing rule. A
+  `const` method promises it needs only read access, so it is callable through either a mutable or a
+  const receiver and trivially satisfies a slot that only ever calls it via a receiver that happens
+  to be mutable; a mutable-only method demands exclusive access a const-only receiver can never
+  grant. This specific sub-case is not evidence of a checker defect.
+- Also from Shammah: the diagnostic mode's `printMsgs` boolean and separate `conceptDiagnostic`
+  mixin were not a design nicety but a forced workaround — `isConcept` gets speculatively
+  instantiated during SFINAE overload resolution (each `if(isConcept!(...))`-constrained overload
+  tried and silently discarded on failure), so an unconditional `pragma(msg, ...)` would print for
+  candidates never actually selected. Diagnostics had to be manually toggled off by default and
+  invoked deliberately from an unconstrained fallback overload, specifically to avoid attributing
+  noise to discarded speculative instantiations. This is retroactive supporting evidence for the new
+  spec section's diagnostic commitment being unconditional (no opt-in mode): it is only possible to
+  make it unconditional because Finch's evidence is already resolved explicitly before checking
+  runs, so there is no speculative trial-and-discard phase for a diagnostic to leak out of.
+- The sharpest remaining finding, unrelated to constness: an overloaded member (`front() const` and
+  a differently-typed `front()`
   side by side) does not behave as "the checker looks at the first declared overload." Direct probe:
   `typeof(__traits(getMember, T, "front")[0])` — indexing the overload set — evaluates to D's
   internal `_error_` placeholder, not a real type; `&member` on the same expression fails to
