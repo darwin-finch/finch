@@ -478,23 +478,25 @@ arguments happen to be literals.
 
 ```lisp
 (define (read-file (path : string)) : string
-  ! throws IoError
+  ! {fs.read(path=path)} throws IoError
   (fs-read-to-string path))
 
 (define config (read-file "config.txt"))
-; NOT eligible for CTFE-of-values folding — "config.txt" being a literal is irrelevant. read-file's
-; effect row (! throws IoError, and in a fuller example a capability requirement like
-; {fs.read(path=path)} alongside it) disqualifies it regardless of argument constancy. This call
-; happens at ordinary runtime, when `config` is actually initialized — never silently executed
-; against the build machine's filesystem just because the compiler could see a constant path.
+; NOT eligible for CTFE-of-values folding — "config.txt" being a literal is irrelevant. The
+; disqualifying part is specifically the {fs.read(path=path)} capability requirement, NOT
+; `throws IoError` on its own (corrected in the spec in the same pass this example was checked
+; against it: ! pure and throws are orthogonal, so a pure-but-throwing function stays eligible —
+; json/parse, used below, is exactly that case). This call happens at ordinary runtime, when
+; `config` is actually initialized — never silently executed against the build machine's
+; filesystem just because the compiler could see a constant path.
 ```
 
-No gap in the rule itself — `fib`/`choose`/`read-file` are exactly the case the eligibility
-addition was written to distinguish, and all three behave the way the rule says they should.
-**UNVERIFIED, not glossed:** the exact combined spelling for a capability requirement alongside
-`throws` in one effect row (`! {fs.read(path=path)} throws IoError`, guessed by analogy to the
-`!`-unification work) isn't shown together anywhere in a single real example — `read-file` above
-uses only `throws IoError` to stay inside confirmed syntax.
+No gap in the rule itself, corrected version — `fib`/`choose`/`json/parse` (below)/`read-file` are
+exactly the cases the eligibility addition distinguishes, and all four behave the way the corrected
+rule says they should. **UNVERIFIED, not glossed:** the exact combined spelling shown above
+(`! {fs.read(path=path)} throws IoError`) is a plausible combination by analogy to the
+`!`-unification work, not confirmed against a single real example showing a capability and `throws`
+together in one row.
 
 ## 14. Open gaps, current as of this pass — what's still missing and why
 

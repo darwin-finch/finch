@@ -3379,8 +3379,15 @@ known, so fold it" optimizer could try to run something like `read-file` at comp
 because its path argument was a literal — executing real I/O against the build machine's
 filesystem, a different and potentially not-yet-existent environment from the actual runtime one, a
 correctness and security hazard, not an edge case. `! pure` is the eligibility bar; anything with a
-capability-gated or throwing effect is never eligible for this kind of folding, full stop, regardless
-of how constant its arguments are. Purity alone doesn't guarantee termination, and requiring proven
+capability requirement is never eligible for this kind of folding, full stop, regardless of how
+constant its arguments are. **Corrected in the same edit that first tested this rule against a real
+example:** an earlier draft of this paragraph additionally excluded anything that `throws`, which
+contradicts the `!`-unification work above — `! pure` and `throws` are orthogonal axes, not
+mutually exclusive, so a `! pure throws ParseError` function (`json/parse`, say) is exactly as
+eligible as an unconditionally-total one. Throwing at compile time on bad input becomes an ordinary
+compile error, the same correctness signal it would be at runtime — nothing like the hazard a real
+capability effect (I/O, network) creates by actually touching something external. Purity alone
+doesn't guarantee termination, and requiring proven
 totality would be undecidable in general, so termination isn't a static precondition here — the
 safety net is a fuel/step limit, reusing the scheduler's own existing "cycle/fuel failure" concept
 (`require`, above) rather than a second mechanism, producing a compile error on exhaustion instead of
