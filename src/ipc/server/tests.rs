@@ -1680,6 +1680,68 @@ impl super::finch_ipc_capnp::brain_runner::Server for SocketApprovalRunner {
     }
 }
 
+/// #911: the local Cap'n Proto IPC socket has no authentication at the RPC
+/// layer (unlike the daemon's HTTP surface, which goes through
+/// `auth_middleware`) — filesystem permissions on the socket itself are the
+/// only boundary controlling who can call `FinchDaemon`/`BrainService`
+/// methods. `UnixListener::bind` alone leaves the socket at whatever the
+/// process umask allows, which was observed world-connectable
+/// (`srwxr-xr-x`) on a real host.
+///
+/// This calls the real production function (`harden_ipc_socket_permissions`,
+/// exercised inside `prepare_ipc_listener` at `src/ipc/server.rs`) against a
+/// real bound Unix socket, not a helper that only asserts the intended mode
+/// in isolation. It does not go through `prepare_ipc_listener` itself:
+/// `prepare_ipc_listener` has a separate early-return for supervised test
+/// runs that reuses an already-bound listener FD sealed into the test
+/// supervisor's proof (`isolated_test_proof_if_present`, `server.rs:2646`)
+/// and deliberately performs no pathname operation of its own in that case
+/// — so under `scripts/test_brains.sh` (always supervised), that branch
+/// would never reach the code this test exists to cover.
+#[cfg(unix)]
+#[test]
+fn test_harden_ipc_socket_permissions_makes_a_real_bound_socket_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // sockaddr_un.sun_path is capped around ~104 bytes; this environment's
+        // $TMPDIR (macOS per-user /var/folders/.../T/) is long enough on its
+        // own to blow that budget once tempfile adds its own subdirectory, so
+        // bind under /tmp directly rather than tempfile::tempdir()'s default.
+        let temp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let socket_path = temp.path().join("f.sock");
+
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let mode_before = std::fs::metadata(&socket_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        super::harden_ipc_socket_permissions(&socket_path).unwrap();
+
+        let mode_after = std::fs::metadata(&socket_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode_after,
+            0o600,
+            "IPC socket at {} must be owner-only (0600) after hardening; was {mode_before:o} \
+             before, {mode_after:o} after. This is the only boundary controlling who can call \
+             daemon RPC methods, since there is no auth check at the capnp-rpc layer.",
+            socket_path.display()
+        );
+
+        drop(listener);
+    });
+}
+
 #[test]
 fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation() {
     const IPC_TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
