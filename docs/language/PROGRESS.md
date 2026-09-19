@@ -644,6 +644,32 @@ the nested-`mixin` chain composes correctly, innermost-first (matching Python's 
 not a new convention). The `@`-stacking sugar itself is still unratified spelling — only the
 desugared, nested-`mixin` mechanics underneath it are now settled.
 
-**Now working through msgpack/protobuf-style derive serialization as an end-to-end composability
-stress test**, per direct instruction to "be creative with the AST system" and invent whatever
-`__traits`-equivalent compile-time reflection turns out to be needed. In progress below.
+**Continued 2026-09-18 — msgpack derive serialization written end to end (`feature_tour.md` §12),
+and it added a real hook, corrected before it shipped wrong, plus a batch of smaller gaps.**
+
+- **`fields-of` added** — the enumeration `members-of` doesn't cover (a record's fields, not an
+  implementation's operations). Shammah caught a real defect in the first draft before it was used
+  in the example: fields and `get`/`set` properties already resolve identically through `.`, so a
+  `fields-of` that only reported stored fields would silently miss get-only computed properties,
+  wrong specifically for serialize (which has every reason to include one) versus deserialize (which
+  must not try to write through one, since there's no setter). Fixed with a `kind` discriminator
+  (`field` / `property-readonly` / `property-read-write`) before the example was written, not after.
+- **Serialize and deserialize both written out concretely**, using `fields-of`'s `kind` filter,
+  `datum->syntax` for field-name promotion, and `mixin`'s eager-escape composition. Deserialize
+  deliberately builds a *fresh* constructor rather than reconstructing an existing signature — this
+  sidesteps the still-open `ParameterSpec -> syntax` gap entirely, since a brand-new constructor
+  needs no existing signature to rebuild.
+- **Composability confirmed, not just assumed**: both derives applied to the same record, alongside
+  an unrelated inherent operation from §1b, with no collision — direct consequence of the
+  already-established "two derives may both implement an operation... without creating a global-name
+  collision" hygiene guarantee, not a new mechanism needed.
+- **Five new, precisely-scoped gaps, all small utilities around an already-solid core** — nothing
+  suggesting the mechanism itself doesn't compose: `fresh-name` (implied by `datum->syntax`'s own
+  text, never itself named), `keyword-syntax-of` (bare symbol → `:name` keyword atom, unconfirmed
+  whether it's the same promotion `datum->syntax` does), splicing a variable-length keyword-argument
+  list into a record constructor specifically (plausible extension of established pack-splicing, not
+  separately confirmed), and an accumulating stdlib surface (`filter`/`map`/`flatten`/`eq?`/etc.)
+  worth resolving as a batch rather than one invented name per example going forward.
+- **Overall shape of this stress test**: the request was to find out whether the CTFE machinery
+  built tonight actually holds up for something real. It does — every gap found is a missing named
+  utility, not a defect in `fields-of`/`FunctionSpec`/`mixin`/hygiene/`! comptime` themselves.

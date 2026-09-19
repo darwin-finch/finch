@@ -315,7 +315,93 @@ capture mode (`weaken`) instead of the first three shown. `upgrade`'s `some`/`no
 called bare like this, or some other way, is still a guess — this example just confirms `weaken`
 *itself* is solid in the one place it's actually documented, narrowing rather than closing that gap.
 
-## 12. Open gaps, current as of this pass — what's still missing and why
+## 12. Derive-style msgpack serialization — an end-to-end CTFE stress test
+
+The real target this whole `syntax`/`FunctionSpec`/`members-of`/`fields-of`/`! comptime` mechanism
+was built to reach: a library-authored derive, no compiler support beyond the hooks already
+specified, generating real serialize/deserialize code from a record's own field list.
+
+```lisp
+(concept MsgPackSerializable
+  (operation serialize (&self) -> bytes))
+```
+
+**Serialize direction — reads any observable value, `kind` filter includes properties:**
+
+```lisp
+(define (derive-msgpack-serialize (rec : syntax)) : syntax
+  (let [flds (filter (lambda (f) (not (eq? (. f kind) 'property-writeonly))) (fields-of rec))]
+    (let [writes (map (lambda (f)
+                         (let [name-stx (datum->syntax (. f name) rec)]
+                           `(write-msgpack-field buf ,(. f name) (. self ,name-stx))))
+                       flds)]
+      `(implementation ,(fresh-name rec "MsgPack") for ,rec : MsgPackSerializable
+         (operation (serialize (self)) : bytes
+           (let [buf (new-msgpack-buffer)]
+             ,@writes
+             (msgpack-buffer-to-bytes buf)))))))
+
+(mixin (derive-msgpack-serialize Account))
+```
+
+**Deserialize direction — filters to only writable `kind`s, builds a fresh constructor rather than
+reusing an existing one (sidesteps the `ParameterSpec -> syntax` gap entirely — a fresh constructor
+needs no existing signature to reconstruct):**
+
+```lisp
+(define (derive-msgpack-deserialize (rec : syntax)) : syntax
+  (let [flds (filter (lambda (f) (or (eq? (. f kind) 'field)
+                                      (eq? (. f kind) 'property-read-write)))
+                      (fields-of rec))]
+    (let [kw-pairs (map (lambda (f)
+                          (list (keyword-syntax-of (. f name))
+                                `(read-msgpack-field buf ,(. f name))))
+                        flds)]
+      `(implementation ,rec
+         (constructor (from-msgpack-bytes (buf : bytes)) : ,rec
+           (,rec ,@(flatten kw-pairs)))))))
+
+(mixin (derive-msgpack-deserialize Account))
+```
+
+**Composability check — both derives applied to the same record, plus a `describe` operation from
+§1b already sitting on `Account`, testing whether independent derives collide:**
+
+```lisp
+(mixin (derive-msgpack-serialize Account))
+(mixin (derive-msgpack-deserialize Account))
+; Account.describe (§1b, inherent) untouched by either — different implementation blocks,
+; different names, no shared declaration surface to collide on.
+```
+
+**No gap in composability itself**, per the already-established rule: "two derives may both
+implement an operation spelled `serialize`... without creating a global-name collision" — hygiene
+already promises this, and nothing about running two independent `mixin` calls against the same
+record contradicts it. **Every genuinely new gap this surfaced is named precisely, not glossed:**
+
+- **`fresh-name`** — used to generate the serialize-implementation's name so two derives never
+  collide on it. `datum->syntax` distinguishes "hygienically fresh" from "caller-context" identifier
+  *construction*, implying a fresh-identifier operation exists, but never names it. Guessed here.
+- **`keyword-syntax-of`** — turns a bare field-name symbol into a `:name`-shaped keyword atom for
+  record-literal construction (`(rec :name val ...)`). Whether `:x` is the *same* kind of token
+  `datum->syntax` already promotes symbols into, or a genuinely different atom shape the reader
+  handles specially, is unconfirmed — flagged rather than assumed identical.
+- **`filter`/`map`/`flatten`/`list`** — assumed stdlib names, same category as `to-string`/`append`/
+  `join` flagged in §9; plausible, not confirmed.
+- **`eq?`/`'property-writeonly`-style quoted-symbol comparison** — assumes plain `'` (bare datum,
+  per the quote/quasiquote split) is the right way to write a comparison tag; not verified against
+  any real enum/tag-comparison example, since none exists in the document to check against.
+- **Record-literal construction from a *spliced, variable-length* keyword-argument list**
+  (`(,rec ,@(flatten kw-pairs))`) — `,@` splicing into a value position inside an ordinary call is
+  established for the `render-all`/pack-forwarding case (§9), but never specifically shown feeding a
+  *record constructor's* keyword-argument list; a plausible, not confirmed, extension.
+
+None of these are the kind of gap that suggests the design doesn't hold up — every one is a small,
+nameable missing utility function around an already-solid core (`fields-of`'s `kind` filter,
+`datum->syntax`, `mixin`'s eager-escape composition, hygiene's no-collision guarantee). That's a
+meaningfully different, better outcome than finding the *mechanism* itself doesn't compose.
+
+## 13. Open gaps, current as of this pass — what's still missing and why
 
 - **Capability requests with wildcarded paths** (`read{path="~/**"}`) — still ungrammared; unchanged
   since first flagged.
@@ -338,3 +424,18 @@ called bare like this, or some other way, is still a guess — this example just
   this pass) — the document says CTFE may inspect/slice/`foreach` a pack, but not whether the loop
   body itself runs as ordinary code (with ordinary effects) or is restricted to CTFE-only operations
   the way the pack's own existence is compile-time-only.
+- **`fresh-name`** (§12, new this pass) — a hygienically-fresh-identifier generator is implied by
+  `datum->syntax`'s own text ("constructing a hygienically fresh identifier is distinct from...")
+  but never itself named. Needed for any derive that must avoid colliding with another derive's
+  generated names.
+- **`keyword-syntax-of`** (§12, new this pass) — turning a bare symbol into a `:name`-shaped keyword
+  atom for record-literal construction; whether this is the same promotion `datum->syntax` already
+  does or a genuinely different reader-level atom shape is unconfirmed.
+- **Record-literal construction from a spliced, variable-length keyword-argument list** (§12, new
+  this pass) — `,@` splicing into an ordinary call's argument list is established for pack forwarding
+  (§9); specifically feeding a record constructor's keyword-arguments this way is a plausible,
+  unconfirmed extension of that same mechanism, not a new one.
+- **A stdlib surface accumulating across §9/§12** (`filter`, `map`, `flatten`, `append`, `join`,
+  `list`, `to-string`, `eq?`) — every one plausible, none confirmed against a real example. Worth
+  resolving as a batch at some point rather than one at a time per new example, since the pattern of
+  "invent a stdlib name, flag it, move on" is now recurring rather than incidental.
