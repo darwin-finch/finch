@@ -26,6 +26,14 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
 
+// Everything under `#[cfg(any(test, feature = "test-support"))]` from here
+// down to `pause_in_projection_sweep` (and its call sites further below) is
+// one seam: hydration batch/completion/sweep test pauses that
+// `src/runtime/tests.rs`, in the *root* crate, drives to get a genuinely
+// `Loading`/`Degraded` MemTree index. It is deliberately not plain
+// `#[cfg(test)]` — see the `test-support` feature comment in Cargo.toml for
+// why a bare `#[cfg(test)]` seam here would silently vanish from a dependent
+// crate's own test build. Add any future cross-crate test seam the same way.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct HydrationBatchPause {
@@ -121,6 +129,11 @@ static PROJECTION_SWEEP_PAUSES: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, Arc<ProjectionSweepPause>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+/// Guard returned by [`register_hydration_batch_pause`]. Holding it keeps the
+/// registered pause installed; dropping it deregisters the pause for `path`
+/// (if this registration is still the one on file for it), so a test that
+/// forgets to keep the guard alive cannot leave a stale pause behind for a
+/// later test on the same path.
 #[cfg(any(test, feature = "test-support"))]
 pub struct HydrationBatchPauseRegistration {
     path: PathBuf,
