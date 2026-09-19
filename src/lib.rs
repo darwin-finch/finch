@@ -125,4 +125,4 @@ pub mod tools; // Tool execution system
 pub mod training; // Batch training and checkpoints (Phase 2) // Offline Ed25519 commercial license key validation
 pub use finch_language as language; // Source compilation facade; returns ModuleVerified
 pub use finch_vm as vm; // Typed stack IR, verifier, capabilities, and language contracts
-pub(crate) mod workbook; // Bounding a worksheet before calamine materialises it (#282)
+pub(crate) mod workbook; // Compatibility facade over runtime-owned worksheet bounds (#282)

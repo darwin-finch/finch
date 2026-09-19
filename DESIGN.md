@@ -128,16 +128,21 @@ list is the whole surface. Direction is not mechanically enforced — `scripts/s
 the edges a directory actually has, and each capsule states which of them are intended. The edges
 below are measured from production `crate::` paths, either as an intended edge or as debt against
 the intended
-direction. `scripts/check_subsystems.py` fails on an undeclared edge and on a declared edge that
-no longer exists, so the record only shrinks as facade work lands. At the module level, nearly
-every top-level module still belongs to one strongly connected component (see the
-[snapshot](#snapshot)).
+direction. The intended `scripts/check_subsystems.py` enforcement does not yet exist in this
+repository, so these declarations are currently reviewed against `scripts/seam_cost.py` evidence
+instead of a subsystem CI gate. At the module level, nearly every top-level module still belongs
+to one strongly connected component (see the [snapshot](#snapshot)).
 
 Two-way edges that block the next extractions, one import each way. `vm` has no outgoing edge
 since [#584](https://github.com/darwin-finch/finch/issues/584). The former `runtime` ↔ `brain`
 loop is gone: production `src/runtime` no longer imports `brain` (there is no
 `src/runtime/scheduler.rs` and no `RunId` import). `src/brain/store.rs` still imports `runtime`,
 which is the intended direction (runtime layer 2, brain layer 4).
+
+Runtime's remaining outgoing edges are now only extracted-crate dependencies. MCP transport and
+editor-backed artifact proposals are application-injected ports, and the worksheet allocation
+bound used by runtime host I/O and the CLI preview is owned behind runtime's flat facade. Runtime
+does not import `cli`, `theme`, `tools`, or another root-package implementation module.
 
 Memory has no two-way edge and no production `crate::` import. Callers inject
 `EmbeddingEngine`; `models::neural_embedding` owns ONNX Runtime (`ort`), `tokenizers`, and

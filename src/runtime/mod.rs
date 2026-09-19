@@ -12,6 +12,7 @@ mod host;
 mod hostio;
 mod mcp;
 mod outcome;
+mod workbook;
 
 use host::*;
 
@@ -56,6 +57,7 @@ pub use effect_log::{
     MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES, MAX_EFFECT_AUDIT_REPLAY_FENCE_TRANSITION_BYTES,
 };
 pub use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
+pub use workbook::{bounded_worksheet_range, MAX_WORKBOOK_CELLS};
 
 use finch_programs::{ExecutionEffect, ProgramCompilerContext, ProgramLanguage, ProgramValue};
 pub(crate) use hostio::workbook_cell_to_string;
@@ -165,7 +167,9 @@ pub type TypedEffectSink = Arc<dyn Fn(VmEffectEnvelope) + Send + Sync>;
 /// embedder. Emitted presentation effects such as `say` are deliberately not
 /// included: they have no host result row and therefore continue immediately.
 ///
-/// `ProgramInvocations` preserves Finch's existing editor-proposal behavior.
+/// `ProgramInvocations` moves Finch's editor-proposal behavior to the
+/// application event loop. With no deferral, the application must bind an
+/// [`ArtifactProposalHost`] for synchronous compatibility.
 /// `AllAwaited` is the portable Runtime/Application boundary: an IDE, web
 /// host, or daemon can handle every approved host request and return a
 /// correlated [`VmResume`] without the VM knowing the host implementation.
@@ -407,6 +411,29 @@ pub trait RuntimeMcpClient: Send + Sync {
     ) -> Result<serde_json::Value>;
 }
 
+/// Application decision returned after presenting a program artifact for
+/// review. Runtime owns this data contract; the application owns how the
+/// proposal is displayed and edited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactProposalDecision {
+    Execute { source: String },
+    Chat { context: String },
+    Cancel,
+}
+
+/// Host-injected presentation boundary for synchronous `proposal-open`
+/// compatibility. Event-loop integrations should prefer deferred program
+/// effects and resume the portable effect explicitly.
+#[async_trait::async_trait]
+pub trait ArtifactProposalHost: Send + Sync {
+    async fn propose_artifact(
+        &self,
+        language: &str,
+        intent: &str,
+        source: &str,
+    ) -> Result<ArtifactProposalDecision>;
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ResourceRootState {
     bindings: BTreeMap<crate::vm::ResourceRoot, Arc<ResourceRootBindingRecord>>,
@@ -432,6 +459,9 @@ pub struct ProgramRuntime {
     /// Host-owned MCP transport. Installing it makes configured servers
     /// callable but never grants authority to any server or tool.
     mcp_client: RwLock<Option<Arc<dyn RuntimeMcpClient>>>,
+    /// Application-owned proposal presentation. Installing it preserves the
+    /// synchronous compatibility path without coupling runtime to a UI.
+    artifact_proposal_host: RwLock<Option<Arc<dyn ArtifactProposalHost>>>,
     host_vocabulary: RwLock<BTreeMap<String, HostVocabularyMetadata>>,
     network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
     /// Output handles are opaque, per-execution presentation resources.  They
@@ -750,6 +780,7 @@ impl ProgramRuntime {
             project_id,
             memory: RwLock::new(None),
             mcp_client: RwLock::new(None),
+            artifact_proposal_host: RwLock::new(None),
             host_vocabulary: RwLock::new(BTreeMap::new()),
             network: Arc::new(Mutex::new(HashMap::new())),
             output_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -963,6 +994,18 @@ impl ProgramRuntime {
             .read()
             .map(|client| client.is_some())
             .unwrap_or(false)
+    }
+
+    /// Install the application-owned artifact proposal presenter. This makes
+    /// synchronous `proposal-open` dispatch available; capability grants are
+    /// still required separately.
+    pub fn bind_artifact_proposal_host(&self, host: Arc<dyn ArtifactProposalHost>) -> Result<()> {
+        *self
+            .artifact_proposal_host
+            .write()
+            .map_err(|_| anyhow::anyhow!("artifact proposal host binding lock poisoned"))? =
+            Some(host);
+        Ok(())
     }
 
     /// Install the host-owned root behind `root<host-machine>`. This is an
@@ -3344,6 +3387,11 @@ impl ProgramRuntime {
             .read()
             .expect("MCP client binding lock poisoned")
             .clone();
+        let artifact_proposal_host = self
+            .artifact_proposal_host
+            .read()
+            .expect("artifact proposal host binding lock poisoned")
+            .clone();
         let mcp_output_schemas = self
             .host_vocabulary
             .read()
@@ -3404,6 +3452,7 @@ impl ProgramRuntime {
                 scheduler,
                 memory,
                 mcp_client,
+                artifact_proposal_host,
                 mcp_output_schemas,
                 vocabulary,
                 network,
@@ -3460,6 +3509,11 @@ impl ProgramRuntime {
             .mcp_client
             .read()
             .expect("MCP client binding lock poisoned")
+            .clone();
+        let artifact_proposal_host = self
+            .artifact_proposal_host
+            .read()
+            .expect("artifact proposal host binding lock poisoned")
             .clone();
         let mcp_output_schemas = self
             .host_vocabulary
@@ -3520,6 +3574,7 @@ impl ProgramRuntime {
                 scheduler,
                 memory,
                 mcp_client,
+                artifact_proposal_host,
                 mcp_output_schemas,
                 vocabulary,
                 network,

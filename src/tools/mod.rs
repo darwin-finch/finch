@@ -45,6 +45,33 @@ pub use permissions::{
     PermissionRule, ToolPermissionConfig, PEER_HARD_DENY_TOOLS, PEER_REVIEWED_CHANGESET_TOOLS,
     PEER_SILENT_ALLOW_TOOLS, VM_DISCOVERY_TOOLS,
 };
+
+/// Editor-backed application adapter for runtime's proposal presentation
+/// port. The runtime crate owns only the typed contract and never names this
+/// UI implementation.
+pub(crate) struct EditorArtifactProposalHost;
+
+#[async_trait::async_trait]
+impl crate::runtime::ArtifactProposalHost for EditorArtifactProposalHost {
+    async fn propose_artifact(
+        &self,
+        language: &str,
+        intent: &str,
+        source: &str,
+    ) -> anyhow::Result<crate::runtime::ArtifactProposalDecision> {
+        Ok(
+            match propose_artifact_with_decision(language, intent, source).await? {
+                ProposalDecision::Execute { source } => {
+                    crate::runtime::ArtifactProposalDecision::Execute { source }
+                }
+                ProposalDecision::Chat { context } => {
+                    crate::runtime::ArtifactProposalDecision::Chat { context }
+                }
+                ProposalDecision::Cancel => crate::runtime::ArtifactProposalDecision::Cancel,
+            },
+        )
+    }
+}
 pub use todo::{todo_journal, TodoJournalReceiver, TodoJournalTarget, TodoJournalWriter, TodoList};
 pub use types::{
     ContentBlock, EffectAuditAuthority, HostModeState, LiveOutput, LiveOutputSink, ToolContext,

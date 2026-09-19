@@ -18,6 +18,7 @@ pub(super) struct TypedHostHandler {
     scheduler: Option<agent_vm::AgentVmBinding>,
     memory: Option<Arc<finch_memory::MemorySystem>>,
     mcp_client: Option<Arc<dyn RuntimeMcpClient>>,
+    artifact_proposal_host: Option<Arc<dyn ArtifactProposalHost>>,
     mcp_output_schemas: BTreeMap<String, serde_json::Value>,
     vocabulary: String,
     network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
@@ -57,6 +58,7 @@ impl TypedHostHandler {
         scheduler: Option<agent_vm::AgentVmBinding>,
         memory: Option<Arc<finch_memory::MemorySystem>>,
         mcp_client: Option<Arc<dyn RuntimeMcpClient>>,
+        artifact_proposal_host: Option<Arc<dyn ArtifactProposalHost>>,
         mcp_output_schemas: BTreeMap<String, serde_json::Value>,
         vocabulary: String,
         network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
@@ -79,6 +81,7 @@ impl TypedHostHandler {
             scheduler,
             memory,
             mcp_client,
+            artifact_proposal_host,
             mcp_output_schemas,
             vocabulary,
             network,
@@ -2000,13 +2003,19 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                 let language = language.clone();
                 let intent = intent.clone();
                 let source = source.clone();
+                let Some(host) = self.artifact_proposal_host.clone() else {
+                    return Err(host_binding_error(
+                        origin,
+                        "proposal-open has no application proposal host binding",
+                    ));
+                };
                 self.mark_host_use();
                 let decision = block_on_host(async move {
-                    crate::tools::propose_artifact_with_decision(&language, &intent, &source).await
+                    host.propose_artifact(&language, &intent, &source).await
                 })
                 .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 let value = match decision {
-                    crate::tools::ProposalDecision::Execute { source } => TypedValue::Option {
+                    ArtifactProposalDecision::Execute { source } => TypedValue::Option {
                         inner_type: Type::Result(Box::new(Type::String), Box::new(Type::String)),
                         value: Some(Box::new(TypedValue::Result {
                             ok_type: Type::String,
@@ -2015,7 +2024,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                             value: Box::new(TypedValue::String(source)),
                         })),
                     },
-                    crate::tools::ProposalDecision::Chat { context } => TypedValue::Option {
+                    ArtifactProposalDecision::Chat { context } => TypedValue::Option {
                         inner_type: Type::Result(Box::new(Type::String), Box::new(Type::String)),
                         value: Some(Box::new(TypedValue::Result {
                             ok_type: Type::String,
@@ -2024,7 +2033,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                             value: Box::new(TypedValue::String(context)),
                         })),
                     },
-                    crate::tools::ProposalDecision::Cancel => TypedValue::Option {
+                    ArtifactProposalDecision::Cancel => TypedValue::Option {
                         inner_type: Type::Result(Box::new(Type::String), Box::new(Type::String)),
                         value: None,
                     },

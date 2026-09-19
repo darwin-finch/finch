@@ -749,6 +749,9 @@ pub struct SubmitProgramTool {
 
 impl SubmitProgramTool {
     pub fn new(runtime: Arc<ProgramRuntime>) -> Self {
+        runtime
+            .bind_artifact_proposal_host(Arc::new(crate::tools::EditorArtifactProposalHost))
+            .expect("artifact proposal host binding lock poisoned");
         Self {
             runtime,
             caller: None,
@@ -756,6 +759,9 @@ impl SubmitProgramTool {
     }
 
     pub fn child(runtime: Arc<ProgramRuntime>, caller: crate::scheduler::AgentIdentity) -> Self {
+        runtime
+            .bind_artifact_proposal_host(Arc::new(crate::tools::EditorArtifactProposalHost))
+            .expect("artifact proposal host binding lock poisoned");
         Self {
             runtime,
             caller: Some(caller),

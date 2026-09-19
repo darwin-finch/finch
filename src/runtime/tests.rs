@@ -1,11 +1,34 @@
 use super::VmEffectEnvelopeRuntimeMethods;
 use super::*;
 
+struct PassthroughArtifactProposalHost;
+
+#[async_trait::async_trait]
+impl ArtifactProposalHost for PassthroughArtifactProposalHost {
+    async fn propose_artifact(
+        &self,
+        _language: &str,
+        _intent: &str,
+        source: &str,
+    ) -> Result<ArtifactProposalDecision> {
+        Ok(ArtifactProposalDecision::Execute {
+            source: source.to_string(),
+        })
+    }
+}
+
+fn bind_passthrough_artifact_proposals(runtime: &ProgramRuntime) {
+    runtime
+        .bind_artifact_proposal_host(Arc::new(PassthroughArtifactProposalHost))
+        .unwrap();
+}
+
 fn production_host_handler(runtime: &ProgramRuntime) -> TypedHostHandler {
     let execution_id = uuid::Uuid::new_v4();
     TypedHostHandler::new(
         Arc::clone(&runtime.automation),
         Arc::clone(&runtime.resource_roots),
+        None,
         None,
         None,
         None,
@@ -3278,7 +3301,7 @@ fn read_workbook_rows_refuses_a_sheet_whose_box_cannot_be_allocated() {
     use std::io::Write;
 
     let mut file = tempfile::NamedTempFile::new().unwrap();
-    file.write_all(&crate::workbook::fixtures::two_cells_spanning_the_whole_sheet())
+    file.write_all(&super::workbook::fixtures::two_cells_spanning_the_whole_sheet())
         .unwrap();
     file.flush().unwrap();
 
@@ -3313,7 +3336,7 @@ fn read_workbook_rows_refuses_a_sheet_that_under_declares_its_extent() {
     use std::io::Write;
 
     let mut file = tempfile::NamedTempFile::new().unwrap();
-    file.write_all(&crate::workbook::fixtures::a_sheet_that_under_declares_its_extent())
+    file.write_all(&super::workbook::fixtures::a_sheet_that_under_declares_its_extent())
         .unwrap();
     file.flush().unwrap();
 
@@ -3342,7 +3365,7 @@ fn read_workbook_rows_reads_a_chart_first_workbook_as_empty() {
     use std::io::Write;
 
     let mut file = tempfile::NamedTempFile::new().unwrap();
-    file.write_all(&crate::workbook::fixtures::chartsheet())
+    file.write_all(&super::workbook::fixtures::chartsheet())
         .unwrap();
     file.flush().unwrap();
 
@@ -3732,7 +3755,7 @@ fn read_workbook_rows_still_reads_an_ordinary_sheet() {
     use std::io::Write;
 
     let mut file = tempfile::NamedTempFile::new().unwrap();
-    file.write_all(&crate::workbook::fixtures::xlsx(
+    file.write_all(&super::workbook::fixtures::xlsx(
         "A1:B2",
         &[
             ("A1", "one"),
@@ -4879,6 +4902,7 @@ async fn process_run_is_unavailable_without_stable_opened_object_execution() {
 #[tokio::test]
 async fn typed_proposal_open_is_an_explicit_capability_and_returns_edited_artifact_data() {
     let runtime = ProgramRuntime::new();
+    bind_passthrough_artifact_proposals(&runtime);
     let request = submission(
         ProgramLanguage::Lisp,
         "(proposal-open \"python\" \"show an artifact\" \"print('ok')\")",
@@ -4918,6 +4942,7 @@ async fn typed_proposal_open_is_an_explicit_capability_and_returns_edited_artifa
 #[tokio::test]
 async fn coforth_proposal_open_uses_the_same_typed_host_boundary() {
     let runtime = ProgramRuntime::new();
+    bind_passthrough_artifact_proposals(&runtime);
     runtime
         .grant_typed_capability(crate::vm::CapabilityRequirement {
             capability: crate::vm::CapabilityKind::ProgramInvoke,
@@ -5265,6 +5290,7 @@ async fn portable_host_boundary_retains_its_policy_across_multiple_resumes() {
 #[tokio::test]
 async fn typed_effect_sink_projects_proposal_request() {
     let runtime = ProgramRuntime::new();
+    bind_passthrough_artifact_proposals(&runtime);
     runtime
         .grant_typed_capability(crate::vm::CapabilityRequirement {
             capability: crate::vm::CapabilityKind::ProgramInvoke,

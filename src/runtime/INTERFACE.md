@@ -33,6 +33,8 @@ impl AgentVmBinding {
     pub async fn spawn_spec(&self, spec: AgentTaskSpec) -> Result<AgentIdentity>;
     pub async fn wait(&self, task_id: Uuid) -> Result<AgentTaskResult>;
 }
+/// Application decision returned after presenting a program artifact for review.
+pub enum ArtifactProposalDecision { Execute, Chat, Cancel }
 pub struct AutomationAvailability { … }
 /// Configuration gate and platform dispatcher for automation operations.
 pub struct AutomationBroker { … }
@@ -154,7 +156,7 @@ impl ProgramRun {
 pub struct ProgramRuntime { … }
 impl ProgramRuntime {
     /// Install the application-owned MCP transport and atomically replace its discovered, validated namespaced vocabulary.
-    pub async fn bind_mcp_client(&self, client: Arc<crate::tools::McpClient>) -> Result<Vec<String>>;
+    pub async fn bind_mcp_client(&self, client: Arc<dyn RuntimeMcpClient>) -> Result<Vec<String>>;
     /// Cancel an awaited portable effect only when it still owns the supplied `(execution_id, sequence)` boundary.
     pub async fn cancel_typed_execution_for_effect(&self, execution_id: uuid::Uuid, effect_sequence: u64, reason: Option<String>) -> Result<ExecutionOutcome>;
     /// Install a newer application-owned reducible checkpoint without replacing this frontend's host authority or resource bindings.
@@ -197,6 +199,8 @@ impl ProgramRuntime {
     pub fn attach_memory(&self, memory: Arc<finch_memory::MemorySystem>);
     pub fn authority_state(&self) -> Result<ProgramRuntimeAuthorityState>;
     pub fn automation(&self) -> Arc<AutomationBroker>;
+    /// Install the application-owned artifact proposal presenter.
+    pub fn bind_artifact_proposal_host(&self, host: Arc<dyn ArtifactProposalHost>) -> Result<()>;
     /// Install the application-owned effect delivery log.
     pub fn bind_effect_delivery_log(&self, log: Arc<Mutex<VmEffectDeliveryLog>>) -> Result<()>;
     /// Install the host-owned root behind `root<host-machine>`.
@@ -320,6 +324,8 @@ impl RuntimeApplicationMessage {
     /// ABI version to stamp on a packed frame.
     pub fn abi_version(&self) -> u32;
 }
+/// Untrusted MCP discovery data presented to the runtime by an application-owned transport.
+pub struct RuntimeMcpToolDescriptor { … }
 /// Host-specific projection of one portable typed VM event.
 pub type TypedEffectSink = Arc<dyn Fn(VmEffectEnvelope) + Send + Sync>;
 pub struct TypedVmStackCell { … }
@@ -378,6 +384,15 @@ pub trait AgentSpawning: Send + Sync {
     async fn wait(&self, task_id: Uuid) -> Result<AgentTaskResult>;
     async fn cancel(&self, task_id: Uuid) -> Result<()>;
 }
+/// Host-injected presentation boundary for synchronous `proposal-open` compatibility.
+pub trait ArtifactProposalHost: Send + Sync {
+    async fn propose_artifact(&self, language: &str, intent: &str, source: &str) -> Result<ArtifactProposalDecision>;
+}
+/// Host-injected MCP transport.
+pub trait RuntimeMcpClient: Send + Sync {
+    async fn tool_descriptors(&self) -> Vec<RuntimeMcpToolDescriptor>;
+    async fn execute_tool_value(&self, tool_name: &str, params: serde_json::Value) -> Result<serde_json::Value>;
+}
 /// Runtime-coupled methods over the re-exported [`VmEffectEnvelope`].
 pub(crate) trait VmEffectEnvelopeRuntimeMethods {
     fn program_run(&self) -> ProgramRun;
@@ -390,6 +405,8 @@ pub(crate) trait VmEffectEnvelopeRuntimeMethods {
 ```rust
 /// Persist each new envelope before projecting it to a live observer.
 pub fn bind_delivery_log(log: Arc<Mutex<VmEffectDeliveryLog>>, downstream: Option<TypedEffectSink>) -> TypedEffectSink { … }
+/// Open one worksheet with its bounding box checked before it is allocated.
+pub fn bounded_worksheet_range<RS: Read + Seek>(workbook: &mut Sheets<RS>, sheet: &str, max_cells: u64) -> Result<Range<Data>, String> { … }
 pub fn parse_task_id(value: &str) -> Result<Uuid> { … }
 /// Conservative key for scoping prior permission observations.
 pub fn permission_context_key() -> String { … }
@@ -437,6 +454,8 @@ pub const MAX_PENDING_TYPED_EXECUTIONS: usize = 256;
 pub const MAX_RETAINED_VM_REVISIONS: usize = 256;
 pub(crate) const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 pub(crate) const MAX_TURNS: usize = 10;
+/// The most cells Finch will read from one worksheet.
+pub const MAX_WORKBOOK_CELLS: u64 = 10_000_000;
 pub const PROGRAM_RUNTIME_ARCHIVE_VERSION: u32 = 1;
 pub const PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION: u32 = 2;
 ```

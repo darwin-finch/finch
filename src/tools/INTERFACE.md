@@ -61,6 +61,8 @@ impl CreateMemoryTool {
 }
 pub struct DeferredFrontendRestart { … }
 pub struct EditTool;
+/// Editor-backed application adapter for runtime's proposal presentation port.
+pub(crate) struct EditorArtifactProposalHost;
 pub struct EnterPlanModeTool;
 /// An exact approval for a specific tool signature Re-exported from `finch-tools-api`.
 pub struct ExactApproval { … }
