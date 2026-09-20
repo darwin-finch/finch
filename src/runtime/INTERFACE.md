@@ -459,3 +459,9 @@ pub const MAX_WORKBOOK_CELLS: u64 = 10_000_000;
 pub const PROGRAM_RUNTIME_ARCHIVE_VERSION: u32 = 1;
 pub const PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION: u32 = 2;
 ```
+
+## Modules
+
+```rust
+pub(crate) mod ipc_codec;
+```

@@ -3,7 +3,8 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/brain/`: `BrainStore` composition, the credential authority, remote brain clients,
-task records, name generation, and the in-memory background-process task table (`background`,
+Brain-domain Cap'n Proto envelope/value translation, task records, name generation, and the
+in-memory background-process task table (`background`,
 issue #754: `BackgroundTaskManager` owns long-lived commands beyond the turn — bounded in count
 and output retention, killed and reaped by stop or process shutdown, kill-not-adopt on restart).
 Persistence and coordination internals live in nested
@@ -11,8 +12,9 @@ facades: [`journal`](journal/AGENTS.md), [`schedule`](schedule/AGENTS.md), [`run
 [`attachment`](attachment/AGENTS.md), and [`projection`](projection/AGENTS.md). Named-Brain
 portable effect delivery lives beside the reducible checkpoint as
 `{root}/{name}/runtime/effects.jsonl` (`VmEffectDeliveryLog`, Brain-bound). The daemon
-subtree is owned from here but implemented in `src/daemon` (its own capsule). Server, IPC,
-client, and agent composition live outside this subtree.
+subtree is owned from here but implemented in `src/daemon` (its own capsule). Server, client, and
+agent composition live outside this subtree; the domain-neutral IPC schema/protocol core remains
+in `src/ipc`.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature.
 Child modules are private (`attachment`, `background`, `credential`, `journal`, `names`,

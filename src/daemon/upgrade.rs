@@ -162,7 +162,7 @@ async fn wait_for_shadow_health(bind: SocketAddr, socket: PathBuf) -> Result<()>
                     .build()?;
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, async move {
-                    let client = crate::ipc::IpcClient::connect_path(socket).await?;
+                    let client = crate::client::IpcClient::connect_path(socket).await?;
                     verify_fresh_brain_bootstrap(&client).await?;
                     drop(client);
                     Ok::<_, anyhow::Error>(())
@@ -179,7 +179,7 @@ async fn wait_for_shadow_health(bind: SocketAddr, socket: PathBuf) -> Result<()>
 
 /// Exercise the two reverse capabilities which historically closed during a
 /// fresh-home startup even though a protocol ping succeeded.
-async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<()> {
+async fn verify_fresh_brain_bootstrap(client: &crate::client::IpcClient) -> Result<()> {
     let suffix = uuid::Uuid::new_v4();
     let brain = format!("preflight-{}", suffix.simple());
     let home_brain = format!("preflight-home-{}", suffix.simple());

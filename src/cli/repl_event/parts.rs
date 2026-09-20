@@ -61,7 +61,7 @@ pub struct ToolParts {
 
 /// How this frontend reaches a daemon, and why it could not.
 pub struct DaemonParts {
-    pub ipc_client: Option<crate::ipc::IpcClient>,
+    pub ipc_client: Option<crate::client::IpcClient>,
     pub ipc_error: Option<String>,
     pub client: Option<Arc<crate::client::DaemonClient>>,
     pub base_url: Option<String>,

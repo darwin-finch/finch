@@ -589,7 +589,7 @@ pub struct Repl {
     // Daemon client (optional - for daemon-only mode, HTTP)
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
     // IPC client — Cap'n Proto channel to the daemon (preferred over daemon_client)
-    ipc_client: Option<crate::ipc::IpcClient>,
+    ipc_client: Option<crate::client::IpcClient>,
     daemon_ipc_error: Option<String>,
     // Teacher session with context optimization
     teacher_session: Arc<RwLock<TeacherSession>>,
@@ -1361,7 +1361,7 @@ impl Repl {
     }
 
     /// Set the IPC client for daemon communication (must be called inside a LocalSet).
-    pub fn set_ipc_client(&mut self, client: crate::ipc::IpcClient) {
+    pub fn set_ipc_client(&mut self, client: crate::client::IpcClient) {
         self.ipc_client = Some(client);
         self.daemon_ipc_error = None;
     }

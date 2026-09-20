@@ -298,7 +298,7 @@ impl Repl {
     /// Retain a daemon IPC bootstrap failure until the TUI owns the screen, so it appears once as an actionable startup diagnostic rather than being cleared with pr…
     pub fn set_daemon_ipc_error(&mut self, error: impl Into<String>);
     /// Set the IPC client for daemon communication (must be called inside a LocalSet).
-    pub fn set_ipc_client(&mut self, client: crate::ipc::IpcClient);
+    pub fn set_ipc_client(&mut self, client: crate::client::IpcClient);
 }
 /// Events that flow through the REPL event loop Re-exported from `cli::repl_event`.
 pub enum ReplEvent { UserInput, QueryComplete, QueryFailed, ToolResult, ToolCallsStarted, ToolApprovalNeeded, VmApprovalNeeded, OutputReady, VmEffect, VmOutputComplete, VmEffectJournalComplete, TypedProgramComplete, StreamingComplete, StatsUpdate, AgentLifecycle, CancelQuery, Shutdown, ShowDialog, PosetComplete, LispResult, RemoteBrainMessage, RemoteBrainError, RemoteBrainDisconnected, HomeBrainMessage, HomeBrainWatchFailed, ReconnectHomeBrain, ReconnectHomeRunner, RunnerLeaseStatus, NamedBrainProgramRequested, NamedBrainTurnRequested, NamedBrainMemoryProjectionRequested, NamedBrainRunCancelRequested, NamedBrainProgramFinished, FrontendRestartReady }

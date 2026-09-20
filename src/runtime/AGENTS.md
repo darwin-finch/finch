@@ -4,7 +4,8 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 
 **Owns** `src/runtime/` (typed program execution, capability/authority binding, host-effect
 audit, automation broker, archive/authority persistence, the child-agent vocabulary, and the
-versioned Runtime/Application ABI: `ProgramRun`, diagnostics, `VmSideEffect` envelopes,
+versioned Runtime/Application ABI and its Cap'n Proto checkpoint/frame codec: `ProgramRun`,
+diagnostics, `VmSideEffect` envelopes,
 `VmResume`, output-handle refs, and `VmEffectDeliveryLog` Brain/client identity ports), plus
 the adjacent `poset` tree and composition adapter [`src/program_registry.rs`](../program_registry.rs)
 listed on the DESIGN.md runtime row. Those adjacent trees are not this facade; this capsule is

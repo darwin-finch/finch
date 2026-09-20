@@ -5,7 +5,7 @@
 //! unknown discriminants, invalid scalar values, duplicate keyed entries, and
 //! host-width integer overflow.
 
-use crate::ipc::schema::finch_ipc_capnp as wire;
+use crate::ipc::finch_ipc_capnp as wire;
 use crate::runtime::{
     DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, ProgramRun,
     RuntimeApplicationMessage, VmEffectEnvelope, VmEffectHandle, VmResume, VmResumeResponse,
@@ -36,6 +36,27 @@ const MAX_NESTING: usize = 128;
 
 fn text(value: capnp::text::Reader<'_>) -> Result<String> {
     Ok(value.to_str()?.to_owned())
+}
+
+#[cfg(test)]
+mod pinned_wire_tests {
+    use super::*;
+
+    #[test]
+    fn empty_checkpoint_bytes_are_stable() {
+        let checkpoint = TypedRuntimeCheckpoint {
+            version: 1,
+            stack: Vec::new(),
+            functions: BTreeMap::new(),
+            producer_fibers: BTreeMap::new(),
+        };
+        let encoded = encode_checkpoint_bytes(&checkpoint).unwrap();
+        assert_eq!(
+            hex::encode(&encoded),
+            "000000000800000000000000010003000100000000000000090000000700000009000000070000000900000007000000000000000200010000000000000002000000000000000200"
+        );
+        assert_eq!(decode_checkpoint_bytes(&encoded).unwrap(), checkpoint);
+    }
 }
 
 fn usize_from_wire(value: u64, field: &str) -> Result<usize> {
@@ -956,7 +977,7 @@ fn encode_value(
         TypedValue::String(value) => builder.set_string(value),
         TypedValue::Bytes(value) => builder.set_bytes(value),
         TypedValue::Json(value) => {
-            super::brain_codec::encode_json_value(builder.reborrow().init_json(), value)?
+            crate::ipc::encode_json_value(builder.reborrow().init_json(), value)?
         }
         TypedValue::Path { selector, relative } => {
             let mut encoded = builder.reborrow().init_path();
@@ -1129,7 +1150,7 @@ fn decode_value(reader: wire::typed_value::Reader<'_>, depth: usize) -> Result<T
         Which::Symbol(value) => TypedValue::Symbol(text(value?)?),
         Which::String(value) => TypedValue::String(text(value?)?),
         Which::Bytes(value) => TypedValue::Bytes(value?.to_vec()),
-        Which::Json(value) => TypedValue::Json(super::brain_codec::decode_json_value(value?)?),
+        Which::Json(value) => TypedValue::Json(crate::ipc::decode_json_value(value?)?),
         Which::Path(value) => {
             let value = value?;
             TypedValue::Path {
@@ -2593,68 +2614,6 @@ pub(crate) fn decode_runtime_application_message_packed(
     decode_runtime_application_message(
         message.get_root::<wire::runtime_application_message::Reader<'_>>()?,
     )
-}
-
-/// Packed envelopes derived from a runner effect journal.
-pub(crate) fn encode_packed_delivery_envelopes(
-    records: &[crate::server::RunnerEffectRecord],
-) -> Result<Vec<Vec<u8>>> {
-    records
-        .iter()
-        .map(|record| {
-            encode_runtime_application_message_packed(&RuntimeApplicationMessage::Envelope {
-                envelope: VmEffectEnvelope {
-                    execution_id: record.execution_id,
-                    effect: record.entry.effect.clone(),
-                },
-            })
-        })
-        .collect()
-}
-
-/// Decode packed delivery frames. Generation 9 requires the packed payload:
-/// an empty list is admitted only when the journal is also empty. Otherwise
-/// every frame must be ABI v1, an envelope, and an exact match of the
-/// corresponding journal `(execution_id, sequence, output row)`.
-pub(crate) fn decode_packed_delivery_envelopes(
-    frames: capnp::data_list::Reader<'_>,
-    journal: &[crate::server::RunnerEffectRecord],
-) -> Result<Vec<VmEffectEnvelope>> {
-    if frames.len() == 0 {
-        anyhow::ensure!(
-            journal.is_empty(),
-            "packed delivery omitted for {} journaled effect(s); IPC generation 9 requires RuntimeApplicationMessage envelopes",
-            journal.len()
-        );
-        return Ok(Vec::new());
-    }
-    anyhow::ensure!(
-        frames.len() as usize == journal.len(),
-        "packed delivery length {} does not match effect journal {}",
-        frames.len(),
-        journal.len()
-    );
-    let mut envelopes = Vec::with_capacity(journal.len());
-    for (index, frame) in frames.iter().enumerate() {
-        let encoded = frame.context("packed delivery frame")?;
-        let message = decode_runtime_application_message_packed(encoded)?;
-        let RuntimeApplicationMessage::Envelope { envelope } = message else {
-            bail!("packed delivery frame {index} is not a RuntimeApplicationMessage envelope");
-        };
-        let record = &journal[index];
-        anyhow::ensure!(
-            envelope.execution_id == record.execution_id
-                && envelope.effect.sequence == record.entry.effect.sequence
-                && envelope.effect.output == record.entry.effect.output
-                && envelope.effect == record.entry.effect,
-            "packed delivery does not match journal at {}:{} output row {:?}",
-            envelope.execution_id,
-            envelope.effect.sequence,
-            envelope.effect.output
-        );
-        envelopes.push(envelope);
-    }
-    Ok(envelopes)
 }
 
 pub(crate) fn decode_packed_runtime_application_frames(

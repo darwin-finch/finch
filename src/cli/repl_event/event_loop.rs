@@ -351,7 +351,7 @@ pub struct EventLoop {
 
     /// IPC client — Cap'n Proto channel to the daemon.
     /// Must live inside a tokio LocalSet (capnp-rpc !Send).
-    ipc_client: Option<crate::ipc::IpcClient>,
+    ipc_client: Option<crate::client::IpcClient>,
     daemon_ipc_error: Option<String>,
 
     /// REPL mode (Normal, Planning, Executing)

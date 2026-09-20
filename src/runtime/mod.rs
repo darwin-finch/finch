@@ -10,6 +10,7 @@ mod effect_audit;
 mod effect_log;
 mod host;
 mod hostio;
+pub(crate) mod ipc_codec;
 mod mcp;
 mod outcome;
 mod workbook;

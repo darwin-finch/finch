@@ -131,7 +131,7 @@ ISOLATION_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Reject fixture traversal before external mutation", (
         "./scripts/test_brains.sh cargo test --lib supervised_http_fixture_rejects -- --nocapture",
         "./scripts/test_brains.sh cargo test --lib server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap -- --exact --nocapture",
-        "./scripts/test_brains.sh cargo test --lib ipc::server::tests::supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path -- --exact --nocapture",
+        "./scripts/test_brains.sh cargo test --lib server::ipc::tests::supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path -- --exact --nocapture",
     )),
     ("Exercise real Brain and server paths behind the guard", (
         "./scripts/test_brains.sh cargo test --lib brain::store -- --nocapture",

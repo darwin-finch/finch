@@ -8,6 +8,7 @@ mod attachment;
 mod background;
 mod credential;
 pub(crate) mod effect_audit_archive;
+pub(crate) mod ipc_codec;
 mod journal;
 mod projection;
 mod run;
@@ -34,7 +35,8 @@ pub use journal::{
 pub use names::generate;
 pub use projection::{BrainEnvironment, BrainSnapshot, BrainWireMessage};
 pub use remote::{
-    AttachedBrainClient, RemoteBrainCapabilities, RemoteBrainClient, RemoteBrainTarget,
+    AttachedBrainClient, LocalBrainTransport, RemoteBrainCapabilities, RemoteBrainClient,
+    RemoteBrainTarget,
 };
 pub use run::{
     BrainRun, BrainRunCancellationReservation, BrainRunKind, BrainRunStatus, BrainRunnerHandoff,
