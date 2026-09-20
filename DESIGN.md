@@ -309,6 +309,10 @@ Design intent, not current fact. The program, its phases, and its measurable gat
   contracts, and `finch-tools-api` for shared effect vocabulary. `finch-programs` and
   `finch-memory` (MemTree, retrieval, TF-IDF fallback, and an embedding port, without ONNX, Candle,
   tokenizer, Hugging Face, HTTP, or TUI stacks) are extracted workspace crates.
+  The [application UI-model capsule](src/ui_model/AGENTS.md) is prepared behind `src/ui_model`:
+  stable message/row identity, semantic widget data, line measurement, and pure claiming layout
+  have no outgoing subsystem edges. Component-specific projection and terminal painting remain
+  above that facade.
   Application subsystems follow only after their cycles are removed and the VM and memory
   measurements justify continuing.
 - **Target dependency direction**, refined during facade work:

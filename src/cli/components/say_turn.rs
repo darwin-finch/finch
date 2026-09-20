@@ -31,8 +31,8 @@
 //! hitbox) is deleted: the completed output region is the toggle target, so
 //! no chrome furniture exists to carry an affordance.
 
-use crate::cli::components::vocab::{NodeRole, RenderedTranscriptLine, RowId};
 use crate::cli::messages::{OutputVm, SayTurnStatus, SayTurnView, WorkUnitViewModel};
+use crate::ui_model::{NodeRole, RenderedTranscriptLine, RowId};
 
 /// Semantic path of the say turn's output region: the toggle hit target of a
 /// completed turn. New in stage 2 — the chrome's `[0]` retired with the
@@ -225,8 +225,8 @@ pub(crate) fn card_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::components::vocab::{Axis, Rect, Track, Widget};
     use crate::cli::messages::{MessageId, ProgramSourceVm};
+    use crate::ui_model::{Axis, Rect, Track, Widget};
 
     fn say_view(vm: WorkUnitViewModel) -> SayTurnView {
         SayTurnView {
@@ -266,10 +266,8 @@ mod tests {
         lines.iter().map(|line| line.text.clone()).collect()
     }
 
-    fn viewport_layout(
-        lines: Vec<RenderedTranscriptLine>,
-    ) -> crate::cli::components::vocab::Layout {
-        crate::cli::components::vocab::layout(
+    fn viewport_layout(lines: Vec<RenderedTranscriptLine>) -> crate::ui_model::Layout {
+        crate::ui_model::layout(
             &Widget::Viewport { lines },
             Rect {
                 x: 0,
@@ -640,7 +638,7 @@ mod tests {
                 ),
             )],
         };
-        let layout = crate::cli::components::vocab::layout(
+        let layout = crate::ui_model::layout(
             &tree,
             Rect {
                 x: 0,

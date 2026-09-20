@@ -77,7 +77,7 @@ rebuilds the ViewModel on the replayed run group from the Program/Result event p
 replayed transcript carries one representation per state like the live session; the live
 rendering path is untouched. The widget vocabulary
 (`Rect`/`Track`/`Axis`/`Widget`/`RenderedTranscriptLine`/`RowId`/line metrics) lives in
-`cli::components::vocab` so components build subtrees without `crossterm` or the shadow
+`crate::ui_model` so components build subtrees without `crossterm` or the shadow
 buffer; the engine re-exports it under its stable paths.
 
 **Claiming widget tree** (`widgets.rs`, `view_model.rs`): the live frame is a ViewModel
@@ -169,8 +169,9 @@ Virtual row helpers:
 ## Key files
 
 - `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
-- `src/cli/components/` — component-owned presentation: the widget vocabulary (`vocab.rs`)
-  and the say-turn component (`say_turn.rs`) (#882)
+- `src/ui_model/` — terminal-independent identity, widget vocabulary, and claiming layout
+- `src/cli/components/` — component-owned presentation, including the say-turn component
+  (`say_turn.rs`) (#882)
 - `src/cli/tui/view_model.rs` — the blit-time `LiveViewModel`, the domain → widget projection, and the root claiming tree
 - `src/cli/tui/markdown.rs` — bounded assistant-prose markdown parse/render for the viewport (#756); raw source stays the canonical record
 - `src/cli/tui/widgets.rs` — claiming layout: rects, tracks, hitboxes, resize

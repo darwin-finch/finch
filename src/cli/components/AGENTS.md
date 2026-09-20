@@ -11,7 +11,7 @@ choose to render or not. The say turn proves the model (#882, stages 1–2); sta
 the remaining message types and add the DOM lowering.
 
 **Dependency direction.** Dependencies point downward only: this module depends on
-`cli::messages` (domain) and its own `vocab`, never on `cli::tui` (the engine), `crossterm`,
+`cli::messages` (domain) and `crate::ui_model`, never on `cli::tui` (the engine), `crossterm`,
 or the shadow buffer. The engine asks the `Message` trait for a component snapshot and hands
 it here; it never matches on message type, and it carries component actions opaquely — there
 is no central action enum.
@@ -21,15 +21,15 @@ below; regenerate with `python3 scripts/generate_interfaces.py --write` after ch
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::components::`.
 
-## The widget vocabulary (`vocab.rs`)
+## The widget vocabulary (`crate::ui_model`)
 
-`Rect`, `Track`, `Axis`, `Widget`, `Layout`, `RenderedTranscriptLine`, `RowId`, `NodeRole`,
-and the pure line-metric functions (`visible_length`, `physical_rows`, …) plus the claiming
-pass (`layout`). This is the module `docs/TUI_DESIGN.md` names under "Dependency direction":
-both `cli::tui` (which re-exports it under its stable `widgets`/`shadow_buffer` paths) and
-any future surface author depend on it, and it touches neither `crossterm` nor the shadow
-buffer. Subwidget subtrees are data: a hidden subwidget contributes zero lines, so the
-claiming pass records zero rows for it.
+`Rect`, `Track`, `Axis`, `Widget`, `Layout`, `RenderedTranscriptLine`, `MessageId`, `RowId`,
+`NodeRole`, and the pure line-metric functions (`visible_length`, `physical_rows`, …) plus the
+claiming pass (`layout`) live behind the root `ui_model` facade. Both `cli::tui` (which
+re-exports it under stable `widgets`/`shadow_buffer` paths) and any future surface author
+depend on that lower capsule; it touches neither `crossterm` nor the shadow buffer. Subwidget
+subtrees are data: a hidden subwidget contributes zero lines, so the claiming pass records
+zero rows for it.
 
 ## The say-turn component (`say_turn.rs`)
 

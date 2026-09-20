@@ -20,7 +20,7 @@ use std::io::Write;
 
 use super::shadow_buffer::ShadowBuffer;
 use super::widgets::{self, Axis, Rect, Track, Widget};
-use crate::cli::components::vocab::char_display_width;
+use crate::ui_model::char_display_width;
 use anyhow::Result;
 use crossterm::{
     cursor::Hide,

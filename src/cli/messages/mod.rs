@@ -9,9 +9,9 @@
 // - Thread-safe: Arc<RwLock<>> for interior mutability
 // - No downcasting: Handlers receive concrete types
 
-use std::fmt;
 use std::sync::Arc;
-use uuid::Uuid;
+
+pub use crate::ui_model::MessageId;
 
 pub mod concrete;
 pub mod work_unit;
@@ -27,34 +27,6 @@ pub use work_unit::{
     WorkRowView, WorkUnit, WorkUnitHead, WorkUnitView, WorkUnitViewModel,
 };
 pub use work_unit::{WorkRowPresentation, WorkUnitPresentation};
-
-/// Unique identifier for messages
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MessageId(Uuid);
-
-impl MessageId {
-    /// Generate a new unique message ID
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    /// Restore a stable ID supplied by a canonical transcript event.
-    pub fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-}
-
-impl Default for MessageId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for MessageId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 /// Status of a message
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

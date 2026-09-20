@@ -14,7 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 
 use super::view_model::{RowId, TranscriptNode};
 
-pub use crate::cli::components::vocab::RenderedTranscriptLine;
+pub use crate::ui_model::RenderedTranscriptLine;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptHitRegion {

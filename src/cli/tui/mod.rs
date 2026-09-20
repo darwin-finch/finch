@@ -36,8 +36,8 @@ use std::time::Duration;
 use tui_textarea::TextArea;
 
 use super::{OutputManager, StatusBar, StatusLineType};
-use crate::cli::components::vocab::input_line_physical_rows_with_ghost;
 use crate::cli::messages::{MessageId, MessageRef, MessageStatus, WorkUnitPresentation};
+use crate::ui_model::input_line_physical_rows_with_ghost;
 // Sub-modules
 mod accordion;
 pub mod activity;
