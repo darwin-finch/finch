@@ -68,6 +68,8 @@ pub struct NodeTlsIdentity { … }
 impl NodeTlsIdentity {
     pub fn certificate_der(&self) -> &[u8];
     pub fn from_signing_identity(identity: &NodeSigningIdentity, hostname: &str) -> Result<Self>;
+    /// Build the TLS server configuration without exposing this identity's private key.
+    pub fn rustls_server_config(&self) -> Result<Arc<rustls::ServerConfig>>;
 }
 /// Aggregate statistics for this node's work
 pub struct WorkStats { … }
