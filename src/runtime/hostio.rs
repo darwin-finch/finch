@@ -494,7 +494,7 @@ pub(super) fn read_workbook_rows(
 ) -> std::result::Result<Vec<Vec<String>>, String> {
     use calamine::{open_workbook_auto_from_rs, Reader};
 
-    use crate::workbook::MAX_WORKBOOK_CELLS;
+    use super::MAX_WORKBOOK_CELLS;
     const MAX_WORKBOOK_BYTES: u64 = 512 * 1024 * 1024;
     let size = file.metadata().map_err(|error| error.to_string())?.len();
     if size > MAX_WORKBOOK_BYTES {
@@ -522,7 +522,7 @@ pub(super) fn read_workbook_rows(
     // what calamine would allocate, so a two-cell sheet spanning A1 to
     // XFD1048576 exhausted memory inside `worksheet_range` and never reached
     // it (#282).
-    let range = crate::workbook::bounded_worksheet_range(&mut workbook, &sheet, MAX_WORKBOOK_CELLS)
+    let range = super::bounded_worksheet_range(&mut workbook, &sheet, MAX_WORKBOOK_CELLS)
         .map_err(|error| format!("reading workbook '{label}': {error}"))?;
     // No second cell count here. `range.rows()` walks exactly the bounding box
     // that `bounded_worksheet_range` already refused to exceed, so a running

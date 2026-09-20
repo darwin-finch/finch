@@ -19,10 +19,12 @@ these types as if they were frozen.
 modules are private, so the `pub use` list in `src/runtime/mod.rs` is the whole public surface.
 Callers outside this directory use `crate::runtime::Item`; they must not name `abi`,
 `agent_vm`, `agents`, `archive_store`, `automation`, `context`, `effect_audit`, `effect_log`,
-`outcome`, `host`, `hostio`, or `mcp`.
+`outcome`, `host`, `hostio`, `mcp`, or `workbook`.
 
 **Dependencies:** `vm` (capability types and the typed machine), `programs` (language, values,
-execution effect), `tools` (MCP client binding), and `memory` (optional MemTree binding).
+execution effect), and `memory` (optional MemTree binding). MCP and artifact-proposal transports
+are application-injected ports; workbook allocation bounds are owned here and exposed as flat
+facade items for the CLI preview.
 Production code under `src/runtime/**` must not name `crate::brain`. Brain → runtime is the
 intended direction (runtime layer 2, brain layer 4). Delivery identity is an embedder-neutral
 port (`DeliveryConsumerIdentity`); Brain implements it. Do not extract `finch-runtime` until

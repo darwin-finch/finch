@@ -308,6 +308,27 @@ impl McpClient {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::runtime::RuntimeMcpClient for McpClient {
+    async fn tool_descriptors(&self) -> Vec<crate::runtime::RuntimeMcpToolDescriptor> {
+        self.tool_descriptors()
+            .await
+            .into_iter()
+            .map(|descriptor| crate::runtime::RuntimeMcpToolDescriptor {
+                server: descriptor.server,
+                tool: descriptor.tool,
+                description: descriptor.description,
+                input_schema: descriptor.input_schema,
+                output_schema: descriptor.output_schema,
+            })
+            .collect()
+    }
+
+    async fn execute_tool_value(&self, tool_name: &str, params: Value) -> Result<Value> {
+        self.execute_tool_value(tool_name, params).await
+    }
+}
+
 /// Convert MCP input schema to our ToolInputSchema format
 fn convert_mcp_schema(mcp_schema: &Value) -> ToolInputSchema {
     // MCP schemas are JSON Schema format

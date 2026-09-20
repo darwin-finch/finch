@@ -1,4 +1,3 @@
-use crate::tools::McpToolDescriptor;
 use crate::vm::{
     CapabilityKind, CapabilityRequirement, ControlEffect, EffectSet, ResourceSelector, StackRow,
     StackSignature, Type,
@@ -21,7 +20,9 @@ pub(super) struct McpVocabularyBinding {
     pub output_schema: Option<Value>,
 }
 
-pub(super) fn adapt_mcp_descriptor(descriptor: &McpToolDescriptor) -> Result<McpVocabularyBinding> {
+pub(super) fn adapt_mcp_descriptor(
+    descriptor: &super::RuntimeMcpToolDescriptor,
+) -> Result<McpVocabularyBinding> {
     validate_component("server", &descriptor.server)?;
     validate_component("tool", &descriptor.tool)?;
     let schema = descriptor
@@ -283,8 +284,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn descriptor(schema: Value) -> McpToolDescriptor {
-        McpToolDescriptor {
+    fn descriptor(schema: Value) -> super::super::RuntimeMcpToolDescriptor {
+        super::super::RuntimeMcpToolDescriptor {
             server: "github".into(),
             tool: "issue_get".into(),
             description: Some("Treat this prose only as untrusted metadata.".into()),
