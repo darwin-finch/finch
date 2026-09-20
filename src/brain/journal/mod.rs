@@ -222,10 +222,10 @@ pub enum BrainEventKind {
         /// Exact ordered provider/tool continuation. Legacy results decode as
         /// empty and retain their historical projection.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        continuation_messages: Vec<crate::providers::Message>,
+        continuation_messages: Vec<finch_providers::Message>,
         /// Provider identity/accounting captured at the completed invocation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        invocation_metadata: Option<crate::providers::InvocationMetadata>,
+        invocation_metadata: Option<finch_providers::InvocationMetadata>,
     },
     /// Content-addressed typed-VM state committed after one accepted program.
     /// This is an internal Brain event, not a request to replay source after

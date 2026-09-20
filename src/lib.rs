@@ -58,6 +58,8 @@ pub use finch_ipc::finch_ipc_capnp;
 // Core modules
 pub mod agent; // Autonomous agent loop (task backlog, reflection, activity log)
 pub mod brain; // Background context-gathering agent (spawned when user starts typing)
+#[cfg(test)]
+mod brain_application_tests;
 pub mod claude;
 pub mod cli;
 pub mod client; // HTTP client for daemon communication (Phase 8)

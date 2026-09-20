@@ -2,7 +2,7 @@
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `src/brain/`: `BrainStore` composition, the credential authority, remote brain clients,
+**Owns** `src/brain/`: `BrainStore` composition, the credential authority, remote Brain clients,
 Brain-domain Cap'n Proto envelope/value translation, task records, name generation, and the
 in-memory background-process task table (`background`,
 issue #754: `BackgroundTaskManager` owns long-lived commands beyond the turn — bounded in count
@@ -14,7 +14,9 @@ portable effect delivery lives beside the reducible checkpoint as
 `{root}/{name}/runtime/effects.jsonl` (`VmEffectDeliveryLog`, Brain-bound). The daemon
 subtree is owned from here but implemented in `src/daemon` (its own capsule). Server, client, and
 agent composition live outside this subtree; the domain-neutral IPC schema/protocol core lives in
-`crates/finch-ipc`.
+`crates/finch-ipc`. Root application fixtures that compose Brain with server/client/CLI live in
+`src/brain_application_tests.rs`; they consume only the normal Brain facade plus the
+`test-support` seam.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature.
 Child modules are private (`attachment`, `background`, `credential`, `journal`, `names`,
@@ -24,12 +26,14 @@ the whole public surface; `effect_audit_archive` stays `pub(crate)`. Callers out
 directory use `crate::brain::Item`; they must not name `brain::store::`, `brain::journal::`,
 `brain::schedule::`, `brain::run::`, `brain::attachment::`, `brain::projection::`,
 `brain::tasks::`, `brain::remote::`, `brain::credential::`, `brain::names::`, or
-`brain::background::`.
+`brain::background::`. `ipc_codec` remains private; the feature-gated flat
+`brain::test_support` facade exposes only the protocol fixtures needed by root application tests.
 
-**Dependencies:** `runtime` (layer 2; the one allowed incoming direction), `models`, `tools`,
-`claude`. Persistence, isolation, credential, and HTTP behavior are not facade concerns: do not
-change storage layout, journaling, isolation proofs, credential handling, or wire behavior in a
-facade commit. Do not extract `finch-brain`.
+**Dependencies:** the extracted `finch-runtime`, `finch-vm`, `finch-programs`,
+`finch-providers`, `finch-node`, and `finch-ipc` crates. Root server/client/CLI composition is
+test-only and stays outside this capsule. Persistence, isolation, credential, and HTTP behavior are
+not facade concerns: do not change storage layout, journaling, isolation proofs, credential
+handling, or wire behavior in a facade or extraction commit.
 
 Add public surface by re-exporting it from `mod.rs`, then regenerate `INTERFACE.md` with
 `python3 scripts/generate_interfaces.py --write`.

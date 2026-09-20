@@ -254,7 +254,7 @@ pub fn validate_binding(provider: CredentialProvider, endpoint: Option<&str>, bi
 ## Constants
 
 ```rust
-pub const DEFAULT_BRAIN_TLS_PORT: u16 = 11436;
+pub const DEFAULT_BRAIN_TLS_PORT: u16 = crate::brain::DEFAULT_BRAIN_PORT;
 /// Default Claude model used when a transport does not override it. Re-exported from `finch-providers`.
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5";
 /// Default bind address for the finch daemon.

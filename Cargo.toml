@@ -232,6 +232,9 @@ nix = { version = "0.29", features = ["term", "process", "signal"] }
 
 [features]
 default = ["onnx", "candle"]  # ONNX Runtime + Candle are the default providers
+# Keeps Brain's root application fixtures outside its production dependency graph. This moves to
+# finch-brain and is enabled only by Finch's dev-dependency when the capsule is extracted.
+test-support = []
 onnx = []  # ONNX Runtime support (always available)
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]  # Candle support (optional)
 candle-metal = ["candle", "dep:candle-metal-kernels"]  # Candle with Metal acceleration (macOS only)

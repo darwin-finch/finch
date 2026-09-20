@@ -127,6 +127,11 @@ pub struct BrainMutationReceipt { … }
 pub struct BrainProgram { … }
 /// Secret-free provider/model overlay stored on a named Brain. Re-exported from `brain::journal`.
 pub struct BrainProviderSelection { … }
+pub enum BrainRemoteCommandKind { Submit, Acknowledge, Detach, RequestRunnerHandoff, CancelRunnerHandoff, CancelRun, CreateSchedule, CancelSchedule, ScheduleInitialization }
+pub enum BrainRemoteReply { Submitted, Acknowledged, Detached, HandoffRequested, HandoffCancelled, RunCancelled, ScheduleCreated, ScheduleCancelled, InitializationScheduled, Error }
+impl BrainRemoteReply {
+    pub fn request_id(&self) -> u64;
+}
 /// Re-exported from `brain::run`.
 pub struct BrainRun { … }
 /// Re-exported from `brain::run`.
@@ -353,12 +358,20 @@ impl RemoteBrainClient {
     pub async fn schedule_initialization_with_handle(&self, next_due_ms: u64, handle: &BrainMutationHandle) -> Result<super::store::BrainSchedule>;
     pub async fn snapshot(&self) -> Result<BrainSnapshot>;
     pub async fn start_speculative(&self, prompt: String) -> Result<super::store::BrainRun>;
+    pub async fn test_credential_claims(&self) -> Option<super::credential::BrainCredentialClaims>;
+    pub async fn test_credential_token(&self) -> Option<String>;
+    pub async fn test_send_remote_command(&self, kind: crate::brain::test_support::BrainRemoteCommandKind) -> Result<crate::brain::test_support::BrainRemoteReply>;
+    pub async fn test_send_remote_command_with_handle(&self, kind: crate::brain::test_support::BrainRemoteCommandKind, handle: Option<&BrainMutationHandle>) -> Result<crate::brain::test_support::BrainRemoteReply>;
+    pub async fn test_set_credential(&self, token: String, claims: super::credential::BrainCredentialClaims);
     /// Connect to the brain's snapshot/live-event stream.
     pub async fn watch(&self) -> Result<mpsc::UnboundedReceiver<BrainWireMessage>>;
     pub fn attachment(&self) -> Option<&BrainAttachment>;
     pub fn invited_node_public_key(&self) -> Option<[u8; 32]>;
     pub fn new(target: RemoteBrainTarget, password: impl Into<String>) -> Result<Self>;
     pub fn new_with_invitation(target: RemoteBrainTarget, invitation: impl Into<String>) -> Result<Self>;
+    pub fn test_http_client(&self) -> &Client;
+    pub fn test_set_attachment(&mut self, attachment: BrainAttachment);
+    pub fn test_with_credential(target: RemoteBrainTarget, attachment: BrainAttachment, token: String, claims: super::credential::BrainCredentialClaims) -> Result<Self>;
 }
 pub struct RemoteBrainTarget { … }
 impl RemoteBrainTarget {
@@ -370,6 +383,12 @@ impl RemoteBrainTarget {
     /// Resolve a bare Brain name through the already-connected local daemon.
     pub fn local(brain: &str, daemon_base_url: &str) -> Result<Self>;
     pub fn parse(value: &str) -> Result<Self>;
+    pub fn test_credentials_url(&self) -> String;
+    pub fn test_delegated_credential_url(&self, credential_id: uuid::Uuid) -> String;
+    pub fn test_http_scheme(&self) -> &'static str;
+    pub fn test_http_url(&self) -> String;
+    pub fn test_invitations_url(&self) -> String;
+    pub fn test_set_insecure(&mut self);
 }
 /// Re-exported from `brain::run`.
 pub struct RunId(pub uuid::Uuid);
@@ -436,6 +455,8 @@ pub(crate) fn validate_isolated_test_socket(proof: &IsolatedTestProof, path: &st
 ## Constants
 
 ```rust
+/// Default TLS listener port for remote named-Brain collaboration.
+pub const DEFAULT_BRAIN_PORT: u16 = 11436;
 /// Default bound on concurrently running background tasks.
 pub const DEFAULT_MAX_RUNNING_TASKS: usize = 16;
 /// Default bound on total retained task entries (running + finished).
@@ -449,6 +470,9 @@ pub const DEFAULT_RING_BYTES_PER_STREAM: usize = 64 * 1024;
 ```rust
 pub(crate) mod effect_audit_archive;
 pub(crate) mod ipc_codec;
+/// Test-only seams used by root application integration fixtures.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support { … }
 ```
 
 ## Referenced but not exported

@@ -9,6 +9,9 @@ mod background;
 mod credential;
 pub(crate) mod effect_audit_archive;
 pub(crate) mod ipc_codec;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 mod journal;
 mod projection;
 mod run;
@@ -36,7 +39,7 @@ pub use names::generate;
 pub use projection::{BrainEnvironment, BrainSnapshot, BrainWireMessage};
 pub use remote::{
     AttachedBrainClient, LocalBrainTransport, RemoteBrainCapabilities, RemoteBrainClient,
-    RemoteBrainTarget,
+    RemoteBrainTarget, DEFAULT_BRAIN_PORT,
 };
 pub use run::{
     BrainRun, BrainRunCancellationReservation, BrainRunKind, BrainRunStatus, BrainRunnerHandoff,
@@ -51,6 +54,30 @@ pub use store::BrainStore;
 pub(crate) use store::{directory_listing_for_tests, seed_scheduled_brain_for_tests};
 pub(crate) use store::{unix_millis, EffectAuditAuthorityGrant};
 pub use tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
+
+/// Test-only seams used by root application integration fixtures.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
+    pub use super::credential::verify_portable_invitation;
+    pub use super::ipc_codec::{
+        brain_remote_command_fingerprint, decode_brain_remote_envelope,
+        encode_brain_remote_envelope, BrainRemoteCommand, BrainRemoteCommandKind,
+        BrainRemoteEnvelope, BrainRemoteMutation, BrainRemoteReply,
+    };
+
+    use super::credential::BrainCredentialAuthority;
+
+    pub const MAX_SIGNED_CLOCK_SKEW_MS: u64 = super::credential::MAX_SIGNED_CLOCK_SKEW_MS;
+
+    pub fn ephemeral_credential_authority(signing_key: [u8; 32]) -> BrainCredentialAuthority {
+        BrainCredentialAuthority::ephemeral(signing_key)
+    }
+
+    pub fn unix_epoch_millis() -> u64 {
+        super::remote::unix_epoch_millis()
+    }
+}
 mod names;
 mod remote;
 mod store;
@@ -2737,6 +2764,7 @@ mod facade_scan_tests {
             .map(str::trim_start)
             .filter(|line| !line.starts_with("//"))
             .filter(|line| line.starts_with("pub mod "))
+            .filter(|line| !line.starts_with("pub mod test_support"))
             .collect::<Vec<_>>();
         assert!(
             published.is_empty(),
@@ -2769,6 +2797,20 @@ mod facade_scan_tests {
         let _ = std::any::type_name::<super::RemoteBrainClient>();
         let _ = super::generate;
         let _ = super::unix_millis;
+    }
+
+    #[test]
+    fn brain_capsule_has_no_root_application_dependencies() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let brain = root.join("src/brain");
+        let forbidden = ["server", "client", "cli", "config", "providers", "node"]
+            .map(|module| ["crate", "::", module, "::"].concat());
+        let mut hits = Vec::new();
+        collect_forbidden_dependencies(&brain, &brain, &forbidden, &mut hits);
+        assert!(
+            hits.is_empty(),
+            "Brain must depend on extracted crates, never root application modules or compatibility facades; found: {hits:?}"
+        );
     }
 
     fn collect_brain_child_imports(
@@ -2813,6 +2855,47 @@ mod facade_scan_tests {
                             let rel = path.strip_prefix(root).unwrap_or(&path);
                             hits.push(format!("{}:{}", rel.display(), index + 1));
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_forbidden_dependencies(
+        dir: &Path,
+        brain: &Path,
+        forbidden: &[String],
+        hits: &mut Vec<String>,
+    ) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                hits.push(format!("failed to read {}: {error}", dir.display()));
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_forbidden_dependencies(&path, brain, forbidden, hits);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                hits.push(format!("failed to read {}", path.display()));
+                continue;
+            };
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for needle in forbidden {
+                    if line.contains(needle) {
+                        let rel = path.strip_prefix(brain).unwrap_or(&path);
+                        hits.push(format!("{}:{} ({needle})", rel.display(), index + 1));
                     }
                 }
             }
