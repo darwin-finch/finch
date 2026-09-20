@@ -10,7 +10,7 @@ mod effect_audit;
 mod effect_log;
 mod host;
 mod hostio;
-pub(crate) mod ipc_codec;
+mod ipc_codec;
 mod mcp;
 mod outcome;
 mod workbook;
@@ -66,6 +66,14 @@ use hostio::{
     hex_digest, list_directory_tree, merkle_directory, read_bounded_csv_record,
     read_bounded_utf8_line, read_workbook_range, read_workbook_rows, read_workbook_sheet_names,
     sha256_file_handle, summarize_csv, summarize_workbook, typed_mcp_arguments,
+};
+pub(crate) use ipc_codec::{
+    decode_checkpoint, decode_checkpoint_bytes, decode_effect_journal_state, decode_effect_record,
+    decode_effects, decode_packed_runtime_application_frames,
+    decode_runtime_application_message_packed, decode_value_list, decode_vm_side_effect,
+    encode_checkpoint, encode_checkpoint_bytes, encode_effect_journal_state, encode_effect_record,
+    encode_effects, encode_packed_runtime_application_frames,
+    encode_runtime_application_message_packed, encode_value_list, encode_vm_side_effect,
 };
 
 use crate::vm::{

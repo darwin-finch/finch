@@ -20,7 +20,7 @@ these types as if they were frozen.
 modules are private, so the `pub use` list in `src/runtime/mod.rs` is the whole public surface.
 Callers outside this directory use `crate::runtime::Item`; they must not name `abi`,
 `agent_vm`, `agents`, `archive_store`, `automation`, `context`, `effect_audit`, `effect_log`,
-`outcome`, `host`, `hostio`, `mcp`, or `workbook`.
+`host`, `hostio`, `ipc_codec`, `mcp`, `outcome`, or `workbook`.
 
 **Dependencies:** `vm` (capability types and the typed machine), `programs` (language, values,
 execution effect), and `memory` (optional MemTree binding). MCP and artifact-proposal transports

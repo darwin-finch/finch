@@ -407,6 +407,28 @@ pub(crate) trait VmEffectEnvelopeRuntimeMethods {
 pub fn bind_delivery_log(log: Arc<Mutex<VmEffectDeliveryLog>>, downstream: Option<TypedEffectSink>) -> TypedEffectSink { … }
 /// Open one worksheet with its bounding box checked before it is allocated.
 pub fn bounded_worksheet_range<RS: Read + Seek>(workbook: &mut Sheets<RS>, sheet: &str, max_cells: u64) -> Result<Range<Data>, String> { … }
+pub(crate) fn decode_checkpoint(reader: wire::typed_runtime_checkpoint::Reader<'_>) -> Result<TypedRuntimeCheckpoint> { … }
+/// Decode one durable typed-runtime checkpoint.
+pub(crate) fn decode_checkpoint_bytes(encoded: &[u8]) -> Result<TypedRuntimeCheckpoint> { … }
+pub(crate) fn decode_effect_journal_state(reader: wire::vm_effect_journal_state::Reader<'_>) -> Result<EffectJournalState> { … }
+pub(crate) fn decode_effect_record(reader: wire::brain_effect_record::Reader<'_>) -> Result<(uuid::Uuid, EffectJournalEntry)> { … }
+pub(crate) fn decode_effects(reader: capnp::struct_list::Reader<'_, wire::capability_requirement::Owned>) -> Result<EffectSet> { … }
+pub(crate) fn decode_packed_runtime_application_frames(frames: capnp::data_list::Reader<'_>) -> Result<Vec<RuntimeApplicationMessage>> { … }
+/// Decode one packed Runtime/Application ABI frame.
+pub(crate) fn decode_runtime_application_message_packed(encoded: &[u8]) -> Result<RuntimeApplicationMessage> { … }
+pub(crate) fn decode_value_list(reader: capnp::struct_list::Reader<'_, wire::typed_value::Owned>, depth: usize) -> Result<Vec<TypedValue>> { … }
+pub(crate) fn decode_vm_side_effect(reader: wire::vm_side_effect::Reader<'_>) -> Result<VmSideEffect> { … }
+pub(crate) fn encode_checkpoint(mut builder: wire::typed_runtime_checkpoint::Builder<'_>, value: &TypedRuntimeCheckpoint) -> Result<()> { … }
+/// Encode one durable typed-runtime checkpoint using the same closed native schema used by runner registration and result transport.
+pub(crate) fn encode_checkpoint_bytes(value: &TypedRuntimeCheckpoint) -> Result<Vec<u8>> { … }
+pub(crate) fn encode_effect_journal_state(mut builder: wire::vm_effect_journal_state::Builder<'_>, value: &EffectJournalState) -> Result<()> { … }
+pub(crate) fn encode_effect_record(mut builder: wire::brain_effect_record::Builder<'_>, execution_id: uuid::Uuid, entry: &EffectJournalEntry) -> Result<()> { … }
+pub(crate) fn encode_effects(mut builder: capnp::struct_list::Builder<'_, wire::capability_requirement::Owned>, value: &EffectSet) { … }
+pub(crate) fn encode_packed_runtime_application_frames(mut encoded: capnp::data_list::Builder<'_>, messages: &[RuntimeApplicationMessage]) -> Result<()> { … }
+/// Compact packed Cap'n Proto frame for the Runtime/Application ABI.
+pub(crate) fn encode_runtime_application_message_packed(value: &RuntimeApplicationMessage) -> Result<Vec<u8>> { … }
+pub(crate) fn encode_value_list(mut builder: capnp::struct_list::Builder<'_, wire::typed_value::Owned>, values: &[TypedValue], depth: usize) -> Result<()> { … }
+pub(crate) fn encode_vm_side_effect(mut builder: wire::vm_side_effect::Builder<'_>, value: &VmSideEffect) -> Result<()> { … }
 pub fn parse_task_id(value: &str) -> Result<Uuid> { … }
 /// Conservative key for scoping prior permission observations.
 pub fn permission_context_key() -> String { … }
@@ -458,10 +480,4 @@ pub(crate) const MAX_TURNS: usize = 10;
 pub const MAX_WORKBOOK_CELLS: u64 = 10_000_000;
 pub const PROGRAM_RUNTIME_ARCHIVE_VERSION: u32 = 1;
 pub const PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION: u32 = 2;
-```
-
-## Modules
-
-```rust
-pub(crate) mod ipc_codec;
 ```

@@ -808,7 +808,7 @@ pub(crate) fn encode_brain_remote_envelope(
                     let mut request = builder.init_create_schedule();
                     request.set_language(language_to_capnp(*language));
                     request.set_source(source);
-                    crate::runtime::ipc_codec::encode_effects(
+                    crate::runtime::encode_effects(
                         request
                             .reborrow()
                             .init_grant_ceiling(grant_ceiling.0.len() as u32),
@@ -955,7 +955,7 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                     BrainRemoteCommandKind::CreateSchedule {
                         language: language_from_capnp(request.get_language()?),
                         source: text(request.get_source()?)?,
-                        grant_ceiling: crate::runtime::ipc_codec::decode_effects(
+                        grant_ceiling: crate::runtime::decode_effects(
                             request.get_grant_ceiling()?,
                         )?,
                         next_due_ms: request.get_next_due_ms(),
@@ -1359,7 +1359,7 @@ pub(crate) fn encode_schedule(
     builder.set_schedule_id(&schedule.schedule_id.0.to_string());
     builder.set_initiating_attachment_id(&schedule.initiating_attachment_id.0.to_string());
     builder.set_created_by(&schedule.created_by);
-    crate::runtime::ipc_codec::encode_effects(
+    crate::runtime::encode_effects(
         builder
             .reborrow()
             .init_grant_ceiling(schedule.grant_ceiling.0.len() as u32),
@@ -1408,7 +1408,7 @@ pub(crate) fn decode_schedule(
         schedule_id: ScheduleId(parse_uuid(reader.get_schedule_id()?)?),
         initiating_attachment_id: AttachmentId(parse_uuid(reader.get_initiating_attachment_id()?)?),
         created_by: text(reader.get_created_by()?)?,
-        grant_ceiling: crate::runtime::ipc_codec::decode_effects(reader.get_grant_ceiling()?)?,
+        grant_ceiling: crate::runtime::decode_effects(reader.get_grant_ceiling()?)?,
         language: language_from_capnp(reader.get_language()?),
         source: text(reader.get_source()?)?,
         next_due_ms: reader.get_next_due_ms(),
@@ -1438,7 +1438,7 @@ fn encode_schedule_due(
     encode_run(builder.reborrow().init_run(), &due.run);
     builder.set_language(language_to_capnp(due.language));
     builder.set_source(&due.source);
-    crate::runtime::ipc_codec::encode_effects(
+    crate::runtime::encode_effects(
         builder
             .reborrow()
             .init_grant_ceiling(due.grant_ceiling.0.len() as u32),
@@ -1459,7 +1459,7 @@ fn decode_schedule_due(
         run: decode_run(reader.get_run()?)?,
         language: language_from_capnp(reader.get_language()?),
         source: text(reader.get_source()?)?,
-        grant_ceiling: crate::runtime::ipc_codec::decode_effects(reader.get_grant_ceiling()?)?,
+        grant_ceiling: crate::runtime::decode_effects(reader.get_grant_ceiling()?)?,
         due_at_ms: reader.get_due_at_ms(),
         first_missed_at_ms: reader.get_first_missed_at_ms(),
         missed_count: reader.get_missed_count(),
@@ -1709,14 +1709,8 @@ pub(crate) fn encode_event(
             let mut recorded = builder.init_effect_recorded();
             recorded.set_request_seq(*request_seq);
             recorded.set_execution_id(&execution_id.to_string());
-            crate::runtime::ipc_codec::encode_vm_side_effect(
-                recorded.reborrow().init_effect(),
-                effect,
-            )?;
-            crate::runtime::ipc_codec::encode_effect_journal_state(
-                recorded.reborrow().init_state(),
-                state,
-            )?;
+            crate::runtime::encode_vm_side_effect(recorded.reborrow().init_effect(), effect)?;
+            crate::runtime::encode_effect_journal_state(recorded.reborrow().init_state(), state)?;
         }
         BrainEventKind::EffectAuditTransition { transition } => {
             let mut encoded = builder.init_effect_audit_transition();
@@ -1942,10 +1936,8 @@ pub(crate) fn decode_event(
             BrainEventKind::EffectRecorded {
                 request_seq: recorded.get_request_seq(),
                 execution_id: parse_uuid(recorded.get_execution_id()?)?,
-                effect: crate::runtime::ipc_codec::decode_vm_side_effect(recorded.get_effect()?)?,
-                state: crate::runtime::ipc_codec::decode_effect_journal_state(
-                    recorded.get_state()?,
-                )?,
+                effect: crate::runtime::decode_vm_side_effect(recorded.get_effect()?)?,
+                state: crate::runtime::decode_effect_journal_state(recorded.get_state()?)?,
             }
         }
         Which::EffectAuditTransition(encoded) => {

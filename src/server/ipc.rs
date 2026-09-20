@@ -18,7 +18,7 @@ use crate::brain::ipc_codec::{
     encode_run, encode_runner_handoff, encode_runner_lease, encode_schedule, encode_snapshot,
 };
 use crate::ipc::finch_ipc_capnp::{self, brain_service, finch_daemon};
-use crate::runtime::ipc_codec::{
+use crate::runtime::{
     decode_checkpoint, encode_checkpoint, encode_packed_runtime_application_frames,
 };
 use crate::server::AgentServer;
@@ -29,7 +29,7 @@ pub(crate) fn encode_packed_delivery_envelopes(
     records
         .iter()
         .map(|record| {
-            crate::runtime::ipc_codec::encode_runtime_application_message_packed(
+            crate::runtime::encode_runtime_application_message_packed(
                 &crate::runtime::RuntimeApplicationMessage::Envelope {
                     envelope: crate::runtime::VmEffectEnvelope {
                         execution_id: record.execution_id,
@@ -62,8 +62,7 @@ fn decode_packed_delivery_envelopes(
     let mut envelopes = Vec::with_capacity(journal.len());
     for (index, frame) in frames.iter().enumerate() {
         let encoded = frame.context("packed delivery frame")?;
-        let message =
-            crate::runtime::ipc_codec::decode_runtime_application_message_packed(encoded)?;
+        let message = crate::runtime::decode_runtime_application_message_packed(encoded)?;
         let crate::runtime::RuntimeApplicationMessage::Envelope { envelope } = message else {
             anyhow::bail!("packed delivery frame {index} is not a Runtime/Application envelope");
         };
@@ -455,7 +454,7 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
         let grant_ceiling = match params
             .get_grant_ceiling()
             .map_err(anyhow::Error::from)
-            .and_then(crate::runtime::ipc_codec::decode_effects)
+            .and_then(crate::runtime::decode_effects)
         {
             Ok(effects) => effects,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -572,7 +571,7 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
         let effect = match params
             .get_effect()
             .map_err(anyhow::Error::from)
-            .and_then(crate::runtime::ipc_codec::decode_vm_side_effect)
+            .and_then(crate::runtime::decode_vm_side_effect)
         {
             Ok(effect) => effect,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -698,7 +697,7 @@ impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermit
         let outcome = match outcome.which() {
             Ok(Which::Acknowledged(values)) => match values
                 .map_err(anyhow::Error::from)
-                .and_then(|values| crate::runtime::ipc_codec::decode_value_list(values, 0))
+                .and_then(|values| crate::runtime::decode_value_list(values, 0))
             {
                 Ok(values) => crate::runtime::EffectAuditTerminalOutcome::Acknowledged {
                     response: crate::runtime::VmResumeResponse::Result { values },
@@ -867,7 +866,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
         let effect = match params
             .get_effect()
             .map_err(anyhow::Error::from)
-            .and_then(crate::runtime::ipc_codec::decode_vm_side_effect)
+            .and_then(crate::runtime::decode_vm_side_effect)
         {
             Ok(effect) => effect,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -1433,7 +1432,7 @@ impl brain_service::Server for BrainRpcService {
         let grant_ceiling = match params
             .get_grant_ceiling()
             .map_err(anyhow::Error::from)
-            .and_then(crate::runtime::ipc_codec::decode_effects)
+            .and_then(crate::runtime::decode_effects)
         {
             Ok(effects) => effects,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -2328,7 +2327,7 @@ async fn forward_runner_request(
                 });
                 payload.set_has_grant_ceiling(request.grant_ceiling.is_some());
                 if let Some(grant_ceiling) = &request.grant_ceiling {
-                    crate::runtime::ipc_codec::encode_effects(
+                    crate::runtime::encode_effects(
                         payload
                             .reborrow()
                             .init_grant_ceiling(grant_ceiling.0.len() as u32),
@@ -2681,8 +2680,8 @@ fn decode_runner_effect_records(
     encoded
         .iter()
         .map(|record| {
-            let (execution_id, entry) = crate::runtime::ipc_codec::decode_effect_record(record)
-                .map_err(|error| error.to_string())?;
+            let (execution_id, entry) =
+                crate::runtime::decode_effect_record(record).map_err(|error| error.to_string())?;
             Ok(crate::server::RunnerEffectRecord {
                 execution_id,
                 entry,
