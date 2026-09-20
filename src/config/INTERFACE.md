@@ -46,7 +46,7 @@ pub enum ColorSpec { Named, Rgb }
 pub enum ColorTheme { Dark, Light, HighContrast, Solarized }
 pub struct Config { … }
 impl Config {
-    /// Get the active provider (first in the unified providers list).
+    /// Get the active provider (named global default, else first in the list).
     pub fn active_provider(&self) -> Option<&ProviderEntry>;
     /// Get the active teacher (first cloud provider in priority list).
     pub fn active_teacher(&self) -> Option<&TeacherEntry>;
@@ -56,6 +56,8 @@ impl Config {
     pub fn credential_dependents(&self, credential_name: &str) -> Vec<String>;
     /// Secret-free named credential records.
     pub fn credentials(&self) -> &[ProviderCredential];
+    /// Profile name new Brains inherit when they have no overlay yet.
+    pub fn default_provider_name(&self) -> Option<String>;
     /// Delete a credential after invalidating every already-constructed provider that shares its authoritative lifecycle signal.
     pub fn delete_credential(&mut self, credential_name: &str) -> anyhow::Result<Vec<String>>;
     /// All local providers (only Local entries).
@@ -183,10 +185,18 @@ impl ProviderEntry {
     pub fn profile_name(&self) -> String;
     /// Short provider-type tag (e.g.
     pub fn provider_type(&self) -> &'static str;
+    /// Configured reasoning effort, when this entry schema carries one.
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort>;
+    /// Whether `/thinking` is meaningful for this provider type.
+    pub fn supports_reasoning_effort(&self) -> bool;
     /// Extract a `BackendConfig` from a `Local` variant.
     pub fn to_backend_config(&self) -> Option<BackendConfig>;
     /// Convert this cloud provider to a `TeacherEntry` for backward compat.
     pub fn to_teacher_entry(&self) -> Option<TeacherEntry>;
+    /// Clone this entry with a Brain-local model overlay.
+    pub fn with_model_overlay(&self, overlay: Option<String>) -> Self;
+    /// Clone this entry with a Brain-local thinking overlay.
+    pub fn with_reasoning_effort_overlay(&self, overlay: Option<ReasoningEffort>) -> Self;
 }
 /// Provider-controlled reasoning depth. Re-exported from `finch-providers`.
 pub enum ReasoningEffort { None, Minimal, Low, Medium, High, Xhigh, Max }

@@ -343,11 +343,39 @@ pub struct BrainProgram {
     pub source: String,
 }
 
+/// Secret-free provider/model overlay stored on a named Brain.
+///
+/// This is Brain metadata, not a journal event and not a `[[providers]]` row.
+/// Optional fields use serde defaults so version-1 files written before the
+/// overlay still load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BrainProviderSelection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// True when `provider` was copied from the global default at creation
+    /// and has not been explicitly overridden.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provider_inherited: bool,
+}
+
+impl BrainProviderSelection {
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none() && self.reasoning_effort.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrainMetadata {
     pub version: u32,
     pub brain_id: BrainId,
     pub created_ms: u64,
+    #[serde(flatten)]
+    #[serde(default)]
+    pub selection: BrainProviderSelection,
 }
 
 pub const fn initial_environment_generation() -> u64 {

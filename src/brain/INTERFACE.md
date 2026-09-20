@@ -125,6 +125,8 @@ pub enum BrainMutationOutcome { RunCancellationReserved, RunCancellationDispatch
 pub struct BrainMutationReceipt { … }
 /// Re-exported from `brain::journal`.
 pub struct BrainProgram { … }
+/// Secret-free provider/model overlay stored on a named Brain. Re-exported from `brain::journal`.
+pub struct BrainProviderSelection { … }
 /// Re-exported from `brain::run`.
 pub struct BrainRun { … }
 /// Re-exported from `brain::run`.
@@ -215,6 +217,8 @@ impl BrainStore {
     pub fn pop_program(&self, name: &str, sender: &str) -> Result<Option<BrainEvent>>;
     /// Return the one live typed runtime for a named Brain, restoring its latest reducible checkpoint on first access after daemon restart.
     pub fn program_runtime(&self, name: &str) -> Result<Arc<crate::runtime::ProgramRuntime>>;
+    /// Read the secret-free provider/model overlay without hydrating the log.
+    pub fn provider_selection(&self, name: &str) -> Result<BrainProviderSelection>;
     pub fn push(&self, name: &str, sender: &str, kind: BrainEventKind) -> Result<BrainEvent>;
     /// Durably append an executable request and its RunStarted projection in one physical record, then apply and broadcast both logical events in native sequence or…
     pub fn push_executable_idempotent(&self, name: &str, sender: &str, kind: BrainEventKind, receipt: BrainMutationReceipt, initiating_attachment_id: AttachmentId, status: BrainRunStatus) -> Result<BrainExecutableMutationAppend>;
@@ -243,6 +247,8 @@ impl BrainStore {
     pub fn schedule_initialization_with_receipt(&self, name: &str, initiating_attachment_id: AttachmentId, connection_id: ConnectionId, next_due_ms: u64, mutation: Option<BrainMutationReceipt>) -> Result<BrainSchedule>;
     /// Woken when a schedule appears that is due sooner than the current head.
     pub fn schedule_wakeup(&self) -> Arc<tokio::sync::Notify>;
+    /// Persist the secret-free provider/model overlay on `metadata.json`.
+    pub fn set_provider_selection(&self, name: &str, selection: BrainProviderSelection) -> Result<BrainProviderSelection>;
     pub fn snapshot(&self, name: &str) -> Result<BrainSnapshot>;
     pub fn start_run(&self, name: &str, sender: &str, kind: BrainRunKind, request_seq: u64, initiating_attachment_id: AttachmentId, status: BrainRunStatus) -> Result<BrainRun>;
     pub fn start_run_with_parent(&self, name: &str, sender: &str, kind: BrainRunKind, request_seq: u64, initiating_attachment_id: AttachmentId, status: BrainRunStatus, parent_run_id: Option<RunId>) -> Result<BrainRun>;

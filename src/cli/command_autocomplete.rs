@@ -117,29 +117,59 @@ impl CommandRegistry {
                     category: CommandCategory::Basic,
                 },
 
-                // Model Commands
+                // Model Commands — common commands first, then Finch-specific provider switch.
                 CommandSpec {
                     name: "/model",
                     params: None,
-                    description: "Show the active named model profile",
+                    description: "Show the active model; interactive picker within this provider",
+                    category: CommandCategory::Model,
+                },
+                CommandSpec {
+                    name: "/model",
+                    params: Some("<id>"),
+                    description: "Overlay a model on this Brain (same credentials; does not switch accounts)",
                     category: CommandCategory::Model,
                 },
                 CommandSpec {
                     name: "/model list",
                     params: None,
-                    description: "List configured cloud and local model profiles",
+                    description: "List models the active provider entry can serve",
                     category: CommandCategory::Model,
                 },
                 CommandSpec {
-                    name: "/model",
+                    name: "/status",
+                    params: None,
+                    description: "Inspect effective provider, model, thinking, and source",
+                    category: CommandCategory::Model,
+                },
+                CommandSpec {
+                    name: "/providers",
+                    params: None,
+                    description: "List configured provider entries (credentials/backend; no mutation)",
+                    category: CommandCategory::Model,
+                },
+                CommandSpec {
+                    name: "/provider",
                     params: Some("<name>"),
-                    description: "Switch profiles without clearing conversation context",
+                    description: "Bind this Brain to a configured provider entry (account/backend switch)",
+                    category: CommandCategory::Model,
+                },
+                CommandSpec {
+                    name: "/thinking",
+                    params: Some("[level]"),
+                    description: "Show or overlay reasoning effort on this Brain when supported",
+                    category: CommandCategory::Model,
+                },
+                CommandSpec {
+                    name: "/config",
+                    params: None,
+                    description: "Persistent configuration and setup",
                     category: CommandCategory::Model,
                 },
                 CommandSpec {
                     name: "/teacher",
                     params: None,
-                    description: "Alias for /model commands",
+                    description: "Compatibility alias for /provider",
                     category: CommandCategory::Model,
                 },
                 CommandSpec {

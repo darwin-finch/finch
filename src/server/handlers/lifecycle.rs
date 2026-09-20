@@ -160,3 +160,96 @@ pub(super) async fn archive_named_brain(
         archived_to: archived_to.map(|path| path.display().to_string()),
     }))
 }
+
+pub(super) async fn get_named_brain_selection(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<crate::brain::BrainProviderSelection>, Response> {
+    check_brain_bootstrap_access(&server, addr, &headers).await?;
+    server
+        .brain_store()
+        .provider_selection(&name)
+        .map(Json)
+        .map_err(|error| AppError(error).into_response())
+}
+
+pub(super) async fn put_named_brain_selection(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(selection): Json<crate::brain::BrainProviderSelection>,
+) -> Result<Json<crate::brain::BrainProviderSelection>, Response> {
+    check_brain_bootstrap_access(&server, addr, &headers).await?;
+    if !provider_selection_is_valid(&selection) {
+        return Err(AppError(anyhow::anyhow!(
+            "provider/model selection contains an invalid name, model, or thinking level"
+        ))
+        .into_response());
+    }
+    let selection_lock = server
+        .brain_store()
+        .execution_lock(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    let _selection_write = selection_lock.lock_owned().await;
+    server
+        .brain_store()
+        .set_provider_selection(&name, selection)
+        .map(Json)
+        .map_err(|error| AppError(error).into_response())
+}
+
+fn provider_selection_is_valid(selection: &crate::brain::BrainProviderSelection) -> bool {
+    let valid_line = |value: Option<&str>, max_len: usize| {
+        value.is_none_or(|value| {
+            !value.trim().is_empty()
+                && value == value.trim()
+                && value.len() <= max_len
+                && !value.chars().any(char::is_control)
+        })
+    };
+    let valid_effort = selection.reasoning_effort.as_deref().is_none_or(|value| {
+        matches!(
+            value,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        )
+    });
+    valid_line(selection.provider.as_deref(), 128)
+        && valid_line(selection.model.as_deref(), 256)
+        && valid_line(selection.reasoning_effort.as_deref(), 32)
+        && valid_effort
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::provider_selection_is_valid;
+    use crate::brain::BrainProviderSelection;
+
+    #[test]
+    fn persisted_selection_rejects_terminal_controls_and_untrimmed_values() {
+        for model in ["gpt-5\u{1b}[2J", " gpt-5", "gpt-5\t"] {
+            let selection = BrainProviderSelection {
+                provider: Some("work".into()),
+                model: Some(model.into()),
+                reasoning_effort: Some("high".into()),
+                provider_inherited: false,
+            };
+            assert!(
+                !provider_selection_is_valid(&selection),
+                "unsafe model identity must not enter persisted status text: {model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_selection_accepts_secret_free_profile_identity() {
+        assert!(provider_selection_is_valid(&BrainProviderSelection {
+            provider: Some("chatgpt-work".into()),
+            model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: Some("xhigh".into()),
+            provider_inherited: false,
+        }));
+    }
+}

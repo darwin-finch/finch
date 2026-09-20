@@ -2,6 +2,8 @@
 
 **Config file:** `~/.finch/config.toml`
 
+Optional `default_provider = "profile-name"` names the global default new Brains inherit once. Changing it does not rewrite existing Brain overlays.
+
 ## Format — `[[providers]]`
 
 ```toml

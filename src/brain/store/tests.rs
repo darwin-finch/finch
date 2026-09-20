@@ -7851,3 +7851,81 @@ fn archive_evicts_delivery_log_so_a_reused_name_does_not_leak() {
         vec![replacement]
     );
 }
+
+#[test]
+fn test_provider_selection_survives_store_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let overlay = BrainProviderSelection {
+        provider: Some("work".into()),
+        model: Some("grok-4.6".into()),
+        reasoning_effort: Some("high".into()),
+        provider_inherited: false,
+    };
+    {
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let stored = store
+            .set_provider_selection("lane-a", overlay.clone())
+            .unwrap();
+        assert_eq!(
+            stored, overlay,
+            "set_provider_selection must return the overlay it persisted; stored={stored:?}"
+        );
+        assert_eq!(
+            store.provider_selection("lane-a").unwrap(),
+            overlay,
+            "the live store must read back the overlay it just wrote"
+        );
+    }
+
+    let reopened = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let restored = reopened.provider_selection("lane-a").unwrap();
+    assert_eq!(
+        restored, overlay,
+        "attach/reopen must restore the Brain overlay from metadata.json; restored={restored:?}"
+    );
+    assert_eq!(
+        reopened.provider_selection("lane-b").unwrap(),
+        BrainProviderSelection::default(),
+        "a different Brain must not inherit another Brain's overlay"
+    );
+}
+
+#[test]
+fn test_provider_selection_makes_brain_durable_without_conversation_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("test-machine", Some(temp.path().to_path_buf()));
+    let selection = BrainProviderSelection {
+        provider: Some("xai".to_string()),
+        model: Some("grok-4.6".to_string()),
+        reasoning_effort: None,
+        provider_inherited: false,
+    };
+
+    store
+        .set_provider_selection("lane-a", selection.clone())
+        .unwrap();
+
+    assert!(
+        !store.remove_if_unused("lane-a").unwrap(),
+        "selection metadata is durable Brain state, even before conversation history exists"
+    );
+    assert_eq!(store.provider_selection("lane-a").unwrap(), selection);
+}
+
+#[test]
+fn test_provider_selection_does_not_hydrate_the_event_log() {
+    let temp = seed_brain_root(1);
+    std::fs::write(
+        temp.path().join("brain-0000").join("metadata.json"),
+        r#"{"version":1,"brain_id":"00000000-0000-0000-0000-00000000000a","created_ms":1,"provider":"chatgpt"}"#,
+    )
+    .unwrap();
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let selection = store.provider_selection("brain-0000").unwrap();
+    assert_eq!(selection.provider.as_deref(), Some("chatgpt"));
+    assert!(
+        hydrated_names(&store).is_empty(),
+        "reading the overlay must not replay the event log; hydrated={:?}",
+        hydrated_names(&store)
+    );
+}

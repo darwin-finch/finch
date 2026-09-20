@@ -815,6 +815,69 @@ pub fn create_provider_profile_from_config_with_resolver(
     Ok(provider)
 }
 
+/// Build one provider from an already-overlaid entry, reusing config credentials.
+///
+/// The clone may carry a Brain-local model or thinking overlay. Shared
+/// `[[providers]]` rows are not written.
+pub fn create_provider_from_overlaid_entry(
+    config: &Config,
+    entry: &ProviderEntry,
+) -> Result<Arc<dyn LlmProvider>> {
+    create_provider_from_overlaid_entry_with_resolver(config, entry, &EnvironmentCredentialResolver)
+}
+
+fn create_provider_from_overlaid_entry_with_resolver(
+    config: &Config,
+    entry: &ProviderEntry,
+    resolver: &dyn CredentialResolver,
+) -> Result<Arc<dyn LlmProvider>> {
+    if entry.is_local() {
+        bail!("Local providers are not constructed from the cloud provider factory");
+    }
+    preflight_provider_config(config)?;
+    if let Some(binding) = entry.credential_binding() {
+        let credentials = crate::config::credential_index(config.credentials())?;
+        let credential = credentials
+            .get(binding.credential_ref.as_str())
+            .expect("Config::validate checked the selected named credential reference");
+        if credential.provider == CredentialProvider::ChatgptSubscription {
+            let ProviderEntry::Credentialed {
+                model,
+                reasoning_effort,
+                ..
+            } = entry
+            else {
+                unreachable!("credential binding implies credentialed entry")
+            };
+            return Ok(Arc::new(ChatGptSubscriptionProvider::production(
+                credential,
+                model.as_deref(),
+                *reasoning_effort,
+            )?) as Arc<dyn LlmProvider>);
+        }
+        if credential.provider == CredentialProvider::GrokSubscription {
+            let ProviderEntry::Credentialed {
+                model,
+                reasoning_effort,
+                ..
+            } = entry
+            else {
+                unreachable!("credential binding implies credentialed entry")
+            };
+            return Ok(Arc::new(GrokSubscriptionProvider::production(
+                credential,
+                model.as_deref(),
+                *reasoning_effort,
+            )?) as Arc<dyn LlmProvider>);
+        }
+        let handle = resolve_named_credential(binding, credential, resolver)?;
+        let inner = create_provider_from_resolved_entry(entry, &handle)?;
+        Ok(Arc::new(CredentialBoundProvider::new(inner, credential)) as Arc<dyn LlmProvider>)
+    } else {
+        Ok(Arc::from(create_provider_from_entry(entry)?))
+    }
+}
+
 /// Create the ordered cloud provider pool from unified configuration, falling back to legacy
 /// teacher entries only when no cloud `[[providers]]` entries exist.
 pub fn create_providers_from_config(config: &Config) -> Result<Vec<Box<dyn LlmProvider>>> {

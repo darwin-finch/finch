@@ -356,6 +356,62 @@ impl ProviderEntry {
         }
     }
 
+    /// Configured reasoning effort, when this entry schema carries one.
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        match self {
+            Self::Credentialed {
+                reasoning_effort, ..
+            }
+            | Self::Openai {
+                reasoning_effort, ..
+            } => *reasoning_effort,
+            _ => None,
+        }
+    }
+
+    /// Whether `/thinking` is meaningful for this provider type.
+    pub fn supports_reasoning_effort(&self) -> bool {
+        matches!(self, Self::Credentialed { .. } | Self::Openai { .. })
+    }
+
+    /// Clone this entry with a Brain-local model overlay. Does not write config.
+    pub fn with_model_overlay(&self, overlay: Option<String>) -> Self {
+        let mut entry = self.clone();
+        match &mut entry {
+            Self::Credentialed { model, .. }
+            | Self::LegacyChatgptSubscription { model, .. }
+            | Self::Claude { model, .. }
+            | Self::Openai { model, .. }
+            | Self::Grok { model, .. }
+            | Self::Gemini { model, .. }
+            | Self::Mistral { model, .. }
+            | Self::Groq { model, .. }
+            | Self::Openrouter { model, .. } => *model = overlay,
+            Self::Ollama { model, .. } => {
+                if let Some(value) = overlay {
+                    *model = value;
+                }
+            }
+            Self::RemoteDaemon { .. } | Self::Local { .. } => {}
+        }
+        entry
+    }
+
+    /// Clone this entry with a Brain-local thinking overlay. Does not write config.
+    pub fn with_reasoning_effort_overlay(&self, overlay: Option<ReasoningEffort>) -> Self {
+        let mut entry = self.clone();
+        match &mut entry {
+            Self::Credentialed {
+                reasoning_effort, ..
+            }
+            | Self::Openai {
+                reasoning_effort, ..
+            } => *reasoning_effort = overlay,
+            _ => {}
+        }
+        entry
+    }
+
     /// Named provider credential binding, if this is a credentialed profile.
     pub fn credential_binding(&self) -> Option<&CredentialBinding> {
         match self {

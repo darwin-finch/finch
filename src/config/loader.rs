@@ -129,6 +129,8 @@ where
         #[serde(default)]
         providers: Vec<ProviderEntry>,
         #[serde(default)]
+        default_provider: Option<String>,
+        #[serde(default)]
         credentials: Vec<super::ProviderCredential>,
         // Legacy fields — kept for reading old configs
         #[serde(default)]
@@ -192,6 +194,7 @@ where
     }
 
     let mut config = config_factory(providers);
+    config.default_provider = toml_config.default_provider;
     config.replace_loaded_credentials(toml_config.credentials);
 
     if let Some(coreml) = toml_config.coreml.or(legacy_coreml) {

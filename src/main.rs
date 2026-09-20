@@ -81,6 +81,14 @@ struct Args {
     /// Compatibility alias for `finch attach <name>`. Hidden from help.
     #[arg(long = "brain", hide = true)]
     brain: Option<String>,
+
+    /// One-shot model overlay for this invocation. Does not persist on the Brain.
+    #[arg(long = "model", value_name = "ID")]
+    model: Option<String>,
+
+    /// Persist this provider entry on the current Brain (account/backend switch).
+    #[arg(long = "provider", value_name = "NAME")]
+    provider: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -176,6 +184,18 @@ enum Command {
     Attach {
         /// Brain name (`1-64` letters, numbers, `-` or `_`)
         name: String,
+        /// One-shot model overlay for this invocation. Does not persist.
+        #[arg(long = "model", value_name = "ID")]
+        model: Option<String>,
+        /// Persist this provider entry on the named Brain.
+        #[arg(long = "provider", value_name = "NAME")]
+        provider: Option<String>,
+    },
+    /// Inspect the effective global default and optional Brain provider/model
+    Status {
+        /// Named Brain to inspect (`finch status --brain <name>`)
+        #[arg(long = "brain", value_name = "NAME")]
+        brain: Option<String>,
     },
     /// List leftover legacy UUID session files
     Sessions {
@@ -889,6 +909,33 @@ fn suppress_ort_logs_unless_overridden() {
     }
 }
 
+fn run_selection_status(brain: Option<String>) -> Result<()> {
+    let config = load_config()?;
+    let global = config
+        .default_provider_name()
+        .unwrap_or_else(|| "(none)".into());
+    println!("global default: {global}");
+    if let Some(name) = brain {
+        let name = finch::brain::BrainStore::validate_name(&name)?.to_string();
+        let store = finch::brain::BrainStore::new("local");
+        let persisted = store.provider_selection(&name)?;
+        let request = finch::cli::SelectionRequest {
+            default_provider: config.default_provider_name(),
+            persisted,
+            cli_provider: None,
+            cli_model: None,
+        };
+        match finch::cli::resolve_selection(&config.providers, &request) {
+            Ok(effective) => println!("{}", effective.status_report(None)),
+            Err(error) => {
+                println!("brain: {name}");
+                println!("error: {error}");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     // Start the startup clock first, so t0 is as close to process entry as a
@@ -912,7 +959,17 @@ async fn main() -> Result<()> {
     // `finch attach NAME` is the canonical REPL entry; take it so the
     // subcommand match below falls through to interactive mode.
     let attach_brain = match args.command.take() {
-        Some(Command::Attach { name }) => {
+        Some(Command::Attach {
+            name,
+            model,
+            provider,
+        }) => {
+            if args.model.is_none() {
+                args.model = model;
+            }
+            if args.provider.is_none() {
+                args.provider = provider;
+            }
             Some(finch::brain::BrainStore::validate_name(&name)?.to_string())
         }
         other => {
@@ -987,6 +1044,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Brain { brain_command }) => {
             return run_brain_command(brain_command);
+        }
+        Some(Command::Status { brain }) => {
+            return run_selection_status(brain);
         }
         Some(Command::Attach { .. }) | None => {
             // `finch attach NAME` is applied above via `attach_brain`.
@@ -1284,6 +1344,7 @@ async fn main() -> Result<()> {
         )
         .await
     };
+    repl.set_cli_selection(args.model.clone(), args.provider.clone());
 
     // Run REPL (with full TUI event loop)
     if std::env::var("SHAMMAH_DEBUG").is_ok() {
@@ -4408,10 +4469,21 @@ mod tests {
     fn attach_subcommand_parses_a_brain_name() {
         let args = Args::try_parse_from(["finch", "attach", "golden-ridge-0771a6"]).unwrap();
         match args.command {
-            Some(Command::Attach { name }) => assert_eq!(
-                name, "golden-ridge-0771a6",
-                "finch attach NAME must parse the Brain name"
-            ),
+            Some(Command::Attach {
+                name,
+                model,
+                provider,
+            }) => {
+                assert_eq!(
+                    name, "golden-ridge-0771a6",
+                    "finch attach NAME must parse the Brain name"
+                );
+                assert_eq!(model, None, "bare attach must not invent a --model overlay");
+                assert_eq!(
+                    provider, None,
+                    "bare attach must not invent a --provider binding"
+                );
+            }
             other => panic!("finch attach NAME must parse as the attach subcommand, got {other:?}"),
         }
     }

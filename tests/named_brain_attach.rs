@@ -1757,3 +1757,136 @@ fn test_reconnected_completed_say_renders_the_component_card() {
         "a clean /exit must succeed after the replay, status={status:?}, live screen:\n{screen}"
     );
 }
+
+fn overlay_from_metadata(path: &Path) -> (Option<String>, Option<String>) {
+    let raw = std::fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "INVARIANT: model overlay persist must write metadata.json at {} ({error})",
+            path.display()
+        )
+    });
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
+        panic!(
+            "metadata.json must be JSON at {}: {error}; raw={raw}",
+            path.display()
+        )
+    });
+    (
+        value
+            .get("provider")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        value
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    )
+}
+
+#[test]
+fn model_overlay_survives_exit_and_named_attach() {
+    let daemon = IsolatedDaemon::start();
+    let mut first = Session::spawn_on(&daemon.home, &["attach", BRAIN]);
+    first.wait_for(
+        "finch v",
+        READY_DEADLINE,
+        "the first attach drew the startup header",
+    );
+    first.send_line("/model grok-4.6");
+    first.wait_for(
+        "✓ Model overlay grok-4.6",
+        ECHO_DEADLINE,
+        "the model overlay command completed its durable write",
+    );
+    let before_exit = std::fs::read_to_string(daemon.metadata_path()).unwrap();
+    assert!(
+        before_exit.contains("grok-4.6"),
+        "the success confirmation must follow the durable write; metadata before exit={before_exit}; terminal={}",
+        first.readable_transcript()
+    );
+    first.send_line("/exit");
+    let status = first.wait_for_exit();
+    let first_text = first.readable_transcript();
+    assert!(
+        status.success(),
+        "a clean /exit after /model must succeed, status={status:?}, terminal:\n{first_text}"
+    );
+    drop(first);
+
+    let (provider, model) = overlay_from_metadata(&daemon.metadata_path());
+    let metadata_raw = std::fs::read_to_string(daemon.metadata_path()).unwrap();
+    assert_eq!(
+        model.as_deref(),
+        Some("grok-4.6"),
+        "INVARIANT: /model must persist the overlay on the named Brain; provider={provider:?} metadata={} raw={metadata_raw} terminal:\n{first_text}",
+        daemon.metadata_path().display(),
+    );
+
+    let mut second = Session::spawn_on(&daemon.home, &["attach", BRAIN]);
+    second.wait_for(
+        "finch v",
+        READY_DEADLINE,
+        "reattach after /model drew the startup header",
+    );
+    second.send_line("/status");
+    second.wait_for(
+        "grok-4.6",
+        ECHO_DEADLINE,
+        "reattach /status still reports the persisted overlay",
+    );
+    second.send_line("/exit");
+    let second_status = second.wait_for_exit();
+    let second_text = second.readable_transcript();
+    assert!(
+        second_status.success(),
+        "reattach /exit must succeed, status={second_status:?}, terminal:\n{second_text}"
+    );
+    assert!(
+        second_text.contains("grok-4.6"),
+        "INVARIANT: finch attach {BRAIN} must still have the persisted model.\nterminal:\n{second_text}"
+    );
+}
+
+#[test]
+fn cli_model_flag_is_one_shot_and_does_not_rewrite_brain_metadata() {
+    let daemon = IsolatedDaemon::start();
+    std::fs::create_dir_all(daemon.brain_dir()).expect("create named Brain dir");
+    std::fs::write(
+        daemon.metadata_path(),
+        r#"{"version":1,"brain_id":"00000000-0000-0000-0000-0000000000aa","created_ms":1,"provider":"attach-fixture","model":"grok-code-fast-1"}"#,
+    )
+    .expect("seed persisted overlay");
+
+    let help = Command::new(env!("CARGO_BIN_EXE_finch"))
+        .args(["attach", "--help"])
+        .output()
+        .expect("finch attach --help");
+    let attach_help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        attach_help.contains("--model"),
+        "attach help must document --model, got:\n{attach_help}"
+    );
+    assert!(
+        attach_help.to_ascii_lowercase().contains("not persist")
+            || attach_help.to_ascii_lowercase().contains("one-shot")
+            || attach_help.contains("Does not persist"),
+        "attach --model help must say it does not persist, got:\n{attach_help}"
+    );
+
+    let mut session = Session::spawn_on(&daemon.home, &["attach", BRAIN, "--model", "grok-4.6"]);
+    session.wait_for(
+        "one-shot",
+        READY_DEADLINE,
+        "one-shot attach projected its temporary model identity",
+    );
+    session.send_line("/exit");
+    let _ = session.wait_for_exit();
+    drop(session);
+
+    let (_provider, model) = overlay_from_metadata(&daemon.metadata_path());
+    assert_eq!(
+        model.as_deref(),
+        Some("grok-code-fast-1"),
+        "INVARIANT: --model must not rewrite the Brain overlay; metadata model={model:?}"
+    );
+}

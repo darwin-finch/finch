@@ -193,6 +193,8 @@ pub fn create_provider_from_config(config: &Config) -> Result<Box<dyn LlmProvide
 pub fn create_provider_from_entries(entries: &[ProviderEntry]) -> Result<Box<dyn LlmProvider>> { … }
 /// Create a cloud `LlmProvider` from a unified `ProviderEntry`.
 pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmProvider>> { … }
+/// Build one provider from an already-overlaid entry, reusing config credentials.
+pub fn create_provider_from_overlaid_entry(config: &Config, entry: &ProviderEntry) -> Result<Arc<dyn LlmProvider>> { … }
 /// Create a single provider from a `TeacherEntry`.
 pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmProvider>> { … }
 /// Construct the named cloud provider graph once.

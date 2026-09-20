@@ -309,54 +309,33 @@ Rules:\n\
                         self.handle_feedback_command(1.0, FeedbackRating::Good, note)
                             .await?;
                     }
-                    Command::ModelShow => {
+                    Command::ProviderShow => {
                         self.handle_provider_show().await;
                         self.render_tui().await?;
                     }
+                    Command::ProviderList => {
+                        self.handle_provider_list().await?;
+                    }
+                    Command::ProviderSwitch(name) => {
+                        self.handle_provider_switch(name).await?;
+                    }
+                    Command::ModelShow => {
+                        self.handle_model_show().await?;
+                    }
                     Command::ModelList => {
-                        use crate::providers::create_provider_from_entry;
-                        let active = self.model_selection.active_index().await;
-                        let pending = self.model_selection.pending_index().await;
-                        let mut lines = vec!["Available model profiles:".to_string()];
-                        for (index, entry) in self.available_providers.iter().enumerate() {
-                            let marker = if index == active {
-                                "→"
-                            } else if Some(index) == pending {
-                                "…"
-                            } else {
-                                " "
-                            };
-                            let tag = if entry.is_local() { "local" } else { "cloud" };
-                            // Show availability: cloud entries are available if we can build a provider
-                            let available =
-                                !entry.is_local() && create_provider_from_entry(entry).is_ok();
-                            let avail_tag = if entry.is_local() || available {
-                                ""
-                            } else {
-                                " (no API key)"
-                            };
-                            lines.push(format!(
-                                "{} {}. [{}] {} · {}{}",
-                                marker,
-                                index + 1,
-                                tag,
-                                entry.profile_name(),
-                                entry.model().unwrap_or(entry.provider_type()),
-                                avail_tag
-                            ));
-                        }
-                        if self.available_providers.is_empty() {
-                            lines.push(
-                                "  (none configured — add [[providers]] to ~/.finch/config.toml)"
-                                    .to_string(),
-                            );
-                        }
-                        lines.push("Use /model <name> or /model <number> to switch.".to_string());
-                        self.output_manager.write_info(lines.join("\n"));
-                        self.render_tui().await?;
+                        self.handle_model_list().await?;
                     }
                     Command::ModelSwitch(name) => {
-                        self.handle_provider_switch(name).await?;
+                        self.handle_model_overlay(name).await?;
+                    }
+                    Command::ThinkingShow => {
+                        self.handle_thinking_show().await?;
+                    }
+                    Command::ThinkingSet(level) => {
+                        self.handle_thinking_set(level).await?;
+                    }
+                    Command::Status => {
+                        self.handle_status().await?;
                     }
                     Command::LicenseStatus => {
                         use crate::config::{load_config, LicenseType};

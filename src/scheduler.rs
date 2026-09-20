@@ -287,6 +287,38 @@ impl ProviderResolver {
             inner,
         )))
     }
+
+    /// Activate a specific (possibly overlaid) provider entry without treating
+    /// the overlay model as a different named profile.
+    pub async fn resolve_entry(
+        &self,
+        entry: &crate::config::ProviderEntry,
+    ) -> Result<Arc<dyn Generator>> {
+        if let Some(config) = &self.config {
+            crate::providers::preflight_provider_config(config)?;
+        }
+        if entry.is_local() {
+            let client = self.daemon_client.clone().ok_or_else(|| {
+                anyhow::anyhow!("NoEligibleModel: local profile requires a running daemon")
+            })?;
+            return Ok(Arc::new(crate::generators::DaemonLocalGenerator::new(
+                client,
+                entry.profile_name(),
+            )));
+        }
+        let provider: Arc<dyn crate::providers::LlmProvider> = if let Some(config) = &self.config {
+            crate::providers::create_provider_from_overlaid_entry(config, entry)?
+        } else {
+            Arc::from(crate::providers::create_provider_from_entry(entry)?)
+        };
+        let client = crate::claude::ClaudeClient::with_shared_provider(provider);
+        let inner: Arc<dyn Generator> =
+            Arc::new(crate::generators::ClaudeGenerator::new(Arc::new(client)));
+        Ok(Arc::new(crate::generators::ProfiledGenerator::new(
+            entry.profile_name(),
+            inner,
+        )))
+    }
 }
 
 /// Transport-neutral lifecycle requests from the child-agent scheduler to the

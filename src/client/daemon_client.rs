@@ -277,6 +277,50 @@ impl DaemonClient {
             .context("Failed to parse local model response")
     }
 
+    /// Read the secret-free provider/model overlay for a named Brain.
+    pub async fn brain_provider_selection(
+        &self,
+        name: &str,
+    ) -> Result<crate::brain::BrainProviderSelection> {
+        self.client
+            .get(format!(
+                "{}/v1/brains/named/{name}/selection",
+                self.base_url
+            ))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("Failed to read Brain provider selection")?
+            .error_for_status()
+            .context("Brain provider selection request failed")?
+            .json()
+            .await
+            .context("Failed to parse Brain provider selection")
+    }
+
+    /// Persist the secret-free provider/model overlay for a named Brain.
+    pub async fn set_brain_provider_selection(
+        &self,
+        name: &str,
+        selection: &crate::brain::BrainProviderSelection,
+    ) -> Result<crate::brain::BrainProviderSelection> {
+        self.client
+            .put(format!(
+                "{}/v1/brains/named/{name}/selection",
+                self.base_url
+            ))
+            .json(selection)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("Failed to persist Brain provider selection")?
+            .error_for_status()
+            .context("Brain provider selection update failed")?
+            .json()
+            .await
+            .context("Failed to parse persisted Brain provider selection")
+    }
+
     /// Return the daemon's current local-model bootstrap state.
     pub async fn local_model_status(&self) -> Result<LocalModelStatus> {
         let value: serde_json::Value = self

@@ -163,6 +163,10 @@ pub struct Config {
     /// from this list, or `new()` to construct from the legacy fields.
     pub providers: Vec<ProviderEntry>,
 
+    /// Explicit global default provider profile name. New Brains inherit this
+    /// once; changing it does not rewrite existing Brain overlays.
+    pub default_provider: Option<String>,
+
     /// Secret-free named provider credential records. Secret material is
     /// resolved through an injected credential store only after graph validation.
     pub(crate) credentials: Vec<ProviderCredential>,
@@ -606,6 +610,17 @@ impl Config {
                 anyhow::bail!("duplicate provider profile name '{}'; profile selectors must be unique across accounts", provider.profile_name());
             }
         }
+        if let Some(name) = self.default_provider.as_deref() {
+            if !self
+                .providers
+                .iter()
+                .any(|entry| entry.profile_name() == name)
+            {
+                anyhow::bail!(
+                    "default_provider '{name}' is not a configured [[providers]] profile name"
+                );
+            }
+        }
         for provider in &self.providers {
             let Some(binding) = provider.credential_binding() else {
                 continue;
@@ -922,6 +937,7 @@ impl Config {
             colors: ColorScheme::default(),
             teachers,
             providers,
+            default_provider: None,
             credentials: Vec::new(),
             features,
             mcp_servers: HashMap::new(),
@@ -931,9 +947,25 @@ impl Config {
         }
     }
 
-    /// Get the active provider (first in the unified providers list).
+    /// Get the active provider (named global default, else first in the list).
     pub fn active_provider(&self) -> Option<&ProviderEntry> {
+        if let Some(name) = self.default_provider.as_deref() {
+            if let Some(entry) = self
+                .providers
+                .iter()
+                .find(|entry| entry.profile_name() == name)
+            {
+                return Some(entry);
+            }
+        }
         self.providers.first()
+    }
+
+    /// Profile name new Brains inherit when they have no overlay yet.
+    pub fn default_provider_name(&self) -> Option<String> {
+        self.default_provider
+            .clone()
+            .or_else(|| self.active_provider().map(|entry| entry.profile_name()))
     }
 
     /// Attach secret-free named credential metadata to this configuration.
@@ -1069,6 +1101,7 @@ impl Config {
             client: Some(self.client.clone()),
             server: Some(self.server.clone()),
             providers,
+            default_provider: self.default_provider.clone(),
             credentials: self.credentials.clone(),
             coreml: Some(self.backend.coreml),
             colors: Some(self.colors.clone()),
@@ -1102,6 +1135,8 @@ struct TomlConfig {
     server: Option<ServerConfig>,
     #[serde(default)]
     providers: Vec<ProviderEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     credentials: Vec<ProviderCredential>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1144,6 +1179,7 @@ mod tests {
             client: None,
             server: None,
             providers: Vec::new(),
+            default_provider: None,
             credentials: Vec::new(),
             coreml: None,
             colors: None,
