@@ -8,10 +8,10 @@ envelope (`parse_finch_script`), the wire corpus capture/audit and its source-on
 The typed machine that runs a program is `crates/finch-vm/`; the service that schedules and
 authorizes one is `src/runtime/`.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `crates/finch-programs/src/lib.rs` is the whole public
-surface. The repository currently has no `scripts/check_subsystems.py`; facade shape is checked by
-interface generation and review.
+**Interface:** child modules are private, so the `pub use` list in
+`crates/finch-programs/src/lib.rs` is the whole public surface — read it directly for exact
+signatures. The repository currently has no `scripts/check_subsystems.py`; facade shape is checked
+by review.
 
 **Dependencies:** `finch-vm` supplies execution contracts, `finch-language` supplies source
 compilation, and `finch-tools-api` supplies the shared `ExecutionEffect` vocabulary. Corpus capture

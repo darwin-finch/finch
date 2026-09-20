@@ -12,21 +12,24 @@ Documentation follows the same semantic waist as the workspace:
 
 - Shared value, ownership, concept, effect, module, and source-to-IR rules stay here. No one crate
   can define them independently.
-- `crates/finch-colisp/docs/` owns implemented CoLisp reader grammar and how that reader
-  submits the shared construction protocol. It does not own typed-stack-IR lowering.
-- `crates/finch-coforth/docs/` owns implemented Co-Forth reader grammar and the same
-  construction-protocol submission. It does not own typed-stack-IR lowering.
+- [`crates/finch-colisp/README.md`](../../crates/finch-colisp/README.md) owns implemented CoLisp
+  reader grammar and how that reader submits the shared construction protocol. It does not own
+  typed-stack-IR lowering.
+- [`crates/finch-coforth/README.md`](../../crates/finch-coforth/README.md) owns implemented
+  Co-Forth reader grammar and the same construction-protocol submission. It does not own
+  typed-stack-IR lowering.
 - `vocabulary/language/wire.gbnf` is the published compact-wire complete-response
   grammar, generated from those reader lexicons. It is not the submission envelope
   (`schema.json`) and is not a proof of semantic safety.
-- `crates/finch-vm-core/docs/` owns implemented typed-IR schema, verifier contracts, diagnostics,
-  and versioning details.
-- `crates/finch-vm/docs/` owns implemented interpreter, fiber, checkpoint, and execution semantics.
+- [`crates/finch-vm-core/README.md`](../../crates/finch-vm-core/README.md) owns implemented
+  typed-IR schema, verifier contracts, diagnostics, and versioning details.
+- [`crates/finch-vm/README.md`](../../crates/finch-vm/README.md) owns implemented interpreter,
+  fiber, checkpoint, and execution semantics.
 
 Create those crate-local documents when their subject has an implemented contract large enough to
 need more than the crate's `AGENTS.md`; do not copy planned semantics into them prematurely. The
-crate capsules remain the fastest authoritative map of current ownership, and generated
-`INTERFACE.md` files remain the exact public Rust surfaces.
+crate capsules remain the fastest authoritative map of current ownership, and each crate's
+`src/lib.rs` remains the exact public Rust surface.
 
 The long-term documentation split should remain coarse: one shared language specification, one
 syntax reference per frontend, one IR/verifier reference, and one execution reference. Avoid a file

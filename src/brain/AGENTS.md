@@ -14,20 +14,17 @@ portable effect delivery lives beside the reducible checkpoint as
 subtree is owned from here but implemented in `src/daemon` (its own capsule). Server, IPC,
 client, and agent composition live outside this subtree.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature.
-Child modules are private (`attachment`, `background`, `credential`, `journal`, `names`,
-`projection`, `remote`, `run`, `schedule`, `store`, `tasks`), so the `pub use` list in
-`src/brain/mod.rs` is
-the whole public surface; `effect_audit_archive` stays `pub(crate)`. Callers outside this
-directory use `crate::brain::Item`; they must not name `brain::store::`, `brain::journal::`,
-`brain::schedule::`, `brain::run::`, `brain::attachment::`, `brain::projection::`,
-`brain::tasks::`, `brain::remote::`, `brain::credential::`, `brain::names::`, or
-`brain::background::`.
+**Interface:** child modules are private (`attachment`, `background`, `credential`, `journal`,
+`names`, `projection`, `remote`, `run`, `schedule`, `store`, `tasks`), so the `pub use` list in
+`src/brain/mod.rs` is the whole public surface — read it directly for exact signatures;
+`effect_audit_archive` stays `pub(crate)`. Callers outside this directory use `crate::brain::Item`;
+they must not name `brain::store::`, `brain::journal::`, `brain::schedule::`, `brain::run::`,
+`brain::attachment::`, `brain::projection::`, `brain::tasks::`, `brain::remote::`,
+`brain::credential::`, `brain::names::`, or `brain::background::`.
 
 **Dependencies:** `runtime` (layer 2; the one allowed incoming direction), `models`, `tools`,
 `claude`. Persistence, isolation, credential, and HTTP behavior are not facade concerns: do not
 change storage layout, journaling, isolation proofs, credential handling, or wire behavior in a
 facade commit. Do not extract `finch-brain`.
 
-Add public surface by re-exporting it from `mod.rs`, then regenerate `INTERFACE.md` with
-`python3 scripts/generate_interfaces.py --write`.
+Add public surface by re-exporting it from `mod.rs`.

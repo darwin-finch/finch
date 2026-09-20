@@ -13,8 +13,8 @@ server use it for method surfaces, not only for these translations.
 This is a sub-subsystem of `ipc`. Nesting here is the same shape as
 `tools/mcp`: a directory with its own capsule inside another.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every item the codec
-facade re-exports. Child modules stay private. Callers outside `src/ipc` use
+**Interface:** `mod.rs`'s re-exports are the whole codec facade — read it directly for exact
+signatures. Child modules stay private. Callers outside `src/ipc` use
 `crate::ipc::Item`; they must not name `ipc::codec`, `ipc::brain_codec`, or
 `ipc::checkpoint_codec`. Sibling IPC modules (`client`, `server`) may use
 `crate::ipc::codec::` for encode/decode helpers that are not on the parent

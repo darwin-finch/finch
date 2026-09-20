@@ -17,31 +17,41 @@ or release-readiness claims without dated evidence; see Issues #74, #98, #120, a
 
 [`DESIGN.md`](DESIGN.md) describes how Finch is composed: what the modules are, how they depend on
 each other, operating modes, storage layout, and the technology stack. The tree itself is the
-record — a directory's `AGENTS.md` says what that directory is, and its `INTERFACE.md` says what it
-exposes.
+record, split by audience: a directory's `AGENTS.md` is its **agent contract** — ownership,
+dependencies, invariants, and test commands — and its `README.md` is the **narrative index** for
+humans and LLMs — what the subtree does, why it exists, and links to the topic docs that cover it.
+Neither restates the other: `AGENTS.md` never carries prose history or a doc index, and `README.md`
+never carries dependency rules or test commands.
 
-### Every source directory has an AGENTS.md; read it first
+`README.md` is a newer convention than `AGENTS.md` and is being added directory-by-directory; a
+subtree without one yet still has its `AGENTS.md`, which remains the authoritative contract either
+way.
+
+### Every source directory has an AGENTS.md, and gets a README.md; read both first
 
 A source directory's `AGENTS.md` states what that subtree is for, what it exposes, what it may
-depend on, and how to test it. **Read it, and the `INTERFACE.md` beside it, before you decide
+depend on, and how to test it. Its `README.md`, where one exists, explains why the subtree exists
+in plain language and indexes any further documentation about it. **Read both before you decide
 anything about that subtree** — before grepping, before opening files, and certainly before
-changing code. It exists so you do not have to read the subtree to find out what the subtree does.
-It supplements this file; it never replaces it.
+changing code. Together they exist so you do not have to read the subtree to find out what it does
+or why. They supplement this file; neither replaces it.
 
-The same document is how you *use* a module from outside it. To call into `src/memory`, read
-`src/memory/INTERFACE.md` — not `src/memory/*.rs`. Reading another module's implementation to
-learn its surface means the surface was not stated well enough; fix the document rather than
-working around it.
+The same documents are how you *use* a module from outside it. To call into `src/memory`, read
+`src/memory/README.md` for what it does and why, `src/memory/AGENTS.md` for its contract, and then
+`src/memory/mod.rs` (or, for a crate, `src/lib.rs`) directly for the exact signature of what you're
+calling — child modules stay private, so the `pub use` list there is the whole public surface.
+Reading another module's implementation beyond its facade to learn its surface means the capsule
+was not stated well enough; fix the document rather than working around it.
 
-**Keeping it true is part of the change, not follow-up work.** If you alter what a module exposes,
-what it depends on, or what it is for, you update its `AGENTS.md` in the same commit. A capsule
-that describes the module as it was is worse than no capsule, because it is trusted. `INTERFACE.md`
-is generated from the facade, so you regenerate rather than edit it:
-`python3 scripts/generate_interfaces.py --write`.
+**Keeping either true is part of the change, not follow-up work.** If you alter what a module
+exposes, what it depends on, or what it is for, you update its `AGENTS.md` in the same commit; if
+you change why it exists, or add or move a topic document about it, you update its `README.md` in
+the same commit. A capsule or index that describes the module as it was is worse than none, because
+it is trusted.
 
 A module directory earns a capsule when something outside it depends on it. The `mod.rs` is the
 interface: child modules stay private and the `pub use` list is the whole public surface, so a
-reader learns the module from one screen instead of from every file in it.
+reader learns the module's exact signatures from one screen instead of from every file in it.
 
 ## Invariants
 
@@ -75,13 +85,6 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 ### Context
 
 - **Load order: `AGENTS.md` → `CLAUDE.md` → `FINCH.md` → `CONTEXT.md` → `README.md`; cwd wins over parent; a file reached by several names (symlink, hardlink) loads once** — `loads_all_names_in_same_directory`, `joins_multiple_sections_with_separator`, `symlinked_agents_md_loads_once_at_the_later_position` in `src/context/claude_md.rs`; `provider_request_carries_symlinked_agents_md_once_and_nested_rules_last` in `src/generators/claude.rs`
-
-### Subsystem interfaces
-
-- **Every subsystem's `INTERFACE.md` matches its facade** — an agent must be able to read what a
-  subsystem offers without opening its source, so the file is generated and checked, never hand-
-  edited. Change a public item, then run `python3 scripts/generate_interfaces.py --write` and commit
-  the result — `scripts/test_generate_interfaces.py`, and the check in `repository-hygiene.yml`
 
 ### GUI Accessibility
 

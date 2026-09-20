@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from generate_interfaces import module_directories, owning_module  # noqa: E402
+from module_boundaries import module_directories, owning_module  # noqa: E402
 from rust_scan import crate_references, strip_comments_and_tests, tracked_files  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent

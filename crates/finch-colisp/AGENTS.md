@@ -8,10 +8,11 @@ span-preserving CoLisp syntax into Finch's shared semantic-construction protocol
 interpreter, runtime, fiber scheduler, capability broker, or checkpoint codec. It does not infer
 types or effects privately or mint `ModuleVerified` certificates.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`. Applications continue
-to use the `finch-vm` compatibility facade; this unpublished crate is the downward frontend seam.
+**Interface:** `src/lib.rs` is the facade; read it directly for exact signatures. Applications
+continue to use the `finch-vm` compatibility facade; this unpublished crate is the downward
+frontend seam.
 
-**Documentation:** [`docs/README.md`](docs/README.md) owns implemented CoLisp syntax and lowering
+**Documentation:** [`README.md`](README.md) owns implemented CoLisp syntax and lowering
 reference material. Cross-frontend planned semantics remain in the shared
 [language design](../../docs/language/README.md); boundary changes follow the shared
 [implementation roadmap](../../docs/language/IMPLEMENTATION_ROADMAP.md).

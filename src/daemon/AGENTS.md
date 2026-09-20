@@ -13,8 +13,7 @@ child modules.
   edge is `client` (`ensure_daemon_running`); `main` composes lifecycle, spawn, and log
   at the daemon process boundary.
 - `lifecycle.rs`, `log.rs`, `spawn.rs`, and `upgrade.rs` are private implementation
-  modules. Add public surface by re-exporting it from `mod.rs`, then regenerate
-  `INTERFACE.md`.
+  modules. Add public surface by re-exporting it from `mod.rs`.
 - Must not own Brain storage, HTTP routes, IPC protocol, or model loading.
 - Do not change spawn, lifecycle, log-rotation, or upgrade-preflight behavior in a
   facade commit. Do not extract `finch-daemon`.
@@ -38,5 +37,5 @@ Run through the repository supervisor with a worktree-specific absolute Cargo ta
 ./scripts/test_brains.sh cargo test --lib daemon::
 ```
 
-Use the smallest matching filter first. Regenerate the facade digest with
-`python3 scripts/generate_interfaces.py --write` whenever the public surface changes.
+Use the smallest matching filter first. `mod.rs`'s re-exports are the whole public surface — read
+it directly for exact signatures.

@@ -10,9 +10,9 @@ This is a sub-subsystem of `tools` — a subsystem declared on a path inside ano
 nesting means: a directory with its own capsule inside another's. Executing a *local* tool is the
 parent's job; nothing here decides permissions or authority.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. The
-child modules are private, so the `pub use` list in `src/tools/mcp/mod.rs` is the whole public
-surface, and `scripts/check_subsystems.py` rejects a `pub mod` there.
+**Interface:** the child modules are private, so the `pub use` list in `src/tools/mcp/mod.rs` is
+the whole public surface — read it directly for exact signatures, and
+`scripts/check_subsystems.py` rejects a `pub mod` there.
 
 **Dependencies:** none downward, and one unwanted edge back up to its parent — `client.rs` uses the tool
 vocabulary `ToolDefinition` and `ToolInputSchema`. That edge clears when tools splits a

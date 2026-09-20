@@ -7,8 +7,8 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 dialects, wire types, dispatch, and adapter tests live in
 [`crates/finch-providers/AGENTS.md`](../../crates/finch-providers/AGENTS.md).
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item. Callers
-outside this directory use `crate::providers::Item`.
+**Interface:** `mod.rs`'s re-exports are the whole public surface — read it directly for exact
+signatures. Callers outside this directory use `crate::providers::Item`.
 
 **Dependencies:** `finch-providers` (transports and contracts), `config` (application
 `Config` / `ProviderEntry` / `TeacherEntry`). Do not add Brain, TUI, daemon, or tool

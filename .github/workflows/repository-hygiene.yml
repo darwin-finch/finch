@@ -22,11 +22,8 @@ jobs:
         run: python3 scripts/check_repository_hygiene.py
       - name: Run repository hygiene regressions
         run: python3 scripts/test_repository_hygiene.py
-      - name: Check generated subsystem interfaces
-        run: |
-          python3 scripts/generate_interfaces.py
-          python3 scripts/test_generate_interfaces.py
-          python3 scripts/test_seam_cost.py
+      - name: Check module seam cost
+        run: python3 scripts/test_seam_cost.py
       - name: Verify reviewed workflow inventory
         run: |
           python3 scripts/check_ci_workflow_manifest.py

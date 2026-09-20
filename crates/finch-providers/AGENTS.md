@@ -7,11 +7,11 @@ boundary, provider-neutral wire types and stream events, model catalog, capabili
 usage/allowance, OAuth lifecycle (`oauth` module), provider-specific OAuth dialects,
 and the Claude / OpenAI-compatible / Gemini / ChatGPT / SuperGrok adapters.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`. Child
+**Interface:** `src/lib.rs` is the facade; read it directly for exact signatures. Child
 modules are private; the `pub use` list is the whole public surface. Finch consumes
 this crate through compatibility facades at `src/providers` and `src/oauth`.
 
-**Documentation:** [`docs/README.md`](docs/README.md) owns crate-local reference
+**Documentation:** [`README.md`](README.md) owns crate-local reference
 material. Provider transport notes remain in the shared docs tree until they are
 extracted here.
 
@@ -55,11 +55,10 @@ Default features enable the current Claude, OpenAI-compatible, Gemini, ChatGPT,
 and SuperGrok subscription adapters.
 
 **Agent-context audit:** a worker can understand, implement against, and test this
-crate from this capsule plus `INTERFACE.md` without opening Finch application
+crate from this capsule plus `src/lib.rs` without opening Finch application
 code. Config-taking factory mapping remains in Finch `src/providers`.
 
 **Named remainders (not this extraction):**
 - Thread streaming HTTP through adapter constructors (named remainder of #775).
 - Feature-gate optional deps (`reqwest`/`png`/`ring`) so `--no-default-features` drops them (Issue 4 / #775).
 - Stop baking `~/.finch` into crate constructors; Finch should pass cache/store roots (Issue 5 / #775).
-- `generate_interfaces.py` omits `async fn` trait methods (Issue 6 / hygiene).

@@ -7,12 +7,12 @@ bus, socket path helpers, and the generated schema re-export. Brain remote
 envelopes and typed-runtime checkpoint framing live in the nested
 [`codec`](codec/AGENTS.md) capsule.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with
-its signature. `codec` is private, so callers outside this directory use
+**Interface:** `codec` is private, so callers outside this directory use
 `crate::ipc::Item` and must not name `ipc::codec`, `ipc::brain_codec`, or
 `ipc::checkpoint_codec`. `client`, `server`, `events`, `transport`, and
 `schema` remain named modules until a later ipc facade cut; do not treat this
-commit as that cut.
+commit as that cut. `mod.rs`'s re-exports are the whole public surface — read it directly for
+exact signatures.
 
 **Dependencies:** intended edges are runtime, VM, and providers for values the
 codecs translate. `ipc → brain` and `ipc → server` are existing
@@ -32,5 +32,3 @@ Leftover-daemon health advertisement (`leftover_daemon_message`,
 not treated as compatibility.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- ipc::`.
-Regenerate the facade digest with `python3 scripts/generate_interfaces.py --write`
-whenever the public surface changes.

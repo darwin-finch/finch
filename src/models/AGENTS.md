@@ -8,10 +8,10 @@ threshold routing, LoRA configuration, and neural embedding load), plus the adja
 the DESIGN.md models row. Those adjacent trees are not this facade; this capsule is
 `src/models/` only.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `src/models/mod.rs` is the whole public surface.
-Callers outside this directory use `crate::models::Item`; they must not name `bootstrap`,
-`download`, `loaders`, `neural_embedding`, `unified_loader`, `adapters`, or any other child.
+**Interface:** child modules are private, so the `pub use` list in `src/models/mod.rs` is the whole
+public surface — read it directly for exact signatures. Callers outside this directory use
+`crate::models::Item`; they must not name `bootstrap`, `download`, `loaders`, `neural_embedding`,
+`unified_loader`, `adapters`, or any other child.
 
 **Dependencies:** `config` (`ExecutionTarget`, `CoreMlConfig`), `memory` (`EmbeddingEngine` for
 neural embeddings), and `tools` (prompt/parser types). Production code under `src/models/**`
@@ -38,5 +38,4 @@ query functions were deleted rather than wired, and the adapters' duplicate fami
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- models::` plus a caller
 smoke (`local::`, `config::backend`). Run the full suite when changing a re-exported `pub`
-item. Regenerate the facade digest with `python3 scripts/generate_interfaces.py --write`
-whenever the public surface changes.
+item.

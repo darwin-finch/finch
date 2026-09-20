@@ -8,11 +8,11 @@ ScrollView, disclosure (accordion), activity rows, and graph *view types*.
 This is not a published crate. The test is whether production code here can draw without naming
 Finch's poset, tool, or runtime vocabularies.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every item the facade re-exports. Child
-modules stay private except `activity`, which callers already name. Add public surface by
-re-exporting it from `mod.rs`, then regenerate with `python3 scripts/generate_interfaces.py --write`.
-`view_model` is `pub(crate)`: projection-feeding consumers and their tests project messages
-through it, so it is reachable crate-wide but is not published facade surface.
+**Interface:** `mod.rs`'s re-exports are the whole facade — read it directly for exact signatures.
+Child modules stay private except `activity`, which callers already name. Add public surface by
+re-exporting it from `mod.rs`. `view_model` is `pub(crate)`: projection-feeding consumers and their
+tests project messages through it, so it is reachable crate-wide but is not published facade
+surface.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::tui::`.
 

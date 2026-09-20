@@ -8,9 +8,9 @@ JSONL persist (single events, checksummed batches, atomic rewrite), torn-tail
 and corrupt-tail recovery, metadata identity, schema constants, and legacy
 speculative-run correlation backfill. The log is authoritative.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its
-signature. Child modules are private, so the `pub use` list in `mod.rs` is the
-whole public surface. Callers outside `src/brain` use `crate::brain::Item`.
+**Interface:** child modules are private, so the `pub use` list in `mod.rs` is the
+whole public surface — read it directly for exact signatures. Callers outside `src/brain` use
+`crate::brain::Item`.
 
 **Dependencies:** `attachment`, `run`, and `schedule` for event payload types
 only. Do not select due work, acquire leases, or mutate attachment cursors.

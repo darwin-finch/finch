@@ -8,9 +8,9 @@ handoffs, the closed run-transition table, cancellation reservation records,
 and disconnect-terminalization intent files. Exact-once terminal state is an
 invariant of this facade.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its
-signature. Child modules are private, so the `pub use` list in `mod.rs` is the
-whole public surface. Callers outside `src/brain` use `crate::brain::Item`.
+**Interface:** child modules are private, so the `pub use` list in `mod.rs` is the
+whole public surface — read it directly for exact signatures. Callers outside `src/brain` use
+`crate::brain::Item`.
 
 **Dependencies:** `attachment` for the initiating attachment id; `journal` for
 durable directory creation used by disconnect intents. Do not depend on

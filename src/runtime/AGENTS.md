@@ -15,11 +15,10 @@ Version 1 may still change when justified: bump `RUNTIME_APPLICATION_ABI_VERSION
 closed. Do not grow a second durable journal, external client schema, or cache keyed on
 these types as if they were frozen.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `src/runtime/mod.rs` is the whole public surface.
-Callers outside this directory use `crate::runtime::Item`; they must not name `abi`,
-`agent_vm`, `agents`, `archive_store`, `automation`, `context`, `effect_audit`, `effect_log`,
-`outcome`, `host`, `hostio`, or `mcp`.
+**Interface:** child modules are private, so the `pub use` list in `src/runtime/mod.rs` is the
+whole public surface — read it directly for exact signatures. Callers outside this directory use
+`crate::runtime::Item`; they must not name `abi`, `agent_vm`, `agents`, `archive_store`,
+`automation`, `context`, `effect_audit`, `effect_log`, `outcome`, `host`, `hostio`, or `mcp`.
 
 **Dependencies:** `vm` (capability types and the typed machine), `programs` (language, values,
 execution effect), `tools` (MCP client binding), and `memory` (optional MemTree binding).
@@ -33,6 +32,4 @@ bindings are not proof of execution-policy conformance. Do not change program ex
 capability grants, effect-audit transitions, or automation availability in a facade commit.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- runtime::` plus a caller smoke
-(`scheduler::`, `poset::`). Run the full suite when changing a re-exported `pub` item. Regenerate
-the facade digest with `python3 scripts/generate_interfaces.py --write` whenever the public
-surface changes.
+(`scheduler::`, `poset::`). Run the full suite when changing a re-exported `pub` item.

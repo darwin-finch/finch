@@ -11,15 +11,14 @@ in this crate; its production callers are `src/runtime/hostio.rs` and `src/cli/t
 `src/runtime/tests.rs` also calls `crate::workbook::fixtures::*` directly to build XLSX fixtures for
 the #282 (two-cell spreadsheet exhausts memory) cell-count-bomb regression tests.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. The
-`embeddings`, `memtree`, `program_registry`, and `quality` children are private; the `pub use` list
-at the top of `crates/finch-memory/src/lib.rs` is their whole public surface, and
-`scripts/check_subsystems.py` rejects a `pub mod` for any of them. `memory_status` is the one
-public child module (`pub mod memory_status;`), carried over unchanged from when it lived beside
-`src/memory` as its own top-level module — callers use `finch_memory::memory_status::observed`
-etc. by design, not through a flat re-export. (`scripts/check_subsystems.py` does not exist in this
-repo as of the finch-memory extraction, #870 — only `scripts/seam_cost.py` and
-`scripts/generate_interfaces.py` do.)
+**Interface:** the `embeddings`, `memtree`, `program_registry`, and `quality` children are private;
+the `pub use` list at the top of `crates/finch-memory/src/lib.rs` is their whole public surface —
+read it directly for exact signatures — and `scripts/check_subsystems.py` rejects a `pub mod` for
+any of them. `memory_status` is the one public child module (`pub mod memory_status;`), carried
+over unchanged from when it lived beside `src/memory` as its own top-level module — callers use
+`finch_memory::memory_status::observed` etc. by design, not through a flat re-export.
+(`scripts/check_subsystems.py` does not exist in this repo as of the finch-memory extraction, #870
+— only `scripts/seam_cost.py` does.)
 
 **Dependencies:** none — `python3 scripts/seam_cost.py crates/finch-memory/src` reports zero
 outgoing edges. Callers inject `EmbeddingEngine`; constructors never select or download models.

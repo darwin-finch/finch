@@ -8,9 +8,9 @@ records, approval audience, and the durable `attachments.json` cursor file used
 to materialize a client's projection across reconnect. The journal records
 attach/detach; this facade does not append events.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its
-signature. Child modules are private, so the `pub use` list in `mod.rs` is the
-whole public surface. Callers outside `src/brain` use `crate::brain::Item`.
+**Interface:** child modules are private, so the `pub use` list in `mod.rs` is the
+whole public surface — read it directly for exact signatures. Callers outside `src/brain` use
+`crate::brain::Item`.
 
 **Dependencies:** `journal` for `BrainId` and durable directory creation. Do not
 depend on `schedule`, `run` orchestration, or `BrainStore`. Do not change cursor

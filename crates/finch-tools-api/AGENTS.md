@@ -34,7 +34,6 @@ from `src/tools/permissions.rs`. The pure policy tests live beside them in
 composition root (`src/tools/permissions/tests.rs`), at their original
 `tools::permissions::tests::*` module path, because only there can the real tools be constructed.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from [`src/lib.rs`](src/lib.rs); CI fails
-if it drifts. Edit the code, then run `python3 scripts/generate_interfaces.py --write`.
+**Interface:** [`src/lib.rs`](src/lib.rs) is the facade; read it directly for exact signatures.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -p finch-tools-api`.

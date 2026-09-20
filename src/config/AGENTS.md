@@ -9,10 +9,10 @@ The declared post-edit diagnostics sources live in
 [`diagnostics.rs`](diagnostics.rs) and their user-facing contract is documented in
 [`CONFIGURATION.md`](CONFIGURATION.md).
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `src/config/mod.rs` is the whole public surface, and
-`scripts/check_subsystems.py` rejects a `pub mod` there. `src/context` and `src/license` have their
-own module documents and no separate facade yet.
+**Interface:** child modules are private, so the `pub use` list in `src/config/mod.rs` is the whole
+public surface — read it directly for exact signatures — and `scripts/check_subsystems.py` rejects
+a `pub mod` there. `src/context` and `src/license` have their own module documents and no separate
+facade yet.
 
 **Dependencies:** `config` should depend on nothing except the extracted provider
 credential/reasoning types from `finch-providers`. Three unwanted edges remain, to

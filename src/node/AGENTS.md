@@ -13,7 +13,7 @@ the work statistics advertised to Brain and server callers. Its public contract 
   implementations.
 - Must not own distributed protocol, invitation, scheduler, Brain/server, or model-loading policy.
 - `identity.rs`, `stats.rs`, and `tls.rs` are private implementation modules. Add public surface by
-  re-exporting it from `mod.rs`, then regenerate `INTERFACE.md`.
+  re-exporting it from `mod.rs`.
 
 ## Invariants
 
@@ -33,5 +33,5 @@ Run through the repository supervisor with a worktree-specific absolute Cargo ta
 ./scripts/test_brains.sh cargo test --lib server::
 ```
 
-Use the smallest matching filter first. Regenerate the facade digest with
-`python3 scripts/generate_interfaces.py --write` whenever the public surface changes.
+Use the smallest matching filter first. `mod.rs`'s re-exports are the whole public surface — read
+it directly for exact signatures.

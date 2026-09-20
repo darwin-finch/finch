@@ -6,10 +6,9 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 embedded methodology spec). DESIGN.md lists this tree on the providers row; this capsule is
 `src/planning/` only. Provider transports, OAuth, and the Claude client live outside this subtree.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `src/planning/mod.rs` is the whole public surface.
-Callers outside this directory use `crate::planning::Item`; they must not name `loop_runner`,
-`personas`, or `types`.
+**Interface:** child modules are private, so the `pub use` list in `src/planning/mod.rs` is the
+whole public surface — read it directly for exact signatures. Callers outside this directory use
+`crate::planning::Item`; they must not name `loop_runner`, `personas`, or `types`.
 
 **Dependencies:** `claude` (`Message`), `cli` (`OutputManager`, TUI dialogs), `generators`
 (`Generator`), and `providers` (`UNIVERSAL_ALIGNMENT_PROMPT`). Do not extract `finch-planning`
@@ -20,5 +19,4 @@ methodology spec stay as they are. Do not change plan generation, critique, or s
 facade commit.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- planning::`. Run CLI plan-mode
-tests when changing a re-exported `pub` item. Regenerate the facade digest with
-`python3 scripts/generate_interfaces.py --write` whenever the public surface changes.
+tests when changing a re-exported `pub` item.

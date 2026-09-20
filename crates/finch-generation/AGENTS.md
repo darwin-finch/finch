@@ -11,11 +11,11 @@ from `finch-providers::StreamChunk`, and scripted test backends. Those types
 are a development seam, not a production wire: change them when justified;
 do not persist a parallel copy or bind an external client as if they were frozen.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`.
+**Interface:** `src/lib.rs` is the facade; read it directly for exact signatures.
 Child modules are private; the `pub use` list is the whole public surface.
 Finch consumes this crate through `src/generators`.
 
-**Documentation:** [`docs/README.md`](docs/README.md) owns crate-local
+**Documentation:** [`README.md`](README.md) owns crate-local
 reference material.
 
 **Dependencies:** this unpublished crate depends on `finch-providers` and
@@ -52,7 +52,7 @@ application `Config`. Environmental effects are injected through
 ```
 
 **Agent-context audit:** a worker can understand, implement against, and test
-this crate from this capsule plus `INTERFACE.md` without opening Finch
+this crate from this capsule plus `src/lib.rs` without opening Finch
 application code. Finch-owned adapters (Claude, Qwen, daemon-local) stay in
 `src/generators`.
 
@@ -64,10 +64,6 @@ application code. Finch-owned adapters (Claude, Qwen, daemon-local) stay in
   bijective wire-binding tables (issue #241) at the validated dispatch
   boundary; this crate must keep storing semantic names, not provider aliases.
 - Local model architecture rewrite (ONNX/Candle/Qwen internals) is out of scope.
-- `generate_interfaces.py` matches `fn`, not `async fn` (hygiene Issue 6).
-  `GenerationBackend::generate` and `Sleeper::sleep` are therefore absent from
-  `INTERFACE.md`. Read the trait in `src/backend.rs` / `src/ports.rs` for those
-  methods until the generator is fixed.
 - `GenerationPorts` progress/loader/cache/telemetry/scheduler are construction
   scaffolding. The supervisor uses clock, sleeper, and hardware metadata.
   Backends do not receive ports on `generate`; stitch them at construction.

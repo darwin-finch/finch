@@ -11,13 +11,12 @@ Shared typed IR, verification, capability/effect descriptions, and vocabulary co
 [`finch-vm-core`](../finch-vm-core/AGENTS.md). The program runtime service is `src/runtime/`; the
 program-definition and corpus metadata live in `crates/finch-programs/`.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature;
-it is generated from the `pub use` list in `src/lib.rs`, which is the whole public surface. Child
-modules are private, so reaching past it is a compile error. To expose something new, re-export it
-deliberately. The root crate provides compatibility namespaces for the former `finch::lisp`
-reader and types paths.
+**Interface:** `src/lib.rs`'s `pub use` list is the whole public surface — read it directly for
+exact signatures. Child modules are private, so reaching past it is a compile error. To expose
+something new, re-export it deliberately. The root crate provides compatibility namespaces for the
+former `finch::lisp` reader and types paths.
 
-**Documentation:** [`docs/README.md`](docs/README.md) owns implemented interpreter, fiber,
+**Documentation:** [`README.md`](README.md) owns implemented interpreter, fiber,
 checkpoint, and execution reference material. Cross-frontend planned semantics remain in the shared
 [language design](../../docs/language/README.md); source-compilation separation follows the shared
 [implementation roadmap](../../docs/language/IMPLEMENTATION_ROADMAP.md).

@@ -17,9 +17,8 @@
 //! snapshot and hands it here; it never matches on message type, and it
 //! carries component actions opaquely — there is no central action enum.
 //!
-//! **Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from the
-//! `pub(crate)` re-exports below; regenerate with
-//! `python3 scripts/generate_interfaces.py --write` after changing them.
+//! **Interface:** the `pub(crate)` re-exports below are the whole surface; read them directly for
+//! exact signatures.
 //!
 //! **Focused tests:** `./scripts/test_brains.sh cargo test --lib --
 //! cli::components::`.

@@ -7,8 +7,8 @@ composer `@` mention resolution (`mention`). Instruction files become the
 system prompt. Mentions snapshot selected project files/directories and lower
 them into structured user-turn context. This is not a published crate.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every item the facade
-re-exports. Child modules stay private except the `pub use` list in `mod.rs`.
+**Interface:** `mod.rs`'s `pub use` list is the whole facade — read it directly
+for exact signatures. Child modules stay private.
 
 **Dependencies:** `providers` for `ContentBlock` only. Do not execute tools,
 spawn processes, or follow credentialed network paths. Directory expansion is

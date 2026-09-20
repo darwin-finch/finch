@@ -11,10 +11,9 @@ generation contract (`GenerationBackend`, `GenerationEvent`, `ToolCall`,
 DESIGN.md lists this tree on the models row; models owns the Finch adapters.
 Provider transports live in `finch-providers`.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its
-signature. Child modules are private, so the `pub use` list in
-`src/generators/mod.rs` is the whole public surface. Callers outside this
-directory use `crate::generators::Item`; they must not name `claude`,
+**Interface:** child modules are private, so the `pub use` list in
+`src/generators/mod.rs` is the whole public surface — read it directly for exact signatures.
+Callers outside this directory use `crate::generators::Item`; they must not name `claude`,
 `daemon_local`, or `qwen`.
 
 **Dependencies:** `finch-generation` (contract), `finch-providers` /
@@ -41,5 +40,4 @@ This facade re-exports `translate_provider_chunk` so
 `ContentBlockComplete(ToolUse)` becomes `ToolCallComplete` at the generation
 layer. Native OpenAI/Claude deltas pass through the same ToolLoop.
 
-Add public surface by re-exporting it from `mod.rs`, then regenerate
-`INTERFACE.md` with `python3 scripts/generate_interfaces.py --write`.
+Add public surface by re-exporting it from `mod.rs`.

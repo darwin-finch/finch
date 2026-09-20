@@ -24,9 +24,9 @@ closed with a typed result and never execute. Cancel, timeout, disconnect,
 retry, and late-result-after-terminal admit at most one execution and append
 at most one result.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `src/tools/mod.rs` is the whole public surface, and
-the facade convention keeps a `pub mod` out of it. Callers outside this directory use
+**Interface:** child modules are private, so the `pub use` list in `src/tools/mod.rs` is the whole
+public surface — read it directly for exact signatures, and the facade convention keeps a `pub mod`
+out of it. Callers outside this directory use
 `crate::tools::Item` (or `finch::tools::Item`); they must not name `implementations`, `types`,
 `executor`, `permissions`, `todo`, or `mcp`. `mcp` publishes its own interface for work inside that
 subtree. The shared tool surface itself is `finch_tools_api::Item` — `src/tools/mod.rs` and the
