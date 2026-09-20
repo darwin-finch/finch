@@ -1516,7 +1516,10 @@ mod tests {
             _ => panic!("Expected ProviderSwitch(claude)"),
         }
         assert!(
-            !matches!(Command::parse("/model grok"), Some(Command::ProviderSwitch(_))),
+            !matches!(
+                Command::parse("/model grok"),
+                Some(Command::ProviderSwitch(_))
+            ),
             "/model must not be treated as a provider/account switch"
         );
         match Command::parse("/model GPT-4o (work)") {
@@ -1551,10 +1554,7 @@ mod tests {
             help.contains("/model never switches accounts"),
             "help must explain the provider/model boundary: {help}"
         );
-        assert!(
-            help.contains("/status"),
-            "help must list /status: {help}"
-        );
+        assert!(help.contains("/status"), "help must list /status: {help}");
     }
 
     #[test]

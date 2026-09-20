@@ -1766,7 +1766,10 @@ fn overlay_from_metadata(path: &Path) -> (Option<String>, Option<String>) {
         )
     });
     let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
-        panic!("metadata.json must be JSON at {}: {error}; raw={raw}", path.display())
+        panic!(
+            "metadata.json must be JSON at {}: {error}; raw={raw}",
+            path.display()
+        )
     });
     (
         value
@@ -1863,10 +1866,7 @@ fn cli_model_flag_is_one_shot_and_does_not_rewrite_brain_metadata() {
         "attach --model help must say it does not persist, got:\n{attach_help}"
     );
 
-    let mut session = Session::spawn_on(
-        &daemon.home,
-        &["attach", BRAIN, "--model", "grok-4.6"],
-    );
+    let mut session = Session::spawn_on(&daemon.home, &["attach", BRAIN, "--model", "grok-4.6"]);
     session.wait_for(
         "finch v",
         READY_DEADLINE,

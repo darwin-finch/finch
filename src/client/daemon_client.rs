@@ -283,7 +283,10 @@ impl DaemonClient {
         name: &str,
     ) -> Result<crate::brain::BrainProviderSelection> {
         self.client
-            .get(format!("{}/v1/brains/named/{name}/selection", self.base_url))
+            .get(format!(
+                "{}/v1/brains/named/{name}/selection",
+                self.base_url
+            ))
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -302,7 +305,10 @@ impl DaemonClient {
         selection: &crate::brain::BrainProviderSelection,
     ) -> Result<crate::brain::BrainProviderSelection> {
         self.client
-            .put(format!("{}/v1/brains/named/{name}/selection", self.base_url))
+            .put(format!(
+                "{}/v1/brains/named/{name}/selection",
+                self.base_url
+            ))
             .json(selection)
             .timeout(Duration::from_secs(10))
             .send()

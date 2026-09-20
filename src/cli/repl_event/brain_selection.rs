@@ -54,12 +54,19 @@ impl EffectiveSelection {
     pub fn status_report(&self, global_default: Option<&str>) -> String {
         let mut lines = vec![
             format!("provider: {}", self.provider_name),
-            format!("model: {}", self.model.as_deref().unwrap_or("provider default")),
+            format!(
+                "model: {}",
+                self.model.as_deref().unwrap_or("provider default")
+            ),
             format!(
                 "thinking: {}",
                 self.reasoning_effort
                     .map(ReasoningEffort::as_str)
-                    .unwrap_or(if self.local { "unsupported" } else { "provider default" })
+                    .unwrap_or(if self.local {
+                        "unsupported"
+                    } else {
+                        "provider default"
+                    })
             ),
             format!(
                 "source: {}",
@@ -103,17 +110,17 @@ pub fn resolve_selection(
             SelectionSource::Override,
         )
     } else if let Some(name) = request.persisted.provider.as_deref() {
-        let source = if request.persisted.provider_inherited
-            && request.persisted.model.is_none()
-            && request.cli_model.is_none()
-        {
+        let source = if request.persisted.provider_inherited && request.cli_model.is_none() {
             SelectionSource::Inherited
         } else {
             SelectionSource::Override
         };
         (index_of_provider(providers, name)?, source)
     } else if let Some(name) = request.default_provider.as_deref() {
-        (index_of_provider(providers, name)?, SelectionSource::Inherited)
+        (
+            index_of_provider(providers, name)?,
+            SelectionSource::Inherited,
+        )
     } else {
         (0, SelectionSource::Inherited)
     };
@@ -185,16 +192,17 @@ pub fn persistable_selection(
 ) -> BrainProviderSelection {
     let mut selection = request.persisted.clone();
     selection.provider = Some(effective.provider_name.clone());
-    selection.provider_inherited = effective.source == SelectionSource::Inherited
-        && request.cli_provider.is_none()
-        && request.persisted.model.is_none();
-    if effective.source != SelectionSource::OneShot {
-        selection.model.clone_from(&effective.model);
-    }
-    selection.reasoning_effort = effective
-        .reasoning_effort
-        .map(ReasoningEffort::as_str)
-        .map(str::to_string);
+    // A one-shot model changes `effective.source`, but it must not turn an
+    // inherited provider binding into an explicit override. Preserve the
+    // underlying provider provenance independently from the temporary model.
+    selection.provider_inherited = request.cli_provider.is_none()
+        && (request.persisted.provider_inherited
+            || (request.persisted.provider.is_none()
+                && request.persisted.model.is_none()
+                && request.persisted.reasoning_effort.is_none()));
+    // `effective` also contains defaults supplied by the provider entry. Do
+    // not materialize those as Brain overlays: callers put only deliberate
+    // `/model` and `/thinking` values into `request.persisted`.
     selection
 }
 
@@ -259,7 +267,10 @@ mod tests {
 
     #[test]
     fn test_new_brain_inherits_named_global_default() {
-        let providers = vec![grok("fast", "grok-code-fast-1"), claude("review", "claude-sonnet")];
+        let providers = vec![
+            grok("fast", "grok-code-fast-1"),
+            claude("review", "claude-sonnet"),
+        ];
         let effective = resolve_selection(
             &providers,
             &SelectionRequest {
@@ -280,7 +291,10 @@ mod tests {
 
     #[test]
     fn test_brain_override_beats_global_default() {
-        let providers = vec![grok("fast", "grok-code-fast-1"), claude("review", "claude-sonnet")];
+        let providers = vec![
+            grok("fast", "grok-code-fast-1"),
+            claude("review", "claude-sonnet"),
+        ];
         let effective = resolve_selection(
             &providers,
             &SelectionRequest {
@@ -328,6 +342,36 @@ mod tests {
             "--model must not write the overlay onto the Brain; persistable={persistable:?}"
         );
         assert_eq!(persistable.provider.as_deref(), Some("fast"));
+        assert!(
+            persistable.provider_inherited,
+            "one-shot --model must preserve inherited provider provenance"
+        );
+    }
+
+    #[test]
+    fn test_inherited_provider_defaults_do_not_become_brain_overlays() {
+        let providers = vec![grok("fast", "grok-code-fast-1")];
+        let request = SelectionRequest {
+            default_provider: Some("fast".into()),
+            ..SelectionRequest::default()
+        };
+        let effective = resolve_selection(&providers, &request).unwrap();
+        let persistable = persistable_selection(&effective, &request);
+        assert_eq!(persistable.provider.as_deref(), Some("fast"));
+        assert!(persistable.provider_inherited);
+        assert_eq!(persistable.model, None);
+        assert_eq!(persistable.reasoning_effort, None);
+
+        let restored = resolve_selection(
+            &providers,
+            &SelectionRequest {
+                persisted: persistable,
+                ..request
+            },
+        )
+        .unwrap();
+        assert_eq!(restored.source, SelectionSource::Inherited);
+        assert_eq!(restored.model.as_deref(), Some("grok-code-fast-1"));
     }
 
     #[test]
@@ -345,7 +389,9 @@ mod tests {
         )
         .expect_err("unknown persisted provider must not silently fall back");
         assert!(
-            error.to_string().contains("Unknown provider profile 'missing'"),
+            error
+                .to_string()
+                .contains("Unknown provider profile 'missing'"),
             "missing provider must fail with a repairable name; error={error}"
         );
     }

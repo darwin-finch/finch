@@ -5609,8 +5609,8 @@ impl BrainStore {
             return Ok(None);
         }
         let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let metadata: BrainMetadata = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let metadata: BrainMetadata =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
         if metadata.version != BRAIN_METADATA_VERSION || metadata.brain_id == BrainId::nil() {
             anyhow::bail!(
                 "unsupported or invalid Brain metadata at {}",
@@ -5633,8 +5633,7 @@ impl BrainStore {
         std::fs::write(&temporary, encoded)
             .with_context(|| format!("write {}", temporary.display()))?;
         std::fs::File::open(&temporary)?.sync_all()?;
-        std::fs::rename(&temporary, &path)
-            .with_context(|| format!("commit {}", path.display()))?;
+        std::fs::rename(&temporary, &path).with_context(|| format!("commit {}", path.display()))?;
         let _ = std::fs::remove_file(&temporary);
         sync_directory(&directory)?;
         Ok(())

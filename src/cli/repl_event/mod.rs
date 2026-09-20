@@ -28,12 +28,12 @@
 //! a query and sends the next LLM turn once every pending tool has resolved.
 
 pub mod activity_view;
+pub mod brain_selection;
 mod changeset;
 pub mod event_loop;
 pub mod events;
 pub mod llm_loop;
 pub mod memory_commitment;
-pub mod brain_selection;
 pub(crate) mod model_selection;
 pub mod parts;
 pub mod plan_handler;

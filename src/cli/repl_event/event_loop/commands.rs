@@ -82,17 +82,14 @@ impl EventLoop {
             &self.effective_selection()?,
             &self.selection_request(),
         );
-        self.brain_selection = persistable.clone();
         if let Some(client) = self.daemon_client.as_ref() {
-            match client
+            let stored = client
                 .set_brain_provider_selection(&self.session_label, &persistable)
-                .await
-            {
-                Ok(stored) => self.brain_selection = stored,
-                Err(error) => self.output_manager.write_info(format!(
-                    "⚠️  Could not persist this Brain's model selection: {error}"
-                )),
-            }
+                .await?;
+            self.brain_selection = stored;
+        } else {
+            self.brain_selection = persistable;
+            anyhow::bail!("the Finch daemon is unavailable");
         }
         Ok(())
     }
@@ -155,13 +152,11 @@ impl EventLoop {
 
     pub(super) async fn hydrate_brain_selection(&mut self) -> Result<()> {
         if let Some(client) = self.daemon_client.as_ref() {
-            match client
-                .brain_provider_selection(&self.session_label)
-                .await
-            {
-                Ok(stored) => self.brain_selection = stored,
-                Err(error) => tracing::debug!("Brain selection not yet available: {error}"),
-            }
+            // The server returns an empty selection for a new Brain. Any
+            // error here is therefore a real read failure, not "not found".
+            // Stop before applying and persisting defaults, or a transient
+            // daemon failure could overwrite an existing Brain selection.
+            self.brain_selection = client.brain_provider_selection(&self.session_label).await?;
         }
         if self.brain_selection.provider.is_none() {
             if let Some(default) = self.default_provider.clone() {
@@ -173,16 +168,16 @@ impl EventLoop {
             self.brain_selection.provider = Some(provider);
             self.brain_selection.provider_inherited = false;
             self.brain_selection.model = None;
+            self.brain_selection.reasoning_effort = None;
         }
         self.apply_effective_selection().await?;
         if self.cli_provider.is_some() || self.brain_selection.provider_inherited {
-            let _ = self.persist_brain_selection().await;
+            self.persist_brain_selection().await?;
         }
         Ok(())
     }
 
     pub(super) async fn handle_provider_list(&mut self) -> Result<()> {
-        use crate::providers::create_provider_from_entry;
         let active = self.model_selection.active_index().await;
         let pending = self.model_selection.pending_index().await;
         let mut lines = vec!["Configured provider entries:".to_string()];
@@ -195,22 +190,22 @@ impl EventLoop {
                 " "
             };
             let tag = if entry.is_local() { "local" } else { "cloud" };
-            let available = entry.is_local() || create_provider_from_entry(entry).is_ok();
-            let avail_tag = if available { "" } else { " (unavailable)" };
             lines.push(format!(
-                "{} {}. [{}] {} · {}{}",
+                "{} {}. [{}] {} · {}",
                 marker,
                 index + 1,
                 tag,
                 entry.profile_name(),
-                entry.model().unwrap_or(entry.provider_type()),
-                avail_tag
+                entry.model().unwrap_or(entry.provider_type())
             ));
         }
         if self.available_providers.is_empty() {
             lines.push("  (none configured — add [[providers]] to ~/.finch/config.toml)".into());
         }
-        lines.push("Use /provider <name> to bind this Brain. /model overlays a model on the active entry.".into());
+        lines.push(
+            "Use /provider <name> to bind this Brain. /model overlays a model on the active entry."
+                .into(),
+        );
         self.output_manager.write_info(lines.join("\n"));
         self.render_tui().await
     }
@@ -252,16 +247,19 @@ impl EventLoop {
                 lines.push(format!("→ {current}  (Brain overlay)"));
             }
         }
-        lines.push("Use /model <id> to overlay a model on this Brain. This does not switch accounts.".into());
+        lines.push(
+            "Use /model <id> to overlay a model on this Brain. This does not switch accounts."
+                .into(),
+        );
         self.output_manager.write_info(lines.join("\n"));
         self.render_tui().await
     }
 
     pub(super) async fn handle_model_show(&mut self) -> Result<()> {
         match self.effective_selection() {
-            Ok(effective) => self.output_manager.write_info(effective.status_report(
-                self.default_provider.as_deref(),
-            )),
+            Ok(effective) => self
+                .output_manager
+                .write_info(effective.status_report(self.default_provider.as_deref())),
             Err(error) => self.output_manager.write_info(format!("⚠️  {error}")),
         }
         self.render_tui().await
@@ -291,7 +289,12 @@ impl EventLoop {
         self.brain_selection.provider = Some(entry.profile_name());
         self.brain_selection.provider_inherited = false;
         self.apply_effective_selection().await?;
-        self.persist_brain_selection().await?;
+        if let Err(error) = self.persist_brain_selection().await {
+            self.output_manager.write_info(format!(
+                "⚠️  Model is active for this process but could not be persisted on this Brain: {error}"
+            ));
+            return self.render_tui().await;
+        }
         if let Ok(effective) = self.effective_selection() {
             self.output_manager.write_info(format!(
                 "✓ Model overlay {} on {} (persisted on this Brain)",
@@ -352,7 +355,12 @@ impl EventLoop {
                 self.brain_selection.provider = Some(effective.provider_name.clone());
                 self.brain_selection.provider_inherited = false;
                 self.apply_effective_selection().await?;
-                self.persist_brain_selection().await?;
+                if let Err(error) = self.persist_brain_selection().await {
+                    self.output_manager.write_info(format!(
+                        "⚠️  Thinking level is active for this process but could not be persisted on this Brain: {error}"
+                    ));
+                    return self.render_tui().await;
+                }
                 self.output_manager.write_info(format!(
                     "✓ Thinking overlay {} on {} (persisted on this Brain)",
                     effort.as_str(),
@@ -376,8 +384,22 @@ impl EventLoop {
         let entry = self.available_providers[target_index].clone();
         let active_index = self.model_selection.active_index().await;
         if target_index == active_index && self.model_selection.pending_index().await.is_none() {
-            self.output_manager
-                .write_info(format!("Already using model: {}", entry.profile_name()));
+            self.brain_selection.provider = Some(entry.profile_name());
+            self.brain_selection.provider_inherited = false;
+            self.brain_selection.model = None;
+            self.brain_selection.reasoning_effort = None;
+            self.cli_model = None;
+            self.cli_provider = None;
+            match self.persist_brain_selection().await {
+                Ok(()) => self.output_manager.write_info(format!(
+                    "✓ Provider {} is now an explicit Brain override",
+                    entry.profile_name()
+                )),
+                Err(error) => self.output_manager.write_info(format!(
+                    "⚠️  Already using {}, but could not persist it on this Brain: {error}",
+                    entry.profile_name()
+                )),
+            }
             return self.render_tui().await;
         }
 
@@ -405,7 +427,13 @@ impl EventLoop {
                     self.brain_selection.provider_inherited = false;
                     self.cli_model = None;
                     self.cli_provider = None;
-                    let _ = self.persist_brain_selection().await;
+                    if let Err(error) = self.persist_brain_selection().await {
+                        self.output_manager.write_info(format!(
+                            "⚠️  Provider is active for this process but could not be persisted on this Brain: {error}"
+                        ));
+                        self.project_model_identity();
+                        return self.render_tui().await;
+                    }
                     self.project_model_identity();
                     self.output_manager.write_info(format!(
                         "✓ Provider {} · {} (persisted on this Brain)",
@@ -416,6 +444,18 @@ impl EventLoop {
                 Ok(crate::client::LocalModelStatus::Initializing)
                 | Ok(crate::client::LocalModelStatus::Downloading(_))
                 | Ok(crate::client::LocalModelStatus::Loading(_)) => {
+                    self.brain_selection.provider = Some(entry.profile_name());
+                    self.brain_selection.model = None;
+                    self.brain_selection.reasoning_effort = None;
+                    self.brain_selection.provider_inherited = false;
+                    self.cli_model = None;
+                    self.cli_provider = None;
+                    if let Err(error) = self.persist_brain_selection().await {
+                        self.output_manager.write_info(format!(
+                            "⚠️  Could not persist the pending local provider on this Brain: {error}"
+                        ));
+                        return self.render_tui().await;
+                    }
                     let token = self.model_selection.begin_pending(target_index).await;
                     self.output_manager.write_info(format!(
                         "⏳ {} is still starting; the current model stays active until it is ready.",
@@ -492,7 +532,13 @@ impl EventLoop {
                     self.brain_selection.provider_inherited = false;
                     self.cli_model = None;
                     self.cli_provider = None;
-                    let _ = self.persist_brain_selection().await;
+                    if let Err(error) = self.persist_brain_selection().await {
+                        self.output_manager.write_info(format!(
+                            "⚠️  Provider is active for this process but could not be persisted on this Brain: {error}"
+                        ));
+                        self.project_model_identity();
+                        return self.render_tui().await;
+                    }
                     self.project_model_identity();
                     self.output_manager.write_info(format!(
                         "✓ Provider {} · {} (persisted on this Brain)",

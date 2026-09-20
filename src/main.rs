@@ -919,17 +919,14 @@ fn run_selection_status(brain: Option<String>) -> Result<()> {
         let name = finch::brain::BrainStore::validate_name(&name)?.to_string();
         let store = finch::brain::BrainStore::new("local");
         let persisted = store.provider_selection(&name)?;
-        let request = finch::cli::repl_event::brain_selection::SelectionRequest {
+        let request = finch::cli::SelectionRequest {
             default_provider: config.default_provider_name(),
             persisted,
             cli_provider: None,
             cli_model: None,
         };
-        match finch::cli::repl_event::brain_selection::resolve_selection(
-            &config.providers,
-            &request,
-        ) {
-            Ok(effective) => println!("{}", effective.status_report(Some(&global))),
+        match finch::cli::resolve_selection(&config.providers, &request) {
+            Ok(effective) => println!("{}", effective.status_report(None)),
             Err(error) => {
                 println!("brain: {name}");
                 println!("error: {error}");
@@ -4472,7 +4469,11 @@ mod tests {
     fn attach_subcommand_parses_a_brain_name() {
         let args = Args::try_parse_from(["finch", "attach", "golden-ridge-0771a6"]).unwrap();
         match args.command {
-            Some(Command::Attach { name, model, provider }) => {
+            Some(Command::Attach {
+                name,
+                model,
+                provider,
+            }) => {
                 assert_eq!(
                     name, "golden-ridge-0771a6",
                     "finch attach NAME must parse the Brain name"

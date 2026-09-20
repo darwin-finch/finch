@@ -286,6 +286,7 @@ mod disabled_training_tests {
             server: crate::config::ServerConfig::default(),
             client: crate::config::ClientConfig::default(),
             providers: vec![provider],
+            default_provider: None,
             teachers: vec![teacher],
             colors: crate::theme::ColorScheme::default(),
             features,
@@ -599,6 +600,7 @@ pub struct Repl {
     active_provider_index: usize,
     cli_model: Option<String>,
     cli_provider: Option<String>,
+    brain_selection: crate::brain::BrainProviderSelection,
     active_teacher_index: usize,
     router: Router, // Now contains ThresholdRouter
     metrics_logger: MetricsLogger,
@@ -747,6 +749,99 @@ impl Repl {
     pub fn set_cli_selection(&mut self, model: Option<String>, provider: Option<String>) {
         self.cli_model = model.filter(|value| !value.trim().is_empty());
         self.cli_provider = provider.filter(|value| !value.trim().is_empty());
+    }
+
+    fn legacy_selection_request(&self) -> super::repl_event::brain_selection::SelectionRequest {
+        super::repl_event::brain_selection::SelectionRequest {
+            default_provider: self._config.default_provider_name(),
+            persisted: self.brain_selection.clone(),
+            cli_provider: self.cli_provider.clone(),
+            cli_model: self.cli_model.clone(),
+        }
+    }
+
+    fn legacy_effective_selection(
+        &self,
+    ) -> Result<super::repl_event::brain_selection::EffectiveSelection> {
+        super::repl_event::brain_selection::resolve_selection(
+            &self.available_providers,
+            &self.legacy_selection_request(),
+        )
+    }
+
+    async fn apply_legacy_selection(&mut self) -> Result<()> {
+        let effective = self.legacy_effective_selection()?;
+        let entry = self.available_providers[effective.provider_index].clone();
+        if !entry.is_local() {
+            let entry = entry
+                .with_model_overlay(effective.model.clone())
+                .with_reasoning_effort_overlay(effective.reasoning_effort);
+            let provider =
+                crate::providers::create_provider_from_overlaid_entry(&self._config, &entry)?;
+            *self.teacher_session.write().await = TeacherSession::with_shared_provider(
+                provider,
+                TeacherContextConfig {
+                    max_context_turns: 15,
+                    tool_result_retention_turns: 5,
+                    prompt_caching_enabled: true,
+                },
+            );
+            if let Some(index) = self
+                .available_teachers
+                .iter()
+                .position(|teacher| teacher.provider.eq_ignore_ascii_case(entry.provider_type()))
+            {
+                self.active_teacher_index = index;
+            }
+        }
+        self.active_provider_index = effective.provider_index;
+        Ok(())
+    }
+
+    async fn persist_legacy_selection(&mut self) -> Result<()> {
+        let persistable = super::repl_event::brain_selection::persistable_selection(
+            &self.legacy_effective_selection()?,
+            &self.legacy_selection_request(),
+        );
+        self.brain_selection = persistable.clone();
+        let client = self
+            .daemon_client
+            .as_ref()
+            .context("the Finch daemon is unavailable")?;
+        self.brain_selection = client
+            .set_brain_provider_selection(&self.session_label, &persistable)
+            .await?;
+        Ok(())
+    }
+
+    async fn hydrate_legacy_selection(&mut self) -> Result<()> {
+        if let Some(client) = self.daemon_client.as_ref() {
+            self.brain_selection = client.brain_provider_selection(&self.session_label).await?;
+        }
+        if self.brain_selection.provider.is_none() {
+            if let Some(default) = self._config.default_provider_name() {
+                self.brain_selection.provider = Some(default);
+                self.brain_selection.provider_inherited = true;
+            }
+        }
+        if let Some(provider) = self.cli_provider.clone() {
+            self.brain_selection.provider = Some(provider);
+            self.brain_selection.model = None;
+            self.brain_selection.reasoning_effort = None;
+            self.brain_selection.provider_inherited = false;
+        }
+        self.apply_legacy_selection().await?;
+        if self.cli_provider.is_some() && self.daemon_client.is_none() {
+            anyhow::bail!(
+                "--provider requires a running Finch daemon so the Brain binding can be persisted"
+            );
+        }
+        if self.daemon_client.is_some()
+            && (self.cli_provider.is_some() || self.brain_selection.provider_inherited)
+        {
+            self.persist_legacy_selection().await?;
+        }
+        Ok(())
     }
 
     async fn new_with_initialization(
@@ -1313,6 +1408,7 @@ impl Repl {
             active_provider_index,
             cli_model: None,
             cli_provider: None,
+            brain_selection: crate::brain::BrainProviderSelection::default(),
             active_teacher_index: 0, // First teacher is active by default
             router,                  // Contains ThresholdRouter now
             metrics_logger,
@@ -2261,6 +2357,11 @@ impl Repl {
         // the TUI path's later call is a no-op if both were somehow reached.
         crate::startup::ready();
 
+        // Raw/no-TUI mode uses the same canonical per-Brain selection as the
+        // event loop. Fail before a query rather than silently routing it
+        // through the process-global startup provider.
+        self.hydrate_legacy_selection().await?;
+
         if let Some(prompt) = initial_prompt {
             // Process initial prompt before starting interactive loop
             if self.is_interactive {
@@ -2752,12 +2853,20 @@ impl Repl {
                         self.handle_persona_show().await?;
                         continue;
                     }
-                    Command::ProviderList | Command::ModelList => {
+                    Command::ProviderList => {
+                        self.handle_provider_list().await?;
+                        continue;
+                    }
+                    Command::ModelList => {
                         self.handle_model_list().await?;
                         continue;
                     }
-                    Command::ProviderSwitch(ref name) | Command::ModelSwitch(ref name) => {
-                        self.handle_model_switch(name).await?;
+                    Command::ProviderSwitch(ref name) => {
+                        self.handle_provider_switch(name).await?;
+                        continue;
+                    }
+                    Command::ModelSwitch(ref name) => {
+                        self.handle_model_overlay(name).await?;
                         continue;
                     }
                     Command::ProviderShow
@@ -2768,7 +2877,7 @@ impl Repl {
                         continue;
                     }
                     Command::ThinkingSet(ref level) => {
-                        self.handle_model_switch(level).await?;
+                        self.handle_thinking_overlay(level).await?;
                         continue;
                     }
                     // Phase 4: Memory system
@@ -3651,12 +3760,9 @@ impl Repl {
                     return Ok(response);
                 }
                 Err(e) => {
-                    tracing::warn!("Daemon query failed: {}, falling back to teacher", e);
-                    if self.is_interactive {
-                        self.output_status(format!("⚠️  Daemon failed: {}", e));
-                        self.output_status("→ Falling back to teacher API");
-                    }
-                    // Fall through to normal routing below
+                    anyhow::bail!(
+                        "Selected local provider failed; Finch did not fall back to another provider: {e}"
+                    );
                 }
             }
         }
@@ -4275,7 +4381,7 @@ impl Repl {
     }
 
     /// Handle /model list command
-    async fn handle_model_list(&self) -> Result<()> {
+    async fn handle_provider_list(&self) -> Result<()> {
         self.output_status("📋 Available Providers:\n");
 
         for (idx, provider) in self.available_providers.iter().enumerate() {
@@ -4322,13 +4428,13 @@ impl Repl {
             ));
         }
 
-        self.output_status("\nUse '/model <name>' or '/model <number>' to switch");
+        self.output_status("\nUse '/provider <name>' or '/provider <number>' to switch");
         self.output_status("Memory will be preserved across switches");
         Ok(())
     }
 
-    /// Handle /model <name> command
-    async fn handle_model_switch(&mut self, name: &str) -> Result<()> {
+    /// Handle /provider <name> command.
+    async fn handle_provider_switch(&mut self, name: &str) -> Result<()> {
         let target_index = match super::repl_event::event_loop::resolve_provider_profile(
             &self.available_providers,
             name,
@@ -4340,129 +4446,158 @@ impl Repl {
             }
         };
 
-        if target_index == self.active_provider_index {
-            self.output_status("Already using this provider");
-            return Ok(());
-        }
-
         let new_entry = self.available_providers[target_index].clone();
-        let old_name = self.available_providers[self.active_provider_index].profile_name();
-
         if new_entry.is_local() {
             let Some(client) = self.daemon_client.as_ref() else {
                 self.output_error("Local model switching requires a running Finch daemon");
                 return Ok(());
             };
             match client.local_model_status().await {
-                Ok(crate::client::LocalModelStatus::Ready(model)) => {
-                    self.active_provider_index = target_index;
-                    self.output_status(format!(
-                        "✓ Switched provider: {} → {} ({})",
-                        old_name,
-                        new_entry.profile_name(),
-                        model
-                    ));
-                }
+                Ok(crate::client::LocalModelStatus::Ready(_)) => {}
                 Ok(crate::client::LocalModelStatus::Initializing)
                 | Ok(crate::client::LocalModelStatus::Downloading(_))
                 | Ok(crate::client::LocalModelStatus::Loading(_)) => {
                     self.output_status(format!(
-                        "⏳ {} is still starting; the current model remains active. Retry /model {} shortly.",
+                        "⏳ {} is still starting; the current model remains active. Retry /provider {} shortly.",
                         new_entry.profile_name(),
                         new_entry.profile_name()
                     ));
+                    return Ok(());
                 }
                 Ok(crate::client::LocalModelStatus::Failed(error)) => {
                     self.output_error(format!("Local model failed to start: {error}"));
+                    return Ok(());
                 }
                 Ok(crate::client::LocalModelStatus::NotAvailable) => {
                     self.output_error("The daemon was started without a local model enabled");
-                }
-                Err(error) => self.output_error(format!("Could not read local status: {error}")),
-            }
-        } else {
-            // Cloud provider — create a new teacher session.
-            let llm_provider = match crate::providers::create_provider_profile_from_config(
-                &self._config,
-                &new_entry.profile_name(),
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.output_error(format!("Failed to create provider: {}", e));
                     return Ok(());
                 }
-            };
-
-            let teacher_config = TeacherContextConfig {
-                max_context_turns: 15,
-                tool_result_retention_turns: 5,
-                prompt_caching_enabled: true,
-            };
-
-            *self.teacher_session.write().await =
-                TeacherSession::with_shared_provider(llm_provider, teacher_config);
-
-            // Keep available_teachers index in sync
-            if let Some(new_teacher_idx) = self
-                .available_teachers
-                .iter()
-                .position(|t| t.provider.eq_ignore_ascii_case(new_entry.provider_type()))
-            {
-                self.active_teacher_index = new_teacher_idx;
-            }
-            self.active_provider_index = target_index;
-
-            let new_name = new_entry.profile_name();
-            let memory_info = if let Some(ref memory) = self.memory_system {
-                // Same wrong number as `/memory` printed before #275: during
-                // hydration this counts what has loaded, not what the user
-                // stored. No room for a sentence here, so a parenthetical.
-                let before = memory.hydration_status();
-                let stats = memory.stats().await?;
-                let index =
-                    finch_memory::memory_status::observed(before, memory.hydration_status());
-                match finch_memory::memory_status::count_qualifier(&index) {
-                    None => format!(" (💾 {} nodes in memory)", stats.tree_node_count),
-                    Some(note) => {
-                        format!(" (💾 {} nodes in memory — {note})", stats.tree_node_count)
-                    }
+                Err(error) => {
+                    self.output_error(format!("Could not read local status: {error}"));
+                    return Ok(());
                 }
-            } else {
-                String::new()
-            };
-            self.output_status(format!(
-                "✓ Switched provider: {} → {}{}",
-                old_name, new_name, memory_info
-            ));
+            }
         }
 
+        let previous = self.brain_selection.clone();
+        self.brain_selection.provider = Some(new_entry.profile_name());
+        self.brain_selection.model = None;
+        self.brain_selection.reasoning_effort = None;
+        self.brain_selection.provider_inherited = false;
+        self.cli_provider = None;
+        self.cli_model = None;
+        if let Err(error) = self.apply_legacy_selection().await {
+            self.brain_selection = previous;
+            let _ = self.apply_legacy_selection().await;
+            self.output_error(format!("Failed to activate provider: {error}"));
+            return Ok(());
+        }
+        match self.persist_legacy_selection().await {
+            Ok(()) => self.output_status(format!(
+                "✓ Provider {} (persisted on this Brain)",
+                new_entry.profile_name()
+            )),
+            Err(error) => self.output_error(format!(
+                "Provider {} is active for this process but could not be persisted: {error}",
+                new_entry.profile_name()
+            )),
+        }
+        Ok(())
+    }
+
+    async fn handle_model_list(&self) -> Result<()> {
+        let effective = self.legacy_effective_selection()?;
+        if effective.local {
+            self.output_status("The active local provider has no ChatGPT-style model picker.");
+        } else {
+            self.output_status(format!(
+                "Current model on {}: {}",
+                effective.provider_name,
+                effective.model.as_deref().unwrap_or("provider default")
+            ));
+            self.output_status("Use /model <id> to set a Brain-local model overlay.");
+        }
+        Ok(())
+    }
+
+    async fn handle_model_overlay(&mut self, model: &str) -> Result<()> {
+        let effective = self.legacy_effective_selection()?;
+        if effective.local {
+            self.output_error("The active local provider has no ChatGPT-style model picker");
+            return Ok(());
+        }
+        let previous = self.brain_selection.clone();
+        self.cli_model = None;
+        self.brain_selection.provider = Some(effective.provider_name.clone());
+        self.brain_selection.model = Some(model.trim().to_string());
+        self.brain_selection.provider_inherited = false;
+        if let Err(error) = self.apply_legacy_selection().await {
+            self.brain_selection = previous;
+            let _ = self.apply_legacy_selection().await;
+            self.output_error(format!("Failed to activate model: {error}"));
+            return Ok(());
+        }
+        match self.persist_legacy_selection().await {
+            Ok(()) => self.output_status(format!(
+                "✓ Model {} on {} (persisted on this Brain)",
+                model.trim(),
+                effective.provider_name
+            )),
+            Err(error) => self.output_error(format!(
+                "Model {} is active for this process but could not be persisted: {error}",
+                model.trim()
+            )),
+        }
+        Ok(())
+    }
+
+    async fn handle_thinking_overlay(&mut self, level: &str) -> Result<()> {
+        let effective = self.legacy_effective_selection()?;
+        let entry = &self.available_providers[effective.provider_index];
+        if !entry.supports_reasoning_effort() {
+            self.output_error(format!(
+                "Thinking level is unsupported for provider '{}'",
+                effective.provider_name
+            ));
+            return Ok(());
+        }
+        let effort = match super::repl_event::brain_selection::parse_reasoning_effort(level) {
+            Ok(effort) => effort,
+            Err(error) => {
+                self.output_error(error.to_string());
+                return Ok(());
+            }
+        };
+        let previous = self.brain_selection.clone();
+        self.brain_selection.provider = Some(effective.provider_name.clone());
+        self.brain_selection.reasoning_effort = Some(effort.as_str().to_string());
+        self.brain_selection.provider_inherited = false;
+        if let Err(error) = self.apply_legacy_selection().await {
+            self.brain_selection = previous;
+            let _ = self.apply_legacy_selection().await;
+            self.output_error(format!("Failed to activate thinking level: {error}"));
+            return Ok(());
+        }
+        match self.persist_legacy_selection().await {
+            Ok(()) => self.output_status(format!(
+                "✓ Thinking {} on {} (persisted on this Brain)",
+                effort.as_str(),
+                effective.provider_name
+            )),
+            Err(error) => self.output_error(format!(
+                "Thinking {} is active for this process but could not be persisted: {error}",
+                effort.as_str()
+            )),
+        }
         Ok(())
     }
 
     /// Handle /model show command
     async fn handle_model_show(&self) -> Result<()> {
-        let active = &self.available_providers[self.active_provider_index];
-        self.output_status(format!("📖 Current Model: {}", active.profile_name()));
-        self.output_status(format!("Type: {}", active.provider_type()));
-
-        if active.is_local() {
-            if let crate::config::ProviderEntry::Local {
-                model_family,
-                model_size,
-                inference_provider,
-                execution_target,
-                ..
-            } = active
-            {
-                self.output_status(format!("Family: {:?}", model_family));
-                self.output_status(format!("Size: {:?}", model_size));
-                self.output_status(format!("Backend: {:?}", inference_provider));
-                self.output_status(format!("Device: {:?}", execution_target));
-            }
-        } else {
-            let model = active.model().unwrap_or("(provider default)");
-            self.output_status(format!("Model: {}", model));
-        }
+        let effective = self.legacy_effective_selection()?;
+        self.output_status(
+            effective.status_report(self._config.default_provider_name().as_deref()),
+        );
 
         // Get conversation stats
         let conv = self.conversation.read().await;

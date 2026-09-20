@@ -654,12 +654,15 @@ fn status_rule_line(width: usize, identity: &str) -> String {
     }
     let prefix = ellipsize("── ", width);
     let remaining = width.saturating_sub(prefix.chars().count());
-    if remaining == 0 {
-        return prefix;
+    if remaining <= 2 {
+        return format!("{prefix}{}", "─".repeat(remaining));
     }
     let label = format!(" {} ", identity.trim());
     let label = if label.chars().count() + 2 > remaining {
-        format!(" {} ", ellipsize(identity.trim(), remaining.saturating_sub(2)))
+        format!(
+            " {} ",
+            ellipsize(identity.trim(), remaining.saturating_sub(2))
+        )
     } else {
         label
     };

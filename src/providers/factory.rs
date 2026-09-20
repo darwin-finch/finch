@@ -823,11 +823,7 @@ pub fn create_provider_from_overlaid_entry(
     config: &Config,
     entry: &ProviderEntry,
 ) -> Result<Arc<dyn LlmProvider>> {
-    create_provider_from_overlaid_entry_with_resolver(
-        config,
-        entry,
-        &EnvironmentCredentialResolver,
-    )
+    create_provider_from_overlaid_entry_with_resolver(config, entry, &EnvironmentCredentialResolver)
 }
 
 fn create_provider_from_overlaid_entry_with_resolver(

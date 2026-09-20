@@ -183,20 +183,34 @@ pub(super) async fn put_named_brain_selection(
     Json(selection): Json<crate::brain::BrainProviderSelection>,
 ) -> Result<Json<crate::brain::BrainProviderSelection>, Response> {
     check_brain_bootstrap_access(&server, addr, &headers).await?;
-    if selection
-        .provider
-        .as_deref()
-        .is_some_and(|value| value.contains('\n') || value.contains('\r'))
-        || selection
-            .model
-            .as_deref()
-            .is_some_and(|value| value.contains('\n') || value.contains('\r'))
+    let valid_line = |value: Option<&str>, max_len: usize| {
+        value.is_none_or(|value| {
+            !value.trim().is_empty()
+                && value.len() <= max_len
+                && !value.chars().any(|ch| matches!(ch, '\n' | '\r' | '\0'))
+        })
+    };
+    let valid_effort = selection.reasoning_effort.as_deref().is_none_or(|value| {
+        matches!(
+            value,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        )
+    });
+    if !valid_line(selection.provider.as_deref(), 128)
+        || !valid_line(selection.model.as_deref(), 256)
+        || !valid_line(selection.reasoning_effort.as_deref(), 32)
+        || !valid_effort
     {
         return Err(AppError(anyhow::anyhow!(
-            "provider/model overlay must be a single secret-free line"
+            "provider/model selection contains an invalid name, model, or thinking level"
         ))
         .into_response());
     }
+    let selection_lock = server
+        .brain_store()
+        .execution_lock(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    let _selection_write = selection_lock.lock_owned().await;
     server
         .brain_store()
         .set_provider_selection(&name, selection)
