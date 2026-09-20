@@ -42,7 +42,7 @@ impl LiveToolMessage {
     /// Get a clone of the Arc status for background streaming
     pub fn status_arc(&self) -> Arc<RwLock<MessageStatus>>;
 }
-/// Stable identity for one retained application message. Re-exported from `ui_model`.
+/// Stable identity for one retained application message. Re-exported from `finch-ui-model`.
 pub struct MessageId(Uuid);
 /// Type alias for a shared message reference
 pub type MessageRef = Arc<dyn Message>;

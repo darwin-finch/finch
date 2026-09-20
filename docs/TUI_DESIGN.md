@@ -8,7 +8,7 @@ the migration keeps main green at every stage.
 `WorkUnitViewModel` on the say WorkUnit behind its own lock; chrome (glyph + elapsed + an
 arrow that renders only while the program source can be shown) and the `ProgramSource` /
 `Output` subwidgets in `src/cli/components/say_turn.rs`; the vocabulary now lives behind
-`src/ui_model/mod.rs`; clicks routed through opaque component actions to
+`crates/finch-ui-model/src/lib.rs`; clicks routed through opaque component actions to
 `handle_transcript_action`; the renderer's RowId-keyed maps hold no say-turn disclosure; and
 the say-turn suppression is deleted (the canonical record keeps its exactly-once semantics
 and pinned invariant).

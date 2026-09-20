@@ -1,8 +1,8 @@
-# ui_model — public interface
+# finch-ui-model — public interface
 
-Generated from [`src/ui_model/mod.rs`](mod.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
+Generated from [`crates/finch-ui-model/src/lib.rs`](src/lib.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
 
-- **Facade:** `src/ui_model/mod.rs`
+- **Facade:** `crates/finch-ui-model/src/lib.rs`
 - **Capsule:** [`AGENTS.md`](AGENTS.md)
 
 Everything below is what callers outside this module can reach. Implementation modules are private; their contents are deliberately absent.

@@ -198,7 +198,7 @@ impl MemTreeConsole {
     /// Toggle expansion of selected node
     pub fn toggle_selected(&mut self);
 }
-/// Stable identity for one retained application message. Re-exported from `ui_model`.
+/// Stable identity for one retained application message. Re-exported from `finch-ui-model`.
 pub struct MessageId(Uuid);
 /// Type alias for a shared message reference Re-exported from `cli::messages`.
 pub type MessageRef = Arc<dyn Message>;

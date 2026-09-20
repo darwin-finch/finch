@@ -21,7 +21,7 @@ below; regenerate with `python3 scripts/generate_interfaces.py --write` after ch
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::components::`.
 
-## The widget vocabulary (`crate::ui_model`)
+## The widget vocabulary (`finch-ui-model`, via `crate::ui_model`)
 
 `Rect`, `Track`, `Axis`, `Widget`, `Layout`, `RenderedTranscriptLine`, `MessageId`, `RowId`,
 `NodeRole`, and the pure line-metric functions (`visible_length`, `physical_rows`, …) plus the
