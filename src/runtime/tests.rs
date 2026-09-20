@@ -8206,7 +8206,7 @@ fn runtime_facade_keeps_child_modules_private() {
         .lines()
         .map(str::trim_start)
         .filter(|line| !line.starts_with("//"))
-        .filter(|line| line.starts_with("pub mod "))
+        .filter(|line| line.starts_with("pub mod ") || line.starts_with("pub(crate) mod "))
         .collect::<Vec<_>>();
     assert!(
         published.is_empty(),
@@ -8227,6 +8227,7 @@ fn runtime_callers_use_facade_not_child_modules() {
         "effect_log",
         "host",
         "hostio",
+        "ipc_codec",
         "mcp",
         "outcome",
     ];
@@ -8298,8 +8299,14 @@ fn collect_runtime_child_imports(
             }
             for child in children {
                 for prefix in ["crate::runtime::", "finch::runtime::"] {
-                    let needle = [prefix, child, "::"].concat();
-                    if line.contains(&needle) {
+                    let child_path = [prefix, child].concat();
+                    let names_child = line.match_indices(&child_path).any(|(offset, _)| {
+                        let suffix = &line[offset + child_path.len()..];
+                        suffix.starts_with("::")
+                            || suffix.starts_with(';')
+                            || suffix.starts_with(" as ")
+                    });
+                    if names_child {
                         let rel = path.strip_prefix(root).unwrap_or(&path);
                         hits.push(format!("{}:{}", rel.display(), index + 1));
                     }

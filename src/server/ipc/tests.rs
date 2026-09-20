@@ -163,8 +163,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
             },
             origin: crate::vm::SourceOrigin::generated("capnp-effect-audit-test"),
         };
-        crate::runtime::ipc_codec::encode_vm_side_effect(reserve.get().init_effect(), &effect)
-            .unwrap();
+        crate::runtime::encode_vm_side_effect(reserve.get().init_effect(), &effect).unwrap();
         let reservation = reserve
             .send()
             .promise
@@ -216,7 +215,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
         stale_reserve
             .get()
             .set_execution_id(&uuid::Uuid::new_v4().to_string());
-        crate::runtime::ipc_codec::encode_vm_side_effect(
+        crate::runtime::encode_vm_side_effect(
             stale_reserve.get().init_effect(),
             &crate::vm::VmSideEffect {
                 sequence: 1,
@@ -305,8 +304,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
             });
         let mut replay = replay_control.reserve_effect_request();
         replay.get().set_execution_id(&execution_id.to_string());
-        crate::runtime::ipc_codec::encode_vm_side_effect(replay.get().init_effect(), &effect)
-            .unwrap();
+        crate::runtime::encode_vm_side_effect(replay.get().init_effect(), &effect).unwrap();
         replay
             .send()
             .promise
@@ -321,7 +319,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
         conflicting
             .get()
             .set_execution_id(&execution_id.to_string());
-        crate::runtime::ipc_codec::encode_vm_side_effect(
+        crate::runtime::encode_vm_side_effect(
             conflicting.get().init_effect(),
             &crate::vm::VmSideEffect {
                 event: crate::vm::HostSideEffect::Emit {
@@ -496,7 +494,7 @@ impl super::finch_ipc_capnp::brain_runner::Server for EffectEofRunner {
                 reserve
                     .get()
                     .set_execution_id(&uuid::Uuid::new_v4().to_string());
-                crate::runtime::ipc_codec::encode_vm_side_effect(
+                crate::runtime::encode_vm_side_effect(
                     reserve.get().init_effect(),
                     &crate::vm::VmSideEffect {
                         protocol_version: 1,
@@ -591,7 +589,7 @@ impl super::finch_ipc_capnp::brain_runner::Server for EffectNormalRunner {
             reserve
                 .get()
                 .set_execution_id(&uuid::Uuid::new_v4().to_string());
-            crate::runtime::ipc_codec::encode_vm_side_effect(
+            crate::runtime::encode_vm_side_effect(
                 reserve.get().init_effect(),
                 &crate::vm::VmSideEffect {
                     protocol_version: 1,
@@ -2352,7 +2350,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         );
         super::encode_checkpoint(result.reborrow().init_checkpoint(), &checkpoint).unwrap();
         result.set_error("");
-        crate::runtime::ipc_codec::encode_effect_record(
+        crate::runtime::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2452,7 +2450,7 @@ fn runner_turn_error_keeps_partial_lifecycle() {
     {
         let mut result = message.init_root::<super::finch_ipc_capnp::brain_turn_result::Builder>();
         result.set_error("provider failed after approval");
-        crate::runtime::ipc_codec::encode_effect_record(
+        crate::runtime::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2496,7 +2494,7 @@ fn runner_program_error_keeps_execute_once_effects() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        crate::runtime::ipc_codec::encode_effect_record(
+        crate::runtime::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2523,7 +2521,7 @@ fn packed_delivery_on_runner_program_result_must_match_the_journal() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        crate::runtime::ipc_codec::encode_effect_record(
+        crate::runtime::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2547,7 +2545,7 @@ fn packed_delivery_on_runner_program_result_must_match_the_journal() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        crate::runtime::ipc_codec::encode_effect_record(
+        crate::runtime::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2580,7 +2578,7 @@ fn omitted_packed_delivery_with_a_journal_fails_closed() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        crate::runtime::ipc_codec::encode_effect_record(
+        crate::runtime::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,

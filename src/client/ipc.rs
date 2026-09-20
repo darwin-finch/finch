@@ -22,7 +22,7 @@ use crate::ipc::finch_ipc_capnp::{
 };
 use crate::ipc::sock_path;
 use crate::providers::{ContentBlock, Message};
-use crate::runtime::ipc_codec::{
+use crate::runtime::{
     decode_checkpoint, decode_packed_runtime_application_frames, encode_checkpoint,
 };
 use crate::server::ipc::encode_packed_delivery_envelopes;
@@ -398,7 +398,7 @@ impl IpcClient {
                 crate::brain::ProgramLanguage::Lisp => finch_ipc_capnp::ProgramLanguage::Lisp,
             });
             params.set_source(source);
-            crate::runtime::ipc_codec::encode_effects(
+            crate::runtime::encode_effects(
                 params
                     .reborrow()
                     .init_grant_ceiling(grant_ceiling.0.len() as u32),
@@ -970,7 +970,7 @@ fn host_effect_permit_proxy(
             let mut outcome = call.get().init_outcome();
             match request.outcome {
                 crate::server::RunnerHostEffectOutcome::Acknowledged { values } => {
-                    crate::runtime::ipc_codec::encode_value_list(
+                    crate::runtime::encode_value_list(
                         outcome.init_acknowledged(values.len() as u32),
                         &values,
                         0,
@@ -1008,7 +1008,7 @@ fn program_effect_audit_proxy(
             let result = async {
                 let mut call = control.reserve_effect_request();
                 call.get().set_execution_id(&execution_id.to_string());
-                crate::runtime::ipc_codec::encode_vm_side_effect(call.get().init_effect(), &effect)
+                crate::runtime::encode_vm_side_effect(call.get().init_effect(), &effect)
                     .map_err(|error| capnp::Error::failed(error.to_string()))?;
                 let response = call.send().promise.await?;
                 Ok(effect_audit_reservation_proxy(
@@ -1037,7 +1037,7 @@ pub(crate) fn turn_effect_audit_proxy(
             let result = async {
                 let mut call = control.reserve_effect_request();
                 call.get().set_execution_id(&execution_id.to_string());
-                crate::runtime::ipc_codec::encode_vm_side_effect(call.get().init_effect(), &effect)
+                crate::runtime::encode_vm_side_effect(call.get().init_effect(), &effect)
                     .map_err(|error| capnp::Error::failed(error.to_string()))?;
                 let response = call.send().promise.await?;
                 Ok(effect_audit_reservation_proxy(
@@ -1157,7 +1157,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                                     }
                                 });
                                 params.set_source(&source);
-                                crate::runtime::ipc_codec::encode_effects(
+                                crate::runtime::encode_effects(
                                     params.reborrow().init_grant_ceiling(
                                         grant_ceiling.0.len() as u32,
                                     ),
@@ -1260,7 +1260,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                         match request
                             .get_grant_ceiling()
                             .map_err(anyhow::Error::new)
-                            .and_then(crate::runtime::ipc_codec::decode_effects)
+                            .and_then(crate::runtime::decode_effects)
                         {
                             Ok(grants) => Some(grants),
                             Err(error) => {
@@ -1606,7 +1606,7 @@ fn encode_runner_effect_records(
     records: &[crate::server::RunnerEffectRecord],
 ) -> capnp::Result<()> {
     for (index, record) in records.iter().enumerate() {
-        crate::runtime::ipc_codec::encode_effect_record(
+        crate::runtime::encode_effect_record(
             encoded.reborrow().get(index as u32),
             record.execution_id,
             &record.entry,
