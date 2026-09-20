@@ -1657,8 +1657,6 @@ dependencies = [
  "chrono",
  "clap",
  "config",
- "core-foundation 0.10.1",
- "core-graphics",
  "crossterm",
  "csv",
  "ctrlc",
@@ -1671,6 +1669,7 @@ dependencies = [
  "finch-memory",
  "finch-programs",
  "finch-providers",
+ "finch-runtime",
  "finch-tools-api",
  "finch-vm",
  "fs2",
@@ -1732,7 +1731,6 @@ dependencies = [
  "walkdir",
  "x25519-dalek",
  "zeroize",
- "zip 2.4.2",
 ]
 
 [[package]]
@@ -1858,6 +1856,37 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "finch-runtime"
+version = "0.7.31"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "calamine",
+ "capnp",
+ "chrono",
+ "core-foundation 0.10.1",
+ "core-graphics",
+ "finch-ipc",
+ "finch-language",
+ "finch-memory",
+ "finch-programs",
+ "finch-tools-api",
+ "finch-vm",
+ "hex",
+ "nix 0.29.0",
+ "rusqlite",
+ "rust_xlsxwriter",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zip 2.4.2",
 ]
 
 [[package]]

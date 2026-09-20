@@ -1,8 +1,8 @@
-use crate::vm::{
+use anyhow::{bail, Result};
+use finch_vm::{
     CapabilityKind, CapabilityRequirement, ControlEffect, EffectSet, ResourceSelector, StackRow,
     StackSignature, Type,
 };
-use anyhow::{bail, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 

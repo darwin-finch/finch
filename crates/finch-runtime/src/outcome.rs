@@ -1,8 +1,8 @@
-use crate::vm::{
+use finch_programs::{ExecutionEffect, ProgramValue};
+use finch_vm::{
     ApprovalPrompt, CapabilityRequirement, EffectJournalEntry, HostSideEffect, VmDiagnostic,
     VmSideEffect,
 };
-use finch_programs::{ExecutionEffect, ProgramValue};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -65,8 +65,8 @@ pub struct ExecutionOutcome {
 
 impl ExecutionOutcome {
     /// Frozen ProgramRun identity for this outcome.
-    pub fn program_run(&self) -> crate::runtime::ProgramRun {
-        crate::runtime::ProgramRun::new(self.execution_id)
+    pub fn program_run(&self) -> crate::ProgramRun {
+        crate::ProgramRun::new(self.execution_id)
     }
 
     pub fn failed(

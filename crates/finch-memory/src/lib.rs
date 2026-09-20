@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 // Everything under `#[cfg(any(test, feature = "test-support"))]` from here
 // down to `pause_in_projection_sweep` (and its call sites further below) is
 // one seam: hydration batch/completion/sweep test pauses that
-// `src/runtime/tests.rs`, in the *root* crate, drives to get a genuinely
+// `crates/finch-runtime/src/tests.rs` drives to get a genuinely
 // `Loading`/`Degraded` MemTree index. It is deliberately not plain
 // `#[cfg(test)]` — see the `test-support` feature comment in Cargo.toml for
 // why a bare `#[cfg(test)]` seam here would silently vanish from a dependent
@@ -198,7 +198,7 @@ impl Drop for ProjectionSweepPauseRegistration {
 }
 
 /// Hold the production loader after `after_loaded` nodes so a test can
-/// observe a genuinely `Loading` index. Visible to `src/runtime` (a
+/// observe a genuinely `Loading` index. Visible to `finch-runtime` (a
 /// dependent crate as of the finch-memory extraction, #870) so the typed
 /// `mem-index-status` regression can drive the state #295 is about; gated on
 /// the `test-support` feature, not bare `cfg(test)`, because `cfg(test)` is
@@ -5831,7 +5831,7 @@ mod tests {
     /// to be bounded.
     ///
     /// The multi-threaded counterpart is `typed_mem_store_completes_on_a_single_worker_runtime`
-    /// in `src/runtime`, which drives the real submit API.
+    /// in `finch-runtime`, which drives the real submit API.
     #[tokio::test]
     async fn test_a_current_thread_runtime_loads_without_spawning_a_loader() -> Result<()> {
         let temp = NamedTempFile::new()?;

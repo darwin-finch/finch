@@ -171,13 +171,13 @@ There are **two** handoffs. Treating them as one is how frontends end up emittin
 
 **1. Frontend → compiler: shared structured syntax, not IR.**
 
-Each frontend owns a private parse tree (CoLisp `Val`/`SpannedVal`, Co-Forth's span-preserving module tree). That tree does **not** enter `finch-vm`, `src/runtime`, Brain, or the TUI. The frontend submits span-bearing structured syntax through the versioned semantic-construction protocol (builder calls: declare a function, unresolved call, match, closure, generic application, effect syntax). That protocol is the **shared** input the dependency scheduler elaborates. It is not a public HIR-node ABI, and it cannot mint `FunctionCertified`, `ModuleSealed`, or `ModuleVerified`.
+Each frontend owns a private parse tree (CoLisp `Val`/`SpannedVal`, Co-Forth's span-preserving module tree). That tree does **not** enter `finch-vm`, `finch-runtime`, Brain, or the TUI. The frontend submits span-bearing structured syntax through the versioned semantic-construction protocol (builder calls: declare a function, unresolved call, match, closure, generic application, effect syntax). That protocol is the **shared** input the dependency scheduler elaborates. It is not a public HIR-node ABI, and it cannot mint `FunctionCertified`, `ModuleSealed`, or `ModuleVerified`.
 
 This is the SDC lesson: parse AST is frontend-private; the compiler scheduler runs on **symbols and phases** derived from those builder submissions (`Declared → SignatureReady → BodyTyped → Lowered → FunctionCertified`). Forward references are `require(symbol, SignatureReady)` (a promise the scheduler fulfills). Parallel files publish skeletons independently. Two files importing one module intern **one** in-flight module job; they do not each lower IR and contend in the VM.
 
 **2. Compiler → execute: typed stack IR, not AST.**
 
-`finch-language` (the compiler door) is the only place that lowers. `finch-vm` (interpreter, fibers, checkpoints), later Cranelift, `programs`, and `src/runtime` consume **`ModuleVerified` IR**. They do not take frontend trees, builder traces, or compiler-private HIR. Application composition submits either source plus a language tag to `finch-language`, or an already-verified module to `finch-vm`. It never compiles by importing `finch-colisp` or `finch-coforth`.
+`finch-language` (the compiler door) is the only place that lowers. `finch-vm` (interpreter, fibers, checkpoints), later Cranelift, `programs`, and `finch-runtime` consume **`ModuleVerified` IR**. They do not take frontend trees, builder traces, or compiler-private HIR. Application composition submits either source plus a language tag to `finch-language`, or an already-verified module to `finch-vm`. It never compiles by importing `finch-colisp` or `finch-coforth`.
 
 The VM fiber scheduler is a **different** machine from the compiler job scheduler. Compiler jobs may eventually be self-hosted as CoLisp fibers that yield `CompilerNeed`; they still lower to IR before anything executes.
 
@@ -4413,7 +4413,7 @@ src/jit/                       later Cranelift ABI, native cache, traps, source 
 vocabulary/language/            canonical provider-facing definitions
 ```
 
-Keep `src/runtime` as orchestration around the VM: submissions, manifests, execution contexts,
+Keep `finch-runtime` as orchestration around the VM: submissions, manifests, execution contexts,
 scheduler, provider resolution, and projection into session/UI events.
 
 ## Definition of done

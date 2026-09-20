@@ -1,7 +1,7 @@
 //! Durable application-side delivery log for portable VM effects.
 
 use super::VmEffectEnvelopeRuntimeMethods;
-use crate::runtime::{
+use crate::{
     DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, TypedEffectSink, VmEffectEnvelope,
     VmEffectHandle,
 };
@@ -66,9 +66,9 @@ pub struct EffectAuditAuthority {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectAuditIntent {
     pub identity: EffectAuditIdentity,
-    pub capability: crate::vm::CapabilityKind,
-    pub selector: crate::vm::ResourceSelector,
-    pub output: Vec<crate::vm::Type>,
+    pub capability: finch_vm::CapabilityKind,
+    pub selector: finch_vm::ResourceSelector,
+    pub output: Vec<finch_vm::Type>,
     pub effect_kind: String,
     pub payload_bytes: usize,
     pub canonical_sha256: String,
@@ -77,7 +77,7 @@ pub struct EffectAuditIntent {
 impl EffectAuditIntent {
     pub fn from_effect(
         identity: EffectAuditIdentity,
-        effect: &crate::vm::VmSideEffect,
+        effect: &finch_vm::VmSideEffect,
     ) -> Result<Self> {
         anyhow::ensure!(
             identity.effect_sequence == effect.sequence,
@@ -89,9 +89,9 @@ impl EffectAuditIntent {
             "effect audit intent exceeds the bounded payload limit"
         );
         let effect_kind = match &effect.event {
-            crate::vm::HostSideEffect::Emit { .. } => "emit",
-            crate::vm::HostSideEffect::Ui { .. } => "ui",
-            crate::vm::HostSideEffect::Request { .. } => "request",
+            finch_vm::HostSideEffect::Emit { .. } => "emit",
+            finch_vm::HostSideEffect::Ui { .. } => "ui",
+            finch_vm::HostSideEffect::Request { .. } => "request",
         }
         .to_string();
         Ok(Self {
@@ -105,9 +105,9 @@ impl EffectAuditIntent {
         })
     }
 
-    pub(crate) fn observer_projection(&self) -> Self {
+    pub fn observer_projection(&self) -> Self {
         let mut projected = self.clone();
-        projected.selector = crate::vm::ResourceSelector::None;
+        projected.selector = finch_vm::ResourceSelector::None;
         projected.output.clear();
         projected.canonical_sha256.clear();
         projected
@@ -115,7 +115,7 @@ impl EffectAuditIntent {
 
     pub(crate) fn tombstone_projection(&self) -> Self {
         let mut projected = self.clone();
-        projected.selector = crate::vm::ResourceSelector::None;
+        projected.selector = finch_vm::ResourceSelector::None;
         projected.output.clear();
         projected.effect_kind = "compacted".into();
         projected
@@ -126,7 +126,7 @@ impl EffectAuditIntent {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum EffectAuditTerminalOutcome {
     Acknowledged {
-        response: crate::runtime::VmResumeResponse,
+        response: crate::VmResumeResponse,
     },
     NotApplied {
         reason: String,
@@ -150,7 +150,7 @@ pub enum EffectAuditTerminalOutcome {
     /// Read-only projection of a schema-v14 `EffectRecorded` event. New
     /// writers never emit this variant.
     LegacyV14Snapshot {
-        state: crate::vm::EffectJournalState,
+        state: finch_vm::EffectJournalState,
     },
 }
 
@@ -176,7 +176,7 @@ pub struct EffectAuditEntry {
 }
 
 impl EffectAuditEntry {
-    pub(crate) fn observer_projection(&self) -> Self {
+    pub fn observer_projection(&self) -> Self {
         let mut projected = self.clone();
         projected.intent = projected.intent.observer_projection();
         projected.authority.authority_id = Uuid::nil();
@@ -202,7 +202,7 @@ pub struct HostEffectPermit {
 }
 
 impl HostEffectPermit {
-    pub(crate) fn new(identity: EffectAuditIdentity, authority_id: Uuid) -> Self {
+    pub fn new(identity: EffectAuditIdentity, authority_id: Uuid) -> Self {
         Self {
             identity,
             authority_id,
@@ -213,7 +213,7 @@ impl HostEffectPermit {
         self.identity
     }
 
-    pub(crate) fn authority_id(&self) -> Uuid {
+    pub fn authority_id(&self) -> Uuid {
         self.authority_id
     }
 }
@@ -259,7 +259,7 @@ impl EffectAuditTransition {
         }
     }
 
-    pub(crate) fn observer_projection(&self) -> Self {
+    pub fn observer_projection(&self) -> Self {
         match self {
             Self::Reserve { intent, authority } => {
                 let mut authority = authority.clone();
@@ -342,7 +342,7 @@ impl EffectAuditReducer {
     /// Oldest detailed terminal identities beyond the retained observer tail.
     /// This queue is maintained as transitions apply, avoiding a scan and sort
     /// of the complete Brain event history during compaction.
-    pub(crate) fn terminal_compaction_candidates(
+    pub fn terminal_compaction_candidates(
         &self,
         retained_limit: usize,
     ) -> Vec<EffectAuditIdentity> {
@@ -396,7 +396,7 @@ impl EffectAuditReducer {
     /// Replace a detailed terminal projection with its permanent fixed-size
     /// intent/outcome digest fence. Unresolved write-ahead state is never
     /// eligible for retention compaction.
-    pub(crate) fn compact_terminal(&mut self, identity: &EffectAuditIdentity) -> Result<()> {
+    pub fn compact_terminal(&mut self, identity: &EffectAuditIdentity) -> Result<()> {
         let entry = self
             .entries
             .get_mut(identity)
@@ -635,8 +635,8 @@ impl EffectAuditReducer {
                     EffectAuditEntry {
                         intent: EffectAuditIntent {
                             identity,
-                            capability: crate::vm::CapabilityKind::SessionEmit,
-                            selector: crate::vm::ResourceSelector::None,
+                            capability: finch_vm::CapabilityKind::SessionEmit,
+                            selector: finch_vm::ResourceSelector::None,
                             output: Vec::new(),
                             effect_kind: "compacted".into(),
                             payload_bytes: intent_bytes,
@@ -666,7 +666,7 @@ impl EffectAuditReducer {
 
     /// Drop an in-memory compact fence after the indexed archive has durably
     /// accepted it. Exact replay remains enforced by the archive lookup.
-    pub(crate) fn forget_archived(&mut self, identity: &EffectAuditIdentity) -> Result<()> {
+    pub fn forget_archived(&mut self, identity: &EffectAuditIdentity) -> Result<()> {
         let entry = self
             .entries
             .get(identity)
@@ -696,7 +696,7 @@ pub(crate) fn authority_sha256(authority: &EffectAuditAuthority) -> Result<Strin
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(authority)?)))
 }
 
-pub(crate) fn replay_fence_transition(entry: &EffectAuditEntry) -> Result<EffectAuditTransition> {
+pub fn replay_fence_transition(entry: &EffectAuditEntry) -> Result<EffectAuditTransition> {
     let EffectAuditState::Terminal { outcome } = &entry.state else {
         bail!("unresolved effect audit cannot become a replay fence");
     };
@@ -1134,10 +1134,8 @@ pub fn bind_delivery_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{
-        DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, TypedEffectSink,
-    };
-    use crate::vm::{
+    use crate::{DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, TypedEffectSink};
+    use finch_vm::{
         CapabilityKind, CapabilityRequirement, HostSideEffect, ResourceSelector, SourceOrigin,
         VmSideEffect,
     };
@@ -1225,7 +1223,7 @@ mod tests {
             identity: intent.identity,
             authority_id: authority.authority_id,
             outcome: EffectAuditTerminalOutcome::Acknowledged {
-                response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
+                response: crate::VmResumeResponse::Result { values: Vec::new() },
             },
         };
         assert!(reducer.apply(finish.clone()).unwrap());
@@ -1258,7 +1256,7 @@ mod tests {
                 identity: intent.identity,
                 authority_id: authority.authority_id,
                 outcome: EffectAuditTerminalOutcome::Acknowledged {
-                    response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
+                    response: crate::VmResumeResponse::Result { values: Vec::new() },
                 },
             })
             .unwrap_err()
@@ -1507,7 +1505,7 @@ mod tests {
         VmEffectEnvelope {
             execution_id,
             effect: VmSideEffect {
-                protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                protocol_version: finch_vm::VM_TYPE_SYSTEM_VERSION,
                 sequence,
                 requirement: CapabilityRequirement {
                     capability: CapabilityKind::SessionEmit,
@@ -1515,8 +1513,8 @@ mod tests {
                 },
                 output: Vec::new(),
                 event: HostSideEffect::Ui {
-                    operation: crate::vm::UiOperation::Status,
-                    target: Some(crate::vm::TypedValue::Resource {
+                    operation: finch_vm::UiOperation::Status,
+                    target: Some(finch_vm::TypedValue::Resource {
                         kind: "output-handle".into(),
                         handle: handle.into(),
                         generation,

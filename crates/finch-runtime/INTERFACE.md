@@ -1,8 +1,8 @@
-# runtime — public interface
+# finch-runtime — public interface
 
-Generated from [`src/runtime/mod.rs`](mod.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
+Generated from [`crates/finch-runtime/src/lib.rs`](src/lib.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
 
-- **Facade:** `src/runtime/mod.rs`
+- **Facade:** `crates/finch-runtime/src/lib.rs`
 - **Capsule:** [`AGENTS.md`](AGENTS.md)
 
 Everything below is what callers outside this module can reach. Implementation modules are private; their contents are deliberately absent.
@@ -14,12 +14,18 @@ Everything below is what callers outside this module can reach. Implementation m
 pub struct AgentActivitySnapshot { … }
 pub struct AgentBudget { … }
 pub struct AgentContextReference { … }
+impl AgentContextReference {
+    pub fn validate(&self) -> Result<()>;
+}
 pub enum AgentEvent { Resnapshot, TaskQueued, TaskStarted, UsageUpdated, ToolStarted, ToolCompleted, TaskFinished }
 pub struct AgentIdentity { … }
 pub enum AgentRole { General, Explore, Research, Code }
 pub struct AgentTaskResult { … }
 pub struct AgentTaskSnapshot { … }
 pub struct AgentTaskSpec { … }
+impl AgentTaskSpec {
+    pub fn validate(&self) -> Result<()>;
+}
 pub enum AgentTaskStatus { Queued, Running, Completed, Failed, Cancelled }
 /// Provider-reported usage for a child task.
 pub struct AgentUsage { … }
@@ -80,11 +86,15 @@ impl DeliveryCursor {
 /// Provenance minted by the daemon when it creates a run-scoped reverse capability.
 pub struct EffectAuditAuthority { … }
 pub struct EffectAuditEntry { … }
+impl EffectAuditEntry {
+    pub fn observer_projection(&self) -> Self;
+}
 /// Complete immutable identity of one named-Brain host effect.
 pub struct EffectAuditIdentity { … }
 pub struct EffectAuditIntent { … }
 impl EffectAuditIntent {
-    pub fn from_effect(identity: EffectAuditIdentity, effect: &crate::vm::VmSideEffect) -> Result<Self>;
+    pub fn from_effect(identity: EffectAuditIdentity, effect: &finch_vm::VmSideEffect) -> Result<Self>;
+    pub fn observer_projection(&self) -> Self;
 }
 pub struct EffectAuditReducer { … }
 impl EffectAuditReducer {
@@ -93,9 +103,15 @@ impl EffectAuditReducer {
     pub fn active_for_run(&self, run_id: Uuid) -> usize;
     /// Validate and apply one monotonic transition.
     pub fn apply(&mut self, transition: EffectAuditTransition) -> Result<bool>;
+    /// Replace a detailed terminal projection with its permanent fixed-size intent/outcome digest fence.
+    pub fn compact_terminal(&mut self, identity: &EffectAuditIdentity) -> Result<()>;
     pub fn entries(&self) -> &BTreeMap<EffectAuditIdentity, EffectAuditEntry>;
+    /// Drop an in-memory compact fence after the indexed archive has durably accepted it.
+    pub fn forget_archived(&mut self, identity: &EffectAuditIdentity) -> Result<()>;
     pub fn get(&self, identity: &EffectAuditIdentity) -> Option<&EffectAuditEntry>;
     pub fn replay_fence_count(&self) -> usize;
+    /// Oldest detailed terminal identities beyond the retained observer tail.
+    pub fn terminal_compaction_candidates(&self, retained_limit: usize) -> Vec<EffectAuditIdentity>;
     pub fn total_count(&self) -> usize;
     /// Validate one transition without cloning the complete replay index.
     pub fn validate(&self, transition: &EffectAuditTransition) -> Result<bool>;
@@ -109,6 +125,7 @@ pub enum EffectAuditTerminalOutcome { Acknowledged, NotApplied, FailedPartial, A
 pub enum EffectAuditTransition { Reserve, Begin, Finish, Fence }
 impl EffectAuditTransition {
     pub fn identity(&self) -> EffectAuditIdentity;
+    pub fn observer_projection(&self) -> Self;
 }
 pub enum ExecutionBackend { TypedVm }
 /// Hard limits applied before an execution result is returned to a provider.
@@ -123,13 +140,15 @@ pub struct ExecutionOutcome { … }
 impl ExecutionOutcome {
     pub fn failed(execution_id: Uuid, revision: u64, effect: ExecutionEffect, backend: ExecutionBackend, diagnostic: impl Into<String>, elapsed_ms: u64) -> Self;
     /// Frozen ProgramRun identity for this outcome.
-    pub fn program_run(&self) -> crate::runtime::ProgramRun;
+    pub fn program_run(&self) -> crate::ProgramRun;
 }
 pub enum ExecutionStatus { Completed, Suspended, AuthorizationRequired, Failed, Cancelled }
 /// Proof that the daemon durably committed `AwaitingHostResult`.
 pub struct HostEffectPermit { … }
 impl HostEffectPermit {
+    pub fn authority_id(&self) -> Uuid;
     pub fn identity(&self) -> EffectAuditIdentity;
+    pub fn new(identity: EffectAuditIdentity, authority_id: Uuid) -> Self;
 }
 /// The spawner a runtime has before a host attaches one.
 pub struct NoAgentSpawning;
@@ -182,14 +201,22 @@ impl ProgramRuntime {
     pub async fn submit_as_typed_only_with_typed_effect_sink(&self, submission: ProgramSubmission, caller: Option<agents::AgentIdentity>, effect_sink: TypedEffectSink) -> Result<ExecutionOutcome>;
     /// Equivalent to [`Self::submit_with_typed_effect_sink`] for a child agent whose ancestry must be preserved by host capability bindings.
     pub async fn submit_as_with_typed_effect_sink(&self, submission: ProgramSubmission, caller: Option<agents::AgentIdentity>, effect_sink: TypedEffectSink) -> Result<ExecutionOutcome>;
+    /// Provider-native `submit_program` entry point.
+    pub async fn submit_tool_program(&self, submission: ProgramSubmission, caller: Option<agents::AgentIdentity>, effect_sink: Option<TypedEffectSink>, defer_program_effects: bool, effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>) -> Result<ExecutionOutcome>;
     /// Execute source through the shared typed runtime only.
     pub async fn submit_typed_only(&self, submission: ProgramSubmission) -> Result<ExecutionOutcome>;
+    /// Run one named-Brain program with schedule effects delegated to the attached Brain service.
+    pub async fn submit_typed_only_with_deferred_schedule_effects(&self, submission: ProgramSubmission, effect_sink: TypedEffectSink, grant_ceiling: Option<EffectSet>, effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>) -> Result<ExecutionOutcome>;
+    /// Test-support entry point for exercising the scheduled-callback grant ceiling from an application-layer regression without widening the production facade.
+    pub async fn submit_typed_only_with_grant_ceiling_for_test(&self, submission: ProgramSubmission, grant_ceiling: EffectSet) -> Result<ExecutionOutcome>;
     /// Submit with a portable host boundary for every awaited capability.
     pub async fn submit_with_deferred_host_effects(&self, submission: ProgramSubmission, effect_sink: TypedEffectSink) -> Result<ExecutionOutcome>;
     /// Submit with an event-loop binding that explicitly owns proposal editing.
     pub async fn submit_with_deferred_program_effects(&self, submission: ProgramSubmission, effect_sink: TypedEffectSink) -> Result<ExecutionOutcome>;
     /// Submit one ProgramRun with a presentation binding owned by the caller.
     pub async fn submit_with_typed_effect_sink(&self, submission: ProgramSubmission, effect_sink: TypedEffectSink) -> Result<ExecutionOutcome>;
+    /// The agent binding a typed program would be handed, built the same way the execution paths build it.
+    pub fn agent_binding_for_test(&self, caller: Option<agents::AgentIdentity>) -> Option<agent_vm::AgentVmBinding>;
     /// Replace the host-owned policy atomically with the corresponding grant revocations.
     pub fn apply_capability_policy(&self, policy: CapabilityPolicy, actor: impl Into<String>) -> Result<Vec<uuid::Uuid>>;
     pub fn archive(&self) -> Result<ProgramRuntimeArchive>;
@@ -233,6 +260,7 @@ impl ProgramRuntime {
     pub fn deny_typed_execution_for_effect(&self, execution_id: uuid::Uuid, effect_sequence: u64, reason: impl Into<String>) -> Result<ExecutionOutcome>;
     /// The bound delivery log, if this runtime is a production Brain instance.
     pub fn effect_delivery_log(&self) -> Option<Arc<Mutex<VmEffectDeliveryLog>>>;
+    pub fn effective_grants_for(&self, caller: Option<&agents::AgentIdentity>) -> Result<EffectSet>;
     /// Restore a retained reducible revision window.
     pub fn from_archive(archive: ProgramRuntimeArchive) -> Result<Self>;
     /// Restore reducible VM state and host authority as two independently validated records.
@@ -253,6 +281,8 @@ impl ProgramRuntime {
     pub fn pending_typed_execution(&self, execution_id: uuid::Uuid) -> Result<Option<PendingTypedExecutionInfo>>;
     /// Number of private continuations retained by this runtime.
     pub fn pending_typed_execution_count(&self) -> Result<usize>;
+    /// Resolve host-issued grant identities into a child creation-time ceiling.
+    pub fn resolve_capability_grant_subset(&self, caller: Option<&agents::AgentIdentity>, grant_ids: &[uuid::Uuid]) -> Result<EffectSet>;
     /// Restore authority only before this runtime is shared with concurrent callers.
     pub fn restore_authority_state(&mut self, state: ProgramRuntimeAuthorityState) -> Result<()>;
     /// Restore host-owned authority records independently of a VM checkpoint.
@@ -264,6 +294,7 @@ impl ProgramRuntime {
     /// Install application persistence for subsequent authority mutations.
     pub fn set_authority_sink(&self, sink: ProgramRuntimeAuthoritySink) -> Result<()>;
     pub fn with_automation(enabled: bool) -> Self;
+    pub fn with_automation_in_workspace(enabled: bool, workspace_root: PathBuf) -> Self;
 }
 /// Versioned bounded window of reducible state for a persistent shared VM.
 pub struct ProgramRuntimeArchive { … }
@@ -301,22 +332,25 @@ pub struct ResourceRootBindingRecord { … }
 /// Send-safe proxy for the daemon-owned run-scoped effect audit capability.
 pub struct RunnerEffectAuditControl { … }
 impl RunnerEffectAuditControl {
-    pub async fn reserve(&self, execution_id: uuid::Uuid, effect: crate::vm::VmSideEffect) -> Result<RunnerEffectAuditReservation, String>;
+    pub async fn reserve(&self, execution_id: uuid::Uuid, effect: finch_vm::VmSideEffect) -> Result<RunnerEffectAuditReservation, String>;
+    pub fn new(tx: mpsc::UnboundedSender<RunnerEffectAuditControlRequest>) -> Self;
 }
-pub(crate) enum RunnerEffectAuditControlRequest { Reserve }
+pub enum RunnerEffectAuditControlRequest { Reserve }
 /// One accepted intent.
 pub struct RunnerEffectAuditReservation { … }
 impl RunnerEffectAuditReservation {
     pub async fn begin(self) -> Result<RunnerHostEffectPermit, String>;
     pub async fn not_applied(self, reason: impl Into<String>) -> Result<(), String>;
+    pub fn new(tx: mpsc::UnboundedSender<RunnerEffectAuditReservationRequest>) -> Self;
 }
-pub(crate) enum RunnerEffectAuditReservationRequest { Begin, NotApplied }
-pub(crate) struct RunnerHostEffectFinishRequest { … }
+pub enum RunnerEffectAuditReservationRequest { Begin, NotApplied }
+pub struct RunnerHostEffectFinishRequest { … }
 pub enum RunnerHostEffectOutcome { Acknowledged, NotApplied, FailedPartial }
 /// Opaque proof that the daemon fsynced `AwaitingHostResult`.
 pub struct RunnerHostEffectPermit { … }
 impl RunnerHostEffectPermit {
     pub async fn finish(self, outcome: RunnerHostEffectOutcome) -> Result<(), String>;
+    pub fn new(tx: mpsc::UnboundedSender<RunnerHostEffectFinishRequest>) -> Self;
 }
 /// One versioned Runtime/Application ABI record.
 pub enum RuntimeApplicationMessage { ProgramRun, Diagnostic, Envelope, Resume, EffectHandle, OutputHandle, CursorAck }
@@ -360,6 +394,10 @@ impl VmEffectDeliveryLog {
 }
 /// A portable VM event attached to its owning ProgramRun. Re-exported from `finch-tools-api`.
 pub struct VmEffectEnvelope { … }
+impl VmEffectEnvelope {
+    /// Stable `(execution_id, sequence)` handle for this envelope.
+    pub fn handle(&self) -> VmEffectHandle;
+}
 /// Stable identity for one journaled VM effect. Re-exported from `finch-tools-api`.
 pub struct VmEffectHandle { … }
 /// The portable, correlated reply to one awaited VM effect.
@@ -407,34 +445,34 @@ pub(crate) trait VmEffectEnvelopeRuntimeMethods {
 pub fn bind_delivery_log(log: Arc<Mutex<VmEffectDeliveryLog>>, downstream: Option<TypedEffectSink>) -> TypedEffectSink { … }
 /// Open one worksheet with its bounding box checked before it is allocated.
 pub fn bounded_worksheet_range<RS: Read + Seek>(workbook: &mut Sheets<RS>, sheet: &str, max_cells: u64) -> Result<Range<Data>, String> { … }
-pub(crate) fn decode_checkpoint(reader: wire::typed_runtime_checkpoint::Reader<'_>) -> Result<TypedRuntimeCheckpoint> { … }
+pub fn decode_checkpoint(reader: wire::typed_runtime_checkpoint::Reader<'_>) -> Result<TypedRuntimeCheckpoint> { … }
 /// Decode one durable typed-runtime checkpoint.
-pub(crate) fn decode_checkpoint_bytes(encoded: &[u8]) -> Result<TypedRuntimeCheckpoint> { … }
-pub(crate) fn decode_effect_journal_state(reader: wire::vm_effect_journal_state::Reader<'_>) -> Result<EffectJournalState> { … }
-pub(crate) fn decode_effect_record(reader: wire::brain_effect_record::Reader<'_>) -> Result<(uuid::Uuid, EffectJournalEntry)> { … }
-pub(crate) fn decode_effects(reader: capnp::struct_list::Reader<'_, wire::capability_requirement::Owned>) -> Result<EffectSet> { … }
-pub(crate) fn decode_packed_runtime_application_frames(frames: capnp::data_list::Reader<'_>) -> Result<Vec<RuntimeApplicationMessage>> { … }
+pub fn decode_checkpoint_bytes(encoded: &[u8]) -> Result<TypedRuntimeCheckpoint> { … }
+pub fn decode_effect_journal_state(reader: wire::vm_effect_journal_state::Reader<'_>) -> Result<EffectJournalState> { … }
+pub fn decode_effect_record(reader: wire::brain_effect_record::Reader<'_>) -> Result<(uuid::Uuid, EffectJournalEntry)> { … }
+pub fn decode_effects(reader: capnp::struct_list::Reader<'_, wire::capability_requirement::Owned>) -> Result<EffectSet> { … }
+pub fn decode_packed_runtime_application_frames(frames: capnp::data_list::Reader<'_>) -> Result<Vec<RuntimeApplicationMessage>> { … }
 /// Decode one packed Runtime/Application ABI frame.
-pub(crate) fn decode_runtime_application_message_packed(encoded: &[u8]) -> Result<RuntimeApplicationMessage> { … }
-pub(crate) fn decode_value_list(reader: capnp::struct_list::Reader<'_, wire::typed_value::Owned>, depth: usize) -> Result<Vec<TypedValue>> { … }
-pub(crate) fn decode_vm_side_effect(reader: wire::vm_side_effect::Reader<'_>) -> Result<VmSideEffect> { … }
-pub(crate) fn encode_checkpoint(mut builder: wire::typed_runtime_checkpoint::Builder<'_>, value: &TypedRuntimeCheckpoint) -> Result<()> { … }
+pub fn decode_runtime_application_message_packed(encoded: &[u8]) -> Result<RuntimeApplicationMessage> { … }
+pub fn decode_value_list(reader: capnp::struct_list::Reader<'_, wire::typed_value::Owned>, depth: usize) -> Result<Vec<TypedValue>> { … }
+pub fn decode_vm_side_effect(reader: wire::vm_side_effect::Reader<'_>) -> Result<VmSideEffect> { … }
+pub fn encode_checkpoint(mut builder: wire::typed_runtime_checkpoint::Builder<'_>, value: &TypedRuntimeCheckpoint) -> Result<()> { … }
 /// Encode one durable typed-runtime checkpoint using the same closed native schema used by runner registration and result transport.
-pub(crate) fn encode_checkpoint_bytes(value: &TypedRuntimeCheckpoint) -> Result<Vec<u8>> { … }
-pub(crate) fn encode_effect_journal_state(mut builder: wire::vm_effect_journal_state::Builder<'_>, value: &EffectJournalState) -> Result<()> { … }
-pub(crate) fn encode_effect_record(mut builder: wire::brain_effect_record::Builder<'_>, execution_id: uuid::Uuid, entry: &EffectJournalEntry) -> Result<()> { … }
-pub(crate) fn encode_effects(mut builder: capnp::struct_list::Builder<'_, wire::capability_requirement::Owned>, value: &EffectSet) { … }
-pub(crate) fn encode_packed_runtime_application_frames(mut encoded: capnp::data_list::Builder<'_>, messages: &[RuntimeApplicationMessage]) -> Result<()> { … }
+pub fn encode_checkpoint_bytes(value: &TypedRuntimeCheckpoint) -> Result<Vec<u8>> { … }
+pub fn encode_effect_journal_state(mut builder: wire::vm_effect_journal_state::Builder<'_>, value: &EffectJournalState) -> Result<()> { … }
+pub fn encode_effect_record(mut builder: wire::brain_effect_record::Builder<'_>, execution_id: uuid::Uuid, entry: &EffectJournalEntry) -> Result<()> { … }
+pub fn encode_effects(mut builder: capnp::struct_list::Builder<'_, wire::capability_requirement::Owned>, value: &EffectSet) { … }
+pub fn encode_packed_runtime_application_frames(mut encoded: capnp::data_list::Builder<'_>, messages: &[RuntimeApplicationMessage]) -> Result<()> { … }
 /// Compact packed Cap'n Proto frame for the Runtime/Application ABI.
-pub(crate) fn encode_runtime_application_message_packed(value: &RuntimeApplicationMessage) -> Result<Vec<u8>> { … }
-pub(crate) fn encode_value_list(mut builder: capnp::struct_list::Builder<'_, wire::typed_value::Owned>, values: &[TypedValue], depth: usize) -> Result<()> { … }
-pub(crate) fn encode_vm_side_effect(mut builder: wire::vm_side_effect::Builder<'_>, value: &VmSideEffect) -> Result<()> { … }
+pub fn encode_runtime_application_message_packed(value: &RuntimeApplicationMessage) -> Result<Vec<u8>> { … }
+pub fn encode_value_list(mut builder: capnp::struct_list::Builder<'_, wire::typed_value::Owned>, values: &[TypedValue], depth: usize) -> Result<()> { … }
+pub fn encode_vm_side_effect(mut builder: wire::vm_side_effect::Builder<'_>, value: &VmSideEffect) -> Result<()> { … }
 pub fn parse_task_id(value: &str) -> Result<Uuid> { … }
 /// Conservative key for scoping prior permission observations.
 pub fn permission_context_key() -> String { … }
 /// Human-readable context for the process asking macOS for TCC trust.
 pub fn permission_target_description() -> String { … }
-pub(crate) fn replay_fence_transition(entry: &EffectAuditEntry) -> Result<EffectAuditTransition> { … }
+pub fn replay_fence_transition(entry: &EffectAuditEntry) -> Result<EffectAuditTransition> { … }
 /// Create a thread-safe, single-consumer adapter for portable VM effects.
 pub fn typed_effect_channel() -> (TypedEffectSink, mpsc::Receiver<VmEffectEnvelope>) { … }
 /// Render one spreadsheet cell as the text a user or program sees.
@@ -452,11 +490,11 @@ pub const MAX_ACTIVE_EFFECT_AUDITS_PER_BRAIN: usize = 256;
 pub const MAX_ACTIVE_EFFECT_AUDITS_PER_RUN: usize = 64;
 /// Brain-wide bound for canonical pre-redaction effect payloads represented by unresolved reservations.
 pub const MAX_ACTIVE_EFFECT_AUDIT_BYTES_PER_BRAIN: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_CONTEXT_ARTIFACT_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_CONTEXT_FIELD_BYTES: usize = 1024;
-pub(crate) const MAX_CONTEXT_REFERENCES: usize = 64;
-pub(crate) const MAX_CONTEXT_TOTAL_BYTES: usize = 256 * 1024;
-pub(crate) const MAX_DEPTH: usize = 4;
+pub const MAX_CONTEXT_ARTIFACT_BYTES: usize = 64 * 1024;
+pub const MAX_CONTEXT_FIELD_BYTES: usize = 1024;
+pub const MAX_CONTEXT_REFERENCES: usize = 64;
+pub const MAX_CONTEXT_TOTAL_BYTES: usize = 256 * 1024;
+pub const MAX_DEPTH: usize = 4;
 /// Maximum serialized intent admitted for one host effect.
 pub const MAX_EFFECT_AUDIT_INTENT_BYTES: usize = 256 * 1024;
 /// Upper bound for the audit share of the canonical Brain journal.
@@ -469,13 +507,13 @@ pub const MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN: usize = EFFECT_AUDIT_REPLAY_
 pub const MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES: usize = 1_024;
 /// Maximum encoded bytes for one compact replay fence transition.
 pub const MAX_EFFECT_AUDIT_REPLAY_FENCE_TRANSITION_BYTES: usize = 768;
-pub(crate) const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 /// Hard per-runtime bound for private transactional continuations.
 pub const MAX_PENDING_TYPED_EXECUTIONS: usize = 256;
 /// Full reducible checkpoints are intentionally expensive.
 pub const MAX_RETAINED_VM_REVISIONS: usize = 256;
-pub(crate) const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
-pub(crate) const MAX_TURNS: usize = 10;
+pub const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+pub const MAX_TURNS: usize = 10;
 /// The most cells Finch will read from one worksheet.
 pub const MAX_WORKBOOK_CELLS: u64 = 10_000_000;
 pub const PROGRAM_RUNTIME_ARCHIVE_VERSION: u32 = 1;

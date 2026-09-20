@@ -73,8 +73,8 @@ fn host_requests_are_routed_through_registered_core_bindings() {
     );
 
     let wrong_requirement = CapabilityRequirement {
-        capability: crate::vm::CapabilityKind::SessionEmit,
-        selector: crate::vm::ResourceSelector::None,
+        capability: finch_vm::CapabilityKind::SessionEmit,
+        selector: finch_vm::ResourceSelector::None,
     };
     assert!(registered_host_binding(&wrong_requirement, &origin).is_err());
     assert!(registered_host_binding(&requirement, &SourceOrigin::generated("+"),).is_err());
@@ -87,8 +87,8 @@ fn host_requests_are_routed_through_registered_core_bindings() {
     ))]
     {
         let process_requirement = CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProcessRun,
-            selector: crate::vm::ResourceSelector::Process {
+            capability: finch_vm::CapabilityKind::ProcessRun,
+            selector: finch_vm::ResourceSelector::Process {
                 executables: vec![resolve_process_executable("/usr/bin/true")
                     .unwrap()
                     .encode()],
@@ -209,10 +209,10 @@ fn every_host_dispatch_rejects_a_same_capability_wrong_binding_or_abi() {
     .is_err());
 
     let file_requirement = CapabilityRequirement::file(
-        crate::vm::FileOperation::Read,
-        crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        finch_vm::FileOperation::Read,
+        finch_vm::FileSelector::parse("./Cargo.toml").unwrap(),
     );
-    let broad = crate::vm::FileSelector::parse("./**").unwrap();
+    let broad = finch_vm::FileSelector::parse("./**").unwrap();
     assert!(validate_core_host_request(
         Some(CoreHostBinding::FileRead),
         &file_requirement,
@@ -225,7 +225,7 @@ fn every_host_dispatch_rejects_a_same_capability_wrong_binding_or_abi() {
     .is_err());
 
     let mut checked = 0_usize;
-    for (name, spec) in crate::vm::core_word_registry() {
+    for (name, spec) in finch_vm::core_word_registry() {
         let CoreWordImplementation::HostEffect(binding) = spec.implementation else {
             continue;
         };
@@ -249,7 +249,7 @@ fn every_host_dispatch_rejects_a_same_capability_wrong_binding_or_abi() {
 
     let runtime = ProgramRuntime::new();
     let mut host = production_host_handler(&runtime);
-    let error = crate::vm::CapabilityHandler::request(
+    let error = finch_vm::CapabilityHandler::request(
         &mut host,
         &requirement,
         vec![TypedValue::String("hostile".into()), TypedValue::Int(0)],
@@ -258,11 +258,11 @@ fn every_host_dispatch_rejects_a_same_capability_wrong_binding_or_abi() {
     .expect_err("the production host boundary must reject automation ABI substitution");
     assert_eq!(error.code, "E-HOST-002");
 
-    let error = crate::vm::CapabilityHandler::request(
+    let error = finch_vm::CapabilityHandler::request(
         &mut host,
         &file_requirement,
         vec![TypedValue::Path {
-            selector: crate::vm::FileSelector::parse("./**").unwrap(),
+            selector: finch_vm::FileSelector::parse("./**").unwrap(),
             relative: "README.md".into(),
         }],
         &SourceOrigin::generated("file-read"),
@@ -302,7 +302,7 @@ fn network_send_rejects_a_stale_program_run_generation() {
         },
     };
     let stale_generation = host.resource_generation + 1;
-    let error = crate::vm::CapabilityHandler::request(
+    let error = finch_vm::CapabilityHandler::request(
         &mut host,
         &requirement,
         vec![
@@ -496,18 +496,18 @@ async fn source_cannot_hide_external_effect_behind_pure_declaration() {
     assert!(outcome
         .required_capabilities
         .iter()
-        .any(|requirement| requirement.capability == crate::vm::CapabilityKind::FileWrite));
+        .any(|requirement| requirement.capability == finch_vm::CapabilityKind::FileWrite));
     assert!(outcome
         .inferred_capabilities
         .iter()
-        .any(|requirement| requirement.capability == crate::vm::CapabilityKind::FileWrite));
+        .any(|requirement| requirement.capability == finch_vm::CapabilityKind::FileWrite));
     assert!(matches!(
         outcome.inferred_capabilities[0].selector,
-        crate::vm::ResourceSelector::FileTemplate { .. }
+        finch_vm::ResourceSelector::FileTemplate { .. }
     ));
     assert!(matches!(
         outcome.required_capabilities[0].selector,
-        crate::vm::ResourceSelector::File { .. }
+        finch_vm::ResourceSelector::File { .. }
     ));
 }
 
@@ -527,7 +527,7 @@ async fn completed_outcome_retains_effects_from_an_untaken_branch() {
     assert!(outcome
         .inferred_capabilities
         .iter()
-        .any(|requirement| { requirement.capability == crate::vm::CapabilityKind::FileRead }));
+        .any(|requirement| { requirement.capability == finch_vm::CapabilityKind::FileRead }));
 }
 
 #[tokio::test]
@@ -640,9 +640,9 @@ async fn enabled_automation_still_requires_an_explicit_typed_grant() {
     assert_eq!(denied.status, ExecutionStatus::AuthorizationRequired);
 
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::AutomationInspect,
-            selector: crate::vm::ResourceSelector::Automation { application: None },
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::AutomationInspect,
+            selector: finch_vm::ResourceSelector::Automation { application: None },
         })
         .unwrap();
     let outcome = runtime
@@ -676,12 +676,12 @@ async fn approved_typed_file_read_resumes_with_a_refined_path() {
     assert!(matches!(
         pending.effect_journal.as_slice(),
         [
-            crate::vm::EffectJournalEntry {
-                state: crate::vm::EffectJournalState::Acknowledged { values },
+            finch_vm::EffectJournalEntry {
+                state: finch_vm::EffectJournalState::Acknowledged { values },
                 ..
             },
-            crate::vm::EffectJournalEntry {
-                state: crate::vm::EffectJournalState::AwaitingApproval,
+            finch_vm::EffectJournalEntry {
+                state: finch_vm::EffectJournalState::AwaitingApproval,
                 ..
             },
         ] if values.is_empty()
@@ -716,9 +716,9 @@ async fn approved_typed_file_read_resumes_with_a_refined_path() {
         .unwrap()
         .is_some());
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let approved = runtime
@@ -734,12 +734,12 @@ async fn approved_typed_file_read_resumes_with_a_refined_path() {
     assert!(matches!(
         approved.effect_journal.as_slice(),
         [
-            crate::vm::EffectJournalEntry {
-                state: crate::vm::EffectJournalState::Acknowledged { .. },
+            finch_vm::EffectJournalEntry {
+                state: finch_vm::EffectJournalState::Acknowledged { .. },
                 ..
             },
-            crate::vm::EffectJournalEntry {
-                state: crate::vm::EffectJournalState::Acknowledged { values },
+            finch_vm::EffectJournalEntry {
+                state: finch_vm::EffectJournalState::Acknowledged { values },
                 ..
             },
         ] if matches!(values.as_slice(), [TypedValue::Bytes(_)])
@@ -805,9 +805,9 @@ async fn approval_requests_are_stable_and_preserve_agent_ancestry() {
 async fn task_scoped_grants_apply_only_to_the_matching_program_run() {
     let runtime = ProgramRuntime::new();
     let allowed_task = uuid::Uuid::new_v4();
-    let requirement = crate::vm::CapabilityRequirement::file(
-        crate::vm::FileOperation::Read,
-        crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+    let requirement = finch_vm::CapabilityRequirement::file(
+        finch_vm::FileOperation::Read,
+        finch_vm::FileSelector::parse("./Cargo.toml").unwrap(),
     );
     runtime
         .issue_typed_capability(
@@ -870,9 +870,9 @@ async fn child_grant_ceiling_blocks_later_ambient_expansion_but_allows_task_appr
         grant_ceiling: runtime.effective_grants_for(None).unwrap(),
         brain_run_id: None,
     };
-    let requirement = crate::vm::CapabilityRequirement::file(
-        crate::vm::FileOperation::Read,
-        crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+    let requirement = finch_vm::CapabilityRequirement::file(
+        finch_vm::FileOperation::Read,
+        finch_vm::FileSelector::parse("./Cargo.toml").unwrap(),
     );
     runtime
         .issue_typed_capability(
@@ -913,9 +913,9 @@ async fn exact_once_grants_never_enter_ambient_program_run_authority() {
     let runtime = ProgramRuntime::new();
     runtime
         .issue_typed_capability(
-            crate::vm::CapabilityRequirement::file(
-                crate::vm::FileOperation::Read,
-                crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+            finch_vm::CapabilityRequirement::file(
+                finch_vm::FileOperation::Read,
+                finch_vm::FileSelector::parse("./Cargo.toml").unwrap(),
             ),
             GrantScope::Once {
                 request_id: uuid::Uuid::new_v4(),
@@ -1056,7 +1056,7 @@ async fn denied_approval_is_audited_and_discards_the_continuation() {
     assert_eq!(denied.status, ExecutionStatus::Failed);
     assert!(matches!(
         denied.effect_journal.last().map(|entry| &entry.state),
-        Some(crate::vm::EffectJournalState::Denied)
+        Some(finch_vm::EffectJournalState::Denied)
     ));
     assert!(runtime
         .pending_typed_execution(pending.execution_id)
@@ -1090,9 +1090,9 @@ async fn typed_file_slice_reads_a_bounded_range_without_loading_the_file() {
         .effect_sequence
         .expect("file-slice must create a portable host request");
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let completed = runtime
@@ -1123,9 +1123,9 @@ async fn typed_file_hash_returns_sha256_without_materializing_file_bytes() {
         .effect_sequence
         .expect("file-hash must create a portable host request");
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let outcome = runtime
@@ -1199,6 +1199,10 @@ fn tree_list_is_sorted_bounded_and_structural() {
 
 #[tokio::test]
 async fn typed_tree_list_has_identical_lisp_and_forth_results() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
     let mut results = Vec::new();
     for (language, source) in [
         (
@@ -1210,11 +1214,11 @@ async fn typed_tree_list_has_identical_lisp_and_forth_results() {
             "s\"crates/finch-vm/src\" path 5 tree-list",
         ),
     ] {
-        let runtime = ProgramRuntime::new();
+        let runtime = ProgramRuntime::with_automation_in_workspace(false, workspace_root.clone());
         runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-                crate::vm::FileOperation::Read,
-                crate::vm::FileSelector::parse("./**").unwrap(),
+            .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+                finch_vm::FileOperation::Read,
+                finch_vm::FileSelector::parse("./**").unwrap(),
             ))
             .unwrap();
         let outcome = runtime
@@ -1251,9 +1255,9 @@ async fn typed_file_line_cursor_reads_one_bounded_line_at_a_time() {
         .effect_sequence
         .expect("file-lines-open must create a portable host request");
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let completed = runtime
@@ -1273,9 +1277,9 @@ async fn typed_file_line_cursor_reads_one_bounded_line_at_a_time() {
 async fn file_stream_follow_up_rechecks_the_minting_selector_after_revocation() {
     let runtime = ProgramRuntime::new();
     let original_grant = runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let suspended = runtime
@@ -1290,9 +1294,9 @@ async fn file_stream_follow_up_rechecks_the_minting_selector_after_revocation() 
 
     assert!(runtime.revoke_typed_capability(original_grant).unwrap());
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./README.md").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./README.md").unwrap(),
         ))
         .unwrap();
     let resumed = runtime
@@ -1302,9 +1306,9 @@ async fn file_stream_follow_up_rechecks_the_minting_selector_after_revocation() 
     assert_eq!(resumed.status, ExecutionStatus::AuthorizationRequired);
     assert_eq!(
         resumed.required_capabilities,
-        vec![crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        vec![finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./Cargo.toml").unwrap(),
         )]
     );
     let ledger = runtime.capability_ledger().unwrap();
@@ -1332,9 +1336,9 @@ async fn typed_csv_cursor_reads_one_record_and_releases_its_handle() {
         .effect_sequence
         .expect("csv-open must create a portable host request");
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let completed = runtime
@@ -1409,9 +1413,9 @@ async fn typed_workbook_cursor_and_sheet_listing_match_across_frontends() {
     ] {
         let runtime = ProgramRuntime::new();
         runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-                crate::vm::FileOperation::Read,
-                crate::vm::FileSelector::parse("./**").unwrap(),
+            .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+                finch_vm::FileOperation::Read,
+                finch_vm::FileSelector::parse("./**").unwrap(),
             ))
             .unwrap();
         let outcome = runtime
@@ -1436,9 +1440,9 @@ async fn typed_workbook_cursor_and_sheet_listing_match_across_frontends() {
 
     let runtime = ProgramRuntime::new();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let outcome = runtime
@@ -1498,9 +1502,9 @@ async fn typed_workbook_cursor_and_sheet_listing_match_across_frontends() {
         ] {
             let runtime = ProgramRuntime::new();
             runtime
-                .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-                    crate::vm::FileOperation::Read,
-                    crate::vm::FileSelector::parse("./**").unwrap(),
+                .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+                    finch_vm::FileOperation::Read,
+                    finch_vm::FileSelector::parse("./**").unwrap(),
                 ))
                 .unwrap();
             let outcome = runtime
@@ -1559,9 +1563,9 @@ async fn csv_summary_is_bounded_and_identical_across_frontends() {
     ] {
         let runtime = ProgramRuntime::new();
         runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-                crate::vm::FileOperation::Read,
-                crate::vm::FileSelector::parse("./**").unwrap(),
+            .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+                finch_vm::FileOperation::Read,
+                finch_vm::FileSelector::parse("./**").unwrap(),
             ))
             .unwrap();
         let outcome = runtime
@@ -1601,9 +1605,9 @@ async fn typed_csv_cursor_branches_on_a_record_without_unwrapping() {
         .effect_sequence
         .expect("csv-open must create a portable host request");
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let completed = runtime
@@ -1640,9 +1644,9 @@ async fn typed_file_line_cursor_streams_a_text_file_through_a_verified_loop() {
         .effect_sequence
         .expect("file-lines-open must create a portable host request");
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
 
@@ -1678,9 +1682,9 @@ async fn typed_lisp_file_line_cursor_streams_a_text_file_through_a_verified_loop
         .effect_sequence
         .expect("file-lines-open must create a portable host request");
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
 
@@ -1710,9 +1714,9 @@ async fn typed_runtime_accepts_a_portable_external_effect_result() {
         .effect_sequence
         .expect("awaited host effect must have a stable sequence");
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
 
@@ -1733,8 +1737,8 @@ async fn typed_runtime_accepts_a_portable_external_effect_result() {
     );
     assert!(matches!(
         completed.effect_journal.last(),
-        Some(crate::vm::EffectJournalEntry {
-            state: crate::vm::EffectJournalState::Acknowledged { values },
+        Some(finch_vm::EffectJournalEntry {
+            state: finch_vm::EffectJournalState::Acknowledged { values },
             ..
         }) if values == &vec![TypedValue::Bytes(b"from external event loop".to_vec())]
     ));
@@ -1743,9 +1747,9 @@ async fn typed_runtime_accepts_a_portable_external_effect_result() {
 #[tokio::test]
 async fn named_brain_schedule_submission_defers_only_the_schedule_host_result() {
     let runtime = ProgramRuntime::new();
-    let requirement = crate::vm::CapabilityRequirement {
-        capability: crate::vm::CapabilityKind::ScheduleCreate,
-        selector: crate::vm::ResourceSelector::Schedule { policy: None },
+    let requirement = finch_vm::CapabilityRequirement {
+        capability: finch_vm::CapabilityKind::ScheduleCreate,
+        selector: finch_vm::ResourceSelector::Schedule { policy: None },
     };
     runtime.grant_typed_capability(requirement.clone()).unwrap();
     let (sink, receiver) = typed_effect_channel();
@@ -1770,7 +1774,7 @@ async fn named_brain_schedule_submission_defers_only_the_schedule_host_result() 
     assert_eq!(envelope.effect.requirement, requirement);
     assert!(matches!(
         envelope.effect.event,
-        crate::vm::HostSideEffect::Request { ref arguments }
+        finch_vm::HostSideEffect::Request { ref arguments }
             if matches!(arguments.as_slice(),
                 [TypedValue::String(_), TypedValue::Int(1770000000)])
     ));
@@ -1827,8 +1831,8 @@ async fn cancellation_marks_a_pending_capability_request_in_the_effect_journal()
     assert!(cancelled.diagnostics[0].contains("host shut down"));
     assert!(matches!(
         cancelled.effect_journal.as_slice(),
-        [crate::vm::EffectJournalEntry {
-            state: crate::vm::EffectJournalState::Cancelled,
+        [finch_vm::EffectJournalEntry {
+            state: finch_vm::EffectJournalState::Cancelled,
             ..
         }]
     ));
@@ -1904,8 +1908,8 @@ async fn portable_denial_records_the_exact_effect_without_resuming_it() {
     assert!(denied.diagnostics[0].contains("user declined workspace access"));
     assert!(matches!(
         denied.effect_journal.last(),
-        Some(crate::vm::EffectJournalEntry {
-            state: crate::vm::EffectJournalState::Denied,
+        Some(finch_vm::EffectJournalEntry {
+            state: finch_vm::EffectJournalState::Denied,
             ..
         })
     ));
@@ -1949,7 +1953,7 @@ async fn typed_effect_sink_is_per_run_and_survives_yield() {
     let first_sink: TypedEffectSink = {
         let first_events = Arc::clone(&first_events);
         Arc::new(move |effect| {
-            if let crate::vm::HostSideEffect::Emit { text } = effect.effect.event {
+            if let finch_vm::HostSideEffect::Emit { text } = effect.effect.event {
                 first_events.lock().unwrap().push(text);
             }
         })
@@ -1958,7 +1962,7 @@ async fn typed_effect_sink_is_per_run_and_survives_yield() {
     let second_sink: TypedEffectSink = {
         let second_events = Arc::clone(&second_events);
         Arc::new(move |effect| {
-            if let crate::vm::HostSideEffect::Emit { text } = effect.effect.event {
+            if let finch_vm::HostSideEffect::Emit { text } = effect.effect.event {
                 second_events.lock().unwrap().push(text);
             }
         })
@@ -2022,11 +2026,11 @@ async fn typed_effect_channel_preserves_one_run_event_order() {
     assert_eq!(events[1].effect.sequence, 1);
     assert!(matches!(
         &events[0].effect.event,
-        crate::vm::HostSideEffect::Emit { text } if text == "first"
+        finch_vm::HostSideEffect::Emit { text } if text == "first"
     ));
     assert!(matches!(
         &events[1].effect.event,
-        crate::vm::HostSideEffect::Emit { text } if text == "second"
+        finch_vm::HostSideEffect::Emit { text } if text == "second"
     ));
 }
 
@@ -2056,7 +2060,7 @@ async fn typed_effect_sink_observes_an_awaited_request_before_approval() {
         [VmEffectEnvelope {
             effect: VmSideEffect {
                 sequence: 0,
-                event: crate::vm::HostSideEffect::Request { .. },
+                event: finch_vm::HostSideEffect::Request { .. },
                 output,
                 ..
             },
@@ -2092,8 +2096,8 @@ async fn typed_suspension_can_be_inspected_and_cancelled_without_committing() {
     assert_eq!(cancelled.output, "before");
     assert!(matches!(
         cancelled.effect_journal.as_slice(),
-        [crate::vm::EffectJournalEntry {
-            state: crate::vm::EffectJournalState::Acknowledged { values },
+        [finch_vm::EffectJournalEntry {
+            state: finch_vm::EffectJournalState::Acknowledged { values },
             ..
         }] if values.is_empty()
     ));
@@ -2318,15 +2322,15 @@ async fn typed_capability_request_does_not_mutate_or_fallback() {
     );
     assert_eq!(
         outcome.required_capabilities[0].capability,
-        crate::vm::CapabilityKind::MemoryWrite
+        finch_vm::CapabilityKind::MemoryWrite
     );
 }
 
 #[tokio::test]
 async fn capability_ledger_restores_and_revokes_runtime_authority_by_id() {
-    let requirement = crate::vm::CapabilityRequirement::file(
-        crate::vm::FileOperation::Read,
-        crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+    let requirement = finch_vm::CapabilityRequirement::file(
+        finch_vm::FileOperation::Read,
+        finch_vm::FileSelector::parse("./Cargo.toml").unwrap(),
     );
     let request = || {
         submission(
@@ -2358,7 +2362,7 @@ async fn capability_ledger_restores_and_revokes_runtime_authority_by_id() {
     assert_eq!(ledger.audit.len(), 2);
     assert_eq!(
         ledger.audit[1].action,
-        crate::vm::CapabilityAuditAction::Revoked
+        finch_vm::CapabilityAuditAction::Revoked
     );
 }
 
@@ -2372,7 +2376,7 @@ fn failed_authority_sink_rolls_back_a_new_grant() {
         .unwrap();
     let requirement = CapabilityRequirement {
         capability: CapabilityKind::AgentSpawn,
-        selector: crate::vm::ResourceSelector::None,
+        selector: finch_vm::ResourceSelector::None,
     };
     let error = runtime
         .issue_typed_capability(
@@ -2418,7 +2422,7 @@ fn process_grant_without_process_selector_has_no_authority_effects() {
         .issue_typed_capability(
             CapabilityRequirement {
                 capability: CapabilityKind::ProcessRun,
-                selector: crate::vm::ResourceSelector::None,
+                selector: finch_vm::ResourceSelector::None,
             },
             GrantScope::Global,
             "test-user",
@@ -2435,12 +2439,12 @@ fn process_grant_without_process_selector_has_no_authority_effects() {
 fn policy_change_revokes_obsolete_and_denied_grants_and_blocks_reissue() {
     let runtime = ProgramRuntime::new();
     let file_read = CapabilityRequirement::file(
-        crate::vm::FileOperation::Read,
-        crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        finch_vm::FileOperation::Read,
+        finch_vm::FileSelector::parse("./Cargo.toml").unwrap(),
     );
     let agent_spawn = CapabilityRequirement {
         capability: CapabilityKind::AgentSpawn,
-        selector: crate::vm::ResourceSelector::None,
+        selector: finch_vm::ResourceSelector::None,
     };
     let file_grant = runtime
         .issue_typed_capability(file_read.clone(), GrantScope::Global, "test-user", None)
@@ -2499,7 +2503,7 @@ fn policy_change_revokes_obsolete_and_denied_grants_and_blocks_reissue() {
         .issue_typed_capability(
             CapabilityRequirement {
                 capability: CapabilityKind::AgentSpawn,
-                selector: crate::vm::ResourceSelector::None,
+                selector: finch_vm::ResourceSelector::None,
             },
             GrantScope::Global,
             "test-user",
@@ -2527,7 +2531,7 @@ fn failed_authority_sink_rolls_back_policy_and_its_revocations() {
     let runtime = ProgramRuntime::new();
     let requirement = CapabilityRequirement {
         capability: CapabilityKind::AgentSpawn,
-        selector: crate::vm::ResourceSelector::None,
+        selector: finch_vm::ResourceSelector::None,
     };
     let grant_id = runtime
         .issue_typed_capability(requirement, GrantScope::Global, "test-user", None)
@@ -2633,9 +2637,9 @@ fn typed_mem_store_completes_on_a_single_worker_runtime() {
         let program_runtime = ProgramRuntime::new();
         program_runtime.attach_memory(memory);
         program_runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::MemoryWrite,
-                selector: crate::vm::ResourceSelector::Memory {
+            .grant_typed_capability(finch_vm::CapabilityRequirement {
+                capability: finch_vm::CapabilityKind::MemoryWrite,
+                selector: finch_vm::ResourceSelector::Memory {
                     tree: "session".into(),
                     path: "**".into(),
                 },
@@ -2678,9 +2682,9 @@ async fn typed_memory_host_reads_and_writes_through_attached_memtree() {
     let runtime = ProgramRuntime::new();
     runtime.attach_memory(memory);
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::MemoryWrite,
-            selector: crate::vm::ResourceSelector::Memory {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::MemoryWrite,
+            selector: finch_vm::ResourceSelector::Memory {
                 tree: "session".into(),
                 path: "**".into(),
             },
@@ -2753,9 +2757,9 @@ async fn typed_mem_recall_refuses_an_unusable_index_instead_of_reporting_absence
     let runtime = ProgramRuntime::new();
     runtime.attach_memory(memory);
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::MemoryRead,
-            selector: crate::vm::ResourceSelector::Memory {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::MemoryRead,
+            selector: finch_vm::ResourceSelector::Memory {
                 tree: "session".into(),
                 path: "**".into(),
             },
@@ -2808,7 +2812,7 @@ async fn typed_mem_recall_refuses_an_unusable_index_instead_of_reporting_absence
 #[test]
 fn test_memory_index_status_projects_every_hydration_state() {
     use finch_memory::HydrationStatus;
-    let origin = crate::vm::SourceOrigin::generated("mem-index-status");
+    let origin = finch_vm::SourceOrigin::generated("mem-index-status");
     let int = |value: i64| ProgramValue::Option(Some(Box::new(ProgramValue::Int(value))));
     let text =
         |value: &str| ProgramValue::Option(Some(Box::new(ProgramValue::String(value.into()))));
@@ -3069,9 +3073,9 @@ fn runtime_reading(memory: Arc<finch_memory::MemorySystem>) -> ProgramRuntime {
     let runtime = ProgramRuntime::new();
     runtime.attach_memory(memory);
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::MemoryRead,
-            selector: crate::vm::ResourceSelector::Memory {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::MemoryRead,
+            selector: finch_vm::ResourceSelector::Memory {
                 tree: "session".into(),
                 path: "**".into(),
             },
@@ -3934,7 +3938,7 @@ async fn inspection_exposes_typed_stack_vocabulary_and_grants() {
     assert!(state
         .granted_capabilities
         .iter()
-        .any(|grant| grant.capability == crate::vm::CapabilityKind::SessionEmit));
+        .any(|grant| grant.capability == finch_vm::CapabilityKind::SessionEmit));
 }
 
 #[tokio::test]
@@ -4349,7 +4353,7 @@ async fn process_run_reports_a_permanent_text_file_busy_without_hanging() {
         !ledger
             .audit
             .iter()
-            .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Consumed),
+            .any(|entry| entry.action == finch_vm::CapabilityAuditAction::Consumed),
         "a refused exec must not record consumption; audit={:#?}",
         ledger.audit
     );
@@ -4533,7 +4537,7 @@ async fn replaced_process_executable_does_not_consume_once_grant() {
     assert!(!ledger
         .audit
         .iter()
-        .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Consumed));
+        .any(|entry| entry.action == finch_vm::CapabilityAuditAction::Consumed));
 }
 
 #[cfg(any(
@@ -4823,7 +4827,7 @@ async fn kernel_rejected_launch_does_not_consume_or_audit_once_grant() {
     assert!(!ledger
         .audit
         .iter()
-        .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Consumed));
+        .any(|entry| entry.action == finch_vm::CapabilityAuditAction::Consumed));
 }
 
 #[cfg(any(
@@ -4912,18 +4916,18 @@ async fn typed_proposal_open_is_an_explicit_capability_and_returns_edited_artifa
     assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
     assert_eq!(
         pending.required_capabilities,
-        vec![crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProgramInvoke,
-            selector: crate::vm::ResourceSelector::Program {
+        vec![finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::ProgramInvoke,
+            selector: finch_vm::ResourceSelector::Program {
                 languages: vec!["python".into()],
             },
         }]
     );
 
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProgramInvoke,
-            selector: crate::vm::ResourceSelector::Program {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::ProgramInvoke,
+            selector: finch_vm::ResourceSelector::Program {
                 languages: vec!["python".into()],
             },
         })
@@ -4944,9 +4948,9 @@ async fn coforth_proposal_open_uses_the_same_typed_host_boundary() {
     let runtime = ProgramRuntime::new();
     bind_passthrough_artifact_proposals(&runtime);
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProgramInvoke,
-            selector: crate::vm::ResourceSelector::Program {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::ProgramInvoke,
+            selector: finch_vm::ResourceSelector::Program {
                 languages: vec!["forth".into()],
             },
         })
@@ -4973,9 +4977,9 @@ async fn coforth_proposal_open_uses_the_same_typed_host_boundary() {
 async fn proposal_open_can_suspend_for_an_external_editor_and_resume_once() {
     let runtime = ProgramRuntime::new();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProgramInvoke,
-            selector: crate::vm::ResourceSelector::Program {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::ProgramInvoke,
+            selector: finch_vm::ResourceSelector::Program {
                 languages: vec!["python".into()],
             },
         })
@@ -5005,11 +5009,11 @@ async fn proposal_open_can_suspend_for_an_external_editor_and_resume_once() {
     );
     assert_eq!(
         event.effect.requirement.capability,
-        crate::vm::CapabilityKind::ProgramInvoke
+        finch_vm::CapabilityKind::ProgramInvoke
     );
     assert!(matches!(
         event.effect.event,
-        crate::vm::HostSideEffect::Request { ref arguments }
+        finch_vm::HostSideEffect::Request { ref arguments }
             if matches!(arguments.as_slice(), [TypedValue::String(language), ..] if language == "python")
     ));
     let info = runtime
@@ -5023,7 +5027,7 @@ async fn proposal_open_can_suspend_for_an_external_editor_and_resume_once() {
     ));
     assert!(matches!(
         pending.effect_journal.last().map(|entry| &entry.state),
-        Some(crate::vm::EffectJournalState::AwaitingHostResult)
+        Some(finch_vm::EffectJournalState::AwaitingHostResult)
     ));
 
     let accepted = runtime
@@ -5052,7 +5056,7 @@ async fn proposal_open_can_suspend_for_an_external_editor_and_resume_once() {
     );
     assert!(matches!(
         accepted.effect_journal.last().map(|entry| &entry.state),
-        Some(crate::vm::EffectJournalState::Acknowledged { values })
+        Some(finch_vm::EffectJournalState::Acknowledged { values })
             if matches!(values.as_slice(), [TypedValue::Option { .. }])
     ));
 }
@@ -5061,9 +5065,9 @@ async fn proposal_open_can_suspend_for_an_external_editor_and_resume_once() {
 async fn portable_effect_channel_round_trips_a_deferred_proposal_resume() {
     let runtime = ProgramRuntime::new();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProgramInvoke,
-            selector: crate::vm::ResourceSelector::Program {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::ProgramInvoke,
+            selector: finch_vm::ResourceSelector::Program {
                 languages: vec!["python".into()],
             },
         })
@@ -5088,7 +5092,7 @@ async fn portable_effect_channel_round_trips_a_deferred_proposal_resume() {
     assert_eq!(envelope.execution_id, pending.execution_id);
     assert_eq!(
         envelope.effect.requirement.capability,
-        crate::vm::CapabilityKind::ProgramInvoke
+        finch_vm::CapabilityKind::ProgramInvoke
     );
 
     let outcome = runtime
@@ -5112,7 +5116,7 @@ async fn portable_effect_channel_round_trips_a_deferred_proposal_resume() {
     assert_eq!(outcome.status, ExecutionStatus::Completed);
     assert!(matches!(
         outcome.effect_journal.last().map(|entry| &entry.state),
-        Some(crate::vm::EffectJournalState::Acknowledged { values })
+        Some(finch_vm::EffectJournalState::Acknowledged { values })
             if matches!(values.as_slice(), [TypedValue::Option { .. }])
     ));
     assert!(
@@ -5125,9 +5129,9 @@ async fn portable_effect_channel_round_trips_a_deferred_proposal_resume() {
 async fn portable_host_boundary_can_defer_a_file_read_without_touching_the_host() {
     let runtime = ProgramRuntime::new();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let (sink, receiver) = typed_effect_channel();
@@ -5150,7 +5154,7 @@ async fn portable_host_boundary_can_defer_a_file_read_without_touching_the_host(
     assert_eq!(envelope.execution_id, pending.execution_id);
     assert_eq!(
         envelope.effect.requirement.capability,
-        crate::vm::CapabilityKind::FileRead
+        finch_vm::CapabilityKind::FileRead
     );
     assert_eq!(envelope.effect.output, vec![Type::Bytes]);
 
@@ -5175,9 +5179,9 @@ async fn portable_host_boundary_can_defer_a_file_read_without_touching_the_host(
 fn deferred_effect_sink_can_reenter_authority_without_deadlock() {
     let runtime = Arc::new(ProgramRuntime::new());
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -5217,9 +5221,9 @@ fn deferred_effect_sink_can_reenter_authority_without_deadlock() {
 async fn portable_host_boundary_retains_its_policy_across_multiple_resumes() {
     let runtime = ProgramRuntime::new();
     let grant_id = runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
     let (sink, receiver) = typed_effect_channel();
@@ -5292,9 +5296,9 @@ async fn typed_effect_sink_projects_proposal_request() {
     let runtime = ProgramRuntime::new();
     bind_passthrough_artifact_proposals(&runtime);
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProgramInvoke,
-            selector: crate::vm::ResourceSelector::Program {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::ProgramInvoke,
+            selector: finch_vm::ResourceSelector::Program {
                 languages: vec!["python".into()],
             },
         })
@@ -5314,7 +5318,7 @@ async fn typed_effect_sink_projects_proposal_request() {
         .unwrap();
     assert_eq!(outcome.status, ExecutionStatus::Completed);
     assert!(events.lock().unwrap().iter().any(|effect| {
-        effect.effect.requirement.capability == crate::vm::CapabilityKind::ProgramInvoke
+        effect.effect.requirement.capability == finch_vm::CapabilityKind::ProgramInvoke
     }));
 }
 
@@ -5322,9 +5326,9 @@ async fn typed_effect_sink_projects_proposal_request() {
 async fn proposal_grant_cannot_be_reused_for_a_different_artifact_language() {
     let runtime = ProgramRuntime::new();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProgramInvoke,
-            selector: crate::vm::ResourceSelector::Program {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::ProgramInvoke,
+            selector: finch_vm::ResourceSelector::Program {
                 languages: vec!["python".into()],
             },
         })
@@ -5340,9 +5344,9 @@ async fn proposal_grant_cannot_be_reused_for_a_different_artifact_language() {
     assert_eq!(outcome.status, ExecutionStatus::AuthorizationRequired);
     assert_eq!(
         outcome.required_capabilities,
-        vec![crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProgramInvoke,
-            selector: crate::vm::ResourceSelector::Program {
+        vec![finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::ProgramInvoke,
+            selector: finch_vm::ResourceSelector::Program {
                 languages: vec!["bash".into()],
             },
         }]
@@ -5377,9 +5381,9 @@ async fn proposal_open_rejects_an_unsupported_artifact_language_before_host_disp
 async fn process_grant_cannot_be_reused_for_a_different_executable() {
     let runtime = ProgramRuntime::new();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProcessRun,
-            selector: crate::vm::ResourceSelector::Process {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::ProcessRun,
+            selector: finch_vm::ResourceSelector::Process {
                 executables: vec!["/usr/bin/printf".into()],
             },
         })
@@ -5472,9 +5476,9 @@ async fn approved_typed_network_connect_and_send_use_scoped_host_binding() {
     let pending = runtime.submit(request.clone()).await.unwrap();
     assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::NetworkConnect,
-            selector: crate::vm::ResourceSelector::Network {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::NetworkConnect,
+            selector: finch_vm::ResourceSelector::Network {
                 host: "127.0.0.1".into(),
                 ports: vec![port],
             },
@@ -5494,9 +5498,9 @@ async fn approved_typed_network_connect_and_send_use_scoped_host_binding() {
 async fn network_grant_cannot_be_reused_for_a_different_host() {
     let runtime = ProgramRuntime::new();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::NetworkConnect,
-            selector: crate::vm::ResourceSelector::Network {
+        .grant_typed_capability(finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::NetworkConnect,
+            selector: finch_vm::ResourceSelector::Network {
                 host: "127.0.0.1".into(),
                 ports: vec![443],
             },
@@ -5514,7 +5518,7 @@ async fn network_grant_cannot_be_reused_for_a_different_host() {
     assert_eq!(outcome.required_capabilities.len(), 1);
     assert!(matches!(
         outcome.required_capabilities[0].selector,
-        crate::vm::ResourceSelector::Network { ref host, ref ports }
+        finch_vm::ResourceSelector::Network { ref host, ref ports }
             if host == "example.test" && ports == &[443]
     ));
 }
@@ -5636,7 +5640,7 @@ async fn typed_say_emits_stream_chunks_and_buffers_result() {
         events
             .iter()
             .map(|event| match &event.effect.event {
-                crate::vm::HostSideEffect::Emit { text } => text.as_str(),
+                finch_vm::HostSideEffect::Emit { text } => text.as_str(),
                 other => panic!("expected emit event, found {other:?}"),
             })
             .collect::<Vec<_>>(),
@@ -5646,10 +5650,10 @@ async fn typed_say_emits_stream_chunks_and_buffers_result() {
     assert_eq!(
         outcome.side_effects,
         vec![
-            crate::vm::HostSideEffect::Emit {
+            finch_vm::HostSideEffect::Emit {
                 text: "first".into()
             },
-            crate::vm::HostSideEffect::Emit {
+            finch_vm::HostSideEffect::Emit {
                 text: "second".into()
             }
         ]
@@ -5673,7 +5677,7 @@ async fn typed_forth_dot_quote_is_a_session_emit_shorthand() {
     assert_eq!(outcome.output, "hello from standard Forth");
     assert_eq!(
         outcome.side_effects,
-        vec![crate::vm::HostSideEffect::Emit {
+        vec![finch_vm::HostSideEffect::Emit {
             text: "hello from standard Forth".into(),
         }]
     );
@@ -5806,12 +5810,12 @@ async fn synchronous_output_open_emits_one_sequence_ordered_create_event() {
     );
     assert!(events.iter().all(|effect| !matches!(
         effect.effect.event,
-        crate::vm::HostSideEffect::Request { .. }
+        finch_vm::HostSideEffect::Request { .. }
     )));
     assert!(matches!(
         events.first().map(|effect| &effect.effect.event),
-        Some(crate::vm::HostSideEffect::Ui {
-            operation: crate::vm::UiOperation::Create,
+        Some(finch_vm::HostSideEffect::Ui {
+            operation: finch_vm::UiOperation::Create,
             text: Some(title),
             target: Some(TypedValue::Resource { kind, .. }),
             ..
@@ -5819,8 +5823,8 @@ async fn synchronous_output_open_emits_one_sequence_ordered_create_event() {
     ));
     assert!(matches!(
         events.last().map(|effect| &effect.effect.event),
-        Some(crate::vm::HostSideEffect::Ui {
-            operation: crate::vm::UiOperation::Complete,
+        Some(finch_vm::HostSideEffect::Ui {
+            operation: finch_vm::UiOperation::Complete,
             ..
         })
     ));
@@ -5852,32 +5856,32 @@ async fn typed_forth_output_handle_can_be_updated_in_its_creating_run() {
     let events = events.lock().unwrap();
     assert!(matches!(
         events.first().map(|effect| &effect.effect.event),
-        Some(crate::vm::HostSideEffect::Ui {
-            operation: crate::vm::UiOperation::Create,
+        Some(finch_vm::HostSideEffect::Ui {
+            operation: finch_vm::UiOperation::Create,
             ..
         })
     ));
     assert!(events.iter().any(|effect| matches!(
         &effect.effect.event,
-        crate::vm::HostSideEffect::Ui {
-            operation: crate::vm::UiOperation::Create,
+        finch_vm::HostSideEffect::Ui {
+            operation: finch_vm::UiOperation::Create,
             text: Some(title),
             ..
         } if title == "download"
     )));
     assert!(events.iter().any(|effect| matches!(
         &effect.effect.event,
-        crate::vm::HostSideEffect::Ui {
-            operation: crate::vm::UiOperation::Status,
+        finch_vm::HostSideEffect::Ui {
+            operation: finch_vm::UiOperation::Status,
             text: Some(text),
             ..
         } if text == "starting"
     )));
     assert!(events.iter().any(|effect| matches!(
         &effect.effect.event,
-        crate::vm::HostSideEffect::Ui {
-            operation: crate::vm::UiOperation::Progress,
-            progress: Some(crate::vm::UiProgress {
+        finch_vm::HostSideEffect::Ui {
+            operation: finch_vm::UiOperation::Progress,
+            progress: Some(finch_vm::UiProgress {
                 completed: 2,
                 total: Some(5),
             }),
@@ -5886,8 +5890,8 @@ async fn typed_forth_output_handle_can_be_updated_in_its_creating_run() {
     )));
     assert!(matches!(
         events.last().map(|effect| &effect.effect.event),
-        Some(crate::vm::HostSideEffect::Ui {
-            operation: crate::vm::UiOperation::Complete,
+        Some(finch_vm::HostSideEffect::Ui {
+            operation: finch_vm::UiOperation::Complete,
             ..
         })
     ));
@@ -5918,7 +5922,7 @@ async fn portable_output_open_registers_the_host_issued_handle_for_later_updates
     assert_eq!(open.execution_id, pending.execution_id);
     assert!(matches!(
         &open.effect.event,
-        crate::vm::HostSideEffect::Request { arguments }
+        finch_vm::HostSideEffect::Request { arguments }
             if matches!(arguments.as_slice(), [TypedValue::String(title)] if title == "download")
     ));
 
@@ -5949,8 +5953,8 @@ async fn portable_output_open_registers_the_host_issued_handle_for_later_updates
     );
     assert!(matches!(
         updates.first().map(|envelope| &envelope.effect.event),
-        Some(crate::vm::HostSideEffect::Ui {
-            operation: crate::vm::UiOperation::Status,
+        Some(finch_vm::HostSideEffect::Ui {
+            operation: finch_vm::UiOperation::Status,
             text: Some(text),
             target: Some(TypedValue::Resource { handle, generation, .. }),
             ..
@@ -5958,8 +5962,8 @@ async fn portable_output_open_registers_the_host_issued_handle_for_later_updates
     ));
     assert!(matches!(
         updates.last().map(|envelope| &envelope.effect.event),
-        Some(crate::vm::HostSideEffect::Ui {
-            operation: crate::vm::UiOperation::Complete,
+        Some(finch_vm::HostSideEffect::Ui {
+            operation: finch_vm::UiOperation::Complete,
             ..
         })
     ));
@@ -6034,9 +6038,9 @@ async fn newer_runner_checkpoint_hydrates_without_importing_authority() {
         .unwrap();
 
     let runner = ProgramRuntime::new();
-    let local_grant = crate::vm::CapabilityRequirement::file(
-        crate::vm::FileOperation::Read,
-        crate::vm::FileSelector::parse("./**").unwrap(),
+    let local_grant = finch_vm::CapabilityRequirement::file(
+        finch_vm::FileOperation::Read,
+        finch_vm::FileSelector::parse("./**").unwrap(),
     );
     runner.grant_typed_capability(local_grant.clone()).unwrap();
     let authority_before = runner.capability_ledger().unwrap();
@@ -6250,14 +6254,14 @@ async fn revision_history_checkpoint_restores_persisted_vocabulary() {
         .and_then(|snapshot| snapshot.checkpoint.clone())
         .expect("pure revision exposes a restorable VM checkpoint");
     let mut restored = TypedRuntime::from_checkpoint(checkpoint).unwrap();
-    let module = crate::language::compile_with_functions(
+    let module = finch_language::compile_with_functions(
         ProgramLanguage::Forth,
         "restore.forth",
         "square",
         restored
             .stack()
             .iter()
-            .map(crate::vm::TypedValue::value_type)
+            .map(finch_vm::TypedValue::value_type)
             .collect(),
         restored.vocabulary(),
         restored.functions(),
@@ -6317,9 +6321,9 @@ async fn program_runtime_restarts_from_a_typed_checkpoint() {
 async fn program_runtime_archive_restores_history_but_not_authority() {
     let runtime = ProgramRuntime::new();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./src/**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./src/**").unwrap(),
         ))
         .unwrap();
     runtime
@@ -6348,7 +6352,7 @@ async fn program_runtime_archive_restores_history_but_not_authority() {
         .unwrap()
         .granted_capabilities
         .iter()
-        .any(|requirement| requirement.capability == crate::vm::CapabilityKind::FileRead));
+        .any(|requirement| requirement.capability == finch_vm::CapabilityKind::FileRead));
     let result = restored
         .submit(submission(
             ProgramLanguage::Lisp,
@@ -6367,9 +6371,9 @@ async fn authority_state_restores_scoped_grants_beside_the_vm_archive() {
     let runtime = ProgramRuntime::new();
     runtime
         .issue_typed_capability(
-            crate::vm::CapabilityRequirement::file(
-                crate::vm::FileOperation::Read,
-                crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+            finch_vm::CapabilityRequirement::file(
+                finch_vm::FileOperation::Read,
+                finch_vm::FileSelector::parse("./Cargo.toml").unwrap(),
             ),
             GrantScope::Session {
                 session_id: runtime.capability_session_id(),
@@ -6407,9 +6411,9 @@ async fn authority_state_restores_scoped_grants_beside_the_vm_archive() {
 fn authority_restore_rejects_active_grants_from_another_policy() {
     let runtime = ProgramRuntime::new();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./Cargo.toml").unwrap(),
         ))
         .unwrap();
     let mut state = runtime.authority_state().unwrap();
@@ -6480,13 +6484,13 @@ fn authority_restore_rejects_legacy_raw_path_process_grants() {
 #[test]
 fn capability_availability_is_separate_from_grants_and_selector_aware() {
     let runtime = ProgramRuntime::new();
-    let workspace_read = crate::vm::CapabilityRequirement::file(
-        crate::vm::FileOperation::Read,
-        crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+    let workspace_read = finch_vm::CapabilityRequirement::file(
+        finch_vm::FileOperation::Read,
+        finch_vm::FileSelector::parse("./Cargo.toml").unwrap(),
     );
     assert_eq!(
         runtime.capability_availability(&workspace_read),
-        crate::vm::CapabilityAvailability::Available
+        finch_vm::CapabilityAvailability::Available
     );
     assert!(runtime
         .capability_ledger()
@@ -6496,35 +6500,35 @@ fn capability_availability_is_separate_from_grants_and_selector_aware() {
         .is_empty());
 
     let root = tempfile::tempdir().unwrap();
-    let host_read = crate::vm::CapabilityRequirement::file(
-        crate::vm::FileOperation::Read,
-        crate::vm::FileSelector {
-            root: crate::vm::ResourceRoot::HostMachine,
+    let host_read = finch_vm::CapabilityRequirement::file(
+        finch_vm::FileOperation::Read,
+        finch_vm::FileSelector {
+            root: finch_vm::ResourceRoot::HostMachine,
             pattern: "**".into(),
         },
     );
     assert_eq!(
         runtime.capability_availability(&host_read),
-        crate::vm::CapabilityAvailability::Disabled
+        finch_vm::CapabilityAvailability::Disabled
     );
     runtime.bind_host_machine_root(root.path()).unwrap();
     assert_eq!(
         runtime.capability_availability(&host_read),
-        crate::vm::CapabilityAvailability::Available
+        finch_vm::CapabilityAvailability::Available
     );
     assert_eq!(
-        runtime.capability_availability(&crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::VmWrite,
-            selector: crate::vm::ResourceSelector::None,
+        runtime.capability_availability(&finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::VmWrite,
+            selector: finch_vm::ResourceSelector::None,
         }),
-        crate::vm::CapabilityAvailability::Unsupported
+        finch_vm::CapabilityAvailability::Unsupported
     );
     assert_eq!(
-        runtime.capability_availability(&crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ScheduleCreate,
-            selector: crate::vm::ResourceSelector::Schedule { policy: None },
+        runtime.capability_availability(&finch_vm::CapabilityRequirement {
+            capability: finch_vm::CapabilityKind::ScheduleCreate,
+            selector: finch_vm::ResourceSelector::Schedule { policy: None },
         }),
-        crate::vm::CapabilityAvailability::Disabled,
+        finch_vm::CapabilityAvailability::Disabled,
         "a bare runtime must not expose a second local schedule store"
     );
 }
@@ -6563,8 +6567,8 @@ async fn submission_source_id_is_preserved_in_effect_origins() {
     let runtime = ProgramRuntime::new();
     runtime
         .grant_typed_capability(CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::SessionEmit,
-            selector: crate::vm::ResourceSelector::None,
+            capability: finch_vm::CapabilityKind::SessionEmit,
+            selector: finch_vm::ResourceSelector::None,
         })
         .unwrap();
     let outcome = runtime
@@ -6664,10 +6668,10 @@ fn workspace_path_rejects_a_stable_symlink_escape_before_host_io() {
     let outside = tempfile::NamedTempFile::new().unwrap();
     let link = workspace.path().join("outside-link");
     std::os::unix::fs::symlink(outside.path(), &link).unwrap();
-    let selector = crate::vm::FileSelector::parse("./**").unwrap();
+    let selector = finch_vm::FileSelector::parse("./**").unwrap();
 
     let root = resource_root_binding_record(
-        crate::vm::ResourceRoot::Workspace,
+        finch_vm::ResourceRoot::Workspace,
         workspace.path(),
         1,
         false,
@@ -6691,14 +6695,14 @@ fn descriptor_relative_open_rejects_final_component_symlink_swap() {
     std::fs::write(&victim, b"inside").unwrap();
     std::fs::write(outside.path(), b"outside").unwrap();
     let binding = resource_root_binding_record(
-        crate::vm::ResourceRoot::Workspace,
+        finch_vm::ResourceRoot::Workspace,
         workspace.path(),
         1,
         false,
         1,
     )
     .unwrap();
-    let selector = crate::vm::FileSelector::parse("./**").unwrap();
+    let selector = finch_vm::FileSelector::parse("./**").unwrap();
     let outside_path = outside.path().to_path_buf();
     RESOURCE_BEFORE_FINAL_OPEN_HOOK
         .get_or_init(|| Mutex::new(Vec::new()))
@@ -6730,14 +6734,14 @@ fn descriptor_relative_open_keeps_the_opened_parent_after_path_replacement() {
     std::fs::write(directory.join("value"), b"authorized").unwrap();
     std::fs::write(replacement.join("value"), b"replacement").unwrap();
     let binding = resource_root_binding_record(
-        crate::vm::ResourceRoot::Workspace,
+        finch_vm::ResourceRoot::Workspace,
         workspace.path(),
         1,
         false,
         1,
     )
     .unwrap();
-    let selector = crate::vm::FileSelector::parse("./**").unwrap();
+    let selector = finch_vm::FileSelector::parse("./**").unwrap();
     let replacement_target = workspace.path().join("dir");
     RESOURCE_BEFORE_FINAL_OPEN_HOOK
         .get_or_init(|| Mutex::new(Vec::new()))
@@ -6761,7 +6765,7 @@ fn descriptor_relative_open_keeps_the_opened_parent_after_path_replacement() {
 #[test]
 fn generic_resource_resolution_does_not_assign_host_roots_to_workspace() {
     let workspace = tempfile::tempdir().unwrap();
-    let selector = crate::vm::FileSelector::parse("${host-machine}/etc/**").unwrap();
+    let selector = finch_vm::FileSelector::parse("${host-machine}/etc/**").unwrap();
     std::fs::create_dir(workspace.path().join("etc")).unwrap();
     std::fs::write(workspace.path().join("etc/hosts"), b"local").unwrap();
 
@@ -6769,7 +6773,7 @@ fn generic_resource_resolution_does_not_assign_host_roots_to_workspace() {
     // check only proves that a child remains under the root selected by
     // the host binding.
     let root = resource_root_binding_record(
-        crate::vm::ResourceRoot::HostMachine,
+        finch_vm::ResourceRoot::HostMachine,
         workspace.path(),
         1,
         false,
@@ -6804,13 +6808,13 @@ async fn host_file_read_requires_an_explicit_host_binding_and_host_grant() {
     assert!(matches!(
         request.arguments.as_slice(),
         [TypedValue::Path { selector, relative }]
-            if selector.root == crate::vm::ResourceRoot::HostMachine && relative == "note.txt"
+            if selector.root == finch_vm::ResourceRoot::HostMachine && relative == "note.txt"
     ));
     let sequence = request.effect_sequence.unwrap();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("${host-machine}/**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("${host-machine}/**").unwrap(),
         ))
         .unwrap();
     let completed = runtime
@@ -6833,15 +6837,15 @@ async fn project_and_task_output_roots_are_typed_independent_bindings() {
     runtime.bind_project_root(project.path()).unwrap();
     runtime.bind_task_output_root(task_output.path()).unwrap();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("${project}/**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("${project}/**").unwrap(),
         ))
         .unwrap();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Write,
-            crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Write,
+            finch_vm::FileSelector::parse("${task.output}/**").unwrap(),
         ))
         .unwrap();
 
@@ -6900,9 +6904,9 @@ async fn host_file_read_fails_when_the_host_binding_is_not_installed() {
         .unwrap();
     let sequence = pending.approval_prompts[0].request.effect_sequence.unwrap();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("${host-machine}/**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("${host-machine}/**").unwrap(),
         ))
         .unwrap();
     let completed = runtime
@@ -6949,9 +6953,9 @@ async fn host_file_write_uses_the_same_explicit_binding_and_grant_boundary() {
     assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
     let sequence = pending.approval_prompts[0].request.effect_sequence.unwrap();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Write,
-            crate::vm::FileSelector::parse("${host-machine}/**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Write,
+            finch_vm::FileSelector::parse("${host-machine}/**").unwrap(),
         ))
         .unwrap();
     let completed = runtime
@@ -7024,7 +7028,7 @@ async fn public_revocation_winning_before_host_use_prevents_file_mutation() {
     assert!(ledger
         .audit
         .iter()
-        .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Revoked));
+        .any(|entry| entry.action == finch_vm::CapabilityAuditAction::Revoked));
 }
 
 #[test]
@@ -7033,9 +7037,9 @@ fn in_flight_deferred_use_blocks_public_revoke_and_root_mutation() {
     let runtime = Arc::new(ProgramRuntime::new());
     runtime.bind_project_root(project.path()).unwrap();
     let grant_id = runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("${project}/**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("${project}/**").unwrap(),
         ))
         .unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -7133,7 +7137,7 @@ fn in_flight_deferred_use_blocks_public_revoke_and_root_mutation() {
         .unwrap()
         .resource_roots
         .iter()
-        .any(|binding| binding.root == crate::vm::ResourceRoot::Project));
+        .any(|binding| binding.root == finch_vm::ResourceRoot::Project));
 }
 
 #[tokio::test]
@@ -7167,7 +7171,7 @@ async fn failed_file_open_rolls_back_once_use_and_restart_state() {
     assert!(!ledger
         .audit
         .iter()
-        .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Consumed));
+        .any(|entry| entry.action == finch_vm::CapabilityAuditAction::Consumed));
 
     let encoded = serde_json::to_vec(&runtime.authority_state().unwrap()).unwrap();
     let state: ProgramRuntimeAuthorityState = serde_json::from_slice(&encoded).unwrap();
@@ -7336,12 +7340,12 @@ fn resource_root_bind_revoke_and_whole_machine_lifecycle_is_durable() {
     assert!(final_state
         .resource_root_audit
         .iter()
-        .any(|entry| entry.root == crate::vm::ResourceRoot::Project
+        .any(|entry| entry.root == finch_vm::ResourceRoot::Project
             && entry.action == ResourceRootAuditAction::Bound));
     assert!(final_state
         .resource_root_audit
         .iter()
-        .any(|entry| entry.root == crate::vm::ResourceRoot::Project
+        .any(|entry| entry.root == finch_vm::ResourceRoot::Project
             && entry.action == ResourceRootAuditAction::Revoked));
     assert!(final_state
         .resource_root_audit
@@ -7350,7 +7354,7 @@ fn resource_root_bind_revoke_and_whole_machine_lifecycle_is_durable() {
     assert!(!final_state
         .resource_roots
         .iter()
-        .any(|binding| binding.root == crate::vm::ResourceRoot::HostMachine));
+        .any(|binding| binding.root == finch_vm::ResourceRoot::HostMachine));
 }
 
 #[test]
@@ -7393,8 +7397,8 @@ fn authority_restart_rejects_replaced_resource_root_identity() {
     assert!(format!("{error:#}").contains("identity changed since approval"));
     assert_eq!(
         restored.capability_availability(&CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("${project}/**").unwrap(),
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("${project}/**").unwrap(),
         )),
         CapabilityAvailability::Disabled
     );
@@ -7426,7 +7430,7 @@ fn authority_restart_rejects_incomplete_resource_root_lifecycle_audit() {
 #[cfg(test)]
 mod agent_capability {
     use super::*;
-    use crate::runtime::agents::{
+    use crate::agents::{
         AgentIdentity, AgentSpawning, AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec,
         AgentTaskStatus,
     };
@@ -7632,7 +7636,7 @@ mod agent_capability {
 
 #[test]
 fn runtime_application_abi_json_records_are_byte_stable() {
-    assert_eq!(crate::vm::RUNTIME_APPLICATION_ABI_VERSION, 1);
+    assert_eq!(finch_vm::RUNTIME_APPLICATION_ABI_VERSION, 1);
     let execution_id = uuid::Uuid::nil();
     let run = ProgramRun::new(execution_id);
     assert_eq!(
@@ -7669,9 +7673,9 @@ async fn delivery_log_observes_awaited_effect_before_local_resume_and_rejects_st
     let sink = bind_delivery_log(Arc::clone(&log), Some(live));
     let runtime = ProgramRuntime::new();
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
 
@@ -7794,8 +7798,8 @@ async fn delivery_bound_concurrent_output_handles_survive_disconnect() {
     let created: Vec<(String, String)> = events
         .iter()
         .filter_map(|envelope| match &envelope.effect.event {
-            crate::vm::HostSideEffect::Ui {
-                operation: crate::vm::UiOperation::Create,
+            finch_vm::HostSideEffect::Ui {
+                operation: finch_vm::UiOperation::Create,
                 text: Some(title),
                 target: Some(TypedValue::Resource { handle, .. }),
                 ..
@@ -7821,7 +7825,7 @@ async fn delivery_bound_concurrent_output_handles_survive_disconnect() {
     let pairs: Vec<_> = events
         .iter()
         .map(|envelope| match &envelope.effect.event {
-            crate::vm::HostSideEffect::Ui {
+            finch_vm::HostSideEffect::Ui {
                 operation,
                 target: Some(TypedValue::Resource { handle, .. }),
                 ..
@@ -7832,12 +7836,12 @@ async fn delivery_bound_concurrent_output_handles_survive_disconnect() {
     assert_eq!(
         pairs,
         vec![
-            (download.clone(), crate::vm::UiOperation::Create),
-            (log_handle.clone(), crate::vm::UiOperation::Create),
-            (download.clone(), crate::vm::UiOperation::Status),
-            (log_handle.clone(), crate::vm::UiOperation::Status),
-            (download, crate::vm::UiOperation::Complete),
-            (log_handle, crate::vm::UiOperation::Complete),
+            (download.clone(), finch_vm::UiOperation::Create),
+            (log_handle.clone(), finch_vm::UiOperation::Create),
+            (download.clone(), finch_vm::UiOperation::Status),
+            (log_handle.clone(), finch_vm::UiOperation::Status),
+            (download, finch_vm::UiOperation::Complete),
+            (log_handle, finch_vm::UiOperation::Complete),
         ]
     );
     drop(log);
@@ -7862,9 +7866,9 @@ async fn delivery_bound_concurrent_output_handles_survive_disconnect() {
 
 fn grant_workspace_file_read(runtime: &ProgramRuntime) {
     runtime
-        .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
+        .grant_typed_capability(finch_vm::CapabilityRequirement::file(
+            finch_vm::FileOperation::Read,
+            finch_vm::FileSelector::parse("./**").unwrap(),
         ))
         .unwrap();
 }
@@ -7883,7 +7887,7 @@ async fn delivery_conflict_fails_observation_instead_of_suspending_unobserved() 
         let log = Arc::clone(&log);
         Arc::new(move |envelope| {
             let mut conflict = envelope.clone();
-            conflict.effect.event = crate::vm::HostSideEffect::Request {
+            conflict.effect.event = finch_vm::HostSideEffect::Request {
                 arguments: vec![TypedValue::String("forged".into())],
             };
             log.lock()
@@ -7969,8 +7973,8 @@ async fn bound_log_cancel_after_persist_marks_the_journalled_effect() {
     assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
     assert!(matches!(
         cancelled.effect_journal.last(),
-        Some(crate::vm::EffectJournalEntry {
-            state: crate::vm::EffectJournalState::Cancelled,
+        Some(finch_vm::EffectJournalEntry {
+            state: finch_vm::EffectJournalState::Cancelled,
             ..
         })
     ));
@@ -8201,7 +8205,7 @@ async fn program_runtime_bound_log_persists_when_caller_omits_a_sink() {
 
 #[test]
 fn runtime_facade_keeps_child_modules_private() {
-    let facade = include_str!("mod.rs");
+    let facade = include_str!("lib.rs");
     let published = facade
         .lines()
         .map(str::trim_start)
@@ -8231,15 +8235,19 @@ fn runtime_callers_use_facade_not_child_modules() {
         "mcp",
         "outcome",
     ];
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let runtime = root.join("src/runtime");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest
+        .parent()
+        .and_then(Path::parent)
+        .expect("finch-runtime must live under the workspace crates directory");
+    let runtime = manifest.join("src");
     let mut hits = Vec::new();
-    for tree in ["src", "tests"] {
+    for tree in ["src", "tests", "crates"] {
         collect_runtime_child_imports(&root.join(tree), &root, &runtime, &children, &mut hits);
     }
     assert!(
         hits.is_empty(),
-        "callers outside src/runtime must use crate::runtime::Item, not child modules; found: {hits:?}"
+        "callers outside finch-runtime must use the flat runtime facade, not child modules; found: {hits:?}"
     );
 }
 
@@ -8298,7 +8306,7 @@ fn collect_runtime_child_imports(
                 continue;
             }
             for child in children {
-                for prefix in ["crate::runtime::", "finch::runtime::"] {
+                for prefix in ["crate::runtime::", "finch::runtime::", "finch_runtime::"] {
                     let child_path = [prefix, child].concat();
                     let names_child = line.match_indices(&child_path).any(|(offset, _)| {
                         let suffix = &line[offset + child_path.len()..];

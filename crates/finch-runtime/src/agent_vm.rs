@@ -1,6 +1,6 @@
 //! VM-facing binding for the structured child-agent scheduler.
 
-use crate::runtime::agents::{
+use crate::agents::{
     AgentIdentity, AgentSpawning, AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec,
 };
 use anyhow::Result;

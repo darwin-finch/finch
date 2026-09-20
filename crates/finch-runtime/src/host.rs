@@ -14,7 +14,7 @@ pub(super) struct TypedHostHandler {
     resource_roots: Arc<RwLock<ResourceRootState>>,
     output: String,
     output_chunks: Vec<String>,
-    side_effects: Vec<crate::vm::HostSideEffect>,
+    side_effects: Vec<finch_vm::HostSideEffect>,
     scheduler: Option<agent_vm::AgentVmBinding>,
     memory: Option<Arc<finch_memory::MemorySystem>>,
     mcp_client: Option<Arc<dyn RuntimeMcpClient>>,
@@ -30,7 +30,7 @@ pub(super) struct TypedHostHandler {
     network_grants: EffectSet,
     typed_effect_sink: Option<TypedEffectSink>,
     deferred_host_effects: DeferredHostEffects,
-    effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
+    effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
     authorization_attempt: Option<HostAuthorizationAttempt>,
 }
 
@@ -70,7 +70,7 @@ impl TypedHostHandler {
         network_grants: EffectSet,
         typed_effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
-        effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
+        effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
     ) -> Self {
         Self {
             automation,
@@ -118,7 +118,7 @@ impl TypedHostHandler {
     fn stream_next(
         &mut self,
         arguments: &[TypedValue],
-        origin: &crate::vm::SourceOrigin,
+        origin: &finch_vm::SourceOrigin,
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
         let [TypedValue::Stream {
             id,
@@ -243,7 +243,7 @@ impl TypedHostHandler {
     fn stream_close(
         &mut self,
         arguments: &[TypedValue],
-        origin: &crate::vm::SourceOrigin,
+        origin: &finch_vm::SourceOrigin,
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
         let [TypedValue::Stream {
             id,
@@ -657,13 +657,13 @@ pub(super) fn typed_agent_task_snapshot(
     Ok(value)
 }
 
-impl crate::vm::CapabilityHandler for TypedHostHandler {
+impl finch_vm::CapabilityHandler for TypedHostHandler {
     fn prepare_awaited_effect(
         &mut self,
         effect: &mut VmSideEffect,
     ) -> std::result::Result<(), VmDiagnostic> {
         let binding = registered_host_binding(&effect.requirement, &effect.origin)?;
-        let crate::vm::HostSideEffect::Request { arguments } = &effect.event else {
+        let finch_vm::HostSideEffect::Request { arguments } = &effect.event else {
             return Err(host_binding_error(
                 &effect.origin,
                 "typed host operation requires a typed host request",
@@ -786,11 +786,11 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
             return Ok(());
         }
         let arguments = match &effect.event {
-            crate::vm::HostSideEffect::Request { arguments } => arguments.clone(),
+            finch_vm::HostSideEffect::Request { arguments } => arguments.clone(),
             _ => {
                 return Err(VmDiagnostic::error(
                     "E-HOST-002",
-                    crate::vm::DiagnosticPhase::HostCall,
+                    finch_vm::DiagnosticPhase::HostCall,
                     "VM await boundary did not carry a host request",
                     Some(effect.origin.clone()),
                 ));
@@ -817,7 +817,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
         if !policy.permits(&effect.requirement) {
             return Err(VmDiagnostic::error(
                 "E-CAP-006",
-                crate::vm::DiagnosticPhase::HostCall,
+                finch_vm::DiagnosticPhase::HostCall,
                 format!(
                     "capability {:?} is denied by policy {}",
                     effect.requirement.capability, policy.policy_hash
@@ -873,13 +873,13 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
             }
             AuthorizationDecision::ApprovalRequired => Err(VmDiagnostic::error(
                 "E-CAP-006",
-                crate::vm::DiagnosticPhase::HostCall,
+                finch_vm::DiagnosticPhase::HostCall,
                 "capability was revoked, expired, or outside its approved scope at the host boundary",
                 Some(effect.origin.clone()),
             )),
             AuthorizationDecision::Denied { reason } => Err(VmDiagnostic::error(
                 "E-CAP-006",
-                crate::vm::DiagnosticPhase::HostCall,
+                finch_vm::DiagnosticPhase::HostCall,
                 format!("capability is denied at the host boundary: {reason}"),
                 Some(effect.origin.clone()),
             )),
@@ -998,10 +998,10 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
         &mut self,
         effect: &VmSideEffect,
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
-        let crate::vm::HostSideEffect::Request { arguments } = &effect.event else {
+        let finch_vm::HostSideEffect::Request { arguments } = &effect.event else {
             return Err(VmDiagnostic::error(
                 "E-HOST-002",
-                crate::vm::DiagnosticPhase::HostCall,
+                finch_vm::DiagnosticPhase::HostCall,
                 "VM await boundary did not carry a host request",
                 Some(effect.origin.clone()),
             ));
@@ -1038,10 +1038,10 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
 
         if let Some(permit) = permit {
             let outcome = match &values {
-                Ok(values) => crate::runtime::effect_audit::RunnerHostEffectOutcome::Acknowledged {
+                Ok(values) => crate::effect_audit::RunnerHostEffectOutcome::Acknowledged {
                     values: values.clone(),
                 },
-                Err(_) => crate::runtime::effect_audit::RunnerHostEffectOutcome::FailedPartial {
+                Err(_) => crate::effect_audit::RunnerHostEffectOutcome::FailedPartial {
                     detail: "host binding failed after physical dispatch was authorized"
                         .to_string(),
                 },
@@ -1064,7 +1064,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
         if effect.origin.word.as_deref() == Some("output-open") {
             let (Some(TypedValue::String(title)), Some(target)) = (
                 match &effect.event {
-                    crate::vm::HostSideEffect::Request { arguments } => arguments.first(),
+                    finch_vm::HostSideEffect::Request { arguments } => arguments.first(),
                     _ => None,
                 },
                 values.first(),
@@ -1076,8 +1076,8 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
             };
             if let Some(sink) = &self.typed_effect_sink {
                 let mut create = effect.clone();
-                create.event = crate::vm::HostSideEffect::Ui {
-                    operation: crate::vm::UiOperation::Create,
+                create.event = finch_vm::HostSideEffect::Ui {
+                    operation: finch_vm::UiOperation::Create,
                     target: Some(target.clone()),
                     text: Some(title.clone()),
                     progress: None,
@@ -1217,7 +1217,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
         &mut self,
         requirement: &CapabilityRequirement,
         arguments: Vec<TypedValue>,
-        origin: &crate::vm::SourceOrigin,
+        origin: &finch_vm::SourceOrigin,
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
         let binding = registered_host_binding(requirement, origin)?;
         // `prepare_awaited_effect` rejects forged portable continuations, but
@@ -1226,7 +1226,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
         // can substitute runtime arguments after authority was derived.
         validate_core_host_request(binding, requirement, &arguments, origin)?;
         let request = match requirement.capability {
-            crate::vm::CapabilityKind::SessionEmit => {
+            finch_vm::CapabilityKind::SessionEmit => {
                 // `output-open` uses the same session-emission authority as
                 // ordinary visible output, but its awaited host request
                 // returns an opaque handle rather than emitting its title as
@@ -1236,7 +1236,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     let [TypedValue::String(_title)] = arguments.as_slice() else {
                         return Err(VmDiagnostic::error(
                             "E-HOST-001",
-                            crate::vm::DiagnosticPhase::HostCall,
+                            finch_vm::DiagnosticPhase::HostCall,
                             "output-open requires one title string",
                             Some(origin.clone()),
                         ));
@@ -1263,7 +1263,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                 let [TypedValue::String(text)] = arguments.as_slice() else {
                     return Err(VmDiagnostic::error(
                         "E-HOST-001",
-                        crate::vm::DiagnosticPhase::HostCall,
+                        finch_vm::DiagnosticPhase::HostCall,
                         "session.emit requires one string",
                         Some(origin.clone()),
                     ));
@@ -1273,7 +1273,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                 self.emit(text);
                 return Ok(vec![TypedValue::Unit]);
             }
-            crate::vm::CapabilityKind::VmRead => {
+            finch_vm::CapabilityKind::VmRead => {
                 if origin.word.as_deref() == Some("vm-vocabulary") {
                     return Ok(vec![TypedValue::String(self.vocabulary.clone())]);
                 }
@@ -1314,7 +1314,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     "unknown VM inspection operation",
                 ));
             }
-            crate::vm::CapabilityKind::AutomationInspect => match binding {
+            finch_vm::CapabilityKind::AutomationInspect => match binding {
                 Some(CoreHostBinding::AutomationDisplays) => AutomationRequest::Displays,
                 Some(CoreHostBinding::AutomationWindows) => AutomationRequest::Windows,
                 Some(CoreHostBinding::AutomationAvailability) => AutomationRequest::Availability,
@@ -1325,7 +1325,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     ))
                 }
             },
-            crate::vm::CapabilityKind::AutomationWrite => match binding {
+            finch_vm::CapabilityKind::AutomationWrite => match binding {
                 Some(CoreHostBinding::AutomationClick) => {
                     let [TypedValue::Float(x), TypedValue::Float(y), TypedValue::String(button), TypedValue::Int(count)] =
                         arguments.as_slice()
@@ -1367,7 +1367,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     ))
                 }
             },
-            crate::vm::CapabilityKind::FileRead => {
+            finch_vm::CapabilityKind::FileRead => {
                 match origin.word.as_deref() {
                     Some("csv-next") | Some("file-lines-next") | Some("stream-next") => {
                         return self.stream_next(&arguments, origin);
@@ -1695,7 +1695,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     }
                 }
             }
-            crate::vm::CapabilityKind::FileWrite => {
+            finch_vm::CapabilityKind::FileWrite => {
                 let [TypedValue::Path { relative, selector }, TypedValue::Bytes(bytes)] =
                     arguments.as_slice()
                 else {
@@ -1713,7 +1713,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 return Ok(vec![TypedValue::Unit]);
             }
-            crate::vm::CapabilityKind::AgentSpawn => {
+            finch_vm::CapabilityKind::AgentSpawn => {
                 let [argument] = arguments.as_slice() else {
                     return Err(host_binding_error(
                         origin,
@@ -1748,10 +1748,10 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                 return Ok(vec![TypedValue::Task {
                     id: identity.task_id.to_string(),
                     result_type: agent_task_result_type(),
-                    kind: crate::vm::TaskKind::Agent,
+                    kind: finch_vm::TaskKind::Agent,
                 }]);
             }
-            crate::vm::CapabilityKind::AgentAwait => {
+            finch_vm::CapabilityKind::AgentAwait => {
                 let [TypedValue::Task { id: task_id, .. }] = arguments.as_slice() else {
                     return Err(host_binding_error(origin, "agent-await requires one task"));
                 };
@@ -1767,7 +1767,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 return Ok(vec![typed_agent_task_result(result, origin)?]);
             }
-            crate::vm::CapabilityKind::AgentPoll => {
+            finch_vm::CapabilityKind::AgentPoll => {
                 let [TypedValue::Task { id: task_id, .. }] = arguments.as_slice() else {
                     return Err(host_binding_error(origin, "agent-poll requires one task"));
                 };
@@ -1783,7 +1783,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 return Ok(vec![typed_agent_task_snapshot(snapshot, origin)?]);
             }
-            crate::vm::CapabilityKind::AgentCancel => {
+            finch_vm::CapabilityKind::AgentCancel => {
                 let [TypedValue::Task { id: task_id, .. }] = arguments.as_slice() else {
                     return Err(host_binding_error(origin, "agent-cancel requires one task"));
                 };
@@ -1799,7 +1799,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 return Ok(vec![TypedValue::Unit]);
             }
-            crate::vm::CapabilityKind::MemoryRead => {
+            finch_vm::CapabilityKind::MemoryRead => {
                 // `mem-index-status` shares `mem-recall`'s authority: both read
                 // the session index, and neither should be reachable without
                 // memory access. So this arm is entered by capability and split
@@ -1860,7 +1860,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     values: values.into_iter().map(TypedValue::String).collect(),
                 }]);
             }
-            crate::vm::CapabilityKind::MemoryWrite => {
+            finch_vm::CapabilityKind::MemoryWrite => {
                 let [TypedValue::String(content)] = arguments.as_slice() else {
                     return Err(host_binding_error(origin, "mem-store requires one string"));
                 };
@@ -1881,7 +1881,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     generation: 0,
                 }]);
             }
-            crate::vm::CapabilityKind::McpCall => {
+            finch_vm::CapabilityKind::McpCall => {
                 let ResourceSelector::Mcp {
                     server: authorized_server,
                     tool: authorized_tool,
@@ -1946,7 +1946,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                 }
                 return Ok(vec![TypedValue::Json(response)]);
             }
-            crate::vm::CapabilityKind::ProcessRun => {
+            finch_vm::CapabilityKind::ProcessRun => {
                 let [TypedValue::String(command), TypedValue::List { values, .. }] =
                     arguments.as_slice()
                 else {
@@ -1991,7 +1991,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     String::from_utf8_lossy(&output.stdout).into_owned(),
                 )]);
             }
-            crate::vm::CapabilityKind::ProgramInvoke => {
+            finch_vm::CapabilityKind::ProgramInvoke => {
                 let [TypedValue::String(language), TypedValue::String(intent), TypedValue::String(source)] =
                     arguments.as_slice()
                 else {
@@ -2040,7 +2040,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                 };
                 return Ok(vec![value]);
             }
-            crate::vm::CapabilityKind::NetworkConnect => {
+            finch_vm::CapabilityKind::NetworkConnect => {
                 if origin.word.as_deref() == Some("network-connect") {
                     let [TypedValue::String(host), TypedValue::Int(port)] = arguments.as_slice()
                     else {
@@ -2111,8 +2111,8 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     ));
                 }
                 let endpoint = CapabilityRequirement {
-                    capability: crate::vm::CapabilityKind::NetworkConnect,
-                    selector: crate::vm::ResourceSelector::Network {
+                    capability: finch_vm::CapabilityKind::NetworkConnect,
+                    selector: finch_vm::ResourceSelector::Network {
                         host: socket.host.clone(),
                         ports: vec![socket.port],
                     },
@@ -2162,20 +2162,20 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
         self.output_chunks.clone()
     }
 
-    fn side_effects(&self) -> Vec<crate::vm::HostSideEffect> {
+    fn side_effects(&self) -> Vec<finch_vm::HostSideEffect> {
         self.side_effects.clone()
     }
 
     fn side_effect(
         &mut self,
-        effect: &crate::vm::VmSideEffect,
+        effect: &finch_vm::VmSideEffect,
     ) -> std::result::Result<(), VmDiagnostic> {
         match &effect.event {
-            crate::vm::HostSideEffect::Emit { text } => {
+            finch_vm::HostSideEffect::Emit { text } => {
                 self.output.push_str(text);
                 self.output_chunks.push(text.clone());
             }
-            crate::vm::HostSideEffect::Ui {
+            finch_vm::HostSideEffect::Ui {
                 target, operation, ..
             } => {
                 let Some(TypedValue::Resource {
@@ -2186,7 +2186,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                 else {
                     return Err(VmDiagnostic::error(
                         "E-OUTPUT-HANDLE-001",
-                        crate::vm::DiagnosticPhase::HostCall,
+                        finch_vm::DiagnosticPhase::HostCall,
                         "UI updates require an output-handle resource",
                         Some(effect.origin.clone()),
                     ));
@@ -2197,7 +2197,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     .map_err(|_| {
                         VmDiagnostic::error(
                             "E-OUTPUT-HANDLE-002",
-                            crate::vm::DiagnosticPhase::HostCall,
+                            finch_vm::DiagnosticPhase::HostCall,
                             "output handle registry is unavailable",
                             Some(effect.origin.clone()),
                         )
@@ -2211,21 +2211,21 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                 if !valid {
                     return Err(VmDiagnostic::error(
                         "E-OUTPUT-HANDLE-003",
-                        crate::vm::DiagnosticPhase::HostCall,
+                        finch_vm::DiagnosticPhase::HostCall,
                         "output handle is unknown, stale, or belongs to another program run",
                         Some(effect.origin.clone()),
                     ));
                 }
                 if matches!(
                     operation,
-                    crate::vm::UiOperation::Complete | crate::vm::UiOperation::Fail
+                    finch_vm::UiOperation::Complete | finch_vm::UiOperation::Fail
                 ) {
                     self.output_handles
                         .lock()
                         .map_err(|_| {
                             VmDiagnostic::error(
                                 "E-OUTPUT-HANDLE-002",
-                                crate::vm::DiagnosticPhase::HostCall,
+                                finch_vm::DiagnosticPhase::HostCall,
                                 "output handle registry is unavailable",
                                 Some(effect.origin.clone()),
                             )
@@ -2233,10 +2233,10 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                         .remove(handle);
                 }
             }
-            crate::vm::HostSideEffect::Request { .. } => {
+            finch_vm::HostSideEffect::Request { .. } => {
                 return Err(VmDiagnostic::error(
                     "E-HOST-003",
-                    crate::vm::DiagnosticPhase::HostCall,
+                    finch_vm::DiagnosticPhase::HostCall,
                     "host requests must be handled at a capability boundary, not as emitted UI events",
                     Some(effect.origin.clone()),
                 ));
@@ -2256,7 +2256,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
 impl TypedHostHandler {
     fn open_secure_resource(
         &self,
-        selector: &crate::vm::FileSelector,
+        selector: &finch_vm::FileSelector,
         relative: &str,
         mode: SecureOpenMode,
     ) -> std::result::Result<std::fs::File, String> {
@@ -2279,7 +2279,7 @@ impl TypedHostHandler {
 /// request through an unrelated word name with the same coarse capability.
 pub(super) fn registered_host_binding(
     requirement: &CapabilityRequirement,
-    origin: &crate::vm::SourceOrigin,
+    origin: &finch_vm::SourceOrigin,
 ) -> std::result::Result<Option<CoreHostBinding>, VmDiagnostic> {
     let Some(name) = origin.word.as_deref() else {
         // Embedders may produce a host request with a generated origin. Its
@@ -2375,7 +2375,7 @@ pub(super) fn validate_core_host_request(
                 .ok_or_else(|| {
                     host_binding_error(origin, "core binding does not declare this capability")
                 })?;
-            let expected = crate::vm::instantiate_requirement(declared, arguments)
+            let expected = finch_vm::instantiate_requirement(declared, arguments)
                 .map_err(|message| host_binding_error(origin, message))?;
             let dynamically_bound = matches!(
                 binding,
@@ -2553,9 +2553,9 @@ pub(super) fn validate_core_host_request(
                 "file host binding requires a concrete file selector",
             ));
         };
-        let exact_selector = crate::vm::FileSelectorTemplate {
+        let exact_selector = finch_vm::FileSelectorTemplate {
             root: runtime_selector.root.clone(),
-            parts: vec![crate::vm::FileSelectorTemplatePart::Argument {
+            parts: vec![finch_vm::FileSelectorTemplatePart::Argument {
                 index: 0,
                 bound: runtime_selector.clone(),
             }],
@@ -2597,12 +2597,12 @@ pub(super) fn validate_core_host_request(
 }
 
 pub(super) fn host_binding_error(
-    origin: &crate::vm::SourceOrigin,
+    origin: &finch_vm::SourceOrigin,
     message: impl Into<String>,
 ) -> VmDiagnostic {
     VmDiagnostic::error(
         "E-HOST-002",
-        crate::vm::DiagnosticPhase::HostCall,
+        finch_vm::DiagnosticPhase::HostCall,
         message,
         Some(origin.clone()),
     )
@@ -2613,7 +2613,7 @@ pub(super) fn validate_process_request(
     requirement: &CapabilityRequirement,
     command: &str,
     arguments: &[String],
-    origin: &crate::vm::SourceOrigin,
+    origin: &finch_vm::SourceOrigin,
 ) -> std::result::Result<OpenedProcessExecutable, VmDiagnostic> {
     if binding != Some(CoreHostBinding::ProcessRun) {
         return Err(host_binding_error(
@@ -3322,7 +3322,7 @@ pub(super) fn validate_process_effect(
     effect: &VmSideEffect,
 ) -> std::result::Result<(), VmDiagnostic> {
     let binding = registered_host_binding(&effect.requirement, &effect.origin)?;
-    let crate::vm::HostSideEffect::Request { arguments } = &effect.event else {
+    let finch_vm::HostSideEffect::Request { arguments } = &effect.event else {
         return Err(host_binding_error(
             &effect.origin,
             "process-run requires a typed host request",
@@ -3437,7 +3437,7 @@ pub(super) fn authority_state_from_parts(
 }
 
 pub(super) fn resource_root_binding_record(
-    root: crate::vm::ResourceRoot,
+    root: finch_vm::ResourceRoot,
     supplied: &Path,
     generation: u64,
     whole_machine: bool,
@@ -3476,7 +3476,7 @@ pub(super) fn validate_resource_root_authority(
     bindings: &[ResourceRootBindingRecord],
     audit: &[ResourceRootAuditEntry],
 ) -> Result<ResourceRootState> {
-    let mut replayed = BTreeMap::<crate::vm::ResourceRoot, (u64, PathBuf, bool, u64)>::new();
+    let mut replayed = BTreeMap::<finch_vm::ResourceRoot, (u64, PathBuf, bool, u64)>::new();
     let mut next_generation = 1_u64;
     let mut previous_time = 0_u64;
     for (index, entry) in audit.iter().enumerate() {
@@ -3489,7 +3489,7 @@ pub(super) fn validate_resource_root_authority(
         }
         previous_time = entry.at_unix_ms;
         if entry.whole_machine
-            && (entry.root != crate::vm::ResourceRoot::HostMachine || entry.path != Path::new("/"))
+            && (entry.root != finch_vm::ResourceRoot::HostMachine || entry.path != Path::new("/"))
         {
             bail!("resource-root audit contains an invalid whole-machine binding");
         }
@@ -3531,7 +3531,7 @@ pub(super) fn validate_resource_root_authority(
             bail!("resource-root generation must be non-zero");
         }
         if binding.whole_machine
-            && (binding.root != crate::vm::ResourceRoot::HostMachine
+            && (binding.root != finch_vm::ResourceRoot::HostMachine
                 || binding.path != Path::new("/"))
         {
             bail!("resource-root authority contains an invalid whole-machine binding");
@@ -3585,7 +3585,7 @@ pub(super) enum SecureOpenMode {
 #[cfg(unix)]
 pub(super) fn open_resource_beneath_mode(
     binding: &ResourceRootBindingRecord,
-    selector: &crate::vm::FileSelector,
+    selector: &finch_vm::FileSelector,
     relative: &str,
     mode: SecureOpenMode,
 ) -> std::result::Result<std::fs::File, String> {
@@ -3702,7 +3702,7 @@ pub(super) fn run_resource_before_final_open_hook(relative: &str) {
 #[cfg(not(unix))]
 pub(super) fn open_resource_beneath_mode(
     _binding: &ResourceRootBindingRecord,
-    _selector: &crate::vm::FileSelector,
+    _selector: &finch_vm::FileSelector,
     _relative: &str,
     _mode: SecureOpenMode,
 ) -> std::result::Result<std::fs::File, String> {

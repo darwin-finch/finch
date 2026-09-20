@@ -23,6 +23,7 @@ members = [
     "crates/finch-memory",
     "crates/finch-programs",
     "crates/finch-providers",
+    "crates/finch-runtime",
     "crates/finch-vm",
     "crates/finch-vm-core",
 ]
@@ -37,6 +38,7 @@ default-members = [
     "crates/finch-memory",
     "crates/finch-programs",
     "crates/finch-providers",
+    "crates/finch-runtime",
     "crates/finch-vm",
     "crates/finch-vm-core",
 ]
@@ -50,6 +52,7 @@ finch-language = { path = "crates/finch-language" }
 finch-memory = { path = "crates/finch-memory" }
 finch-programs = { path = "crates/finch-programs" }
 finch-providers = { path = "crates/finch-providers" }
+finch-runtime = { path = "crates/finch-runtime" }
 finch-vm = { path = "crates/finch-vm" }
 
 # CLI
@@ -139,7 +142,6 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 ring = "0.17"
 zeroize = { version = "1.8", features = ["derive"] }
-zip = "2"
 uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 
 # Text processing for TF-IDF
@@ -191,8 +193,6 @@ ort = { version = "=2.0.0-rc.11", features = ["coreml"] }
 # Candle uses Metal (requires candle feature flag)
 candle-metal-kernels = { version = "0.11", optional = true }
 # GUI automation (Phase 3: Accessibility tools)
-core-graphics = "0.23"  # Mouse/keyboard events for GUI automation
-core-foundation = "0.10"  # Foundation types (required by core-graphics)
 
 # Unix signal handling (for daemon process checks)
 [target.'cfg(unix)'.dependencies]
@@ -205,14 +205,13 @@ capnp-rpc = "0.24"
 [dev-dependencies]
 semver = "1"
 vte = "0.15"  # ANSI/VT byte parser for production console-writer regressions
-# Enables finch-memory's hydration batch/completion/sweep test pauses only for
-# finch's own dev/test builds (resolver = "2" keeps this out of the release
-# artifact); see the `test-support` feature doc in crates/finch-memory/Cargo.toml.
-finch-memory = { path = "crates/finch-memory", features = ["test-support"] }
 h2 = "0.4.16"  # Raw HTTP/2 protocol fixtures for transport-boundary regressions
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }  # Raw WSS protocol fixtures for TLS transport-boundary regressions
 mockito = "1.2"
 tempfile = "3.8"
+# Enables finch-runtime's cross-crate test seams only for finch's own test
+# builds; resolver = "2" keeps this feature out of production artifacts.
+finch-runtime = { path = "crates/finch-runtime", features = ["test-support"] }
 # tower moved to [dependencies] (#223): ServiceBuilder is now used in production
 # for the request-id/trace layer stack, and ServiceExt::oneshot() for tests
 # comes along with it as a regular dependency.

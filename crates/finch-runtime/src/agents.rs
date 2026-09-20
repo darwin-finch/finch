@@ -10,17 +10,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-use crate::vm::EffectSet;
+use finch_vm::EffectSet;
 
 // Bounds a child-agent request is checked against; they belong with the types that enforce them.
-pub(crate) const MAX_DEPTH: usize = 4;
-pub(crate) const MAX_TURNS: usize = 10;
-pub(crate) const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
-pub(crate) const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_CONTEXT_REFERENCES: usize = 64;
-pub(crate) const MAX_CONTEXT_FIELD_BYTES: usize = 1024;
-pub(crate) const MAX_CONTEXT_ARTIFACT_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_CONTEXT_TOTAL_BYTES: usize = 256 * 1024;
+pub const MAX_DEPTH: usize = 4;
+pub const MAX_TURNS: usize = 10;
+pub const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CONTEXT_REFERENCES: usize = 64;
+pub const MAX_CONTEXT_FIELD_BYTES: usize = 1024;
+pub const MAX_CONTEXT_ARTIFACT_BYTES: usize = 64 * 1024;
+pub const MAX_CONTEXT_TOTAL_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,7 +62,7 @@ pub struct AgentContextReference {
 }
 
 impl AgentContextReference {
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         for (name, value) in [("kind", &self.kind), ("id", &self.id)] {
             if value.trim().is_empty() {
                 bail!("agent context reference {name} cannot be empty");
@@ -101,7 +101,7 @@ pub struct AgentTaskSpec {
 }
 
 impl AgentTaskSpec {
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.task.trim().is_empty() {
             bail!("agent task cannot be empty");
         }

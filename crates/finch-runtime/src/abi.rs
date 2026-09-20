@@ -11,13 +11,13 @@
 //! module never names `crate::brain`. Live attached-console streaming is
 //! issue #57 and is not implemented here.
 
-use crate::runtime::{VmEffectEnvelope, VmEffectHandle, VmResume};
-use crate::vm::{HostSideEffect, TypedValue, VmDiagnostic, VmSideEffect};
+use crate::{VmEffectEnvelope, VmEffectHandle, VmResume};
+use finch_vm::{HostSideEffect, TypedValue, VmDiagnostic, VmSideEffect};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 fn abi_version() -> u32 {
-    crate::vm::RUNTIME_APPLICATION_ABI_VERSION
+    finch_vm::RUNTIME_APPLICATION_ABI_VERSION
 }
 
 /// Versioned identity of one verified ProgramRun (not a frozen public wire).
@@ -167,7 +167,7 @@ pub enum RuntimeApplicationMessage {
 impl RuntimeApplicationMessage {
     /// ABI version to stamp on a packed frame. Non-`ProgramRun` records use
     /// the process constant; packed decode fail-closes unless the frame
-    /// version equals [`crate::vm::RUNTIME_APPLICATION_ABI_VERSION`].
+    /// version equals [`finch_vm::RUNTIME_APPLICATION_ABI_VERSION`].
     pub fn abi_version(&self) -> u32 {
         match self {
             Self::ProgramRun { run } => run.abi_version,

@@ -21,10 +21,9 @@ src/lisp/types.rs
 src/memory/program_registry.rs
 src/poset/executor.rs
 crates/finch-programs/src/lib.rs
-src/runtime/effect_log.rs
-src/runtime/fiber.rs
-src/runtime/mcp.rs
-src/runtime/mod.rs
+crates/finch-runtime/src/effect_log.rs
+crates/finch-runtime/src/mcp.rs
+crates/finch-runtime/src/lib.rs
 src/server/brain_approval.rs
 src/server/brain_runner.rs
 src/server/brain_service.rs
