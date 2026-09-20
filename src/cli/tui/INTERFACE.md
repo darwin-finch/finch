@@ -185,8 +185,6 @@ impl TuiRenderer {
     pub fn set_model_identity(&mut self, identity: impl Into<String>);
     /// Set the OperationStatus line in the status bar (visible while queries run).
     pub fn set_operation_status(&self, msg: impl Into<String>);
-    /// Attach the Co-Forth poset VM.
-    pub fn set_poset(&mut self, poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>);
     /// Set session identity without writing to the terminal.
     pub fn set_session_label(&mut self, session_label: impl Into<String>);
     /// Attach the Co-Forth shared stack so the live area can display it.

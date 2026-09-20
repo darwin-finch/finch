@@ -1,5 +1,5 @@
 //! Production-boundary proof that the terminal renderer does not name Finch's
-//! poset, tool, or runtime vocabularies except at the documented injection.
+//! poset, tool, or runtime vocabularies.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ fn production_source(path: &Path) -> String {
 /// Only `mod name { ... }` and `mod name;` after the attribute are skipped. A `#[cfg(test)]`
 /// on a fn, method, or `use` is left in place: treating the next `mod` in the file as that
 /// attribute's item blanks the production between them — including `spreadsheet_preview_rows`
-/// and `set_poset` after `TuiRenderer::new_headless`.
+/// and any later production item after `TuiRenderer::new_headless`.
 fn strip_cfg_test_modules(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut index = 0;
@@ -224,7 +224,7 @@ fn insert_into_fn(source: &str, fn_name: &str, payload: &str) -> String {
 fn test_strip_does_not_treat_cfg_test_fn_or_use_as_a_module() {
     // Shape of src/cli/tui/mod.rs: a cfg(test) method, then production leak sites, then
     // `mod tests`. The old scanner took the next `mod ` after any `#[cfg(test)]` and blanked
-    // everything between — including spreadsheet_preview_rows and set_poset.
+    // everything between — including spreadsheet_preview_rows and a later Poset leak.
     let src = concat!(
         "impl TuiRenderer {\n",
         "    #[cfg(test)]\n",
@@ -232,7 +232,7 @@ fn test_strip_does_not_treat_cfg_test_fn_or_use_as_a_module() {
         "    pub(crate) fn spreadsheet_preview_rows() {\n",
         "        crate::runtime::workbook_cell_to_string\n",
         "    }\n",
-        "    pub fn set_poset() { crate::poset::Poset }\n",
+        "    pub fn production_poset_adapter() { crate::poset::Poset }\n",
         "}\n",
         "#[cfg(test)]\n",
         "use crate::tools::ToolUse;\n",
@@ -253,7 +253,7 @@ fn test_strip_does_not_treat_cfg_test_fn_or_use_as_a_module() {
     );
     assert!(
         stripped.contains("crate::poset::Poset"),
-        "#[cfg(test)] fn blanked production set_poset: {stripped}"
+        "#[cfg(test)] fn blanked a later production Poset item: {stripped}"
     );
     let tools = hits_in(&stripped, "fixture.rs", "crate::tools");
     assert_eq!(
@@ -322,20 +322,11 @@ fn test_tui_production_does_not_name_finch_tools_or_runtime() {
 }
 
 #[test]
-fn test_tui_production_keeps_finch_poset_at_the_injection_boundary() {
+fn test_tui_production_does_not_name_finch_poset() {
     let hits = production_hits("crate::poset");
-    let leaked: Vec<&String> = hits
-        .iter()
-        .filter(|hit| !hit.starts_with("mod.rs:"))
-        .collect();
     assert!(
-        leaked.is_empty(),
-        "Finch Poset may appear in production tui only at the injection boundary in mod.rs \
-         (set_poset / graph_view_from_poset). Other files must not name it: {hits:?}"
-    );
-    assert!(
-        !hits.is_empty(),
-        "expected the documented Poset injection in tui/mod.rs; if set_poset no longer takes \
-         Poset, update src/cli/tui/AGENTS.md and this test. hits={hits:?}"
+        hits.is_empty(),
+        "tui production must not name Finch Poset; the active overlay paints the injected \
+         corner text and generic graph helpers consume GraphView: {hits:?}"
     );
 }

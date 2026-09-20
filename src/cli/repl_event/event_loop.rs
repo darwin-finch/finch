@@ -1938,13 +1938,12 @@ impl EventLoop {
         let poset: Arc<tokio::sync::Mutex<crate::poset::Poset>> =
             Arc::new(tokio::sync::Mutex::new(crate::poset::Poset::new()));
 
-        // Wire todo list, stack, and poset into TUI renderer before wrapping in Arc<Mutex>
+        // Wire todo list and stack into TUI renderer before wrapping in Arc<Mutex>
         let mut tui_renderer = tui_renderer;
         tui_renderer.set_task_rows(crate::cli::repl_event::activity_view::TodoRows::new(
             Arc::clone(&todo_list),
         ));
         tui_renderer.set_stack(Arc::clone(&stack));
-        tui_renderer.set_poset(Arc::clone(&poset));
         // Wrap TUI in Arc<Mutex> for shared access
         let tui_renderer = Arc::new(Mutex::new(tui_renderer));
 

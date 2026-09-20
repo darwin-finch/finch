@@ -177,7 +177,7 @@ draws a view, and the caller converts.
 |------|-------------------------|----------------|
 | `view_model::TranscriptNode` | label, body, children, role, default disclosure | WorkUnit `domain_view()`, in `view_model::project_message` |
 | [`activity::ActivityRow`](activity.rs) | indented status text | todos / agent tasks, in `cli::repl_event::activity_view` |
-| [`GraphView`](graph.rs) | nodes, edges, camera | Finch `Poset`, via unused `graph_view_from_poset` |
+| [`GraphView`](graph.rs) | nodes, edges, camera | TUI-owned graph snapshots and tests |
 | `Dialog::tool_approval(name, summary)` | a name and a summary line | Finch `ToolUse`, in `cli::repl_event::tool_display::tool_approval_dialog` |
 | [`cell_format::workbook_cell_to_string`](cell_format.rs) | one cell as text | calamine `Data`, inside `spreadsheet_preview_rows` |
 
@@ -194,17 +194,10 @@ survives re-projection, streaming appends, terminal reflow, and reconnects. Comp
 cannot collapse a result. Leaf lines render exactly the ViewModel's label — which carries the
 status glyph — and never invent a `•` bullet or sniff glyph characters (#821).
 
-Splitting the poset widget out of the framework (rather than generalising it) remains open.
-Production does **not** convert at `set_poset` and does **not** draw `GraphView`:
-
-- `TuiRenderer::set_poset` stores `Arc<Mutex<Poset>>` and returns.
-- `graph_view_from_poset` / `poset_to_forth_lines` are the view-shaped renderer and are unused
-  (`dead_code`). Tests call them.
-- `draw_poset_overlay` paints the user-defined `check` word from `corner`, not the graph.
-
-Finch's `Poset` stays on that field because `EventLoop` still hands the shared mutex in and this
-capsule must not rewrite `repl_event`. Wiring `GraphView` at `set_poset` or `draw_poset_overlay`
-is a behaviour change, not a documentation fix.
+The renderer no longer accepts or stores Finch's `Poset`. The old `set_poset` injection was
+write-only and its Finch-to-`GraphView` adapter had no production caller, so #996 removed both.
+`draw_poset_overlay` continues to paint the user-defined `check` word from `corner`; generic graph
+helpers consume only the TUI-owned `GraphView` vocabulary.
 
 ## Deliberate remaining production references
 
@@ -213,10 +206,6 @@ module of this crate, **or** the remaining ones are written down here with the r
 
 **Finch modules this directory still names in production, and why they stay:**
 
-- **`crate::poset::Poset` in `mod.rs` only** — the `poset` field, `TuiRenderer::set_poset`, and
-  the unused `graph_view_from_poset` helper. The event loop shares `Arc<Mutex<Poset>>` with the
-  executor. Do not add new `crate::poset` names outside `mod.rs`
-  (`test_tui_production_keeps_finch_poset_at_the_injection_boundary`).
 - **`crate::workbook::{bounded_worksheet_range, MAX_WORKBOOK_CELLS}` in `spreadsheet_preview_rows`**
   — the file viewer still lives in this renderer. It opens a workbook and maps cells through
   tui-owned `cell_format`. Pulling the viewer out is the cheaper cut if the framework is ever
@@ -240,10 +229,9 @@ module of this crate, **or** the remaining ones are written down here with the r
 - **`crate::tools::ToolUse` in `dialog.rs` tests** — three fixtures still build a `ToolUse` so they
   can drive `cli::repl_event::tool_display::tool_approval_dialog`, which is the production assembler
   (and lives outside this capsule). Dialog production code takes a name and a summary.
-- **`crate::poset` in `mod.rs` tests** — one conversion test builds a Finch poset and checks
-  `graph_view_from_poset` preserves the Forth projection. Other graph tests use `GraphView`.
-
 `test_tui_production_does_not_name_finch_tools_or_runtime` fails if production source grows a
-`crate::tools` or `crate::runtime` name. `test_scanner_would_fail_if_runtime_returned_to_spreadsheet_preview_rows`
-and `test_scanner_would_fail_if_tools_returned_to_tool_approval` fail if the scanner can no
-longer see those production functions (the original leak sites).
+`crate::tools` or `crate::runtime` name, and
+`test_tui_production_does_not_name_finch_poset` keeps the deleted write-only Poset edge from
+returning. `test_scanner_would_fail_if_runtime_returned_to_spreadsheet_preview_rows` and
+`test_scanner_would_fail_if_tools_returned_to_tool_approval` fail if the scanner can no longer
+see those production functions (the original leak sites).
