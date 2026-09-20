@@ -89,7 +89,7 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
         "crates/finch-ipc/schema/**",
         "src/bin/finch-test-supervisor.rs", "src/brain/**",
         "src/daemon/**", "crates/finch-ipc/src/**", "crates/finch-runtime/**",
-        "src/node/**", "src/server/**",
+        "crates/finch-node/**", "src/node/**", "src/node_name.rs", "src/server/**",
         "src/client/daemon_client.rs", "src/cli/repl_event/brain_handler.rs",
         "scripts/test_brains.sh", "scripts/test_brain_isolation.sh",
         "scripts/with-cargo-slot", "scripts/test-with-cargo-slot",
