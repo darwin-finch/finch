@@ -136,7 +136,7 @@ pub(crate) fn decode_json_value(
 
 pub(crate) fn encode_messages(
     mut builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
-    messages: &[crate::providers::Message],
+    messages: &[finch_providers::Message],
 ) -> anyhow::Result<()> {
     for (message_index, message) in messages.iter().enumerate() {
         let mut encoded_message = builder.reborrow().get(message_index as u32);
@@ -145,14 +145,14 @@ pub(crate) fn encode_messages(
         for (block_index, block) in message.content.iter().enumerate() {
             let mut encoded_block = content.reborrow().get(block_index as u32);
             match block {
-                crate::providers::ContentBlock::Text { text } => encoded_block.set_text(text),
-                crate::providers::ContentBlock::ToolUse { id, name, input } => {
+                finch_providers::ContentBlock::Text { text } => encoded_block.set_text(text),
+                finch_providers::ContentBlock::ToolUse { id, name, input } => {
                     let mut tool = encoded_block.init_tool_use();
                     tool.set_id(id);
                     tool.set_name(name);
                     encode_json_value(tool.reborrow().init_input(), input)?;
                 }
-                crate::providers::ContentBlock::ToolResult {
+                finch_providers::ContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     is_error,
@@ -162,13 +162,13 @@ pub(crate) fn encode_messages(
                     result.set_content(content);
                     result.set_is_error(is_error.unwrap_or(false));
                 }
-                crate::providers::ContentBlock::Image { source } => {
+                finch_providers::ContentBlock::Image { source } => {
                     let mut image = encoded_block.init_image();
                     image.set_source_type(&source.source_type);
                     image.set_media_type(&source.media_type);
                     image.set_data(&source.data);
                 }
-                crate::providers::ContentBlock::OpaqueReasoning { encrypted_content } => {
+                finch_providers::ContentBlock::OpaqueReasoning { encrypted_content } => {
                     encoded_block.set_thinking(encrypted_content);
                 }
             }
@@ -179,7 +179,7 @@ pub(crate) fn encode_messages(
 
 pub(crate) fn decode_messages(
     messages: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
-) -> anyhow::Result<Vec<crate::providers::Message>> {
+) -> anyhow::Result<Vec<finch_providers::Message>> {
     let mut decoded = Vec::with_capacity(messages.len() as usize);
     for message in messages.iter() {
         let role = text(message.get_role()?)?;
@@ -187,12 +187,12 @@ pub(crate) fn decode_messages(
         for block in message.get_content()?.iter() {
             use finch_ipc_capnp::content_block::Which;
             match block.which()? {
-                Which::Text(value) => content.push(crate::providers::ContentBlock::Text {
+                Which::Text(value) => content.push(finch_providers::ContentBlock::Text {
                     text: text(value?)?,
                 }),
                 Which::ToolUse(value) => {
                     let value = value?;
-                    content.push(crate::providers::ContentBlock::ToolUse {
+                    content.push(finch_providers::ContentBlock::ToolUse {
                         id: text(value.get_id()?)?,
                         name: text(value.get_name()?)?,
                         input: decode_json_value(value.get_input()?)?,
@@ -200,21 +200,21 @@ pub(crate) fn decode_messages(
                 }
                 Which::ToolResult(value) => {
                     let value = value?;
-                    content.push(crate::providers::ContentBlock::ToolResult {
+                    content.push(finch_providers::ContentBlock::ToolResult {
                         tool_use_id: text(value.get_tool_use_id()?)?,
                         content: text(value.get_content()?)?,
                         is_error: Some(value.get_is_error()),
                     });
                 }
                 Which::Thinking(value) => {
-                    content.push(crate::providers::ContentBlock::OpaqueReasoning {
+                    content.push(finch_providers::ContentBlock::OpaqueReasoning {
                         encrypted_content: text(value?)?,
                     });
                 }
                 Which::Image(value) => {
                     let value = value?;
-                    content.push(crate::providers::ContentBlock::Image {
-                        source: crate::providers::ImageSource {
+                    content.push(finch_providers::ContentBlock::Image {
+                        source: finch_providers::ImageSource {
                             source_type: text(value.get_source_type()?)?,
                             media_type: text(value.get_media_type()?)?,
                             data: text(value.get_data()?)?,
@@ -223,14 +223,14 @@ pub(crate) fn decode_messages(
                 }
             }
         }
-        decoded.push(crate::providers::Message { role, content });
+        decoded.push(finch_providers::Message { role, content });
     }
     Ok(decoded)
 }
 
 pub(crate) fn encode_invocation_metadata(
     mut builder: finch_ipc_capnp::invocation_metadata::Builder<'_>,
-    metadata: &crate::providers::InvocationMetadata,
+    metadata: &finch_providers::InvocationMetadata,
 ) {
     builder.set_requested_model(&metadata.requested_model);
     builder.set_resolved_model(&metadata.resolved_model);
@@ -255,8 +255,8 @@ pub(crate) fn encode_invocation_metadata(
 
 pub(crate) fn decode_invocation_metadata(
     reader: finch_ipc_capnp::invocation_metadata::Reader<'_>,
-) -> anyhow::Result<crate::providers::InvocationMetadata> {
-    let metadata = crate::providers::InvocationMetadata {
+) -> anyhow::Result<finch_providers::InvocationMetadata> {
+    let metadata = finch_providers::InvocationMetadata {
         requested_model: text(reader.get_requested_model()?)?,
         resolved_model: text(reader.get_resolved_model()?)?,
         actual_model: text(reader.get_actual_model()?)?,
@@ -279,14 +279,14 @@ pub(crate) fn decode_invocation_metadata(
 
 pub(crate) fn encode_continuation_messages(
     builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
-    messages: &[crate::providers::Message],
+    messages: &[finch_providers::Message],
 ) -> anyhow::Result<()> {
     encode_messages(builder, messages)
 }
 
 pub(crate) fn decode_continuation_messages(
     messages: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
-) -> anyhow::Result<Vec<crate::providers::Message>> {
+) -> anyhow::Result<Vec<finch_providers::Message>> {
     let decoded = decode_messages(messages)?;
     anyhow::ensure!(
         decoded
@@ -298,14 +298,14 @@ pub(crate) fn decode_continuation_messages(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct BrainRemoteCommand {
+pub struct BrainRemoteCommand {
     pub request_id: u64,
     pub mutation: Option<BrainRemoteMutation>,
     pub kind: BrainRemoteCommandKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BrainRemoteMutation {
+pub struct BrainRemoteMutation {
     pub brain_id: BrainId,
     pub expected_revision: u64,
     pub environment_generation: u64,
@@ -313,7 +313,7 @@ pub(crate) struct BrainRemoteMutation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum BrainRemoteCommandKind {
+pub enum BrainRemoteCommandKind {
     Submit(BrainEventKind),
     Acknowledge(u64),
     Detach,
@@ -340,7 +340,7 @@ pub(crate) enum BrainRemoteCommandKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum BrainRemoteReply {
+pub enum BrainRemoteReply {
     Submitted {
         request_id: u64,
         accepted: BrainEvent,
@@ -385,7 +385,7 @@ pub(crate) enum BrainRemoteReply {
 }
 
 impl BrainRemoteReply {
-    pub(crate) fn request_id(&self) -> u64 {
+    pub fn request_id(&self) -> u64 {
         match self {
             Self::Submitted { request_id, .. }
             | Self::Acknowledged { request_id, .. }
@@ -401,9 +401,7 @@ impl BrainRemoteReply {
     }
 }
 
-pub(crate) fn brain_remote_command_fingerprint(
-    kind: &BrainRemoteCommandKind,
-) -> anyhow::Result<String> {
+pub fn brain_remote_command_fingerprint(kind: &BrainRemoteCommandKind) -> anyhow::Result<String> {
     let canonical = BrainRemoteEnvelope::Command(BrainRemoteCommand {
         request_id: 0,
         mutation: None,
@@ -415,7 +413,7 @@ pub(crate) fn brain_remote_command_fingerprint(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum BrainRemoteEnvelope {
+pub enum BrainRemoteEnvelope {
     Projection(BrainWireMessage),
     Command(BrainRemoteCommand),
     Reply(BrainRemoteReply),
@@ -747,9 +745,7 @@ pub(crate) fn decode_brain_wire_reader(
     }
 }
 
-pub(crate) fn encode_brain_remote_envelope(
-    envelope: &BrainRemoteEnvelope,
-) -> anyhow::Result<Vec<u8>> {
+pub fn encode_brain_remote_envelope(envelope: &BrainRemoteEnvelope) -> anyhow::Result<Vec<u8>> {
     let mut encoded = capnp::message::Builder::new_default();
     let mut root = encoded.init_root::<finch_ipc_capnp::brain_remote_envelope::Builder<'_>>();
     match envelope {
@@ -884,7 +880,7 @@ pub(crate) fn encode_brain_remote_envelope(
     Ok(capnp::serialize::write_message_to_words(&encoded))
 }
 
-pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<BrainRemoteEnvelope> {
+pub fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<BrainRemoteEnvelope> {
     use finch_ipc_capnp::brain_remote_command::Which as CommandWhich;
     use finch_ipc_capnp::brain_remote_envelope::Which as EnvelopeWhich;
     use finch_ipc_capnp::brain_remote_reply::Which as ReplyWhich;
@@ -2052,26 +2048,26 @@ mod tests {
             "line": 42,
             "flags": [true, false],
         });
-        let messages = vec![crate::providers::Message {
+        let messages = vec![finch_providers::Message {
             role: "assistant".into(),
             content: vec![
-                crate::providers::ContentBlock::Text {
+                finch_providers::ContentBlock::Text {
                     text: "checking".into(),
                 },
-                crate::providers::ContentBlock::ToolUse {
+                finch_providers::ContentBlock::ToolUse {
                     id: "tool-1".into(),
                     name: "read".into(),
                     input: expected_input.clone(),
                 },
-                crate::providers::ContentBlock::ToolResult {
+                finch_providers::ContentBlock::ToolResult {
                     tool_use_id: "tool-1".into(),
                     content: "contents".into(),
                     is_error: Some(false),
                 },
-                crate::providers::ContentBlock::OpaqueReasoning {
+                finch_providers::ContentBlock::OpaqueReasoning {
                     encrypted_content: "opaque-continuation".into(),
                 },
-                crate::providers::ContentBlock::image("image/png", "aW1hZ2U="),
+                finch_providers::ContentBlock::image("image/png", "aW1hZ2U="),
             ],
         }];
         let mut message = capnp::message::Builder::new_default();
@@ -2099,16 +2095,16 @@ mod tests {
         assert_eq!(decoded[0].role, "assistant");
         assert!(matches!(
             &decoded[0].content[0],
-            crate::providers::ContentBlock::Text { text } if text == "checking"
+            finch_providers::ContentBlock::Text { text } if text == "checking"
         ));
         assert!(matches!(
             &decoded[0].content[1],
-            crate::providers::ContentBlock::ToolUse { id, name, input }
+            finch_providers::ContentBlock::ToolUse { id, name, input }
                 if id == "tool-1" && name == "read" && input == &expected_input
         ));
         assert!(matches!(
             &decoded[0].content[2],
-            crate::providers::ContentBlock::ToolResult {
+            finch_providers::ContentBlock::ToolResult {
                 tool_use_id,
                 content,
                 is_error: Some(false),
@@ -2116,12 +2112,12 @@ mod tests {
         ));
         assert!(matches!(
             &decoded[0].content[3],
-            crate::providers::ContentBlock::OpaqueReasoning { encrypted_content }
+            finch_providers::ContentBlock::OpaqueReasoning { encrypted_content }
                 if encrypted_content == "opaque-continuation"
         ));
         assert!(matches!(
             &decoded[0].content[4],
-            crate::providers::ContentBlock::Image { source }
+            finch_providers::ContentBlock::Image { source }
                 if source.source_type == "base64"
                     && source.media_type == "image/png"
                     && source.data == "aW1hZ2U="
@@ -2435,14 +2431,14 @@ mod tests {
                 request_seq: 5,
                 output: "done".into(),
                 error: Some("example".into()),
-                continuation_messages: vec![crate::providers::Message::with_content(
+                continuation_messages: vec![finch_providers::Message::with_content(
                     "assistant",
                     vec![
-                        crate::providers::ContentBlock::opaque_reasoning("opaque-restart-token"),
-                        crate::providers::ContentBlock::text("(say \"done\")"),
+                        finch_providers::ContentBlock::opaque_reasoning("opaque-restart-token"),
+                        finch_providers::ContentBlock::text("(say \"done\")"),
                     ],
                 )],
-                invocation_metadata: Some(crate::providers::InvocationMetadata {
+                invocation_metadata: Some(finch_providers::InvocationMetadata {
                     requested_model: "gpt-5.6".into(),
                     resolved_model: "gpt-5.6".into(),
                     actual_model: "gpt-5.6-sol".into(),
