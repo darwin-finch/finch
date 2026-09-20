@@ -56,9 +56,9 @@ ctrlc = "3.4"
 rustyline = "13.0"
 
 # TUI (Phase 2: Terminal UI refactor)
-ratatui = "0.28"
+ratatui = "0.29"
 ansi-to-tui = "6.0"
-tui-textarea = "0.6"  # Text area widget for ratatui (TUI mode)
+tui-textarea = "0.7"  # Text area widget for ratatui (TUI mode)
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
@@ -150,16 +150,16 @@ unicode-width = "0.2"
 ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "ndarray"] }
 ndarray = "0.17"  # Multi-dimensional arrays for ONNX tensor creation
 # Candle (alternative provider, optional)
-candle-core = { version = "0.8", optional = true }
-candle-nn = { version = "0.8", optional = true }
-candle-transformers = { version = "0.8", optional = true }
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
 # Shared dependencies
 sysinfo = "0.32"  # System RAM detection for model selection
-tokenizers = "0.21"  # Tokenization (used by both ONNX and Candle)
+tokenizers = "0.23"  # Tokenization (used by both ONNX and Candle)
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }  # HuggingFace Hub integration
 indicatif = "0.17"  # Progress bars for download tracking
 rand = { version = "0.8", features = ["small_rng"] }  # Random number generation for sampling
-safetensors = "0.4"  # Model weight loading (used by Candle)
+safetensors = "0.8"  # Model weight loading (used by Candle)
 
 # Spreadsheet / tabular data
 calamine = { version = "0.36.1", features = ["dates"] } # xlsx / xls / ods reading; `dates` turns Data::DateTime into a real date rather than an Excel serial (#281)
@@ -185,7 +185,7 @@ fs2 = "0.4"  # File locking for concurrent weight updates
 # ONNX Runtime uses CoreML execution provider
 ort = { version = "=2.0.0-rc.11", features = ["coreml"] }
 # Candle uses Metal (requires candle feature flag)
-candle-metal-kernels = { version = "0.8", optional = true }
+candle-metal-kernels = { version = "0.11", optional = true }
 # GUI automation (Phase 3: Accessibility tools)
 core-graphics = "0.23"  # Mouse/keyboard events for GUI automation
 core-foundation = "0.10"  # Foundation types (required by core-graphics)
