@@ -36,6 +36,23 @@ commits sticky conversation rows between program source and output (#819). Lefto
 environment mismatch at startup still uses `apply_home_runner_startup` (header plus the detailed
 startup TUI line, #794).
 
+**Snapshot replay reconstructs say-turn cards (#970).** The say ViewModel is produced only by the
+live paths, so `project_remote_brain_snapshot_runs` also runs
+`reconstruct_replayed_say_turn_cards`: a freshly replayed Interactive run whose journal pattern is
+one typed `Program` (the run-correlated provider event, or the run-unaffiliated event at
+`run.request_seq` for typed programs) plus a successful `Result`, with no tool or approval events,
+gets `begin_say_turn` on its run group and the output filled from the Result; the one guarded
+`set_complete` transition closes it. The run group's legacy rows stay as the canonical record (a
+typed-program replay gains its program row there, since no run-correlated Program event exists),
+and the viewport renders the card because the renderer consults `say_turn_view()` first. Runs keep
+the legacy projection when the pattern does not match — tools/approvals/speculative prompts, more
+than one Program, an errored Result, a failed/cancelled/completed-without-output run, a run unit
+this snapshot did not create (a locally rendered live turn or an earlier snapshot), or a unit that
+already carries a card (a later snapshot must not reset `show_program` or duplicate output). The
+Snapshot branch also skips the run-unaffiliated Program source unit for programs a replayed card
+already covers, so one turn never wears two representations. The live event path
+(`project_remote_brain_live_run_event`) is untouched.
+
 **The state is shared, and that is the known weakness.** Every handler takes `&mut self` on an
 `EventLoop` whose field list is long. Before adding a field, check whether the state belongs to a
 query (`query_state.rs`) or to a tool run (`tool_execution.rs`) instead.

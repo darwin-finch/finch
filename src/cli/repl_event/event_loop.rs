@@ -4751,6 +4751,13 @@ fn project_remote_brain_snapshot_runs(
     selected_brain_is_home: bool,
     events: &[crate::brain::BrainEvent],
 ) {
+    // Say-turn reconstruction (#970) only targets run units this snapshot
+    // creates. A unit that already exists was projected by a live turn or an
+    // earlier snapshot: its turn is already on screen (live say card, or a
+    // card the previous snapshot rebuilt), so replaying again would stack a
+    // second card or duplicate streamed output bytes.
+    let pre_existing: std::collections::HashSet<crate::brain::RunId> =
+        projections.keys().copied().collect();
     for group in projected_brain_run_groups(events) {
         ensure_remote_brain_run_projection(
             output_manager,
@@ -4769,6 +4776,156 @@ fn project_remote_brain_snapshot_runs(
             selected_brain_is_home,
             event,
         );
+    }
+    reconstruct_replayed_say_turn_cards(projections, &pre_existing, events);
+}
+
+/// Rebuild say-turn component ViewModels on freshly replayed run units (#970).
+///
+/// The say ViewModel is created by the live producer paths and never
+/// persisted, so a reconnect otherwise rebuilds a completed say turn as the
+/// pre-stage-2 legacy projection (Program source / result rows inside the run
+/// group). The journal already carries the pattern — for one interactive run,
+/// a single typed `Program` and a successful `Result`, with no tool or
+/// approval events — so the component VM is rebuilt from the events at replay
+/// time. The legacy activity rows stay on the unit (the canonical record
+/// still carries the raw program and output exactly once); the viewport
+/// renders the card because `TuiRenderer::projected_message_lines` consults
+/// `say_turn_view()` before the row projection.
+///
+/// Runs stay on the legacy projection when the pattern does not match: tool
+/// calls, approvals, or speculative prompts in the run (their rows must
+/// render), more than one `Program` event (a popped/repaired program), an
+/// errored `Result` (a failed turn is not a say card), a run that ended
+/// failed, cancelled, or completed without its output (the status row says
+/// how it ended, which a Running card would misrepresent), a run unit this
+/// snapshot did not create (a locally rendered live turn or an earlier
+/// snapshot), or a unit that already carries a say ViewModel (idempotence: a
+/// later snapshot must not reset the reader's `show_program` choice or
+/// duplicate the output bytes). The runner's `RuntimeCommitted` and
+/// `EffectRecorded`/audit events are durable state, not transcript content,
+/// and do not disqualify the pattern.
+fn reconstruct_replayed_say_turn_cards(
+    projections: &mut std::collections::HashMap<crate::brain::RunId, RemoteBrainRunProjection>,
+    pre_existing: &std::collections::HashSet<crate::brain::RunId>,
+    events: &[crate::brain::BrainEvent],
+) {
+    use crate::brain::{BrainEventKind, BrainRunKind, BrainRunStatus, ProgramLanguage};
+
+    for group in projected_brain_run_groups(events) {
+        if group.kind != BrainRunKind::Interactive || pre_existing.contains(&group.run_id) {
+            continue;
+        }
+        let mut request_seq: Option<u64> = None;
+        let mut program: Option<(&str, &str, u64)> = None;
+        let mut result: Option<(&str, Option<&str>)> = None;
+        let mut pure = true;
+        for event in events
+            .iter()
+            .filter(|event| event.run_id == Some(group.run_id))
+        {
+            match &event.kind {
+                BrainEventKind::RunStarted { run } => request_seq = Some(run.request_seq),
+                // Runtime/audit commits are the runner's durable state, not
+                // transcript content.
+                BrainEventKind::RunStatusChanged { .. }
+                | BrainEventKind::RuntimeCommitted { .. }
+                | BrainEventKind::EffectRecorded { .. }
+                | BrainEventKind::EffectAuditTransition { .. } => {}
+                BrainEventKind::Program { language, source } => {
+                    if program.is_some() {
+                        pure = false;
+                    } else {
+                        program = Some((
+                            match language {
+                                ProgramLanguage::Forth => "forth",
+                                ProgramLanguage::Lisp => "lisp",
+                            },
+                            source,
+                            event.seq,
+                        ));
+                    }
+                }
+                BrainEventKind::Result { output, error, .. } => {
+                    if result.is_some() {
+                        pure = false;
+                    } else {
+                        result = Some((output.as_str(), error.as_deref()));
+                    }
+                }
+                _ => pure = false,
+            }
+        }
+        // A query turn's wire source is the run-correlated provider Program
+        // event. A typed-program run's source is the run-unaffiliated Program
+        // event at the run's request_seq — the pushed program itself.
+        if program.is_none() {
+            if let Some(request_seq) = request_seq {
+                let request = events.iter().find(|event| event.seq == request_seq);
+                if let Some(BrainEventKind::Program { language, source }) =
+                    request.map(|event| &event.kind)
+                {
+                    program = Some((
+                        match language {
+                            ProgramLanguage::Forth => "forth",
+                            ProgramLanguage::Lisp => "lisp",
+                        },
+                        source,
+                        request_seq,
+                    ));
+                }
+            }
+        }
+        if !pure {
+            continue;
+        }
+        // A say card needs the program; the output part fills from the
+        // Result when one arrived.
+        let (language, source, program_seq) = match program {
+            Some(turn) => turn,
+            None => continue,
+        };
+        let output = match (result, group.status) {
+            (Some((_, Some(_))), _) => continue,
+            (Some((output, None)), BrainRunStatus::Completed)
+            | (Some((output, None)), BrainRunStatus::Running)
+            | (Some((output, None)), BrainRunStatus::QueuedForEnvironment) => Some(output),
+            (None, BrainRunStatus::Running) | (None, BrainRunStatus::QueuedForEnvironment) => None,
+            _ => continue,
+        };
+        let Some(projection) = projections.get_mut(&group.run_id) else {
+            continue;
+        };
+        let unit = &projection.unit;
+        if unit.say_turn_snapshot().is_some() {
+            continue;
+        }
+        // The typed-program run has no run-correlated Program event, so the
+        // replayed group has no program row yet. Add it in the same shape the
+        // run-correlated projection renders, so the canonical record keeps
+        // the raw program exactly once; the card hides it from the viewport.
+        // Recording the row on the projection keeps any later run-correlated
+        // Program event from appending a duplicate.
+        if projection.program_row.is_none() {
+            let row = unit.add_activity_row(format!("{language} program"));
+            unit.complete_row_with_body(
+                row,
+                format!("event #{program_seq}"),
+                source.lines().map(str::to_owned).collect(),
+            );
+            projection.program_row = Some(row);
+        }
+        // `begin_say_turn` leaves the card Running; the output append mirrors
+        // into the output part under the same lock; and the completion path
+        // owns the one guarded Running → Completed transition, so a settled
+        // turn cannot keep wearing `running` (#820-class residue).
+        unit.begin_say_turn(language, source);
+        if let Some(output) = output.filter(|output| !output.is_empty()) {
+            unit.append_response(output);
+        }
+        if group.status == BrainRunStatus::Completed {
+            unit.set_complete();
+        }
     }
 }
 

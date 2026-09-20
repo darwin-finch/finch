@@ -2294,6 +2294,780 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
     assert!(canonical.contains("value=7"));
 }
 
+/// The replayed-event pattern for one interactive say turn, in journal order.
+fn replayed_say_run_events(
+    run_id: crate::brain::RunId,
+    source: &str,
+    output: Option<&str>,
+    error: Option<String>,
+    terminal: Option<crate::brain::BrainRunStatus>,
+) -> Vec<crate::brain::BrainEvent> {
+    use crate::brain::{
+        AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
+    };
+    let run = BrainRun {
+        run_id,
+        kind: BrainRunKind::Interactive,
+        parent_run_id: None,
+        request_seq: 1,
+        initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+        initiated_by: "shammah".into(),
+        status: BrainRunStatus::Running,
+        started_ms: 1,
+        updated_ms: 1,
+        detail: None,
+    };
+    let mut kinds = vec![
+        BrainEventKind::RunStarted { run },
+        BrainEventKind::Program {
+            language: ProgramLanguage::Lisp,
+            source: source.to_string(),
+        },
+    ];
+    if let Some(text) = output {
+        kinds.push(BrainEventKind::Result {
+            request_seq: 1,
+            output: text.to_string(),
+            error,
+            continuation_messages: Vec::new(),
+            invocation_metadata: None,
+        });
+    }
+    if let Some(status) = terminal {
+        kinds.push(BrainEventKind::RunStatusChanged {
+            run_id,
+            status,
+            detail: None,
+        });
+    }
+    kinds
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            let mut event = brain_event(index as u64 + 1, "daemon", kind);
+            event.run_id = Some(run_id);
+            event
+        })
+        .collect()
+}
+
+/// The journal pattern of one typed-program (`(say …)` pushed at the prompt)
+/// interactive run: the run-unaffiliated Program event AT the run's
+/// request_seq is the turn's wire source, the runner's runtime commit rides
+/// the run, and the Result carries the output. Production journals this
+/// exact shape (see the #970 PTY fixture dump); there is no run-correlated
+/// Program event on this path.
+#[allow(clippy::too_many_arguments)]
+fn replayed_typed_program_say_events(
+    run_id: crate::brain::RunId,
+    source: &str,
+    output: Option<&str>,
+    error: Option<String>,
+    terminal: Option<crate::brain::BrainRunStatus>,
+) -> Vec<crate::brain::BrainEvent> {
+    use crate::brain::{
+        AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
+    };
+    let mut kinds = vec![BrainEventKind::Program {
+        language: ProgramLanguage::Lisp,
+        source: source.to_string(),
+    }];
+    let request_seq = 1u64;
+    let run = BrainRun {
+        run_id,
+        kind: BrainRunKind::Interactive,
+        parent_run_id: None,
+        request_seq,
+        initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+        initiated_by: "shammah".into(),
+        status: BrainRunStatus::Running,
+        started_ms: 1,
+        updated_ms: 1,
+        detail: None,
+    };
+    kinds.push(BrainEventKind::RunStarted { run });
+    kinds.push(BrainEventKind::RuntimeCommitted {
+        request_seq,
+        runtime_revision: 1,
+        checkpoint_sha256: "abc".into(),
+    });
+    if let Some(text) = output {
+        kinds.push(BrainEventKind::Result {
+            request_seq,
+            output: text.to_string(),
+            error,
+            continuation_messages: Vec::new(),
+            invocation_metadata: None,
+        });
+    }
+    if let Some(status) = terminal {
+        kinds.push(BrainEventKind::RunStatusChanged {
+            run_id,
+            status,
+            detail: None,
+        });
+    }
+    kinds
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            let mut event = brain_event(index as u64 + 1, "daemon", kind);
+            if index == 0 {
+                event.sender = "shammah".into();
+                event.run_id = None;
+            } else {
+                event.run_id = Some(run_id);
+            }
+            event
+        })
+        .collect()
+}
+
+fn replay_output_manager() -> crate::cli::output_manager::OutputManager {
+    let output =
+        crate::cli::output_manager::OutputManager::new(crate::theme::ColorScheme::default());
+    output.disable_stdout();
+    output
+}
+
+/// #970 regression (replay projection): a completed say turn's journal
+/// pattern — one typed Program + a successful Result for the same interactive
+/// run — rebuilds the component ViewModel on the replayed run unit, while the
+/// legacy rows stay on the unit as the canonical record.
+#[test]
+fn replayed_completed_say_run_reconstructs_the_component_card() {
+    use crate::cli::messages::{Message, SayTurnStatus};
+
+    let greeting = "Hi, Shammah! What would you like to work on?";
+    let source = format!("(say \"{greeting}\")");
+    let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+    let events = replayed_say_run_events(
+        run_id,
+        &source,
+        Some(greeting),
+        None,
+        Some(crate::brain::BrainRunStatus::Completed),
+    );
+
+    let output = replay_output_manager();
+    let mut projections = std::collections::HashMap::new();
+    let mut local_projections = std::collections::VecDeque::new();
+    super::project_remote_brain_snapshot_runs(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &events,
+    );
+
+    let unit = projections
+        .get(&run_id)
+        .unwrap_or_else(|| panic!("INVARIANT: the replayed run must project a WorkUnit"))
+        .unit
+        .clone();
+    let view = unit.say_turn_view().unwrap_or_else(|| {
+        panic!(
+            "INVARIANT: the replayed completed say turn must reconstruct its component \
+             ViewModel (say_vm) from the journal pattern; unit={:?}",
+            unit.domain_head()
+        )
+    });
+    assert_eq!(
+        view.vm.status,
+        SayTurnStatus::Completed,
+        "INVARIANT: the run ended Completed, so the replayed card is Completed; view={view:?}"
+    );
+    assert_eq!(
+        view.vm.program.lines,
+        source.lines().map(str::to_owned).collect::<Vec<_>>(),
+        "INVARIANT: the card retains the raw wire source for the toggle; view={view:?}"
+    );
+    let output_lines = view
+        .vm
+        .output
+        .as_ref()
+        .unwrap_or_else(|| panic!("INVARIANT: the Result output must fill the card's output part"))
+        .lines
+        .clone();
+    assert!(
+        output_lines.iter().any(|line| line == greeting),
+        "INVARIANT: the replayed card renders the say prose; output_lines={output_lines:?}"
+    );
+
+    // The viewport renders the card: prose + `(ran Ns)`, no legacy rows.
+    let card: Vec<String> = crate::cli::components::card_lines(&view)
+        .into_iter()
+        .map(|line| line.text)
+        .collect();
+    assert!(
+        card.iter().any(|line| line.contains(greeting)),
+        "INVARIANT: the replayed card renders the completed prose; card={card:?}"
+    );
+    assert!(
+        card.iter().any(|line| line.contains("(ran ")),
+        "INVARIANT: the replayed card carries the `(ran Ns)` annotation (stage-2 \
+         verbatim target, docs/TUI_DESIGN.md); card={card:?}"
+    );
+    assert!(
+        !card.iter().any(|line| line.contains("Program source")),
+        "INVARIANT: the replayed viewport must not render the legacy Program source \
+         row; card={card:?}"
+    );
+    assert!(
+        !card.iter().any(|line| line.contains("result")),
+        "INVARIANT: the replayed viewport must not render the legacy result row; \
+         card={card:?}"
+    );
+
+    // The toggle works on the replayed card: the output region routes the
+    // component action and swaps the prose to the source.
+    let action = unit
+        .say_turn_action(&[1])
+        .expect("INVARIANT: the replayed card's output region is the toggle hit target");
+    assert!(
+        unit.handle_say_turn_action(&action),
+        "INVARIANT: the replayed card must route the toggle through its ViewModel"
+    );
+    assert!(
+        unit.say_turn_view()
+            .unwrap_or_else(|| { panic!("INVARIANT: the say ViewModel must survive the toggle") })
+            .vm
+            .show_program,
+        "INVARIANT: the toggle flips show_program on the replayed card"
+    );
+
+    // The canonical record is unchanged: the raw program and output stay on
+    // the unit's legacy rows, spooling exactly once.
+    let canonical = unit.complete_transcript(&crate::theme::ColorScheme::default());
+    assert!(
+        canonical.contains(&source),
+        "INVARIANT: the canonical record keeps the raw program; canonical=\n{canonical}"
+    );
+    assert!(
+        canonical.contains(greeting),
+        "INVARIANT: the canonical record keeps the say output; canonical=\n{canonical}"
+    );
+}
+
+/// #970 acceptance: a say turn mid-stream at disconnect replays as its
+/// best-known state — source inline while running, prose beneath once the
+/// output arrived even before the run reported terminal status.
+#[test]
+fn replayed_midstream_say_run_replays_best_known_state() {
+    use crate::cli::messages::{Message, SayTurnStatus};
+
+    let greeting = "Hi, Shammah!";
+    let source = format!("(say \"{greeting}\")");
+
+    // Program emitted, no Result yet: the card renders the source inline.
+    let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+    let events = replayed_say_run_events(run_id, &source, None, None, None);
+    let output = replay_output_manager();
+    let mut projections = std::collections::HashMap::new();
+    let mut local_projections = std::collections::VecDeque::new();
+    super::project_remote_brain_snapshot_runs(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &events,
+    );
+    let unit = projections.get(&run_id).expect("run unit").unit.clone();
+    let view = unit
+        .say_turn_view()
+        .expect("INVARIANT: a replayed running say turn reconstructs its card");
+    assert_eq!(
+        view.vm.status,
+        SayTurnStatus::Running,
+        "INVARIANT: without a terminal status the replayed card stays Running; view={view:?}"
+    );
+    assert!(
+        view.vm.output.is_none(),
+        "INVARIANT: no Result arrived, so the card has no output part; view={view:?}"
+    );
+    let card: Vec<String> = crate::cli::components::card_lines(&view)
+        .into_iter()
+        .map(|line| line.text)
+        .collect();
+    assert!(
+        card.iter().any(|line| line.contains(&source)),
+        "INVARIANT: the Running card renders the program source inline; card={card:?}"
+    );
+
+    // Output arrived, run still running: prose renders beneath the source.
+    let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+    let events = replayed_say_run_events(run_id, &source, Some(greeting), None, None);
+    let output = replay_output_manager();
+    let mut projections = std::collections::HashMap::new();
+    let mut local_projections = std::collections::VecDeque::new();
+    super::project_remote_brain_snapshot_runs(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &events,
+    );
+    let unit = projections.get(&run_id).expect("run unit").unit.clone();
+    let view = unit
+        .say_turn_view()
+        .expect("INVARIANT: a replayed running say turn reconstructs its card");
+    assert_eq!(
+        view.vm.status,
+        SayTurnStatus::Running,
+        "INVARIANT: the run has not reported terminal status, so the card stays \
+         Running; view={view:?}"
+    );
+    let arrived = view
+        .vm
+        .output
+        .as_ref()
+        .expect("INVARIANT: the arrived Result output must fill the card")
+        .lines
+        .clone();
+    assert!(
+        arrived.iter().any(|line| line == greeting),
+        "INVARIANT: arrived say bytes are never hidden; output={arrived:?}"
+    );
+    let card: Vec<String> = crate::cli::components::card_lines(&view)
+        .into_iter()
+        .map(|line| line.text)
+        .collect();
+    let card_text = card
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        card_text.contains(&source) && card_text.contains(greeting),
+        "INVARIANT: the Running card renders the source inline with the arrived \
+         prose beneath it; card={card:?}"
+    );
+}
+
+/// A run that carried tool calls is more than one say turn: the legacy
+/// projection (which renders the tool rows) must survive reconstruction.
+#[test]
+fn replayed_say_run_with_tools_keeps_the_legacy_projection() {
+    use crate::brain::{BrainEventKind, BrainRunStatus};
+    use crate::cli::messages::Message;
+
+    let source = "(say \"hello\")";
+    let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+    let mut events = replayed_say_run_events(
+        run_id,
+        source,
+        Some("hello"),
+        None,
+        Some(BrainRunStatus::Completed),
+    );
+    // Splice a tool round between the Program and the Result, then renumber
+    // the journal sequence so the list stays in journal order.
+    let tool_events = [
+        BrainEventKind::ToolCall {
+            request_seq: 1,
+            tool_id: "tool-970".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+        },
+        BrainEventKind::ToolResult {
+            request_seq: 1,
+            tool_id: "tool-970".into(),
+            output: "fn main() {}".into(),
+            is_error: false,
+        },
+    ];
+    for (offset, kind) in tool_events.into_iter().enumerate() {
+        let mut event = brain_event(0, "provider", kind);
+        event.run_id = Some(run_id);
+        events.insert(2 + offset, event);
+    }
+    for (index, event) in events.iter_mut().enumerate() {
+        event.seq = index as u64 + 1;
+    }
+
+    let output = replay_output_manager();
+    let mut projections = std::collections::HashMap::new();
+    let mut local_projections = std::collections::VecDeque::new();
+    super::project_remote_brain_snapshot_runs(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &events,
+    );
+    let unit = projections.get(&run_id).expect("run unit").unit.clone();
+    assert!(
+        unit.say_turn_view().is_none(),
+        "INVARIANT: a run with tool calls keeps the legacy projection — the card \
+         would hide the tool rows; unit={:?}",
+        unit.domain_head()
+    );
+    let canonical = unit.complete_transcript(&crate::theme::ColorScheme::default());
+    assert!(
+        canonical.contains("read_file"),
+        "INVARIANT: the tool row still renders through the legacy projection; \
+         canonical=\n{canonical}"
+    );
+}
+
+/// An errored Result is a failed turn, not a say card: the legacy projection
+/// renders the failure.
+#[test]
+fn replayed_errored_say_result_keeps_the_legacy_projection() {
+    use crate::brain::BrainRunStatus;
+    use crate::cli::messages::Message;
+
+    let source = "(say \"hello\")";
+    let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+    let events = replayed_say_run_events(
+        run_id,
+        source,
+        Some(""),
+        Some("VM wire error: E-WIRE-001".to_string()),
+        Some(BrainRunStatus::Failed),
+    );
+    let output = replay_output_manager();
+    let mut projections = std::collections::HashMap::new();
+    let mut local_projections = std::collections::VecDeque::new();
+    super::project_remote_brain_snapshot_runs(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &events,
+    );
+    let unit = projections.get(&run_id).expect("run unit").unit.clone();
+    assert!(
+        unit.say_turn_view().is_none(),
+        "INVARIANT: an errored Result is not a say card; unit={:?}",
+        unit.domain_head()
+    );
+    let canonical = unit.complete_transcript(&crate::theme::ColorScheme::default());
+    assert!(
+        canonical.contains("VM wire error: E-WIRE-001"),
+        "INVARIANT: the failed result still renders through the legacy projection; \
+         canonical=\n{canonical}"
+    );
+}
+
+/// Non-interactive runs (speculative helper turns, scheduled deliveries) keep
+/// the durable legacy projection: the say card is the interactive turn's
+/// representation.
+#[test]
+fn replayed_non_interactive_run_keeps_the_legacy_projection() {
+    use crate::brain::{BrainEventKind, BrainRunStatus};
+    use crate::cli::messages::Message;
+
+    let source = "(say \"hello\")";
+    let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+    let mut events = replayed_say_run_events(
+        run_id,
+        source,
+        Some("hello"),
+        None,
+        Some(BrainRunStatus::Completed),
+    );
+    // Rewrite the run's kind to Speculative in place.
+    let mut speculative = events.remove(0);
+    let BrainEventKind::RunStarted { run } = &mut speculative.kind else {
+        panic!(
+            "fixture must start with RunStarted; got {:?}",
+            speculative.kind
+        )
+    };
+    run.kind = crate::brain::BrainRunKind::Speculative;
+    events.insert(0, speculative);
+
+    let output = replay_output_manager();
+    let mut projections = std::collections::HashMap::new();
+    let mut local_projections = std::collections::VecDeque::new();
+    super::project_remote_brain_snapshot_runs(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &events,
+    );
+    let unit = projections.get(&run_id).expect("run unit").unit.clone();
+    assert!(
+        unit.say_turn_view().is_none(),
+        "INVARIANT: a speculative run keeps the legacy projection; unit={:?}",
+        unit.domain_head()
+    );
+}
+
+/// Idempotence: a second snapshot of the same run (reconnect over reconnect)
+/// must not reset the reader's `show_program` choice or duplicate the output
+/// bytes in the ViewModel.
+#[test]
+fn replayed_say_card_survives_a_second_snapshot_without_duplicating_output() {
+    use crate::cli::messages::{Message, SayTurnStatus};
+
+    let greeting = "Hi!";
+    let source = format!("(say \"{greeting}\")");
+    let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+    let events = replayed_say_run_events(
+        run_id,
+        &source,
+        Some(greeting),
+        None,
+        Some(crate::brain::BrainRunStatus::Completed),
+    );
+
+    let output = replay_output_manager();
+    let mut projections = std::collections::HashMap::new();
+    let mut local_projections = std::collections::VecDeque::new();
+    super::project_remote_brain_snapshot_runs(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &events,
+    );
+    let unit = projections.get(&run_id).expect("run unit").unit.clone();
+    let action = unit.say_turn_action(&[1]).expect("toggle target");
+    assert!(unit.handle_say_turn_action(&action), "first toggle");
+    assert!(
+        unit.say_turn_view().expect("card").vm.show_program,
+        "fixture: the reader toggled the card to the source"
+    );
+
+    // The reconnect delivers the same journal suffix again.
+    let mut local_projections = std::collections::VecDeque::new();
+    super::project_remote_brain_snapshot_runs(
+        &output,
+        &mut projections,
+        &mut local_projections,
+        true,
+        &events,
+    );
+    let view = unit
+        .say_turn_view()
+        .expect("INVARIANT: the card survives the second snapshot");
+    assert!(
+        view.vm.show_program,
+        "INVARIANT: the second snapshot must not reset the reader's show_program \
+         choice; view={view:?}"
+    );
+    let output_lines = view.vm.output.as_ref().expect("output stays").lines.clone();
+    assert_eq!(
+        output_lines.iter().filter(|line| *line == greeting).count(),
+        1,
+        "INVARIANT: the second snapshot must not duplicate the output bytes; \
+         output_lines={output_lines:?}"
+    );
+    assert_eq!(
+        view.vm.status,
+        SayTurnStatus::Completed,
+        "INVARIANT: the card's state is unchanged by the second snapshot"
+    );
+}
+
+fn replayed_brain_snapshot(events: Vec<crate::brain::BrainEvent>) -> crate::brain::BrainSnapshot {
+    crate::brain::BrainSnapshot {
+        brain_id: crate::brain::BrainId(uuid::Uuid::new_v4()),
+        name: "shared".into(),
+        environment: crate::brain::BrainEnvironment {
+            machine: "box.local".into(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            generation: 1,
+        },
+        revision: events.iter().map(|event| event.seq).max().unwrap_or(0),
+        events,
+        program_stack: Vec::new(),
+        attachments: Vec::new(),
+        runner_lease: None,
+        runner_handoff: None,
+        runs: Vec::new(),
+        tasks: Vec::new(),
+        committed_memories: Vec::new(),
+        schedules: Vec::new(),
+        pending_schedule_dues: Vec::new(),
+        effect_audits: Vec::new(),
+    }
+}
+
+/// Production-boundary regression for #970's guest-replay duplication: when a
+/// replayed run's say card already carries the turn's program, the separate
+/// run-unaffiliated Program source unit must not render beside it — the same
+/// turn must not wear two representations in one session.
+#[tokio::test]
+async fn reattached_say_snapshot_renders_one_card_without_duplicate_source_unit() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::brain::BrainRunStatus;
+            use crate::cli::messages::MessageStatus;
+
+            let greeting = "Hi, Shammah!";
+            let source = format!("(say \"{greeting}\")");
+            let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+            let events = replayed_typed_program_say_events(
+                run_id,
+                &source,
+                Some(greeting),
+                None,
+                Some(BrainRunStatus::Completed),
+            );
+
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let tempdir = tempfile::tempdir().expect("say replay fixture: isolated tool state");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("say replay fixture: construct inert tool executor");
+            let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&runtime),
+            );
+            event_loop.output_manager.disable_stdout();
+
+            event_loop
+                .render_remote_brain_message(crate::brain::BrainWireMessage::Snapshot {
+                    brain: replayed_brain_snapshot(events),
+                })
+                .await
+                .expect("snapshot replay must dispatch");
+
+            let messages = event_loop.output_manager.get_messages();
+            let rendered = messages
+                .iter()
+                .map(|message| {
+                    (
+                        message.id(),
+                        message.format(&crate::theme::ColorScheme::default()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                messages.len(),
+                1,
+                "INVARIANT: the replayed say turn renders one representation — the card on \
+         the run group; the run-unaffiliated source unit must not duplicate it. \
+         messages={rendered:?}"
+            );
+            let unit = messages[0].say_turn_view().unwrap_or_else(|| {
+                panic!(
+                    "INVARIANT: the replayed run group must carry the say card; \
+                 messages={rendered:?}"
+                )
+            });
+            assert_eq!(
+                unit.vm.status,
+                crate::cli::messages::SayTurnStatus::Completed,
+                "INVARIANT: the completed run replays as a completed card; view={unit:?}"
+            );
+            assert_eq!(
+                messages[0].status(),
+                MessageStatus::Complete,
+                "INVARIANT: the run unit is complete so the card commits exactly once; \
+         rendered={rendered:?}"
+            );
+            let canonical = messages[0].complete_transcript(&crate::theme::ColorScheme::default());
+            assert!(
+                canonical.contains(&source) && canonical.contains(greeting),
+                "INVARIANT: the canonical record keeps the raw program and the say output \
+         exactly once through the run group's rows; canonical=\n{canonical}"
+            );
+        })
+        .await;
+}
+
+/// The duplicate-source suppression is keyed on reconstructed say cards: a
+/// program whose run kept the legacy projection (here: a tool round) still
+/// renders its run-unaffiliated source unit.
+#[tokio::test]
+async fn reattached_non_say_program_still_renders_its_source_unit() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::brain::{BrainEventKind, BrainRunStatus};
+
+            let source = "(+ 970 0)";
+            let run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+            let mut events = replayed_typed_program_say_events(
+                run_id,
+                source,
+                Some("970"),
+                None,
+                Some(BrainRunStatus::Completed),
+            );
+            let tool_call = {
+                let mut event = brain_event(
+                    0,
+                    "provider",
+                    BrainEventKind::ToolCall {
+                        request_seq: 1,
+                        tool_id: "tool-970".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path": "src/main.rs"}),
+                    },
+                );
+                event.run_id = Some(run_id);
+                event
+            };
+            events.insert(2, tool_call);
+            for (index, event) in events.iter_mut().enumerate() {
+                event.seq = index as u64 + 1;
+            }
+
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let tempdir =
+                tempfile::tempdir().expect("say replay control fixture: isolated tool state");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("say replay control fixture: construct inert tool executor");
+            let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&runtime),
+            );
+            event_loop.output_manager.disable_stdout();
+
+            event_loop
+                .render_remote_brain_message(crate::brain::BrainWireMessage::Snapshot {
+                    brain: replayed_brain_snapshot(events),
+                })
+                .await
+                .expect("snapshot replay must dispatch");
+
+            let messages = event_loop.output_manager.get_messages();
+            let rendered = messages
+                .iter()
+                .map(|message| message.format(&crate::theme::ColorScheme::default()))
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            assert!(
+                messages.iter().any(|message| {
+                    message.work_unit_head().is_some_and(|head| {
+                        matches!(
+                            head.presentation,
+                            crate::cli::messages::WorkUnitPresentation::ProgramSource { .. }
+                        )
+                    })
+                }),
+                "INVARIANT: an uncovered program keeps its run-unaffiliated source unit in \
+         the replayed transcript; rendered=\n{rendered}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| message.say_turn_view().is_none()),
+                "INVARIANT: a tool-carrying run keeps the legacy projection — no say card; \
+         rendered=\n{rendered}"
+            );
+        })
+        .await;
+}
+
 #[test]
 fn todo_write_transcript_shows_the_task_list_not_the_raw_json() {
     // Issue #425 (todo_write dumps raw JSON as transcript rows): one todo_write

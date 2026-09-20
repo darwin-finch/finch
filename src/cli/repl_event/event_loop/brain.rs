@@ -795,12 +795,40 @@ impl EventLoop {
                     .and_then(|client| client.attachment())
                     .map(|attachment| attachment.acknowledged_seq)
                     .unwrap_or(0);
+                // A replayed say card (#970) already carries its program for
+                // the toggle; the run group's canonical record keeps the raw
+                // source. The separate run-unaffiliated source unit the
+                // Program event otherwise projects would render the same
+                // bytes beside the card — the stage-2 duplication defect — so
+                // its replay is skipped for covered programs. Live Program
+                // events never consult this set: it is built from the
+                // snapshot's reconstructed cards only, and a live turn's card
+                // lives on a Program-output unit, never an activity run group.
+                let say_covered_programs: std::collections::HashSet<Vec<String>> = self
+                    .remote_brain_run_units
+                    .values()
+                    .filter(|projection| projection.unit.is_activity_presentation())
+                    .filter_map(|projection| projection.unit.say_turn_snapshot())
+                    .map(|view| view.vm.program.lines.clone())
+                    .collect();
                 for event in brain
                     .events
                     .iter()
                     .filter(|event| event.seq > acknowledged_seq)
                 {
-                    if event.run_id.is_none() && replay_event_belongs_in_transcript(event) {
+                    let covered_by_replayed_say_card = event.run_id.is_none()
+                        && match &event.kind {
+                            crate::brain::BrainEventKind::Program { source, .. } => {
+                                say_covered_programs.contains(
+                                    &source.lines().map(str::to_owned).collect::<Vec<_>>(),
+                                )
+                            }
+                            _ => false,
+                        };
+                    if event.run_id.is_none()
+                        && replay_event_belongs_in_transcript(event)
+                        && !covered_by_replayed_say_card
+                    {
                         self.render_remote_brain_event(event).await;
                     }
                     self.observe_remote_brain_approval(event);

@@ -78,6 +78,8 @@ prefer_local = true
 struct Session {
     child: Child,
     master: OwnedFd,
+    rows: u16,
+    cols: u16,
     transcript: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     reader: Option<std::thread::JoinHandle<()>>,
     reader_done: std::sync::mpsc::Receiver<()>,
@@ -89,9 +91,16 @@ impl Session {
     }
 
     fn spawn_on(home: &Path, args: &[&str]) -> Self {
+        Self::spawn_sized(home, args, ROWS, COLS)
+    }
+
+    /// Spawn with an explicit grid size. A shorter terminal keeps the native
+    /// scrollback off the visible grid, so a viewport-tail assertion can read
+    /// the live card without the canonical rows above it.
+    fn spawn_sized(home: &Path, args: &[&str], rows: u16, cols: u16) -> Self {
         let winsize = nix::pty::Winsize {
-            ws_row: ROWS,
-            ws_col: COLS,
+            ws_row: rows,
+            ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
@@ -146,6 +155,8 @@ impl Session {
         Self {
             child,
             master,
+            rows,
+            cols,
             transcript,
             reader: Some(reader),
             reader_done,
@@ -238,7 +249,7 @@ impl Session {
     /// experiences the session. Repaints (absolute cursor moves, erases) are
     /// honoured, so this is the production surface, not the byte stream.
     fn screen_text(&self) -> String {
-        let mut screen = vt::Screen::new(ROWS, COLS);
+        let mut screen = vt::Screen::new(self.rows, self.cols);
         let mut parser = vte::Parser::new();
         let bytes = self.transcript_bytes();
         parser.advance(&mut screen, &bytes);
@@ -250,7 +261,7 @@ impl Session {
     /// row that scrolled off the grid top retained. Rows in scrollback were
     /// written exactly once — a row can never be erased after it scrolls.
     fn scrollback_text(&self) -> String {
-        let mut screen = vt::Screen::new(ROWS, COLS);
+        let mut screen = vt::Screen::new(self.rows, self.cols);
         let mut parser = vte::Parser::new();
         let bytes = self.transcript_bytes();
         parser.advance(&mut screen, &bytes);
@@ -1563,5 +1574,186 @@ fn completed_say_renders_one_representation_per_state_and_toggles_to_the_program
     assert!(
         status.success(),
         "a clean /exit must succeed after the say turn, status={status:?}, live screen:\n{screen}"
+    );
+}
+
+/// #970 regression at the production boundary: a completed say turn must
+/// replay from the journal, on reconnect, as the component card (prose +
+/// `(ran Ns)`, source reveal via the toggle) — not the pre-stage-2 legacy
+/// projection (Program source / result rows inside the Brain run group).
+///
+/// Mirrors the durable-reattach fixture: a real daemon owns the disposable
+/// HOME, session 1 completes a say turn and exits cleanly, session 2 attaches
+/// the same named Brain and reads the replayed transcript. Session 2 runs on
+/// a shorter grid so the visible tail is the viewport the reader sees: the
+/// canonical record (which keeps the raw program and output exactly once)
+/// stays above the visible region, and absence assertions read the rendered
+/// card, not the record.
+#[test]
+fn test_reconnected_completed_say_renders_the_component_card() {
+    const SAY_TEXT: &str = "attach-say-970";
+    const SOURCE_LINE: &str = "(say \"attach-say-970\")";
+    const REPLAY_ROWS: u16 = 16;
+
+    let daemon = IsolatedDaemon::start();
+    let mut first = Session::spawn_on(&daemon.home, &["attach", BRAIN]);
+    first.wait_for(
+        "finch v",
+        READY_DEADLINE,
+        "the first attach drew the startup header",
+    );
+    first.wait_for(
+        BRAIN,
+        READY_DEADLINE,
+        "the first attach drew the named Brain",
+    );
+    first.send_line(SOURCE_LINE);
+    // The typed-program say turn completes on the daemon path; the live
+    // session renders it through the run-group projection (pre-stage-2 — the
+    // replay reconstruction is what this ticket fixes), so wait for the say
+    // bytes and then for the durable journal to carry the terminal run.
+    first.wait_for(
+        SAY_TEXT,
+        ECHO_DEADLINE,
+        "the completed say rendered its prose in the first session",
+    );
+
+    // The replay reads the durable journal, so the turn must be terminal in
+    // it before session 1 exits; otherwise the reconnect would replay a still
+    // running turn and this test would measure the daemon's writer, not the
+    // regression. Bounded liveness gate on the journal append, not a latency
+    // assertion.
+    let journal_deadline = Instant::now() + ECHO_DEADLINE;
+    loop {
+        let journal = std::fs::read_to_string(daemon.events_path()).unwrap_or_default();
+        if journal.lines().any(|line| {
+            line.contains("run_status_changed") && line.contains("\"status\":\"completed\"")
+        }) {
+            break;
+        }
+        if Instant::now() >= journal_deadline {
+            panic!(
+                "INVARIANT: a completed say turn must reach the durable journal as a \
+                 terminal run before the reconnect, so the replay has the event pattern \
+                 to reconstruct from. Journal at {} never showed the completed status.\n\
+                 journal:\n{journal}",
+                daemon.events_path().display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    first.send_line("/exit");
+    let status = first.wait_for_exit();
+    let first_text = first.readable_transcript();
+    assert!(
+        status.success(),
+        "a clean /exit must succeed after the say turn, status={status:?}, terminal:\n{first_text}"
+    );
+    drop(first);
+
+    // Reconnect through the printed command, exactly as a user resumes.
+    let printed = printed_attach_command(&first_text);
+    let mut second = Session::spawn_sized(
+        &daemon.home,
+        &printed.split_whitespace().collect::<Vec<_>>(),
+        REPLAY_ROWS,
+        COLS,
+    );
+    second.wait_for(
+        "finch v",
+        READY_DEADLINE,
+        "the reconnect drew the startup header",
+    );
+    second.wait_for_screen(
+        SAY_TEXT,
+        ECHO_DEADLINE,
+        "the replayed say turn rendered its prose on the live screen",
+    );
+    let screen = second
+        .wait_for_screen_pred(|screen| screen.contains("(ran "), Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "INVARIANT: the replayed completed say turn must render as the component \
+                 card — prose plus the `(ran Ns)` annotation. The annotation never reached \
+                 the live screen, so the replay fell back to the legacy projection.\n\
+                 live screen:\n{}\nscrollback:\n{}\njournal:\n{}",
+                second.screen_text(),
+                second.scrollback_text(),
+                std::fs::read_to_string(daemon.events_path()).unwrap_or_default()
+            )
+        });
+    assert!(
+        screen.lines().any(|line| line.contains(SAY_TEXT)),
+        "INVARIANT: the replayed say turn renders its prose on the live screen.\n\
+         live screen:\n{screen}"
+    );
+    assert!(
+        screen.lines().any(|line| line.contains("(ran ")),
+        "INVARIANT: the replayed card carries the `(ran Ns)` annotation (stage-2 \
+         verbatim target, docs/TUI_DESIGN.md).\nlive screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Program source") && !screen.contains("Lisp program"),
+        "INVARIANT: the legacy Program source row does not render for the replayed \
+         say turn — one representation per state (issue 970). The canonical record \
+         still carries it above the visible region.\nlive screen:\n{screen}"
+    );
+    assert!(
+        !screen.lines().any(|line| line.contains("result")),
+        "INVARIANT: no legacy result row renders for the replayed say turn.\n\
+         live screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Interactive run") && !screen.contains("Brain run"),
+        "INVARIANT: no Brain run group row renders for the replayed say turn.\n\
+         live screen:\n{screen}"
+    );
+    assert!(
+        uuid_only_lines(&screen).is_empty(),
+        "INVARIANT: no UUID row renders for the replayed say turn.\nlive screen:\n{screen}"
+    );
+
+    // The toggle works on the replayed card through the real input path: F6
+    // focuses the next semantic row, Enter activates it. The card's source
+    // reveal is a second occurrence of the exact source line on the live
+    // screen — the legacy projection has no toggle to produce one.
+    let before = second.screen_text().matches(SOURCE_LINE).count();
+    let mut toggled = None;
+    for _ in 0..4 {
+        second.send_line("\x1b[17~"); // F6, then Enter
+        if let Some(screen) = second.wait_for_screen_pred(
+            |screen| {
+                let after = screen.matches(SOURCE_LINE).count();
+                after > before && screen.contains("(ran ")
+            },
+            Duration::from_secs(5),
+        ) {
+            toggled = Some(screen);
+            break;
+        }
+    }
+    let screen = toggled.unwrap_or_else(|| {
+        panic!(
+            "INVARIANT: driving the keyboard disclosure path (F6/Enter) must toggle the \
+             replayed say card's show_program through the component ViewModel and swap \
+             the prose to the program source.\nbefore: {before} occurrence(s) of \
+             {SOURCE_LINE:?}.\nlive screen:\n{}",
+            second.screen_text()
+        )
+    });
+    assert!(
+        screen.matches(SOURCE_LINE).count() == before + 1,
+        "INVARIANT: exactly one new occurrence of the source line — the card's \
+         reveal, not a duplicated legacy row.\nlive screen:\n{screen}"
+    );
+
+    second.send_raw(b"\x1b");
+    std::thread::sleep(Duration::from_millis(300));
+    second.send_line("/exit");
+    let status = second.wait_for_exit();
+    assert!(
+        status.success(),
+        "a clean /exit must succeed after the replay, status={status:?}, live screen:\n{screen}"
     );
 }

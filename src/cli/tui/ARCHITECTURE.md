@@ -71,7 +71,11 @@ viewport pairing (`say_turn_consolidated_source_ids` in `tui/mod.rs`) suppresses
 completed Program-source unit whose bytes are the turn's program — byte identity holds by
 construction in every producer path and a mismatch suppresses nothing — while the canonical
 record keeps the raw program exactly once (`commit_complete_messages` is untouched). The
-renderer's RowId-keyed open-set maps never hold component rows. The widget vocabulary
+renderer's RowId-keyed open-set maps never hold component rows. On reconnect the replay
+reconstructs the card from the journal itself (#970): `reconstruct_replayed_say_turn_cards`
+rebuilds the ViewModel on the replayed run group from the Program/Result event pattern, so the
+replayed transcript carries one representation per state like the live session; the live
+rendering path is untouched. The widget vocabulary
 (`Rect`/`Track`/`Axis`/`Widget`/`RenderedTranscriptLine`/`RowId`/line metrics) lives in
 `cli::components::vocab` so components build subtrees without `crossterm` or the shadow
 buffer; the engine re-exports it under its stable paths.
