@@ -543,7 +543,12 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 # Concurrent ordinary invocations receive disjoint process groups, state
 # roots, sockets, listener addresses, and credentials without mutating global
-# parent-shell environment.
+# parent-shell environment. Each child stays alive for the 2s overlap window
+# below so both allocations are concurrently live while they record. The
+# window is a coverage aid, not a timing oracle: disjointness is asserted from
+# the records, and a 200ms window could be outrun by scheduler delay before
+# the second child records, silently weakening the concurrency this phase
+# proves.
 parallel_a="$scratch/parallel-a"
 parallel_b="$scratch/parallel-b"
 phase=parallel-supervisor-isolation
@@ -553,7 +558,7 @@ FINCH_PARALLEL_RECORD="$parallel_a" run_isolated bash -ec '
     "$FINCH_TEST_IPC_SOCKET" "$FINCH_TEST_BRAIN_ADDR" \
     "$FINCH_TEST_DAEMON_ADDR" "$FINCH_TEST_BRAIN_PASSWORD" \
     "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" >"$FINCH_PARALLEL_RECORD"
-  sleep 0.2
+  sleep 2
 ' & parallel_pid_a=$!
 FINCH_PARALLEL_RECORD="$parallel_b" run_isolated bash -ec '
   printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
@@ -561,7 +566,7 @@ FINCH_PARALLEL_RECORD="$parallel_b" run_isolated bash -ec '
     "$FINCH_TEST_IPC_SOCKET" "$FINCH_TEST_BRAIN_ADDR" \
     "$FINCH_TEST_DAEMON_ADDR" "$FINCH_TEST_BRAIN_PASSWORD" \
     "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" >"$FINCH_PARALLEL_RECORD"
-  sleep 0.2
+  sleep 2
 ' & parallel_pid_b=$!
 wait "$parallel_pid_a"
 wait "$parallel_pid_b"
@@ -619,6 +624,15 @@ phase=timeout-descendant-cleanup
 # 35420222687 failed at the signaler status check). 3000x10ms=30s matches the
 # coarse bounds this codebase already accepts for supervised-process startup
 # under load.
+#
+# The 120s fixture lifetimes below are hang-detector margins, not timing
+# oracles: the descendant must still be a live group member when the
+# supervisor's SIGKILL stage runs (the supervisor's own teardown bound is 8s),
+# and the leader must still be sleeping when the signaler's TERM lands, no
+# matter how far scheduler starvation pushes either event. A 30s lifetime
+# assumed a quiet workstation; a slower teardown or signaler would let the
+# fixture exit first and leave the quiescence and status assertions vacuously
+# true.
 (
   for _ in {1..3000}; do
     if [[ -s "$timeout_target_file" ]]; then
@@ -634,10 +648,10 @@ timeout_status=0
 FINCH_TIMEOUT_TARGET_FILE="$timeout_target_file" \
 FINCH_TIMEOUT_DESCENDANT_PID_FILE="$timeout_descendant_pid_file" \
 FINCH_TIMEOUT_HOME_FILE="$timeout_home_file" run_isolated bash -ec '
-  (trap "" TERM HUP INT; printf "%s\n" "$BASHPID" >"$FINCH_TIMEOUT_DESCENDANT_PID_FILE"; sleep 30) &
+  (trap "" TERM HUP INT; printf "%s\n" "$BASHPID" >"$FINCH_TIMEOUT_DESCENDANT_PID_FILE"; sleep 120) &
   printf "%s\n" "$HOME" >"$FINCH_TIMEOUT_HOME_FILE"
   printf "%s\n" "$FINCH_TEST_SUPERVISOR_PID" >"$FINCH_TIMEOUT_TARGET_FILE"
-  sleep 30
+  sleep 120
 ' || timeout_status=$?
 signaler_status=0
 wait "$signaler_pid" || signaler_status=$?
@@ -692,7 +706,7 @@ if FINCH_DESCENDANT_PID_FILE="$inspection_pid" FINCH_OBSERVED_HOME="$inspection_
   FINCH_SHADOW_PS_CALLED="$inspection_called" PATH="$inspection_bin:$PATH" \
   run_isolated bash -ec '
     printf "%s\n" "$HOME" >"$FINCH_OBSERVED_HOME"
-    (trap "" TERM HUP INT; printf "%s\n" "$BASHPID" >"$FINCH_DESCENDANT_PID_FILE"; sleep 30) &
+    (trap "" TERM HUP INT; printf "%s\n" "$BASHPID" >"$FINCH_DESCENDANT_PID_FILE"; sleep 120) &
     exit 31
   '; then
   exit 1
@@ -729,7 +743,7 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 normal_descendant_pid_file="$scratch/normal-descendant.pid"
 phase=normal-exit-term-resistant-descendant
 if FINCH_DESCENDANT_PID_FILE="$normal_descendant_pid_file" run_isolated bash -ec '
-  (trap "" TERM HUP INT; echo "$BASHPID" >"$FINCH_DESCENDANT_PID_FILE"; sleep 30) &
+  (trap "" TERM HUP INT; echo "$BASHPID" >"$FINCH_DESCENDANT_PID_FILE"; sleep 120) &
   exit 29
 '; then
   exit 1
@@ -895,21 +909,27 @@ phase=manifest-swap-to-fifo-status
 race_name=manifest-race-node
 race_path="$fake_home/.finch/brains/$race_name"
 (
-  # Paired with PROBE_CONTINUATION_BOUND in finch-test-supervisor.rs: the two
-  # deadlines must move together (#328) because the probe parks waiting for
-  # the continuation this subshell publishes. This is the harness's only
-  # wall-clock deadline -- the attempts-counted polls elsewhere stretch with
-  # load, a fixed wall budget does not -- so it must cover the measured
-  # 20-30s supervisor spawn cadence of a degraded shared runner (the 8s
-  # deadline expired on CI run 35437807757 while each supervisor spawn took
-  # tens of seconds; earlier phases in the same run spanned the gap in
-  # silence between 11:01:43 and 11:04:43).
-  race_deadline=$(( $(date +%s) + 120 ))
+  # This is the harness's only wall-clock deadline -- the attempts-counted
+  # polls elsewhere stretch with load, a fixed wall budget does not. It covers
+  # supervisor spawn plus the manifest walk up to the ready marker: a span the
+  # supervisor's own PROBE_CONTINUATION_BOUND (120s, src/bin/
+  # finch-test-supervisor.rs) cannot observe, because that bound starts only
+  # once the ready marker exists. Raising this side alone therefore cannot
+  # strand a parked probe (#328's pairing failure needs the swapper to abandon
+  # a probe that is still parked, which would require the ready marker to stay
+  # invisible to this live subshell), and a probe left parked by a dead
+  # subshell self-limits on its own continuation bound. 300s absorbs runner
+  # starvation far past the measured 20-30s supervisor spawn cadence of a
+  # degraded shared runner (the 8s deadline expired on CI run 35437807757
+  # while each supervisor spawn took tens of seconds; earlier phases in the
+  # same run spanned the gap in silence between 11:01:43 and 11:04:43), and
+  # expiry still reports hung, not slow.
+  race_deadline=$(( $(date +%s) + 300 ))
   while :; do
     race_ready="$(find "$temp_parent" -maxdepth 2 -name .manifest-race-ready -print -quit)"
     [[ -n "$race_ready" ]] && break
     if (( $(date +%s) >= race_deadline )); then
-      echo "manifest race swapper: probe never published .manifest-race-ready under $temp_parent within 120s (hung); the probe is waiting on a continuation this subshell will not write" >&2
+      echo "manifest race swapper: probe never published .manifest-race-ready under $temp_parent within 300s (hung); the probe is waiting on a continuation this subshell will not write" >&2
       exit 1
     fi
     sleep 0.005
@@ -1317,5 +1337,48 @@ if [[ "$scan_status" -ne 1 ]]; then
   echo "inline-child errexit scan could not run: rg exited $scan_status" >&2
   exit "$scan_status"
 fi
+
+# The #858 sweep audited every coordination wait in this harness and widened
+# the fixed worst-case waits into generous hang detectors whose expiry reports
+# hung, never a quiet-workstation slow. Each row pins one bound to its sweep
+# floor as an exact source pattern and required occurrence count: a bound that
+# shrinks, or a widened site that disappears, fails here naming the pattern
+# and its label instead of re-introducing the too-tight bounds that let one
+# previously-unreachable phase at a time exhaust on a loaded CI runner. Move a
+# bound and update its row in the same change.
+phase=harness-coordination-bounds-keep-sweep-floors
+bounds_floor_harness="$repo_root/scripts/test_brain_isolation.sh"
+bounds_floor_lib="$repo_root/scripts/lib/brain_test_isolation.sh"
+while IFS='|' read -r bounds_floor_target bounds_floor_pattern bounds_floor_expected bounds_floor_label; do
+  case "$bounds_floor_target" in
+    harness) bounds_floor_path="$bounds_floor_harness" ;;
+    lib) bounds_floor_path="$bounds_floor_lib" ;;
+    *)
+      echo "coordination-bound floor table names an unknown target: $bounds_floor_target" >&2
+      exit 1
+      ;;
+  esac
+  # Floor rows are exact-substring matches, so this table's own heredoc lines
+  # each contain their pattern; exclude them from the count so the floor
+  # reflects source sites only.
+  bounds_floor_observed="$(
+    rg -F -- "$bounds_floor_pattern" "$bounds_floor_path" 2>/dev/null |
+      grep -c -v -E '^(harness|lib)\|'
+  )" || bounds_floor_observed=0
+  if [[ "$bounds_floor_observed" != "$bounds_floor_expected" ]]; then
+    echo "isolation harness coordination bound left its #858 hang-detector floor: pattern=$bounds_floor_pattern label=$bounds_floor_label expected $bounds_floor_expected occurrence(s) in $bounds_floor_path observed ${bounds_floor_observed:-0}; restore the widened bound or update its floor row in the same change" >&2
+    exit 1
+  fi
+done <<'EOF'
+harness|local poll_attempts=3000|1|substitution marker polls: 3000 attempts-counted x10ms
+harness|for _ in {1..3000}; do|4|signaler and observer polls: 3000 attempts-counted x10ms
+harness|for ((_i = 0; _i < 3000; _i++)); do|1|stubborn-leader ready poll: 3000 attempts-counted x10ms
+harness|for _ in {1..12000}; do|1|concurrent-launcher base poll: 12000 attempts-counted x10ms
+harness|for _ in {1..90000}; do|1|concurrent-launcher cargo-slot extension poll: 90000 attempts-counted x10ms
+harness|race_deadline=$(( $(date +%s) + 300 ))|1|manifest-race swapper wall deadline: 300s
+harness|sleep 2|2|parallel-isolation children overlap window: 2s
+harness|sleep 120|4|term-resistant descendant and leader fixture lifetimes: 120s
+lib|bound="${3:-120}"|1|await_bound_address daemon-bind wait default: 120s wall-clock
+EOF
 
 echo 'Brain test isolation regression checks passed.'

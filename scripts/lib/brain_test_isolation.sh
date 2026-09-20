@@ -364,7 +364,7 @@ brain_test_isolation_reexec_launcher() {
 # moves the deadline. #328 asked for monotonic deadlines and this is the one
 # place that does not deliver one -- bash has no monotonic clock without
 # reaching outside it, and the failure mode (a step large enough to matter
-# during a 30-second daemon startup) is not worth that. Said plainly rather
+# during a two-minute daemon startup) is not worth that. Said plainly rather
 # than left to be assumed.
 #
 # Replaces a bare `for _ in {1..100}; do ... sleep 0.05; done` that expired
@@ -374,9 +374,15 @@ brain_test_isolation_reexec_launcher() {
 # whether the process is still running, its exit status if not, and where the
 # address file was expected.
 #
+# The 120s default is a hang detector, not a latency claim (#858 sweep): the
+# same loaded-runner starvation that measured a 20-30s supervisor spawn cadence
+# exhausted the previous 30s default on bind publication alone. Expiry still
+# says hung -- the daemon is named as still running or as exited with its
+# status -- never "slow".
+#
 # Usage: await_bound_address <address_file> <daemon_pid> [bound_seconds]
 await_bound_address() {
-    local address_file="$1" daemon_pid="$2" bound="${3:-30}"
+    local address_file="$1" daemon_pid="$2" bound="${3:-120}"
     local deadline=$(( $(date +%s) + bound ))
 
     while [[ ! -s "$address_file" ]]; do
