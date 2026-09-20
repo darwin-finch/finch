@@ -2844,13 +2844,9 @@ mod tests {
         let tls = crate::node::NodeTlsIdentity::from_signing_identity(&node, "localhost").unwrap();
         let invitation_certificate =
             super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
-        crate::node::install_crypto_provider().unwrap();
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-            vec![invitation_certificate],
-            tls.private_key_der().to_vec(),
-        )
-        .await
-        .unwrap();
+        assert_eq!(invitation_certificate, tls.certificate_der());
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(tls.rustls_server_config().unwrap());
         let handle = axum_server::Handle::new();
         let server = tokio::spawn(
             axum_server::bind_rustls(
@@ -2913,24 +2909,11 @@ mod tests {
                 unix_epoch_millis(),
             )
             .unwrap();
-        crate::node::install_crypto_provider().unwrap();
-        let tls_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![rustls::pki_types::CertificateDer::from(
-                    super::super::credential::invitation_tls_certificate_der(&invitation_claims)
-                        .unwrap(),
-                )],
-                rustls::pki_types::PrivateKeyDer::Pkcs8(
-                    rustls::pki_types::PrivatePkcs8KeyDer::from(
-                        authority
-                            .invitation_tls_identity()
-                            .private_key_der()
-                            .to_vec(),
-                    ),
-                ),
-            )
-            .unwrap();
+        let invitation_certificate =
+            super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
+        let tls_identity = authority.invitation_tls_identity();
+        assert_eq!(invitation_certificate, tls_identity.certificate_der());
+        let tls_config = tls_identity.rustls_server_config().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let streamed = BrainEvent {
@@ -2950,7 +2933,7 @@ mod tests {
         let expected_snapshot = initial_snapshot.clone();
         let fixture = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let stream = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls_config))
+            let stream = tokio_rustls::TlsAcceptor::from(tls_config)
                 .accept(stream)
                 .await
                 .unwrap();
@@ -3117,19 +3100,13 @@ mod tests {
                 unix_epoch_millis(),
             )
             .unwrap();
-        crate::node::install_crypto_provider().unwrap();
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-            vec![
-                super::super::credential::invitation_tls_certificate_der(&invitation_claims)
-                    .unwrap(),
-            ],
-            authority
-                .invitation_tls_identity()
-                .private_key_der()
-                .to_vec(),
-        )
-        .await
-        .unwrap();
+        let invitation_certificate =
+            super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
+        let tls_identity = authority.invitation_tls_identity();
+        assert_eq!(invitation_certificate, tls_identity.certificate_der());
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(
+            tls_identity.rustls_server_config().unwrap(),
+        );
         let app = Router::new().route(
             "/v1/brains/named/shared/ws",
             get(move || {
@@ -3232,16 +3209,11 @@ mod tests {
             .unwrap();
         let invitation_certificate =
             super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
-        crate::node::install_crypto_provider().unwrap();
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-            vec![invitation_certificate],
-            authority
-                .invitation_tls_identity()
-                .private_key_der()
-                .to_vec(),
-        )
-        .await
-        .unwrap();
+        let tls_identity = authority.invitation_tls_identity();
+        assert_eq!(invitation_certificate, tls_identity.certificate_der());
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(
+            tls_identity.rustls_server_config().unwrap(),
+        );
         let app = Router::new().route(
             "/v1/brains/invitations/redeem",
             post(|| async { Json(serde_json::json!({ "unexpected": true })) }),
@@ -3375,13 +3347,9 @@ mod tests {
         let tls = crate::node::NodeTlsIdentity::from_signing_identity(&node, "localhost").unwrap();
         let invitation_certificate =
             super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
-        crate::node::install_crypto_provider().unwrap();
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-            vec![invitation_certificate],
-            tls.private_key_der().to_vec(),
-        )
-        .await
-        .unwrap();
+        assert_eq!(invitation_certificate, tls.certificate_der());
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(tls.rustls_server_config().unwrap());
         let handle = axum_server::Handle::new();
         let server = tokio::spawn(
             axum_server::bind_rustls(
@@ -3554,13 +3522,8 @@ mod tests {
             .unwrap();
 
         let tls = authority.invitation_tls_identity();
-        crate::node::install_crypto_provider().unwrap();
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-            vec![tls.certificate_der().to_vec()],
-            tls.private_key_der().to_vec(),
-        )
-        .await
-        .unwrap();
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(tls.rustls_server_config().unwrap());
         let app = crate::server::create_remote_brain_router(state);
         let handle = axum_server::Handle::new();
         let server = tokio::spawn(

@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+use std::sync::Arc;
 
 use super::NodeSigningIdentity;
 
@@ -76,8 +77,24 @@ impl NodeTlsIdentity {
         &self.certificate_der
     }
 
-    pub(crate) fn private_key_der(&self) -> &[u8] {
-        &self.private_key_der
+    /// Build the TLS server configuration without exposing this identity's private key.
+    pub fn rustls_server_config(&self) -> Result<Arc<rustls::ServerConfig>> {
+        install_crypto_provider()?;
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    self.certificate_der.clone(),
+                )],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(self.private_key_der.clone()),
+                ),
+            )
+            .context("pair node TLS certificate with its private key")?;
+        // Match axum-server's DER loader exactly so moving key ownership does
+        // not alter HTTP/2 or HTTP/1.1 negotiation.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(Arc::new(config))
     }
 }
 
@@ -207,10 +224,23 @@ mod tests {
         let second = NodeTlsIdentity::from_signing_identity(&node, "workstation").unwrap();
 
         assert_eq!(first.certificate_der(), second.certificate_der());
-        assert_eq!(first.private_key_der(), second.private_key_der());
+        assert_eq!(first.private_key_der, second.private_key_der);
 
-        let key_pair = KeyPair::try_from(first.private_key_der()).unwrap();
+        let key_pair = KeyPair::try_from(first.private_key_der.as_slice()).unwrap();
         assert_eq!(key_pair.public_key_raw(), node.public_key_bytes());
+    }
+
+    #[test]
+    fn server_config_keeps_the_identity_key_private_and_preserves_http_alpn() {
+        let node = NodeSigningIdentity::from_secret([19; 32]);
+        let tls = NodeTlsIdentity::from_signing_identity(&node, "workstation").unwrap();
+
+        let config = tls.rustls_server_config().unwrap();
+
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     #[test]

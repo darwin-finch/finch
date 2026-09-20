@@ -841,14 +841,11 @@ impl AgentServer {
         );
 
         if let Some(brain_bind_address) = &app_state.config.brain_bind_address {
-            crate::node::install_crypto_provider()?;
             let brain_addr: SocketAddr = brain_bind_address.parse()?;
             let tls_identity = app_state.brain_credentials.invitation_tls_identity();
-            let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-                vec![tls_identity.certificate_der().to_vec()],
-                tls_identity.private_key_der().to_vec(),
-            )
-            .await?;
+            let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(
+                tls_identity.rustls_server_config()?,
+            );
             let brain_request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
             let brain_app = crate::server::handlers::create_remote_brain_router(app_state)
                 .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
