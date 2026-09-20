@@ -80,8 +80,13 @@ buffer; the engine re-exports it under its stable paths.
 snapshot projected into a tree of standard widgets laid out by depth-first frame claiming. The
 root column allocates chrome from the bottom (status, hr, input, hr, completions 0–N) and the
 transcript viewport claims the leftover; an empty completions pane claims zero rows so the
-composer and status never move (#232). While a dialog is open the column instead carries the
-dialog card as an inline child (#807) and the composer/status yield. Resize is a full layout
+composer and status never move (#232). The session task list and the tracked child-agent rows
+are furniture (#966): natural tracks between the transcript viewport and the completions pane —
+zero rows when there is nothing to show, never scrollable content, and visible at every scroll
+position (a finished session task claims no row; a finished tracked row still renders its `✓`).
+While a dialog is open the column instead carries the dialog card as an inline child (#807) and
+the composer/status yield; the furniture keeps its place above the separator so an open dialog
+cannot hide it either. Resize is a full layout
 pass — no widget keeps a cell count from the previous frame. `Row` parents place children side
 by side, and `Side` tracks are the width-conditional rails (#810).
 

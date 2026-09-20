@@ -468,6 +468,11 @@ pub(crate) mod frame_key {
     pub const STATUS_RULE: u16 = 4;
     pub const STATUS: u16 = 5;
     pub const DIALOG_CARD: u16 = 6;
+    /// The session task list — furniture between the transcript viewport and
+    /// the composer (#966). Zero rows when there is nothing to show.
+    pub const TASKS: u16 = 7;
+    /// The tracked child-agent rows — furniture alongside the session tasks.
+    pub const TRACKED: u16 = 8;
 }
 
 /// The regions of one live frame, claimed by the widget tree. Rects are in the
@@ -484,6 +489,12 @@ pub(crate) struct FrameRects {
     /// The open dialog's inline card (#807). Empty when no dialog is open or
     /// the card was squeezed out of a tiny frame.
     pub dialog_card: Rect,
+    /// The session task list's furniture claim (#966). Empty when there is
+    /// nothing to show.
+    pub tasks: Rect,
+    /// The tracked child-agent rows' furniture claim. Empty when there is
+    /// nothing to show.
+    pub tracked: Rect,
 }
 
 /// Everything the live-frame planner reads: the blit-time ViewModel snapshot.
@@ -509,8 +520,8 @@ pub(crate) struct LiveViewModel<'a> {
     /// A render error, like a dialog, owns the viewport and suppresses
     /// completions.
     pub render_error: bool,
-    /// Polled session task list, including `Done` rows: the layout reserves a
-    /// row for each, and the draw skips the finished ones.
+    /// Polled session task list. A finished row claims no furniture row (the
+    /// draw skips it), so the claim shrinks as the list completes.
     pub task_rows: &'a [crate::cli::tui::activity::ActivityRow],
     /// Child-agent rows, already ordered by depth then identity.
     pub tracked_rows: &'a [crate::cli::tui::activity::ActivityRow],
@@ -527,17 +538,44 @@ pub(crate) struct LiveFrameContent {
     pub dialog_card: Vec<String>,
 }
 
+/// The session task list's furniture lines: one bounded row per unfinished
+/// task; a finished row claims nothing. Rendered from the ViewModel each
+/// frame, so both claiming passes and the paint agree.
+pub(crate) fn furniture_task_lines(vm: &LiveViewModel<'_>, width: usize) -> Vec<String> {
+    vm.task_rows
+        .iter()
+        .filter_map(|row| super::session_task_line(row, width))
+        .collect()
+}
+
+/// The tracked child-agent rows' furniture lines: one bounded row per tracked
+/// agent, finished rows included (they render their `✓` state).
+pub(crate) fn furniture_tracked_lines(vm: &LiveViewModel<'_>, width: usize) -> Vec<String> {
+    vm.tracked_rows
+        .iter()
+        .map(|row| super::tracked_agent_line(row, width))
+        .collect()
+}
+
 /// Project the root of the live frame: a single column whose chrome allocates
 /// from the bottom — status, hr, input, hr, completions (0–N) — with the live
 /// transcript viewport claiming the leftover (#805).
 ///
+/// The session task list and the tracked child-agent rows are **furniture**
+/// (#966): natural tracks between the transcript viewport and the completions
+/// pane, always on the frame regardless of scroll position or transcript
+/// length, and zero rows when there is nothing to show. The focused expanded
+/// tool-result surface still owns the whole viewport and suppresses them, as
+/// it suppresses the viewport itself.
+///
 /// When a dialog is open the card is an inline child of the same column
 /// (#807): the conversation viewport stays projected above it, the card
 /// claims its pinned extent below the separator, and the composer/status
-/// chrome yields for the duration (the dialog owns the keys, as before).
-/// `dialog_card_natural` is the card's pinned extent for the sizing pass;
-/// `content`, when given, is the pane, viewport, and card content sized to
-/// the first pass's claims.
+/// chrome yields for the duration (the dialog owns the keys, as before). The
+/// furniture keeps its place between the viewport and the separator so an
+/// open dialog cannot hide it either. `dialog_card_natural` is the card's
+/// pinned extent for the sizing pass; `content`, when given, is the pane,
+/// viewport, and card content sized to the first pass's claims.
 pub(crate) fn project_root(
     vm: &LiveViewModel<'_>,
     content: Option<&LiveFrameContent>,
@@ -552,6 +590,13 @@ pub(crate) fn project_root(
     let completions_rows = content
         .map(|c| c.completions.clone())
         .unwrap_or_else(|| vec![String::new(); completion_rows]);
+    let furniture_shown = vm.expanded_lines.is_none();
+    let task_lines = furniture_shown
+        .then(|| furniture_task_lines(vm, width))
+        .unwrap_or_default();
+    let tracked_lines = furniture_shown
+        .then(|| furniture_tracked_lines(vm, width))
+        .unwrap_or_default();
     let mut children: Vec<(Track, Widget)> = vec![(
         // While a dialog owns focus the card outranks the live transcript:
         // the floor yields so Yes/No keep their rows on small frames (#435).
@@ -567,10 +612,12 @@ pub(crate) fn project_root(
         ),
     )];
     if vm.dialog.is_some() {
-        // Paint order below is [conversation, separator, card], so the tree
-        // carries the separator between the viewport and the card: the card
-        // claims the frame's trailing rows, exactly where the pinned lines
-        // are painted.
+        // Paint order below is [conversation, tasks, tracked, separator, card],
+        // so the tree carries the separator between the furniture and the
+        // card: the card claims the frame's trailing rows, exactly where the
+        // pinned lines are painted.
+        children.push(furniture_track(frame_key::TASKS, task_lines));
+        children.push(furniture_track(frame_key::TRACKED, tracked_lines));
         children.push((
             Track::Natural,
             Widget::Marked(
@@ -591,6 +638,8 @@ pub(crate) fn project_root(
             ),
         ));
     } else {
+        children.push(furniture_track(frame_key::TASKS, task_lines));
+        children.push(furniture_track(frame_key::TRACKED, tracked_lines));
         children.push((
             Track::Natural,
             Widget::Marked(
@@ -643,6 +692,15 @@ pub(crate) fn project_root(
     }
 }
 
+/// One furniture track: the rendered rows at their natural extent — zero rows
+/// when there is nothing to show (#966).
+fn furniture_track(key: u16, lines: Vec<String>) -> (Track, Widget) {
+    (
+        Track::Natural,
+        Widget::Marked(key, Box::new(Widget::Text { lines })),
+    )
+}
+
 /// Run the claiming pass over the live frame and return the layout with the
 /// marked regions' rects.
 ///
@@ -680,6 +738,8 @@ pub(crate) fn frame_rects(layout: &widgets::Layout) -> FrameRects {
         status_rule: layout.keyed(frame_key::STATUS_RULE).unwrap_or_default(),
         status: layout.keyed(frame_key::STATUS).unwrap_or_default(),
         dialog_card: layout.keyed(frame_key::DIALOG_CARD).unwrap_or_default(),
+        tasks: layout.keyed(frame_key::TASKS).unwrap_or_default(),
+        tracked: layout.keyed(frame_key::TRACKED).unwrap_or_default(),
     }
 }
 

@@ -549,10 +549,6 @@ fn live_viewport_lines(
 
 /// Drop the oldest transcript-viewport lines until the remaining content fits
 /// the viewport rect the widget tree claimed.
-///
-/// Session tasks and child-agent rows are reserved against the viewport budget
-/// but painted in full. When they filled the viewport the composer was pushed
-/// off the bottom — typed draft hidden until the turn finished (#136).
 fn clip_viewport_prefix(
     content: &mut Vec<RenderedTranscriptLine>,
     visible_live: &mut Vec<RenderedTranscriptLine>,
@@ -573,6 +569,17 @@ fn clip_viewport_prefix(
             visible_live.remove(0);
         }
     }
+}
+
+/// The furniture lines painted into their claimed rect: the newest
+/// `claimed_rows` lines, so the oldest furniture yields first on a frame too
+/// small to afford every row (#966). An empty claim paints nothing.
+fn furniture_for_claim(lines: Vec<String>, claimed_rows: usize) -> Vec<String> {
+    if lines.len() <= claimed_rows {
+        return lines;
+    }
+    let keep_from = lines.len() - claimed_rows;
+    lines.into_iter().skip(keep_from).collect()
 }
 
 fn input_physical_rows(lines: &[String], terminal_width: usize) -> usize {
@@ -1181,7 +1188,11 @@ fn write_live_frame(
 ///
 /// The ViewModel is projected into a widget tree whose root column allocates
 /// from the bottom — status, hr, input, hr, completions (0–N) — and the live
-/// transcript viewport claims the leftover rows (#805). The completion pane is
+/// transcript viewport claims the leftover rows (#805). The session task list
+/// and the tracked child-agent rows are furniture (#966): natural tracks
+/// between the transcript viewport and the completions pane that never ride
+/// scrollable content, claim zero rows when there is nothing to show, and
+/// stay on the frame at every scroll position. The completion pane is
 /// a sibling **above** the composer: an empty pane claims zero rows, so
 /// opening or closing it never moves the composer or status rects (#232).
 pub(crate) fn plan_live_frame(
@@ -1230,42 +1241,21 @@ pub(crate) fn plan_live_frame(
             .iter()
             .map(|line| line.text.clone())
             .collect::<Vec<_>>();
-        // Session tasks and child-agent rows are reserved one row each before
-        // the live transcript claims its window.
-        let live_budget = rects
-            .transcript
-            .height
-            .saturating_sub(vm.task_rows.len() + vm.tracked_rows.len());
+        // The furniture tracks claim their own rows between the viewport and
+        // the composer (#966), so the live transcript windows over the whole
+        // viewport claim.
         let mut live_lines = if all_live_lines.is_empty() {
             Vec::new()
         } else {
-            live_viewport_lines(&all_live_lines, width, live_budget).0
+            live_viewport_lines(&all_live_lines, width, rects.transcript.height).0
         };
         pin_live_disclosure_header(vm.live_rendered, &mut live_lines, width);
         let mut visible_live = rendered_metadata_for_visible(vm.live_rendered, &live_lines);
         viewport_content.extend(visible_live.iter().cloned());
 
-        // ── 1b. Session task list (active items only) ────────────────────────
-        for row in vm.task_rows {
-            if let Some(text) = session_task_line(row, width) {
-                viewport_content.push(RenderedTranscriptLine {
-                    text,
-                    ..RenderedTranscriptLine::default()
-                });
-            }
-        }
-
-        // ── 1c. Child-agent task tree ────────────────────────────────────────
-        for row in vm.tracked_rows {
-            viewport_content.push(RenderedTranscriptLine {
-                text: tracked_agent_line(row, width),
-                ..RenderedTranscriptLine::default()
-            });
-        }
-
-        // Pin the composer in the viewport: activity rows were painted in full
-        // and could still consume every remaining row. Clip that prefix so
-        // separator + draft + status always fit.
+        // Pin the composer in the viewport: the live window was painted in
+        // full and could still consume every remaining row. Clip that prefix
+        // so separator + draft + status always fit.
         clip_viewport_prefix(
             &mut viewport_content,
             &mut visible_live,
@@ -1295,10 +1285,27 @@ pub(crate) fn plan_live_frame(
     let claimed = view_model::claim_live_frame(vm, Some(&content), 0, dialog_card_natural);
     let claimed_rects = view_model::frame_rects(&claimed);
 
-    // ── 3. Paint in claimed order: transcript, completions, hr, input, hr,
-    //       status ────────────────────────────────────────────────────────────
+    // ── 3. Paint in claimed order: transcript, task rows, tracked rows,
+    //       completions, hr, input, hr, status ────────────────────────────────
     for line in &viewport_content {
         frame.push(line.text.trim_end_matches('\r'));
+    }
+    // ── 3a. Furniture: session tasks and tracked child agents claim fixed
+    //        rows between the transcript viewport and the composer (#966).
+    //        They never scroll away with the conversation; when the frame is
+    //        too small to afford every furniture row, the oldest rows yield
+    //        first so the composer and status never move (#136).
+    for line in furniture_for_claim(
+        view_model::furniture_task_lines(vm, width),
+        claimed_rects.tasks.height,
+    ) {
+        frame.push(line);
+    }
+    for line in furniture_for_claim(
+        view_model::furniture_tracked_lines(vm, width),
+        claimed_rects.tracked.height,
+    ) {
+        frame.push(line);
     }
     // ── 3b. Slash-command completion pane, above the composer ────────────────
     // Plain text is deliberate: the raw/no-colour path stays fully speakable,
@@ -9798,6 +9805,467 @@ mod tests {
              width {width} and read {child_line:?}",
             shadow_buffer::visible_length(child_line)
         );
+    }
+
+    // ── Furniture claims (#966) ─────────────────────────────────────────────────
+
+    /// Plan one frame with session tasks, tracked child agents, and a live
+    /// transcript far taller than the viewport — the shape the maintainer's
+    /// report describes.
+    fn furniture_frame_inputs<'a>(
+        width: usize,
+        height: usize,
+        input_lines: &'a [String],
+        live: &'a [RenderedTranscriptLine],
+        tasks: &'a [activity::ActivityRow],
+        tracked: &'a [activity::ActivityRow],
+    ) -> view_model::LiveViewModel<'a> {
+        let mut vm = live_inputs(width, height, input_lines, "ready");
+        vm.live_rendered = live;
+        vm.task_rows = tasks;
+        vm.tracked_rows = tracked;
+        vm
+    }
+
+    fn active_tasks(count: usize) -> Vec<activity::ActivityRow> {
+        (0..count)
+            .map(|index| {
+                activity::ActivityRow::new(
+                    format!("move ticket {index}"),
+                    activity::ActivityState::Active,
+                )
+            })
+            .collect()
+    }
+
+    /// INVARIANT (#966): the session task rows and the tracked child-agent
+    /// rows are furniture, not scroll content. They claim fixed rows in the
+    /// root column between the transcript viewport and the completions pane —
+    /// above the separator and the status rule — and paint exactly into their
+    /// claimed rects while a live transcript far taller than the viewport
+    /// fills the claim above them. The composer keeps its anchored rect.
+    #[test]
+    fn test_furniture_claims_fixed_rows_between_transcript_and_composer() {
+        let width = 60;
+        let height = 24;
+        let live: Vec<RenderedTranscriptLine> = (0..60)
+            .map(|index| RenderedTranscriptLine {
+                text: format!("live transcript line {index}"),
+                ..RenderedTranscriptLine::default()
+            })
+            .collect();
+        let tasks = active_tasks(3);
+        let tracked = vec![activity::ActivityRow::new(
+            "child agent",
+            activity::ActivityState::Active,
+        )];
+        let draft = vec![String::new()];
+        let vm = furniture_frame_inputs(width, height, &draft, &live, &tasks, &tracked);
+        let mut autocomplete = AutocompleteState::new();
+        let frame = plan_live_frame(&vm, &mut autocomplete);
+
+        assert_eq!(
+            frame.rects.tasks.height, 3,
+            "INVARIANT: every unfinished session task claims one furniture row; \
+             rects were {:?}",
+            frame.rects
+        );
+        assert_eq!(
+            frame.rects.tracked.height, 1,
+            "INVARIANT: the tracked child-agent row claims one furniture row; \
+             rects were {:?}",
+            frame.rects
+        );
+        assert_eq!(
+            frame.rects.tasks.y,
+            frame.rects.transcript.bottom(),
+            "INVARIANT: the furniture sits directly under the transcript \
+             viewport, not inside it; rects were {:?}",
+            frame.rects
+        );
+        let chrome_top = frame
+            .rects
+            .completions
+            .map(|rect| rect.y)
+            .unwrap_or(frame.rects.separator.y);
+        assert_eq!(
+            frame.rects.tracked.bottom(),
+            chrome_top,
+            "INVARIANT: the furniture ends exactly where the bottom chrome \
+             begins; rects were {:?}",
+            frame.rects
+        );
+        let painted = frame.to_shadow_buffer(width, height).rows_as_text();
+        for index in 0..3 {
+            assert!(
+                painted
+                    .iter()
+                    .any(|row| row.contains(&format!("move ticket {index}"))),
+                "INVARIANT: task row {index} must paint into its claimed furniture \
+                 rect while the transcript streams; visible rows were {painted:?}"
+            );
+        }
+        assert!(
+            painted.iter().any(|row| row.contains("child agent")),
+            "INVARIANT: the tracked child-agent row must paint into its claimed \
+             furniture rect; visible rows were {painted:?}"
+        );
+        let separator_row = painted
+            .iter()
+            .position(|row| row.contains("──"))
+            .expect("separator painted");
+        for (label, marker) in [("task 0", "move ticket 0"), ("tracked", "child agent")] {
+            let row = painted
+                .iter()
+                .position(|row| row.contains(marker))
+                .unwrap_or_else(|| panic!("{label} furniture row painted; rows {painted:?}"));
+            assert!(
+                row < separator_row,
+                "INVARIANT: {label} furniture paints above the session separator \
+                 (between the transcript viewport and the composer); row {row}, \
+                 separator {separator_row}, rows {painted:?}"
+            );
+        }
+        assert!(
+            frame.physical_rows(width) <= height,
+            "INVARIANT: the furniture claims must keep the frame inside the \
+             terminal; physical_rows={} height={height}",
+            frame.physical_rows(width)
+        );
+        // The composer stays anchored: identical frame without the furniture.
+        let plain_draft = vec![String::new()];
+        let plain_vm = furniture_frame_inputs(width, height, &plain_draft, &live, &[], &[]);
+        let plain = plan_live_frame(&plain_vm, &mut AutocompleteState::new());
+        assert_eq!(
+            plain.rects.composer, frame.rects.composer,
+            "INVARIANT: adding furniture must not move the composer — the \
+             transcript viewport yields instead; plain was {:?}, furniture was {:?}",
+            plain.rects, frame.rects
+        );
+    }
+
+    /// INVARIANT (#966): furniture visibility does not depend on the
+    /// conversation's scroll position. With a committed transcript far taller
+    /// than the viewport, the composed screen keeps every furniture row
+    /// between the transcript window and the separator at bottom, middle, and
+    /// top scroll offsets, while the transcript rows above shift behind them.
+    #[test]
+    fn test_furniture_renders_at_claimed_rects_at_every_scroll_position() {
+        use crate::cli::messages::WorkUnit;
+        let (mut renderer, _) = committed_tool_result_renderer(10);
+        for index in 0..12 {
+            let unit = Arc::new(WorkUnit::new(format!("turn {index}")));
+            unit.set_response(format!("assistant reply {index}"));
+            unit.set_complete();
+            let id = renderer.add_trait_message(unit.clone());
+            renderer.printed_ids.insert(id);
+        }
+        struct FixedRows(Vec<activity::ActivityRow>);
+        impl activity::ActivityRows for FixedRows {
+            fn rows(&self) -> Vec<activity::ActivityRow> {
+                self.0.clone()
+            }
+        }
+        renderer.set_task_rows(Arc::new(FixedRows(active_tasks(3))));
+        renderer.apply_activity(activity::ActivityUpdate::Upsert {
+            id: uuid::Uuid::new_v4(),
+            row: activity::ActivityRow::new("child agent", activity::ActivityState::Active),
+            usage: activity::ActivityUsage::default(),
+        });
+        let live_unit = Arc::new(WorkUnit::new("streaming"));
+        live_unit.set_response("a live streaming reply line");
+        renderer.add_trait_message(live_unit);
+
+        let width = 80usize;
+        let height = 24usize;
+        let mut furniture_slots = None;
+        for (label, offset) in [("bottom", 0usize), ("middle", 10), ("top", 60)] {
+            renderer.transcript_scroll.set_offset(offset);
+            let live_rows = renderer
+                .live_geometry(width as u16, height as u16)
+                .unwrap()
+                .0;
+            let transcript_budget = height.saturating_sub(live_rows);
+            let projected = renderer.projected_lines(
+                visible_printed_messages(
+                    &renderer.output_manager.get_messages(),
+                    &renderer.printed_ids,
+                ),
+                width,
+            );
+            let (prefix, _) =
+                scroll_window_split(&projected, width, renderer.transcript_scroll.offset());
+            let transcript: Vec<String> = projected[..prefix]
+                .iter()
+                .map(|line| line.text.clone())
+                .collect();
+            let transcript = viewport_tail_lines(&transcript, width, transcript_budget);
+            let plan = viewport_redraw_plan(height, live_rows, transcript.len());
+            let sources = renderer.live_frame_sources(width);
+            let vm = live_view_model(&sources, width, height, None, None);
+            let mut autocomplete = renderer.autocomplete_state.clone();
+            let frame = plan_live_frame(&vm, &mut autocomplete);
+            let mut screen: Vec<String> = transcript.clone();
+            screen.extend(frame.lines.iter().map(|line| {
+                let plain: String = strip_sgr_probe(line);
+                plain
+            }));
+            let find = |needle: &str| {
+                screen
+                    .iter()
+                    .position(|row| row.contains(needle))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{needle} must render on the composed screen at scroll \
+                             {label} (offset {offset}); screen was {screen:?}"
+                        )
+                    })
+            };
+            let live_frame_start = transcript.len();
+            let slots = [
+                find("move ticket 0"),
+                find("move ticket 1"),
+                find("move ticket 2"),
+                find("child agent"),
+                find("──"),
+            ];
+            // The furniture rows sit in the live frame — below the transcript
+            // window and above the session separator — on the same frame slots
+            // at every offset.
+            for slot in slots.iter().take(4) {
+                assert!(
+                    *slot >= live_frame_start && *slot < live_frame_start + frame.lines.len(),
+                    "INVARIANT: furniture must paint in the live frame at scroll \
+                     {label}; slot {slot} of {live_frame_start} transcript rows and \
+                     {} frame rows; screen was {screen:?}",
+                    frame.lines.len()
+                );
+            }
+            assert!(
+                slots[4] > slots[3],
+                "INVARIANT: the separator paints below the tracked row at scroll \
+                 {label}; slots {slots:?}"
+            );
+            let frame_slots: Vec<usize> = slots[..4]
+                .iter()
+                .map(|slot| slot - live_frame_start)
+                .collect();
+            if let Some(previous) = &furniture_slots {
+                assert_eq!(
+                    previous, &frame_slots,
+                    "INVARIANT: the furniture rows must hold the same live-frame \
+                     slots at every scroll position; bottom was {previous:?}, \
+                     {label} was {frame_slots:?}"
+                );
+            }
+            furniture_slots = Some(frame_slots);
+            assert!(
+                frame.physical_rows(width) + transcript.len() <= height,
+                "INVARIANT: the composed screen must fit the terminal at scroll \
+                 {label}; live frame rows {} + transcript {} > {height}",
+                frame.physical_rows(width),
+                transcript.len()
+            );
+        }
+        renderer.is_active = false;
+    }
+
+    fn strip_sgr_probe(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for nc in chars.by_ref() {
+                        if nc.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// INVARIANT (#966): with no session tasks and no tracked child agents,
+    /// the furniture tracks claim zero rows and paint nothing — the frame
+    /// keeps exactly the chrome it had before, so the composer and status
+    /// never move (#232's rule extended to the furniture).
+    #[test]
+    fn test_furniture_claims_zero_rows_when_empty() {
+        let width = 60;
+        let height = 24;
+        let live: Vec<RenderedTranscriptLine> = (0..40)
+            .map(|index| RenderedTranscriptLine {
+                text: format!("live line {index}"),
+                ..RenderedTranscriptLine::default()
+            })
+            .collect();
+        let draft = vec![String::new()];
+        let vm = furniture_frame_inputs(width, height, &draft, &live, &[], &[]);
+        let frame = plan_live_frame(&vm, &mut AutocompleteState::new());
+        assert!(
+            frame.rects.tasks.is_empty() && frame.rects.tracked.is_empty(),
+            "INVARIANT: empty furniture sources claim zero rows; rects were {:?}",
+            frame.rects
+        );
+        let painted = frame
+            .lines
+            .iter()
+            .filter(|line| line.contains("move ticket") || line.contains("child agent"))
+            .count();
+        assert_eq!(
+            0, painted,
+            "INVARIANT: empty furniture sources paint nothing; frame was {:?}",
+            frame.lines
+        );
+        // The transcript viewport reclaims every row the tracks did not claim.
+        assert_eq!(
+            frame.rects.transcript.bottom(),
+            frame
+                .rects
+                .completions
+                .map(|rect| rect.y)
+                .unwrap_or(frame.rects.separator.y),
+            "INVARIANT: the transcript viewport fills the space above the bottom \
+             chrome when the furniture is empty; rects were {:?}",
+            frame.rects
+        );
+    }
+
+    /// INVARIANT (#966, visibility derived): a finished session task claims no
+    /// furniture row — the draw skips it, and the claim shrinks with the
+    /// list. A finished tracked row still renders its `✓` state, so the tree
+    /// stays legible while the child winds down.
+    #[test]
+    fn test_finished_session_task_claims_zero_rows_but_tracked_done_renders() {
+        let width = 60;
+        let height = 24;
+        let draft = vec![String::new()];
+        let tasks = vec![
+            activity::ActivityRow::new("finished task", activity::ActivityState::Done),
+            activity::ActivityRow::new("active task", activity::ActivityState::Active),
+        ];
+        let tracked = vec![{
+            let mut row =
+                activity::ActivityRow::new("finished agent", activity::ActivityState::Done);
+            row.detail = Some(" · done".to_string());
+            row
+        }];
+        let mut vm = live_inputs(width, height, &draft, "ready");
+        vm.task_rows = &tasks;
+        vm.tracked_rows = &tracked;
+        let frame = plan_live_frame(&vm, &mut AutocompleteState::new());
+
+        assert_eq!(
+            frame.rects.tasks.height, 1,
+            "INVARIANT: a finished session task claims no furniture row; rects \
+             were {:?}",
+            frame.rects
+        );
+        assert!(
+            !frame
+                .lines
+                .iter()
+                .any(|line| line.contains("finished task")),
+            "a finished session task must not paint; frame was {:?}",
+            frame.lines
+        );
+        assert!(
+            frame.lines.iter().any(|line| line.contains("active task")),
+            "the unfinished session task must paint; frame was {:?}",
+            frame.lines
+        );
+        assert_eq!(
+            frame.rects.tracked.height, 1,
+            "INVARIANT: a finished tracked row still renders its state; rects \
+             were {:?}",
+            frame.rects
+        );
+        assert!(
+            frame
+                .lines
+                .iter()
+                .any(|line| line.contains('✓') && line.contains("finished agent")),
+            "the finished tracked row paints with its check glyph; frame was {:?}",
+            frame.lines
+        );
+    }
+
+    /// INVARIANT (#966, #136): when the frame cannot afford every furniture
+    /// row, the oldest rows yield first and the composer stays visible — the
+    /// frame never overflows the terminal.
+    #[test]
+    fn test_furniture_yields_oldest_rows_first_and_keeps_the_composer() {
+        let width = 40;
+        let tasks = active_tasks(12);
+        let tracked = vec![activity::ActivityRow::new(
+            "spawned agent",
+            activity::ActivityState::Active,
+        )];
+        let input = vec!["draft".to_string()];
+        for height in [8usize, 12, 24] {
+            let mut vm = live_inputs(width, height, &input, "running");
+            vm.task_rows = &tasks;
+            vm.tracked_rows = &tracked;
+            let frame = plan_live_frame(&vm, &mut AutocompleteState::new());
+            let painted: Vec<String> = frame
+                .lines
+                .iter()
+                .map(|line| strip_sgr_probe(line))
+                .collect();
+            assert!(
+                frame.physical_rows(width) <= height,
+                "INVARIANT: the frame must fit the terminal while furniture \
+                 yields; height={height} physical_rows={} frame={:?}",
+                frame.physical_rows(width),
+                frame.lines
+            );
+            assert!(
+                painted.iter().any(|row| row.contains("draft")),
+                "INVARIANT: the composer draft must stay visible while furniture \
+                 yields; height={height} rows {painted:?}"
+            );
+            // The oldest task yields before the newest whenever the frame
+            // cannot afford the whole list: at 24 rows everything fits, so
+            // only the smaller frames squeeze.
+            let kept: Vec<&String> = painted
+                .iter()
+                .filter(|row| row.contains("move ticket"))
+                .collect();
+            let squeezed = height < 4 + tasks.len() + tracked.len() + 1;
+            if squeezed {
+                assert!(
+                    kept.len() < tasks.len(),
+                    "INVARIANT: a squeezed frame must drop furniture rows; \
+                     height={height} kept {} of {} tasks",
+                    kept.len(),
+                    tasks.len()
+                );
+                assert!(
+                    kept.iter().any(|row| row.contains("move ticket 11")),
+                    "INVARIANT: the newest furniture rows survive the squeeze; \
+                     height={height} kept {kept:?}"
+                );
+                assert!(
+                    !kept.iter().any(|row| row.contains("move ticket 0")),
+                    "INVARIANT: the oldest furniture rows yield first; height={height} \
+                     kept {kept:?}"
+                );
+            } else {
+                assert_eq!(
+                    kept.len(),
+                    tasks.len(),
+                    "INVARIANT: an affording frame keeps every furniture row; \
+                     height={height} kept {kept:?}"
+                );
+            }
+        }
     }
 
     #[test]
