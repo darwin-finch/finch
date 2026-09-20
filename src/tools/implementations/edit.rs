@@ -23,7 +23,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
 
 use super::propose::{open_review_artifact, reconstruct_reviewed_text};
-use crate::cli::diff::FileDiff;
+use crate::cli::{sanitize_multiline, sanitize_terminal, FileDiff};
 
 /// Separates the machine-read decision header from the human-read diff.
 ///
@@ -94,7 +94,7 @@ fn directive_on_line(line: &str) -> Option<Result<&str, ()>> {
 /// apart: anything the parser would read as a directive is quoted, and a
 /// quoted line is never read as a directive.
 fn header_comment(line: &str) -> String {
-    let clean = crate::cli::diff::sanitize_terminal(line);
+    let clean = sanitize_terminal(line);
     let candidate = format!("# {}", clean);
     if directive_on_line(&candidate).is_some() {
         format!("# > {}\n", clean)
@@ -213,7 +213,7 @@ fn header_decision(header: &str) -> HeaderDecision {
                 return HeaderDecision::Cancel(format!(
                     "the line {:?} looks like an action directive but is not one, so Finch \
                      did not assume it meant approval",
-                    crate::cli::diff::sanitize_terminal(line.trim())
+                    sanitize_terminal(line.trim())
                 ))
             }
             Some(Ok("cancel")) => {
@@ -224,7 +224,7 @@ fn header_decision(header: &str) -> HeaderDecision {
             Some(Ok(other)) => {
                 return HeaderDecision::Cancel(format!(
                     "the artifact asked for the unrecognised action {:?}",
-                    crate::cli::diff::sanitize_terminal(other)
+                    sanitize_terminal(other)
                 ))
             }
         }
@@ -274,7 +274,7 @@ fn user_prose(returned: &str, expected: &str) -> String {
     if prose.is_empty() {
         return "(no explanation given)".to_string();
     }
-    crate::cli::diff::sanitize_multiline(&prose.join("\n"))
+    sanitize_multiline(&prose.join("\n"))
 }
 
 /// Read the target as text, refusing rather than mangling non-UTF-8 content.
@@ -342,7 +342,7 @@ fn path_still_names_handle(_file_path: &str, _handle: &File) -> Result<bool> {
 }
 
 fn ensure_review_path_is_exact(file_path: &str) -> Result<()> {
-    let shown = crate::cli::diff::sanitize_terminal(file_path);
+    let shown = sanitize_terminal(file_path);
     if shown == file_path {
         return Ok(());
     }
@@ -703,7 +703,7 @@ pub fn generate_edit_diff(
     } else {
         original.replacen(old_string, new_string, 1)
     };
-    crate::cli::diff::FileDiff::from_texts("file", original, &new_content).to_unified()
+    FileDiff::from_texts("file", original, &new_content).to_unified()
 }
 
 #[cfg(test)]
@@ -1684,7 +1684,7 @@ mod tests {
             "new line A\nnew line B",
             1,
         );
-        let parsed = crate::cli::diff::FileDiff::parse(&diff).unwrap();
+        let parsed = FileDiff::parse(&diff).unwrap();
         assert_eq!((parsed.added(), parsed.removed()), (2, 1));
     }
 

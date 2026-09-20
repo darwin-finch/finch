@@ -1034,7 +1034,7 @@ mod tests {
         // warning that carries the name in `phase = ...` reaches the terminal
         // as "⚠️ [startup] startup phase exceeded its budget". This asserts
         // through that exact visitor.
-        use crate::cli::output_layer::MessageVisitor;
+        use crate::cli::MessageVisitor;
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt as _;
 

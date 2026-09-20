@@ -696,7 +696,7 @@ impl IpcClient {
         &self,
         brain: &str,
         lease_id: crate::brain::RunnerLeaseId,
-        event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
+        event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::ReplEvent>,
     ) -> Result<BrainRunnerBootstrap> {
         let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl { event_tx });
         let mut request = self.client.register_brain_runner_request();
@@ -802,7 +802,7 @@ fn ensure_protocol_generation(protocol_version: u32, required_version: u32) -> R
 }
 
 struct BrainRunnerImpl {
-    event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::ReplEvent>,
 }
 
 fn effect_audit_reservation_proxy(
@@ -1127,43 +1127,41 @@ impl brain_runner::Server for BrainRunnerImpl {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
-            .send(
-                crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(
-                    crate::server::RunnerProgramRequest {
-                        brain,
-                        run_id,
-                        request_seq: request.get_request_seq(),
-                        language,
-                        source,
-                        interaction: match request.get_interaction() {
-                            Ok(finch_ipc_capnp::BrainProgramInteraction::Interactive) => {
-                                crate::server::RunnerProgramInteraction::Interactive
-                            }
-                            Ok(finch_ipc_capnp::BrainProgramInteraction::Noninteractive) => {
-                                crate::server::RunnerProgramInteraction::Noninteractive
-                            }
-                            Err(error) => return Promise::err(error.into()),
-                        },
-                        grant_ceiling: if request.get_has_grant_ceiling() {
-                            match request
-                                .get_grant_ceiling()
-                                .map_err(anyhow::Error::new)
-                                .and_then(crate::ipc::codec::decode_effects)
-                            {
-                                Ok(grants) => Some(grants),
-                                Err(error) => {
-                                    return Promise::err(capnp::Error::failed(error.to_string()))
-                                }
-                            }
-                        } else {
-                            None
-                        },
-                        control_tx: Some(control_tx),
-                        effect_audit: Some(effect_audit),
-                        response_tx,
+            .send(crate::cli::ReplEvent::NamedBrainProgramRequested(
+                crate::server::RunnerProgramRequest {
+                    brain,
+                    run_id,
+                    request_seq: request.get_request_seq(),
+                    language,
+                    source,
+                    interaction: match request.get_interaction() {
+                        Ok(finch_ipc_capnp::BrainProgramInteraction::Interactive) => {
+                            crate::server::RunnerProgramInteraction::Interactive
+                        }
+                        Ok(finch_ipc_capnp::BrainProgramInteraction::Noninteractive) => {
+                            crate::server::RunnerProgramInteraction::Noninteractive
+                        }
+                        Err(error) => return Promise::err(error.into()),
                     },
-                ),
-            )
+                    grant_ceiling: if request.get_has_grant_ceiling() {
+                        match request
+                            .get_grant_ceiling()
+                            .map_err(anyhow::Error::new)
+                            .and_then(crate::ipc::codec::decode_effects)
+                        {
+                            Ok(grants) => Some(grants),
+                            Err(error) => {
+                                return Promise::err(capnp::Error::failed(error.to_string()))
+                            }
+                        }
+                    } else {
+                        None
+                    },
+                    control_tx: Some(control_tx),
+                    effect_audit: Some(effect_audit),
+                    response_tx,
+                },
+            ))
             .is_err()
         {
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
@@ -1271,7 +1269,7 @@ impl brain_runner::Server for BrainRunnerImpl {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
-            .send(crate::cli::repl_event::ReplEvent::NamedBrainTurnRequested(
+            .send(crate::cli::ReplEvent::NamedBrainTurnRequested(
                 crate::server::RunnerTurnRequest {
                     brain,
                     run_id,
@@ -1387,15 +1385,13 @@ impl brain_runner::Server for BrainRunnerImpl {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
-            .send(
-                crate::cli::repl_event::ReplEvent::NamedBrainRunCancelRequested(
-                    crate::server::RunnerCancelRequest {
-                        brain,
-                        run_id,
-                        response_tx,
-                    },
-                ),
-            )
+            .send(crate::cli::ReplEvent::NamedBrainRunCancelRequested(
+                crate::server::RunnerCancelRequest {
+                    brain,
+                    run_id,
+                    response_tx,
+                },
+            ))
             .is_err()
         {
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
@@ -1460,19 +1456,17 @@ impl brain_runner::Server for BrainRunnerImpl {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
-            .send(
-                crate::cli::repl_event::ReplEvent::NamedBrainMemoryProjectionRequested(
-                    crate::server::RunnerMemoryProjectionRequest {
-                        brain_id,
-                        brain: text(request.get_brain()),
-                        run_id,
-                        request_seq: request.get_request_seq(),
-                        prompt: text(request.get_prompt()),
-                        rendered: text(request.get_rendered()),
-                        response_tx,
-                    },
-                ),
-            )
+            .send(crate::cli::ReplEvent::NamedBrainMemoryProjectionRequested(
+                crate::server::RunnerMemoryProjectionRequest {
+                    brain_id,
+                    brain: text(request.get_brain()),
+                    run_id,
+                    request_seq: request.get_request_seq(),
+                    prompt: text(request.get_prompt()),
+                    rendered: text(request.get_rendered()),
+                    response_tx,
+                },
+            ))
             .is_err()
         {
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));

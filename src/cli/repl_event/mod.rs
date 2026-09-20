@@ -50,5 +50,9 @@ pub use parts::{
     ContextLimits, DaemonParts, GenerationParts, LlmChannels, LlmGeneration, LlmRuntime,
     LlmSession, LlmTools, LlmUi, RuntimeParts, SessionParts, ToolParts, UiParts,
 };
+pub(crate) use plan_handler::{
+    is_tool_allowed_in_mode, PLANNING_ALLOWED_TOOLS, PLANNING_ALLOWED_TOOL_ALIASES,
+};
 pub use query_state::{QueryMetadata, QueryState, QueryStateManager};
+pub use tool_display::{format_token_count, format_tool_label};
 pub use tool_execution::ToolExecutionCoordinator;

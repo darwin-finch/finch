@@ -5,10 +5,10 @@ mod brain_approval;
 mod brain_runner;
 mod brain_service;
 mod feedback_handler;
-pub mod handlers;
+mod handlers;
 mod middleware;
 mod openai_handlers;
-pub mod openai_types; // Public for client access
+mod openai_types;
 
 pub use brain_approval::BrainApprovalBroker;
 pub use brain_runner::{
@@ -28,6 +28,11 @@ pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
 };
 pub use feedback_handler::{handle_feedback, handle_training_status};
+#[cfg(test)]
+pub(crate) use handlers::{
+    authorize_pending_remote_attachment, create_remote_brain_router,
+    drop_next_remote_brain_reply_after_commit, execute_authorized_remote_initialization,
+};
 pub use handlers::{
     create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
 };

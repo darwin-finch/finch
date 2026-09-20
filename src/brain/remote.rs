@@ -2247,12 +2247,12 @@ mod tests {
                         tokio::net::TcpListener::from_std(daemon_listener).unwrap();
                     let brain = axum::serve(
                         brain_listener,
-                        crate::server::handlers::create_remote_brain_router(Arc::clone(&state))
+                        crate::server::create_remote_brain_router(Arc::clone(&state))
                             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
                     );
                     let daemon = axum::serve(
                         daemon_listener,
-                        crate::server::handlers::create_router(state).into_make_service(),
+                        crate::server::create_router(state).into_make_service(),
                     );
                     ready_tx.send(()).unwrap();
                     let _ = tokio::join!(brain, daemon);
@@ -3478,7 +3478,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let app = crate::server::handlers::create_remote_brain_router(state);
+        let app = crate::server::create_remote_brain_router(state);
         let handle = axum_server::Handle::new();
         let server = tokio::spawn(
             axum_server::bind_rustls(
@@ -4517,7 +4517,7 @@ mod tests {
             };
             let (runner_tx, runner_rx) = mpsc::unbounded_channel();
             lifecycle.register_test_runner("shared", lease.lease_id, runner_tx);
-            let app = crate::server::handlers::create_router(server);
+            let app = crate::server::create_router(server);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let task = tokio::spawn(async move {
@@ -4639,7 +4639,7 @@ mod tests {
                 }))
                 .unwrap();
         });
-        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        crate::server::drop_next_remote_brain_reply_after_commit();
         assert!(client
             .push_with_handle(program.clone(), &handle)
             .await
@@ -4755,7 +4755,7 @@ mod tests {
             )
             .await
             .unwrap();
-        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        crate::server::drop_next_remote_brain_reply_after_commit();
         assert!(client
             .request_runner_handoff_with_handle(
                 "runner-b",
@@ -4810,7 +4810,7 @@ mod tests {
             .prepare_cancel_runner_handoff_mutation(handoff.handoff_id)
             .await
             .unwrap();
-        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        crate::server::drop_next_remote_brain_reply_after_commit();
         assert!(client
             .cancel_runner_handoff_with_handle(handoff.handoff_id, &cancel_handle,)
             .await
@@ -4874,7 +4874,7 @@ mod tests {
             )
             .await
             .unwrap();
-        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        crate::server::drop_next_remote_brain_reply_after_commit();
         assert!(client
             .create_schedule_with_handle(
                 ProgramLanguage::Lisp,
@@ -4930,7 +4930,7 @@ mod tests {
             .prepare_cancel_schedule_mutation(schedule.schedule_id)
             .await
             .unwrap();
-        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        crate::server::drop_next_remote_brain_reply_after_commit();
         assert!(client
             .cancel_schedule_with_handle(schedule.schedule_id, &cancel_schedule_handle,)
             .await
@@ -4981,7 +4981,7 @@ mod tests {
             assert_eq!(request.run_id, cancellable_run_id);
             request.response_tx.send(Ok(true)).unwrap();
         });
-        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        crate::server::drop_next_remote_brain_reply_after_commit();
         assert!(client
             .cancel_run_with_handle(cancellable.run_id, &cancel_run_handle,)
             .await
@@ -5242,7 +5242,7 @@ mod tests {
             decision: serde_json::json!({"choice": "approve_once"}),
         };
         let decision_handle = client.prepare_push_mutation(&decision).await.unwrap();
-        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        crate::server::drop_next_remote_brain_reply_after_commit();
         assert!(client
             .push_with_handle(decision.clone(), &decision_handle)
             .await
@@ -5320,7 +5320,7 @@ mod tests {
         ) -> Response {
             let attachment_id = AttachmentId(connection.attachment_id);
             let connection_id = crate::brain::ConnectionId(connection.connection_id);
-            let claims = match crate::server::handlers::authorize_pending_remote_attachment(
+            let claims = match crate::server::authorize_pending_remote_attachment(
                 &fixture.lifecycle,
                 &fixture.credentials,
                 &headers,
@@ -5360,7 +5360,7 @@ mod tests {
                     let reply = match command.kind {
                         crate::ipc::BrainRemoteCommandKind::ScheduleInitialization {
                             next_due_ms,
-                        } => crate::server::handlers::execute_authorized_remote_initialization(
+                        } => crate::server::execute_authorized_remote_initialization(
                             &lifecycle,
                             &claims,
                             &name,
@@ -5869,8 +5869,7 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("target runner callback closed");
-            let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = request
-            else {
+            let crate::cli::ReplEvent::NamedBrainProgramRequested(request) = request else {
                 panic!("target callback received the wrong frontend event")
             };
             assert_eq!(request.brain, brain);

@@ -1,8 +1,7 @@
 // Integration test for tabbed dialog functionality
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use finch::cli::llm_dialogs::{build_annotations, Question, QuestionOption};
-use finch::cli::tui::{TabbedDialog, TabbedDialogResult};
+use finch::cli::{build_annotations, Question, QuestionOption, TabbedDialog, TabbedDialogResult};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)

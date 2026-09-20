@@ -126,7 +126,7 @@ pub fn logging_enabled() -> bool {
 #[macro_export]
 macro_rules! output_user {
     ($($arg:tt)*) => {{
-        let output_mgr = $crate::cli::global_output::global_output();
+        let output_mgr = $crate::cli::global_output();
         output_mgr.write_user(format!($($arg)*));
     }};
 }
@@ -138,13 +138,13 @@ macro_rules! output_user {
 macro_rules! output_response {
     ($($arg:tt)*) => {{
         let content = format!($($arg)*);
-        if $crate::cli::global_output::is_non_interactive() {
+        if $crate::cli::is_non_interactive() {
             // Non-interactive mode: print to stdout
             use std::io::Write;
             let _ = writeln!(std::io::stdout(), "{}", content);
         } else {
             // Interactive mode: write to buffer for TUI
-            let output_mgr = $crate::cli::global_output::global_output();
+            let output_mgr = $crate::cli::global_output();
             output_mgr.write_response(content);
         }
     }};
@@ -154,7 +154,7 @@ macro_rules! output_response {
 #[macro_export]
 macro_rules! output_response_append {
     ($($arg:tt)*) => {{
-        let output_mgr = $crate::cli::global_output::global_output();
+        let output_mgr = $crate::cli::global_output();
         output_mgr.append_response(format!($($arg)*));
     }};
 }
@@ -163,7 +163,7 @@ macro_rules! output_response_append {
 #[macro_export]
 macro_rules! output_tool {
     ($tool:expr, $($arg:tt)*) => {{
-        let output_mgr = $crate::cli::global_output::global_output();
+        let output_mgr = $crate::cli::global_output();
         output_mgr.write_tool($tool, format!($($arg)*));
     }};
 }
@@ -175,14 +175,14 @@ macro_rules! output_tool {
 macro_rules! output_status {
     ($($arg:tt)*) => {{
         let content = format!($($arg)*);
-        if $crate::cli::global_output::is_non_interactive() {
+        if $crate::cli::is_non_interactive() {
             // Non-interactive mode: only print if logging enabled
-            if $crate::cli::global_output::logging_enabled() {
+            if $crate::cli::logging_enabled() {
                 eprintln!("[STATUS] {}", content);
             }
         } else {
             // Interactive mode: write to scrollback buffer for visibility
-            let output_mgr = $crate::cli::global_output::global_output();
+            let output_mgr = $crate::cli::global_output();
             output_mgr.write_progress(content);
         }
     }};
@@ -195,14 +195,14 @@ macro_rules! output_status {
 macro_rules! output_error {
     ($($arg:tt)*) => {{
         let content = format!($($arg)*);
-        if $crate::cli::global_output::is_non_interactive() {
+        if $crate::cli::is_non_interactive() {
             // Non-interactive mode: print to stderr if logging enabled
-            if $crate::cli::global_output::logging_enabled() {
+            if $crate::cli::logging_enabled() {
                 eprintln!("[ERROR] {}", content);
             }
         } else {
             // Interactive mode: write to buffer for TUI
-            let output_mgr = $crate::cli::global_output::global_output();
+            let output_mgr = $crate::cli::global_output();
             output_mgr.write_error(content);
         }
     }};
@@ -215,14 +215,14 @@ macro_rules! output_error {
 macro_rules! output_progress {
     ($($arg:tt)*) => {{
         let content = format!($($arg)*);
-        if $crate::cli::global_output::is_non_interactive() {
+        if $crate::cli::is_non_interactive() {
             // Non-interactive mode: only print if logging enabled
-            if $crate::cli::global_output::logging_enabled() {
+            if $crate::cli::logging_enabled() {
                 eprintln!("[PROGRESS] {}", content);
             }
         } else {
             // Interactive mode: write to buffer for TUI
-            let output_mgr = $crate::cli::global_output::global_output();
+            let output_mgr = $crate::cli::global_output();
             output_mgr.write_progress(content);
         }
     }};
@@ -235,8 +235,8 @@ macro_rules! output_progress {
 #[macro_export]
 macro_rules! status_training {
     ($queries:expr, $local_pct:expr, $quality:expr) => {{
-        if $crate::cli::global_output::is_non_interactive() {
-            if $crate::cli::global_output::logging_enabled() {
+        if $crate::cli::is_non_interactive() {
+            if $crate::cli::logging_enabled() {
                 eprintln!(
                     "[STATUS] Training: {} queries | Local: {:.0}% | Quality: {:.2}",
                     $queries,
@@ -245,7 +245,7 @@ macro_rules! status_training {
                 );
             }
         } else {
-            let status_bar = $crate::cli::global_output::global_status();
+            let status_bar = $crate::cli::global_status();
             status_bar.update_training_stats($queries, $local_pct, $quality);
         }
     }};
@@ -256,8 +256,8 @@ macro_rules! status_training {
 #[macro_export]
 macro_rules! status_download {
     ($name:expr, $pct:expr, $downloaded:expr, $total:expr) => {{
-        if $crate::cli::global_output::is_non_interactive() {
-            if $crate::cli::global_output::logging_enabled() {
+        if $crate::cli::is_non_interactive() {
+            if $crate::cli::logging_enabled() {
                 eprintln!(
                     "[STATUS] Downloading {}: {:.0}% ({}/{})",
                     $name,
@@ -267,7 +267,7 @@ macro_rules! status_download {
                 );
             }
         } else {
-            let status_bar = $crate::cli::global_output::global_status();
+            let status_bar = $crate::cli::global_status();
             status_bar.update_download_progress($name, $pct, $downloaded, $total);
         }
     }};
@@ -279,12 +279,12 @@ macro_rules! status_download {
 macro_rules! status_operation {
     ($($arg:tt)*) => {{
         let content = format!($($arg)*);
-        if $crate::cli::global_output::is_non_interactive() {
-            if $crate::cli::global_output::logging_enabled() {
+        if $crate::cli::is_non_interactive() {
+            if $crate::cli::logging_enabled() {
                 eprintln!("[STATUS] {}", content);
             }
         } else {
-            let status_bar = $crate::cli::global_output::global_status();
+            let status_bar = $crate::cli::global_status();
             status_bar.update_operation(content);
         }
     }};
@@ -294,7 +294,7 @@ macro_rules! status_operation {
 #[macro_export]
 macro_rules! status_clear_operation {
     () => {{
-        let status_bar = $crate::cli::global_output::global_status();
+        let status_bar = $crate::cli::global_status();
         status_bar.clear_operation();
     }};
 }

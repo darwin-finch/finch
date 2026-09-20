@@ -482,10 +482,7 @@ impl ToolExecutor {
             // The single authoritative planning gate (see #465): the same
             // function the dispatch path uses, so a tool that passes dispatch
             // is not refused here by a divergent copy of the list.
-            if !crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode(
-                &tool_use.name,
-                &current_mode,
-            ) {
+            if !crate::cli::is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
                 drop(current_mode);
                 warn!("Tool '{}' blocked in planning mode", tool_use.name);
                 return Ok(ToolResult::error(
@@ -495,7 +492,7 @@ impl ToolExecutor {
                          Available tools: {}\n\
                          Use present_plan to show your plan for approval.",
                         tool_use.name,
-                        crate::cli::repl_event::plan_handler::PLANNING_ALLOWED_TOOLS.join(", ")
+                        crate::cli::PLANNING_ALLOWED_TOOLS.join(", ")
                     ),
                 ));
             }
@@ -1075,10 +1072,10 @@ mod tests {
     /// verdict, in both directions.
     #[tokio::test]
     async fn test_plan_mode_live_check_agrees_with_dispatch_gate() {
-        use crate::cli::repl_event::plan_handler::{
+        use crate::cli::ReplMode;
+        use crate::cli::{
             is_tool_allowed_in_mode, PLANNING_ALLOWED_TOOLS, PLANNING_ALLOWED_TOOL_ALIASES,
         };
-        use crate::cli::ReplMode;
 
         let spellings: Vec<String> = PLANNING_ALLOWED_TOOLS
             .iter()

@@ -10,7 +10,7 @@ use tracing::{debug, error, info};
 
 use crate::daemon::ensure_daemon_running;
 use crate::providers::{ContentBlock, Message};
-use crate::server::openai_types::{
+use crate::server::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionDefinition, Tool,
 };
 use crate::tools::ToolExecutor;
@@ -545,10 +545,10 @@ impl DaemonClient {
                         text_parts.push(text.clone());
                     }
                     ContentBlock::ToolUse { id, name, input } => {
-                        tool_calls.push(crate::server::openai_types::ToolCall {
+                        tool_calls.push(crate::server::ToolCall {
                             id: id.clone(),
                             tool_type: "function".to_string(),
-                            function: crate::server::openai_types::FunctionCall {
+                            function: crate::server::FunctionCall {
                                 name: name.clone(),
                                 arguments: serde_json::to_string(input).unwrap_or_default(),
                             },
