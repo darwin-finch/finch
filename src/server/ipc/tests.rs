@@ -3,7 +3,7 @@ use super::{
     ipc_call_span, require_approval_connection, BrainRpcService, BrainRunnerControlImpl,
     FinchDaemonImpl,
 };
-use crate::ipc::codec::encode_approval_audience;
+use crate::brain::ipc_codec::encode_approval_audience;
 
 /// #223: the local Cap'n Proto IPC path had no tracing correlation of any
 /// kind. `ipc_call_span` must carry a `request_id` and the method name as
@@ -163,7 +163,8 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
             },
             origin: crate::vm::SourceOrigin::generated("capnp-effect-audit-test"),
         };
-        crate::ipc::codec::encode_vm_side_effect(reserve.get().init_effect(), &effect).unwrap();
+        crate::runtime::ipc_codec::encode_vm_side_effect(reserve.get().init_effect(), &effect)
+            .unwrap();
         let reservation = reserve
             .send()
             .promise
@@ -215,7 +216,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
         stale_reserve
             .get()
             .set_execution_id(&uuid::Uuid::new_v4().to_string());
-        crate::ipc::codec::encode_vm_side_effect(
+        crate::runtime::ipc_codec::encode_vm_side_effect(
             stale_reserve.get().init_effect(),
             &crate::vm::VmSideEffect {
                 sequence: 1,
@@ -304,7 +305,8 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
             });
         let mut replay = replay_control.reserve_effect_request();
         replay.get().set_execution_id(&execution_id.to_string());
-        crate::ipc::codec::encode_vm_side_effect(replay.get().init_effect(), &effect).unwrap();
+        crate::runtime::ipc_codec::encode_vm_side_effect(replay.get().init_effect(), &effect)
+            .unwrap();
         replay
             .send()
             .promise
@@ -319,7 +321,7 @@ fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
         conflicting
             .get()
             .set_execution_id(&execution_id.to_string());
-        crate::ipc::codec::encode_vm_side_effect(
+        crate::runtime::ipc_codec::encode_vm_side_effect(
             conflicting.get().init_effect(),
             &crate::vm::VmSideEffect {
                 event: crate::vm::HostSideEffect::Emit {
@@ -494,7 +496,7 @@ impl super::finch_ipc_capnp::brain_runner::Server for EffectEofRunner {
                 reserve
                     .get()
                     .set_execution_id(&uuid::Uuid::new_v4().to_string());
-                crate::ipc::codec::encode_vm_side_effect(
+                crate::runtime::ipc_codec::encode_vm_side_effect(
                     reserve.get().init_effect(),
                     &crate::vm::VmSideEffect {
                         protocol_version: 1,
@@ -589,7 +591,7 @@ impl super::finch_ipc_capnp::brain_runner::Server for EffectNormalRunner {
             reserve
                 .get()
                 .set_execution_id(&uuid::Uuid::new_v4().to_string());
-            crate::ipc::codec::encode_vm_side_effect(
+            crate::runtime::ipc_codec::encode_vm_side_effect(
                 reserve.get().init_effect(),
                 &crate::vm::VmSideEffect {
                     protocol_version: 1,
@@ -1429,7 +1431,7 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                         std::sync::Arc::clone(&server),
                         uuid::Uuid::new_v4(),
                     ));
-                let ipc = crate::ipc::IpcClient::from_test_client(daemon);
+                let ipc = crate::client::IpcClient::from_test_client(daemon);
                 let initial = ipc.brain_snapshot("shared").await.unwrap();
                 let runner_subject = "runner@box.local/frontend-audit";
                 ipc.brain_claim_runner_identity(runner_subject).await.unwrap();
@@ -1708,7 +1710,7 @@ impl super::finch_ipc_capnp::brain_runner::Server for SocketApprovalRunner {
             .expect("runner received more than one turn");
         capnp::capability::Promise::from_future(async move {
             let mut call = control.request_approval_request();
-            crate::ipc::client::encode_brain_turn_event(
+            crate::client::ipc::encode_brain_turn_event(
                 call.get().init_event(),
                 &crate::server::RunnerTurnEvent::ApprovalRequested {
                     approval_id: "socket-approval".into(),
@@ -1759,7 +1761,7 @@ impl super::finch_ipc_capnp::brain_runner::Server for SocketApprovalRunner {
 /// (`srwxr-xr-x`) on a real host.
 ///
 /// This calls the real production function (`harden_ipc_socket_permissions`,
-/// exercised inside `prepare_ipc_listener` at `src/ipc/server.rs`) against a
+/// exercised inside `prepare_ipc_listener` at `src/server/ipc.rs`) against a
 /// real bound Unix socket, not a helper that only asserts the intended mode
 /// in isolation. It does not go through `prepare_ipc_listener` itself:
 /// `prepare_ipc_listener` has a separate early-return for supervised test
@@ -1829,7 +1831,7 @@ fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation
                 .map(|proof| proof.ipc_socket.clone())
                 .unwrap_or_else(|| temp.path().join("finch.sock"));
             let _socket_path = supervised_proof.is_none().then(|| {
-                crate::ipc::transport::set_test_sock_path(socket_path.clone())
+                crate::server::ipc::set_test_sock_path(socket_path.clone())
             });
             let store = crate::brain::BrainStore::with_root(
                 "box.local",
@@ -1864,7 +1866,7 @@ fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation
                 }
             }
 
-            let participant = crate::ipc::IpcClient::connect_path(socket_path.clone())
+            let participant = crate::client::IpcClient::connect_path(socket_path.clone())
                 .await
                 .unwrap();
             let attachment = participant
@@ -1882,7 +1884,7 @@ fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation
                 .unwrap();
             participant_events.recv().await.unwrap().unwrap();
 
-            let runner = crate::ipc::IpcClient::connect_path(socket_path.clone())
+            let runner = crate::client::IpcClient::connect_path(socket_path.clone())
                 .await
                 .unwrap();
             let snapshot = runner.brain_snapshot("shared").await.unwrap();
@@ -1991,7 +1993,7 @@ fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation
                 );
             }
 
-            let replacement = crate::ipc::IpcClient::connect_path(socket_path)
+            let replacement = crate::client::IpcClient::connect_path(socket_path)
                 .await
                 .unwrap();
             let replacement_attachment = replacement
@@ -2094,7 +2096,7 @@ fn encode_test_packed_delivery(
     mut encoded: capnp::data_list::Builder<'_>,
     records: &[crate::server::RunnerEffectRecord],
 ) {
-    let frames = crate::ipc::codec::encode_packed_delivery_envelopes(records).unwrap();
+    let frames = crate::server::ipc::encode_packed_delivery_envelopes(records).unwrap();
     encoded.set(0, &frames[0]);
 }
 
@@ -2249,7 +2251,7 @@ fn local_initialization_clients_require_their_active_driver_connection() {
                 runners,
                 connection_id: uuid::Uuid::new_v4(),
             });
-        let ipc = crate::ipc::IpcClient::from_test_client(daemon);
+        let ipc = crate::client::IpcClient::from_test_client(daemon);
         let target = crate::brain::RemoteBrainTarget::local("shared", "127.0.0.1:1").unwrap();
         let mut driver = crate::brain::AttachedBrainClient::local(target.clone(), ipc.clone());
         driver
@@ -2303,7 +2305,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         result.set_language(super::finch_ipc_capnp::ProgramLanguage::Lisp);
         result.set_output("done");
         result.set_runtime_revision(1);
-        crate::ipc::codec::encode_continuation_messages(
+        crate::brain::ipc_codec::encode_continuation_messages(
             result.reborrow().init_continuation_messages(3),
             &[
                 crate::providers::Message::with_content(
@@ -2336,7 +2338,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         )
         .unwrap();
         result.set_has_invocation_metadata(true);
-        crate::ipc::codec::encode_invocation_metadata(
+        crate::brain::ipc_codec::encode_invocation_metadata(
             result.reborrow().init_invocation_metadata(),
             &crate::providers::InvocationMetadata {
                 requested_model: "gpt-5.6".into(),
@@ -2350,7 +2352,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         );
         super::encode_checkpoint(result.reborrow().init_checkpoint(), &checkpoint).unwrap();
         result.set_error("");
-        crate::ipc::codec::encode_effect_record(
+        crate::runtime::ipc_codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2365,7 +2367,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         call.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::Call);
         call.set_tool_id("tool-1");
         call.set_name("search_word");
-        crate::ipc::codec::encode_json_value(
+        crate::ipc::encode_json_value(
             call.reborrow().init_input(),
             &serde_json::json!({"query": "fib"}),
         )
@@ -2379,7 +2381,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
             approval.reborrow().init_approval_audience(),
             &test_approval_audience(),
         );
-        crate::ipc::codec::encode_json_value(
+        crate::ipc::encode_json_value(
             approval.reborrow().init_detail(),
             &serde_json::json!({"input": {"query": "fib"}}),
         )
@@ -2387,7 +2389,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         let mut decision = events.reborrow().get(2);
         decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
         decision.set_approval_id("tool-1");
-        crate::ipc::codec::encode_json_value(
+        crate::ipc::encode_json_value(
             decision.reborrow().init_decision(),
             &serde_json::json!({"choice": "approve_once"}),
         )
@@ -2450,7 +2452,7 @@ fn runner_turn_error_keeps_partial_lifecycle() {
     {
         let mut result = message.init_root::<super::finch_ipc_capnp::brain_turn_result::Builder>();
         result.set_error("provider failed after approval");
-        crate::ipc::codec::encode_effect_record(
+        crate::runtime::ipc_codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2464,7 +2466,7 @@ fn runner_turn_error_keeps_partial_lifecycle() {
         let mut decision = events.reborrow().get(0);
         decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
         decision.set_approval_id("approval-1");
-        crate::ipc::codec::encode_json_value(
+        crate::ipc::encode_json_value(
             decision.reborrow().init_decision(),
             &serde_json::json!({"choice": "deny"}),
         )
@@ -2494,7 +2496,7 @@ fn runner_program_error_keeps_execute_once_effects() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        crate::ipc::codec::encode_effect_record(
+        crate::runtime::ipc_codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2521,14 +2523,14 @@ fn packed_delivery_on_runner_program_result_must_match_the_journal() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        crate::ipc::codec::encode_effect_record(
+        crate::runtime::ipc_codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
         )
         .unwrap();
         let frames =
-            crate::ipc::codec::encode_packed_delivery_envelopes(&[expected_effect.clone()])
+            crate::server::ipc::encode_packed_delivery_envelopes(&[expected_effect.clone()])
                 .unwrap();
         result.reborrow().init_delivery(1).set(0, &frames[0]);
     }
@@ -2545,13 +2547,13 @@ fn packed_delivery_on_runner_program_result_must_match_the_journal() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        crate::ipc::codec::encode_effect_record(
+        crate::runtime::ipc_codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
         )
         .unwrap();
-        let frames = crate::ipc::codec::encode_packed_delivery_envelopes(&[mismatched]).unwrap();
+        let frames = crate::server::ipc::encode_packed_delivery_envelopes(&[mismatched]).unwrap();
         result.reborrow().init_delivery(1).set(0, &frames[0]);
     }
     let reader = message
@@ -2578,7 +2580,7 @@ fn omitted_packed_delivery_with_a_journal_fails_closed() {
         let mut result =
             message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
         result.set_error("program failed after emit");
-        crate::ipc::codec::encode_effect_record(
+        crate::runtime::ipc_codec::encode_effect_record(
             result.reborrow().init_effect_journal(1).get(0),
             expected_effect.execution_id,
             &expected_effect.entry,
@@ -2656,7 +2658,7 @@ async fn register_brain_runner_replays_unacked_packed_delivery_and_ack_clears_it
             let daemon: super::finch_ipc_capnp::finch_daemon::Client = capnp_rpc::new_client(
                 FinchDaemonImpl::new(std::sync::Arc::clone(&server), uuid::Uuid::new_v4()),
             );
-            let ipc = crate::ipc::IpcClient::from_test_client(daemon);
+            let ipc = crate::client::IpcClient::from_test_client(daemon);
             let snapshot = ipc.brain_snapshot("shared").await.unwrap();
             let subject = "runner@box.local/frontend-delivery";
             ipc.brain_claim_runner_identity(subject).await.unwrap();
@@ -2726,7 +2728,7 @@ async fn pending_effect_delivery_survives_observer_disconnect_and_late_completio
                     std::sync::Arc::clone(&server),
                     uuid::Uuid::new_v4(),
                 ));
-            let first_ipc = crate::ipc::IpcClient::from_test_client(first);
+            let first_ipc = crate::client::IpcClient::from_test_client(first);
             assert_eq!(
                 ipc_delivery_envelopes(
                     &first_ipc
@@ -2743,7 +2745,7 @@ async fn pending_effect_delivery_survives_observer_disconnect_and_late_completio
                     std::sync::Arc::clone(&server),
                     uuid::Uuid::new_v4(),
                 ));
-            let replacement_ipc = crate::ipc::IpcClient::from_test_client(replacement);
+            let replacement_ipc = crate::client::IpcClient::from_test_client(replacement);
             let pending = replacement_ipc
                 .brain_pending_effect_delivery("shared", observer)
                 .await

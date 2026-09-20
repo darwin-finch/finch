@@ -30,7 +30,7 @@ impl AttachedBrainClient {
     /// Connect while retaining a transport failure as data.
     pub async fn watch_with_errors(&self) -> Result<mpsc::UnboundedReceiver<Result<BrainWireMessage>>>;
     pub fn attachment(&self) -> Option<&BrainAttachment>;
-    pub fn local(target: RemoteBrainTarget, ipc: crate::ipc::IpcClient) -> Self;
+    pub fn local<T: LocalBrainTransport + 'static>(target: RemoteBrainTarget, ipc: T) -> Self;
     pub fn remote(client: RemoteBrainClient) -> Self;
 }
 /// Stable identity of one client projection of a Brain. Re-exported from `brain::attachment`.
@@ -375,6 +375,25 @@ pub struct RunnerLeaseId(pub uuid::Uuid);
 pub struct ScheduleId(pub uuid::Uuid);
 ```
 
+## Traits
+
+```rust
+pub trait LocalBrainTransport {
+    async fn brain_attach(&self, brain: &str, subject: &str, role: AttachmentRole, attachment_id: Option<AttachmentId>) -> Result<BrainAttachment>;
+    async fn brain_snapshot(&self, brain: &str) -> Result<BrainSnapshot>;
+    async fn brain_submit(&self, brain: &str, attachment: &BrainAttachment, kind: BrainEventKind) -> Result<()>;
+    async fn brain_start_speculative(&self, brain: &str, attachment: &BrainAttachment, prompt: String) -> Result<super::store::BrainRun>;
+    async fn brain_cancel_run(&self, brain: &str, attachment: &BrainAttachment, run_id: super::store::RunId) -> Result<super::store::BrainRun>;
+    async fn brain_create_schedule(&self, brain: &str, attachment: &BrainAttachment, language: super::store::ProgramLanguage, source: &str, grant_ceiling: &crate::vm::EffectSet, next_due_ms: u64, interval_ms: Option<u64>, delivery_policy: &super::store::BrainScheduleDeliveryPolicy) -> Result<super::store::BrainSchedule>;
+    async fn brain_inspect_schedule(&self, brain: &str, schedule_id: super::store::ScheduleId) -> Result<Option<super::store::BrainSchedule>>;
+    async fn brain_cancel_schedule(&self, brain: &str, attachment: &BrainAttachment, schedule_id: super::store::ScheduleId) -> Result<bool>;
+    async fn brain_schedule_initialization(&self, brain: &str, attachment: &BrainAttachment, next_due_ms: u64) -> Result<super::store::BrainSchedule>;
+    async fn brain_acknowledge(&self, brain: &str, attachment: &BrainAttachment, seq: u64) -> Result<BrainAttachment>;
+    async fn brain_detach(&self, brain: &str, attachment: &BrainAttachment) -> Result<()>;
+    async fn brain_watch(&self, brain: &str, attachment: &BrainAttachment) -> Result<mpsc::UnboundedReceiver<Result<BrainWireMessage>>>;
+}
+```
+
 ## Functions
 
 ```rust
@@ -423,6 +442,7 @@ pub const DEFAULT_RING_BYTES_PER_STREAM: usize = 64 * 1024;
 
 ```rust
 pub(crate) mod effect_audit_archive;
+pub(crate) mod ipc_codec;
 ```
 
 ## Referenced but not exported

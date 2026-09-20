@@ -242,7 +242,7 @@ pub fn create_remote_brain_router(server: Arc<AgentServer>) -> Router { … }
 pub fn create_router(server: Arc<AgentServer>) -> Router { … }
 #[cfg(test)]
 pub(crate) fn drop_next_remote_brain_reply_after_commit() { … }
-pub(crate) fn execute_authorized_remote_initialization(lifecycle: &crate::server::BrainLifecycleService, claims: &crate::brain::BrainCredentialClaims, name: &str, attachment_id: crate::brain::AttachmentId, connection_id: crate::brain::ConnectionId, request_id: u64, next_due_ms: u64, mutation: Option<crate::brain::BrainMutationReceipt>) -> crate::ipc::BrainRemoteReply { … }
+pub(crate) fn execute_authorized_remote_initialization(lifecycle: &crate::server::BrainLifecycleService, claims: &crate::brain::BrainCredentialClaims, name: &str, attachment_id: crate::brain::AttachmentId, connection_id: crate::brain::ConnectionId, request_id: u64, next_due_ms: u64, mutation: Option<crate::brain::BrainMutationReceipt>) -> crate::brain::ipc_codec::BrainRemoteReply { … }
 /// Handle POST /v1/chat/completions - OpenAI-compatible chat endpoint
 pub async fn handle_chat_completions(State(server): State<Arc<AgentServer>>, Json(request): Json<ChatCompletionRequest>) -> Response { … }
 /// Handle POST /v1/feedback - durably retain explicit feedback
@@ -265,6 +265,8 @@ pub async fn handle_training_status() -> Json<TrainingStatusResponse> { … }
 pub async fn health_check(State(server): State<Arc<AgentServer>>) -> Result<Json<HealthStatus>, AppError> { … }
 /// Handle GET /metrics - Prometheus metrics endpoint
 pub async fn metrics_endpoint(State(server): State<Arc<AgentServer>>) -> Result<Response, AppError> { … }
+/// Bind the Unix socket and accept Cap'n Proto connections in a `LocalSet`.
+pub async fn start_ipc_server(server: Arc<AgentServer>, shutdown: tokio_util::sync::CancellationToken) -> Result<()> { … }
 ```
 
 ## Constants
@@ -277,6 +279,7 @@ pub const RUNNER_UNAVAILABLE_PREFIX: &str = "runner-unavailable: ";
 ## Modules
 
 ```rust
+pub(crate) mod ipc;
 /// The two timing decisions the schedule delivery loop makes.
 pub(crate) mod schedule_delivery { … }
 ```

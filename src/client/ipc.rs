@@ -10,22 +10,22 @@ use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::generators::StreamChunk;
-use crate::ipc::codec::{
+use crate::brain::ipc_codec::{
     decode_approval_audience, decode_attachment, decode_brain_wire_reader, decode_event,
     decode_run, decode_runner_handoff, decode_runner_lease, decode_schedule, decode_snapshot,
     encode_approval_audience, encode_brain_submission, encode_environment,
 };
-use crate::ipc::codec::{
-    decode_checkpoint, decode_packed_runtime_application_frames, encode_checkpoint,
-    encode_packed_delivery_envelopes,
-};
-use crate::ipc::schema::finch_ipc_capnp::{
+use crate::generators::StreamChunk;
+use crate::ipc::finch_ipc_capnp::{
     self, brain_runner, brain_runner_control, brain_service, brain_wire_receiver, finch_daemon,
     stream_receiver,
 };
-use crate::ipc::transport::sock_path;
+use crate::ipc::sock_path;
 use crate::providers::{ContentBlock, Message};
+use crate::runtime::ipc_codec::{
+    decode_checkpoint, decode_packed_runtime_application_frames, encode_checkpoint,
+};
+use crate::server::ipc::encode_packed_delivery_envelopes;
 use crate::tools::{ToolDefinition, ToolUse};
 
 pub struct BrainRunnerBootstrap {
@@ -66,6 +66,117 @@ impl Drop for RpcTask {
         // final IpcClient clone disappears so the daemon observes connection
         // loss and releases connection-scoped identities/callbacks promptly.
         self.0.abort();
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::brain::LocalBrainTransport for IpcClient {
+    async fn brain_attach(
+        &self,
+        brain: &str,
+        subject: &str,
+        role: crate::brain::AttachmentRole,
+        attachment_id: Option<crate::brain::AttachmentId>,
+    ) -> Result<crate::brain::BrainAttachment> {
+        IpcClient::brain_attach(self, brain, subject, role, attachment_id).await
+    }
+    async fn brain_snapshot(&self, brain: &str) -> Result<crate::brain::BrainSnapshot> {
+        IpcClient::brain_snapshot(self, brain).await
+    }
+    async fn brain_submit(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::BrainAttachment,
+        kind: crate::brain::BrainEventKind,
+    ) -> Result<()> {
+        IpcClient::brain_submit(self, brain, attachment, kind)
+            .await
+            .map(|_| ())
+    }
+    async fn brain_start_speculative(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::BrainAttachment,
+        prompt: String,
+    ) -> Result<crate::brain::BrainRun> {
+        IpcClient::brain_start_speculative(self, brain, attachment, prompt).await
+    }
+    async fn brain_cancel_run(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::BrainAttachment,
+        run_id: crate::brain::RunId,
+    ) -> Result<crate::brain::BrainRun> {
+        IpcClient::brain_cancel_run(self, brain, attachment, run_id).await
+    }
+    async fn brain_create_schedule(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::BrainAttachment,
+        language: crate::brain::ProgramLanguage,
+        source: &str,
+        grant_ceiling: &crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: &crate::brain::BrainScheduleDeliveryPolicy,
+    ) -> Result<crate::brain::BrainSchedule> {
+        IpcClient::brain_create_schedule(
+            self,
+            brain,
+            attachment,
+            language,
+            source,
+            grant_ceiling,
+            next_due_ms,
+            interval_ms,
+            delivery_policy,
+        )
+        .await
+    }
+    async fn brain_inspect_schedule(
+        &self,
+        brain: &str,
+        schedule_id: crate::brain::ScheduleId,
+    ) -> Result<Option<crate::brain::BrainSchedule>> {
+        IpcClient::brain_inspect_schedule(self, brain, schedule_id).await
+    }
+    async fn brain_cancel_schedule(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::BrainAttachment,
+        schedule_id: crate::brain::ScheduleId,
+    ) -> Result<bool> {
+        IpcClient::brain_cancel_schedule(self, brain, attachment, schedule_id).await
+    }
+    async fn brain_schedule_initialization(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::BrainAttachment,
+        next_due_ms: u64,
+    ) -> Result<crate::brain::BrainSchedule> {
+        IpcClient::brain_schedule_initialization(self, brain, attachment, next_due_ms).await
+    }
+    async fn brain_acknowledge(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::BrainAttachment,
+        seq: u64,
+    ) -> Result<crate::brain::BrainAttachment> {
+        IpcClient::brain_acknowledge(self, brain, attachment, seq).await
+    }
+    async fn brain_detach(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::BrainAttachment,
+    ) -> Result<()> {
+        IpcClient::brain_detach(self, brain, attachment).await
+    }
+    async fn brain_watch(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::BrainAttachment,
+    ) -> Result<mpsc::UnboundedReceiver<Result<crate::brain::BrainWireMessage>>> {
+        IpcClient::brain_watch(self, brain, attachment).await
     }
 }
 
@@ -145,7 +256,7 @@ impl IpcClient {
         let mut req = self.client.query_request();
         {
             let mut p = req.get();
-            super::codec::encode_messages(
+            crate::brain::ipc_codec::encode_messages(
                 p.reborrow().init_messages(messages.len() as u32),
                 &messages,
             )?;
@@ -174,7 +285,7 @@ impl IpcClient {
         let mut req = self.client.query_stream_request();
         {
             let mut p = req.get();
-            super::codec::encode_messages(
+            crate::brain::ipc_codec::encode_messages(
                 p.reborrow().init_messages(messages.len() as u32),
                 &messages,
             )?;
@@ -287,7 +398,7 @@ impl IpcClient {
                 crate::brain::ProgramLanguage::Lisp => finch_ipc_capnp::ProgramLanguage::Lisp,
             });
             params.set_source(source);
-            crate::ipc::codec::encode_effects(
+            crate::runtime::ipc_codec::encode_effects(
                 params
                     .reborrow()
                     .init_grant_ceiling(grant_ceiling.0.len() as u32),
@@ -751,7 +862,9 @@ impl IpcClient {
                             {
                                 let mut params = call.get();
                                 params.set_run_id(&run_id.0.to_string());
-                                params.set_status(crate::ipc::codec::run_status_to_capnp(status));
+                                params.set_status(crate::brain::ipc_codec::run_status_to_capnp(
+                                    status,
+                                ));
                                 params.set_detail(&detail);
                             }
                             let reply = call.send().promise.await?;
@@ -857,7 +970,7 @@ fn host_effect_permit_proxy(
             let mut outcome = call.get().init_outcome();
             match request.outcome {
                 crate::server::RunnerHostEffectOutcome::Acknowledged { values } => {
-                    crate::ipc::codec::encode_value_list(
+                    crate::runtime::ipc_codec::encode_value_list(
                         outcome.init_acknowledged(values.len() as u32),
                         &values,
                         0,
@@ -895,7 +1008,7 @@ fn program_effect_audit_proxy(
             let result = async {
                 let mut call = control.reserve_effect_request();
                 call.get().set_execution_id(&execution_id.to_string());
-                crate::ipc::codec::encode_vm_side_effect(call.get().init_effect(), &effect)
+                crate::runtime::ipc_codec::encode_vm_side_effect(call.get().init_effect(), &effect)
                     .map_err(|error| capnp::Error::failed(error.to_string()))?;
                 let response = call.send().promise.await?;
                 Ok(effect_audit_reservation_proxy(
@@ -924,7 +1037,7 @@ pub(crate) fn turn_effect_audit_proxy(
             let result = async {
                 let mut call = control.reserve_effect_request();
                 call.get().set_execution_id(&execution_id.to_string());
-                crate::ipc::codec::encode_vm_side_effect(call.get().init_effect(), &effect)
+                crate::runtime::ipc_codec::encode_vm_side_effect(call.get().init_effect(), &effect)
                     .map_err(|error| capnp::Error::failed(error.to_string()))?;
                 let response = call.send().promise.await?;
                 Ok(effect_audit_reservation_proxy(
@@ -954,7 +1067,7 @@ impl finch_ipc_capnp::brain_turn_commit_ack::Server for BrainTurnCommitAckImpl {
             Err(error) => return Promise::err(error),
         };
         let status = match params.get_status() {
-            Ok(status) => crate::ipc::codec::run_status_from_capnp(status),
+            Ok(status) => crate::brain::ipc_codec::run_status_from_capnp(status),
             Err(error) => return Promise::err(error.into()),
         };
         let detail = params
@@ -1044,7 +1157,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                                     }
                                 });
                                 params.set_source(&source);
-                                crate::ipc::codec::encode_effects(
+                                crate::runtime::ipc_codec::encode_effects(
                                     params.reborrow().init_grant_ceiling(
                                         grant_ceiling.0.len() as u32,
                                     ),
@@ -1075,7 +1188,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                                 }
                             }
                             let reply = call.send().promise.await?;
-                            crate::ipc::codec::decode_schedule(
+                            crate::brain::ipc_codec::decode_schedule(
                                 reply.get()?.get_schedule()?,
                             )
                             .map_err(|error| capnp::Error::failed(error.to_string()))
@@ -1099,7 +1212,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                                     reply
                                         .get_schedule()
                                         .map_err(anyhow::Error::from)
-                                        .and_then(crate::ipc::codec::decode_schedule)
+                                        .and_then(crate::brain::ipc_codec::decode_schedule)
                                 })
                                 .transpose()
                                 .map_err(|error| capnp::Error::failed(error.to_string()))
@@ -1147,7 +1260,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                         match request
                             .get_grant_ceiling()
                             .map_err(anyhow::Error::new)
-                            .and_then(crate::ipc::codec::decode_effects)
+                            .and_then(crate::runtime::ipc_codec::decode_effects)
                         {
                             Ok(grants) => Some(grants),
                             Err(error) => {
@@ -1232,7 +1345,7 @@ impl brain_runner::Server for BrainRunnerImpl {
         let context = match request
             .get_context()
             .map_err(anyhow::Error::new)
-            .and_then(super::codec::decode_messages)
+            .and_then(crate::brain::ipc_codec::decode_messages)
         {
             Ok(context) => context,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -1258,7 +1371,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     let mut call = control.request_approval_request();
                     encode_brain_turn_event(call.get().init_event(), &request.event)?;
                     let response = call.send().promise.await?;
-                    super::codec::decode_json_value(response.get()?.get_decision()?)
+                    crate::ipc::decode_json_value(response.get()?.get_decision()?)
                         .map_err(|error| capnp::Error::failed(error.to_string()))
                 }
                 .await
@@ -1324,7 +1437,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     });
                     result.set_output(&response.output);
                     if !response.continuation_messages.is_empty() {
-                        super::codec::encode_continuation_messages(
+                        crate::brain::ipc_codec::encode_continuation_messages(
                             result.reborrow().init_continuation_messages(
                                 response.continuation_messages.len() as u32,
                             ),
@@ -1334,7 +1447,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     }
                     if let Some(metadata) = &response.invocation_metadata {
                         result.set_has_invocation_metadata(true);
-                        super::codec::encode_invocation_metadata(
+                        crate::brain::ipc_codec::encode_invocation_metadata(
                             result.reborrow().init_invocation_metadata(),
                             metadata,
                         );
@@ -1493,7 +1606,7 @@ fn encode_runner_effect_records(
     records: &[crate::server::RunnerEffectRecord],
 ) -> capnp::Result<()> {
     for (index, record) in records.iter().enumerate() {
-        crate::ipc::codec::encode_effect_record(
+        crate::runtime::ipc_codec::encode_effect_record(
             encoded.reborrow().get(index as u32),
             record.execution_id,
             &record.entry,
@@ -1539,7 +1652,7 @@ pub(crate) fn encode_brain_turn_event(
             encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::Call);
             encoded.set_tool_id(tool_id);
             encoded.set_name(name);
-            super::codec::encode_json_value(encoded.reborrow().init_input(), input)
+            crate::ipc::encode_json_value(encoded.reborrow().init_input(), input)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
         }
         crate::server::RunnerTurnEvent::Result {
@@ -1564,7 +1677,7 @@ pub(crate) fn encode_brain_turn_event(
             encoded.set_approval_kind(approval_kind);
             encoded.set_subject(subject);
             encode_approval_audience(encoded.reborrow().init_approval_audience(), audience);
-            super::codec::encode_json_value(encoded.reborrow().init_detail(), detail)
+            crate::ipc::encode_json_value(encoded.reborrow().init_detail(), detail)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
         }
         crate::server::RunnerTurnEvent::ApprovalDecided {
@@ -1573,7 +1686,7 @@ pub(crate) fn encode_brain_turn_event(
         } => {
             encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
             encoded.set_approval_id(approval_id);
-            super::codec::encode_json_value(encoded.reborrow().init_decision(), decision)
+            crate::ipc::encode_json_value(encoded.reborrow().init_decision(), decision)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
         }
     }
@@ -1659,7 +1772,7 @@ impl stream_receiver::Server for StreamReceiverImpl {
                         .to_str()
                         .map_err(|e| capnp::Error::failed(e.to_string()))?
                         .to_string();
-                    let input = super::codec::decode_json_value(tu.get_input()?)
+                    let input = crate::ipc::decode_json_value(tu.get_input()?)
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;
                     Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse {
                         id,
@@ -1771,7 +1884,7 @@ fn decode_stream_content_block(
                     .to_str()
                     .map_err(|error| capnp::Error::failed(error.to_string()))?
                     .to_string(),
-                input: super::codec::decode_json_value(value.get_input()?)
+                input: crate::ipc::decode_json_value(value.get_input()?)
                     .map_err(|error| capnp::Error::failed(error.to_string()))?,
             })
         }
@@ -1864,7 +1977,7 @@ fn read_query_response(
 
     let mut tool_uses = Vec::new();
     for tu in r.get_tool_uses()?.iter() {
-        let input = super::codec::decode_json_value(tu.get_input()?)
+        let input = crate::ipc::decode_json_value(tu.get_input()?)
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
         tool_uses.push(ToolUse {
             id: tu
@@ -2232,7 +2345,7 @@ mod tests {
     ///
     /// Requires an owned daemon socket named by `FINCH_TEST_IPC_SOCKET`.
     /// Run with:
-    ///   ./scripts/test_brains.sh cargo test --lib ipc::client::tests::test_ipc_ping -- --ignored --nocapture
+    ///   ./scripts/test_brains.sh cargo test --lib client::ipc::tests::test_ipc_ping -- --ignored --nocapture
     /// capnp-rpc uses spawn_local internally so we need a LocalSet.
     #[test]
     #[ignore]

@@ -6,6 +6,7 @@ mod brain_runner;
 mod brain_service;
 mod feedback_handler;
 mod handlers;
+pub(crate) mod ipc;
 mod middleware;
 mod openai_handlers;
 mod openai_types;
@@ -38,6 +39,7 @@ pub use handlers::{
 };
 #[cfg(unix)]
 pub use handlers::{handle_node_info_from_state_directory, handle_node_stats_from_state_directory};
+pub use ipc::start_ipc_server;
 pub use middleware::{auth_middleware, DaemonAuth, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
 pub use openai_types::{

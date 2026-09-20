@@ -4,5 +4,7 @@
 // Handles auto-spawn, health checks, and message passing.
 
 mod daemon_client;
+pub(crate) mod ipc;
 
 pub use daemon_client::{DaemonClient, DaemonConfig, LocalModelStatus};
+pub use ipc::{BrainRunnerBootstrap, BrainSubmissionResult, IpcClient, QueryResponse};

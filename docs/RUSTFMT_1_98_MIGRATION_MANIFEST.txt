@@ -12,8 +12,8 @@ src/config/colors.rs
 src/config/persona.rs
 src/daemon/upgrade.rs
 src/ipc/brain_codec.rs
-src/ipc/client.rs
-src/ipc/server.rs
+src/client/ipc.rs
+src/server/ipc.rs
 src/ipc/transport.rs
 src/lib.rs
 src/lisp/reader.rs

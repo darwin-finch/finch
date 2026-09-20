@@ -1897,8 +1897,8 @@ fn remote_brain_error(
     request_id: u64,
     code: impl Into<String>,
     message: impl Into<String>,
-) -> crate::ipc::BrainRemoteReply {
-    crate::ipc::BrainRemoteReply::Error {
+) -> crate::brain::ipc_codec::BrainRemoteReply {
+    crate::brain::ipc_codec::BrainRemoteReply::Error {
         request_id,
         code: code.into(),
         message: message.into(),
@@ -1914,9 +1914,9 @@ pub(crate) fn execute_authorized_remote_initialization(
     request_id: u64,
     next_due_ms: u64,
     mutation: Option<crate::brain::BrainMutationReceipt>,
-) -> crate::ipc::BrainRemoteReply {
+) -> crate::brain::ipc_codec::BrainRemoteReply {
+    use crate::brain::ipc_codec::BrainRemoteReply;
     use crate::brain::BrainCredentialScope;
-    use crate::ipc::BrainRemoteReply;
 
     if !claims.permits(BrainCredentialScope::BrainSubmit) {
         return remote_brain_error(
@@ -1957,10 +1957,10 @@ async fn execute_remote_brain_command(
     name: &str,
     attachment_id: crate::brain::AttachmentId,
     connection_id: crate::brain::ConnectionId,
-    command: crate::ipc::BrainRemoteCommand,
-) -> crate::ipc::BrainRemoteReply {
+    command: crate::brain::ipc_codec::BrainRemoteCommand,
+) -> crate::brain::ipc_codec::BrainRemoteReply {
+    use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
     use crate::brain::BrainCredentialScope;
-    use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
 
     let request_id = command.request_id;
     let lifecycle = crate::server::BrainLifecycleService::from_server(server);
@@ -2016,10 +2016,11 @@ async fn execute_remote_brain_command(
                 ),
             );
         }
-        let command_sha256 = match crate::ipc::brain_remote_command_fingerprint(&command.kind) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => return remote_brain_error(request_id, "invalid", error.to_string()),
-        };
+        let command_sha256 =
+            match crate::brain::ipc_codec::brain_remote_command_fingerprint(&command.kind) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => return remote_brain_error(request_id, "invalid", error.to_string()),
+            };
         Some(crate::brain::BrainMutationReceipt {
             mutation_id: mutation.idempotency_key,
             attachment_id,

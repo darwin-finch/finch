@@ -290,7 +290,7 @@ impl DaemonLifecycle {
     ///
     /// Blind unlinking would let this command steal a live listener's pathname
     /// while that process kept serving through its open file descriptor. The
-    /// bind path in `src/ipc/server.rs` uses the same connect-then-unlink rule.
+    /// bind path in `src/server/ipc.rs` uses the same connect-then-unlink rule.
     fn reap_stale_socket(&self) -> Result<StaleSocketReap> {
         match self.probe_socket()? {
             StaleSocketProbe::Absent => Ok(StaleSocketReap::Absent),

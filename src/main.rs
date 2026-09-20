@@ -1301,7 +1301,7 @@ async fn main() -> Result<()> {
             // a half-connected Brain state.
             {
                 let mut phase = finch::startup::phase(finch::startup::PHASE_IPC_CONNECT);
-                match finch::ipc::IpcClient::connect().await {
+                match finch::client::IpcClient::connect().await {
                     Ok(ipc) => {
                         if let Some(error) = leftover_daemon_error.take() {
                             phase.detail(finch::startup::PhaseDetail::category("incompatible"));
@@ -2079,7 +2079,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 .build()
                 .expect("IPC tokio runtime");
             let local = tokio::task::LocalSet::new();
-            rt.block_on(local.run_until(finch::ipc::start_ipc_server(server, shutdown)))
+            rt.block_on(local.run_until(finch::server::start_ipc_server(server, shutdown)))
         }
     });
 

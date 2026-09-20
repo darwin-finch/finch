@@ -223,7 +223,7 @@ impl EventLoop {
 
     fn start_runner_lease_renewal(
         &self,
-        ipc: crate::ipc::IpcClient,
+        ipc: crate::client::IpcClient,
         brain: String,
         subject: String,
         environment: crate::brain::BrainEnvironment,
@@ -463,7 +463,7 @@ impl EventLoop {
             ipc.ping().await.context("check local daemon IPC")?;
             anyhow::bail!("home Brain attachment is not ready to reconnect");
         }
-        let ipc = crate::ipc::IpcClient::connect()
+        let ipc = crate::client::IpcClient::connect()
             .await
             .context("reconnect local daemon IPC")?;
         self.ipc_client = Some(ipc);
@@ -507,7 +507,7 @@ impl EventLoop {
             .context("Cap'n Proto daemon connection unavailable")?
             .clone();
         if ipc.ping().await.is_err() {
-            ipc = crate::ipc::IpcClient::connect()
+            ipc = crate::client::IpcClient::connect()
                 .await
                 .context("reconnect local daemon IPC for runner")?;
             self.ipc_client = Some(ipc.clone());
@@ -1107,7 +1107,7 @@ impl EventLoop {
 
     async fn restore_runner_after_failed_handoff(
         &mut self,
-        ipc: &crate::ipc::IpcClient,
+        ipc: &crate::client::IpcClient,
         previous: Option<(String, crate::brain::BrainEnvironment)>,
     ) -> Result<()> {
         let Some((brain, environment)) = previous else {
@@ -1159,7 +1159,7 @@ impl EventLoop {
 
     async fn fail_handoff_and_restore_runner(
         &mut self,
-        ipc: &crate::ipc::IpcClient,
+        ipc: &crate::client::IpcClient,
         previous: Option<(String, crate::brain::BrainEnvironment)>,
         error: anyhow::Error,
     ) -> anyhow::Error {

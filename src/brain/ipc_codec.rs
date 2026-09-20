@@ -7,10 +7,8 @@ use crate::brain::{
     RunnerLeaseId, ScheduleId,
 };
 use crate::brain::{BrainTask, BrainTaskPriority, BrainTaskStatus};
-use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
+use crate::ipc::finch_ipc_capnp::{self, brain_approval_audience};
 use sha2::Digest;
-
-const MAX_JSON_VALUE_DEPTH: usize = 64;
 
 fn encode_task(mut builder: finch_ipc_capnp::brain_task::Builder<'_>, task: &BrainTask) {
     builder.set_id(&task.id);
@@ -25,6 +23,26 @@ fn encode_task(mut builder: finch_ipc_capnp::brain_task::Builder<'_>, task: &Bra
         BrainTaskPriority::Medium => finch_ipc_capnp::BrainTaskPriority::Medium,
         BrainTaskPriority::Low => finch_ipc_capnp::BrainTaskPriority::Low,
     });
+}
+
+#[cfg(test)]
+mod pinned_wire_tests {
+    use super::*;
+
+    #[test]
+    fn detach_remote_envelope_bytes_are_stable() {
+        let envelope = BrainRemoteEnvelope::Command(BrainRemoteCommand {
+            request_id: 1,
+            mutation: None,
+            kind: BrainRemoteCommandKind::Detach,
+        });
+        let encoded = encode_brain_remote_envelope(&envelope).unwrap();
+        assert_eq!(
+            hex::encode(&encoded),
+            "000000000800000000000000010001000100000000000000000000000300020001000000000000000200000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(decode_brain_remote_envelope(&encoded).unwrap(), envelope);
+    }
 }
 
 fn decode_task(reader: finch_ipc_capnp::brain_task::Reader<'_>) -> anyhow::Result<BrainTask> {
@@ -107,89 +125,13 @@ pub(crate) fn encode_json_value(
     builder: finch_ipc_capnp::json_value::Builder<'_>,
     value: &serde_json::Value,
 ) -> anyhow::Result<()> {
-    encode_json_value_at(builder, value, 0)
-}
-
-fn encode_json_value_at(
-    mut builder: finch_ipc_capnp::json_value::Builder<'_>,
-    value: &serde_json::Value,
-    depth: usize,
-) -> anyhow::Result<()> {
-    if depth > MAX_JSON_VALUE_DEPTH {
-        anyhow::bail!("dynamic value exceeds the maximum nesting depth");
-    }
-    match value {
-        serde_json::Value::Null => builder.set_null_value(()),
-        serde_json::Value::Bool(value) => builder.set_bool_value(*value),
-        serde_json::Value::Number(value) if value.is_i64() => {
-            builder.set_signed(value.as_i64().expect("checked signed JSON number"));
-        }
-        serde_json::Value::Number(value) if value.is_u64() => {
-            builder.set_unsigned(value.as_u64().expect("checked unsigned JSON number"));
-        }
-        serde_json::Value::Number(value) => {
-            builder.set_float(value.as_f64().expect("JSON number is representable as f64"));
-        }
-        serde_json::Value::String(value) => builder.set_text(value),
-        serde_json::Value::Array(values) => {
-            let mut encoded = builder.reborrow().init_array(values.len() as u32);
-            for (index, value) in values.iter().enumerate() {
-                encode_json_value_at(encoded.reborrow().get(index as u32), value, depth + 1)?;
-            }
-        }
-        serde_json::Value::Object(values) => {
-            let mut encoded = builder.reborrow().init_object(values.len() as u32);
-            for (index, (name, value)) in values.iter().enumerate() {
-                let mut field = encoded.reborrow().get(index as u32);
-                field.set_name(name);
-                encode_json_value_at(field.reborrow().init_value(), value, depth + 1)?;
-            }
-        }
-    }
-    Ok(())
+    crate::ipc::encode_json_value(builder, value)
 }
 
 pub(crate) fn decode_json_value(
     reader: finch_ipc_capnp::json_value::Reader<'_>,
 ) -> anyhow::Result<serde_json::Value> {
-    decode_json_value_at(reader, 0)
-}
-
-fn decode_json_value_at(
-    reader: finch_ipc_capnp::json_value::Reader<'_>,
-    depth: usize,
-) -> anyhow::Result<serde_json::Value> {
-    if depth > MAX_JSON_VALUE_DEPTH {
-        anyhow::bail!("dynamic value exceeds the maximum nesting depth");
-    }
-    use finch_ipc_capnp::json_value::Which;
-    Ok(match reader.which()? {
-        Which::NullValue(()) => serde_json::Value::Null,
-        Which::BoolValue(value) => serde_json::Value::Bool(value),
-        Which::Signed(value) => serde_json::Value::Number(value.into()),
-        Which::Unsigned(value) => serde_json::Value::Number(value.into()),
-        Which::Float(value) => serde_json::Value::Number(
-            serde_json::Number::from_f64(value)
-                .ok_or_else(|| anyhow::anyhow!("dynamic value contains a non-finite float"))?,
-        ),
-        Which::Text(value) => serde_json::Value::String(text(value?)?),
-        Which::Array(values) => serde_json::Value::Array(
-            values?
-                .iter()
-                .map(|value| decode_json_value_at(value, depth + 1))
-                .collect::<anyhow::Result<Vec<_>>>()?,
-        ),
-        Which::Object(fields) => {
-            let mut values = serde_json::Map::new();
-            for field in fields?.iter() {
-                values.insert(
-                    text(field.get_name()?)?,
-                    decode_json_value_at(field.get_value()?, depth + 1)?,
-                );
-            }
-            serde_json::Value::Object(values)
-        }
-    })
+    crate::ipc::decode_json_value(reader)
 }
 
 pub(crate) fn encode_messages(
@@ -866,7 +808,7 @@ pub(crate) fn encode_brain_remote_envelope(
                     let mut request = builder.init_create_schedule();
                     request.set_language(language_to_capnp(*language));
                     request.set_source(source);
-                    super::checkpoint_codec::encode_effects(
+                    crate::runtime::ipc_codec::encode_effects(
                         request
                             .reborrow()
                             .init_grant_ceiling(grant_ceiling.0.len() as u32),
@@ -1013,7 +955,7 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                     BrainRemoteCommandKind::CreateSchedule {
                         language: language_from_capnp(request.get_language()?),
                         source: text(request.get_source()?)?,
-                        grant_ceiling: super::checkpoint_codec::decode_effects(
+                        grant_ceiling: crate::runtime::ipc_codec::decode_effects(
                             request.get_grant_ceiling()?,
                         )?,
                         next_due_ms: request.get_next_due_ms(),
@@ -1417,7 +1359,7 @@ pub(crate) fn encode_schedule(
     builder.set_schedule_id(&schedule.schedule_id.0.to_string());
     builder.set_initiating_attachment_id(&schedule.initiating_attachment_id.0.to_string());
     builder.set_created_by(&schedule.created_by);
-    super::checkpoint_codec::encode_effects(
+    crate::runtime::ipc_codec::encode_effects(
         builder
             .reborrow()
             .init_grant_ceiling(schedule.grant_ceiling.0.len() as u32),
@@ -1466,7 +1408,7 @@ pub(crate) fn decode_schedule(
         schedule_id: ScheduleId(parse_uuid(reader.get_schedule_id()?)?),
         initiating_attachment_id: AttachmentId(parse_uuid(reader.get_initiating_attachment_id()?)?),
         created_by: text(reader.get_created_by()?)?,
-        grant_ceiling: super::checkpoint_codec::decode_effects(reader.get_grant_ceiling()?)?,
+        grant_ceiling: crate::runtime::ipc_codec::decode_effects(reader.get_grant_ceiling()?)?,
         language: language_from_capnp(reader.get_language()?),
         source: text(reader.get_source()?)?,
         next_due_ms: reader.get_next_due_ms(),
@@ -1496,7 +1438,7 @@ fn encode_schedule_due(
     encode_run(builder.reborrow().init_run(), &due.run);
     builder.set_language(language_to_capnp(due.language));
     builder.set_source(&due.source);
-    super::checkpoint_codec::encode_effects(
+    crate::runtime::ipc_codec::encode_effects(
         builder
             .reborrow()
             .init_grant_ceiling(due.grant_ceiling.0.len() as u32),
@@ -1517,7 +1459,7 @@ fn decode_schedule_due(
         run: decode_run(reader.get_run()?)?,
         language: language_from_capnp(reader.get_language()?),
         source: text(reader.get_source()?)?,
-        grant_ceiling: super::checkpoint_codec::decode_effects(reader.get_grant_ceiling()?)?,
+        grant_ceiling: crate::runtime::ipc_codec::decode_effects(reader.get_grant_ceiling()?)?,
         due_at_ms: reader.get_due_at_ms(),
         first_missed_at_ms: reader.get_first_missed_at_ms(),
         missed_count: reader.get_missed_count(),
@@ -1767,11 +1709,11 @@ pub(crate) fn encode_event(
             let mut recorded = builder.init_effect_recorded();
             recorded.set_request_seq(*request_seq);
             recorded.set_execution_id(&execution_id.to_string());
-            super::checkpoint_codec::encode_vm_side_effect(
+            crate::runtime::ipc_codec::encode_vm_side_effect(
                 recorded.reborrow().init_effect(),
                 effect,
             )?;
-            super::checkpoint_codec::encode_effect_journal_state(
+            crate::runtime::ipc_codec::encode_effect_journal_state(
                 recorded.reborrow().init_state(),
                 state,
             )?;
@@ -2000,8 +1942,10 @@ pub(crate) fn decode_event(
             BrainEventKind::EffectRecorded {
                 request_seq: recorded.get_request_seq(),
                 execution_id: parse_uuid(recorded.get_execution_id()?)?,
-                effect: super::checkpoint_codec::decode_vm_side_effect(recorded.get_effect()?)?,
-                state: super::checkpoint_codec::decode_effect_journal_state(recorded.get_state()?)?,
+                effect: crate::runtime::ipc_codec::decode_vm_side_effect(recorded.get_effect()?)?,
+                state: crate::runtime::ipc_codec::decode_effect_journal_state(
+                    recorded.get_state()?,
+                )?,
             }
         }
         Which::EffectAuditTransition(encoded) => {

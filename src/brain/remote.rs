@@ -388,9 +388,10 @@ struct RemoteBrainConnection {
 }
 
 struct RemoteBrainRequest {
-    kind: crate::ipc::BrainRemoteCommandKind,
-    mutation: Option<crate::ipc::BrainRemoteMutation>,
-    response: oneshot::Sender<std::result::Result<crate::ipc::BrainRemoteReply, String>>,
+    kind: crate::brain::ipc_codec::BrainRemoteCommandKind,
+    mutation: Option<crate::brain::ipc_codec::BrainRemoteMutation>,
+    response:
+        oneshot::Sender<std::result::Result<crate::brain::ipc_codec::BrainRemoteReply, String>>,
 }
 
 impl RemoteBrainClient {
@@ -991,7 +992,7 @@ impl RemoteBrainClient {
     }
 
     pub async fn push(&self, kind: BrainEventKind) -> Result<()> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
             .send_remote_command(BrainRemoteCommandKind::Submit(kind))
@@ -1003,7 +1004,7 @@ impl RemoteBrainClient {
     }
 
     pub async fn start_speculative(&self, prompt: String) -> Result<super::store::BrainRun> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
             .send_remote_command(BrainRemoteCommandKind::Submit(
@@ -1023,8 +1024,10 @@ impl RemoteBrainClient {
         &self,
         kind: &BrainEventKind,
     ) -> Result<BrainMutationHandle> {
-        self.prepare_mutation(&crate::ipc::BrainRemoteCommandKind::Submit(kind.clone()))
-            .await
+        self.prepare_mutation(&crate::brain::ipc_codec::BrainRemoteCommandKind::Submit(
+            kind.clone(),
+        ))
+        .await
     }
 
     /// Retry-safe submission using a caller-persisted immutable envelope.
@@ -1033,7 +1036,7 @@ impl RemoteBrainClient {
         kind: BrainEventKind,
         handle: &BrainMutationHandle,
     ) -> Result<()> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
         match self
             .send_remote_command_with_handle(BrainRemoteCommandKind::Submit(kind), Some(handle))
             .await?
@@ -1047,7 +1050,7 @@ impl RemoteBrainClient {
     /// outside durable mutation replay: a reconnect obtains fresh attachment
     /// state and may acknowledge that current connection again.
     pub async fn acknowledge(&mut self, seq: u64) -> Result<()> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
             .send_remote_command(BrainRemoteCommandKind::Acknowledge(seq))
@@ -1088,7 +1091,7 @@ impl RemoteBrainClient {
         environment_generation: u64,
         ttl_ms: u64,
     ) -> Result<super::store::BrainRunnerHandoff> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
             .send_remote_command(BrainRemoteCommandKind::RequestRunnerHandoff {
@@ -1111,12 +1114,14 @@ impl RemoteBrainClient {
         environment_generation: u64,
         ttl_ms: u64,
     ) -> Result<BrainMutationHandle> {
-        self.prepare_mutation(&crate::ipc::BrainRemoteCommandKind::RequestRunnerHandoff {
-            target_subject: target_subject.to_string(),
-            expected_lease_id,
-            environment_generation,
-            ttl_ms,
-        })
+        self.prepare_mutation(
+            &crate::brain::ipc_codec::BrainRemoteCommandKind::RequestRunnerHandoff {
+                target_subject: target_subject.to_string(),
+                expected_lease_id,
+                environment_generation,
+                ttl_ms,
+            },
+        )
         .await
     }
 
@@ -1128,7 +1133,7 @@ impl RemoteBrainClient {
         ttl_ms: u64,
         handle: &BrainMutationHandle,
     ) -> Result<super::store::BrainRunnerHandoff> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
         match self
             .send_remote_command_with_handle(
                 BrainRemoteCommandKind::RequestRunnerHandoff {
@@ -1150,7 +1155,7 @@ impl RemoteBrainClient {
         &self,
         handoff_id: super::store::RunnerHandoffId,
     ) -> Result<()> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
             .send_remote_command(BrainRemoteCommandKind::CancelRunnerHandoff(handoff_id))
@@ -1165,9 +1170,9 @@ impl RemoteBrainClient {
         &self,
         handoff_id: super::store::RunnerHandoffId,
     ) -> Result<BrainMutationHandle> {
-        self.prepare_mutation(&crate::ipc::BrainRemoteCommandKind::CancelRunnerHandoff(
-            handoff_id,
-        ))
+        self.prepare_mutation(
+            &crate::brain::ipc_codec::BrainRemoteCommandKind::CancelRunnerHandoff(handoff_id),
+        )
         .await
     }
 
@@ -1176,7 +1181,7 @@ impl RemoteBrainClient {
         handoff_id: super::store::RunnerHandoffId,
         handle: &BrainMutationHandle,
     ) -> Result<()> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
         match self
             .send_remote_command_with_handle(
                 BrainRemoteCommandKind::CancelRunnerHandoff(handoff_id),
@@ -1190,7 +1195,7 @@ impl RemoteBrainClient {
     }
 
     pub async fn cancel_run(&self, run_id: super::store::RunId) -> Result<super::store::BrainRun> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
             .send_remote_command(BrainRemoteCommandKind::CancelRun(run_id))
@@ -1205,8 +1210,10 @@ impl RemoteBrainClient {
         &self,
         run_id: super::store::RunId,
     ) -> Result<BrainMutationHandle> {
-        self.prepare_mutation(&crate::ipc::BrainRemoteCommandKind::CancelRun(run_id))
-            .await
+        self.prepare_mutation(&crate::brain::ipc_codec::BrainRemoteCommandKind::CancelRun(
+            run_id,
+        ))
+        .await
     }
 
     pub async fn cancel_run_with_handle(
@@ -1214,7 +1221,7 @@ impl RemoteBrainClient {
         run_id: super::store::RunId,
         handle: &BrainMutationHandle,
     ) -> Result<super::store::BrainRun> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
         match self
             .send_remote_command_with_handle(
                 BrainRemoteCommandKind::CancelRun(run_id),
@@ -1237,7 +1244,7 @@ impl RemoteBrainClient {
         interval_ms: Option<u64>,
         delivery_policy: super::store::BrainScheduleDeliveryPolicy,
     ) -> Result<super::store::BrainSchedule> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
             .send_remote_command(BrainRemoteCommandKind::CreateSchedule {
@@ -1265,14 +1272,16 @@ impl RemoteBrainClient {
         interval_ms: Option<u64>,
         delivery_policy: super::store::BrainScheduleDeliveryPolicy,
     ) -> Result<BrainMutationHandle> {
-        self.prepare_mutation(&crate::ipc::BrainRemoteCommandKind::CreateSchedule {
-            language,
-            source: source.to_string(),
-            grant_ceiling: grant_ceiling.clone(),
-            next_due_ms,
-            interval_ms,
-            delivery_policy,
-        })
+        self.prepare_mutation(
+            &crate::brain::ipc_codec::BrainRemoteCommandKind::CreateSchedule {
+                language,
+                source: source.to_string(),
+                grant_ceiling: grant_ceiling.clone(),
+                next_due_ms,
+                interval_ms,
+                delivery_policy,
+            },
+        )
         .await
     }
 
@@ -1287,7 +1296,7 @@ impl RemoteBrainClient {
         delivery_policy: super::store::BrainScheduleDeliveryPolicy,
         handle: &BrainMutationHandle,
     ) -> Result<super::store::BrainSchedule> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
         match self
             .send_remote_command_with_handle(
                 BrainRemoteCommandKind::CreateSchedule {
@@ -1308,7 +1317,7 @@ impl RemoteBrainClient {
     }
 
     pub async fn cancel_schedule(&self, schedule_id: super::store::ScheduleId) -> Result<bool> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
             .send_remote_command(BrainRemoteCommandKind::CancelSchedule(schedule_id))
@@ -1323,9 +1332,9 @@ impl RemoteBrainClient {
         &self,
         schedule_id: super::store::ScheduleId,
     ) -> Result<BrainMutationHandle> {
-        self.prepare_mutation(&crate::ipc::BrainRemoteCommandKind::CancelSchedule(
-            schedule_id,
-        ))
+        self.prepare_mutation(
+            &crate::brain::ipc_codec::BrainRemoteCommandKind::CancelSchedule(schedule_id),
+        )
         .await
     }
 
@@ -1334,7 +1343,7 @@ impl RemoteBrainClient {
         schedule_id: super::store::ScheduleId,
         handle: &BrainMutationHandle,
     ) -> Result<bool> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
         match self
             .send_remote_command_with_handle(
                 BrainRemoteCommandKind::CancelSchedule(schedule_id),
@@ -1351,7 +1360,7 @@ impl RemoteBrainClient {
         &self,
         next_due_ms: u64,
     ) -> Result<super::store::BrainSchedule> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
             .send_remote_command(BrainRemoteCommandKind::ScheduleInitialization { next_due_ms })
@@ -1367,7 +1376,9 @@ impl RemoteBrainClient {
         next_due_ms: u64,
     ) -> Result<BrainMutationHandle> {
         self.prepare_mutation(
-            &crate::ipc::BrainRemoteCommandKind::ScheduleInitialization { next_due_ms },
+            &crate::brain::ipc_codec::BrainRemoteCommandKind::ScheduleInitialization {
+                next_due_ms,
+            },
         )
         .await
     }
@@ -1377,7 +1388,7 @@ impl RemoteBrainClient {
         next_due_ms: u64,
         handle: &BrainMutationHandle,
     ) -> Result<super::store::BrainSchedule> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
         match self
             .send_remote_command_with_handle(
                 BrainRemoteCommandKind::ScheduleInitialization { next_due_ms },
@@ -1394,7 +1405,7 @@ impl RemoteBrainClient {
     /// connection lifecycle, not a canonical Brain mutation, so it carries no
     /// durable idempotency handle across reconnects.
     pub async fn disconnect(&self) -> Result<()> {
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         let temporary_events = if self.connection.lock().await.is_none() {
             Some(self.watch().await?)
@@ -1414,7 +1425,7 @@ impl RemoteBrainClient {
 
     /// Connect to the brain's snapshot/live-event stream.
     pub async fn watch(&self) -> Result<mpsc::UnboundedReceiver<BrainWireMessage>> {
-        use crate::ipc::{BrainRemoteCommand, BrainRemoteEnvelope, BrainRemoteReply};
+        use crate::brain::ipc_codec::{BrainRemoteCommand, BrainRemoteEnvelope, BrainRemoteReply};
 
         let attachment = self
             .attachment
@@ -1467,7 +1478,7 @@ impl RemoteBrainClient {
                             mutation: request.mutation,
                             kind: request.kind,
                         });
-                        let encoded = match crate::ipc::encode_brain_remote_envelope(&envelope) {
+                        let encoded = match crate::brain::ipc_codec::encode_brain_remote_envelope(&envelope) {
                             Ok(encoded) => encoded,
                             Err(error) => {
                                 let _ = request.response.send(Err(error.to_string()));
@@ -1491,7 +1502,7 @@ impl RemoteBrainClient {
                         };
                         match message {
                             tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
-                                match crate::ipc::decode_brain_remote_envelope(&bytes) {
+                                match crate::brain::ipc_codec::decode_brain_remote_envelope(&bytes) {
                                     Ok(BrainRemoteEnvelope::Projection(message)) => {
                                         if event_tx.send(message).is_err() {
                                             break;
@@ -1542,12 +1553,12 @@ impl RemoteBrainClient {
 
     async fn send_remote_command(
         &self,
-        kind: crate::ipc::BrainRemoteCommandKind,
-    ) -> Result<crate::ipc::BrainRemoteReply> {
+        kind: crate::brain::ipc_codec::BrainRemoteCommandKind,
+    ) -> Result<crate::brain::ipc_codec::BrainRemoteReply> {
         let durable = !matches!(
             &kind,
-            crate::ipc::BrainRemoteCommandKind::Acknowledge(_)
-                | crate::ipc::BrainRemoteCommandKind::Detach
+            crate::brain::ipc_codec::BrainRemoteCommandKind::Acknowledge(_)
+                | crate::brain::ipc_codec::BrainRemoteCommandKind::Detach
         );
         let handle = if durable {
             Some(self.prepare_mutation(&kind).await?)
@@ -1560,7 +1571,7 @@ impl RemoteBrainClient {
 
     async fn prepare_mutation(
         &self,
-        kind: &crate::ipc::BrainRemoteCommandKind,
+        kind: &crate::brain::ipc_codec::BrainRemoteCommandKind,
     ) -> Result<BrainMutationHandle> {
         let attachment = self
             .attachment
@@ -1575,15 +1586,15 @@ impl RemoteBrainClient {
             attachment_id: attachment.attachment_id,
             expected_revision: snapshot.revision,
             environment_generation: snapshot.environment.generation,
-            command_sha256: crate::ipc::brain_remote_command_fingerprint(kind)?,
+            command_sha256: crate::brain::ipc_codec::brain_remote_command_fingerprint(kind)?,
         })
     }
 
     async fn send_remote_command_with_handle(
         &self,
-        kind: crate::ipc::BrainRemoteCommandKind,
+        kind: crate::brain::ipc_codec::BrainRemoteCommandKind,
         handle: Option<&BrainMutationHandle>,
-    ) -> Result<crate::ipc::BrainRemoteReply> {
+    ) -> Result<crate::brain::ipc_codec::BrainRemoteReply> {
         let connection = self
             .connection
             .lock()
@@ -1592,8 +1603,8 @@ impl RemoteBrainClient {
             .context("remote Brain event stream is not connected")?;
         let durable = !matches!(
             &kind,
-            crate::ipc::BrainRemoteCommandKind::Acknowledge(_)
-                | crate::ipc::BrainRemoteCommandKind::Detach
+            crate::brain::ipc_codec::BrainRemoteCommandKind::Acknowledge(_)
+                | crate::brain::ipc_codec::BrainRemoteCommandKind::Detach
         );
         anyhow::ensure!(
             durable == handle.is_some(),
@@ -1610,10 +1621,11 @@ impl RemoteBrainClient {
                     "Brain mutation handle belongs to a different attachment"
                 );
                 anyhow::ensure!(
-                    handle.command_sha256 == crate::ipc::brain_remote_command_fingerprint(&kind)?,
+                    handle.command_sha256
+                        == crate::brain::ipc_codec::brain_remote_command_fingerprint(&kind)?,
                     "Brain mutation handle was reused with a different command"
                 );
-                Some(crate::ipc::BrainRemoteMutation {
+                Some(crate::brain::ipc_codec::BrainRemoteMutation {
                     brain_id: handle.brain_id,
                     expected_revision: handle.expected_revision,
                     environment_generation: handle.environment_generation,
@@ -1849,9 +1861,80 @@ fn validate_remote_capabilities(
     Ok(())
 }
 
+#[async_trait::async_trait(?Send)]
+pub trait LocalBrainTransport {
+    async fn brain_attach(
+        &self,
+        brain: &str,
+        subject: &str,
+        role: AttachmentRole,
+        attachment_id: Option<AttachmentId>,
+    ) -> Result<BrainAttachment>;
+    async fn brain_snapshot(&self, brain: &str) -> Result<BrainSnapshot>;
+    async fn brain_submit(
+        &self,
+        brain: &str,
+        attachment: &BrainAttachment,
+        kind: BrainEventKind,
+    ) -> Result<()>;
+    async fn brain_start_speculative(
+        &self,
+        brain: &str,
+        attachment: &BrainAttachment,
+        prompt: String,
+    ) -> Result<super::store::BrainRun>;
+    async fn brain_cancel_run(
+        &self,
+        brain: &str,
+        attachment: &BrainAttachment,
+        run_id: super::store::RunId,
+    ) -> Result<super::store::BrainRun>;
+    #[allow(clippy::too_many_arguments)]
+    async fn brain_create_schedule(
+        &self,
+        brain: &str,
+        attachment: &BrainAttachment,
+        language: super::store::ProgramLanguage,
+        source: &str,
+        grant_ceiling: &crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: &super::store::BrainScheduleDeliveryPolicy,
+    ) -> Result<super::store::BrainSchedule>;
+    async fn brain_inspect_schedule(
+        &self,
+        brain: &str,
+        schedule_id: super::store::ScheduleId,
+    ) -> Result<Option<super::store::BrainSchedule>>;
+    async fn brain_cancel_schedule(
+        &self,
+        brain: &str,
+        attachment: &BrainAttachment,
+        schedule_id: super::store::ScheduleId,
+    ) -> Result<bool>;
+    async fn brain_schedule_initialization(
+        &self,
+        brain: &str,
+        attachment: &BrainAttachment,
+        next_due_ms: u64,
+    ) -> Result<super::store::BrainSchedule>;
+    async fn brain_acknowledge(
+        &self,
+        brain: &str,
+        attachment: &BrainAttachment,
+        seq: u64,
+    ) -> Result<BrainAttachment>;
+    async fn brain_detach(&self, brain: &str, attachment: &BrainAttachment) -> Result<()>;
+    async fn brain_watch(
+        &self,
+        brain: &str,
+        attachment: &BrainAttachment,
+    ) -> Result<mpsc::UnboundedReceiver<Result<BrainWireMessage>>>;
+}
+
 #[derive(Clone)]
 enum AttachedBrainTransport {
-    Local(crate::ipc::IpcClient),
+    Local(std::rc::Rc<dyn LocalBrainTransport>),
     Remote(RemoteBrainClient),
 }
 
@@ -1867,10 +1950,10 @@ pub struct AttachedBrainClient {
 }
 
 impl AttachedBrainClient {
-    pub fn local(target: RemoteBrainTarget, ipc: crate::ipc::IpcClient) -> Self {
+    pub fn local<T: LocalBrainTransport + 'static>(target: RemoteBrainTarget, ipc: T) -> Self {
         Self {
             target,
-            transport: AttachedBrainTransport::Local(ipc),
+            transport: AttachedBrainTransport::Local(std::rc::Rc::new(ipc)),
             attachment: None,
         }
     }
@@ -2229,7 +2312,7 @@ mod tests {
                     .build()
                     .unwrap();
                 runtime
-                    .block_on(crate::ipc::start_ipc_server(
+                    .block_on(crate::server::start_ipc_server(
                         ipc_state,
                         tokio_util::sync::CancellationToken::new(),
                     ))
@@ -2302,7 +2385,7 @@ mod tests {
             .expect("FINCH_TEST_BRAIN_PASSWORD must match the isolated daemon fixture")
     }
 
-    async fn connect_isolated_live_ipc() -> crate::ipc::IpcClient {
+    async fn connect_isolated_live_ipc() -> crate::client::IpcClient {
         let proof = crate::brain::isolated_test_proof().unwrap();
         let path = std::env::var_os("FINCH_TEST_IPC_SOCKET")
             .map(std::path::PathBuf::from)
@@ -2313,7 +2396,7 @@ mod tests {
         let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         #[cfg(unix)]
         crate::brain::authenticate_isolated_test_peer(&stream).unwrap();
-        let client = crate::ipc::IpcClient::from_stream(stream).await.unwrap();
+        let client = crate::client::IpcClient::from_stream(stream).await.unwrap();
         #[cfg(unix)]
         {
             let after = crate::brain::validate_isolated_test_socket(&proof, &path).unwrap();
@@ -2800,8 +2883,8 @@ mod tests {
 
     #[tokio::test]
     async fn invitation_pinned_wss_handles_fragmented_binary_ping_pong_and_close() {
+        use crate::brain::ipc_codec::BrainRemoteEnvelope;
         use crate::brain::{BrainEvent, ConnectionId};
-        use crate::ipc::BrainRemoteEnvelope;
         use tokio_tungstenite::tungstenite::{
             handshake::server::{Request, Response},
             protocol::frame::{coding::Data, Frame},
@@ -2894,7 +2977,7 @@ mod tests {
             });
             socket
                 .send(Message::Binary(
-                    crate::ipc::encode_brain_remote_envelope(&snapshot)
+                    crate::brain::ipc_codec::encode_brain_remote_envelope(&snapshot)
                         .unwrap()
                         .into(),
                 ))
@@ -2902,7 +2985,7 @@ mod tests {
                 .unwrap();
             let envelope =
                 BrainRemoteEnvelope::Projection(BrainWireMessage::Event { event: streamed });
-            let encoded = crate::ipc::encode_brain_remote_envelope(&envelope).unwrap();
+            let encoded = crate::brain::ipc_codec::encode_brain_remote_envelope(&envelope).unwrap();
             let midpoint = encoded.len() / 2;
             socket
                 .send(Message::Frame(Frame::message(
@@ -4034,8 +4117,10 @@ mod tests {
 
     #[tokio::test]
     async fn remote_binary_session_correlates_mutations_while_streaming_events() {
+        use crate::brain::ipc_codec::{
+            BrainRemoteCommandKind, BrainRemoteEnvelope, BrainRemoteReply,
+        };
         use crate::brain::{BrainEvent, ConnectionId};
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteEnvelope, BrainRemoteReply};
         use tokio_tungstenite::tungstenite::Message;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4073,7 +4158,7 @@ mod tests {
             });
             socket
                 .send(Message::Binary(
-                    crate::ipc::encode_brain_remote_envelope(&projection)
+                    crate::brain::ipc_codec::encode_brain_remote_envelope(&projection)
                         .unwrap()
                         .into(),
                 ))
@@ -4082,7 +4167,7 @@ mod tests {
 
             let submit = socket.next().await.unwrap().unwrap().into_data();
             let BrainRemoteEnvelope::Command(submit) =
-                crate::ipc::decode_brain_remote_envelope(&submit).unwrap()
+                crate::brain::ipc_codec::decode_brain_remote_envelope(&submit).unwrap()
             else {
                 panic!("expected submit command")
             };
@@ -4106,7 +4191,7 @@ mod tests {
             });
             socket
                 .send(Message::Binary(
-                    crate::ipc::encode_brain_remote_envelope(&reply)
+                    crate::brain::ipc_codec::encode_brain_remote_envelope(&reply)
                         .unwrap()
                         .into(),
                 ))
@@ -4115,7 +4200,7 @@ mod tests {
 
             let acknowledge = socket.next().await.unwrap().unwrap().into_data();
             let BrainRemoteEnvelope::Command(acknowledge) =
-                crate::ipc::decode_brain_remote_envelope(&acknowledge).unwrap()
+                crate::brain::ipc_codec::decode_brain_remote_envelope(&acknowledge).unwrap()
             else {
                 panic!("expected acknowledge command")
             };
@@ -4129,7 +4214,7 @@ mod tests {
             });
             socket
                 .send(Message::Binary(
-                    crate::ipc::encode_brain_remote_envelope(&reply)
+                    crate::brain::ipc_codec::encode_brain_remote_envelope(&reply)
                         .unwrap()
                         .into(),
                 ))
@@ -4138,7 +4223,7 @@ mod tests {
 
             let request_handoff = socket.next().await.unwrap().unwrap().into_data();
             let BrainRemoteEnvelope::Command(request_handoff) =
-                crate::ipc::decode_brain_remote_envelope(&request_handoff).unwrap()
+                crate::brain::ipc_codec::decode_brain_remote_envelope(&request_handoff).unwrap()
             else {
                 panic!("expected runner handoff request")
             };
@@ -4169,7 +4254,7 @@ mod tests {
             });
             socket
                 .send(Message::Binary(
-                    crate::ipc::encode_brain_remote_envelope(&reply)
+                    crate::brain::ipc_codec::encode_brain_remote_envelope(&reply)
                         .unwrap()
                         .into(),
                 ))
@@ -4178,7 +4263,7 @@ mod tests {
 
             let cancel_handoff = socket.next().await.unwrap().unwrap().into_data();
             let BrainRemoteEnvelope::Command(cancel_handoff) =
-                crate::ipc::decode_brain_remote_envelope(&cancel_handoff).unwrap()
+                crate::brain::ipc_codec::decode_brain_remote_envelope(&cancel_handoff).unwrap()
             else {
                 panic!("expected runner handoff cancellation")
             };
@@ -4191,7 +4276,7 @@ mod tests {
             });
             socket
                 .send(Message::Binary(
-                    crate::ipc::encode_brain_remote_envelope(&reply)
+                    crate::brain::ipc_codec::encode_brain_remote_envelope(&reply)
                         .unwrap()
                         .into(),
                 ))
@@ -4200,7 +4285,7 @@ mod tests {
 
             let detach = socket.next().await.unwrap().unwrap().into_data();
             let BrainRemoteEnvelope::Command(detach) =
-                crate::ipc::decode_brain_remote_envelope(&detach).unwrap()
+                crate::brain::ipc_codec::decode_brain_remote_envelope(&detach).unwrap()
             else {
                 panic!("expected detach command")
             };
@@ -4210,7 +4295,7 @@ mod tests {
             });
             socket
                 .send(Message::Binary(
-                    crate::ipc::encode_brain_remote_envelope(&reply)
+                    crate::brain::ipc_codec::encode_brain_remote_envelope(&reply)
                         .unwrap()
                         .into(),
                 ))
@@ -4264,7 +4349,7 @@ mod tests {
             attachment_id: attachment.attachment_id,
             expected_revision: 1,
             environment_generation: 1,
-            command_sha256: crate::ipc::brain_remote_command_fingerprint(
+            command_sha256: crate::brain::ipc_codec::brain_remote_command_fingerprint(
                 &BrainRemoteCommandKind::Submit(submit_kind.clone()),
             )
             .unwrap(),
@@ -4288,7 +4373,10 @@ mod tests {
             attachment_id: attachment.attachment_id,
             expected_revision: 1,
             environment_generation: 1,
-            command_sha256: crate::ipc::brain_remote_command_fingerprint(&handoff_kind).unwrap(),
+            command_sha256: crate::brain::ipc_codec::brain_remote_command_fingerprint(
+                &handoff_kind,
+            )
+            .unwrap(),
         };
         let handoff = client
             .request_runner_handoff_with_handle(
@@ -4307,7 +4395,8 @@ mod tests {
             attachment_id: attachment.attachment_id,
             expected_revision: 1,
             environment_generation: 1,
-            command_sha256: crate::ipc::brain_remote_command_fingerprint(&cancel_kind).unwrap(),
+            command_sha256: crate::brain::ipc_codec::brain_remote_command_fingerprint(&cancel_kind)
+                .unwrap(),
         };
         client
             .cancel_runner_handoff_with_handle(handoff.handoff_id, &cancel_handle)
@@ -4319,8 +4408,8 @@ mod tests {
 
     #[tokio::test]
     async fn remote_mutation_retry_preserves_idempotency_key_across_reconnect() {
+        use crate::brain::ipc_codec::{BrainRemoteEnvelope, BrainRemoteReply};
         use crate::brain::{BrainEvent, ConnectionId};
-        use crate::ipc::{BrainRemoteEnvelope, BrainRemoteReply};
         use tokio_tungstenite::tungstenite::Message;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4358,7 +4447,7 @@ mod tests {
                 });
                 socket
                     .send(Message::Binary(
-                        crate::ipc::encode_brain_remote_envelope(&projection)
+                        crate::brain::ipc_codec::encode_brain_remote_envelope(&projection)
                             .unwrap()
                             .into(),
                     ))
@@ -4366,7 +4455,7 @@ mod tests {
                     .unwrap();
                 let bytes = socket.next().await.unwrap().unwrap().into_data();
                 let BrainRemoteEnvelope::Command(command) =
-                    crate::ipc::decode_brain_remote_envelope(&bytes).unwrap()
+                    crate::brain::ipc_codec::decode_brain_remote_envelope(&bytes).unwrap()
                 else {
                     panic!("expected retried mutation")
                 };
@@ -4392,7 +4481,7 @@ mod tests {
                 });
                 socket
                     .send(Message::Binary(
-                        crate::ipc::encode_brain_remote_envelope(&reply)
+                        crate::brain::ipc_codec::encode_brain_remote_envelope(&reply)
                             .unwrap()
                             .into(),
                     ))
@@ -4436,17 +4525,19 @@ mod tests {
                 event: projected.clone()
             })
         );
-        let kind = crate::ipc::BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
-            text: "once".into(),
-            attached_mentions: Vec::new(),
-        });
+        let kind =
+            crate::brain::ipc_codec::BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
+                text: "once".into(),
+                attached_mentions: Vec::new(),
+            });
         let handle = BrainMutationHandle {
             idempotency_key: uuid::Uuid::new_v4(),
             brain_id,
             attachment_id: attachment.attachment_id,
             expected_revision: projected.seq,
             environment_generation: projected.environment_generation,
-            command_sha256: crate::ipc::brain_remote_command_fingerprint(&kind).unwrap(),
+            command_sha256: crate::brain::ipc_codec::brain_remote_command_fingerprint(&kind)
+                .unwrap(),
         };
         assert!(client
             .send_remote_command_with_handle(kind.clone(), Some(&handle))
@@ -4654,12 +4745,12 @@ mod tests {
         assert_eq!(rebound.attachment_id, handle.attachment_id);
         let reply = client
             .send_remote_command_with_handle(
-                crate::ipc::BrainRemoteCommandKind::Submit(program.clone()),
+                crate::brain::ipc_codec::BrainRemoteCommandKind::Submit(program.clone()),
                 Some(&handle),
             )
             .await
             .unwrap();
-        let crate::ipc::BrainRemoteReply::Submitted {
+        let crate::brain::ipc_codec::BrainRemoteReply::Submitted {
             result: Some(result),
             run: Some(completed_run),
             ..
@@ -5337,13 +5428,12 @@ mod tests {
             let initial = watch.snapshot;
             let lifecycle = fixture.lifecycle.clone();
             ws.on_upgrade(move |mut socket| async move {
-                let envelope =
-                    crate::ipc::BrainRemoteEnvelope::Projection(BrainWireMessage::Snapshot {
-                        brain: initial,
-                    });
+                let envelope = crate::brain::ipc_codec::BrainRemoteEnvelope::Projection(
+                    BrainWireMessage::Snapshot { brain: initial },
+                );
                 socket
                     .send(axum::extract::ws::Message::Binary(
-                        crate::ipc::encode_brain_remote_envelope(&envelope)
+                        crate::brain::ipc_codec::encode_brain_remote_envelope(&envelope)
                             .unwrap()
                             .into(),
                     ))
@@ -5351,14 +5441,14 @@ mod tests {
                     .unwrap();
                 while let Some(Ok(axum::extract::ws::Message::Binary(bytes))) = socket.next().await
                 {
-                    let Ok(crate::ipc::BrainRemoteEnvelope::Command(command)) =
-                        crate::ipc::decode_brain_remote_envelope(&bytes)
+                    let Ok(crate::brain::ipc_codec::BrainRemoteEnvelope::Command(command)) =
+                        crate::brain::ipc_codec::decode_brain_remote_envelope(&bytes)
                     else {
                         break;
                     };
                     let request_id = command.request_id;
                     let reply = match command.kind {
-                        crate::ipc::BrainRemoteCommandKind::ScheduleInitialization {
+                        crate::brain::ipc_codec::BrainRemoteCommandKind::ScheduleInitialization {
                             next_due_ms,
                         } => crate::server::execute_authorized_remote_initialization(
                             &lifecycle,
@@ -5372,10 +5462,10 @@ mod tests {
                         ),
                         _ => break,
                     };
-                    let envelope = crate::ipc::BrainRemoteEnvelope::Reply(reply);
+                    let envelope = crate::brain::ipc_codec::BrainRemoteEnvelope::Reply(reply);
                     socket
                         .send(axum::extract::ws::Message::Binary(
-                            crate::ipc::encode_brain_remote_envelope(&envelope)
+                            crate::brain::ipc_codec::encode_brain_remote_envelope(&envelope)
                                 .unwrap()
                                 .into(),
                         ))
@@ -5604,8 +5694,8 @@ mod tests {
     #[test]
     #[ignore = "requires explicitly owned IPC and HTTP endpoints"]
     fn live_local_and_remote_transports_produce_equivalent_lifecycle() {
+        use crate::brain::ipc_codec::{BrainRemoteCommandKind, BrainRemoteReply};
         use crate::brain::{BrainRunKind, BrainRunStatus};
-        use crate::ipc::{BrainRemoteCommandKind, BrainRemoteReply};
 
         fn lifecycle(snapshot: &BrainSnapshot) -> Vec<&'static str> {
             snapshot
