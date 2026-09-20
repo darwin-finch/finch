@@ -718,6 +718,11 @@ subdirectory has no example to check against.
 
 ## 18. Open gaps, current as of this pass — what's still missing and why
 
+- **Compile-time integer-range iteration for loop unrolling** (value-generic-parameters pass, new) —
+  `ct-foreach` iterates a parameter pack, never a plain `0..N` range; §26's `matmul` typechecks with
+  value-generic `R`/`K`/`C` but its body is an ordinary runtime loop, not compile-time-unrolled. This
+  is the remaining gap between "the matrix type exists" and "this generates a real, hand-tuned-
+  quality kernel" — a separate primitive from value-generic parameters themselves, not solved by them.
 - **Panics/traps unwinding across an FFI boundary** (FFI survey pass, new) — a Finch trap occurring
   inside a callback invoked from foreign code is unaddressed anywhere, and this is a real hazard in
   most ABIs unless explicitly caught at the boundary (Rust's documented `catch_unwind` requirement is
@@ -1147,3 +1152,34 @@ backend is Cranelift — whose auto-vectorization is real but historically weake
 Finch needs explicit SIMD lane types (`f32x4`-style) as a deliberate, hand-tunable escape hatch, the
 way real numerics libraries often want regardless of how good the auto-vectorizer is, is a second,
 separate open question, not something "generates like a template" already answers.
+
+**Resolved: value-generic parameters (new section, "Generics, concepts, dispatch") unblock the
+struct itself, and the multiply function now typechecks:**
+
+```lisp
+(record Matrix<T, value R : int, value C : int>
+  data : array<T, (* R C)>)
+
+(define (matmul <T : Add<T,T,Output=T>, Mul<T,T,Output=T>>
+                (a : &Matrix<T, R, K>) (b : &Matrix<T, K, C>)) : Matrix<T, R, C>
+  (let [result (Matrix.zeroed)]
+    (for i (range 0 R)
+      (for j (range 0 C)
+        (for k (range 0 K)
+          (+= (matrix-at result i j)
+              (* (matrix-at a i k) (matrix-at b k j))))))
+    result))
+```
+
+`Matrix<T,R,K>` and `Matrix<T,K,C>` as two independently-value-parameterized arguments, with `K`
+inferred from both and required to agree, is exactly the inference behavior stated in the new
+section — the caller never writes `K` anywhere. **UNVERIFIED**, per this document's own stated
+practice: `for`/`range`, `+=`, `matrix-at`, and `Matrix.zeroed` are illustrative, not confirmed
+against a real established example — joining the already-logged accumulating-stdlib-surface gap
+(§18) rather than a new one. What this example does *not* resolve, and shouldn't
+be read as resolving: `for`/`range` here is an ordinary *runtime* loop, not a compile-time-unrolled
+one — actually unrolling this into straight-line code per concrete `R`/`K`/`C` needs a compile-time
+integer-range iteration primitive that still doesn't exist (`ct-foreach` iterates a parameter pack,
+never a plain `0..N` range). That is the next, separate, still-open gap standing between "the type
+now typechecks" and "this generates a real, hand-tuned-quality kernel" — logged in §18 rather than
+guessed at here.

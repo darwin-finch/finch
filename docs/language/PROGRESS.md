@@ -1390,3 +1390,34 @@ entirely once consumed as a library, never inherited transitively.
 `feature_tour.md` §25 updated in place: `ledger.coforth`'s import of its sibling `account.colisp`
 changed from the absolute `accounts.account` to the relative `pkg.account`, demonstrating the new
 form on the exact case it was designed for (a same-package, cross-frontend import).
+
+**Continued 2026-09-19 — value-generic parameters designed and specified, unblocking the matrix-
+kernel attempt from the previous entry.** `value N : int` added as a new generic-header form,
+alongside plain type parameters (`<T, value N : int>`), deliberately unparenthesized unlike the
+`(types Ts...)` pack form since a single value needs no grouping. Chose `int` for value-generic
+sizes specifically for consistency with the already-established signed-length policy ("Numeric
+types") rather than introducing a different-signedness exception for this one role.
+
+Designed to need no new machinery beyond what already exists, checked against each established
+mechanism in turn rather than assumed to compose: compile-time arithmetic on bound value parameters
+(`(* R C)` for a matrix's flat storage size) reuses the same `! pure` CTFE-of-values evaluation
+already established for everything else — deliberately not a separate type-level arithmetic
+sublanguage, directly continuing the session's own thesis that ordinary syntax plus CTFE covers what
+other languages need a template-metaprogramming layer for. Coherence and "generates like a template"
+both apply to value-generic instantiations exactly as they already do to type-generic ones (each
+concrete `(T,R,C)` is a distinct family member, monomorphized lazily, no new rule needed) — verified
+against the same reasoning already used for `Codec<bytes,User>` vs. `Codec<User,User>` being distinct
+instantiations rather than a coherence conflict. `infer` composes the same way too: a value parameter
+derives from an argument's own already-bound value exactly as a type parameter derives from an
+argument's own bound evidence. Added a `where` constraint form for value-generic parameters
+(`value N : int where (> N 0)`), checked once at instantiation like any other declared bound, not a
+second mechanism alongside concept bounds.
+
+`feature_tour.md` §26 updated with the resolution: `Matrix<T, value R : int, value C : int>` now
+typechecks, and a `matmul` function demonstrates `K` inferred from two independently-value-
+parameterized arguments agreeing. Explicitly flagged what this does *not* resolve, rather than
+overclaiming: the loop body is ordinary runtime iteration, not compile-time-unrolled, since
+`ct-foreach` iterates a parameter pack, never a plain integer range — logged as a new, separate §18
+gap (compile-time integer-range iteration) rather than conflated with value-generic parameters
+themselves. Also flagged `for`/`range`/`+=`/`matrix-at`/`Matrix.zeroed` as unverified stdlib/syntax
+per the document's own stated practice, joining the already-logged accumulating-stdlib-surface gap.

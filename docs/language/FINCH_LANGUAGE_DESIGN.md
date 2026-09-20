@@ -4333,6 +4333,50 @@ global back-solving system. For example, `T : Map<K,V>, infer K, infer V` derive
 the selected `Map` implementation, while callable evidence may similarly derive an argument pack,
 result, and effect row.
 
+### Value-generic parameters
+
+A generic header may bind an ordinary compile-time value, not only a type — `value N : int` beside
+`T` in the same comma-separated header (`<T, value N : int>`), never a separate parenthesized pack
+form, since a single value needs no grouping the way `(types Ts...)` needs one for its `...`. Sizes
+are `int`, matching the signed-length policy already established ("Numeric types"), for the same
+consistency reason: a matrix dimension is a size, and a value-generic parameter having its own
+different-signedness rule from every other size in the language would be a needless exception.
+
+```text
+(record Matrix<T, value R : int, value C : int>
+  data : array<T, (* R C)>)
+```
+
+The array-size position, and any other position expecting a compile-time-known value, accepts an
+ordinary expression rather than only a bare literal or parameter reference — `(* R C)` is not a
+separate type-level arithmetic sublanguage, it is the same `! pure` CTFE-of-values evaluation already
+established for everything else, applied here because `R` and `C` are already compile-time-known
+once bound. This is a direct instance of the session's broader thesis that ordinary syntax plus CTFE
+covers what other languages need a separate template-metaprogramming layer for.
+
+A value-generic parameter is part of a type's identity exactly as a type-generic parameter already
+is, needing no new machinery for coherence or code generation: `Matrix<f32,4,4>` and `Matrix<f32,3,3>`
+are different members of the same parametric family, the same relationship `Codec<bytes,User>` and
+`Codec<User,User>` already have — an implementation for one never collides with the other under
+coherence, and each concrete `(T,R,C)` combination gets its own lazily-compiled body under "generates
+like a template," identically to a purely type-generic instantiation. Inference composes the same
+way too: `infer` already derives a type parameter from an argument's own bound evidence, and a value
+parameter derives from an argument's own bound value the same way — `matrix-multiply(a, b)` with
+`a : Matrix<f32,4,8>` and `b : Matrix<f32,8,4>` infers `R=4, K=8, C=4` for the result type from the
+arguments' own already-bound `R`/`C`, without the caller spelling out a single value explicitly.
+
+A value-generic parameter may carry a `where` constraint, checked once at instantiation the same way
+a type parameter's concept bound is — never per-call, never a D-style `static if`/SFINAE probe:
+
+```text
+(record FixedBuffer<T, value N : int> where (> N 0)
+  data : array<T, N>)
+```
+
+`FixedBuffer<T,0>` is rejected wherever it is written, the same "provably invalid, not silently
+excluded" posture already established for a generic body checked against a declared concept bound —
+a value-generic constraint is a bound like any other, not a second, separate mechanism.
+
 Static evidence generates like a template, not through a shared dictionary-passing ABI: a call
 supplying statically-known evidence for a parameter compiles or reuses one ordinary, fixed-signature
 native function specialized to that concrete type/evidence combination, exactly as C++, Rust, and D
