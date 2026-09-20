@@ -24,6 +24,11 @@ pub enum BrainMutationOutcome { RunCancellationReserved, RunCancellationDispatch
 /// Durable identity and preconditions for one authorized Brain mutation.
 pub struct BrainMutationReceipt { … }
 pub struct BrainProgram { … }
+/// Secret-free provider/model overlay stored on a named Brain.
+pub struct BrainProviderSelection { … }
+impl BrainProviderSelection {
+    pub fn is_empty(&self) -> bool;
+}
 /// One MemTree leaf the query processor has promoted into this Brain's durable, byte-stable recall prefix (#940).
 pub struct CommittedMemoryRecord { … }
 /// Append-only event log rooted at a Brain store directory.

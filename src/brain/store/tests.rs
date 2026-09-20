@@ -7891,6 +7891,28 @@ fn test_provider_selection_survives_store_reopen() {
 }
 
 #[test]
+fn test_provider_selection_makes_brain_durable_without_conversation_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = BrainStore::with_root("test-machine", Some(temp.path().to_path_buf()));
+    let selection = BrainProviderSelection {
+        provider: Some("xai".to_string()),
+        model: Some("grok-4.6".to_string()),
+        reasoning_effort: None,
+        provider_inherited: false,
+    };
+
+    store
+        .set_provider_selection("lane-a", selection.clone())
+        .unwrap();
+
+    assert!(
+        !store.remove_if_unused("lane-a").unwrap(),
+        "selection metadata is durable Brain state, even before conversation history exists"
+    );
+    assert_eq!(store.provider_selection("lane-a").unwrap(), selection);
+}
+
+#[test]
 fn test_provider_selection_does_not_hydrate_the_event_log() {
     let temp = seed_brain_root(1);
     std::fs::write(

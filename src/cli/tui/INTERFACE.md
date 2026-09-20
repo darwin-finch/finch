@@ -182,6 +182,7 @@ impl TuiRenderer {
     pub fn render_ask_user_dialog(&mut self, title: &str, options: Vec<DialogOption>) -> Result<DialogResult>;
     /// Re-acquire the terminal after a `suspend()`.
     pub fn resume(&mut self) -> anyhow::Result<()>;
+    pub fn set_model_identity(&mut self, identity: impl Into<String>);
     /// Set the OperationStatus line in the status bar (visible while queries run).
     pub fn set_operation_status(&self, msg: impl Into<String>);
     /// Attach the Co-Forth poset VM.

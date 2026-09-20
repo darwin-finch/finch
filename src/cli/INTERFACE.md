@@ -119,6 +119,8 @@ impl DiffColorMode {
 pub struct DiffHunk { … }
 pub struct DiffLine { … }
 pub enum DiffLineKind { Context, Add, Remove, NoNewline }
+/// Secret-free identity the status line, `/status`, and `/model` all project. Re-exported from `cli::repl_event`.
+pub struct EffectiveSelection { … }
 /// Main event loop for concurrent REPL Re-exported from `cli::repl_event`.
 pub struct EventLoop { … }
 /// Bounded structured diff for one file.
@@ -295,6 +297,8 @@ impl Repl {
     pub async fn run_event_loop(&mut self, initial_prompt: Option<String>) -> Result<()>;
     /// Run REPL with an optional initial prompt
     pub async fn run_with_initial_prompt(&mut self, initial_prompt: Option<String>) -> Result<()>;
+    /// `--model` is one-shot; `--provider` persists on this Brain.
+    pub fn set_cli_selection(&mut self, model: Option<String>, provider: Option<String>);
     /// Retain a daemon IPC bootstrap failure until the TUI owns the screen, so it appears once as an actionable startup diagnostic rather than being cleared with pr…
     pub fn set_daemon_ipc_error(&mut self, error: impl Into<String>);
     /// Set the IPC client for daemon communication (must be called inside a LocalSet).
@@ -312,6 +316,10 @@ impl ReplMode {
 }
 /// Handle to the live session mode, injected where the tool API cannot name [`ReplMode`].
 pub struct ReplModeState(pub Arc<RwLock<ReplMode>>);
+/// Inputs used to resolve one Brain's effective provider/model. Re-exported from `cli::repl_event`.
+pub struct SelectionRequest { … }
+/// Where the effective provider/model identity came from. Re-exported from `cli::repl_event`.
+pub enum SelectionSource { Inherited, Override, OneShot }
 /// Result of the shared first-run, `finch setup`, and `/setup` commit ceremony.
 pub enum SetupApplyOutcome { Saved, Cancelled }
 /// Check if a model family is compatible with an execution target Setup wizard result containing all collected configuration
@@ -481,6 +489,8 @@ pub fn render_status_line(status: &ChatGptAuthStatus) -> Result<String> { … }
 pub fn render_files(files: &[FileDiff], colors: &ColorScheme, mode: DiffColorMode) -> String { … }
 /// Render one stable, secret-free status line for scripts and interactive use. Exported as `render_grok_auth_status_line`.
 pub fn render_status_line(status: &GrokAuthStatus) -> Result<String> { … }
+/// Pick the configured entry and overlays. Re-exported from `cli::repl_event`.
+pub fn resolve_selection(providers: &[ProviderEntry], request: &SelectionRequest) -> Result<EffectiveSelection> { … }
 /// Remove terminal controls from bounded multi-line dialog content.
 pub fn sanitize_multiline(s: &str) -> String { … }
 pub fn sanitize_terminal(s: &str) -> String { … }

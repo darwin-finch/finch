@@ -1794,9 +1794,15 @@ fn model_overlay_survives_exit_and_named_attach() {
     );
     first.send_line("/model grok-4.6");
     first.wait_for(
-        "grok-4.6",
+        "✓ Model overlay grok-4.6",
         ECHO_DEADLINE,
-        "the model overlay command was acknowledged",
+        "the model overlay command completed its durable write",
+    );
+    let before_exit = std::fs::read_to_string(daemon.metadata_path()).unwrap();
+    assert!(
+        before_exit.contains("grok-4.6"),
+        "the success confirmation must follow the durable write; metadata before exit={before_exit}; terminal={}",
+        first.readable_transcript()
     );
     first.send_line("/exit");
     let status = first.wait_for_exit();
@@ -1808,11 +1814,12 @@ fn model_overlay_survives_exit_and_named_attach() {
     drop(first);
 
     let (provider, model) = overlay_from_metadata(&daemon.metadata_path());
+    let metadata_raw = std::fs::read_to_string(daemon.metadata_path()).unwrap();
     assert_eq!(
         model.as_deref(),
         Some("grok-4.6"),
-        "INVARIANT: /model must persist the overlay on the named Brain; provider={provider:?} metadata={}",
-        daemon.metadata_path().display()
+        "INVARIANT: /model must persist the overlay on the named Brain; provider={provider:?} metadata={} raw={metadata_raw} terminal:\n{first_text}",
+        daemon.metadata_path().display(),
     );
 
     let mut second = Session::spawn_on(&daemon.home, &["attach", BRAIN]);
@@ -1868,9 +1875,9 @@ fn cli_model_flag_is_one_shot_and_does_not_rewrite_brain_metadata() {
 
     let mut session = Session::spawn_on(&daemon.home, &["attach", BRAIN, "--model", "grok-4.6"]);
     session.wait_for(
-        "finch v",
+        "one-shot",
         READY_DEADLINE,
-        "one-shot attach drew the startup header",
+        "one-shot attach projected its temporary model identity",
     );
     session.send_line("/exit");
     let _ = session.wait_for_exit();

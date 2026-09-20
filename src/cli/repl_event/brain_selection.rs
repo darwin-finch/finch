@@ -110,7 +110,11 @@ pub fn resolve_selection(
             SelectionSource::Override,
         )
     } else if let Some(name) = request.persisted.provider.as_deref() {
-        let source = if request.persisted.provider_inherited && request.cli_model.is_none() {
+        let source = if request.persisted.provider_inherited
+            && request.persisted.model.is_none()
+            && request.persisted.reasoning_effort.is_none()
+            && request.cli_model.is_none()
+        {
             SelectionSource::Inherited
         } else {
             SelectionSource::Override
@@ -372,6 +376,35 @@ mod tests {
         .unwrap();
         assert_eq!(restored.source, SelectionSource::Inherited);
         assert_eq!(restored.model.as_deref(), Some("grok-code-fast-1"));
+    }
+
+    #[test]
+    fn test_thinking_overlay_is_reported_as_brain_override() {
+        let providers = vec![ProviderEntry::Openai {
+            api_key: "sk-test".into(),
+            model: Some("gpt-5".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("work".into()),
+            reasoning_effort: None,
+        }];
+        let effective = resolve_selection(
+            &providers,
+            &SelectionRequest {
+                persisted: BrainProviderSelection {
+                    provider: Some("work".into()),
+                    reasoning_effort: Some("high".into()),
+                    provider_inherited: true,
+                    ..BrainProviderSelection::default()
+                },
+                ..SelectionRequest::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(effective.source, SelectionSource::Override);
+        assert_eq!(effective.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]

@@ -143,6 +143,7 @@ pub(crate) const PLANNING_ALLOWED_TOOL_ALIASES: &[(&str, &str)] = &[ ("Bash", "b
 
 ```rust
 pub mod activity_view;
+pub mod brain_selection;
 pub mod event_loop;
 pub mod events;
 pub mod llm_loop;

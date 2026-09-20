@@ -435,6 +435,8 @@ pub struct BrainStore {
     /// concurrently, but accepted input, VM commit, and its Result event must
     /// remain an indivisible sequence against the authoritative revision.
     execution_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Serializes metadata read-modify-write with provisional Brain cleanup.
+    metadata_locks: Arc<RwLock<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
     run_publication_gates:
         Arc<RwLock<HashMap<(String, RunId), Arc<tokio::sync::Mutex<RunPublicationGate>>>>>,
     /// Ephemeral transport generation that currently supervises a live run.
@@ -681,6 +683,7 @@ impl BrainStore {
             runtime_checkpoints: Arc::new(RwLock::new(HashMap::new())),
             delivery_logs: Arc::new(RwLock::new(HashMap::new())),
             execution_locks: Arc::new(RwLock::new(HashMap::new())),
+            metadata_locks: Arc::new(RwLock::new(HashMap::new())),
             run_publication_gates: Arc::new(RwLock::new(HashMap::new())),
             run_connection_authority: Arc::new(RwLock::new(RunConnectionAuthority::default())),
             disconnect_retry_owners: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -735,6 +738,26 @@ impl BrainStore {
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone())
+    }
+
+    fn metadata_lock(&self, name: &str) -> Arc<std::sync::Mutex<()>> {
+        if let Some(lock) = self
+            .metadata_locks
+            .read()
+            .expect("shared brain metadata-lock map poisoned")
+            .get(name)
+            .cloned()
+        {
+            return lock;
+        }
+        let mut locks = self
+            .metadata_locks
+            .write()
+            .expect("shared brain metadata-lock map poisoned");
+        locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
     }
 
     pub(crate) fn bind_run_connection(
@@ -904,6 +927,10 @@ impl BrainStore {
     /// not inherited a default yet.
     pub fn provider_selection(&self, name: &str) -> Result<BrainProviderSelection> {
         let name = Self::validate_name(name)?;
+        let metadata_lock = self.metadata_lock(name);
+        let _metadata_guard = metadata_lock
+            .lock()
+            .expect("shared Brain metadata lock poisoned");
         Ok(self
             .read_metadata(name)?
             .map(|metadata| metadata.selection)
@@ -921,7 +948,11 @@ impl BrainStore {
         selection: BrainProviderSelection,
     ) -> Result<BrainProviderSelection> {
         let name = Self::validate_name(name)?;
-        let mut metadata = self.load_or_create_metadata(name)?;
+        let metadata_lock = self.metadata_lock(name);
+        let _metadata_guard = metadata_lock
+            .lock()
+            .expect("shared Brain metadata lock poisoned");
+        let mut metadata = self.load_or_create_metadata_unlocked(name)?;
         metadata.selection = selection;
         self.write_metadata(name, &metadata)?;
         Ok(metadata.selection)
@@ -3991,6 +4022,13 @@ impl BrainStore {
     pub fn remove_if_unused(&self, name: &str) -> Result<bool> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let metadata_lock = self.metadata_lock(name);
+        let _metadata_guard = metadata_lock
+            .lock()
+            .expect("shared Brain metadata lock poisoned");
+        let has_persisted_selection = self
+            .read_metadata(name)?
+            .is_some_and(|metadata| !metadata.selection.is_empty());
         {
             // Keep the state lock from the eligibility check through removal.
             // Otherwise a concurrent attach could recreate a live participant
@@ -4037,7 +4075,11 @@ impl BrainStore {
                 .attachments
                 .values()
                 .any(|attachment| attachment.connection_id.is_some());
-            if has_substantive_history || has_live_attachment || state.runner_lease.is_some() {
+            if has_substantive_history
+                || has_persisted_selection
+                || has_live_attachment
+                || state.runner_lease.is_some()
+            {
                 return Ok(false);
             }
 
@@ -5640,6 +5682,14 @@ impl BrainStore {
     }
 
     fn load_or_create_metadata(&self, name: &str) -> Result<BrainMetadata> {
+        let metadata_lock = self.metadata_lock(name);
+        let _metadata_guard = metadata_lock
+            .lock()
+            .expect("shared Brain metadata lock poisoned");
+        self.load_or_create_metadata_unlocked(name)
+    }
+
+    fn load_or_create_metadata_unlocked(&self, name: &str) -> Result<BrainMetadata> {
         let Some(root) = &self.root else {
             return Ok(BrainMetadata {
                 version: BRAIN_METADATA_VERSION,

@@ -95,13 +95,7 @@ impl EventLoop {
     }
 
     async fn apply_effective_selection(&mut self) -> Result<()> {
-        let effective = match self.effective_selection() {
-            Ok(effective) => effective,
-            Err(error) => {
-                self.output_manager.write_info(format!("⚠️  {error}"));
-                return Ok(());
-            }
-        };
+        let effective = self.effective_selection()?;
         let mut entry = self.available_providers[effective.provider_index].clone();
         if !entry.is_local() {
             entry = entry.with_model_overlay(effective.model.clone());
@@ -109,10 +103,7 @@ impl EventLoop {
         }
         if entry.is_local() {
             let Some(client) = self.daemon_client.clone() else {
-                self.output_manager.write_info(
-                    "⚠️  Local model switching requires a running Finch daemon.".to_string(),
-                );
-                return Ok(());
+                anyhow::bail!("Local model switching requires a running Finch daemon.");
             };
             let generator: Arc<dyn Generator> = Arc::new(
                 crate::generators::DaemonLocalGenerator::new(client, entry.profile_name()),
@@ -128,12 +119,11 @@ impl EventLoop {
                         .await;
                 }
                 Err(error) => {
-                    self.output_manager.write_info(format!(
-                        "⚠️  Failed to activate {} · {}: {error}",
+                    anyhow::bail!(
+                        "Failed to activate {} · {}: {error}",
                         entry.profile_name(),
                         effective.model.as_deref().unwrap_or(entry.provider_type())
-                    ));
-                    return Ok(());
+                    );
                 }
             }
         }
@@ -284,11 +274,18 @@ impl EventLoop {
             ));
             return self.render_tui().await;
         }
-        self.cli_model = None;
+        let previous_selection = self.brain_selection.clone();
+        let previous_cli_model = self.cli_model.take();
         self.brain_selection.model = Some(model.trim().to_string());
         self.brain_selection.provider = Some(entry.profile_name());
         self.brain_selection.provider_inherited = false;
-        self.apply_effective_selection().await?;
+        if let Err(error) = self.apply_effective_selection().await {
+            self.brain_selection = previous_selection;
+            self.cli_model = previous_cli_model;
+            self.output_manager
+                .write_info(format!("⚠️  Model was not changed: {error}"));
+            return self.render_tui().await;
+        }
         if let Err(error) = self.persist_brain_selection().await {
             self.output_manager.write_info(format!(
                 "⚠️  Model is active for this process but could not be persisted on this Brain: {error}"
@@ -351,10 +348,16 @@ impl EventLoop {
         }
         match crate::cli::repl_event::brain_selection::parse_reasoning_effort(&level) {
             Ok(effort) => {
+                let previous_selection = self.brain_selection.clone();
                 self.brain_selection.reasoning_effort = Some(effort.as_str().to_string());
                 self.brain_selection.provider = Some(effective.provider_name.clone());
                 self.brain_selection.provider_inherited = false;
-                self.apply_effective_selection().await?;
+                if let Err(error) = self.apply_effective_selection().await {
+                    self.brain_selection = previous_selection;
+                    self.output_manager
+                        .write_info(format!("⚠️  Thinking level was not changed: {error}"));
+                    return self.render_tui().await;
+                }
                 if let Err(error) = self.persist_brain_selection().await {
                     self.output_manager.write_info(format!(
                         "⚠️  Thinking level is active for this process but could not be persisted on this Brain: {error}"
@@ -383,7 +386,12 @@ impl EventLoop {
         };
         let entry = self.available_providers[target_index].clone();
         let active_index = self.model_selection.active_index().await;
-        if target_index == active_index && self.model_selection.pending_index().await.is_none() {
+        if target_index == active_index
+            && self.model_selection.pending_index().await.is_none()
+            && self.brain_selection.model.is_none()
+            && self.brain_selection.reasoning_effort.is_none()
+            && self.cli_model.is_none()
+        {
             self.brain_selection.provider = Some(entry.profile_name());
             self.brain_selection.provider_inherited = false;
             self.brain_selection.model = None;
