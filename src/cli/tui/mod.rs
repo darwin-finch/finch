@@ -273,46 +273,6 @@ fn stable_poset_order_and_depth(
     (order, depth)
 }
 
-/// Convert Finch's poset into the graph view the Forth overlay would draw.
-///
-/// Unused in production: [`TuiRenderer::draw_poset_overlay`] paints `corner`,
-/// not this view. Named here so Finch's `Poset` stays next to
-/// [`TuiRenderer::set_poset`] rather than in the widget.
-#[allow(dead_code)]
-fn graph_view_from_poset(poset: &crate::poset::Poset) -> GraphView {
-    GraphView {
-        nodes: poset.nodes.iter().map(graph_node_from_poset).collect(),
-        edges: poset.edges.clone(),
-        yaw: poset.yaw,
-        pitch: poset.pitch,
-    }
-}
-
-#[allow(dead_code)]
-fn graph_node_from_poset(node: &crate::poset::Node) -> GraphNode {
-    GraphNode {
-        id: node.id,
-        label: node.label.clone(),
-        kind: match node.kind {
-            crate::poset::NodeKind::Task => GraphNodeKind::Task,
-            crate::poset::NodeKind::Constraint => GraphNodeKind::Constraint,
-            crate::poset::NodeKind::Question => GraphNodeKind::Question,
-            crate::poset::NodeKind::Observation => GraphNodeKind::Observation,
-        },
-        status: match node.status {
-            crate::poset::NodeStatus::Pending => GraphNodeStatus::Pending,
-            crate::poset::NodeStatus::Running => GraphNodeStatus::Running,
-            crate::poset::NodeStatus::Done => GraphNodeStatus::Done,
-            crate::poset::NodeStatus::Failed => GraphNodeStatus::Failed,
-        },
-        pos: node.pos,
-        author: match node.author {
-            crate::poset::NodeAuthor::User => GraphNodeAuthor::User,
-            crate::poset::NodeAuthor::Ai => GraphNodeAuthor::Ai,
-        },
-    }
-}
-
 /// Render a graph view as compact Forth source lines for the panel overlay.
 ///
 /// Each node becomes one word definition; predecessors are called first.
@@ -1637,9 +1597,6 @@ pub struct TuiRenderer {
     // Co-Forth shared stack (set after construction via set_stack)
     stack: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
 
-    // Co-Forth poset VM (set after construction via set_poset). Stored only;
-    // draw_poset_overlay paints `corner`, not this graph.
-    poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
     // True when the poset panel was rendered (non-empty) on the last tick.
     // Used to keep cursor_row_from_top stable when try_lock() fails.
     poset_was_visible: bool,
@@ -1723,7 +1680,6 @@ impl TuiRenderer {
             tracked_agent_usage: HashMap::new(),
             corner: Arc::new(std::sync::Mutex::new(None)),
             stack: None,
-            poset: None,
             poset_was_visible: false,
             poset_panel_mode: PosetPanelMode::Forth,
             panel_hint_shown: false,
@@ -1814,7 +1770,6 @@ impl TuiRenderer {
             tracked_agent_usage: HashMap::new(),
             corner: Arc::new(std::sync::Mutex::new(None)),
             stack: None,
-            poset: None,
             poset_was_visible: false,
             poset_panel_mode: PosetPanelMode::Forth,
             panel_hint_shown: false,
@@ -1887,15 +1842,6 @@ impl TuiRenderer {
     /// Attach the Co-Forth shared stack so the live area can display it.
     pub fn set_stack(&mut self, stack: Arc<tokio::sync::Mutex<Vec<String>>>) {
         self.stack = Some(stack);
-    }
-
-    /// Attach the Co-Forth poset VM. Stored, not drawn: the overlay paints `corner`.
-    ///
-    /// Finch's `Poset` is accepted only here and held as the shared mutex the
-    /// event loop already owns. [`graph_view_from_poset`] is unused;
-    /// [`draw_poset_overlay`] does not snapshot a [`GraphView`].
-    pub fn set_poset(&mut self, poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>) {
-        self.poset = Some(poset);
     }
 
     /// Mark the live area as needing a redraw on the next flush.
@@ -11092,37 +11038,6 @@ mod tests {
                 "rendering changed for node/edge shuffle seed {seed}"
             );
         }
-    }
-
-    /// The injection conversion must preserve the Forth projection the overlay already had.
-    #[test]
-    fn test_graph_view_from_poset_preserves_forth_projection() {
-        let mut poset = crate::poset::Poset::new();
-        poset.add_node(
-            "base".to_string(),
-            crate::poset::NodeKind::Task,
-            crate::poset::NodeAuthor::User,
-        );
-        poset.add_node(
-            "derived".to_string(),
-            crate::poset::NodeKind::Task,
-            crate::poset::NodeAuthor::User,
-        );
-        poset.add_edge(0, 1);
-        let from_poset = poset_to_forth_lines(&graph_view_from_poset(&poset), 80, 40);
-        let mut view = graph_from_labels(&["base", "derived"]);
-        view.edges = vec![(0, 1)];
-        let from_view = poset_to_forth_lines(&view, 80, 40);
-        assert_eq!(
-            from_poset, from_view,
-            "graph_view_from_poset must not change the Forth projection\n\
-             from_poset={from_poset:?}\nfrom_view={from_view:?}"
-        );
-        assert!(
-            rendered_word_body(&from_poset, 1).contains("W0"),
-            "converted view lost the predecessor call: {}",
-            rendered_word_body(&from_poset, 1)
-        );
     }
 }
 
