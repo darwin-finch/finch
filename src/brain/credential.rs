@@ -325,7 +325,7 @@ impl BrainCredentialAuthority {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn ephemeral(signing_key: [u8; 32]) -> Self {
         let invitation_signer = finch_node::NodeSigningIdentity::from_secret(signing_key);
         let invitation_tls =
