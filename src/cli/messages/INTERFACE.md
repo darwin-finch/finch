@@ -42,14 +42,8 @@ impl LiveToolMessage {
     /// Get a clone of the Arc status for background streaming
     pub fn status_arc(&self) -> Arc<RwLock<MessageStatus>>;
 }
-/// Unique identifier for messages
+/// Stable identity for one retained application message. Re-exported from `ui_model`.
 pub struct MessageId(Uuid);
-impl MessageId {
-    /// Restore a stable ID supplied by a canonical transcript event.
-    pub fn from_uuid(uuid: Uuid) -> Self;
-    /// Generate a new unique message ID
-    pub fn new() -> Self;
-}
 /// Type alias for a shared message reference
 pub type MessageRef = Arc<dyn Message>;
 /// Status of a message

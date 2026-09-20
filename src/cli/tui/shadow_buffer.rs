@@ -17,10 +17,10 @@ use crate::cli::messages::MessageRef;
 use ratatui::style::{Color, Style};
 
 // Line measurement moved to the widget vocabulary
-// (`cli::components::vocab`) so components can measure text without this
+// (`crate::ui_model`) so components can measure text without this
 // buffer; engine call sites keep their stable paths here.
-use crate::cli::components::vocab::char_display_width;
-pub use crate::cli::components::vocab::{
+use crate::ui_model::char_display_width;
+pub use crate::ui_model::{
     extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
 };
 

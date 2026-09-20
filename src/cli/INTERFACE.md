@@ -198,7 +198,7 @@ impl MemTreeConsole {
     /// Toggle expansion of selected node
     pub fn toggle_selected(&mut self);
 }
-/// Unique identifier for messages Re-exported from `cli::messages`.
+/// Stable identity for one retained application message. Re-exported from `ui_model`.
 pub struct MessageId(Uuid);
 /// Type alias for a shared message reference Re-exported from `cli::messages`.
 pub type MessageRef = Arc<dyn Message>;

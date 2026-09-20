@@ -261,13 +261,13 @@ pub(crate) fn compute_ghost_text(input: &str, registry: &crate::cli::command_aut
 pub(crate) fn count_status_lines(status: &str) -> usize { … }
 /// Best-effort terminal restoration for an exit path that cannot acquire the renderer lock.
 pub fn emergency_restore_terminal() { … }
-/// Extract visible characters from string (strip ANSI codes) Returns (visible_chars, positions_of_ansi_codes) Re-exported from `cli::components`.
+/// Extract visible characters from string (strip ANSI codes) Returns (visible_chars, positions_of_ansi_codes) Re-exported from `ui_model`.
 pub fn extract_visible_chars(s: &str) -> (Vec<char>, Vec<usize>) { … }
 /// Formats the visible content of the custom-input line (no box borders).
 pub(crate) fn format_custom_input_content(input: &str, cursor: usize) -> String { … }
 /// Returns `(ansi_on, marker)` for the "Other (custom response)" row.
 pub(crate) fn other_row_parts(is_selected: bool) -> (String, &'static str) { … }
-/// Number of physical terminal rows occupied by one logical line. Re-exported from `cli::components`.
+/// Number of physical terminal rows occupied by one logical line. Re-exported from `ui_model`.
 pub fn physical_rows(s: &str, terminal_width: usize) -> usize { … }
 /// Lay out one live-area frame.
 pub(crate) fn plan_live_frame(vm: &view_model::LiveViewModel<'_>, autocomplete: &mut AutocompleteState) -> LiveFrame { … }
@@ -275,9 +275,9 @@ pub(crate) fn plan_live_frame(vm: &view_model::LiveViewModel<'_>, autocomplete: 
 pub fn plan_wizard_frame(view: &WizardView, width: usize, height: usize) -> WizardFrame { … }
 /// Spawn a background task that polls keyboard input and sends to channel  This enables non-blocking input handling in the event loop: - Polls keyboard with 100…
 pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>, quit_tx: mpsc::UnboundedSender<Vec<u8>>) -> mpsc::UnboundedReceiver<InputEvent> { … }
-/// Truncate `s` to at most `columns` display columns. Re-exported from `cli::components`.
+/// Truncate `s` to at most `columns` display columns. Re-exported from `ui_model`.
 pub fn truncate_to_columns(s: &str, columns: usize) -> String { … }
-/// Calculate visible display-column width of string (excluding ANSI escape codes). Re-exported from `cli::components`.
+/// Calculate visible display-column width of string (excluding ANSI escape codes). Re-exported from `ui_model`.
 pub fn visible_length(s: &str) -> usize { … }
 /// A coloured, bold wizard span.
 pub fn wizard_bold(text: &str, fg: WizardColor) -> String { … }

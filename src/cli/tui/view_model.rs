@@ -25,9 +25,9 @@ use super::widgets::{self, Axis, Rect, Track, Widget};
 
 /// Stable identity for one expandable row within the transcript, and the
 /// role vocabulary: moved to the widget vocabulary
-/// ([`crate::cli::components::vocab`]) so components can build row identity
+/// ([`crate::ui_model`]) so components can build row identity
 /// without the engine (#882). Engine call sites keep these stable paths.
-pub(crate) use crate::cli::components::vocab::{NodeRole, RowId};
+pub(crate) use crate::ui_model::{NodeRole, RowId};
 
 /// Widget props for one transcript row, projected from domain data.
 #[derive(Debug, Clone)]

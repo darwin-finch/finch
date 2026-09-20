@@ -11,7 +11,7 @@
 //! not. This module proves the model with the say turn (#882, stage 1).
 //!
 //! **Dependency direction.** Dependencies point downward only: this module
-//! depends on `cli::messages` (domain) and `cli::components::vocab` (the
+//! depends on `cli::messages` (domain) and `crate::ui_model` (the
 //! widget vocabulary), never on `cli::tui` (the engine), `crossterm`, or the
 //! shadow buffer. The engine asks the `Message` trait for a component
 //! snapshot and hands it here; it never matches on message type, and it
@@ -25,6 +25,5 @@
 //! cli::components::`.
 
 mod say_turn;
-pub(crate) mod vocab;
 
 pub(crate) use say_turn::card_lines;

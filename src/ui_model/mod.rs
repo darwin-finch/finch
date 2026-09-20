@@ -7,11 +7,39 @@
 //! The claiming pass lives here because it is pure layout over these types —
 //! the engine supplies the frames, hit-rect routing, and paint.
 
+use std::fmt;
 use std::ops::Range;
 
 use unicode_width::UnicodeWidthChar;
+use uuid::Uuid;
 
-use crate::cli::messages::MessageId;
+/// Stable identity for one retained application message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MessageId(Uuid);
+
+impl MessageId {
+    /// Generate a new unique message ID.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Restore a stable ID supplied by a canonical transcript event.
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl Default for MessageId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for MessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Stable identity for one expandable row within the transcript.
 ///
@@ -1053,7 +1081,7 @@ mod tests {
         let header = |text: &str| RenderedTranscriptLine {
             text: text.to_string(),
             row_id: Some(RowId {
-                message_id: crate::cli::messages::MessageId::new(),
+                message_id: MessageId::new(),
                 path: vec![0],
             }),
             ..RenderedTranscriptLine::default()
@@ -1241,7 +1269,7 @@ mod tests {
         let header = RenderedTranscriptLine {
             text: line,
             row_id: Some(RowId {
-                message_id: crate::cli::messages::MessageId::new(),
+                message_id: MessageId::new(),
                 path: vec![1],
             }),
             component_owned: true,
