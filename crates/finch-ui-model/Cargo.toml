@@ -1,0 +1,13 @@
+[package]
+name = "finch-ui-model"
+version = "0.7.31"
+publish = false
+rust-version = "1.98"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0"
+description = "Terminal-independent application UI identity, semantic widget data, line measurement, and pure claiming layout"
+repository = "https://github.com/darwin-finch/finch"
+
+[dependencies]
+unicode-width = "0.2"
+uuid = { version = "1.0", features = ["v4"] }

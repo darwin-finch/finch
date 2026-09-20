@@ -47,10 +47,11 @@ Every blit converts domain state into one owned ViewModel snapshot, then lays it
 4. Painting stays line-based on the claimed rects; native `canonical_commit` remains the
    separate once-per-id pipeline.
 
-## The widget vocabulary lives in `crate::ui_model` (#877/#882)
+## The widget vocabulary lives in `finch-ui-model` (#877/#882)
 
 `Rect`, `Track`, `Axis`, `Widget`, `Layout`, `RenderedTranscriptLine`, `RowId`, `NodeRole`,
-and the pure line-metric functions live behind `crate::ui_model` (stage-1
+and the pure line-metric functions live in `finch-ui-model`, reached through the root
+`crate::ui_model` compatibility facade (stage-1
 prerequisite of `docs/TUI_DESIGN.md`) so a component can build and claim a subtree without
 touching `crossterm` or the shadow buffer. The engine keeps its stable `widgets` /
 `shadow_buffer` paths as re-exports; new surface authors depend on the vocabulary directly.

@@ -169,7 +169,7 @@ Virtual row helpers:
 ## Key files
 
 - `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
-- `src/ui_model/` — terminal-independent identity, widget vocabulary, and claiming layout
+- `crates/finch-ui-model/` — terminal-independent identity, widget vocabulary, and claiming layout
 - `src/cli/components/` — component-owned presentation, including the say-turn component
   (`say_turn.rs`) (#882)
 - `src/cli/tui/view_model.rs` — the blit-time `LiveViewModel`, the domain → widget projection, and the root claiming tree

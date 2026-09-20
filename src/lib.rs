@@ -113,7 +113,7 @@ pub mod startup; // Startup phase timing: #364, instrument and reduce
 pub mod theme; // Colour scheme and semantic bands: what a renderer needs, with no config format
 pub mod tools; // Tool execution system
 pub mod training; // Batch training and checkpoints (Phase 2) // Offline Ed25519 commercial license key validation
-pub mod ui_model; // Terminal-independent application UI identity, widget data, and layout
 pub use finch_language as language; // Source compilation facade; returns ModuleVerified
+pub use finch_ui_model as ui_model; // Terminal-independent application UI identity, widget data, and layout
 pub use finch_vm as vm; // Typed stack IR, verifier, capabilities, and language contracts
 pub(crate) mod workbook; // Compatibility facade over runtime-owned worksheet bounds (#282)

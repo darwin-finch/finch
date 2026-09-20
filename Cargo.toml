@@ -26,6 +26,7 @@ members = [
     "crates/finch-programs",
     "crates/finch-providers",
     "crates/finch-runtime",
+    "crates/finch-ui-model",
     "crates/finch-vm",
     "crates/finch-vm-core",
 ]
@@ -43,6 +44,7 @@ default-members = [
     "crates/finch-programs",
     "crates/finch-providers",
     "crates/finch-runtime",
+    "crates/finch-ui-model",
     "crates/finch-vm",
     "crates/finch-vm-core",
 ]
@@ -59,6 +61,7 @@ finch-node = { path = "crates/finch-node" }
 finch-programs = { path = "crates/finch-programs" }
 finch-providers = { path = "crates/finch-providers" }
 finch-runtime = { path = "crates/finch-runtime" }
+finch-ui-model = { path = "crates/finch-ui-model" }
 finch-vm = { path = "crates/finch-vm" }
 
 # CLI

@@ -1673,6 +1673,7 @@ dependencies = [
  "finch-providers",
  "finch-runtime",
  "finch-tools-api",
+ "finch-ui-model",
  "finch-vm",
  "fs2",
  "futures",
@@ -1969,6 +1970,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "finch-ui-model"
+version = "0.7.31"
+dependencies = [
+ "unicode-width 0.2.0",
  "uuid",
 ]
 
