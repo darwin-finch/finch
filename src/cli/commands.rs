@@ -52,10 +52,24 @@ pub enum Command {
     PersonaList,           // List available personas
     PersonaSelect(String), // Switch to a different persona
     PersonaShow,           // Show current persona and system prompt
-    // Provider switching (/provider is canonical; /model and /teacher are silent aliases)
-    ModelList,           // /provider list
-    ModelSwitch(String), // /provider <name>  e.g. /provider grok
-    ModelShow,           // /provider  (show current active provider)
+    /// `/providers` — inspect configured provider entries; no mutation.
+    ProviderList,
+    /// `/provider` — show the active Brain's provider entry.
+    ProviderShow,
+    /// `/provider <name>` — bind this Brain to that configured entry.
+    ProviderSwitch(String),
+    /// `/model list` — list models the active provider entry can serve.
+    ModelList,
+    /// `/model <id>` — overlay a model on this Brain, same credentials.
+    ModelSwitch(String),
+    /// `/model` — show the active model overlay / picker.
+    ModelShow,
+    /// `/thinking` — show the active thinking/reasoning overlay.
+    ThinkingShow,
+    /// `/thinking <level>` — overlay effort on this Brain when supported.
+    ThinkingSet(String),
+    /// `/status` — inspect effective provider, model, thinking, and source.
+    Status,
     // License management
     LicenseStatus,           // /license or /license status
     LicenseActivate(String), // /license activate <key>
@@ -117,24 +131,48 @@ pub enum Command {
 
 impl Command {
     pub fn parse(input: &str) -> Option<Self> {
-        // Model profile names are user-defined and may end in punctuation
+        // Provider and model names are user-defined and may end in punctuation
         // (for example "GPT-4o (work)"). Parse these before the historical
         // punctuation cleanup used for conversational slash commands.
         let raw = input.trim();
         match raw {
-            "/provider" | "/provider show" | "/model" | "/model show" | "/teacher"
-            | "/teacher show" => return Some(Command::ModelShow),
-            "/provider list" | "/model list" | "/teacher list" => return Some(Command::ModelList),
+            "/providers" | "/provider list" | "/teacher list" => {
+                return Some(Command::ProviderList)
+            }
+            "/provider" | "/provider show" | "/teacher" | "/teacher show" => {
+                return Some(Command::ProviderShow)
+            }
+            "/model" | "/model show" => return Some(Command::ModelShow),
+            "/model list" => return Some(Command::ModelList),
+            "/thinking" | "/thinking show" | "/reasoning" | "/reasoning show" => {
+                return Some(Command::ThinkingShow)
+            }
+            "/status" => return Some(Command::Status),
+            "/config" => return Some(Command::Setup),
             _ => {}
         }
         if let Some(rest) = raw
             .strip_prefix("/provider ")
-            .or_else(|| raw.strip_prefix("/model "))
             .or_else(|| raw.strip_prefix("/teacher "))
         {
             let profile_name = rest.trim();
             if profile_name != "list" && profile_name != "show" && !profile_name.is_empty() {
-                return Some(Command::ModelSwitch(profile_name.to_string()));
+                return Some(Command::ProviderSwitch(profile_name.to_string()));
+            }
+        }
+        if let Some(rest) = raw.strip_prefix("/model ") {
+            let model_id = rest.trim();
+            if model_id != "list" && model_id != "show" && !model_id.is_empty() {
+                return Some(Command::ModelSwitch(model_id.to_string()));
+            }
+        }
+        if let Some(rest) = raw
+            .strip_prefix("/thinking ")
+            .or_else(|| raw.strip_prefix("/reasoning "))
+        {
+            let level = rest.trim();
+            if level != "show" && !level.is_empty() {
+                return Some(Command::ThinkingSet(level.to_string()));
             }
         }
         if let Some(rest) = raw.strip_prefix("/brain say ") {
@@ -195,10 +233,19 @@ impl Command {
             // Persona commands
             "/persona" | "/persona list" => return Some(Command::PersonaList),
             "/persona show" => return Some(Command::PersonaShow),
-            // Provider commands (/provider canonical; /model and /teacher are aliases)
-            "/provider" | "/provider show" | "/model" | "/model show" | "/teacher"
-            | "/teacher show" => return Some(Command::ModelShow),
-            "/provider list" | "/model list" | "/teacher list" => return Some(Command::ModelList),
+            "/providers" | "/provider list" | "/teacher list" => {
+                return Some(Command::ProviderList)
+            }
+            "/provider" | "/provider show" | "/teacher" | "/teacher show" => {
+                return Some(Command::ProviderShow)
+            }
+            "/model" | "/model show" => return Some(Command::ModelShow),
+            "/model list" => return Some(Command::ModelList),
+            "/thinking" | "/thinking show" | "/reasoning" | "/reasoning show" => {
+                return Some(Command::ThinkingShow)
+            }
+            "/status" => return Some(Command::Status),
+            "/config" => return Some(Command::Setup),
             // License management
             "/license" | "/license status" => return Some(Command::LicenseStatus),
             "/license remove" => return Some(Command::LicenseRemove),
@@ -407,16 +454,28 @@ impl Command {
             }
         }
 
-        // Handle /provider <name> (canonical), /model <name>, /teacher <name> (aliases)
         if let Some(rest) = trimmed
             .strip_prefix("/provider ")
-            .or_else(|| trimmed.strip_prefix("/model "))
             .or_else(|| trimmed.strip_prefix("/teacher "))
         {
-            let teacher_name = rest.trim();
-            // Filter out subcommands
-            if teacher_name != "list" && teacher_name != "show" && !teacher_name.is_empty() {
-                return Some(Command::ModelSwitch(teacher_name.to_string()));
+            let profile_name = rest.trim();
+            if profile_name != "list" && profile_name != "show" && !profile_name.is_empty() {
+                return Some(Command::ProviderSwitch(profile_name.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/model ") {
+            let model_id = rest.trim();
+            if model_id != "list" && model_id != "show" && !model_id.is_empty() {
+                return Some(Command::ModelSwitch(model_id.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("/thinking ")
+            .or_else(|| trimmed.strip_prefix("/reasoning "))
+        {
+            let level = rest.trim();
+            if level != "show" && !level.is_empty() {
+                return Some(Command::ThinkingSet(level.to_string()));
             }
         }
 
@@ -626,10 +685,17 @@ pub fn handle_command(
         Command::PersonaList | Command::PersonaSelect(_) | Command::PersonaShow => Ok(
             CommandOutput::Status("Persona commands should be handled in REPL.".to_string()),
         ),
-        // Model/Teacher switching commands are handled directly in REPL
-        Command::ModelList | Command::ModelSwitch(_) | Command::ModelShow => Ok(
-            CommandOutput::Status("Model commands should be handled in REPL.".to_string()),
-        ),
+        Command::ProviderList
+        | Command::ProviderShow
+        | Command::ProviderSwitch(_)
+        | Command::ModelList
+        | Command::ModelSwitch(_)
+        | Command::ModelShow
+        | Command::ThinkingShow
+        | Command::ThinkingSet(_)
+        | Command::Status => Ok(CommandOutput::Status(
+            "Model commands should be handled in REPL.".to_string(),
+        )),
         // License commands are handled directly in REPL
         Command::LicenseStatus | Command::LicenseActivate(_) | Command::LicenseRemove => Ok(
             CommandOutput::Status("License commands should be handled in REPL.".to_string()),
@@ -730,16 +796,18 @@ pub fn format_help() -> String {
           {cyan}  /training{reset}          Show routing statistics and disabled training status\n\
           {cyan}  /usage{reset}             Show this Brain's session token burn (and cost when priced)\n\
           {cyan}  /usage reset{reset}       Zero the session-cumulative totals\n\n\
-         {yellow_bold}🤖 Provider Commands:{reset}\n\
-         {cyan}  /model{reset}             Show current named model profile\n\
-         {cyan}  /model list{reset}        List configured cloud and local profiles\n\
-         {cyan}  /model <name>{reset}      Switch profiles without clearing context\n\
-         {reset}                     Example: /provider grok\n\
+         {yellow_bold}🤖 Provider and Model:{reset}\n\
+         {cyan}  /model{reset}             Show the active model; interactive picker\n\
+         {cyan}  /model <id>{reset}        Overlay a model on this Brain (same credentials)\n\
+         {cyan}  /status{reset}            Inspect effective provider, model, and thinking\n\
+         {cyan}  /providers{reset}         List configured provider entries (no mutation)\n\
+         {cyan}  /provider <name>{reset}   Bind this Brain to a configured provider entry\n\
+         {cyan}  /thinking <level>{reset}  Overlay reasoning effort when the provider supports it\n\
+         {cyan}  /config{reset}            Persistent configuration and setup (alias of /setup)\n\
          {cyan}  /local <query>{reset}     Query local ONNX model directly (bypass routing)\n\
-         {reset}                     Example: /local What is 2+2?\n\
          {reset}\n\
-         {gray}  Aliases: /model and /teacher also work (kept for compatibility){reset}\n\
-         {gray}  Switch between Claude, Grok, GPT-4, local ONNX, etc.{reset}\n\
+         {gray}  /model never switches accounts. /provider does. /teacher is a /provider alias.{reset}\n\
+         {gray}  Overlays persist on this Brain; --model is one-shot for this invocation.{reset}\n\
          {gray}  Conversation history is preserved across switches.{reset}\n\n\
          {yellow_bold}🔌 MCP Plugin Commands:{reset}\n\
          {cyan}  /mcp list{reset}          List connected MCP servers\n\
@@ -1423,46 +1491,70 @@ mod tests {
 
     #[test]
     fn test_parse_provider_commands() {
-        // /provider is canonical
         assert!(matches!(
             Command::parse("/provider"),
-            Some(Command::ModelShow)
+            Some(Command::ProviderShow)
         ));
         assert!(matches!(
             Command::parse("/provider show"),
-            Some(Command::ModelShow)
+            Some(Command::ProviderShow)
+        ));
+        assert!(matches!(
+            Command::parse("/providers"),
+            Some(Command::ProviderList)
         ));
         assert!(matches!(
             Command::parse("/provider list"),
-            Some(Command::ModelList)
+            Some(Command::ProviderList)
         ));
-        // switch
         match Command::parse("/provider grok") {
-            Some(Command::ModelSwitch(name)) => assert_eq!(name, "grok"),
-            _ => panic!("Expected ModelSwitch(grok)"),
+            Some(Command::ProviderSwitch(name)) => assert_eq!(name, "grok"),
+            _ => panic!("Expected ProviderSwitch(grok)"),
         }
         match Command::parse("/provider claude") {
-            Some(Command::ModelSwitch(name)) => assert_eq!(name, "claude"),
-            _ => panic!("Expected ModelSwitch(claude)"),
+            Some(Command::ProviderSwitch(name)) => assert_eq!(name, "claude"),
+            _ => panic!("Expected ProviderSwitch(claude)"),
         }
+        assert!(
+            !matches!(Command::parse("/model grok"), Some(Command::ProviderSwitch(_))),
+            "/model must not be treated as a provider/account switch"
+        );
         match Command::parse("/model GPT-4o (work)") {
             Some(Command::ModelSwitch(name)) => assert_eq!(name, "GPT-4o (work)"),
-            _ => panic!("Expected punctuation in the profile name to be preserved"),
+            _ => panic!("Expected /model to overlay a model id, preserving punctuation"),
         }
-        // Legacy aliases still work
         assert!(matches!(Command::parse("/model"), Some(Command::ModelShow)));
         assert!(matches!(
             Command::parse("/teacher"),
-            Some(Command::ModelShow)
+            Some(Command::ProviderShow)
         ));
         assert!(matches!(
             Command::parse("/teacher list"),
-            Some(Command::ModelList)
+            Some(Command::ProviderList)
         ));
         match Command::parse("/teacher grok") {
-            Some(Command::ModelSwitch(name)) => assert_eq!(name, "grok"),
-            _ => panic!("Expected ModelSwitch(grok) via /teacher alias"),
+            Some(Command::ProviderSwitch(name)) => assert_eq!(name, "grok"),
+            _ => panic!("Expected ProviderSwitch(grok) via /teacher alias"),
         }
+        assert!(matches!(Command::parse("/status"), Some(Command::Status)));
+        assert!(matches!(
+            Command::parse("/thinking high"),
+            Some(Command::ThinkingSet(level)) if level == "high"
+        ));
+        assert!(matches!(
+            Command::parse("/reasoning"),
+            Some(Command::ThinkingShow)
+        ));
+        assert!(matches!(Command::parse("/config"), Some(Command::Setup)));
+        let help = format_help();
+        assert!(
+            help.contains("/model never switches accounts"),
+            "help must explain the provider/model boundary: {help}"
+        );
+        assert!(
+            help.contains("/status"),
+            "help must list /status: {help}"
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub(super) use super::journal::{create_dir_all_durable, sync_directory};
 pub use super::journal::{
     BrainApprovalDecisionReservation, BrainEvent, BrainEventKind, BrainExecutableMutationAppend,
     BrainId, BrainMetadata, BrainMutationAppend, BrainMutationOutcome, BrainMutationReceipt,
-    BrainProgram, CommittedMemoryRecord, BRAIN_EVENT_SCHEMA_VERSION,
+    BrainProgram, BrainProviderSelection, CommittedMemoryRecord, BRAIN_EVENT_SCHEMA_VERSION,
 };
 use super::projection::{self, observer_effect_audit_event};
 pub use super::projection::{
@@ -896,6 +896,35 @@ impl BrainStore {
             anyhow::bail!("brain name must use 1-64 letters, numbers, '-' or '_'");
         }
         Ok(name)
+    }
+
+    /// Read the secret-free provider/model overlay without hydrating the log.
+    ///
+    /// Missing metadata is an empty selection, not an error: a new Brain has
+    /// not inherited a default yet.
+    pub fn provider_selection(&self, name: &str) -> Result<BrainProviderSelection> {
+        let name = Self::validate_name(name)?;
+        Ok(self
+            .read_metadata(name)?
+            .map(|metadata| metadata.selection)
+            .unwrap_or_default())
+    }
+
+    /// Persist the secret-free provider/model overlay on `metadata.json`.
+    ///
+    /// This does not append a journal event and does not copy secrets. The
+    /// Brain directory is created if needed so a newly named Brain can inherit
+    /// the global default once.
+    pub fn set_provider_selection(
+        &self,
+        name: &str,
+        selection: BrainProviderSelection,
+    ) -> Result<BrainProviderSelection> {
+        let name = Self::validate_name(name)?;
+        let mut metadata = self.load_or_create_metadata(name)?;
+        metadata.selection = selection;
+        self.write_metadata(name, &metadata)?;
+        Ok(metadata.selection)
     }
 
     pub fn list(&self) -> Result<Vec<String>> {
@@ -5571,12 +5600,53 @@ impl BrainStore {
         )
     }
 
+    fn read_metadata(&self, name: &str) -> Result<Option<BrainMetadata>> {
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+        let path = root.join(name).join("metadata.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let metadata: BrainMetadata = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", path.display()))?;
+        if metadata.version != BRAIN_METADATA_VERSION || metadata.brain_id == BrainId::nil() {
+            anyhow::bail!(
+                "unsupported or invalid Brain metadata at {}",
+                path.display()
+            );
+        }
+        Ok(Some(metadata))
+    }
+
+    fn write_metadata(&self, name: &str, metadata: &BrainMetadata) -> Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let directory = root.join(name);
+        create_dir_all_durable(&directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+        let path = directory.join("metadata.json");
+        let encoded = serde_json::to_vec_pretty(metadata)?;
+        let temporary = directory.join(format!(".metadata.{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, encoded)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        std::fs::File::open(&temporary)?.sync_all()?;
+        std::fs::rename(&temporary, &path)
+            .with_context(|| format!("commit {}", path.display()))?;
+        let _ = std::fs::remove_file(&temporary);
+        sync_directory(&directory)?;
+        Ok(())
+    }
+
     fn load_or_create_metadata(&self, name: &str) -> Result<BrainMetadata> {
         let Some(root) = &self.root else {
             return Ok(BrainMetadata {
                 version: BRAIN_METADATA_VERSION,
                 brain_id: BrainId::new(),
                 created_ms: unix_millis(),
+                selection: BrainProviderSelection::default(),
             });
         };
         let directory = root.join(name);
@@ -5599,6 +5669,7 @@ impl BrainStore {
             version: BRAIN_METADATA_VERSION,
             brain_id: BrainId::new(),
             created_ms: unix_millis(),
+            selection: BrainProviderSelection::default(),
         };
         let encoded = serde_json::to_vec_pretty(&metadata)?;
         let temporary = directory.join(format!(".metadata.{}.tmp", uuid::Uuid::new_v4()));

@@ -160,3 +160,46 @@ pub(super) async fn archive_named_brain(
         archived_to: archived_to.map(|path| path.display().to_string()),
     }))
 }
+
+pub(super) async fn get_named_brain_selection(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<crate::brain::BrainProviderSelection>, Response> {
+    check_brain_bootstrap_access(&server, addr, &headers).await?;
+    server
+        .brain_store()
+        .provider_selection(&name)
+        .map(Json)
+        .map_err(|error| AppError(error).into_response())
+}
+
+pub(super) async fn put_named_brain_selection(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(selection): Json<crate::brain::BrainProviderSelection>,
+) -> Result<Json<crate::brain::BrainProviderSelection>, Response> {
+    check_brain_bootstrap_access(&server, addr, &headers).await?;
+    if selection
+        .provider
+        .as_deref()
+        .is_some_and(|value| value.contains('\n') || value.contains('\r'))
+        || selection
+            .model
+            .as_deref()
+            .is_some_and(|value| value.contains('\n') || value.contains('\r'))
+    {
+        return Err(AppError(anyhow::anyhow!(
+            "provider/model overlay must be a single secret-free line"
+        ))
+        .into_response());
+    }
+    server
+        .brain_store()
+        .set_provider_selection(&name, selection)
+        .map(Json)
+        .map_err(|error| AppError(error).into_response())
+}

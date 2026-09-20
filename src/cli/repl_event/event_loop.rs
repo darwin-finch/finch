@@ -262,6 +262,10 @@ pub struct EventLoop {
 
     /// Available providers from config (for /provider list + switching)
     available_providers: Vec<crate::config::ProviderEntry>,
+    default_provider: Option<String>,
+    cli_model: Option<String>,
+    cli_provider: Option<String>,
+    brain_selection: crate::brain::BrainProviderSelection,
 
     /// HTTP daemon client used for local-model status and generation.
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
@@ -1874,6 +1878,9 @@ impl EventLoop {
             resolver: provider_resolver,
             available: available_providers,
             active_index: active_provider_index,
+            default_provider,
+            cli_model,
+            cli_provider,
         } = generation;
         let crate::cli::repl_event::parts::UiParts {
             renderer: tui_renderer,
@@ -2042,6 +2049,10 @@ impl EventLoop {
             ),
             qwen_gen,
             available_providers,
+            default_provider,
+            cli_model,
+            cli_provider,
+            brain_selection: crate::brain::BrainProviderSelection::default(),
             daemon_client,
             router,
             generator_state,
@@ -2210,9 +2221,13 @@ impl EventLoop {
             self.output_manager.clear();
         }
 
+        let _ = self.hydrate_brain_selection().await;
         let model_name = {
             let _phase = crate::startup::phase(crate::startup::PHASE_GENERATOR_RESOLVE);
-            self.model_selection.generator().await.name().to_string()
+            match self.effective_selection() {
+                Ok(effective) => effective.identity_label(),
+                Err(_) => self.model_selection.generator().await.name().to_string(),
+            }
         };
         let cwd = std::env::current_dir()
             .ok()
@@ -2282,7 +2297,13 @@ impl EventLoop {
                 self.last_home_watch_error = Some(detail);
                 self.project_ipc_recovery_header(self.home_watch_reconnecting_header());
                 self.schedule_home_brain_reconnect(self.home_watch_epoch, 0);
+            } else if let Err(error) = self.hydrate_brain_selection().await {
+                self.output_manager.write_info(format!(
+                    "⚠️  Could not restore this Brain's model selection: {error}"
+                ));
             }
+        } else if let Err(error) = self.hydrate_brain_selection().await {
+            tracing::debug!("Brain selection hydrate skipped: {error}");
         }
         // ─────────────────────────────────────────────────────────────────────
 
@@ -3180,27 +3201,20 @@ impl EventLoop {
     }
 
     async fn handle_provider_show(&self) {
-        let active = self.model_selection.active_index().await;
-        let Some(entry) = self.available_providers.get(active) else {
-            self.output_manager.write_info("No active model profile.");
-            return;
-        };
-
-        let mut text = format!(
-            "Active model: {}\n  provider: {}\n  model: {}\n  conversation: preserved across switches",
-            entry.profile_name(),
-            entry.provider_type(),
-            entry.model().unwrap_or("provider default")
-        );
-        if let Some(pending) = self.model_selection.pending_index().await {
-            if let Some(entry) = self.available_providers.get(pending) {
-                text.push_str(&format!(
-                    "\n  pending: {} (waiting for local model startup)",
-                    entry.profile_name()
-                ));
-            }
+        match crate::cli::repl_event::brain_selection::resolve_selection(
+            &self.available_providers,
+            &crate::cli::repl_event::brain_selection::SelectionRequest {
+                default_provider: self.default_provider.clone(),
+                persisted: self.brain_selection.clone(),
+                cli_provider: self.cli_provider.clone(),
+                cli_model: self.cli_model.clone(),
+            },
+        ) {
+            Ok(effective) => self
+                .output_manager
+                .write_info(effective.status_report(self.default_provider.as_deref())),
+            Err(error) => self.output_manager.write_info(format!("⚠️  {error}")),
         }
-        self.output_manager.write_info(text);
     }
 
     /// Handle /mcp list command - list connected MCP servers

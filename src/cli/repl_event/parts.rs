@@ -38,6 +38,9 @@ pub struct GenerationParts {
     pub resolver: crate::scheduler::ProviderResolver,
     pub available: Vec<crate::config::ProviderEntry>,
     pub active_index: usize,
+    pub default_provider: Option<String>,
+    pub cli_model: Option<String>,
+    pub cli_provider: Option<String>,
 }
 
 /// Everything that draws.

@@ -597,6 +597,8 @@ pub struct Repl {
     available_providers: Vec<crate::config::ProviderEntry>,
     available_teachers: Vec<crate::config::TeacherEntry>,
     active_provider_index: usize,
+    cli_model: Option<String>,
+    cli_provider: Option<String>,
     active_teacher_index: usize,
     router: Router, // Now contains ThresholdRouter
     metrics_logger: MetricsLogger,
@@ -739,6 +741,12 @@ impl Repl {
             initialization,
         )
         .await
+    }
+
+    /// `--model` is one-shot; `--provider` persists on this Brain.
+    pub fn set_cli_selection(&mut self, model: Option<String>, provider: Option<String>) {
+        self.cli_model = model.filter(|value| !value.trim().is_empty());
+        self.cli_provider = provider.filter(|value| !value.trim().is_empty());
     }
 
     async fn new_with_initialization(
@@ -1303,6 +1311,8 @@ impl Repl {
             available_providers,
             available_teachers,
             active_provider_index,
+            cli_model: None,
+            cli_provider: None,
             active_teacher_index: 0, // First teacher is active by default
             router,                  // Contains ThresholdRouter now
             metrics_logger,
@@ -2443,6 +2453,9 @@ impl Repl {
                 resolver: provider_resolver,
                 available: self.available_providers.clone(),
                 active_index: initial_provider_index,
+                default_provider: self._config.default_provider_name(),
+                cli_model: self.cli_model.clone(),
+                cli_provider: self.cli_provider.clone(),
             },
             UiParts {
                 renderer: tui_renderer,
@@ -2739,17 +2752,23 @@ impl Repl {
                         self.handle_persona_show().await?;
                         continue;
                     }
-                    // Model/Teacher switching
-                    Command::ModelList => {
+                    Command::ProviderList | Command::ModelList => {
                         self.handle_model_list().await?;
                         continue;
                     }
-                    Command::ModelSwitch(ref name) => {
+                    Command::ProviderSwitch(ref name) | Command::ModelSwitch(ref name) => {
                         self.handle_model_switch(name).await?;
                         continue;
                     }
-                    Command::ModelShow => {
+                    Command::ProviderShow
+                    | Command::ModelShow
+                    | Command::ThinkingShow
+                    | Command::Status => {
                         self.handle_model_show().await?;
+                        continue;
+                    }
+                    Command::ThinkingSet(ref level) => {
+                        self.handle_model_switch(level).await?;
                         continue;
                     }
                     // Phase 4: Memory system

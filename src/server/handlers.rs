@@ -5,7 +5,7 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -107,6 +107,10 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
             axum::routing::delete(revoke_named_brain_credential),
         )
         .route("/v1/brains/named/:name/ws", get(watch_named_brain))
+        .route(
+            "/v1/brains/named/:name/selection",
+            get(get_named_brain_selection).put(put_named_brain_selection),
+        )
         .route(
             "/v1/brains/password",
             get(show_brain_password).put(change_brain_password),

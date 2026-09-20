@@ -33,6 +33,7 @@ pub mod event_loop;
 pub mod events;
 pub mod llm_loop;
 pub mod memory_commitment;
+pub mod brain_selection;
 pub(crate) mod model_selection;
 pub mod parts;
 pub mod plan_handler;

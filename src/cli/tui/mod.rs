@@ -644,6 +644,29 @@ fn session_separator_line(width: usize, cwd: &str, session: &str) -> String {
     )
 }
 
+/// Bottom status rule with provider · model identity on the left.
+fn status_rule_line(width: usize, identity: &str) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if identity.trim().is_empty() {
+        return "─".repeat(width);
+    }
+    let prefix = ellipsize("── ", width);
+    let remaining = width.saturating_sub(prefix.chars().count());
+    if remaining == 0 {
+        return prefix;
+    }
+    let label = format!(" {} ", identity.trim());
+    let label = if label.chars().count() + 2 > remaining {
+        format!(" {} ", ellipsize(identity.trim(), remaining.saturating_sub(2)))
+    } else {
+        label
+    };
+    let used = prefix.chars().count() + label.chars().count();
+    format!("{prefix}{label}{}", "─".repeat(width.saturating_sub(used)))
+}
+
 /// Return a plain visible suffix small enough to fit in `columns`. This is
 /// used only when one logical line is itself taller than the remaining live
 /// viewport; completed scrollback retains the original ANSI-bearing line.
@@ -1406,9 +1429,10 @@ pub(crate) fn plan_live_frame(
     }
 
     // ── 6. Status separator and status line(s) ───────────────────────────────
-    // Session identity is projected into the upper separator; repeating it here
-    // wasted a row and made the Brain appear twice.
-    frame.push(format!("{DIM_GRAY}{}{RESET}", "─".repeat(width)));
+    // Provider/model identity sits on the left of this rule. Brain identity
+    // remains on the upper separator so the two identities are not stacked.
+    let rule = status_rule_line(width, vm.model_identity);
+    frame.push(format!("{DIM_GRAY}{rule}{RESET}"));
     for line in vm.effective_status.lines() {
         frame.push(format!("{DIM_GRAY}{line}{RESET}"));
     }
@@ -1625,6 +1649,9 @@ pub struct TuiRenderer {
     // separator line.
     session_label: String,
 
+    /// Secret-free provider · model identity for the bottom status rule.
+    model_identity: String,
+
     /// Words currently being typed (updated on each keystroke via set_typing_words).
     /// When non-empty, the panel switches to Typing mode to show live arrows.
     pub typing_words: Vec<String>,
@@ -1698,6 +1725,7 @@ impl TuiRenderer {
             poset_panel_mode: PosetPanelMode::Forth,
             panel_hint_shown: false,
             session_label: String::new(),
+            model_identity: String::new(),
             typing_words: Vec::new(),
             pre_typing_mode: PosetPanelMode::Forth,
             live_area_dirty: true,
@@ -1789,6 +1817,7 @@ impl TuiRenderer {
             panel_hint_shown: false,
 
             session_label: String::new(),
+            model_identity: String::new(),
             typing_words: Vec::new(),
             pre_typing_mode: PosetPanelMode::Forth,
 
@@ -2166,6 +2195,7 @@ impl TuiRenderer {
             effective_status,
             cwd_label,
             session_label,
+            model_identity: self.model_identity.clone(),
             task_rows,
             tracked_rows,
             live_rendered,
@@ -2608,6 +2638,7 @@ struct LiveFrameSources {
     effective_status: String,
     cwd_label: String,
     session_label: String,
+    model_identity: String,
     task_rows: Vec<activity::ActivityRow>,
     tracked_rows: Vec<activity::ActivityRow>,
     live_rendered: Vec<RenderedTranscriptLine>,
@@ -2632,6 +2663,7 @@ fn live_view_model<'a>(
         effective_status: &sources.effective_status,
         cwd_label: &sources.cwd_label,
         session_label: &sources.session_label,
+        model_identity: &sources.model_identity,
         dialog,
         expanded_lines,
         render_error: sources.render_error,
@@ -2774,6 +2806,11 @@ impl TuiRenderer {
     /// same ordered commit path as every other message.
     pub fn set_session_label(&mut self, session_label: impl Into<String>) {
         self.session_label = session_label.into();
+    }
+
+    pub fn set_model_identity(&mut self, identity: impl Into<String>) {
+        self.model_identity = identity.into();
+        self.live_area_dirty = true;
     }
 
     /// Build the static startup artifact for `OutputManager` projection.
@@ -5198,6 +5235,7 @@ mod tests {
             effective_status: "ready",
             cwd_label: "~/repos/finch",
             session_label: "jade-river",
+            model_identity: "",
             dialog: None,
             expanded_lines: None,
             render_error: false,
@@ -6273,6 +6311,25 @@ mod tests {
         assert_eq!(input_line_physical_rows(&lines, 10), vec![1, 1]);
         assert_eq!(input_line_physical_rows(&lines, 5), vec![2, 2]);
         assert_eq!(input_physical_rows(&lines, 5), 4);
+    }
+
+    #[test]
+    fn status_rule_never_wraps_and_keeps_identity_on_the_left() {
+        let identity = "ChatGPT · gpt-5.6-sol · override";
+        for width in 1..160 {
+            let line = status_rule_line(width, identity);
+            assert_eq!(line.chars().count(), width, "width {width}: {line:?}");
+            assert_eq!(
+                shadow_buffer::physical_rows(&line, width),
+                1,
+                "width {width}: {line:?}"
+            );
+        }
+        let wide = status_rule_line(80, identity);
+        assert!(
+            wide.contains("ChatGPT · gpt-5.6-sol"),
+            "bottom rule must keep provider/model on the left: {wide:?}"
+        );
     }
 
     #[test]
@@ -8460,6 +8517,7 @@ mod tests {
             effective_status: status,
             cwd_label: "~/repos/finch",
             session_label: "jade-river",
+            model_identity: "",
             dialog: None,
             expanded_lines: None,
             render_error: false,
@@ -8638,6 +8696,7 @@ mod tests {
                 effective_status: status,
                 cwd_label: "~/repos/finch",
                 session_label: "jade-river",
+                model_identity: "",
                 dialog: None,
                 expanded_lines: None,
                 render_error: false,
@@ -8727,6 +8786,7 @@ mod tests {
             effective_status: status,
             cwd_label: "~/repos/finch",
             session_label: "jade-river",
+            model_identity: "",
             dialog: None,
             expanded_lines: None,
             render_error: false,

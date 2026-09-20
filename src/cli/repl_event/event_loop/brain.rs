@@ -50,6 +50,9 @@ impl EventLoop {
                 resolver: provider_resolver,
                 available: Vec::new(),
                 active_index: 0,
+                default_provider: None,
+                cli_model: None,
+                cli_provider: None,
             },
             UiParts {
                 renderer: tui_renderer,

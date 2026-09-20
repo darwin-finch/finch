@@ -30,7 +30,7 @@ pub use credential::{
 };
 pub use journal::{
     BrainEvent, BrainEventKind, BrainId, BrainMutationOutcome, BrainMutationReceipt, BrainProgram,
-    CommittedMemoryRecord, PromptAttachment,
+    BrainProviderSelection, CommittedMemoryRecord, PromptAttachment,
 };
 pub use names::generate;
 pub use projection::{BrainEnvironment, BrainSnapshot, BrainWireMessage};

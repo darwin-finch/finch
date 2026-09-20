@@ -513,6 +513,7 @@ pub(crate) struct LiveViewModel<'a> {
     pub effective_status: &'a str,
     pub cwd_label: &'a str,
     pub session_label: &'a str,
+    pub model_identity: &'a str,
     pub dialog: Option<&'a super::Dialog>,
     /// Lines of the focused expanded tool-result surface (#656), pre-rendered
     /// by the caller so the planner stays a pure function of its inputs.

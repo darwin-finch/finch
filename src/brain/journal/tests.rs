@@ -159,3 +159,46 @@ fn test_replay_mutation_is_idempotent_and_rejects_key_reuse() {
         "an unseen mutation id must not invent a replayed event"
     );
 }
+
+#[test]
+fn test_legacy_metadata_json_loads_without_selection_fields() {
+    let metadata: BrainMetadata = serde_json::from_str(
+        r#"{"version":1,"brain_id":"00000000-0000-0000-0000-000000000001","created_ms":1}"#,
+    )
+    .expect("version-1 metadata without overlay fields must still load");
+    assert_eq!(metadata.version, 1);
+    assert!(
+        metadata.selection.is_empty(),
+        "legacy metadata must not invent a provider overlay: {:?}",
+        metadata.selection
+    );
+}
+
+#[test]
+fn test_metadata_selection_round_trip_is_secret_free() {
+    let metadata = BrainMetadata {
+        version: 1,
+        brain_id: BrainId(uuid::Uuid::from_u128(2)),
+        created_ms: 9,
+        selection: BrainProviderSelection {
+            provider: Some("chatgpt".into()),
+            model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: Some("high".into()),
+            provider_inherited: false,
+        },
+    };
+    let json = serde_json::to_string(&metadata).unwrap();
+    assert!(
+        !json.contains("api_key") && !json.contains("sk-"),
+        "Brain metadata must never carry secrets: {json}"
+    );
+    let loaded: BrainMetadata = serde_json::from_str(&json).unwrap();
+    assert_eq!(loaded.selection.provider.as_deref(), Some("chatgpt"));
+    assert_eq!(loaded.selection.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(loaded.selection.reasoning_effort.as_deref(), Some("high"));
+    assert!(
+        !loaded.selection.provider_inherited,
+        "explicit overlay must not look inherited: {:?}",
+        loaded.selection
+    );
+}

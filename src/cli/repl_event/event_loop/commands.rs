@@ -59,7 +59,312 @@ impl EventLoop {
         Ok(())
     }
 
-    /// Handle `/model <name>` — switch the active named provider profile.
+    fn selection_request(&self) -> crate::cli::repl_event::brain_selection::SelectionRequest {
+        crate::cli::repl_event::brain_selection::SelectionRequest {
+            default_provider: self.default_provider.clone(),
+            persisted: self.brain_selection.clone(),
+            cli_provider: self.cli_provider.clone(),
+            cli_model: self.cli_model.clone(),
+        }
+    }
+
+    pub(super) fn effective_selection(
+        &self,
+    ) -> anyhow::Result<crate::cli::repl_event::brain_selection::EffectiveSelection> {
+        crate::cli::repl_event::brain_selection::resolve_selection(
+            &self.available_providers,
+            &self.selection_request(),
+        )
+    }
+
+    async fn persist_brain_selection(&mut self) -> Result<()> {
+        let persistable = crate::cli::repl_event::brain_selection::persistable_selection(
+            &self.effective_selection()?,
+            &self.selection_request(),
+        );
+        self.brain_selection = persistable.clone();
+        if let Some(client) = self.daemon_client.as_ref() {
+            match client
+                .set_brain_provider_selection(&self.session_label, &persistable)
+                .await
+            {
+                Ok(stored) => self.brain_selection = stored,
+                Err(error) => self.output_manager.write_info(format!(
+                    "⚠️  Could not persist this Brain's model selection: {error}"
+                )),
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_effective_selection(&mut self) -> Result<()> {
+        let effective = match self.effective_selection() {
+            Ok(effective) => effective,
+            Err(error) => {
+                self.output_manager.write_info(format!("⚠️  {error}"));
+                return Ok(());
+            }
+        };
+        let mut entry = self.available_providers[effective.provider_index].clone();
+        if !entry.is_local() {
+            entry = entry.with_model_overlay(effective.model.clone());
+            entry = entry.with_reasoning_effort_overlay(effective.reasoning_effort);
+        }
+        if entry.is_local() {
+            let Some(client) = self.daemon_client.clone() else {
+                self.output_manager.write_info(
+                    "⚠️  Local model switching requires a running Finch daemon.".to_string(),
+                );
+                return Ok(());
+            };
+            let generator: Arc<dyn Generator> = Arc::new(
+                crate::generators::DaemonLocalGenerator::new(client, entry.profile_name()),
+            );
+            self.model_selection
+                .activate(effective.provider_index, generator)
+                .await;
+        } else {
+            match self.provider_resolver.resolve_entry(&entry).await {
+                Ok(generator) => {
+                    self.model_selection
+                        .activate(effective.provider_index, generator)
+                        .await;
+                }
+                Err(error) => {
+                    self.output_manager.write_info(format!(
+                        "⚠️  Failed to activate {} · {}: {error}",
+                        entry.profile_name(),
+                        effective.model.as_deref().unwrap_or(entry.provider_type())
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+        self.project_model_identity();
+        Ok(())
+    }
+
+    fn project_model_identity(&self) {
+        if let Ok(effective) = self.effective_selection() {
+            let identity = effective.identity_label();
+            if let Ok(mut tui) = self.tui_renderer.try_lock() {
+                tui.set_model_identity(identity);
+            }
+        }
+    }
+
+    pub(super) async fn hydrate_brain_selection(&mut self) -> Result<()> {
+        if let Some(client) = self.daemon_client.as_ref() {
+            match client
+                .brain_provider_selection(&self.session_label)
+                .await
+            {
+                Ok(stored) => self.brain_selection = stored,
+                Err(error) => tracing::debug!("Brain selection not yet available: {error}"),
+            }
+        }
+        if self.brain_selection.provider.is_none() {
+            if let Some(default) = self.default_provider.clone() {
+                self.brain_selection.provider = Some(default);
+                self.brain_selection.provider_inherited = true;
+            }
+        }
+        if let Some(provider) = self.cli_provider.clone() {
+            self.brain_selection.provider = Some(provider);
+            self.brain_selection.provider_inherited = false;
+            self.brain_selection.model = None;
+        }
+        self.apply_effective_selection().await?;
+        if self.cli_provider.is_some() || self.brain_selection.provider_inherited {
+            let _ = self.persist_brain_selection().await;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn handle_provider_list(&mut self) -> Result<()> {
+        use crate::providers::create_provider_from_entry;
+        let active = self.model_selection.active_index().await;
+        let pending = self.model_selection.pending_index().await;
+        let mut lines = vec!["Configured provider entries:".to_string()];
+        for (index, entry) in self.available_providers.iter().enumerate() {
+            let marker = if index == active {
+                "→"
+            } else if Some(index) == pending {
+                "…"
+            } else {
+                " "
+            };
+            let tag = if entry.is_local() { "local" } else { "cloud" };
+            let available = entry.is_local() || create_provider_from_entry(entry).is_ok();
+            let avail_tag = if available { "" } else { " (unavailable)" };
+            lines.push(format!(
+                "{} {}. [{}] {} · {}{}",
+                marker,
+                index + 1,
+                tag,
+                entry.profile_name(),
+                entry.model().unwrap_or(entry.provider_type()),
+                avail_tag
+            ));
+        }
+        if self.available_providers.is_empty() {
+            lines.push("  (none configured — add [[providers]] to ~/.finch/config.toml)".into());
+        }
+        lines.push("Use /provider <name> to bind this Brain. /model overlays a model on the active entry.".into());
+        self.output_manager.write_info(lines.join("\n"));
+        self.render_tui().await
+    }
+
+    pub(super) async fn handle_model_list(&mut self) -> Result<()> {
+        let Some(entry) = self
+            .available_providers
+            .get(self.model_selection.active_index().await)
+        else {
+            self.output_manager.write_info("No active provider entry.");
+            return self.render_tui().await;
+        };
+        if entry.is_local() {
+            self.output_manager.write_info(format!(
+                "Local provider '{}' has no ChatGPT-style model picker. Family/size lives on the provider entry. Use /provider to switch entries.",
+                entry.profile_name()
+            ));
+            return self.render_tui().await;
+        }
+        let current = self
+            .effective_selection()
+            .ok()
+            .and_then(|effective| effective.model)
+            .or_else(|| entry.model().map(str::to_string));
+        let mut lines = vec![format!(
+            "Models for provider '{}' (same credentials):",
+            entry.profile_name()
+        )];
+        if let Some(model) = entry.model() {
+            let marker = if current.as_deref() == Some(model) {
+                "→"
+            } else {
+                " "
+            };
+            lines.push(format!("{marker} {model}"));
+        }
+        if let Some(current) = current.as_deref() {
+            if entry.model() != Some(current) {
+                lines.push(format!("→ {current}  (Brain overlay)"));
+            }
+        }
+        lines.push("Use /model <id> to overlay a model on this Brain. This does not switch accounts.".into());
+        self.output_manager.write_info(lines.join("\n"));
+        self.render_tui().await
+    }
+
+    pub(super) async fn handle_model_show(&mut self) -> Result<()> {
+        match self.effective_selection() {
+            Ok(effective) => self.output_manager.write_info(effective.status_report(
+                self.default_provider.as_deref(),
+            )),
+            Err(error) => self.output_manager.write_info(format!("⚠️  {error}")),
+        }
+        self.render_tui().await
+    }
+
+    pub(super) async fn handle_status(&mut self) -> Result<()> {
+        self.handle_model_show().await
+    }
+
+    pub(super) async fn handle_model_overlay(&mut self, model: String) -> Result<()> {
+        let Some(entry) = self
+            .available_providers
+            .get(self.model_selection.active_index().await)
+        else {
+            self.output_manager.write_info("No active provider entry.");
+            return self.render_tui().await;
+        };
+        if entry.is_local() {
+            self.output_manager.write_info(format!(
+                "⚠️  Local provider '{}' has no ChatGPT-style model picker. Use /provider to switch entries.",
+                entry.profile_name()
+            ));
+            return self.render_tui().await;
+        }
+        self.cli_model = None;
+        self.brain_selection.model = Some(model.trim().to_string());
+        self.brain_selection.provider = Some(entry.profile_name());
+        self.brain_selection.provider_inherited = false;
+        self.apply_effective_selection().await?;
+        self.persist_brain_selection().await?;
+        if let Ok(effective) = self.effective_selection() {
+            self.output_manager.write_info(format!(
+                "✓ Model overlay {} on {} (persisted on this Brain)",
+                effective.model.as_deref().unwrap_or(&model),
+                effective.provider_name
+            ));
+        }
+        self.render_tui().await
+    }
+
+    pub(super) async fn handle_thinking_show(&mut self) -> Result<()> {
+        match self.effective_selection() {
+            Ok(effective) => {
+                if effective.local || effective.reasoning_effort.is_none() {
+                    let entry = &self.available_providers[effective.provider_index];
+                    if !entry.supports_reasoning_effort() {
+                        self.output_manager.write_info(format!(
+                            "Thinking level is unsupported for provider '{}'.",
+                            effective.provider_name
+                        ));
+                    } else {
+                        self.output_manager.write_info(
+                            "thinking: provider default\nUse /thinking <none|minimal|low|medium|high|xhigh|max>."
+                                .to_string(),
+                        );
+                    }
+                } else {
+                    self.output_manager.write_info(format!(
+                        "thinking: {}",
+                        effective.reasoning_effort.unwrap().as_str()
+                    ));
+                }
+            }
+            Err(error) => self.output_manager.write_info(format!("⚠️  {error}")),
+        }
+        self.render_tui().await
+    }
+
+    pub(super) async fn handle_thinking_set(&mut self, level: String) -> Result<()> {
+        let effective = match self.effective_selection() {
+            Ok(effective) => effective,
+            Err(error) => {
+                self.output_manager.write_info(format!("⚠️  {error}"));
+                return self.render_tui().await;
+            }
+        };
+        let entry = &self.available_providers[effective.provider_index];
+        if !entry.supports_reasoning_effort() {
+            self.output_manager.write_info(format!(
+                "⚠️  Thinking level is unsupported for provider '{}'.",
+                effective.provider_name
+            ));
+            return self.render_tui().await;
+        }
+        match crate::cli::repl_event::brain_selection::parse_reasoning_effort(&level) {
+            Ok(effort) => {
+                self.brain_selection.reasoning_effort = Some(effort.as_str().to_string());
+                self.brain_selection.provider = Some(effective.provider_name.clone());
+                self.brain_selection.provider_inherited = false;
+                self.apply_effective_selection().await?;
+                self.persist_brain_selection().await?;
+                self.output_manager.write_info(format!(
+                    "✓ Thinking overlay {} on {} (persisted on this Brain)",
+                    effort.as_str(),
+                    effective.provider_name
+                ));
+            }
+            Err(error) => self.output_manager.write_info(format!("⚠️  {error}")),
+        }
+        self.render_tui().await
+    }
+
+    /// Handle `/provider <name>` — bind this Brain to a configured provider entry.
     pub(super) async fn handle_provider_switch(&mut self, name: String) -> Result<()> {
         let target_index = match resolve_provider_profile(&self.available_providers, &name) {
             Ok(index) => index,
@@ -94,8 +399,16 @@ impl EventLoop {
                         crate::generators::DaemonLocalGenerator::new(client, entry.profile_name()),
                     );
                     self.model_selection.activate(target_index, generator).await;
+                    self.brain_selection.provider = Some(entry.profile_name());
+                    self.brain_selection.model = None;
+                    self.brain_selection.reasoning_effort = None;
+                    self.brain_selection.provider_inherited = false;
+                    self.cli_model = None;
+                    self.cli_provider = None;
+                    let _ = self.persist_brain_selection().await;
+                    self.project_model_identity();
                     self.output_manager.write_info(format!(
-                        "✓ Switched to {} · {} (conversation preserved)",
+                        "✓ Provider {} · {} (persisted on this Brain)",
                         entry.profile_name(),
                         model
                     ));
@@ -173,8 +486,16 @@ impl EventLoop {
                 }
                 Ok(new_gen) => {
                     self.model_selection.activate(target_index, new_gen).await;
+                    self.brain_selection.provider = Some(entry.profile_name());
+                    self.brain_selection.model = None;
+                    self.brain_selection.reasoning_effort = None;
+                    self.brain_selection.provider_inherited = false;
+                    self.cli_model = None;
+                    self.cli_provider = None;
+                    let _ = self.persist_brain_selection().await;
+                    self.project_model_identity();
                     self.output_manager.write_info(format!(
-                        "✓ Switched to {} · {} (conversation preserved)",
+                        "✓ Provider {} · {} (persisted on this Brain)",
                         entry.profile_name(),
                         entry.model().unwrap_or(entry.provider_type())
                     ));

@@ -59,8 +59,9 @@ pub const COMMAND_REFERENCE: &str = "\
 
 Basic: /help  /quit  /clear  /compact [note]  /debug  /metrics  /memory  /training
 
-Provider: /provider  /provider list  /provider <name>  /local <query>
-  (aliases: /model /teacher)
+Provider: /model [id]  /status  /providers  /provider <name>  /thinking [level]  /local <query>
+  /model overlays a model on this Brain (same credentials). /provider switches the named entry.
+  /teacher is a /provider alias. --model is one-shot and does not persist.
 
 MCP: /mcp list  /mcp tools [server]  /mcp refresh  /mcp reload
 
