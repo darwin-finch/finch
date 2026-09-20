@@ -101,7 +101,7 @@ pub mod providers; // Multi-provider LLM support
 pub mod registry; // Migration-only legacy Co-Forth peer registry
 pub mod review; // Local reviewed-changeset projection
 pub mod router;
-pub mod runtime; // Provider-neutral Forth/Lisp execution and capabilities
+pub use finch_runtime as runtime; // Provider-neutral Forth/Lisp execution and capabilities
 pub mod samples; // Sample spreadsheet generator (finch samples)
 pub mod scheduler; // Child-agent orchestration: chooses providers and models, runs tasks
 pub mod server; // HTTP daemon mode (Phase 1)

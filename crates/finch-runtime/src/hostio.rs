@@ -7,7 +7,7 @@
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
-use crate::vm::TypedValue;
+use finch_vm::TypedValue;
 
 pub(super) fn typed_mcp_arguments(
     value: &TypedValue,

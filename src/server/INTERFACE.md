@@ -180,20 +180,20 @@ impl RateLimiter {
 }
 pub struct RunnerApprovalRequest { … }
 pub struct RunnerCancelRequest { … }
-/// Send-safe proxy for the daemon-owned run-scoped effect audit capability. Re-exported from `runtime`.
+/// Send-safe proxy for the daemon-owned run-scoped effect audit capability. Re-exported from `finch-runtime`.
 pub struct RunnerEffectAuditControl { … }
-/// Re-exported from `runtime`.
+/// Re-exported from `finch-runtime`.
 pub(crate) enum RunnerEffectAuditControlRequest { Reserve }
-/// One accepted intent. Re-exported from `runtime`.
+/// One accepted intent. Re-exported from `finch-runtime`.
 pub struct RunnerEffectAuditReservation { … }
-/// Re-exported from `runtime`.
+/// Re-exported from `finch-runtime`.
 pub(crate) enum RunnerEffectAuditReservationRequest { Begin, NotApplied }
 pub struct RunnerEffectRecord { … }
-/// Re-exported from `runtime`.
+/// Re-exported from `finch-runtime`.
 pub(crate) struct RunnerHostEffectFinishRequest { … }
-/// Re-exported from `runtime`.
+/// Re-exported from `finch-runtime`.
 pub enum RunnerHostEffectOutcome { Acknowledged, NotApplied, FailedPartial }
-/// Opaque proof that the daemon fsynced `AwaitingHostResult`. Re-exported from `runtime`.
+/// Opaque proof that the daemon fsynced `AwaitingHostResult`. Re-exported from `finch-runtime`.
 pub struct RunnerHostEffectPermit { … }
 pub struct RunnerMemoryProjectionRequest { … }
 pub enum RunnerProgramControlRequest { CreateSchedule, InspectSchedule, CancelSchedule }

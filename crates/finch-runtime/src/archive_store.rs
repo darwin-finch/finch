@@ -1,6 +1,6 @@
 //! Atomic application-owned persistence for reducible typed VM state.
 
-use crate::runtime::{ProgramRuntime, ProgramRuntimeArchive, ProgramRuntimeAuthorityState};
+use crate::{ProgramRuntime, ProgramRuntimeArchive, ProgramRuntimeAuthorityState};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,7 +32,7 @@ struct LegacyRuntimeAuthority<'a> {
     format_version: u32,
     session_id: uuid::Uuid,
     project_id: &'a str,
-    ledger: &'a crate::vm::CapabilityLedger,
+    ledger: &'a finch_vm::CapabilityLedger,
 }
 
 /// Durable storage for one persistent [`ProgramRuntime`].
@@ -286,9 +286,9 @@ fn sync_parent_directory(_parent: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{ProgramSubmission, ProgramValue};
-    use crate::vm::{CapabilityKind, CapabilityRequirement, GrantScope, ResourceSelector};
+    use crate::{ProgramSubmission, ProgramValue};
     use finch_programs::{ExecutionEffect, ProgramLanguage};
+    use finch_vm::{CapabilityKind, CapabilityRequirement, GrantScope, ResourceSelector};
 
     fn submission(runtime: &ProgramRuntime, source: &str) -> ProgramSubmission {
         ProgramSubmission {

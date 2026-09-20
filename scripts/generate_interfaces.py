@@ -25,6 +25,7 @@ GENERATED_BY = "scripts/generate_interfaces.py"
 
 # `pub use path::{A, B};` or `pub use path::Name;`, possibly spanning lines.
 REEXPORT = re.compile(r"^pub(?:\(crate\))?\s+use\s+([^;]+);", re.M)
+REEXPORT_WITH_VISIBILITY = re.compile(r"^(pub(?:\(crate\))?)\s+use\s+([^;]+);", re.M)
 ITEM_KINDS = ("struct", "enum", "trait", "type", "fn", "const", "static", "union", "mod")
 SECTIONS = (
     ("Types", ("struct", "enum", "union", "type")),
@@ -95,6 +96,38 @@ def exported_names(facade: str, problems: list[str] | None = None) -> list[tuple
             body = body[len("self::"):]
         names.extend(expand_use_tree("", body, problems))
     return names
+
+
+def export_visibilities(
+    facade: str, problems: list[str] | None = None
+) -> dict[tuple[str, str, str], str]:
+    """Effective visibility for each named facade re-export."""
+    problems = problems if problems is not None else []
+    visibilities: dict[tuple[str, str, str], str] = {}
+    for match in REEXPORT_WITH_VISIBILITY.finditer(without_comments(facade)):
+        body = " ".join(match.group(2).split())
+        if body.startswith("self::"):
+            body = body[len("self::"):]
+        for exported in expand_use_tree("", body, problems):
+            visibilities[exported] = match.group(1)
+    return visibilities
+
+
+def apply_export_visibility(text: str, visibility: str) -> str:
+    """Render a resolved definition with the facade's narrower visibility."""
+    if visibility == "pub":
+        return text
+    return re.sub(r"^pub(?!\()\b", visibility, text, count=1, flags=re.M)
+
+
+def is_external_workspace_definition(directory: str, path: str) -> bool:
+    """Whether a resolved item crosses a workspace-package boundary."""
+    if not path.startswith("crates/"):
+        return False
+    if not directory.startswith("crates/"):
+        return True
+    package_prefix = "/".join(directory.split("/", 2)[:2]) + "/"
+    return not path.startswith(package_prefix)
 
 
 def local_items(facade: str, sources: dict[str, str] | None = None) -> list[tuple[str, str, str]]:
@@ -571,6 +604,7 @@ def interface_text(
     rendered: list[tuple[str, str, str]] = []
     missing: list[str] = []
     facade_exports = exported_names(facade_source, problems)
+    facade_export_visibilities = export_visibilities(facade_source, problems)
     for module, defined, name in facade_exports:
         local = definitions.get(defined) or []
         full = elsewhere.get(defined) or []
@@ -607,8 +641,16 @@ def interface_text(
             }
         else:
             method_sources = sources
+        rendered_text = with_methods(kind, defined, name, render(signature, doc), method_sources)
+        visibility = "pub"
+        if is_external_workspace_definition(directory, path):
+            visibility = facade_export_visibilities[(module, defined, name)]
         rendered.append(
-            (kind, name, with_methods(kind, defined, name, render(signature, doc), method_sources))
+            (
+                kind,
+                name,
+                apply_export_visibility(rendered_text, visibility),
+            )
         )
     rendered.extend(local_items(facade_source, sources))
 

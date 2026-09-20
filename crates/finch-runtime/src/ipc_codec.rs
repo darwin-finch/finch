@@ -5,29 +5,27 @@
 //! unknown discriminants, invalid scalar values, duplicate keyed entries, and
 //! host-width integer overflow.
 
-use crate::ipc::finch_ipc_capnp as wire;
-use crate::runtime::{
+use crate::{
     DeliveryConsumerIdentity, DeliveryCursor, OutputHandleRef, ProgramRun,
     RuntimeApplicationMessage, VmEffectEnvelope, VmEffectHandle, VmResume, VmResumeResponse,
 };
-use crate::vm::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
-use crate::vm::{
+use anyhow::{anyhow, bail, Context, Result};
+use finch_ipc::finch_ipc_capnp as wire;
+use finch_vm::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
+use finch_vm::{
     CapabilityKind, CapabilityRequirement, EffectSet, FileSelector, FileSelectorTemplate,
     FileSelectorTemplatePart, McpSelectorTemplate, NetworkSelectorTemplate,
     ProcessSelectorTemplate, ProgramSelectorTemplate, ResourceRoot, ResourceSelector,
 };
-use crate::vm::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
-use crate::vm::{
-    DiagnosticPhase, Severity, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
-};
-use crate::vm::{
+use finch_vm::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
+use finch_vm::{DiagnosticPhase, Severity, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic};
+use finch_vm::{
     EffectJournalEntry, EffectJournalState, ProducerFiberRecord, ProducerFiberState,
     TypedRuntimeCheckpoint,
 };
-use crate::vm::{HostSideEffect, UiOperation, UiProgress, VmContinuation, VmFrame, VmSideEffect};
-use crate::vm::{TaskKind, Type, TypedValue};
-use crate::vm::{VerifiedFunction, VerifiedModule};
-use anyhow::{anyhow, bail, Context, Result};
+use finch_vm::{HostSideEffect, UiOperation, UiProgress, VmContinuation, VmFrame, VmSideEffect};
+use finch_vm::{TaskKind, Type, TypedValue};
+use finch_vm::{VerifiedFunction, VerifiedModule};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use uuid::Uuid;
@@ -475,7 +473,7 @@ fn decode_requirement(
     })
 }
 
-pub(crate) fn encode_effects(
+pub fn encode_effects(
     mut builder: capnp::struct_list::Builder<'_, wire::capability_requirement::Owned>,
     value: &EffectSet,
 ) {
@@ -484,7 +482,7 @@ pub(crate) fn encode_effects(
     }
 }
 
-pub(crate) fn decode_effects(
+pub fn decode_effects(
     reader: capnp::struct_list::Reader<'_, wire::capability_requirement::Owned>,
 ) -> Result<EffectSet> {
     let mut values = BTreeSet::new();
@@ -939,7 +937,7 @@ fn task_kind_from_wire(value: wire::TaskKind) -> TaskKind {
     }
 }
 
-pub(crate) fn encode_value_list(
+pub fn encode_value_list(
     mut builder: capnp::struct_list::Builder<'_, wire::typed_value::Owned>,
     values: &[TypedValue],
     depth: usize,
@@ -950,7 +948,7 @@ pub(crate) fn encode_value_list(
     Ok(())
 }
 
-pub(crate) fn decode_value_list(
+pub fn decode_value_list(
     reader: capnp::struct_list::Reader<'_, wire::typed_value::Owned>,
     depth: usize,
 ) -> Result<Vec<TypedValue>> {
@@ -977,7 +975,7 @@ fn encode_value(
         TypedValue::String(value) => builder.set_string(value),
         TypedValue::Bytes(value) => builder.set_bytes(value),
         TypedValue::Json(value) => {
-            crate::ipc::encode_json_value(builder.reborrow().init_json(), value)?
+            finch_ipc::encode_json_value(builder.reborrow().init_json(), value)?
         }
         TypedValue::Path { selector, relative } => {
             let mut encoded = builder.reborrow().init_path();
@@ -1150,7 +1148,7 @@ fn decode_value(reader: wire::typed_value::Reader<'_>, depth: usize) -> Result<T
         Which::Symbol(value) => TypedValue::Symbol(text(value?)?),
         Which::String(value) => TypedValue::String(text(value?)?),
         Which::Bytes(value) => TypedValue::Bytes(value?.to_vec()),
-        Which::Json(value) => TypedValue::Json(crate::ipc::decode_json_value(value?)?),
+        Which::Json(value) => TypedValue::Json(finch_ipc::decode_json_value(value?)?),
         Which::Path(value) => {
             let value = value?;
             TypedValue::Path {
@@ -2150,7 +2148,7 @@ fn decode_producer(
     })
 }
 
-pub(crate) fn encode_vm_side_effect(
+pub fn encode_vm_side_effect(
     mut builder: wire::vm_side_effect::Builder<'_>,
     value: &VmSideEffect,
 ) -> Result<()> {
@@ -2198,9 +2196,7 @@ pub(crate) fn encode_vm_side_effect(
     encode_origin(builder.reborrow().init_origin(), &value.origin, 0)
 }
 
-pub(crate) fn decode_vm_side_effect(
-    reader: wire::vm_side_effect::Reader<'_>,
-) -> Result<VmSideEffect> {
+pub fn decode_vm_side_effect(reader: wire::vm_side_effect::Reader<'_>) -> Result<VmSideEffect> {
     use wire::vm_host_side_effect::Which;
     let event = match reader.get_event()?.which()? {
         Which::Emit(text_value) => HostSideEffect::Emit {
@@ -2244,7 +2240,7 @@ pub(crate) fn decode_vm_side_effect(
     })
 }
 
-pub(crate) fn encode_effect_journal_state(
+pub fn encode_effect_journal_state(
     mut builder: wire::vm_effect_journal_state::Builder<'_>,
     value: &EffectJournalState,
 ) -> Result<()> {
@@ -2264,7 +2260,7 @@ pub(crate) fn encode_effect_journal_state(
     Ok(())
 }
 
-pub(crate) fn decode_effect_journal_state(
+pub fn decode_effect_journal_state(
     reader: wire::vm_effect_journal_state::Reader<'_>,
 ) -> Result<EffectJournalState> {
     use wire::vm_effect_journal_state::Which;
@@ -2283,7 +2279,7 @@ pub(crate) fn decode_effect_journal_state(
     })
 }
 
-pub(crate) fn encode_effect_record(
+pub fn encode_effect_record(
     mut builder: wire::brain_effect_record::Builder<'_>,
     execution_id: uuid::Uuid,
     entry: &EffectJournalEntry,
@@ -2293,7 +2289,7 @@ pub(crate) fn encode_effect_record(
     encode_effect_journal_state(builder.reborrow().init_state(), &entry.state)
 }
 
-pub(crate) fn decode_effect_record(
+pub fn decode_effect_record(
     reader: wire::brain_effect_record::Reader<'_>,
 ) -> Result<(uuid::Uuid, EffectJournalEntry)> {
     Ok((
@@ -2305,7 +2301,7 @@ pub(crate) fn decode_effect_record(
     ))
 }
 
-pub(crate) fn encode_checkpoint(
+pub fn encode_checkpoint(
     mut builder: wire::typed_runtime_checkpoint::Builder<'_>,
     value: &TypedRuntimeCheckpoint,
 ) -> Result<()> {
@@ -2333,7 +2329,7 @@ pub(crate) fn encode_checkpoint(
     Ok(())
 }
 
-pub(crate) fn decode_checkpoint(
+pub fn decode_checkpoint(
     reader: wire::typed_runtime_checkpoint::Reader<'_>,
 ) -> Result<TypedRuntimeCheckpoint> {
     let mut producer_fibers = BTreeMap::new();
@@ -2541,9 +2537,9 @@ fn decode_runtime_application_message(
     use wire::runtime_application_message::Which;
     let abi_version = reader.get_abi_version();
     anyhow::ensure!(
-        abi_version == crate::vm::RUNTIME_APPLICATION_ABI_VERSION,
+        abi_version == finch_vm::RUNTIME_APPLICATION_ABI_VERSION,
         "unsupported Runtime/Application ABI version {abi_version}; expected {}",
-        crate::vm::RUNTIME_APPLICATION_ABI_VERSION
+        finch_vm::RUNTIME_APPLICATION_ABI_VERSION
     );
     let message = match reader.which()? {
         Which::ProgramRun(run) => RuntimeApplicationMessage::ProgramRun {
@@ -2587,7 +2583,7 @@ fn decode_runtime_application_message(
 /// issue #57 and is not implemented here. Version 1 is not a production freeze:
 /// bump `RUNTIME_APPLICATION_ABI_VERSION` and fail closed rather than forking
 /// a parallel frame format.
-pub(crate) fn encode_runtime_application_message_packed(
+pub fn encode_runtime_application_message_packed(
     value: &RuntimeApplicationMessage,
 ) -> Result<Vec<u8>> {
     let mut message = capnp::message::Builder::new_default();
@@ -2602,7 +2598,7 @@ pub(crate) fn encode_runtime_application_message_packed(
 
 /// Decode one packed Runtime/Application ABI frame. Trailing bytes are
 /// rejected so a content-addressed record has one unambiguous representation.
-pub(crate) fn decode_runtime_application_message_packed(
+pub fn decode_runtime_application_message_packed(
     encoded: &[u8],
 ) -> Result<RuntimeApplicationMessage> {
     let mut cursor = Cursor::new(encoded);
@@ -2616,7 +2612,7 @@ pub(crate) fn decode_runtime_application_message_packed(
     )
 }
 
-pub(crate) fn decode_packed_runtime_application_frames(
+pub fn decode_packed_runtime_application_frames(
     frames: capnp::data_list::Reader<'_>,
 ) -> Result<Vec<RuntimeApplicationMessage>> {
     frames
@@ -2628,7 +2624,7 @@ pub(crate) fn decode_packed_runtime_application_frames(
         .collect()
 }
 
-pub(crate) fn encode_packed_runtime_application_frames(
+pub fn encode_packed_runtime_application_frames(
     mut encoded: capnp::data_list::Builder<'_>,
     messages: &[RuntimeApplicationMessage],
 ) -> Result<()> {
@@ -2643,7 +2639,7 @@ pub(crate) fn encode_packed_runtime_application_frames(
 
 /// Encode one durable typed-runtime checkpoint using the same closed native
 /// schema used by runner registration and result transport.
-pub(crate) fn encode_checkpoint_bytes(value: &TypedRuntimeCheckpoint) -> Result<Vec<u8>> {
+pub fn encode_checkpoint_bytes(value: &TypedRuntimeCheckpoint) -> Result<Vec<u8>> {
     let mut message = capnp::message::Builder::new_default();
     encode_checkpoint(
         message.init_root::<wire::typed_runtime_checkpoint::Builder<'_>>(),
@@ -2656,7 +2652,7 @@ pub(crate) fn encode_checkpoint_bytes(value: &TypedRuntimeCheckpoint) -> Result<
 
 /// Decode one durable typed-runtime checkpoint. Trailing bytes are rejected so
 /// a content-addressed checkpoint has exactly one unambiguous representation.
-pub(crate) fn decode_checkpoint_bytes(encoded: &[u8]) -> Result<TypedRuntimeCheckpoint> {
+pub fn decode_checkpoint_bytes(encoded: &[u8]) -> Result<TypedRuntimeCheckpoint> {
     let mut cursor = std::io::Cursor::new(encoded);
     let message =
         capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
@@ -2669,8 +2665,8 @@ pub(crate) fn decode_checkpoint_bytes(encoded: &[u8]) -> Result<TypedRuntimeChec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::{TypedExecutionStatus, TypedRuntime};
     use finch_programs::ProgramLanguage;
+    use finch_vm::{TypedExecutionStatus, TypedRuntime};
 
     fn round_trip_value(value: &TypedValue) -> Result<TypedValue> {
         let mut message = capnp::message::Builder::new_default();
@@ -2697,13 +2693,13 @@ mod tests {
         source_id: &str,
         source: &str,
         fuel: u64,
-    ) -> crate::vm::TypedExecution {
+    ) -> finch_vm::TypedExecution {
         let initial_types = runtime
             .stack()
             .iter()
-            .map(crate::vm::TypedValue::value_type)
+            .map(finch_vm::TypedValue::value_type)
             .collect();
-        match crate::language::compile_with_functions(
+        match finch_language::compile_with_functions(
             language,
             source_id,
             source,
@@ -2712,7 +2708,7 @@ mod tests {
             runtime.functions(),
         ) {
             Ok(module) => runtime.execute(&module, fuel),
-            Err(diagnostics) => crate::vm::TypedExecution::failed(diagnostics),
+            Err(diagnostics) => finch_vm::TypedExecution::failed(diagnostics),
         }
     }
 
@@ -2793,7 +2789,7 @@ mod tests {
         let effects = vec![
             EffectJournalEntry {
                 effect: VmSideEffect {
-                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    protocol_version: finch_vm::VM_TYPE_SYSTEM_VERSION,
                     sequence: 1,
                     requirement: CapabilityRequirement {
                         capability: CapabilityKind::SessionEmit,
@@ -2809,7 +2805,7 @@ mod tests {
             },
             EffectJournalEntry {
                 effect: VmSideEffect {
-                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    protocol_version: finch_vm::VM_TYPE_SYSTEM_VERSION,
                     sequence: 2,
                     requirement: sample_requirement(),
                     event: HostSideEffect::Request {
@@ -2822,7 +2818,7 @@ mod tests {
             },
             EffectJournalEntry {
                 effect: VmSideEffect {
-                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    protocol_version: finch_vm::VM_TYPE_SYSTEM_VERSION,
                     sequence: 3,
                     requirement: CapabilityRequirement {
                         capability: CapabilityKind::SessionEmit,
@@ -3258,7 +3254,7 @@ mod tests {
                 envelope: VmEffectEnvelope {
                     execution_id,
                     effect: VmSideEffect {
-                        protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                        protocol_version: finch_vm::VM_TYPE_SYSTEM_VERSION,
                         sequence: 0,
                         requirement: sample_requirement(),
                         event: HostSideEffect::Request {
@@ -3341,7 +3337,7 @@ mod tests {
             envelope: VmEffectEnvelope {
                 execution_id: uuid::Uuid::nil(),
                 effect: VmSideEffect {
-                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    protocol_version: finch_vm::VM_TYPE_SYSTEM_VERSION,
                     sequence: 0,
                     requirement: sample_requirement(),
                     event: HostSideEffect::Request {
@@ -3356,7 +3352,7 @@ mod tests {
 
     #[test]
     fn packed_runtime_application_abi_rejects_unknown_and_mismatched_versions() -> Result<()> {
-        let expected = crate::vm::RUNTIME_APPLICATION_ABI_VERSION;
+        let expected = finch_vm::RUNTIME_APPLICATION_ABI_VERSION;
         for version in [0_u32, 2] {
             let packed = packed_with_outer_abi_version(&sample_envelope_message(), version)?;
             let error = decode_runtime_application_message_packed(&packed)

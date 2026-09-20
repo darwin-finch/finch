@@ -88,7 +88,8 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
         "crates/finch-ipc/Cargo.toml", "crates/finch-ipc/build.rs",
         "crates/finch-ipc/schema/**",
         "src/bin/finch-test-supervisor.rs", "src/brain/**",
-        "src/daemon/**", "crates/finch-ipc/src/**", "src/node/**", "src/server/**",
+        "src/daemon/**", "crates/finch-ipc/src/**", "crates/finch-runtime/**",
+        "src/node/**", "src/server/**",
         "src/client/daemon_client.rs", "src/cli/repl_event/brain_handler.rs",
         "scripts/test_brains.sh", "scripts/test_brain_isolation.sh",
         "scripts/with-cargo-slot", "scripts/test-with-cargo-slot",
@@ -1079,6 +1080,29 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
         documents, "ci.yml", "test", "Prove validated request tokens cannot be forged",
         "matrix.feature_name == 'default'", None,
         ("cargo test --doc -- ValidatedProviderRequest",),
+    ))
+    errors.extend(required_step_errors(
+        documents, "ci.yml", "runtime-authority", "Run runtime authority regressions",
+        None, None, ("cargo test -p finch-runtime --lib -- --nocapture",),
+    ))
+    errors.extend(required_step_errors(
+        documents, "ci.yml", "runtime-authority",
+        "Regress scheduler and authority-use concurrency", None, None, (
+            'cargo test -p finch --lib -- --list > "$RUNNER_TEMP/finch-root-tests.txt"',
+            'cargo test -p finch-runtime --lib -- --list > "$RUNNER_TEMP/finch-runtime-tests.txt"',
+            "grep -Fqx 'scheduler::tests::wait_rechecks_completion_after_registering_notification: test' \"$RUNNER_TEMP/finch-root-tests.txt\"",
+            "timeout --signal=TERM --kill-after=10s 2m cargo test -p finch --lib scheduler::tests::wait_rechecks_completion_after_registering_notification -- --exact --nocapture",
+            "grep -Fqx 'scheduler::tests::agent_spawn_reenters_authority_to_snapshot_grants_without_deadlock: test' \"$RUNNER_TEMP/finch-root-tests.txt\"",
+            "timeout --signal=TERM --kill-after=10s 2m cargo test -p finch --lib scheduler::tests::agent_spawn_reenters_authority_to_snapshot_grants_without_deadlock -- --exact --nocapture",
+            "grep -Fqx 'scheduler::tests::typed_agent_spec_attenuates_to_selected_opaque_grant: test' \"$RUNNER_TEMP/finch-root-tests.txt\"",
+            "timeout --signal=TERM --kill-after=10s 2m cargo test -p finch --lib scheduler::tests::typed_agent_spec_attenuates_to_selected_opaque_grant -- --exact --nocapture",
+            "grep -Fqx 'tests::deferred_effect_sink_can_reenter_authority_without_deadlock: test' \"$RUNNER_TEMP/finch-runtime-tests.txt\"",
+            "timeout --signal=TERM --kill-after=10s 2m cargo test -p finch-runtime --lib tests::deferred_effect_sink_can_reenter_authority_without_deadlock -- --exact --nocapture",
+            "grep -Fqx 'tests::public_revocation_winning_before_host_use_prevents_file_mutation: test' \"$RUNNER_TEMP/finch-runtime-tests.txt\"",
+            "timeout --signal=TERM --kill-after=10s 2m cargo test -p finch-runtime --lib tests::public_revocation_winning_before_host_use_prevents_file_mutation -- --exact --nocapture",
+            "grep -Fqx 'tests::in_flight_deferred_use_blocks_public_revoke_and_root_mutation: test' \"$RUNNER_TEMP/finch-runtime-tests.txt\"",
+            "timeout --signal=TERM --kill-after=10s 2m cargo test -p finch-runtime --lib tests::in_flight_deferred_use_blocks_public_revoke_and_root_mutation -- --exact --nocapture",
+        ),
     ))
     errors.extend(required_step_errors(
         documents, "ci.yml", "build", "Run release-mode atomic history regression",

@@ -6,7 +6,7 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 envelope (`parse_finch_script`), the wire corpus capture/audit and its source-only
 `ProgramCompilerContext`, and Co-Forth token helpers.
 The typed machine that runs a program is `crates/finch-vm/`; the service that schedules and
-authorizes one is `src/runtime/`.
+authorizes one is [`finch-runtime`](../finch-runtime/AGENTS.md).
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
 modules are private, so the `pub use` list in `crates/finch-programs/src/lib.rs` is the whole public

@@ -1,4 +1,4 @@
-//! Portable VM effect envelope, moved verbatim from `src/runtime/mod.rs`.
+//! Portable VM effect envelope, moved verbatim from the former `src/runtime/mod.rs`.
 //!
 //! The envelope rides [`crate::types::LiveOutputSink::vm_effect_envelope`],
 //! so the tool API must be able to name it. `runtime` re-exports the same

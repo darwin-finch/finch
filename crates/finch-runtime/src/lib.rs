@@ -27,7 +27,7 @@ pub use agents::{
     AgentRole, AgentSpawning, AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec, AgentTaskStatus,
     AgentUsage, AgentUsageState, NoAgentSpawning,
 };
-pub(crate) use agents::{
+pub use agents::{
     MAX_CONTEXT_ARTIFACT_BYTES, MAX_CONTEXT_FIELD_BYTES, MAX_CONTEXT_REFERENCES,
     MAX_CONTEXT_TOTAL_BYTES, MAX_DEPTH, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, MAX_TURNS,
 };
@@ -42,11 +42,11 @@ pub use effect_audit::{
     RunnerEffectAuditControl, RunnerEffectAuditReservation, RunnerHostEffectOutcome,
     RunnerHostEffectPermit,
 };
-pub(crate) use effect_audit::{
+pub use effect_audit::{
     RunnerEffectAuditControlRequest, RunnerEffectAuditReservationRequest,
     RunnerHostEffectFinishRequest,
 };
-pub(crate) use effect_log::replay_fence_transition;
+pub use effect_log::replay_fence_transition;
 pub use effect_log::{
     bind_delivery_log, EffectAuditAuthority, EffectAuditEntry, EffectAuditIdentity,
     EffectAuditIntent, EffectAuditReducer, EffectAuditState, EffectAuditTerminalOutcome,
@@ -67,7 +67,7 @@ use hostio::{
     read_bounded_utf8_line, read_workbook_range, read_workbook_rows, read_workbook_sheet_names,
     sha256_file_handle, summarize_csv, summarize_workbook, typed_mcp_arguments,
 };
-pub(crate) use ipc_codec::{
+pub use ipc_codec::{
     decode_checkpoint, decode_checkpoint_bytes, decode_effect_journal_state, decode_effect_record,
     decode_effects, decode_packed_runtime_application_frames,
     decode_runtime_application_message_packed, decode_value_list, decode_vm_side_effect,
@@ -76,19 +76,19 @@ pub(crate) use ipc_codec::{
     encode_runtime_application_message_packed, encode_value_list, encode_vm_side_effect,
 };
 
-use crate::vm::{
+use anyhow::{bail, Context, Result};
+use finch_vm::{
     agent_task_result_type, agent_task_snapshot_type, agent_task_spec_type,
     capability_grant_entry_type, core_word_spec, tree_entry_type, tree_listing_type,
     CoreHostBinding, CoreWordImplementation,
 };
-use crate::vm::{
+use finch_vm::{
     ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
     CapabilityAvailability, CapabilityKind, CapabilityLedger, CapabilityPolicy, CapabilityRequest,
     CapabilityRequirement, EffectSet, GrantScope, ResourceSelector, SourceOrigin, Type,
     TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension, TypedValue,
     VmDiagnostic, VmSideEffect,
 };
-use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 #[cfg(any(
     target_os = "linux",
@@ -118,7 +118,7 @@ fn default_capability_policy() -> CapabilityPolicy {
 
 /// A portable VM event attached to its owning ProgramRun. Defined in the
 /// dependency-free `finch-tools-api` crate (the tool API's live-output sink
-/// receives it) and re-exported here, so `crate::runtime::VmEffectEnvelope`
+/// receives it) and re-exported here, so `crate::VmEffectEnvelope`
 /// is the same type it always was. The runtime-coupled methods remain on
 /// [`VmEffectEnvelopeRuntimeMethods`].
 pub use finch_tools_api::{VmEffectEnvelope, VmEffectHandle};
@@ -195,13 +195,13 @@ impl DeferredHostEffects {
         match self {
             Self::None => false,
             Self::ProgramInvocations => {
-                effect.requirement.capability == crate::vm::CapabilityKind::ProgramInvoke
+                effect.requirement.capability == finch_vm::CapabilityKind::ProgramInvoke
             }
             Self::Schedules => matches!(
                 effect.requirement.capability,
-                crate::vm::CapabilityKind::ScheduleCreate
-                    | crate::vm::CapabilityKind::ScheduleRead
-                    | crate::vm::CapabilityKind::ScheduleManage
+                finch_vm::CapabilityKind::ScheduleCreate
+                    | finch_vm::CapabilityKind::ScheduleRead
+                    | finch_vm::CapabilityKind::ScheduleManage
             ),
             Self::AllAwaited => true,
         }
@@ -369,7 +369,7 @@ pub struct ProgramRuntimeAuthorityState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRootBindingRecord {
-    pub root: crate::vm::ResourceRoot,
+    pub root: finch_vm::ResourceRoot,
     pub path: PathBuf,
     pub device: u64,
     pub inode: u64,
@@ -388,7 +388,7 @@ pub enum ResourceRootAuditAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRootAuditEntry {
     pub sequence: u64,
-    pub root: crate::vm::ResourceRoot,
+    pub root: finch_vm::ResourceRoot,
     pub generation: u64,
     pub path: PathBuf,
     pub whole_machine: bool,
@@ -445,7 +445,7 @@ pub trait ArtifactProposalHost: Send + Sync {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ResourceRootState {
-    bindings: BTreeMap<crate::vm::ResourceRoot, Arc<ResourceRootBindingRecord>>,
+    bindings: BTreeMap<finch_vm::ResourceRoot, Arc<ResourceRootBindingRecord>>,
     audit: Vec<ResourceRootAuditEntry>,
 }
 
@@ -559,9 +559,9 @@ struct PendingTypedExecution {
     caller: Option<agents::AgentIdentity>,
     output: String,
     output_chunks: Vec<String>,
-    side_effects: Vec<crate::vm::HostSideEffect>,
+    side_effects: Vec<finch_vm::HostSideEffect>,
     effect_sink: Option<TypedEffectSink>,
-    effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
+    effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
     deferred_host_effects: DeferredHostEffects,
     /// An execution-specific authority ceiling, used by durable scheduled
     /// callbacks. Ordinary interactive runs intentionally pick up newly
@@ -743,7 +743,7 @@ impl ProgramRuntime {
         Self::with_automation_in_workspace(enabled, workspace_root)
     }
 
-    pub(crate) fn with_automation_in_workspace(enabled: bool, workspace_root: PathBuf) -> Self {
+    pub fn with_automation_in_workspace(enabled: bool, workspace_root: PathBuf) -> Self {
         let automation = Arc::new(AutomationBroker::new(enabled));
         let typed_runtime = TypedRuntime::new();
         let checkpoint = typed_runtime
@@ -755,7 +755,7 @@ impl ProgramRuntime {
             .to_string_lossy()
             .into_owned();
         let workspace_binding = resource_root_binding_record(
-            crate::vm::ResourceRoot::Workspace,
+            finch_vm::ResourceRoot::Workspace,
             &workspace_root,
             1,
             false,
@@ -764,7 +764,7 @@ impl ProgramRuntime {
         .expect("the current workspace is a stable directory");
         let resource_roots = ResourceRootState {
             bindings: BTreeMap::from([(
-                crate::vm::ResourceRoot::Workspace,
+                finch_vm::ResourceRoot::Workspace,
                 Arc::new(workspace_binding.clone()),
             )]),
             audit: vec![ResourceRootAuditEntry {
@@ -803,7 +803,7 @@ impl ProgramRuntime {
             revision_history: Mutex::new(vec![VmRevisionSnapshot {
                 revision: 0,
                 stack: Vec::new(),
-                vocabulary: crate::vm::core_vocabulary().into_keys().collect(),
+                vocabulary: finch_vm::core_vocabulary().into_keys().collect(),
                 checkpoint: Some(checkpoint),
                 checkpoint_diagnostic: None,
             }]),
@@ -856,8 +856,8 @@ impl ProgramRuntime {
         &self,
         requirement: &CapabilityRequirement,
     ) -> CapabilityAvailability {
-        use crate::runtime::automation::AutomationState;
-        use crate::vm::{ResourceRoot, ResourceSelector};
+        use crate::automation::AutomationState;
+        use finch_vm::{ResourceRoot, ResourceSelector};
 
         let root_availability = |root: &ResourceRoot| match self.resource_roots.read() {
             Ok(roots) if roots.bindings.contains_key(root) => CapabilityAvailability::Available,
@@ -1024,7 +1024,7 @@ impl ProgramRuntime {
     /// the deliberately named `bind_whole_machine_root` API.
     pub fn bind_host_machine_root(&self, root: impl Into<PathBuf>) -> Result<()> {
         self.bind_resource_root(
-            crate::vm::ResourceRoot::HostMachine,
+            finch_vm::ResourceRoot::HostMachine,
             root,
             false,
             "local-user",
@@ -1036,7 +1036,7 @@ impl ProgramRuntime {
     /// instead of inferring it from an ordinary path binding.
     pub fn bind_whole_machine_root(&self) -> Result<()> {
         self.bind_resource_root(
-            crate::vm::ResourceRoot::HostMachine,
+            finch_vm::ResourceRoot::HostMachine,
             PathBuf::from("/"),
             true,
             "local-user-whole-machine",
@@ -1047,14 +1047,14 @@ impl ProgramRuntime {
     /// the current workspace so a host can expose a narrower or broader
     /// project tree without changing process current-directory semantics.
     pub fn bind_project_root(&self, root: impl Into<PathBuf>) -> Result<()> {
-        self.bind_resource_root(crate::vm::ResourceRoot::Project, root, false, "local-user")
+        self.bind_resource_root(finch_vm::ResourceRoot::Project, root, false, "local-user")
     }
 
     /// Install the output directory assigned to this task/session. Programs
     /// can receive write authority here without receiving workspace writes.
     pub fn bind_task_output_root(&self, root: impl Into<PathBuf>) -> Result<()> {
         self.bind_resource_root(
-            crate::vm::ResourceRoot::TaskOutput,
+            finch_vm::ResourceRoot::TaskOutput,
             root,
             false,
             "local-user",
@@ -1063,7 +1063,7 @@ impl ProgramRuntime {
 
     fn bind_resource_root(
         &self,
-        kind: crate::vm::ResourceRoot,
+        kind: finch_vm::ResourceRoot,
         root: impl Into<PathBuf>,
         whole_machine: bool,
         actor: &str,
@@ -1072,7 +1072,7 @@ impl ProgramRuntime {
         if root == Path::new("/") && !whole_machine {
             bail!("binding '/' requires bind_whole_machine_root");
         }
-        if whole_machine && (kind != crate::vm::ResourceRoot::HostMachine || root != Path::new("/"))
+        if whole_machine && (kind != finch_vm::ResourceRoot::HostMachine || root != Path::new("/"))
         {
             bail!("whole-machine binding must be host-machine root '/'");
         }
@@ -1154,18 +1154,18 @@ impl ProgramRuntime {
     /// Remove the host binding. Pending executions recheck this at their next
     /// host call, so revocation takes effect without widening workspace paths.
     pub fn clear_host_machine_root(&self) -> Result<()> {
-        self.clear_resource_root(&crate::vm::ResourceRoot::HostMachine)
+        self.clear_resource_root(&finch_vm::ResourceRoot::HostMachine)
     }
 
     pub fn clear_project_root(&self) -> Result<()> {
-        self.clear_resource_root(&crate::vm::ResourceRoot::Project)
+        self.clear_resource_root(&finch_vm::ResourceRoot::Project)
     }
 
     pub fn clear_task_output_root(&self) -> Result<()> {
-        self.clear_resource_root(&crate::vm::ResourceRoot::TaskOutput)
+        self.clear_resource_root(&finch_vm::ResourceRoot::TaskOutput)
     }
 
-    fn clear_resource_root(&self, kind: &crate::vm::ResourceRoot) -> Result<()> {
+    fn clear_resource_root(&self, kind: &finch_vm::ResourceRoot) -> Result<()> {
         let _authority_use = self
             .authority_use_gate
             .write()
@@ -1562,7 +1562,7 @@ impl ProgramRuntime {
         Ok(())
     }
 
-    pub(crate) fn effective_grants_for(
+    pub fn effective_grants_for(
         &self,
         caller: Option<&agents::AgentIdentity>,
     ) -> Result<EffectSet> {
@@ -1609,7 +1609,7 @@ impl ProgramRuntime {
     /// Resolve host-issued grant identities into a child creation-time
     /// ceiling. IDs are only lookup keys: every spawn rechecks live policy,
     /// caller scope, expiry/revocation, and the caller's existing ceiling.
-    pub(crate) fn resolve_capability_grant_subset(
+    pub fn resolve_capability_grant_subset(
         &self,
         caller: Option<&agents::AgentIdentity>,
         grant_ids: &[uuid::Uuid],
@@ -1766,7 +1766,7 @@ impl ProgramRuntime {
                         .is_some_and(|entry| {
                             matches!(
                                 entry.state,
-                                crate::vm::EffectJournalState::AwaitingHostResult
+                                finch_vm::EffectJournalState::AwaitingHostResult
                             )
                         }) =>
                 {
@@ -1876,7 +1876,7 @@ impl ProgramRuntime {
         let mut effect_journal = pending.suspension.effect_journal.clone();
         if pending.suspension.pending_host_call.is_some() {
             if let Some(entry) = effect_journal.last_mut() {
-                entry.state = crate::vm::EffectJournalState::Cancelled;
+                entry.state = finch_vm::EffectJournalState::Cancelled;
             }
         }
         let mut diagnostics = vec![match reason {
@@ -2014,7 +2014,7 @@ impl ProgramRuntime {
 
         let mut effect_journal = pending.suspension.effect_journal.clone();
         if let Some(entry) = effect_journal.last_mut() {
-            entry.state = crate::vm::EffectJournalState::Denied;
+            entry.state = finch_vm::EffectJournalState::Denied;
         }
         let inferred_capabilities = pending.suspension.effects.0.iter().cloned().collect();
         Ok(ExecutionOutcome {
@@ -2622,8 +2622,8 @@ impl ProgramRuntime {
     /// Exists so the agent capability can be tested against a fake `AgentSpawning` rather than a
     /// real scheduler, which needs a provider resolver, a generator and a Brain client to exist at
     /// all. The production paths construct this inline; this returns the same thing.
-    #[cfg(test)]
-    pub(crate) fn agent_binding_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn agent_binding_for_test(
         &self,
         caller: Option<agents::AgentIdentity>,
     ) -> Option<agent_vm::AgentVmBinding> {
@@ -2968,16 +2968,28 @@ impl ProgramRuntime {
         .await
     }
 
+    /// Test-support entry point for exercising the scheduled-callback grant ceiling from an
+    /// application-layer regression without widening the production facade.
+    #[cfg(feature = "test-support")]
+    pub async fn submit_typed_only_with_grant_ceiling_for_test(
+        &self,
+        submission: ProgramSubmission,
+        grant_ceiling: EffectSet,
+    ) -> Result<ExecutionOutcome> {
+        self.submit_typed_only_with_grant_ceiling(submission, grant_ceiling)
+            .await
+    }
+
     /// Run one named-Brain program with schedule effects delegated to the
     /// attached Brain service. An optional ceiling is the persisted authority
     /// of an unattended scheduled run; interactive runs pass `None` and
     /// capture their live grants only when a schedule is actually created.
-    pub(crate) async fn submit_typed_only_with_deferred_schedule_effects(
+    pub async fn submit_typed_only_with_deferred_schedule_effects(
         &self,
         submission: ProgramSubmission,
         effect_sink: TypedEffectSink,
         grant_ceiling: Option<EffectSet>,
-        effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
+        effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         self.submit_as_with_optional_typed_effect_sink(
             submission,
@@ -3064,13 +3076,13 @@ impl ProgramRuntime {
     /// Provider-native `submit_program` entry point. A named-Brain turn must
     /// carry its daemon-issued audit capability through every tool round; the
     /// tool cannot reconstruct that authority from Brain/run provenance.
-    pub(crate) async fn submit_tool_program(
+    pub async fn submit_tool_program(
         &self,
         submission: ProgramSubmission,
         caller: Option<agents::AgentIdentity>,
         effect_sink: Option<TypedEffectSink>,
         defer_program_effects: bool,
-        effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
+        effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         let deferred_host_effects = if defer_program_effects && caller.is_none() {
             DeferredHostEffects::ProgramInvocations
@@ -3136,7 +3148,7 @@ impl ProgramRuntime {
         effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
         grant_ceiling: Option<EffectSet>,
-        effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
+        effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         let effect_sink = self.compose_typed_effect_sink(effect_sink);
         // This is a per-session state transaction, not a process-wide
@@ -3382,8 +3394,8 @@ impl ProgramRuntime {
         caller: Option<agents::AgentIdentity>,
         typed_effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
-        effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
-    ) -> Result<(TypedRuntime, crate::vm::TypedExecution)> {
+        effect_audit: Option<crate::effect_audit::RunnerEffectAuditControl>,
+    ) -> Result<(TypedRuntime, finch_vm::TypedExecution)> {
         let automation = Arc::clone(&self.automation);
         let resource_roots = Arc::clone(&self.resource_roots);
         let memory = self
@@ -3478,9 +3490,9 @@ impl ProgramRuntime {
             let initial_types = runtime
                 .stack()
                 .iter()
-                .map(crate::vm::TypedValue::value_type)
+                .map(finch_vm::TypedValue::value_type)
                 .collect();
-            let compiled = crate::language::compile_with_functions(
+            let compiled = finch_language::compile_with_functions(
                 language,
                 &source_id,
                 &source,
@@ -3492,7 +3504,7 @@ impl ProgramRuntime {
                 Ok(module) => {
                     runtime.execute_with_handler(&module, fuel, declared.as_ref(), &mut handler)
                 }
-                Err(diagnostics) => crate::vm::TypedExecution::failed(diagnostics),
+                Err(diagnostics) => finch_vm::TypedExecution::failed(diagnostics),
             };
             (runtime, execution)
         })
@@ -3506,7 +3518,7 @@ impl ProgramRuntime {
         pending: &PendingTypedExecution,
         external_effect_result: Option<(u64, Vec<TypedValue>)>,
         authorize_pending_host_call: bool,
-    ) -> Result<(TypedRuntime, crate::vm::TypedExecution)> {
+    ) -> Result<(TypedRuntime, finch_vm::TypedExecution)> {
         let automation = Arc::clone(&self.automation);
         let resource_roots = Arc::clone(&self.resource_roots);
         let memory = self

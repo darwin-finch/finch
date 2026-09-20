@@ -658,15 +658,15 @@ Avoid putting more session state into `ToolContext`. Prefer explicit services wi
 interfaces:
 
 ```text
-src/runtime/mod.rs              ProgramRuntime and session binding
-src/runtime/context.rs          ExecutionContext, authority, budgets
-src/runtime/outcome.rs          values, diagnostics, suspension, usage
-src/runtime/capabilities.rs     typed requests and effect derivation
-src/runtime/broker.rs           permissions, dispatch, audit
-src/runtime/scheduler.rs        VM tasks and child agents
-src/runtime/providers.rs        dynamic provider/model resolver
-src/runtime/changeset.rs        preview, hashes, atomic application
-src/runtime/automation.rs       optional automation capability and availability
+crates/finch-runtime/src/lib.rs              ProgramRuntime and session binding
+crates/finch-runtime/src/context.rs          ExecutionContext, authority, budgets
+crates/finch-runtime/src/outcome.rs          values, diagnostics, suspension, usage
+crates/finch-runtime/src/capabilities.rs     typed requests and effect derivation
+crates/finch-runtime/src/broker.rs           permissions, dispatch, audit
+crates/finch-runtime/src/scheduler.rs        VM tasks and child agents
+crates/finch-runtime/src/providers.rs        dynamic provider/model resolver
+crates/finch-runtime/src/changeset.rs        preview, hashes, atomic application
+crates/finch-runtime/src/automation.rs       optional automation capability and availability
 src/coforth/capabilities.rs     Forth bindings only
 src/lisp/capabilities.rs        Lisp bindings only
 src/tools/implementations/program.rs  thin provider-tool adapters

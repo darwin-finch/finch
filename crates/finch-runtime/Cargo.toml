@@ -1,0 +1,49 @@
+[package]
+name = "finch-runtime"
+version = "0.7.31"
+publish = false
+rust-version = "1.98"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0"
+description = "Typed program runtime, capability authority, host effects, automation, and durable runtime checkpoints"
+repository = "https://github.com/darwin-finch/finch"
+
+[features]
+# Cross-crate test-only access for application-layer regressions. Production
+# dependency edges do not enable this feature.
+test-support = []
+
+[dependencies]
+finch-ipc = { path = "../finch-ipc" }
+finch-language = { path = "../finch-language" }
+finch-memory = { path = "../finch-memory" }
+finch-programs = { path = "../finch-programs" }
+finch-tools-api = { path = "../finch-tools-api" }
+finch-vm = { path = "../finch-vm" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+calamine = { version = "0.36.1", features = ["dates"] }
+capnp = "0.24"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.8"
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
+zip = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = "0.23"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["dir", "fs", "process", "signal", "user"] }
+
+[dev-dependencies]
+finch-memory = { path = "../finch-memory", features = ["test-support"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust_xlsxwriter = "0.80"

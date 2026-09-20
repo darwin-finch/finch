@@ -5,22 +5,22 @@
 //! doing so; the host owns the other end of each channel and decides what durability means.
 //!
 //! They live here rather than with the daemon that services them because they name nothing but
-//! `crate::vm` — putting them one layer up is what made the runtime depend on the server.
+//! `finch_vm` — putting them one layer up is what made the runtime depend on the server.
 
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunnerHostEffectOutcome {
-    Acknowledged { values: Vec<crate::vm::TypedValue> },
+    Acknowledged { values: Vec<finch_vm::TypedValue> },
     NotApplied { reason: String },
     FailedPartial { detail: String },
 }
 
 #[derive(Debug)]
-pub(crate) enum RunnerEffectAuditControlRequest {
+pub enum RunnerEffectAuditControlRequest {
     Reserve {
         execution_id: uuid::Uuid,
-        effect: crate::vm::VmSideEffect,
+        effect: finch_vm::VmSideEffect,
         response_tx: oneshot::Sender<Result<RunnerEffectAuditReservation, String>>,
     },
 }
@@ -42,14 +42,14 @@ impl finch_tools_api::EffectAuditAuthority for RunnerEffectAuditControl {
 }
 
 impl RunnerEffectAuditControl {
-    pub(crate) fn new(tx: mpsc::UnboundedSender<RunnerEffectAuditControlRequest>) -> Self {
+    pub fn new(tx: mpsc::UnboundedSender<RunnerEffectAuditControlRequest>) -> Self {
         Self { tx }
     }
 
     pub async fn reserve(
         &self,
         execution_id: uuid::Uuid,
-        effect: crate::vm::VmSideEffect,
+        effect: finch_vm::VmSideEffect,
     ) -> Result<RunnerEffectAuditReservation, String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
@@ -66,7 +66,7 @@ impl RunnerEffectAuditControl {
 }
 
 #[derive(Debug)]
-pub(crate) enum RunnerEffectAuditReservationRequest {
+pub enum RunnerEffectAuditReservationRequest {
     Begin {
         response_tx: oneshot::Sender<Result<RunnerHostEffectPermit, String>>,
     },
@@ -84,7 +84,7 @@ pub struct RunnerEffectAuditReservation {
 }
 
 impl RunnerEffectAuditReservation {
-    pub(crate) fn new(tx: mpsc::UnboundedSender<RunnerEffectAuditReservationRequest>) -> Self {
+    pub fn new(tx: mpsc::UnboundedSender<RunnerEffectAuditReservationRequest>) -> Self {
         Self { tx }
     }
 
@@ -113,7 +113,7 @@ impl RunnerEffectAuditReservation {
 }
 
 #[derive(Debug)]
-pub(crate) struct RunnerHostEffectFinishRequest {
+pub struct RunnerHostEffectFinishRequest {
     pub outcome: RunnerHostEffectOutcome,
     pub response_tx: oneshot::Sender<Result<(), String>>,
 }
@@ -127,7 +127,7 @@ pub struct RunnerHostEffectPermit {
 }
 
 impl RunnerHostEffectPermit {
-    pub(crate) fn new(tx: mpsc::UnboundedSender<RunnerHostEffectFinishRequest>) -> Self {
+    pub fn new(tx: mpsc::UnboundedSender<RunnerHostEffectFinishRequest>) -> Self {
         Self { tx }
     }
 

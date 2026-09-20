@@ -8,7 +8,8 @@ and `examples/finch/` integration corpus.
 Source compilation lives in [`finch-language`](../finch-language/AGENTS.md); this crate consumes
 `ModuleVerified` and does not select or invoke a frontend.
 Shared typed IR, verification, capability/effect descriptions, and vocabulary contracts live in
-[`finch-vm-core`](../finch-vm-core/AGENTS.md). The program runtime service is `src/runtime/`; the
+[`finch-vm-core`](../finch-vm-core/AGENTS.md). The program runtime service is
+[`finch-runtime`](../finch-runtime/AGENTS.md); the
 program-definition and corpus metadata live in `crates/finch-programs/`.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature;

@@ -4111,7 +4111,7 @@ mod tests {
             direct_wire_submission(&runtime, "(file-read (path \"Cargo.toml\"))".to_string())
                 .unwrap();
         let suspended = runtime
-            .submit_typed_only_with_grant_ceiling(submission, crate::vm::EffectSet::pure())
+            .submit_typed_only_with_grant_ceiling_for_test(submission, crate::vm::EffectSet::pure())
             .await
             .unwrap();
         assert_eq!(

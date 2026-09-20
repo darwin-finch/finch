@@ -7,8 +7,9 @@ fallback, retrieval quality, and the opaque program-index table), and `memory_st
 embedding model loading is `src/models/neural_embedding.rs`. Program-definition mapping, authored
 files, and VM manifests are `src/program_registry.rs`. Brain event logs are `src/brain/`. The
 XLSX-bomb-bounding utility `src/workbook.rs` is not owned here — it has no reference from anything
-in this crate; its production callers are `src/runtime/hostio.rs` and `src/cli/tui/mod.rs`, and
-`src/runtime/tests.rs` also calls `crate::workbook::fixtures::*` directly to build XLSX fixtures for
+in this crate; its production callers are `crates/finch-runtime/src/hostio.rs` and
+`src/cli/tui/mod.rs`, and `crates/finch-runtime/src/tests.rs` also calls
+`crate::workbook::fixtures::*` directly to build XLSX fixtures for
 the #282 (two-cell spreadsheet exhausts memory) cell-count-bomb regression tests.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. The
@@ -40,10 +41,10 @@ replay cases from the root [testing rules](../../CLAUDE.md#testing-mandatory).
 
 **`test-support` feature:** the hydration batch/completion/sweep pause seam
 (`register_hydration_batch_pause`, `HYDRATION_BATCH`) drives `Loading`/`Degraded` states from
-`src/runtime/tests.rs` in the root crate. It used to be `#[cfg(test)]`, which stopped working once
-that caller crossed a crate boundary — `cfg(test)` is local to the crate being compiled and is
+`crates/finch-runtime/src/tests.rs`. It used to be `#[cfg(test)]`, which stopped working once that
+caller crossed a crate boundary — `cfg(test)` is local to the crate being compiled and is
 never set when a dependent crate links this one as an ordinary dependency. It is now
-`#[cfg(any(test, feature = "test-support"))]`; the root crate's `[dev-dependencies]` enables
+`#[cfg(any(test, feature = "test-support"))]`; `finch-runtime`'s `[dev-dependencies]` enables
 `test-support` on `finch-memory` so `cargo test --workspace` still exercises the real path, while
 `[dependencies]` (the release build) does not request the feature, so it never ships. See the
 `test-support` feature comment in `Cargo.toml` and the block comment at the first

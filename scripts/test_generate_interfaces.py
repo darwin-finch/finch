@@ -308,6 +308,22 @@ class InterfaceGeneratorTests(unittest.TestCase):
         self.assertIn("pub struct Shared;", text, "a re-export from another subsystem must be listed")
         self.assertIn("Re-exported from `app`", text, "and must say which subsystem owns it")
 
+    def test_cross_subsystem_reexport_preserves_narrower_facade_visibility(self) -> None:
+        self.fixture.write(
+            "crates/shared/src/lib.rs",
+            "/// A type exported by another workspace crate.\npub struct ExternalShared;\n",
+        )
+        self.fixture.edit(
+            "src/vm/mod.rs",
+            "pub use interpreter::{inspect, run, Handler};",
+            "pub(crate) use shared::ExternalShared;\npub use interpreter::{inspect, run, Handler};",
+        )
+        result = self.fixture.run("--write")
+        self.assertEqual(0, result.returncode, result.stderr)
+        text = self.fixture.interface()
+        self.assertIn("pub(crate) struct ExternalShared;", text, text)
+        self.assertNotIn("pub struct ExternalShared;", text, text)
+
     def test_ambiguous_definition_fails_rather_than_guessing(self) -> None:
         self.fixture.write("src/app/other.rs", "/// A second definition of the same name.\npub struct Shared;\n")
         self.fixture.edit("src/vm/mod.rs", "pub use interpreter::{inspect, run, Handler};", "pub use crate::app::Shared;\npub use interpreter::{inspect, run, Handler};")
