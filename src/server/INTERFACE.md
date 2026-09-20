@@ -242,7 +242,7 @@ pub fn create_remote_brain_router(server: Arc<AgentServer>) -> Router { … }
 pub fn create_router(server: Arc<AgentServer>) -> Router { … }
 #[cfg(test)]
 pub(crate) fn drop_next_remote_brain_reply_after_commit() { … }
-pub(crate) fn execute_authorized_remote_initialization(lifecycle: &crate::server::BrainLifecycleService, claims: &crate::brain::BrainCredentialClaims, name: &str, attachment_id: crate::brain::AttachmentId, connection_id: crate::brain::ConnectionId, request_id: u64, next_due_ms: u64, mutation: Option<crate::brain::BrainMutationReceipt>) -> crate::brain::ipc_codec::BrainRemoteReply { … }
+pub(crate) fn execute_authorized_remote_initialization(lifecycle: &crate::server::BrainLifecycleService, claims: &crate::brain::BrainCredentialClaims, name: &str, attachment_id: crate::brain::AttachmentId, connection_id: crate::brain::ConnectionId, request_id: u64, next_due_ms: u64, mutation: Option<crate::brain::BrainMutationReceipt>) -> crate::brain::BrainRemoteReply { … }
 /// Handle POST /v1/chat/completions - OpenAI-compatible chat endpoint
 pub async fn handle_chat_completions(State(server): State<Arc<AgentServer>>, Json(request): Json<ChatCompletionRequest>) -> Response { … }
 /// Handle POST /v1/feedback - durably retain explicit feedback

@@ -1,13 +1,110 @@
 //! Root application integration tests for the Brain boundary.
 
 use crate::brain::test_support::{
-    ephemeral_credential_authority, unix_epoch_millis as test_unix_epoch_millis,
-    verify_portable_invitation,
+    decode_brain_submission, encode_brain_submission, ephemeral_credential_authority,
+    unix_epoch_millis as test_unix_epoch_millis, verify_portable_invitation,
 };
 use crate::brain::*;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+#[test]
+fn named_brain_codec_submit_journal_keeps_mention_digest_without_rereading_disk() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = "fn selected() { 1 }\n";
+    std::fs::write(temp.path().join("foo.rs"), original).unwrap();
+    let catalog = crate::context::mention::MentionCatalog::new(temp.path());
+    let snapshot = catalog.resolve_path("foo.rs").unwrap();
+    assert_eq!(snapshot.content, original);
+    let kind = BrainEventKind::Prompt {
+        text: "explain @foo.rs".into(),
+        attached_mentions: vec![PromptAttachment {
+            path: snapshot.relative_path.clone(),
+            kind: snapshot.kind.as_str().to_string(),
+            sha256: snapshot.sha256.clone(),
+            byte_len: snapshot.byte_len,
+            truncated: snapshot.truncated,
+            truncation_note: snapshot.truncation_note.clone(),
+            content: snapshot.content.clone(),
+        }],
+    };
+
+    let mut message = capnp::message::Builder::new_default();
+    encode_brain_submission(
+        message.init_root::<crate::finch_ipc_capnp::brain_submission::Builder<'_>>(),
+        &kind,
+    )
+    .unwrap();
+    let encoded = capnp::serialize::write_message_to_words(&message);
+    let mut cursor = std::io::Cursor::new(encoded);
+    let decoded =
+        capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new()).unwrap();
+    let submitted = decode_brain_submission(
+        decoded
+            .get_root::<crate::finch_ipc_capnp::brain_submission::Reader<'_>>()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+    store.push("shared", "alice", submitted).unwrap();
+    std::fs::write(temp.path().join("foo.rs"), "DISK CHANGED").unwrap();
+
+    let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+    let journaled = restarted
+        .snapshot("shared")
+        .unwrap()
+        .events
+        .into_iter()
+        .find_map(|event| match event.kind {
+            BrainEventKind::Prompt {
+                text,
+                attached_mentions,
+            } => Some((text, attached_mentions)),
+            _ => None,
+        })
+        .expect("codec submit must journal a Prompt");
+    assert_eq!(
+        journaled.0, "explain @foo.rs",
+        "visible prompt must survive codec submit: {:?}",
+        journaled.0
+    );
+    assert_eq!(
+        journaled.1.len(),
+        1,
+        "named-Brain submit must persist mention snapshots, got {:?}",
+        journaled.1
+    );
+    assert_eq!(
+        journaled.1[0].sha256, snapshot.sha256,
+        "journal must keep the selection digest, got {:?}",
+        journaled.1[0]
+    );
+    assert_eq!(
+        journaled.1[0].content, original,
+        "journal must keep the selection payload, got {:?}",
+        journaled.1[0]
+    );
+    let bodies = vec![crate::context::mention::AttachmentBody {
+        relative_path: &journaled.1[0].path,
+        kind: crate::context::mention::MentionKind::File,
+        sha256: &journaled.1[0].sha256,
+        byte_len: journaled.1[0].byte_len,
+        truncated: journaled.1[0].truncated,
+        truncation_note: journaled.1[0].truncation_note.as_deref(),
+        content: &journaled.1[0].content,
+    }];
+    let replayed = crate::context::mention::format_attachment_document(&bodies);
+    assert!(
+        replayed.contains(original) && replayed.contains(&snapshot.sha256),
+        "restarted BrainStore replay must use stored payload: {replayed}"
+    );
+    assert!(
+        !replayed.contains("DISK CHANGED"),
+        "replay must not substitute later disk bytes: {replayed}"
+    );
+}
 
 fn ensure_supervisor_live_fixture() {
     static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();

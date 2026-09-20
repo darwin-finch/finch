@@ -14,6 +14,7 @@ repository = "https://github.com/darwin-finch/finch"
 
 [workspace]
 members = [
+    "crates/finch-brain",
     "crates/finch-coforth",
     "crates/finch-tools-api",
     "crates/finch-colisp",
@@ -30,6 +31,7 @@ members = [
 ]
 default-members = [
     ".",
+    "crates/finch-brain",
     "crates/finch-tools-api",
     "crates/finch-coforth",
     "crates/finch-colisp",
@@ -47,6 +49,7 @@ default-members = [
 resolver = "2"
 
 [dependencies]
+finch-brain = { path = "crates/finch-brain" }
 finch-generation = { path = "crates/finch-generation" }
 finch-ipc = { path = "crates/finch-ipc" }
 finch-tools-api = { path = "crates/finch-tools-api" }
@@ -218,6 +221,9 @@ finch-runtime = { path = "crates/finch-runtime", features = ["test-support"] }
 # Enables the certificate-validity constructor only in Finch's dependent test
 # build; production artifacts keep finch-node's test seam disabled.
 finch-node = { path = "crates/finch-node", features = ["test-support"] }
+# Enables finch-brain's cross-crate application-test seams only for Finch's
+# own test build; resolver = "2" keeps this out of production artifacts.
+finch-brain = { path = "crates/finch-brain", features = ["test-support"] }
 # tower moved to [dependencies] (#223): ServiceBuilder is now used in production
 # for the request-id/trace layer stack, and ServiceExt::oneshot() for tests
 # comes along with it as a regular dependency.
@@ -232,9 +238,6 @@ nix = { version = "0.29", features = ["term", "process", "signal"] }
 
 [features]
 default = ["onnx", "candle"]  # ONNX Runtime + Candle are the default providers
-# Keeps Brain's root application fixtures outside its production dependency graph. This moves to
-# finch-brain and is enabled only by Finch's dev-dependency when the capsule is extracted.
-test-support = []
 onnx = []  # ONNX Runtime support (always available)
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]  # Candle support (optional)
 candle-metal = ["candle", "dep:candle-metal-kernels"]  # Candle with Metal acceleration (macOS only)

@@ -1305,12 +1305,12 @@ escape_uses="$(
   rg --no-heading --no-line-number \
     --glob '*.rs' --glob '*.sh' --glob '!scripts/test_brain_isolation.sh' \
     '(^|[^[:alnum:]_])(setsid|setpgid|process_group\(|set[[:space:]]+-m)' \
-    scripts src tests | sed 's/:[[:space:]]*/:/' | sort
+    crates scripts src tests | sed 's/:[[:space:]]*/:/' | sort
 )"
 expected_escape_uses="$(cat <<'EOF'
+crates/finch-brain/src/lib.rs:.process_group(0)
+crates/finch-brain/src/lib.rs:if nix::libc::setpgid(0, 0) == -1 {
 src/bin/finch-test-supervisor.rs:if libc::setpgid(0, 0) == -1 {
-src/brain/mod.rs:.process_group(0)
-src/brain/mod.rs:if nix::libc::setpgid(0, 0) == -1 {
 src/daemon/spawn.rs:if nix::libc::setsid() == -1 {
 tests/no_external_provider_binary_test.rs:.process_group(0);
 EOF

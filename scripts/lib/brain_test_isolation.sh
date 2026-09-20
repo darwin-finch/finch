@@ -294,7 +294,7 @@ brain_test_isolation_is_active() {
   esac
   library_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P)" || return 1
   [[ "$actual_supervisor_executable" == "$supervisor_executable" ]] || { brain_isolation_proof_rejected supervisor-executable-binding; return 1; }
-  # Same rule as `verify_supervisor_image` in src/brain/mod.rs: the image digest
+  # Same rule as `verify_supervisor_image` in crates/finch-brain/src/lib.rs: the image digest
   # is checked always, not only when the inode differs, because an in-place
   # overwrite keeps the inode. A byte-identical relink is accepted; anything
   # else is refused (#259).

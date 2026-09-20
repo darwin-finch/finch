@@ -11,7 +11,7 @@ is defined in the dependency-free [`finch-tools-api`](../../crates/finch-tools-a
 (issue #872). Connecting to external Model Context Protocol servers is the nested
 [`mcp`](mcp/AGENTS.md) capsule. The background command tools (`background_bash`,
 `background_poll`, `background_stop`, issue #754) are thin siblings of bash over the brain-owned
-`BackgroundTaskManager` lifecycle; the task records and process ownership live in `src/brain`, not
+`BackgroundTaskManager` lifecycle; the task records and process ownership live in `crates/finch-brain`, not
 here. The diagnostics service annotates completed write/edit/patch results with bounded output
 from a check command the user declared in `[diagnostics]` config — nothing is inferred, and the
 declared command's authority verdict is read from the existing bash approval path

@@ -194,7 +194,7 @@ impl SubmitProgramTool {
     pub fn child(runtime: Arc<ProgramRuntime>, caller: crate::scheduler::AgentIdentity) -> Self;
     pub fn new(runtime: Arc<ProgramRuntime>) -> Self;
 }
-/// One typed task in the Brain's authoritative task-list projection. Re-exported from `brain`. Exported as `TodoItem`.
+/// One typed task in the Brain's authoritative task-list projection. Re-exported from `finch-brain`. Exported as `TodoItem`.
 pub struct BrainTask { … }
 pub struct TodoJournalReceiver { … }
 impl TodoJournalReceiver {
@@ -226,14 +226,14 @@ impl TodoList {
     /// Replace the entire list atomically (the semantics of TodoWrite).
     pub fn replace_all(&mut self, items: Vec<TodoItem>);
 }
-/// Priority of one Brain-owned task. Re-exported from `brain`. Exported as `TodoPriority`.
+/// Priority of one Brain-owned task. Re-exported from `finch-brain`. Exported as `TodoPriority`.
 pub enum BrainTaskPriority { High, Medium, Low }
 /// Return the selected Brain's current task-list projection as JSON.
 pub struct TodoReadTool { … }
 impl TodoReadTool {
     pub fn new(todo_list: Arc<RwLock<TodoList>>) -> Self;
 }
-/// Lifecycle status of one Brain-owned task. Re-exported from `brain`. Exported as `TodoStatus`.
+/// Lifecycle status of one Brain-owned task. Re-exported from `finch-brain`. Exported as `TodoStatus`.
 pub enum BrainTaskStatus { Pending, InProgress, Completed }
 /// Replace the selected Brain's task list atomically.
 pub struct TodoWriteTool { … }

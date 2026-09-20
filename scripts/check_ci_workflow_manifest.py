@@ -87,7 +87,7 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
         ".github/workflows/issue-56-brain-isolation.yml", "Cargo.toml", "Cargo.lock",
         "crates/finch-ipc/Cargo.toml", "crates/finch-ipc/build.rs",
         "crates/finch-ipc/schema/**",
-        "src/bin/finch-test-supervisor.rs", "src/brain/**",
+        "src/bin/finch-test-supervisor.rs", "crates/finch-brain/**",
         "src/daemon/**", "crates/finch-ipc/src/**", "crates/finch-runtime/**",
         "crates/finch-node/**", "src/node/**", "src/node_name.rs", "src/server/**",
         "src/client/daemon_client.rs", "src/cli/repl_event/brain_handler.rs",
@@ -126,7 +126,7 @@ ISOLATION_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     # The module, not two of its tests: a name list leaves anything added to the module scheduled
     # nowhere, and a test that never runs under the contract reports pass without asserting (#614).
     ("Brain isolation boundaries under the supervisor contract", (
-        "./scripts/test_brains.sh cargo test --lib brain::isolation_tests:: -- --nocapture",
+        "./scripts/test_brains.sh cargo test -p finch-brain --lib isolation_tests:: -- --nocapture",
     )),
     ("Reject rewritten proof at the production constructor", (
         "./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore -- --nocapture",
@@ -137,7 +137,7 @@ ISOLATION_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "./scripts/test_brains.sh cargo test --lib server::ipc::tests::supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path -- --exact --nocapture",
     )),
     ("Exercise real Brain and server paths behind the guard", (
-        "./scripts/test_brains.sh cargo test --lib brain::store -- --nocapture",
+        "./scripts/test_brains.sh cargo test -p finch-brain --lib store -- --nocapture",
         "./scripts/test_brains.sh cargo test --lib server::brain_service -- --nocapture",
         "./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_persists_named_brain_only_in_isolated_home -- --exact --nocapture",
         "./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_unverified_environment_before_store_mutation -- --exact --nocapture",
@@ -164,13 +164,13 @@ SUPERVISOR_WARM_COMMANDS = (
 
 # Mirrors the escape-API allowlist in scripts/test_brain_isolation.sh so ordinary source PRs,
 # which no longer run that harness, still reject unauthorized process-group/session escapes.
-ESCAPE_API_ROOTS = ("scripts", "src", "tests")
+ESCAPE_API_ROOTS = ("crates", "scripts", "src", "tests")
 ESCAPE_API_SELF = "scripts/test_brain_isolation.sh"
 ESCAPE_API = re.compile(r"(?:^|[^A-Za-z0-9_])(?:setsid|setpgid|process_group\(|set[ \t\n\v\f\r]+-m)")
 ESCAPE_API_ALLOWLIST = (
     "src/bin/finch-test-supervisor.rs:if libc::setpgid(0, 0) == -1 {",
-    "src/brain/mod.rs:.process_group(0)",
-    "src/brain/mod.rs:if nix::libc::setpgid(0, 0) == -1 {",
+    "crates/finch-brain/src/lib.rs:.process_group(0)",
+    "crates/finch-brain/src/lib.rs:if nix::libc::setpgid(0, 0) == -1 {",
     "src/daemon/spawn.rs:if nix::libc::setsid() == -1 {",
     "tests/no_external_provider_binary_test.rs:.process_group(0);",
 )
@@ -238,7 +238,7 @@ EXPECTED_FIXTURES = {
     "ordinary_query_tui_provider": (
         ("src/cli/query.rs", "src/cli/tui/mod.rs", "src/providers/anthropic.rs"), ALWAYS_CHECKS,
     ),
-    "brain_effect": (("src/brain/store.rs", "src/server/handlers.rs"), (
+    "brain_effect": (("crates/finch-brain/src/store.rs", "src/server/handlers.rs"), (
         *ALWAYS_CHECKS, *ISOLATION_CHECKS,
     )),
     "isolation_harness": (("scripts/test_brain_isolation.sh",), (
@@ -262,7 +262,7 @@ SCCACHE_ACTION = "mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec50
 SUPERVISOR_IMAGE_CACHE_NAME = "Restore pinned isolation supervisor"
 SUPERVISOR_IMAGE_CACHE_KEY = (
     "isolation-supervisor-${{ runner.os }}-${{ runner.arch }}-rust-1.98.0-"
-    "${{ hashFiles('src/bin/finch-test-supervisor.rs', 'src/brain/mod.rs', "
+    "${{ hashFiles('src/bin/finch-test-supervisor.rs', 'crates/finch-brain/src/lib.rs', "
     "'Cargo.lock', 'rust-toolchain.toml', 'crates/finch-ipc/build.rs', "
     "'crates/finch-ipc/schema/**') }}"
 )

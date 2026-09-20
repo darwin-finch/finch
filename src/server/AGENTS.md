@@ -6,7 +6,7 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 OpenAI-compatible request/response types, named-Brain HTTP handlers, runner callbacks, approval
 bridging, the daemon-side Cap'n Proto RPC adapter and listener lifecycle, and server lifecycle
 state. Daemon process lifecycle belongs to `src/daemon`; durable Brain state belongs to
-`src/brain`; the domain-neutral schema/protocol/socket core belongs to `crates/finch-ipc`.
+`crates/finch-brain`; the domain-neutral schema/protocol/socket core belongs to `crates/finch-ipc`.
 
 **Facade:** child modules are private. Callers outside this directory use flat
 `crate::server::Item` imports from the `pub use` list in `mod.rs`; they must not name
