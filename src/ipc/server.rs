@@ -2699,11 +2699,44 @@ async fn prepare_ipc_listener() -> Result<PreparedIpcListener> {
         std::fs::create_dir_all(parent)?;
     }
     let listener = UnixListener::bind(&path)?;
+    harden_ipc_socket_permissions(&path)?;
     Ok(PreparedIpcListener {
         path,
         listener,
         remove_on_shutdown: true,
     })
+}
+
+/// Owner-only mode for the local IPC socket, matching `daemon.log`'s
+/// `LOG_MODE` (`daemon/log.rs`).
+#[cfg(unix)]
+const IPC_SOCKET_MODE: u32 = 0o600;
+
+/// Restrict the freshly bound IPC socket to the owning user.
+///
+/// There is no authentication at the Cap'n Proto RPC layer — unlike the
+/// daemon's HTTP surface, which goes through `auth_middleware`
+/// (`server/mod.rs`) — so the socket's filesystem permissions are the only
+/// boundary controlling who can call `FinchDaemon`/`BrainService` methods.
+/// `UnixListener::bind` creates the socket at whatever the process umask
+/// allows (commonly world-connectable), so this must run immediately after
+/// bind, before the daemon starts accepting connections (#911).
+#[cfg(unix)]
+fn harden_ipc_socket_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(IPC_SOCKET_MODE)).with_context(
+        || {
+            format!(
+                "Failed to harden IPC socket permissions: {}",
+                path.display()
+            )
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn harden_ipc_socket_permissions(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }
 
 async fn serve_ipc_listener(
