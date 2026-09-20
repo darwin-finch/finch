@@ -36,7 +36,14 @@ Every blit converts domain state into one owned ViewModel snapshot, then lays it
    previous frame. The TUI root is one column that allocates chrome **from the bottom**
    (status, hr, input, hr, completions 0–N) with the transcript viewport claiming the
    leftover; a `Row`/grid parent places children side by side, and `Side` tracks are the
-   width-conditional rails (#805, #809, #810).
+   width-conditional rails (#805, #809, #810). The session task list and the tracked
+   child-agent rows are **furniture** (#966): natural tracks between the transcript viewport
+   and the completions pane that claim zero rows when there is nothing to show, never ride
+   scrollable viewport content, and stay on the frame at every scroll position (the frame
+   yields its oldest furniture rows first when it cannot afford them all, so the composer
+   and status never move). The status-strip chips ride the `STATUS` natural claim the same
+   way — they are projected from the status bar (`effective_status`), never from scroll
+   content.
 4. Painting stays line-based on the claimed rects; native `canonical_commit` remains the
    separate once-per-id pipeline.
 
