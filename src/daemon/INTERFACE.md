@@ -96,8 +96,16 @@ impl VerifiedDaemonUpgrade {
 pub fn daemon_log_path() -> Result<PathBuf> { … }
 /// Ensure daemon is running, spawning if necessary  This function: 1.
 pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> { … }
+/// Directory holding one diagnostic log file per frontend run.
+pub fn frontend_log_dir() -> Result<PathBuf> { … }
+/// A short, human-correlatable identity for this frontend process: its PID plus 8 hex characters of a fresh UUID.
+pub fn frontend_log_identity() -> String { … }
+/// Path for one frontend run's log file, named by its identity (see [`frontend_log_identity`]).
+pub fn frontend_log_path(identity: &str) -> Result<PathBuf> { … }
 /// On-disk accounting for `path` under `policy`, usable without an open handle.
 pub fn log_status(path: &Path, policy: RotationPolicy) -> LogStatus { … }
+/// Delete the oldest frontend log files in `dir` beyond `max_files`, oldest-mtime first.
+pub fn prune_frontend_logs(dir: &Path, max_files: usize) { … }
 /// Spawn daemon as background process  Detaches daemon from current process and redirects logs to ~/.finch/daemon.log - Unix: Standard spawn with log file redir…
 pub fn spawn_daemon(bind_address: &str) -> Result<()> { … }
 ```
@@ -105,6 +113,8 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> { … }
 ## Constants
 
 ```rust
+/// Upper bound on retained frontend log files across all past runs, so an operator who launches Finch often does not accumulate unbounded diagnostic files the w…
+pub const DEFAULT_MAX_FRONTEND_LOG_FILES: usize = 20;
 /// Set by `spawn_daemon` on the detached child.
 pub const DETACHED_DAEMON_ENV: &str = "FINCH_DAEMON_DETACHED";
 ```

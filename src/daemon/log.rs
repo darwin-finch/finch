@@ -165,6 +165,69 @@ pub fn daemon_log_path() -> Result<PathBuf> {
         .join("daemon.log"))
 }
 
+/// Directory holding one diagnostic log file per frontend run.
+///
+/// Unlike `daemon.log` (one long-lived daemon process, one size-rotated
+/// file), multiple interactive frontends can run concurrently on the same
+/// machine, so each gets its own file rather than interleaving rows in one
+/// shared log (#223: debugging a daemon "wedge" needed the daemon and the
+/// attached frontend traceable together, and no frontend log existed at all
+/// before this).
+pub fn frontend_log_dir() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("Failed to determine home directory")?
+        .join(".finch")
+        .join("frontend-logs"))
+}
+
+/// Path for one frontend run's log file, named by its identity (see
+/// [`frontend_log_identity`]).
+pub fn frontend_log_path(identity: &str) -> Result<PathBuf> {
+    Ok(frontend_log_dir()?.join(format!("frontend-{identity}.log")))
+}
+
+/// A short, human-correlatable identity for this frontend process: its PID
+/// plus 8 hex characters of a fresh UUID. This matches the `frontend-XXXXXXXX`
+/// naming already used for runner-lease subjects (`runner_subject_from` in
+/// `cli/repl_event/event_loop.rs`), so a person can visually match a
+/// status-bar/runner-lease identity to a log file, and the PID lets `ps`/`lsof`
+/// correlate directly to the running process.
+pub fn frontend_log_identity() -> String {
+    let suffix = &uuid::Uuid::new_v4().to_string()[..8];
+    format!("{}-{}", std::process::id(), suffix)
+}
+
+/// Upper bound on retained frontend log files across all past runs, so an
+/// operator who launches Finch often does not accumulate unbounded
+/// diagnostic files the way a pre-#240 `daemon.log` once did.
+pub const DEFAULT_MAX_FRONTEND_LOG_FILES: usize = 20;
+
+/// Delete the oldest frontend log files in `dir` beyond `max_files`,
+/// oldest-mtime first. Best-effort: a directory or file that cannot be read
+/// is skipped rather than failing frontend startup over a diagnostics
+/// concern.
+pub fn prune_frontend_logs(dir: &Path, max_files: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(PathBuf, std::time::SystemTime)> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            Some((path, modified))
+        })
+        .collect();
+    if files.len() <= max_files {
+        return;
+    }
+    files.sort_by_key(|(_, modified)| *modified);
+    for (path, _) in &files[..files.len() - max_files] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Path of rotated generation `index` (1 is the most recent).
 fn generation_path(path: &Path, index: usize) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
@@ -650,6 +713,89 @@ mod tests {
             max_bytes,
             max_files,
         }
+    }
+
+    #[test]
+    fn test_frontend_log_path_is_named_by_identity_under_frontend_logs_dir() {
+        let path = frontend_log_path("1234-abcd1234").unwrap();
+        assert_eq!(
+            path.file_name().unwrap(),
+            "frontend-1234-abcd1234.log",
+            "frontend log file must be named by its identity: {}",
+            path.display()
+        );
+        assert_eq!(
+            path.parent().unwrap().file_name().unwrap(),
+            "frontend-logs",
+            "frontend logs must live in their own directory, not beside daemon.log: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn test_frontend_log_identity_is_unique_across_calls_and_contains_the_pid() {
+        // #223: multiple frontends can run concurrently on the same machine,
+        // so identities (and therefore file names) must not collide even
+        // within the same process.
+        let first = frontend_log_identity();
+        let second = frontend_log_identity();
+        assert_ne!(first, second);
+        assert!(
+            first.starts_with(&format!("{}-", std::process::id())),
+            "identity must start with this process's pid: {first}"
+        );
+    }
+
+    #[test]
+    fn test_prune_frontend_logs_keeps_only_the_newest_max_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..5 {
+            let path = dir.path().join(format!("frontend-{index}.log"));
+            std::fs::write(&path, b"log").unwrap();
+            // Force a distinct, strictly increasing mtime per file: some
+            // filesystems have coarse mtime resolution, and this prune is
+            // mtime-ordered, so the test must not depend on real wall-clock
+            // spacing between fast successive writes.
+            let modified = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + index);
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(modified).unwrap();
+            paths.push(path);
+        }
+        // A non-log file in the same directory must survive pruning
+        // untouched: this function only manages frontend-logs/*.log.
+        let unrelated = dir.path().join("not-a-log.txt");
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        prune_frontend_logs(dir.path(), 2);
+
+        assert!(!paths[0].exists(), "oldest file must be pruned");
+        assert!(!paths[1].exists(), "second-oldest file must be pruned");
+        assert!(!paths[2].exists(), "third-oldest file must be pruned");
+        assert!(paths[3].exists(), "newest-but-one file must survive");
+        assert!(paths[4].exists(), "newest file must survive");
+        assert!(unrelated.exists(), "non-.log files must not be touched");
+    }
+
+    #[test]
+    fn test_prune_frontend_logs_is_a_noop_at_or_under_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frontend-only.log");
+        std::fs::write(&path, b"log").unwrap();
+
+        prune_frontend_logs(dir.path(), 5);
+
+        assert!(path.exists(), "must not delete files when under the limit");
+    }
+
+    #[test]
+    fn test_prune_frontend_logs_tolerates_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        // Must not panic: frontend startup calls this before it knows
+        // whether the directory has ever been created.
+        prune_frontend_logs(&missing, 5);
     }
 
     #[test]

@@ -69,7 +69,7 @@ impl IpcClient {
     /// Streaming query — returns a channel of `StreamChunk`s.
     pub async fn query_stream(&self, messages: Vec<Message>, tools: Vec<ToolDefinition>) -> Result<mpsc::UnboundedReceiver<Result<StreamChunk>>>;
     /// Register this frontend as the callback for its current named-Brain runner lease.
-    pub async fn register_brain_runner(&self, brain: &str, lease_id: crate::brain::RunnerLeaseId, event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>) -> Result<BrainRunnerBootstrap>;
+    pub async fn register_brain_runner(&self, brain: &str, lease_id: crate::brain::RunnerLeaseId, event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::ReplEvent>) -> Result<BrainRunnerBootstrap>;
 }
 /// A single event on the bus.
 pub struct QueuedEvent { … }

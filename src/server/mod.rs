@@ -40,12 +40,17 @@ pub use handlers::{
 pub use handlers::{handle_node_info_from_state_directory, handle_node_stats_from_state_directory};
 pub use middleware::{auth_middleware, DaemonAuth, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
-pub use openai_types::*;
+pub use openai_types::{
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, FunctionCall,
+    FunctionDefinition, Model, ModelsResponse, Tool, ToolCall, Usage,
+};
 
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tower::ServiceBuilder;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::claude::ClaudeClient;
@@ -413,6 +418,53 @@ pub(crate) mod schedule_delivery {
     }
 }
 
+/// Header carrying the per-request correlation id (#223): always assigned by
+/// the daemon itself (see [`strip_client_request_id`]), logged on every
+/// tracing event emitted while handling that request, and echoed back on the
+/// response so a client-side log can be joined to the daemon's by that id.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Discard any client-supplied `x-request-id` before `SetRequestIdLayer` can
+/// see it, so the daemon always assigns its own.
+///
+/// `SetRequestIdLayer` only generates a fresh id when the header is absent —
+/// otherwise it preserves whatever the caller sent, verbatim, and that value
+/// then flows into every tracing log line for the request. This daemon's
+/// HTTP surface includes the TLS remote-Brain listener and the
+/// OpenAI-compatible API, both reachable by callers this process does not
+/// otherwise trust; writing an unvalidated client string into `daemon.log`
+/// is a log-injection vector (forged-looking log lines, or terminal
+/// control/ANSI-escape sequences aimed at whoever later `tail -f`s the log).
+/// This middleware must be the outermost layer in every request-id/trace
+/// stack, ahead of `SetRequestIdLayer`.
+async fn strip_client_request_id(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    request.headers_mut().remove(REQUEST_ID_HEADER);
+    next.run(request).await
+}
+
+/// Span-building closure for the request-id/trace layer stack, applied
+/// inline at each router-construction site (Rust's tower `Layer`/`Service`
+/// generic bounds make a shared helper function that *returns* the composed
+/// stack impractical to name; the stack itself is four short lines). A
+/// missing request id (a request that somehow bypassed `SetRequestIdLayer`)
+/// logs as `-` rather than panicking or silently omitting the field.
+fn request_tracing_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
+    let request_id = request
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    tracing::info_span!(
+        "request",
+        request_id = %request_id,
+        method = %request.method(),
+        uri = %request.uri(),
+    )
+}
+
 impl AgentServer {
     #[cfg(test)]
     pub(crate) fn for_brain_http_test(
@@ -762,10 +814,20 @@ impl AgentServer {
 
         // Build router with a body size limit to guard against oversized foreign payloads.
         // 4MB is generous for natural-language queries while blocking obvious DoS attempts.
+        let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
         let app = create_router(Arc::clone(&app_state))
             .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)) // 4MB
             .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
-            .layer(TraceLayer::new_for_http());
+            .layer(
+                ServiceBuilder::new()
+                    .layer(axum::middleware::from_fn(strip_client_request_id))
+                    .layer(SetRequestIdLayer::new(
+                        request_id_header.clone(),
+                        MakeRequestUuid,
+                    ))
+                    .layer(TraceLayer::new_for_http().make_span_with(request_tracing_span))
+                    .layer(PropagateRequestIdLayer::new(request_id_header)),
+            );
 
         // Start server — ConnectInfo requires into_make_service_with_connect_info
         // so handlers can read the peer's IP for auth logging.
@@ -785,9 +847,19 @@ impl AgentServer {
                 tls_identity.private_key_der().to_vec(),
             )
             .await?;
+            let brain_request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
             let brain_app = crate::server::handlers::create_remote_brain_router(app_state)
                 .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
-                .layer(TraceLayer::new_for_http());
+                .layer(
+                    ServiceBuilder::new()
+                        .layer(axum::middleware::from_fn(strip_client_request_id))
+                        .layer(SetRequestIdLayer::new(
+                            brain_request_id_header.clone(),
+                            MakeRequestUuid,
+                        ))
+                        .layer(TraceLayer::new_for_http().make_span_with(request_tracing_span))
+                        .layer(PropagateRequestIdLayer::new(brain_request_id_header)),
+                );
             tracing::info!("Starting encrypted Brain listener on {}", brain_addr);
             let remote_server = axum_server::bind_rustls(brain_addr, tls_config)
                 .serve(brain_app.into_make_service_with_connect_info::<std::net::SocketAddr>());
@@ -1446,6 +1518,112 @@ mod tests {
         // The permanent Brain-isolation CI gate runs these entries through
         // scripts/test_brains.sh, which supplies the authenticated contract.
         std::env::var_os("FINCH_BRAIN_TEST_TOKEN").is_some()
+    }
+
+    fn request_id_tracing_router(server: Arc<AgentServer>) -> axum::Router {
+        let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
+        isolated_http_router(server).layer(
+            ServiceBuilder::new()
+                .layer(axum::middleware::from_fn(strip_client_request_id))
+                .layer(SetRequestIdLayer::new(
+                    request_id_header.clone(),
+                    MakeRequestUuid,
+                ))
+                .layer(TraceLayer::new_for_http().make_span_with(request_tracing_span))
+                .layer(PropagateRequestIdLayer::new(request_id_header)),
+        )
+    }
+
+    /// #223: the daemon's logs had no way to tell which client request (if
+    /// any) was in flight when a wedge happened. Through the real production
+    /// layer stack, a request with no id must get a fresh one assigned and
+    /// echoed on the response, so a client-side log can be joined to the
+    /// daemon's by that id.
+    #[tokio::test]
+    async fn production_router_assigns_and_echoes_a_request_id() {
+        use tower::ServiceExt as _;
+        let (_state, server) = isolated_http_server();
+        let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
+
+        let response = request_id_tracing_router(server)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let request_id = response.headers().get(&request_id_header).expect(
+            "response must echo an assigned request id so a client can correlate its own logs",
+        );
+        assert!(
+            !request_id.is_empty(),
+            "assigned request id header must not be empty"
+        );
+    }
+
+    /// A caller-supplied request id must not survive into the response or the
+    /// tracing span. The production stack strips it before assigning its own
+    /// UUID so untrusted header bytes cannot forge daemon log content.
+    #[tokio::test]
+    async fn production_router_replaces_a_caller_supplied_request_id() {
+        use tower::ServiceExt as _;
+        let (_state, server) = isolated_http_server();
+        let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
+
+        let response = request_id_tracing_router(server)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .header(&request_id_header, "caller-supplied-id-123")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "request-id replacement must not alter the response status"
+        );
+        let assigned = response
+            .headers()
+            .get(&request_id_header)
+            .expect("response must carry the daemon-assigned request id")
+            .to_str()
+            .expect("tower-http UUID request ids are valid header text");
+        assert_ne!(
+            assigned, "caller-supplied-id-123",
+            "an untrusted caller-supplied request id must be replaced"
+        );
+        uuid::Uuid::parse_str(assigned)
+            .unwrap_or_else(|error| panic!("daemon-assigned request id must be a UUID: {error}"));
+    }
+
+    /// The span `request_tracing_span` builds must actually carry the
+    /// request id, method, and uri as named fields (not just interpolated
+    /// into an opaque message), so a `tracing_subscriber::fmt` layer renders
+    /// them as filterable/greppable `key=value` pairs in the log file.
+    #[test]
+    fn request_tracing_span_carries_named_fields() {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(REQUEST_ID_HEADER, "abc123")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let span = request_tracing_span(&request);
+        let metadata = span
+            .metadata()
+            .expect("span must be enabled and have metadata");
+        let field_names: Vec<&str> = metadata.fields().iter().map(|f| f.name()).collect();
+        assert!(field_names.contains(&"request_id"));
+        assert!(field_names.contains(&"method"));
+        assert!(field_names.contains(&"uri"));
     }
 
     #[tokio::test]
