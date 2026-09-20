@@ -133,16 +133,33 @@ fn test_capnp_dependency_family_excludes_rustsec_2025_0143() {
             manifest_path.display()
         )
     });
+    let ipc_manifest_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/finch-ipc/Cargo.toml");
+    let ipc_manifest_text = std::fs::read_to_string(&ipc_manifest_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read IPC dependency security contract from {}: {error}",
+            ipc_manifest_path.display()
+        )
+    });
+    let ipc_manifest: toml::Value = ipc_manifest_text.parse().unwrap_or_else(|error| {
+        panic!(
+            "failed to parse IPC dependency security contract from {}: {error}",
+            ipc_manifest_path.display()
+        )
+    });
 
     let unix_dependencies = manifest
         .get("target")
         .and_then(|value| value.get("cfg(unix)"))
         .and_then(|value| value.get("dependencies"))
         .expect("Cargo.toml must contain [target.'cfg(unix)'.dependencies] for Unix IPC crates");
-    let build_dependencies = manifest
+    let ipc_dependencies = ipc_manifest
+        .get("dependencies")
+        .expect("finch-ipc Cargo.toml must contain [dependencies] for the Cap'n Proto runtime");
+    let build_dependencies = ipc_manifest
         .get("build-dependencies")
-        .expect("Cargo.toml must contain [build-dependencies] for the Cap'n Proto schema compiler");
-    let capnp = dependency_version(
+        .expect("finch-ipc Cargo.toml must contain [build-dependencies] for the Cap'n Proto schema compiler");
+    let root_capnp = dependency_version(
         unix_dependencies,
         "target.'cfg(unix)'.dependencies",
         "capnp",
@@ -152,18 +169,24 @@ fn test_capnp_dependency_family_excludes_rustsec_2025_0143() {
         "target.'cfg(unix)'.dependencies",
         "capnp-rpc",
     );
+    let ipc_capnp = dependency_version(ipc_dependencies, "dependencies", "capnp");
     let capnpc = dependency_version(build_dependencies, "build-dependencies", "capnpc");
     assert_eq!(
-        capnp, capnp_rpc,
-        "Cap'n Proto runtime crates must remain on one compatible release series: capnp={capnp}, capnp-rpc={capnp_rpc}"
+        root_capnp, capnp_rpc,
+        "Cap'n Proto runtime crates must remain on one compatible release series: capnp={root_capnp}, capnp-rpc={capnp_rpc}"
     );
     assert_eq!(
-        capnp, capnpc,
-        "Cap'n Proto runtime and schema compiler must remain on one compatible release series: capnp={capnp}, capnpc={capnpc}"
+        root_capnp, ipc_capnp,
+        "root and finch-ipc Cap'n Proto runtimes must remain on one compatible release series: root capnp={root_capnp}, finch-ipc capnp={ipc_capnp}"
+    );
+    assert_eq!(
+        ipc_capnp, capnpc,
+        "finch-ipc Cap'n Proto runtime and schema compiler must remain on one compatible release series: capnp={ipc_capnp}, capnpc={capnpc}"
     );
 
-    assert_requirement_excludes_affected("capnp", capnp);
+    assert_requirement_excludes_affected("root capnp", root_capnp);
     assert_requirement_excludes_affected("capnp-rpc", capnp_rpc);
+    assert_requirement_excludes_affected("finch-ipc capnp", ipc_capnp);
     assert_requirement_excludes_affected("capnpc", capnpc);
     assert_resolved_capnp_family_is_fixed(&manifest_path);
 }

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Measure what it would cost to declare a path as its own subsystem.
 
-Picking a seam by how its directory reads is how you pick a bad one. `src/ipc/*_codec.rs` looks
-like a low-level wire boundary and is in fact 5,483 lines that translate domain types from five
-other subsystems, so declaring it would take five debt edges on the first day.
+Picking a seam by how its directory reads is how you pick a bad one. Before the IPC dependency
+inversion, `src/ipc/*_codec.rs` looked like a low-level wire boundary but translated domain types
+from five other subsystems, so declaring it would have taken five debt edges on the first day.
 
 This reports the two numbers that decide the question instead:
 

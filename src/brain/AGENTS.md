@@ -13,8 +13,8 @@ facades: [`journal`](journal/AGENTS.md), [`schedule`](schedule/AGENTS.md), [`run
 portable effect delivery lives beside the reducible checkpoint as
 `{root}/{name}/runtime/effects.jsonl` (`VmEffectDeliveryLog`, Brain-bound). The daemon
 subtree is owned from here but implemented in `src/daemon` (its own capsule). Server, client, and
-agent composition live outside this subtree; the domain-neutral IPC schema/protocol core remains
-in `src/ipc`.
+agent composition live outside this subtree; the domain-neutral IPC schema/protocol core lives in
+`crates/finch-ipc`.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature.
 Child modules are private (`attachment`, `background`, `credential`, `journal`, `names`,

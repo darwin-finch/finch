@@ -18,6 +18,7 @@ members = [
     "crates/finch-tools-api",
     "crates/finch-colisp",
     "crates/finch-generation",
+    "crates/finch-ipc",
     "crates/finch-language",
     "crates/finch-memory",
     "crates/finch-programs",
@@ -31,6 +32,7 @@ default-members = [
     "crates/finch-coforth",
     "crates/finch-colisp",
     "crates/finch-generation",
+    "crates/finch-ipc",
     "crates/finch-language",
     "crates/finch-memory",
     "crates/finch-programs",
@@ -42,6 +44,7 @@ resolver = "2"
 
 [dependencies]
 finch-generation = { path = "crates/finch-generation" }
+finch-ipc = { path = "crates/finch-ipc" }
 finch-tools-api = { path = "crates/finch-tools-api" }
 finch-language = { path = "crates/finch-language" }
 finch-memory = { path = "crates/finch-memory" }
@@ -198,9 +201,6 @@ nix = { version = "0.29", features = ["dir", "fs", "process", "signal", "user"] 
 # Cap'n Proto IPC (CLI ↔ daemon over Unix socket)
 capnp = "0.24"
 capnp-rpc = "0.24"
-
-[build-dependencies]
-capnpc = "0.24"
 
 [dev-dependencies]
 semver = "1"

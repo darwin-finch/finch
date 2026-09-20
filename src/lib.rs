@@ -53,19 +53,7 @@ pub fn take_tui_rebuild() -> bool {
     NEEDS_TUI_REBUILD.swap(false, Ordering::SeqCst)
 }
 
-// Cap'n Proto generated code must live at the crate root so that the
-// self-references emitted by capnpc (`crate::finch_ipc_capnp::…`) resolve.
-#[allow(
-    clippy::all,
-    dead_code,
-    unused_imports,
-    unused_parens,
-    non_camel_case_types,
-    non_snake_case
-)]
-pub mod finch_ipc_capnp {
-    include!(concat!(env!("OUT_DIR"), "/finch_ipc_capnp.rs"));
-}
+pub use finch_ipc::finch_ipc_capnp;
 
 // Core modules
 pub mod agent; // Autonomous agent loop (task backlog, reflection, activity log)
@@ -80,7 +68,7 @@ pub mod errors; // User-friendly error messages
 pub mod feedback; // Response feedback system for LoRA training
 pub mod generators; // Unified generator interface
 pub mod graph; // Execution graph — causal trace of query turns
-pub mod ipc; // Cap'n Proto IPC layer (CLI ↔ daemon over Unix socket)
+pub use finch_ipc as ipc; // Cap'n Proto IPC schema/protocol/socket core
 pub mod license;
 /// Compatibility paths for Finch Lisp syntax values and reader functions.
 pub mod lisp {

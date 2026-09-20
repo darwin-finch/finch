@@ -1,4 +1,4 @@
-use crate::ipc::finch_ipc_capnp;
+use crate::finch_ipc_capnp;
 
 const MAX_JSON_VALUE_DEPTH: usize = 64;
 
