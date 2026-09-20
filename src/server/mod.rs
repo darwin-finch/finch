@@ -40,7 +40,10 @@ pub use handlers::{
 pub use handlers::{handle_node_info_from_state_directory, handle_node_stats_from_state_directory};
 pub use middleware::{auth_middleware, DaemonAuth, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
-pub use openai_types::*;
+pub use openai_types::{
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, FunctionCall,
+    FunctionDefinition, Model, ModelsResponse, Tool, ToolCall, Usage,
+};
 
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -1521,6 +1524,7 @@ mod tests {
         let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
         isolated_http_router(server).layer(
             ServiceBuilder::new()
+                .layer(axum::middleware::from_fn(strip_client_request_id))
                 .layer(SetRequestIdLayer::new(
                     request_id_header.clone(),
                     MakeRequestUuid,
@@ -1561,11 +1565,11 @@ mod tests {
         );
     }
 
-    /// A caller-supplied request id must survive, not be silently replaced by
-    /// a fresh one — otherwise a caller's own request-scoped logging cannot
-    /// be joined to the daemon's.
+    /// A caller-supplied request id must not survive into the response or the
+    /// tracing span. The production stack strips it before assigning its own
+    /// UUID so untrusted header bytes cannot forge daemon log content.
     #[tokio::test]
-    async fn production_router_preserves_a_caller_supplied_request_id() {
+    async fn production_router_replaces_a_caller_supplied_request_id() {
         use tower::ServiceExt as _;
         let (_state, server) = isolated_http_server();
         let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
@@ -1582,10 +1586,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            response.headers().get(&request_id_header).unwrap(),
-            "caller-supplied-id-123",
-            "a caller-supplied request id must be preserved verbatim, not overwritten"
+            response.status(),
+            axum::http::StatusCode::OK,
+            "request-id replacement must not alter the response status"
         );
+        let assigned = response
+            .headers()
+            .get(&request_id_header)
+            .expect("response must carry the daemon-assigned request id")
+            .to_str()
+            .expect("tower-http UUID request ids are valid header text");
+        assert_ne!(
+            assigned, "caller-supplied-id-123",
+            "an untrusted caller-supplied request id must be replaced"
+        );
+        uuid::Uuid::parse_str(assigned)
+            .unwrap_or_else(|error| panic!("daemon-assigned request id must be a UUID: {error}"));
     }
 
     /// The span `request_tracing_span` builds must actually carry the

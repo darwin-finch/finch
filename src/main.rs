@@ -1413,16 +1413,25 @@ fn init_tracing() {
 /// directory or file still runs, just without this diagnostic sink.
 fn frontend_log_file() -> Option<finch::daemon::RotatingLog> {
     let dir = finch::daemon::frontend_log_dir().ok()?;
-    finch::daemon::prune_frontend_logs(&dir, finch::daemon::DEFAULT_MAX_FRONTEND_LOG_FILES);
+    // Prune to one below the cap before creating this run's file. Pruning to
+    // the cap itself and then opening a new file would retain cap + 1 forever.
+    finch::daemon::prune_frontend_logs(
+        &dir,
+        finch::daemon::DEFAULT_MAX_FRONTEND_LOG_FILES.saturating_sub(1),
+    );
     let identity = finch::daemon::frontend_log_identity();
     let path = finch::daemon::frontend_log_path(&identity).ok()?;
     match finch::daemon::RotatingLog::open(&path, finch::daemon::RotationPolicy::default()) {
         Ok(log) => {
-            eprintln!("Frontend logs: {}", path.display());
+            if finch::cli::logging_enabled() {
+                eprintln!("Frontend logs: {}", path.display());
+            }
             Some(log)
         }
         Err(error) => {
-            eprintln!("Could not open frontend log file ({error:#}); continuing without it");
+            if finch::cli::logging_enabled() {
+                eprintln!("Could not open frontend log file ({error:#}); continuing without it");
+            }
             None
         }
     }

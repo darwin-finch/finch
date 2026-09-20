@@ -119,6 +119,26 @@ pub struct ToolParts { … }
 pub struct UiParts { … }
 ```
 
+## Functions
+
+```rust
+/// Format a token count as "N" or "N.Nk".
+pub fn format_token_count(n: usize) -> String { … }
+/// Format a tool label like "Bash(git push)" or "Read(src/file.rs)"
+pub fn format_tool_label(name: &str, input: &Value) -> String { … }
+/// Returns `true` when `tool_name` may be called in `mode`.
+pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool { … }
+```
+
+## Constants
+
+```rust
+/// Tools permitted in `ReplMode::Planning`, by canonical registered name.
+pub(crate) const PLANNING_ALLOWED_TOOLS: &[&str] = &[ "read", "glob", "grep", "web_fetch", // Read-only by convention and confirmed normally, so the model can run // inspection commands like `which gh` or `cargo check` while planning. "bash", // Session-local plan visibility is not a workspace or host mutation. Keep // the familiar checklist usable while the model is deliberately planning. "todo_read", "todo_write", // Re-entering planning while already planning is idempotent // (`EnterPlanModeTool::execute` returns "already in planning mode" and // changes nothing). The canonical name is the only spelling the provider // is shown: `ToolRegistry::definitions()` omits aliases. "enter_plan_mode", "present_plan", "ask_user_question", ];
+/// Compatibility spellings the planning gate accepts, mapped to the canonical entry in [`PLANNING_ALLOWED_TOOLS`].
+pub(crate) const PLANNING_ALLOWED_TOOL_ALIASES: &[(&str, &str)] = &[ ("Bash", "bash"), ("TodoRead", "todo_read"), ("TodoWrite", "todo_write"), ("EnterPlanMode", "enter_plan_mode"), ("PresentPlan", "present_plan"), ("AskUserQuestion", "ask_user_question"), ];
+```
+
 ## Modules
 
 ```rust
