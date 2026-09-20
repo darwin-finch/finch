@@ -55,7 +55,7 @@ pub enum Widget { Stack, Text, Rule, Completions, Composer, Viewport, DialogCard
 
 ```rust
 /// Return the terminal display width (in columns) of a single character.
-pub(crate) fn char_display_width(c: char) -> usize { … }
+pub fn char_display_width(c: char) -> usize { … }
 /// Extract visible characters from string (strip ANSI codes) Returns (visible_chars, positions_of_ansi_codes)
 pub fn extract_visible_chars(s: &str) -> (Vec<char>, Vec<usize>) { … }
 /// Physical rows the composer's draft occupies, including the ghost suffix on its last line and the two-column prompt/continuation indent.

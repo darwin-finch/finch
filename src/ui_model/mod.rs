@@ -115,7 +115,7 @@ pub struct RenderedTranscriptLine {
 /// - Control characters measure 0; callers strip escape sequences before
 ///   measuring.
 #[inline]
-pub(crate) fn char_display_width(c: char) -> usize {
+pub fn char_display_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
