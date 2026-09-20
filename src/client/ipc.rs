@@ -10,7 +10,7 @@ use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::brain::ipc_codec::{
+use crate::brain::{
     decode_approval_audience, decode_attachment, decode_brain_wire_reader, decode_event,
     decode_run, decode_runner_handoff, decode_runner_lease, decode_schedule, decode_snapshot,
     encode_approval_audience, encode_brain_submission, encode_environment,
@@ -256,7 +256,7 @@ impl IpcClient {
         let mut req = self.client.query_request();
         {
             let mut p = req.get();
-            crate::brain::ipc_codec::encode_messages(
+            crate::brain::encode_messages(
                 p.reborrow().init_messages(messages.len() as u32),
                 &messages,
             )?;
@@ -285,7 +285,7 @@ impl IpcClient {
         let mut req = self.client.query_stream_request();
         {
             let mut p = req.get();
-            crate::brain::ipc_codec::encode_messages(
+            crate::brain::encode_messages(
                 p.reborrow().init_messages(messages.len() as u32),
                 &messages,
             )?;
@@ -862,9 +862,7 @@ impl IpcClient {
                             {
                                 let mut params = call.get();
                                 params.set_run_id(&run_id.0.to_string());
-                                params.set_status(crate::brain::ipc_codec::run_status_to_capnp(
-                                    status,
-                                ));
+                                params.set_status(crate::brain::run_status_to_capnp(status));
                                 params.set_detail(&detail);
                             }
                             let reply = call.send().promise.await?;
@@ -1067,7 +1065,7 @@ impl finch_ipc_capnp::brain_turn_commit_ack::Server for BrainTurnCommitAckImpl {
             Err(error) => return Promise::err(error),
         };
         let status = match params.get_status() {
-            Ok(status) => crate::brain::ipc_codec::run_status_from_capnp(status),
+            Ok(status) => crate::brain::run_status_from_capnp(status),
             Err(error) => return Promise::err(error.into()),
         };
         let detail = params
@@ -1188,7 +1186,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                                 }
                             }
                             let reply = call.send().promise.await?;
-                            crate::brain::ipc_codec::decode_schedule(
+                            crate::brain::decode_schedule(
                                 reply.get()?.get_schedule()?,
                             )
                             .map_err(|error| capnp::Error::failed(error.to_string()))
@@ -1212,7 +1210,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                                     reply
                                         .get_schedule()
                                         .map_err(anyhow::Error::from)
-                                        .and_then(crate::brain::ipc_codec::decode_schedule)
+                                        .and_then(crate::brain::decode_schedule)
                                 })
                                 .transpose()
                                 .map_err(|error| capnp::Error::failed(error.to_string()))
@@ -1345,7 +1343,7 @@ impl brain_runner::Server for BrainRunnerImpl {
         let context = match request
             .get_context()
             .map_err(anyhow::Error::new)
-            .and_then(crate::brain::ipc_codec::decode_messages)
+            .and_then(crate::brain::decode_messages)
         {
             Ok(context) => context,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -1437,7 +1435,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     });
                     result.set_output(&response.output);
                     if !response.continuation_messages.is_empty() {
-                        crate::brain::ipc_codec::encode_continuation_messages(
+                        crate::brain::encode_continuation_messages(
                             result.reborrow().init_continuation_messages(
                                 response.continuation_messages.len() as u32,
                             ),
@@ -1447,7 +1445,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     }
                     if let Some(metadata) = &response.invocation_metadata {
                         result.set_has_invocation_metadata(true);
-                        crate::brain::ipc_codec::encode_invocation_metadata(
+                        crate::brain::encode_invocation_metadata(
                             result.reborrow().init_invocation_metadata(),
                             metadata,
                         );

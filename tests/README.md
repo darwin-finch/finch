@@ -23,7 +23,7 @@ home from the production home. To wrap a narrower test command, pass it as
 arguments, for example:
 
 ```bash
-./scripts/test_brains.sh cargo test --lib brain::store
+./scripts/test_brains.sh cargo test -p finch-brain --lib store
 ```
 
 The Rust supervisor creates and owns one OS process group, retains its leader

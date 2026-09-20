@@ -1663,6 +1663,7 @@ dependencies = [
  "dashmap",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "finch-brain",
  "finch-generation",
  "finch-ipc",
  "finch-language",
@@ -1732,6 +1733,46 @@ dependencies = [
  "walkdir",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "finch-brain"
+version = "0.7.31"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "capnp",
+ "dirs 5.0.1",
+ "ed25519-dalek",
+ "finch-ipc",
+ "finch-node",
+ "finch-programs",
+ "finch-providers",
+ "finch-runtime",
+ "finch-vm",
+ "fs2",
+ "futures",
+ "hex",
+ "hmac",
+ "hostname",
+ "nix 0.29.0",
+ "rand 0.8.8",
+ "rcgen",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -3,7 +3,7 @@ use super::{
     ipc_call_span, require_approval_connection, BrainRpcService, BrainRunnerControlImpl,
     FinchDaemonImpl,
 };
-use crate::brain::ipc_codec::encode_approval_audience;
+use crate::brain::encode_approval_audience;
 
 /// #223: the local Cap'n Proto IPC path had no tracing correlation of any
 /// kind. `ipc_call_span` must carry a `request_id` and the method name as
@@ -2303,7 +2303,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         result.set_language(super::finch_ipc_capnp::ProgramLanguage::Lisp);
         result.set_output("done");
         result.set_runtime_revision(1);
-        crate::brain::ipc_codec::encode_continuation_messages(
+        crate::brain::encode_continuation_messages(
             result.reborrow().init_continuation_messages(3),
             &[
                 crate::providers::Message::with_content(
@@ -2336,7 +2336,7 @@ fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         )
         .unwrap();
         result.set_has_invocation_metadata(true);
-        crate::brain::ipc_codec::encode_invocation_metadata(
+        crate::brain::encode_invocation_metadata(
             result.reborrow().init_invocation_metadata(),
             &crate::providers::InvocationMetadata {
                 requested_model: "gpt-5.6".into(),

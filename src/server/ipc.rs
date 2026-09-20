@@ -12,7 +12,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::Instrument;
 
-use crate::brain::ipc_codec::{
+use crate::brain::{
     decode_approval_audience, decode_brain_submission, decode_environment,
     encode_approval_audience, encode_attachment, encode_brain_submission_outcome, encode_event,
     encode_run, encode_runner_handoff, encode_runner_lease, encode_schedule, encode_snapshot,
@@ -411,7 +411,7 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let status = match params.get_status() {
-            Ok(status) => crate::brain::ipc_codec::run_status_from_capnp(status),
+            Ok(status) => crate::brain::run_status_from_capnp(status),
             Err(error) => return Promise::err(error.into()),
         };
         let detail = params
@@ -1832,10 +1832,8 @@ impl finch_daemon::Server for FinchDaemonImpl {
         mut results: finch_daemon::QueryResults,
     ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let p = pry!(params.get());
-        let messages = pry!(
-            crate::brain::ipc_codec::decode_messages(pry!(p.get_messages()))
-                .map_err(|error| capnp::Error::failed(error.to_string()))
-        );
+        let messages = pry!(crate::brain::decode_messages(pry!(p.get_messages()))
+            .map_err(|error| capnp::Error::failed(error.to_string())));
         let tools = pry!(read_tools(pry!(p.get_tools())));
         let server = Arc::clone(&self.server);
 
@@ -1879,10 +1877,8 @@ impl finch_daemon::Server for FinchDaemonImpl {
         _results: finch_daemon::QueryStreamResults,
     ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let p = pry!(params.get());
-        let messages = pry!(
-            crate::brain::ipc_codec::decode_messages(pry!(p.get_messages()))
-                .map_err(|error| capnp::Error::failed(error.to_string()))
-        );
+        let messages = pry!(crate::brain::decode_messages(pry!(p.get_messages()))
+            .map_err(|error| capnp::Error::failed(error.to_string())));
         let tools = pry!(read_tools(pry!(p.get_tools())));
         let receiver = pry!(p.get_receiver());
         let server = Arc::clone(&self.server);
@@ -2393,7 +2389,7 @@ async fn forward_runner_request(
                     payload.set_run_id(&request.run_id.0.to_string());
                     payload.set_request_seq(request.request_seq);
                     payload.set_prompt(&request.prompt);
-                    let encoded = crate::brain::ipc_codec::encode_messages(
+                    let encoded = crate::brain::encode_messages(
                         payload
                             .reborrow()
                             .init_context(request.context.len() as u32),
@@ -2624,7 +2620,7 @@ fn decode_runner_turn_result(
             while let Some(notice) = rx.recv().await {
                 let mut call = capability.committed_request();
                 call.get()
-                    .set_status(crate::brain::ipc_codec::run_status_to_capnp(notice.status));
+                    .set_status(crate::brain::run_status_to_capnp(notice.status));
                 call.get().set_detail(&notice.detail);
                 if let Err(error) = call.send().promise.await {
                     tracing::warn!(%error, "could not acknowledge committed Brain turn to runner");
@@ -2652,7 +2648,7 @@ fn decode_runner_turn_result(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string(),
-        continuation_messages: crate::brain::ipc_codec::decode_continuation_messages(
+        continuation_messages: crate::brain::decode_continuation_messages(
             result
                 .get_continuation_messages()
                 .map_err(|error| error.to_string())?,
@@ -2663,7 +2659,7 @@ fn decode_runner_turn_result(
             .then(|| result.get_invocation_metadata())
             .transpose()
             .map_err(|error| error.to_string())?
-            .map(crate::brain::ipc_codec::decode_invocation_metadata)
+            .map(crate::brain::decode_invocation_metadata)
             .transpose()
             .map_err(|error| error.to_string())?,
         turn_events,

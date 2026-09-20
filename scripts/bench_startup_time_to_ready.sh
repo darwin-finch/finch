@@ -51,7 +51,7 @@
 # daemon's warmth rather than on the code.
 #
 # The /health cost is measured separately and directly by
-# `brain::store::tests::bench_list_versus_count_over_a_realistic_brain_root`:
+# `finch-brain`'s `store::tests::bench_list_versus_count_over_a_realistic_brain_root`:
 #
 #   cargo test --lib bench_list_versus_count -- --ignored --nocapture
 #
