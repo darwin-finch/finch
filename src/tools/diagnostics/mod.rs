@@ -15,6 +15,7 @@
 // The command is executed directly (argv split, never a shell) with
 // `kill_on_drop`, so a timed-out run cannot leave an orphaned build behind.
 
+use crate::cli::sanitize_multiline;
 use crate::config::{CheckCommandSource, DiagnosticsConfig};
 use crate::tools::permissions::{PermissionCheck, PermissionManager};
 use std::collections::HashMap;
@@ -205,7 +206,7 @@ impl DiagnosticsService {
                     }
                     text.push_str(&stderr);
                 }
-                let text = crate::cli::diff::sanitize_multiline(&text);
+                let text = sanitize_multiline(&text);
                 let truncated = text.chars().count() > self.config.max_output_chars;
                 let output_text = if truncated {
                     text.chars().take(self.config.max_output_chars).collect()

@@ -239,7 +239,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
         .await
         .context("fresh daemon runner callback timed out")?
         .context("fresh daemon runner callback closed")?;
-    let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = request else {
+    let crate::cli::ReplEvent::NamedBrainProgramRequested(request) = request else {
         anyhow::bail!("fresh daemon delivered the wrong runner callback");
     };
     anyhow::ensure!(
@@ -349,7 +349,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
         .await
         .context("restored handed-off callback timed out")?
         .context("restored handed-off callback closed")?;
-    let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = request else {
+    let crate::cli::ReplEvent::NamedBrainProgramRequested(request) = request else {
         anyhow::bail!("restored callback delivered the wrong request");
     };
     anyhow::ensure!(

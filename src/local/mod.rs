@@ -3,8 +3,8 @@
 // Handles local response generation through pattern classification and learned responses
 // This is the core of Shammah's "95% local processing" capability
 
-pub mod generator;
-pub mod patterns;
+mod generator;
+mod patterns;
 
 pub use generator::{GeneratedResponse, TemplateGenerator};
 pub use patterns::{PatternClassifier, QueryPattern};

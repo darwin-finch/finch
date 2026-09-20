@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use finch::claude::ClaudeClient;
-use finch::cli::output_layer::OutputManagerLayer;
+use finch::cli::OutputManagerLayer;
 use finch::cli::Repl;
 use finch::config::{load_config, Config};
 use finch::metrics::MetricsLogger;
@@ -396,14 +396,14 @@ fn first_run_setup_cancelled() -> anyhow::Error {
 }
 
 async fn finish_first_run_setup<V, VF, L, W>(
-    wizard_result: Result<finch::cli::setup_wizard::SetupResult>,
+    wizard_result: Result<finch::cli::SetupResult>,
     validate_and_apply: V,
     load_saved_config: L,
     success_output: &mut W,
 ) -> Result<Config>
 where
-    V: FnOnce(finch::cli::setup_wizard::SetupResult) -> VF,
-    VF: std::future::Future<Output = Result<finch::cli::setup_wizard::SetupApplyOutcome>>,
+    V: FnOnce(finch::cli::SetupResult) -> VF,
+    VF: std::future::Future<Output = Result<finch::cli::SetupApplyOutcome>>,
     L: FnOnce() -> Result<Config>,
     W: std::io::Write + ?Sized,
 {
@@ -415,7 +415,7 @@ where
         Err(error) => return Err(error),
     };
 
-    if validate_and_apply(result).await? == finch::cli::setup_wizard::SetupApplyOutcome::Cancelled {
+    if validate_and_apply(result).await? == finch::cli::SetupApplyOutcome::Cancelled {
         return Err(first_run_setup_cancelled());
     }
 
@@ -1025,7 +1025,7 @@ async fn main() -> Result<()> {
 
     // CRITICAL: Create and configure OutputManager BEFORE initializing tracing
     // This prevents lazy initialization with stdout enabled
-    use finch::cli::global_output::{set_global_output, set_global_status};
+    use finch::cli::{set_global_output, set_global_status};
     use finch::cli::{OutputManager, StatusBar};
     use finch::config::ColorScheme;
     use finch::models::ModelProgress;
@@ -1124,7 +1124,7 @@ async fn main() -> Result<()> {
                     finish_first_run_setup(
                         show_setup_wizard(),
                         |result| async move {
-                            finch::cli::setup_wizard::validate_first_run_and_apply(&result).await
+                            finch::cli::validate_first_run_and_apply(&result).await
                         },
                         finch::config::load_config,
                         &mut std::io::stderr(),
@@ -1692,7 +1692,7 @@ async fn run_train_setup() -> Result<()> {
 /// install here. Uses the same `GLOBAL_OUTPUT` host `output_progress!` already
 /// writes to (origin/main download attached `ProgressMessage` there).
 fn install_daemon_model_progress() -> Arc<finch::cli::OutputManager> {
-    use finch::cli::global_output::global_output;
+    use finch::cli::global_output;
     use finch::models::ModelProgress;
     let output = global_output();
     finch::models::install_model_progress(Arc::clone(&output) as Arc<dyn ModelProgress>);
@@ -2765,8 +2765,8 @@ async fn run_setup() -> Result<()> {
 
     // Run the wizard
     let result = show_setup_wizard()?;
-    if finch::cli::setup_wizard::validate_command_and_apply(&result).await?
-        == finch::cli::setup_wizard::SetupApplyOutcome::Cancelled
+    if finch::cli::validate_command_and_apply(&result).await?
+        == finch::cli::SetupApplyOutcome::Cancelled
     {
         println!("Setup cancelled; configuration was not changed.");
         return Ok(());
@@ -2797,15 +2797,16 @@ async fn run_auth_command(command: AuthCommand) -> Result<()> {
 }
 
 async fn run_chatgpt_auth(command: AuthCommand) -> Result<()> {
-    use finch::cli::chatgpt_auth::{
-        render_status_line, save_named_credential, ChatGptAuthService, DeviceLoginPresentation,
+    use finch::cli::{
+        render_chatgpt_auth_status_line, save_chatgpt_named_credential, ChatGptAuthService,
+        ChatGptDeviceLoginPresentation,
     };
 
     let service = ChatGptAuthService::production()?;
     match command {
         AuthCommand::Status { credential, .. } => {
             let status = service.status(&credential)?;
-            println!("{}", render_status_line(&status)?);
+            println!("{}", render_chatgpt_auth_status_line(&status)?);
         }
         AuthCommand::Login {
             credential,
@@ -2817,7 +2818,7 @@ async fn run_chatgpt_auth(command: AuthCommand) -> Result<()> {
             let metadata = service
                 .login(
                     &credential,
-                    DeviceLoginPresentation {
+                    ChatGptDeviceLoginPresentation {
                         copy_code: copy,
                         open_browser: open,
                     },
@@ -2828,19 +2829,19 @@ async fn run_chatgpt_auth(command: AuthCommand) -> Result<()> {
             let config = load_config().context(
                 "ChatGPT login succeeded, but Finch config is unavailable; rerun `finch setup` to bind the named credential",
             )?;
-            save_named_credential(config, metadata)?;
+            save_chatgpt_named_credential(config, metadata)?;
             println!("ChatGPT login saved credential {credential} for account {account}.");
         }
         AuthCommand::Logout { credential, .. } => {
             let metadata = service.logout(&credential, command_cancellation()).await?;
             let config = load_config()?;
-            save_named_credential(config, metadata)?;
+            save_chatgpt_named_credential(config, metadata)?;
             println!("ChatGPT credential {credential} was revoked and signed out.");
         }
         AuthCommand::Recover { credential, .. } => {
             let metadata = service.recover(&credential)?;
             let config = load_config()?;
-            save_named_credential(config, metadata)?;
+            save_chatgpt_named_credential(config, metadata)?;
             println!("Recovered ChatGPT credential {credential} as signed_out; run `finch auth login chatgpt --credential {credential}` to sign in again.");
         }
     }
@@ -2848,15 +2849,16 @@ async fn run_chatgpt_auth(command: AuthCommand) -> Result<()> {
 }
 
 async fn run_grok_auth(command: AuthCommand) -> Result<()> {
-    use finch::cli::grok_auth::{
-        render_status_line, save_named_credential, DeviceLoginPresentation, GrokAuthService,
+    use finch::cli::{
+        render_grok_auth_status_line, save_grok_named_credential, GrokAuthService,
+        GrokDeviceLoginPresentation,
     };
 
     let service = GrokAuthService::production()?;
     match command {
         AuthCommand::Status { credential, .. } => {
             let status = service.status(&credential)?;
-            println!("{}", render_status_line(&status)?);
+            println!("{}", render_grok_auth_status_line(&status)?);
         }
         AuthCommand::Login {
             credential,
@@ -2868,7 +2870,7 @@ async fn run_grok_auth(command: AuthCommand) -> Result<()> {
             let metadata = service
                 .login(
                     &credential,
-                    DeviceLoginPresentation {
+                    GrokDeviceLoginPresentation {
                         copy_code: copy,
                         open_browser: open,
                     },
@@ -2879,19 +2881,19 @@ async fn run_grok_auth(command: AuthCommand) -> Result<()> {
             let config = load_config().context(
                 "Grok login succeeded, but Finch config is unavailable; rerun `finch setup` to bind the named credential",
             )?;
-            save_named_credential(config, metadata)?;
+            save_grok_named_credential(config, metadata)?;
             println!("Grok login saved credential {credential} for account {account}.");
         }
         AuthCommand::Logout { credential, .. } => {
             let metadata = service.logout(&credential, command_cancellation()).await?;
             let config = load_config()?;
-            save_named_credential(config, metadata)?;
+            save_grok_named_credential(config, metadata)?;
             println!("Grok credential {credential} was revoked and signed out.");
         }
         AuthCommand::Recover { credential, .. } => {
             let metadata = service.recover(&credential)?;
             let config = load_config()?;
-            save_named_credential(config, metadata)?;
+            save_grok_named_credential(config, metadata)?;
             println!("Recovered Grok credential {credential} as signed_out; run `finch auth login grok-sub --credential {credential}` to sign in again.");
         }
     }
@@ -3747,7 +3749,7 @@ mod tests {
             Err(anyhow::anyhow!("Setup cancelled")),
             move |_| async move {
                 validate_probe.fetch_add(1, Ordering::SeqCst);
-                Ok(finch::cli::setup_wizard::SetupApplyOutcome::Saved)
+                Ok(finch::cli::SetupApplyOutcome::Saved)
             },
             move || {
                 load_probe.fetch_add(1, Ordering::SeqCst);

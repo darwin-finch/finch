@@ -1422,7 +1422,7 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                 let physical_effects =
                     std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let mut event_loop =
-                    crate::cli::repl_event::EventLoop::new_named_brain_test_runner(
+                    crate::cli::EventLoop::new_named_brain_test_runner(
                         generator,
                         definitions,
                         executor,
@@ -1516,7 +1516,7 @@ async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publica
                     conversation.read().await.get_messages(),
                 )
                 .unwrap();
-                event_tx.send(crate::cli::repl_event::ReplEvent::Shutdown).unwrap();
+                event_tx.send(crate::cli::ReplEvent::Shutdown).unwrap();
                 tokio::time::timeout(std::time::Duration::from_secs(2), event_driver)
                     .await
                     .expect("runner EventLoop disconnect exceeded the teardown bound")

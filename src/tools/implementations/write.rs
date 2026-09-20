@@ -4,6 +4,7 @@
 //   Created src/foo.rs (42 lines)
 //   Updated src/bar.rs (Added 10 lines, removed 3 lines)
 
+use crate::cli::{sanitize_terminal, FileDiff};
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use crate::tools::Tool;
 use anyhow::{Context, Result};
@@ -481,7 +482,7 @@ fn commit_reviewed_write(file_path: &str, content: &str, target: ReviewTarget) -
 }
 
 fn ensure_review_is_faithful(file_path: &str, original: &str, content: &str) -> Result<()> {
-    let shown_path = crate::cli::diff::sanitize_terminal(file_path);
+    let shown_path = sanitize_terminal(file_path);
     if shown_path != file_path {
         anyhow::bail!(
             "Cannot open a byte-faithful write review: the target path contains terminal control bytes"
@@ -531,9 +532,9 @@ where
     };
     ensure_review_is_faithful(file_path, &original, content)?;
     let file_diff = match &target {
-        ReviewTarget::Missing(_) => crate::cli::diff::FileDiff::from_created(file_path, content),
+        ReviewTarget::Missing(_) => FileDiff::from_created(file_path, content),
         ReviewTarget::Existing { original, .. } => {
-            crate::cli::diff::FileDiff::from_texts(file_path, original, content)
+            FileDiff::from_texts(file_path, original, content)
         }
     };
     let diff = file_diff.to_unified();
@@ -565,10 +566,9 @@ where
             };
             let created = matches!(&target, ReviewTarget::Missing(_));
             let result_diff = if created {
-                crate::cli::diff::FileDiff::from_created(file_path, &reconstructed).to_unified()
+                FileDiff::from_created(file_path, &reconstructed).to_unified()
             } else {
-                crate::cli::diff::FileDiff::from_texts(file_path, &original, &reconstructed)
-                    .to_unified()
+                FileDiff::from_texts(file_path, &original, &reconstructed).to_unified()
             };
             commit_reviewed_write(file_path, &reconstructed, target)?;
             if reconstructed == original {
@@ -653,7 +653,7 @@ impl Tool for WriteTool {
                 .with_context(|| format!("Failed to write file: {}", file_path))?;
             run_post_save_hook(file_path);
 
-            Ok(crate::cli::diff::FileDiff::from_created(file_path, content).to_unified())
+            Ok(FileDiff::from_created(file_path, content).to_unified())
         } else {
             // Existing file: read original, write new, show stats
             let original = fs::read_to_string(file_path)
@@ -663,7 +663,7 @@ impl Tool for WriteTool {
                 .with_context(|| format!("Failed to write file: {}", file_path))?;
             run_post_save_hook(file_path);
 
-            Ok(crate::cli::diff::FileDiff::from_texts(file_path, &original, content).to_unified())
+            Ok(FileDiff::from_texts(file_path, &original, content).to_unified())
         }
     }
 }
@@ -857,7 +857,7 @@ mod tests {
             skip_interactive_review: false,
         };
         let result = tool.execute(input, &context).await.unwrap();
-        let diff = crate::cli::diff::FileDiff::parse(&result).unwrap();
+        let diff = FileDiff::parse(&result).unwrap();
         assert_eq!(diff.display_path(), path);
         assert_eq!(diff.old_path, "/dev/null");
         assert!(diff.is_created());

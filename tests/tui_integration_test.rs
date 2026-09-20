@@ -76,8 +76,7 @@ fn test_non_interactive_mode() {
 /// Uses the WorkUnit API (the live rendering path) — no terminal needed.
 #[test]
 fn test_tool_display_uses_correct_unicode() {
-    use finch::cli::messages::{Message, WorkUnit};
-    use finch::cli::repl_event::tool_display::format_tool_label;
+    use finch::cli::{format_tool_label, Message, WorkUnit};
     use finch::config::ColorScheme;
 
     let label = format_tool_label("bash", &serde_json::json!({"command": "echo hi"}));
@@ -121,7 +120,7 @@ fn test_tool_display_uses_correct_unicode() {
 /// test confirming the public export is stable.
 #[test]
 fn test_format_token_count_public_api() {
-    use finch::cli::repl_event::tool_display::format_token_count;
+    use finch::cli::format_token_count;
 
     // Below 1000 → plain decimal
     assert_eq!(format_token_count(0), "0");
@@ -139,7 +138,7 @@ fn test_format_token_count_public_api() {
 /// The status-bar "↑ input" format is correctly assembled from format_token_count.
 #[test]
 fn test_input_token_status_bar_format() {
-    use finch::cli::repl_event::tool_display::format_token_count;
+    use finch::cli::format_token_count;
 
     let input_tokens: u32 = 1250;
     let output_tokens: usize = 300;

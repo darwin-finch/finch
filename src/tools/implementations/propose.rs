@@ -10,8 +10,9 @@
 // The user can read the comment to understand intent and edit the code before
 // approving.  Clearing the file aborts execution.
 
-use crate::cli::diff::{
-    FileDiff, MAX_DIFF_HUNKS, MAX_DIFF_INPUT_BYTES, MAX_DIFF_LINES, MAX_DIFF_LINE_CHARS,
+use crate::cli::{
+    sanitize_multiline, sanitize_terminal, FileDiff, MAX_DIFF_HUNKS, MAX_DIFF_INPUT_BYTES,
+    MAX_DIFF_LINES, MAX_DIFF_LINE_CHARS,
 };
 use anyhow::Result;
 use crossterm::{cursor, event, execute, style::ResetColor, terminal};
@@ -193,7 +194,7 @@ pub fn proposal_chat_context(returned: &str, expected: &str) -> String {
     if prose.is_empty() {
         return "(no explanation given)".to_string();
     }
-    crate::cli::diff::sanitize_multiline(&prose.join("\n"))
+    sanitize_multiline(&prose.join("\n"))
 }
 
 /// Reject a bounded terminal diff whose rendered hunks do not faithfully
@@ -517,7 +518,7 @@ fn parse_reviewed_patch(operation: &str, path: &str, saved_diff: &str) -> Result
                 path,
                 &format!(
                     "the saved review diff has a malformed hunk line ({})",
-                    crate::cli::diff::sanitize_terminal(line)
+                    sanitize_terminal(line)
                 ),
             ));
         };
@@ -546,7 +547,7 @@ fn parse_reviewed_patch(operation: &str, path: &str, saved_diff: &str) -> Result
                 path,
                 &format!(
                     "the saved review diff has a malformed hunk line ({})",
-                    crate::cli::diff::sanitize_terminal(line)
+                    sanitize_terminal(line)
                 ),
             ));
         };
@@ -1404,7 +1405,7 @@ fn build_artifact(description: &str, code: &str, comment_prefix: &str, executabl
     };
     append_proposal_header(&mut out, comment_prefix);
     for line in description.lines() {
-        let clean = crate::cli::diff::sanitize_terminal(line);
+        let clean = sanitize_terminal(line);
         let candidate = format!("{comment_prefix} {clean}");
         out.push_str(comment_prefix);
         out.push(' ');
