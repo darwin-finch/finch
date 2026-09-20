@@ -10,12 +10,13 @@ on:
       - '.github/workflows/issue-56-brain-isolation.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'build.rs'
-      - 'schema/**'
+      - 'crates/finch-ipc/Cargo.toml'
+      - 'crates/finch-ipc/build.rs'
+      - 'crates/finch-ipc/schema/**'
       - 'src/bin/finch-test-supervisor.rs'
       - 'src/brain/**'
       - 'src/daemon/**'
-      - 'src/ipc/**'
+      - 'crates/finch-ipc/src/**'
       - 'src/node/**'
       - 'src/server/**'
       - 'src/client/daemon_client.rs'
@@ -34,12 +35,13 @@ on:
       - '.github/workflows/issue-56-brain-isolation.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'build.rs'
-      - 'schema/**'
+      - 'crates/finch-ipc/Cargo.toml'
+      - 'crates/finch-ipc/build.rs'
+      - 'crates/finch-ipc/schema/**'
       - 'src/bin/finch-test-supervisor.rs'
       - 'src/brain/**'
       - 'src/daemon/**'
-      - 'src/ipc/**'
+      - 'crates/finch-ipc/src/**'
       - 'src/node/**'
       - 'src/server/**'
       - 'src/client/daemon_client.rs'
@@ -107,7 +109,7 @@ jobs:
         path: |
           target/debug/finch-test-supervisor
           target/debug/finch-test-supervisor-pinned
-        key: isolation-supervisor-${{ runner.os }}-${{ runner.arch }}-rust-1.98.0-${{ hashFiles('src/bin/finch-test-supervisor.rs', 'src/brain/mod.rs', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs') }}
+        key: isolation-supervisor-${{ runner.os }}-${{ runner.arch }}-rust-1.98.0-${{ hashFiles('src/bin/finch-test-supervisor.rs', 'src/brain/mod.rs', 'Cargo.lock', 'rust-toolchain.toml', 'crates/finch-ipc/build.rs', 'crates/finch-ipc/schema/**') }}
 
     - name: Build isolation supervisor
       timeout-minutes: 40
@@ -220,7 +222,7 @@ jobs:
         path: |
           target/debug/finch-test-supervisor
           target/debug/finch-test-supervisor-pinned
-        key: isolation-supervisor-${{ runner.os }}-${{ runner.arch }}-rust-1.98.0-${{ hashFiles('src/bin/finch-test-supervisor.rs', 'src/brain/mod.rs', 'Cargo.lock', 'rust-toolchain.toml', 'build.rs') }}
+        key: isolation-supervisor-${{ runner.os }}-${{ runner.arch }}-rust-1.98.0-${{ hashFiles('src/bin/finch-test-supervisor.rs', 'src/brain/mod.rs', 'Cargo.lock', 'rust-toolchain.toml', 'crates/finch-ipc/build.rs', 'crates/finch-ipc/schema/**') }}
 
     - name: Build isolation supervisor
       timeout-minutes: 40

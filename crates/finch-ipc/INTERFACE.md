@@ -1,8 +1,8 @@
-# ipc — public interface
+# finch-ipc — public interface
 
-Generated from [`src/ipc/mod.rs`](mod.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
+Generated from [`crates/finch-ipc/src/lib.rs`](src/lib.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
 
-- **Facade:** `src/ipc/mod.rs`
+- **Facade:** `crates/finch-ipc/src/lib.rs`
 - **Capsule:** [`AGENTS.md`](AGENTS.md)
 
 Everything below is what callers outside this module can reach. Implementation modules are private; their contents are deliberately absent.
@@ -63,6 +63,5 @@ pub const IPC_PROTOCOL_VERSION: u32 = 10;
 ## Modules
 
 ```rust
-/// Re-exported from `lib`.
 pub mod finch_ipc_capnp { … }
 ```

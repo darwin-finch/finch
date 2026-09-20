@@ -85,8 +85,10 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
     # covers them on every PR.
     "issue-56-brain-isolation.yml": (
         ".github/workflows/issue-56-brain-isolation.yml", "Cargo.toml", "Cargo.lock",
-        "build.rs", "schema/**", "src/bin/finch-test-supervisor.rs", "src/brain/**",
-        "src/daemon/**", "src/ipc/**", "src/node/**", "src/server/**",
+        "crates/finch-ipc/Cargo.toml", "crates/finch-ipc/build.rs",
+        "crates/finch-ipc/schema/**",
+        "src/bin/finch-test-supervisor.rs", "src/brain/**",
+        "src/daemon/**", "crates/finch-ipc/src/**", "src/node/**", "src/server/**",
         "src/client/daemon_client.rs", "src/cli/repl_event/brain_handler.rs",
         "scripts/test_brains.sh", "scripts/test_brain_isolation.sh",
         "scripts/with-cargo-slot", "scripts/test-with-cargo-slot",
@@ -260,7 +262,8 @@ SUPERVISOR_IMAGE_CACHE_NAME = "Restore pinned isolation supervisor"
 SUPERVISOR_IMAGE_CACHE_KEY = (
     "isolation-supervisor-${{ runner.os }}-${{ runner.arch }}-rust-1.98.0-"
     "${{ hashFiles('src/bin/finch-test-supervisor.rs', 'src/brain/mod.rs', "
-    "'Cargo.lock', 'rust-toolchain.toml', 'build.rs') }}"
+    "'Cargo.lock', 'rust-toolchain.toml', 'crates/finch-ipc/build.rs', "
+    "'crates/finch-ipc/schema/**') }}"
 )
 GRAPH_HASH = "${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}"
 MATRIX_CACHE_KEY = (

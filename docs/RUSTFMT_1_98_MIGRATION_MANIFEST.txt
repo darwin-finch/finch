@@ -11,10 +11,10 @@ src/cli/setup_wizard.rs
 src/config/colors.rs
 src/config/persona.rs
 src/daemon/upgrade.rs
-src/ipc/brain_codec.rs
+src/brain/ipc_codec.rs
 src/client/ipc.rs
 src/server/ipc.rs
-src/ipc/transport.rs
+crates/finch-ipc/src/transport.rs
 src/lib.rs
 src/lisp/reader.rs
 src/lisp/types.rs

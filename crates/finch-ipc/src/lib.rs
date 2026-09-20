@@ -1,10 +1,23 @@
 //! Domain-neutral Cap'n Proto transport primitives shared by Finch clients and servers.
 
+// Cap'n Proto generated code must live at the crate root so that the
+// self-references emitted by capnpc (`crate::finch_ipc_capnp::…`) resolve.
+#[allow(
+    clippy::all,
+    dead_code,
+    unused_imports,
+    unused_parens,
+    non_camel_case_types,
+    non_snake_case
+)]
+pub mod finch_ipc_capnp {
+    include!(concat!(env!("OUT_DIR"), "/finch_ipc_capnp.rs"));
+}
+
 mod events;
 mod transport;
 mod value_codec;
 
-pub use crate::finch_ipc_capnp;
 pub use events::{EventBus, QueuedEvent};
 pub use transport::{sock_path, DAEMON_SOCK_PATH};
 pub use value_codec::{decode_json_value, encode_json_value};
