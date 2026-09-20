@@ -1667,6 +1667,7 @@ dependencies = [
  "finch-ipc",
  "finch-language",
  "finch-memory",
+ "finch-node",
  "finch-programs",
  "finch-providers",
  "finch-runtime",
@@ -1800,6 +1801,28 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "finch-node"
+version = "0.7.31"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs 5.0.1",
+ "ed25519-dalek",
+ "fs2",
+ "hostname",
+ "nix 0.29.0",
+ "rand 0.8.8",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
  "tracing",
  "uuid",
 ]

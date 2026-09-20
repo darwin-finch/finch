@@ -175,8 +175,6 @@ pub async fn handle_node_stats() -> Result<Json<serde_json::Value>, AppError> {
 pub async fn handle_node_stats_from_state_directory(
     state: crate::node::IsolatedNodeTestState,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::node::WorkTracker;
-
-    let stats = WorkTracker::load_persisted_from_state_directory(state.descriptor())?;
+    let stats = state.load_work_stats()?;
     Ok(Json(serde_json::to_value(&stats)?))
 }

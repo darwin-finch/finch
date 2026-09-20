@@ -21,6 +21,7 @@ members = [
     "crates/finch-ipc",
     "crates/finch-language",
     "crates/finch-memory",
+    "crates/finch-node",
     "crates/finch-programs",
     "crates/finch-providers",
     "crates/finch-runtime",
@@ -36,6 +37,7 @@ default-members = [
     "crates/finch-ipc",
     "crates/finch-language",
     "crates/finch-memory",
+    "crates/finch-node",
     "crates/finch-programs",
     "crates/finch-providers",
     "crates/finch-runtime",
@@ -50,6 +52,7 @@ finch-ipc = { path = "crates/finch-ipc" }
 finch-tools-api = { path = "crates/finch-tools-api" }
 finch-language = { path = "crates/finch-language" }
 finch-memory = { path = "crates/finch-memory" }
+finch-node = { path = "crates/finch-node" }
 finch-programs = { path = "crates/finch-programs" }
 finch-providers = { path = "crates/finch-providers" }
 finch-runtime = { path = "crates/finch-runtime" }
@@ -212,6 +215,9 @@ tempfile = "3.8"
 # Enables finch-runtime's cross-crate test seams only for finch's own test
 # builds; resolver = "2" keeps this feature out of production artifacts.
 finch-runtime = { path = "crates/finch-runtime", features = ["test-support"] }
+# Enables the certificate-validity constructor only in Finch's dependent test
+# build; production artifacts keep finch-node's test seam disabled.
+finch-node = { path = "crates/finch-node", features = ["test-support"] }
 # tower moved to [dependencies] (#223): ServiceBuilder is now used in production
 # for the request-id/trace layer stack, and ServiceExt::oneshot() for tests
 # comes along with it as a regular dependency.

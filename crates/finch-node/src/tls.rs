@@ -21,8 +21,9 @@ impl NodeTlsIdentity {
         Self::from_signing_identity_with_params(identity, hostname, None)
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_signing_identity_with_validity(
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_signing_identity_with_validity(
         identity: &NodeSigningIdentity,
         hostname: &str,
         not_before: (i32, u8, u8),
