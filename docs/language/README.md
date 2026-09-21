@@ -25,8 +25,8 @@ Documentation follows the same semantic waist as the workspace:
 
 Create those crate-local documents when their subject has an implemented contract large enough to
 need more than the crate's `AGENTS.md`; do not copy planned semantics into them prematurely. The
-crate capsules remain the fastest authoritative map of current ownership, and generated
-`INTERFACE.md` files remain the exact public Rust surfaces.
+crate READMEs and capsules remain the fastest map of current ownership; each crate's
+`src/lib.rs` facade is its exact callable Rust surface, with method signatures in rustdoc.
 
 The long-term documentation split should remain coarse: one shared language specification, one
 syntax reference per frontend, one IR/verifier reference, and one execution reference. Avoid a file

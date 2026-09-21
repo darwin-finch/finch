@@ -32,13 +32,13 @@ Constitutional constraints apply to **both** roles: `rm -rf`, `sudo`, `dd if=`, 
 `is_readonly_bash()` approves commands that: (1) start with a known safe prefix AND (2) contain no shell operators (`;`, `|`, `>`, `<`, `&`). Operator presence always returns false.
 
 The public surface is the facade in [`mod.rs`](mod.rs); callers outside this directory use
-`crate::tools::Item`. See the capsule [`AGENTS.md`](AGENTS.md) and generated
-[`INTERFACE.md`](INTERFACE.md).
+`crate::tools::Item`. The [README](README.md) explains the execution boundary and
+[AGENTS.md](AGENTS.md) states its authority rules. Rustdoc supplies callable signatures.
 
 ## Key files
 
 - `src/tools/mod.rs` — private children and the `pub use` list
-- `src/tools/tool_loop.rs` — event-loop-owned `ToolLoop` protocol (REPL + scheduler)
-- `src/tools/executor.rs` — `ToolExecutor`, host execution after ToolLoop admits a call
+- `crates/finch-tools-api/src/tool_loop.rs` — shared `ToolLoop` admission protocol (REPL + scheduler)
+- `src/tools/executor.rs` — `ToolExecutor`, host execution after REPL/scheduler admission or from the legacy direct headless caller
 - `src/tools/implementations/` — Individual tool implementations
-- `src/tools/permissions.rs` — `PermissionManager`, `ExecutorRole`, `is_readonly_bash()`
+- `crates/finch-tools-api/src/permissions.rs` — `PermissionManager`, `ExecutorRole`, `is_readonly_bash()`; `src/tools/permissions.rs` is a compatibility re-export

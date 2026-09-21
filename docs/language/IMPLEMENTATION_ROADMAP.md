@@ -212,7 +212,7 @@ fallback, not a language fork.
 A coordinator can delegate one ready language issue with only:
 
 - this roadmap and the relevant section of `FINCH_LANGUAGE_DESIGN.md`;
-- the `AGENTS.md` and `INTERFACE.md` for the affected language crates;
+- the `README.md`, `AGENTS.md`, and `src/lib.rs` facade for the affected language crates;
 - the issue contract, base revision, precise files, predecessor/removal trigger, and focused gates;
 - paired source fixtures and the smallest affected boundary tests.
 
