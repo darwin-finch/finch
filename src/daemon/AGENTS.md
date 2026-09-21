@@ -3,21 +3,25 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 `src/daemon` owns process lifecycle, auto-spawn, the bounded rotating log, and upgrade
-preflight for the background Finch server. Brain owns this directory; it is not a
-separate layer. Its public contract is the facade in `mod.rs`; callers must not name
-child modules.
+preflight for the background Finch server. It is root application composition, not part
+of the `finch-brain` crate. Its public contract is the facade in [`mod.rs`](mod.rs);
+callers must not name child modules.
 
 ## Boundary
 
-- Callers outside this directory use `crate::daemon::Item`. The one production incoming
-  edge is `client` (`ensure_daemon_running`); `main` composes lifecycle, spawn, and log
-  at the daemon process boundary.
+- The [README](README.md) traces the daemon process and client auto-spawn workflows.
+  Callers outside this directory use `crate::daemon::Item` or `finch::daemon::Item`.
 - `lifecycle.rs`, `log.rs`, `spawn.rs`, and `upgrade.rs` are private implementation
-  modules. Add public surface by re-exporting it from `mod.rs`, then regenerate
-  `INTERFACE.md`.
+  modules. Add public surface with a demonstrated caller and a flat re-export in `mod.rs`;
+  do not regenerate a signature catalog.
 - Must not own Brain storage, HTTP routes, IPC protocol, or model loading.
 - Do not change spawn, lifecycle, log-rotation, or upgrade-preflight behavior in a
-  facade commit. Do not extract `finch-daemon`.
+  facade commit. This application-bound module is not a mechanical `finch-daemon` crate cut.
+
+**Dependencies and direction:** `spawn` uses config, startup, IPC compatibility, and the
+Brain test-isolation authority; `upgrade` composes client, server, and Brain proof paths.
+Those application edges are why this module stays at the root. Lower-level Brain and IPC
+crates must not import daemon lifecycle or log policy.
 
 ## Invariants
 
@@ -32,11 +36,11 @@ child modules.
 
 ## Focused tests
 
-Run through the repository supervisor with a worktree-specific absolute Cargo target directory:
+Run through the repository supervisor:
 
 ```bash
 ./scripts/test_brains.sh cargo test --lib daemon::
 ```
 
-Use the smallest matching filter first. Regenerate the facade digest with
-`python3 scripts/generate_interfaces.py --write` whenever the public surface changes.
+Use the smallest matching filter first. Run `python3 scripts/check_docs.py` and
+`python3 scripts/check_facade_boundaries.py` after capsule or facade changes.
