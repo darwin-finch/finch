@@ -326,7 +326,7 @@ fn test_tui_production_does_not_name_finch_poset() {
     let hits = production_hits("crate::poset");
     assert!(
         hits.is_empty(),
-        "tui production must not name Finch Poset; the active overlay paints the injected \
-         corner text and generic graph helpers consume GraphView: {hits:?}"
+        "tui production must not name Finch Poset; the active overlay paints only the injected \
+         corner text: {hits:?}"
     );
 }
