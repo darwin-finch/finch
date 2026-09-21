@@ -48,7 +48,6 @@ mod dialog;
 mod dialog_widget;
 #[cfg(test)]
 mod isolation;
-mod markdown;
 mod mouse_capture;
 mod scroll_view;
 mod shadow_buffer; // kept – good architecture for future diffing

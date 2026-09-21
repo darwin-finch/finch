@@ -8,16 +8,18 @@ one AI generation turn with tool rows, program source/output presentations, and 
 lifecycle rows. Everything here is **domain data**: a WorkUnit is one run, never a widget kind.
 
 **No presentation surface lives here.** Since #805 the old `TranscriptRow` projection tree is
-gone; disclosure (`default_expanded`), row roles, and open/closed state belong to the renderer's
-ViewModel (`src/cli/tui/view_model.rs`), which is the one domain → widget conversion.
+gone. WorkUnit snapshot types and the pure snapshot → `TranscriptNode` conversion live in
+`finch-ui-model`; this module constructs and re-exports the snapshots for source compatibility.
+Disclosure state remains renderer-owned and keyed by the projected stable row identities.
 
 **What the renderer reads.** Two domain snapshots (plain data, safe to expose):
 
 - `Message::work_unit_head() -> Option<WorkUnitHead>` — presentation class, status, body text;
   for classify/filter consumers (live-message replacement).
 - `Message::work_unit_view(colors) -> Option<WorkUnitView>` — the full blit-time snapshot:
-  rows with labels, statuses, bodies, and diffs pre-rendered to display lines. The renderer's
-  ViewModel projects it into widget props once per frame.
+  rows with labels, statuses, bodies, and diffs pre-rendered to display lines.
+  `finch_ui_model::project_work_unit` projects it into widget props once per frame; the root
+  TUI adapter supplies the message trait and colour scheme.
 
 Both default to `None` on the trait; only WorkUnit overrides them. Disclosure persistence is not
 a message concern: the renderer's open set is keyed by stable row identity (message id +
@@ -40,8 +42,8 @@ disclosure maps.
 **Stable identity.** `MessageId` is a UUID; row paths are append-only semantic ancestry
 (unit, call index, input/output). Never reuse or reorder a path segment.
 
-**Testing.** Projection-shape tests (labels, glyphs, disclosure defaults) live in
-`work_unit.rs`'s test module and drive the ViewModel projector
-(`crate::cli::tui::view_model::try_project_for_test`) so the coverage stays on the real
-conversion path. Focused tests:
-`./scripts/test_brains.sh cargo test --lib -- cli::messages::`.
+**Testing.** Message lifecycle and snapshot-construction tests live with `work_unit.rs`.
+Projection-shape and markdown tests live with `finch-ui-model`; root integration tests exercise
+the thin `Message`/`ColorScheme` adapter. Focused tests:
+`./scripts/test_brains.sh cargo test --lib -- cli::messages::` and
+`./scripts/test_brains.sh cargo test -p finch-ui-model`.

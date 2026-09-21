@@ -60,10 +60,11 @@ for open/closed (message, accordion map, renderer), chrome invented by data obje
 double bullet, #232's completions-in-input), and every consumer rebuilt hit regions from
 wrapped lines.
 
-**Centralized projection (805–812, current).** One `project_work_unit` converts domain
-snapshots to widget props; the renderer owns all UI state in maps keyed by `RowId`. Layout,
-hitboxes, and paint are correct and tested. But component rendering must be implemented in
-the central files — adding a surface means touching `view_model.rs` — and central rules can
+**Centralized projection (805–812).** One `project_work_unit` converts domain snapshots to
+widget props; it now lives in the terminal-independent `finch-ui-model` capsule while the
+renderer owns all UI state in maps keyed by `RowId`. Layout, hitboxes, and paint are correct and
+tested. But component rendering was implemented in the central projection — adding a surface
+meant changing that shared function — and central rules can
 drop information the component owns: the say-turn rule ("assistant-prose output suppresses
 Program source rows") deleted the source and left a dead disclosure arrow. Exhibit A.
 

@@ -202,7 +202,7 @@ impl MemTreeConsole {
 pub struct MessageId(Uuid);
 /// Type alias for a shared message reference Re-exported from `cli::messages`.
 pub type MessageRef = Arc<dyn Message>;
-/// Status of a message Re-exported from `cli::messages`.
+/// Status of a retained application message. Re-exported from `finch-ui-model`.
 pub enum MessageStatus { InProgress, Complete, Failed }
 /// Visitor to extract the log message from tracing events.
 pub(crate) struct MessageVisitor { … }

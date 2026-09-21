@@ -55,8 +55,9 @@ pub fn random_spinner_verb() -> &'static str {
 }
 
 use super::{
-    Message, MessageId, MessageStatus, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView,
-    WorkUnitViewModel,
+    AgentActivityView, AgentToolView, Message, MessageId, MessageStatus, OutputVm, ProgramSourceVm,
+    SayTurnStatus, SayTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead,
+    WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };
 use crate::cli::diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 use crate::config::{ColorScheme, MessageBand};
@@ -109,51 +110,6 @@ impl ComponentAction {
 // ============================================================================
 // WorkRowStatus / WorkRow
 // ============================================================================
-
-/// Status of an individual tool-call sub-row within a WorkUnit
-#[derive(Clone, Debug)]
-pub enum WorkRowStatus {
-    /// Tool is currently running
-    Running,
-    /// Tool completed with an optional compact one-line summary
-    Complete(String),
-    /// Tool failed with an error description
-    Error(String),
-}
-
-/// Whether a run row presents as a model tool call or as internal lifecycle
-/// activity. Domain classification the ViewModel reads at projection time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkRowPresentation {
-    Tool,
-    Activity,
-}
-
-/// How a completed unit is projected into the transcript.
-///
-/// Most units are ordinary assistant turns and retain the familiar `⏺` marker.
-/// VM wire source and its emitted output are separate artifacts: source is
-/// explicitly labelled and output is rendered as plain content so neither is
-/// mistaken for a second assistant turn.
-#[derive(Clone, Debug, Default)]
-pub enum WorkUnitPresentation {
-    #[default]
-    Assistant,
-    /// Internal lifecycle activity that must not be presented as model tool
-    /// calls (for example, a named Brain run's status/result projection).
-    Activity {
-        title: String,
-    },
-    ProgramSource {
-        language: String,
-    },
-    /// Plain `say` output has no title or conversational chrome. Explicit
-    /// VM output handles retain their title while independently tracking a
-    /// body, transient status, and progress.
-    ProgramOutput {
-        title: Option<String>,
-    },
-}
 
 /// A single tool-call sub-item rendered below the WorkUnit header
 #[derive(Clone, Debug)]
@@ -1159,100 +1115,6 @@ impl Message for WorkUnit {
     }
 }
 
-// ============================================================================
-// Domain snapshots for the blit-time projection (#805)
-// ============================================================================
-//
-// A WorkUnit is domain data — one run, its tool rows, its program — never a
-// widget kind. These snapshots expose that data plainly; the renderer's
-// ViewModel (`cli::tui::view_model`) is the one place that converts it into
-// widget props, once per frame.
-
-/// Lightweight domain snapshot for consumers that classify or filter WorkUnit
-/// messages without projecting their full presentation.
-#[derive(Clone, Debug)]
-pub struct WorkUnitHead {
-    pub message_id: MessageId,
-    pub status: MessageStatus,
-    pub presentation: WorkUnitPresentation,
-    /// True when this untitled successful `say` output projects as assistant
-    /// prose rather than `Program output` chrome.
-    pub projects_as_prose: bool,
-    pub response_text: String,
-    pub transient_status: Option<String>,
-    pub progress: Option<(u64, Option<u64>)>,
-}
-
-impl WorkUnitHead {
-    /// The unit's visible output body: response text plus transient status and
-    /// progress lines an output handle appends.
-    pub fn output_body_lines(&self) -> Vec<String> {
-        let mut body = self
-            .response_text
-            .lines()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if let Some(status) = &self.transient_status {
-            body.push(status.clone());
-        }
-        if let Some((completed, total)) = self.progress {
-            body.push(format_progress(completed, total));
-        }
-        body
-    }
-}
-
-/// One tool or activity row of a [`WorkUnitView`], with diffs already rendered
-/// to display lines.
-#[derive(Clone, Debug)]
-pub struct WorkRowView {
-    pub label: String,
-    pub status: WorkRowStatus,
-    pub presentation: WorkRowPresentation,
-    pub body_lines: Vec<String>,
-    pub rendered_diffs: Option<Vec<String>>,
-}
-
-impl WorkRowView {
-    /// True when the row carries any inspectable output.
-    pub fn has_output(&self) -> bool {
-        !self.body_lines.is_empty()
-            || self
-                .rendered_diffs
-                .as_ref()
-                .is_some_and(|diffs| !diffs.is_empty())
-    }
-}
-
-/// One child-agent lifecycle row of a [`WorkUnitView`].
-#[derive(Clone, Debug)]
-pub struct AgentActivityView {
-    pub owner_row: Option<usize>,
-    pub agent_id: uuid::Uuid,
-    pub parent_agent_id: Option<uuid::Uuid>,
-    pub label: String,
-    pub status: WorkRowStatus,
-    pub body_lines: Vec<String>,
-    pub tools: Vec<AgentToolView>,
-}
-
-/// One tool run inside an agent lifecycle row.
-#[derive(Clone, Debug)]
-pub struct AgentToolView {
-    pub name: String,
-    pub status: WorkRowStatus,
-}
-
-/// Full blit-time domain snapshot of one WorkUnit run.
-#[derive(Clone, Debug)]
-pub struct WorkUnitView {
-    pub head: WorkUnitHead,
-    /// Verb shown in the animated header ("Channeling", "Building", …).
-    pub verb: String,
-    pub rows: Vec<WorkRowView>,
-    pub agent_activity: Vec<AgentActivityView>,
-}
-
 impl WorkUnit {
     /// The lightweight domain snapshot (see [`WorkUnitHead`]).
     pub fn domain_head(&self) -> WorkUnitHead {
@@ -1451,15 +1313,6 @@ fn append_agent_activity_row_text(
     {
         append_agent_activity_row_text(out, inner, owner_row, child_index, depth + 1);
     }
-}
-
-pub(crate) fn compact_summary_text(text: &str, max_chars: usize) -> String {
-    let first_line = text.lines().next().unwrap_or_default().trim();
-    let mut compact = first_line.chars().take(max_chars).collect::<String>();
-    if first_line.chars().count() > max_chars {
-        compact.push('…');
-    }
-    compact
 }
 
 fn format_work_unit_header(inner: &WorkUnitInner) -> String {
