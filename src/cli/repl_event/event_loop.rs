@@ -1986,7 +1986,7 @@ impl EventLoop {
         // directly and must not install a competing terminal reader.
         #[cfg(not(test))]
         let input_rx = {
-            let rx = spawn_input_task(Arc::clone(&tui_renderer), quit_tx);
+            let rx = spawn_input_task(Arc::clone(&tui_renderer), quit_tx, crate::is_editor_active);
             // Keys are buffered from here, but nothing acts on them until the
             // select loop below. The two instants are recorded separately
             // because they are routinely confused (#364).
@@ -2280,6 +2280,8 @@ impl EventLoop {
             tui.set_session_label(self.session_label.clone());
         }
         self.output_manager.write_info(TuiRenderer::startup_header(
+            env!("CARGO_PKG_VERSION"),
+            crate::ABOUT,
             &model_name,
             &cwd,
             &self.session_label,
