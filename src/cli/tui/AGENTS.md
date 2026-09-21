@@ -219,7 +219,9 @@ module of this crate, **or** the remaining ones are written down here with the r
   answer annotations stay in `cli::llm_dialogs`; the renderer sees only `QuestionView`.
   Command-completion metadata is owned
   directly by this capsule in `command_autocomplete.rs`; its types and `AutocompleteState` remain crate-visible only, not
-  facade exports. The unused contextual-suggestion subsystem was removed.
+  facade exports. The unused contextual-suggestion subsystem was removed. `shadow_buffer.rs`
+  has no production message dependency; its band-style tests drive `write_line` with a user-message
+  style, and the uncalled `render_messages` path was deleted.
 - **`crate::ABOUT`** — startup header copy.
 - **`crate::is_editor_active` and `crate::finch_ipc_capnp` in `async_input.rs`** — the input task
   must not steal keys while `$EDITOR` is in the foreground, and it talks to the local control
