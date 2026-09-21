@@ -97,7 +97,7 @@ fn dialog_owns_key(has_dialog: bool, key: &KeyEvent, input: &str) -> bool {
 pub fn encode_quit_message() -> Vec<u8> {
     let mut message = capnp::message::Builder::new_default();
     {
-        let mut ctrl = message.init_root::<crate::finch_ipc_capnp::control_message::Builder>();
+        let mut ctrl = message.init_root::<finch_ipc::finch_ipc_capnp::control_message::Builder>();
         ctrl.set_quit(());
     }
     let mut bytes = Vec::new();
@@ -118,9 +118,12 @@ pub fn encode_quit_message() -> Vec<u8> {
 ///
 /// `quit_tx`: binary channel for out-of-band `/quit` signals (Cap'n Proto ControlMessage).
 /// The quit watcher task (spawned separately) reads this channel and exits the process.
+/// `editor_active`: application-owned terminal ownership query; the input task
+/// must not poll or render while an external editor owns the terminal.
 pub fn spawn_input_task(
     tui_renderer: Arc<Mutex<TuiRenderer>>,
     quit_tx: mpsc::UnboundedSender<Vec<u8>>,
+    editor_active: fn() -> bool,
 ) -> mpsc::UnboundedReceiver<InputEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -136,7 +139,7 @@ pub fn spawn_input_task(
             // While an external editor owns the terminal, suspend all crossterm
             // event polling.  Consuming events here would steal keystrokes from
             // the editor process and cause visible flickering / input loss.
-            if crate::is_editor_active() {
+            if editor_active() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -505,7 +508,7 @@ pub fn spawn_input_task(
                         tui.update_ghost_text();
                     }
 
-                    if (had_input || needs_render) && !crate::is_editor_active() {
+                    if (had_input || needs_render) && !editor_active() {
                         if let Err(e) = tui.render() {
                             tracing::error!("Async input render failed: {}", e);
                             tui.needs_full_refresh = true;
@@ -579,6 +582,22 @@ pub fn spawn_input_task(
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn quit_message_uses_the_ipc_control_wire() {
+        let encoded = encode_quit_message();
+        let mut cursor = encoded.as_slice();
+        let message =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::default())
+                .expect("quit control message must decode");
+        let control = message
+            .get_root::<finch_ipc::finch_ipc_capnp::control_message::Reader>()
+            .expect("quit control root must decode");
+        assert!(matches!(
+            control.which().expect("quit control variant must decode"),
+            finch_ipc::finch_ipc_capnp::control_message::Which::Quit(_)
+        ));
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

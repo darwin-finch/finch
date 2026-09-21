@@ -21,6 +21,9 @@ that port. Keep status ordering and status-line policy in the application; do no
 `TuiOutputPort` is the stateful conversation-output seam: CLI `OutputManager` implements it,
 retains message identity, controls stdout, and accepts settled dialog records. Production TUI
 code must not import `OutputManager`; blit and canonical commit read its message snapshots.
+The event loop supplies package-version/tagline text for the startup header and a function
+that reports whether an external editor owns the terminal. The input task must consult that
+query before polling and before rendering; quit control messages use `finch-ipc` directly.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::tui::`.
 
@@ -214,7 +217,7 @@ so #1002 deleted them. `draw_poset_overlay` continues to paint the user-defined 
 Acceptance for #623 (terminal framework standing alone) is: no production reference to any other
 module of this crate, **or** the remaining ones are written down here with the reason.
 
-**Finch modules this directory still names in production, and why they stay:**
+**Lower crates this directory names in production, and why they stay:**
 
 - **`finch_theme::ColorScheme`** — shared colour vocabulary from the extracted leaf crate,
   re-exported so existing callers can still write `crate::cli::tui::ColorScheme`.
@@ -228,10 +231,9 @@ module of this crate, **or** the remaining ones are written down here with the r
   facade exports. The unused contextual-suggestion subsystem was removed. `shadow_buffer.rs`
   has no production message dependency; its band-style tests drive `write_line` with a user-message
   style, and the uncalled `render_messages` path was deleted.
-- **`crate::ABOUT`** — startup header copy.
-- **`crate::is_editor_active` and `crate::finch_ipc_capnp` in `async_input.rs`** — the input task
-  must not steal keys while `$EDITOR` is in the foreground, and it talks to the local control
-  socket. That is process glue, not a widget.
+- **`finch_ipc::finch_ipc_capnp`** — encodes the quit control message consumed by the
+  application-owned watcher. The TUI does not own the socket or the quit policy; it receives
+  the sender and an editor-activity query from its caller.
 
 **Not production, documented so a grep is not a surprise:**
 

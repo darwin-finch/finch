@@ -2572,13 +2572,18 @@ impl TuiRenderer {
     /// This deliberately returns plain text rather than issuing crossterm
     /// commands: direct header writes can race the shadow-buffer live area and
     /// corrupt scrollback accounting on the first redraw.
-    pub fn startup_header(model: &str, cwd: &str, session_label: &str) -> String {
-        let version = env!("CARGO_PKG_VERSION");
+    pub fn startup_header(
+        version: &str,
+        about: &str,
+        model: &str,
+        cwd: &str,
+        session_label: &str,
+    ) -> String {
         // The tagline renders BELOW the mascot: interpolating it inside the
         // art split the bird between its head and body (#558).
         format!(
             "      ▄▄▄▄▄▄\n    ▗▟█●██▙►  finch v{version}\n  ▐████████▌   {model}\n  ▝▜██████▛▘   {session_label}  ·  {cwd}\n     ╥  ╥\n    ╱    ╲\n\n{}",
-            crate::ABOUT
+            about
         )
     }
 }
@@ -5774,7 +5779,13 @@ mod tests {
 
     #[test]
     fn startup_header_is_plain_scrollback_content() {
-        let header = TuiRenderer::startup_header("grok-code-fast-1", "~/repo", "amber-river");
+        let header = TuiRenderer::startup_header(
+            env!("CARGO_PKG_VERSION"),
+            crate::ABOUT,
+            "grok-code-fast-1",
+            "~/repo",
+            "amber-river",
+        );
         assert!(header.contains(&format!("finch v{}", env!("CARGO_PKG_VERSION"))));
         assert!(header.contains(crate::ABOUT));
         assert!(header.contains("grok-code-fast-1"));
@@ -5786,11 +5797,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn startup_header_uses_caller_owned_package_text() {
+        let header =
+            TuiRenderer::startup_header("test-version", "test-tagline", "model", "cwd", "session");
+        assert!(header.contains("finch vtest-version"));
+        assert!(header.ends_with("test-tagline"));
+    }
+
     /// The tagline must not split the mascot: the bird's body line comes
     /// before any tagline text (#558).
     #[test]
     fn startup_tagline_renders_below_the_mascot_not_through_it() {
-        let header = TuiRenderer::startup_header("grok-code-fast-1", "~/repo", "amber-river");
+        let header = TuiRenderer::startup_header(
+            env!("CARGO_PKG_VERSION"),
+            crate::ABOUT,
+            "grok-code-fast-1",
+            "~/repo",
+            "amber-river",
+        );
         let body_at = header
             .find("\u{2580}███████▌")
             .or_else(|| header.find("▐████████▌"));
