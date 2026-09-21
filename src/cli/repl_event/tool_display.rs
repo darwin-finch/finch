@@ -575,6 +575,7 @@ pub fn format_token_count(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::messages::{Message, WorkUnit};
 
     // ── session task-list rendering (#425) ──────────────────────────────────
 
@@ -1040,6 +1041,24 @@ mod tests {
     }
 
     // ── tool_result_to_display ───────────────────────────────────────────────
+
+    #[test]
+    fn test_edit_and_write_tool_display_payloads_survive_retained_work_unit() {
+        for tool in ["edit", "write"] {
+            let raw = finch_diff::FileDiff::from_texts("src/file.txt", "old\n", "new\nmore\n")
+                .to_unified();
+            let (summary, body) = tool_result_to_display(tool, &raw);
+            let wu = WorkUnit::new("Tools");
+            let row = wu.add_row(format!("{tool}(src/file.txt)"));
+            wu.complete_row_with_body(row, summary, body);
+            wu.set_complete();
+            let rendered = wu.format(&finch_theme::ColorScheme::default());
+            assert!(rendered.contains("src/file.txt  +2 -1"), "{rendered}");
+            assert!(rendered.contains("- old"), "{rendered}");
+            assert!(rendered.contains("+ new"), "{rendered}");
+            assert!(!rendered.contains("\x1b]"), "{rendered}");
+        }
+    }
 
     #[test]
     fn test_tool_result_edit_extracts_summary_and_diff() {
