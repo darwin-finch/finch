@@ -61,13 +61,11 @@ pub(crate) use output_layer::MessageVisitor;
 pub use output_layer::OutputManagerLayer;
 pub use output_manager::{OutputManager, VmOutputProjection};
 pub use repl::{Repl, ReplMode, ReplModeState};
-pub use repl_event::brain_selection::{
-    resolve_selection, EffectiveSelection, SelectionRequest, SelectionSource,
-};
 pub use repl_event::{format_token_count, format_tool_label, EventLoop, ReplEvent};
 pub(crate) use repl_event::{
     is_tool_allowed_in_mode, PLANNING_ALLOWED_TOOLS, PLANNING_ALLOWED_TOOL_ALIASES,
 };
+pub use repl_event::{resolve_selection, EffectiveSelection, SelectionRequest, SelectionSource};
 pub use setup_wizard::{
     show_setup_wizard, validate_command_and_apply, validate_first_run_and_apply, SetupApplyOutcome,
     SetupResult,
