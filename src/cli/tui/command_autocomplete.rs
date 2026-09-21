@@ -6,7 +6,7 @@ use std::fmt;
 
 /// Command definition with description and parameter hints
 #[derive(Debug, Clone)]
-pub struct CommandSpec {
+pub(crate) struct CommandSpec {
     /// Command name (e.g., "/clear")
     pub name: &'static str,
 
@@ -21,7 +21,7 @@ pub struct CommandSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandCategory {
+pub(crate) enum CommandCategory {
     Basic,
     Model,
     Mcp,
@@ -49,7 +49,7 @@ impl fmt::Display for CommandCategory {
 
 impl CommandSpec {
     /// Get full command syntax (name + params)
-    pub fn full_syntax(&self) -> String {
+    pub(crate) fn full_syntax(&self) -> String {
         if let Some(params) = self.params {
             format!("{} {}", self.name, params)
         } else {
@@ -59,7 +59,7 @@ impl CommandSpec {
 }
 
 /// Registry of all available commands
-pub struct CommandRegistry {
+pub(crate) struct CommandRegistry {
     commands: Vec<CommandSpec>,
 }
 

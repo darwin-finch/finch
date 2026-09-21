@@ -51,7 +51,6 @@ mod isolation;
 mod mouse_capture;
 mod scroll_view;
 mod shadow_buffer; // kept – good architecture for future diffing
-mod suggestions; // Contextual prompt suggestions (like Claude Code)
 mod tabbed_dialog;
 mod tabbed_dialog_widget; // kept for wizard helpers
 mod tool_viewport;
@@ -73,15 +72,14 @@ use tool_viewport::{
 };
 
 pub use async_input::{spawn_input_task, InputEvent};
-pub use autocomplete_widget::AutocompleteState;
+use autocomplete_widget::AutocompleteState;
 use autocomplete_widget::{completion_pane_lines, replace_command_prefix, replace_mention_prefix};
-pub use command_autocomplete::{CommandCategory, CommandRegistry, CommandSpec};
+use command_autocomplete::{CommandRegistry, CommandSpec};
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use shadow_buffer::{
     extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
 };
-pub use suggestions::{Suggestion, SuggestionContext, SuggestionManager, SuggestionSource};
 
 /// One speakable project-resource row offered by the composer mention picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1360,11 +1358,10 @@ pub struct TuiRenderer {
     pub pending_cancellation: bool,
     pub pending_dialog_result: Option<DialogResult>,
 
-    // Autocomplete / suggestions
+    // Autocomplete
     pub(crate) ghost_text: Option<String>,
-    suggestions: suggestions::SuggestionManager,
     command_registry: CommandRegistry,
-    pub autocomplete_state: AutocompleteState,
+    pub(crate) autocomplete_state: AutocompleteState,
 
     // Image paste support
     pub pending_images: Vec<(usize, String, String)>,
@@ -1457,7 +1454,6 @@ impl TuiRenderer {
             pending_cancellation: false,
             pending_dialog_result: None,
             ghost_text: None,
-            suggestions: suggestions::SuggestionManager::new(),
             command_registry: CommandRegistry::new(),
             autocomplete_state: AutocompleteState::default(),
             pending_images: Vec::new(),
@@ -1543,7 +1539,6 @@ impl TuiRenderer {
             pending_dialog_result: None,
 
             ghost_text: None,
-            suggestions: suggestions::SuggestionManager::new(),
             command_registry: CommandRegistry::new(),
             autocomplete_state: AutocompleteState::default(),
 

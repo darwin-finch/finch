@@ -3,7 +3,7 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/cli/`: command handling, the interactive REPL and event loop, terminal rendering,
-typed presentation messages, setup and provider-login flows, output routing, dialogs, suggestions,
+typed presentation messages, setup and provider-login flows, output routing and dialogs,
 and conversation projection. Nested capsules document the event loop, message model, and TUI
 details. Application startup and daemon composition remain in the root package.
 
