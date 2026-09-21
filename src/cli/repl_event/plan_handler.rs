@@ -20,7 +20,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::messages::work_unit::WorkUnit;
+use crate::cli::messages::WorkUnit;
 use crate::cli::output_manager::OutputManager;
 use crate::cli::repl::ReplMode;
 use crate::cli::repl_event::events::ReplEvent;

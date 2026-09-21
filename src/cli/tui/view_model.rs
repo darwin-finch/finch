@@ -609,7 +609,7 @@ mod tests {
         // CONTROL (#756): markdown rendering is assistant prose only. A user
         // query (the Plain projection path) and a tool output row must carry
         // their text literally — no marker dropping, no bullet swaps, no SGR.
-        let user: MessageRef = Arc::new(crate::cli::messages::concrete::UserQueryMessage::new(
+        let user: MessageRef = Arc::new(crate::cli::messages::UserQueryMessage::new(
             "show **bold** and - lists",
         ));
         assert!(
