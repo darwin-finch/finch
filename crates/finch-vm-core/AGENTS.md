@@ -10,16 +10,10 @@ Capability *requirements* live here as typed effects; grants, approval policy, a
 authorization ledgers remain physically in this crate until application-runtime
 extraction, and are not consulted during compilation.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`. Application callers
-continue to use `finch-vm`; the compiler-support exports (`BlockId`, `nearest_names`,
-`apply_signature_types`, `instantiate_signature_types`, `parse_type_name`, `SemanticBuilder`,
-`Parsed`, `Elaborated`, `FunctionCertified`, `ModuleSealed`, and `ModuleVerified`)
-are an intentionally restricted workspace seam and are not stable application API.
-
-**Documentation:** [`docs/README.md`](docs/README.md) owns implemented IR/verifier reference
-material for this crate. Cross-frontend planned semantics remain in the shared
-[language design](../../docs/language/README.md); boundary changes follow the shared
-[implementation roadmap](../../docs/language/IMPLEMENTATION_ROADMAP.md).
+**Boundary:** the [README](README.md) explains two caller workflows; [`src/lib.rs`](src/lib.rs)
+is the flat facade, and `cargo doc -p finch-vm-core --no-deps --open` renders public methods.
+Application callers use `finch-vm`; compiler-support exports are an intentionally restricted
+workspace seam, not a stable application API. Do not recreate a generated signature catalog.
 
 **Dependencies:** this unpublished foundation crate depends only on `anyhow`, `once_cell`, `serde`,
 `serde_json`, `thiserror`, and `uuid`. It never depends on `finch-vm` or the root `finch` crate.
