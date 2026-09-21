@@ -59,8 +59,8 @@ use super::{
     SayTurnStatus, SayTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead,
     WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };
-use crate::config::{ColorScheme, MessageBand};
 use finch_diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
+use finch_theme::{ColorScheme, MessageBand};
 
 // Animation frames: small → large → small (creates a "throb" pulse effect)
 const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
@@ -513,8 +513,7 @@ impl WorkUnit {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());
-            row.status =
-                WorkRowStatus::Complete(crate::cli::diff::sanitize_terminal(&summary.into()));
+            row.status = WorkRowStatus::Complete(finch_diff::sanitize_terminal(&summary.into()));
         }
     }
 
@@ -533,7 +532,7 @@ impl WorkUnit {
         let body_has_diff = !summary_starts_diff
             && body_lines
                 .iter()
-                .take(crate::cli::diff::MAX_DIFF_STRUCTURAL_LINES)
+                .take(finch_diff::MAX_DIFF_STRUCTURAL_LINES)
                 .any(|line| is_diff_start(line));
         let parsed = if summary_starts_diff || body_has_diff {
             let parsed = if summary_starts_diff {
@@ -574,7 +573,7 @@ impl WorkUnit {
             row.status = WorkRowStatus::Complete(if parsed.is_some() {
                 String::new()
             } else {
-                crate::cli::diff::sanitize_terminal(&summary)
+                finch_diff::sanitize_terminal(&summary)
             });
             row.diffs = parsed;
             row.body_lines = display_body_lines;
@@ -600,8 +599,7 @@ impl WorkUnit {
     pub fn append_row_body_line(&self, idx: usize, line: String) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(row) = inner.rows.get_mut(idx) {
-            row.body_lines
-                .push(crate::cli::diff::sanitize_terminal(&line));
+            row.body_lines.push(finch_diff::sanitize_terminal(&line));
         }
     }
 
@@ -620,11 +618,11 @@ impl WorkUnit {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());
-            row.status = WorkRowStatus::Error(crate::cli::diff::sanitize_terminal(&error.into()));
+            row.status = WorkRowStatus::Error(finch_diff::sanitize_terminal(&error.into()));
             row.body_lines.extend(
                 body_lines
                     .into_iter()
-                    .map(|line| crate::cli::diff::sanitize_terminal(&line)),
+                    .map(|line| finch_diff::sanitize_terminal(&line)),
             );
         }
     }
@@ -643,7 +641,7 @@ impl WorkUnit {
         label: impl Into<String>,
     ) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
-        let label = crate::cli::diff::sanitize_terminal(&label.into());
+        let label = finch_diff::sanitize_terminal(&label.into());
         if let Some(row) = inner
             .agent_activity
             .iter_mut()
@@ -700,7 +698,7 @@ impl WorkUnit {
         if !matches!(row.status, WorkRowStatus::Running) {
             return;
         }
-        let name = crate::cli::diff::sanitize_terminal(&name.into());
+        let name = finch_diff::sanitize_terminal(&name.into());
         if row
             .tools
             .iter()
@@ -758,7 +756,7 @@ impl WorkUnit {
         if !matches!(row.status, WorkRowStatus::Running) {
             return;
         }
-        let summary = crate::cli::diff::sanitize_terminal(&summary.into());
+        let summary = finch_diff::sanitize_terminal(&summary.into());
         row.status = if failed {
             WorkRowStatus::Error(summary)
         } else {
@@ -767,7 +765,7 @@ impl WorkUnit {
         row.body_lines.extend(
             body_lines
                 .into_iter()
-                .map(|line| crate::cli::diff::sanitize_terminal(&line)),
+                .map(|line| finch_diff::sanitize_terminal(&line)),
         );
         finish_requested_terminal(&mut inner, self.started_at.elapsed());
     }
@@ -1415,10 +1413,7 @@ fn format_row_themed(row: &WorkRow, colors: &ColorScheme, diff_mode: DiffColorMo
             if let Some(diffs) = &row.diffs {
                 for line in &row.body_lines {
                     out.push('\n');
-                    out.push_str(&format!(
-                        "    {}",
-                        crate::cli::diff::sanitize_terminal(line)
-                    ));
+                    out.push_str(&format!("    {}", finch_diff::sanitize_terminal(line)));
                 }
                 for line in render_files(diffs, colors, diff_mode).lines() {
                     out.push('\n');
@@ -1427,10 +1422,7 @@ fn format_row_themed(row: &WorkRow, colors: &ColorScheme, diff_mode: DiffColorMo
             } else {
                 for line in &row.body_lines {
                     out.push('\n');
-                    out.push_str(&format!(
-                        "    {}",
-                        crate::cli::diff::sanitize_terminal(line)
-                    ));
+                    out.push_str(&format!("    {}", finch_diff::sanitize_terminal(line)));
                 }
             }
             out
@@ -1474,10 +1466,7 @@ fn format_row_collapsed(row: &WorkRow, colors: &ColorScheme, diff_mode: DiffColo
             if let Some(diffs) = &row.diffs {
                 for line in &row.body_lines {
                     out.push('\n');
-                    out.push_str(&format!(
-                        "    {}",
-                        crate::cli::diff::sanitize_terminal(line)
-                    ));
+                    out.push_str(&format!("    {}", finch_diff::sanitize_terminal(line)));
                 }
                 let rendered = render_files(diffs, colors, diff_mode);
                 let lines: Vec<_> = rendered.lines().collect();
@@ -1495,10 +1484,7 @@ fn format_row_collapsed(row: &WorkRow, colors: &ColorScheme, diff_mode: DiffColo
             } else {
                 for line in &row.body_lines {
                     out.push('\n');
-                    out.push_str(&format!(
-                        "    {}",
-                        crate::cli::diff::sanitize_terminal(line)
-                    ));
+                    out.push_str(&format!("    {}", finch_diff::sanitize_terminal(line)));
                 }
             }
             out
@@ -1672,7 +1658,7 @@ mod tests {
             .hunks
             .iter()
             .flat_map(|hunk| &hunk.lines)
-            .any(|line| line.kind == crate::cli::diff::DiffLineKind::NoNewline));
+            .any(|line| line.kind == finch_diff::DiffLineKind::NoNewline));
         assert!(matches!(
             &inner.rows[row].status,
             WorkRowStatus::Complete(summary) if summary.is_empty()
@@ -1715,12 +1701,12 @@ mod tests {
         };
         let dark = format_row_collapsed(
             &row,
-            &crate::theme::ColorTheme::Dark.to_scheme(),
+            &finch_theme::ColorTheme::Dark.to_scheme(),
             DiffColorMode::Theme,
         );
         let light = format_row_collapsed(
             &row,
-            &crate::theme::ColorTheme::Light.to_scheme(),
+            &finch_theme::ColorTheme::Light.to_scheme(),
             DiffColorMode::Theme,
         );
         let plain = format_row_collapsed(&row, &colors(), DiffColorMode::NoColor);
@@ -1853,7 +1839,7 @@ mod tests {
 
     #[test]
     fn presentation_and_tool_state_choose_distinct_semantic_bands() {
-        let colors = crate::theme::ColorTheme::Dark.to_scheme();
+        let colors = finch_theme::ColorTheme::Dark.to_scheme();
         let assistant = WorkUnit::new("assistant");
         let source = WorkUnit::new("source");
         source.set_program_source("forth");
@@ -1875,7 +1861,7 @@ mod tests {
 
     #[test]
     fn completed_response_and_collapsed_tools_keep_separate_bands() {
-        let colors = crate::theme::ColorTheme::Dark.to_scheme();
+        let colors = finch_theme::ColorTheme::Dark.to_scheme();
         let unit = WorkUnit::new("mixed");
         unit.set_response("assistant prose");
         let row = unit.add_row("bash(test)");
