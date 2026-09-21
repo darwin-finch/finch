@@ -1,0 +1,14 @@
+[package]
+name = "finch-diff"
+version = "0.7.31"
+publish = false
+rust-version = "1.98"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0"
+description = "Bounded, terminal-safe structured diffs for Finch presentation"
+repository = "https://github.com/darwin-finch/finch"
+
+[dependencies]
+finch-theme = { path = "../finch-theme" }
+ratatui = "0.29"
+similar = "2.7"

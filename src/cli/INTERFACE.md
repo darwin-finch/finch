@@ -111,42 +111,20 @@ pub struct Dialog { … }
 pub struct DialogOption { … }
 /// Result returned when a dialog is closed Re-exported from `cli::tui`.
 pub enum DialogResult { Selected, MultiSelected, TextEntered, CustomText, Confirmed, Cancelled }
-pub enum DiffColorMode { Theme, NoColor }
-impl DiffColorMode {
-    /// Select the terminal mode used by interactive production renderers.
-    pub fn production() -> Self;
-}
-pub struct DiffHunk { … }
-pub struct DiffLine { … }
-pub enum DiffLineKind { Context, Add, Remove, NoNewline }
+/// Re-exported from `finch-diff`.
+pub(crate) enum DiffColorMode { Theme, NoColor }
+/// Re-exported from `finch-diff`.
+pub(crate) struct DiffHunk { … }
+/// Re-exported from `finch-diff`.
+pub(crate) struct DiffLine { … }
+/// Re-exported from `finch-diff`.
+pub(crate) enum DiffLineKind { Context, Add, Remove, NoNewline }
 /// Secret-free identity the status line, `/status`, and `/model` all project. Re-exported from `cli::repl_event`.
 pub struct EffectiveSelection { … }
 /// Main event loop for concurrent REPL Re-exported from `cli::repl_event`.
 pub struct EventLoop { … }
-/// Bounded structured diff for one file.
-pub struct FileDiff { … }
-impl FileDiff {
-    pub fn added(&self) -> usize;
-    /// Whether retained added/removed counts are exact, including that canonical [`Self::to_unified`] rendering was not cut at [`MAX_RENDER_CHARS`].
-    pub fn counts_are_exact(&self) -> bool;
-    pub fn display_path(&self) -> &str;
-    /// Whether the number of files in this payload is exact, or only a lower bound because later files were omitted at a parse limit.
-    pub fn file_count_is_exact(&self) -> bool;
-    /// Build a diff for a newly created file, preserving `/dev/null` as the old path through canonical serialization and retained rendering.
-    pub fn from_created(path: &str, new: &str) -> Self;
-    pub fn from_texts(path: &str, old: &str, new: &str) -> Self;
-    /// Honest answer to "is this complete?": exact line counts, exact file count, no content-omitting elision, and [`Self::to_unified`] would not hit [`MAX_RENDER_C…
-    pub fn is_complete(&self) -> bool;
-    pub fn is_created(&self) -> bool;
-    pub fn is_rename(&self) -> bool;
-    pub fn parse(text: &str) -> Option<Self>;
-    pub fn parse_all(text: &str) -> Vec<Self>;
-    /// Parse a line-oriented retained payload without first joining an unbounded vector supplied by a reconnect or replay path.
-    pub fn parse_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<Self>;
-    pub fn removed(&self) -> usize;
-    pub fn render(&self, colors: &ColorScheme, mode: DiffColorMode) -> String;
-    pub fn to_unified(&self) -> String;
-}
+/// Bounded structured diff for one file. Re-exported from `finch-diff`.
+pub(crate) struct FileDiff { … }
 /// Production Finch-native SuperGrok authentication service.
 pub struct GrokAuthService { … }
 impl GrokAuthService {
@@ -447,15 +425,16 @@ pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool 
 pub fn logging_enabled() -> bool { … }
 /// Render one stable, secret-free status line for scripts and interactive use. Exported as `render_chatgpt_auth_status_line`.
 pub fn render_status_line(status: &ChatGptAuthStatus) -> Result<String> { … }
-/// Render one bounded changeset using a single theme and total output limit.
-pub fn render_files(files: &[FileDiff], colors: &ColorScheme, mode: DiffColorMode) -> String { … }
+/// Render one bounded changeset using a single theme and total output limit. Re-exported from `finch-diff`.
+pub(crate) fn render_files(files: &[FileDiff], colors: &ColorScheme, mode: DiffColorMode) -> String { … }
 /// Render one stable, secret-free status line for scripts and interactive use. Exported as `render_grok_auth_status_line`.
 pub fn render_status_line(status: &GrokAuthStatus) -> Result<String> { … }
 /// Pick the configured entry and overlays. Re-exported from `cli::repl_event`.
 pub fn resolve_selection(providers: &[ProviderEntry], request: &SelectionRequest) -> Result<EffectiveSelection> { … }
-/// Remove terminal controls from bounded multi-line dialog content.
-pub fn sanitize_multiline(s: &str) -> String { … }
-pub fn sanitize_terminal(s: &str) -> String { … }
+/// Remove terminal controls from bounded multi-line dialog content. Re-exported from `finch-diff`.
+pub(crate) fn sanitize_multiline(s: &str) -> String { … }
+/// Re-exported from `finch-diff`.
+pub(crate) fn sanitize_terminal(s: &str) -> String { … }
 /// Replace or append one secret-free named credential and save no token data to config.toml. Exported as `save_chatgpt_named_credential`.
 pub fn save_named_credential(config: crate::config::Config, credential: ProviderCredential) -> Result<()> { … }
 /// Exported as `save_grok_named_credential`.
@@ -470,8 +449,8 @@ pub fn set_global_tui_renderer(renderer: TuiRenderer) { … }
 pub fn show_setup_wizard() -> Result<SetupResult> { … }
 /// Shutdown the global TUI renderer and restore terminal state
 pub fn shutdown_global_tui() -> anyhow::Result<()> { … }
-/// Build the stable path and aggregate line-count summary for parsed files.
-pub fn summarize_files(files: &[FileDiff]) -> String { … }
+/// Build the stable path and aggregate line-count summary for parsed files. Re-exported from `finch-diff`.
+pub(crate) fn summarize_files(files: &[FileDiff]) -> String { … }
 /// Run the shared ceremony for the explicit `finch setup` command.
 pub async fn validate_command_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> { … }
 /// Run the shared ceremony for automatic first-run setup.
@@ -481,11 +460,14 @@ pub async fn validate_first_run_and_apply(result: &SetupResult) -> Result<SetupA
 ## Constants
 
 ```rust
-pub const MAX_DIFF_HUNKS: usize = 128;
-pub const MAX_DIFF_INPUT_BYTES: usize = 1_048_576;
-/// Maximum semantic lines retained for a bounded diff.
-pub const MAX_DIFF_LINES: usize = 1024;
-pub const MAX_DIFF_LINE_CHARS: usize = 512;
+/// Re-exported from `finch-diff`.
+pub(crate) const MAX_DIFF_HUNKS: usize = 128;
+/// Re-exported from `finch-diff`.
+pub(crate) const MAX_DIFF_INPUT_BYTES: usize = 1_048_576;
+/// Maximum semantic lines retained for a bounded diff. Re-exported from `finch-diff`.
+pub(crate) const MAX_DIFF_LINES: usize = 1024;
+/// Re-exported from `finch-diff`.
+pub(crate) const MAX_DIFF_LINE_CHARS: usize = 512;
 /// Tools permitted in `ReplMode::Planning`, by canonical registered name. Re-exported from `cli::repl_event`.
 pub(crate) const PLANNING_ALLOWED_TOOLS: &[&str] = &[ "read", "glob", "grep", "web_fetch", // Read-only by convention and confirmed normally, so the model can run // inspection commands like `which gh` or `cargo check` while planning. "bash", // Session-local plan visibility is not a workspace or host mutation. Keep // the familiar checklist usable while the model is deliberately planning. "todo_read", "todo_write", // Re-entering planning while already planning is idempotent // (`EnterPlanModeTool::execute` returns "already in planning mode" and // changes nothing). The canonical name is the only spelling the provider // is shown: `ToolRegistry::definitions()` omits aliases. "enter_plan_mode", "present_plan", "ask_user_question", ];
 /// Compatibility spellings the planning gate accepts, mapped to the canonical entry in [`PLANNING_ALLOWED_TOOLS`]. Re-exported from `cli::repl_event`.

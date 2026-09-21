@@ -4573,9 +4573,9 @@ mod tests {
     }
 
     use super::*;
-    use crate::cli::diff::{summarize_files, DiffColorMode, FileDiff};
     use crate::cli::messages::{Message, MessageId, MessageRef, WorkUnit};
     use crate::cli::tui::vt_oracle::{VtColor, VtOracle, VtStyle};
+    use finch_diff::{summarize_files, DiffColorMode, FileDiff};
     use finch_theme::ColorTheme;
 
     fn assert_vt(condition: bool, message: &str, terminal: &VtOracle) {

@@ -16,6 +16,7 @@ repository = "https://github.com/darwin-finch/finch"
 members = [
     "crates/finch-brain",
     "crates/finch-coforth",
+    "crates/finch-diff",
     "crates/finch-tools-api",
     "crates/finch-colisp",
     "crates/finch-generation",
@@ -36,6 +37,7 @@ default-members = [
     "crates/finch-brain",
     "crates/finch-tools-api",
     "crates/finch-coforth",
+    "crates/finch-diff",
     "crates/finch-colisp",
     "crates/finch-generation",
     "crates/finch-ipc",
@@ -54,6 +56,7 @@ resolver = "2"
 
 [dependencies]
 finch-brain = { path = "crates/finch-brain" }
+finch-diff = { path = "crates/finch-diff" }
 finch-generation = { path = "crates/finch-generation" }
 finch-ipc = { path = "crates/finch-ipc" }
 finch-tools-api = { path = "crates/finch-tools-api" }

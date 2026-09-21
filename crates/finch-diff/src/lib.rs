@@ -1,9 +1,11 @@
-//! Compatibility path for the extracted bounded diff crate.
+//! Bounded, terminal-safe structured diffs shared by Finch presenters.
 //!
-//! New presentation code imports `finch_diff` directly; existing application
-//! callers retain this path while their composition code is migrated.
+//! The application selects and supplies files, while this crate owns the
+//! retained diff model, output bounds, terminal-control removal, and rendering.
 
-pub use finch_diff::{
+mod diff;
+
+pub use diff::{
     render_files, sanitize_multiline, sanitize_terminal, summarize_files, DiffColorMode, DiffHunk,
     DiffLine, DiffLineKind, FileDiff, MAX_DIFF_COMPUTE_LINES, MAX_DIFF_FILES, MAX_DIFF_HUNKS,
     MAX_DIFF_INPUT_BYTES, MAX_DIFF_LINES, MAX_DIFF_LINE_CHARS, MAX_DIFF_PREVIEW_LINES,

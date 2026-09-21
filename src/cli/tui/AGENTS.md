@@ -211,11 +211,12 @@ module of this crate, **or** the remaining ones are written down here with the r
 
 - **`finch_theme::ColorScheme`** — shared colour vocabulary from the extracted leaf crate,
   re-exported so existing callers can still write `crate::cli::tui::ColorScheme`.
-- **Sibling CLI types** (`cli::messages`, `cli::diff`, `cli::llm_dialogs`, `StatusBar`,
+- **`finch_diff`** — bounded, terminal-safe diff summaries and dialog sanitation from the
+  extracted leaf crate. `cli::messages` also uses it when constructing WorkUnit snapshots.
+- **Sibling CLI types** (`cli::messages`, `cli::llm_dialogs`, `StatusBar`,
   `AskUserQuestion*`) — the renderer uses the `Message` trait to request WorkUnit snapshots and
-  delegates their pure projection to `finch-ui-model`; `cli::diff` renders diff bodies while the
-  snapshot is constructed. Command-completion metadata is owned directly by this capsule in
-  `command_autocomplete.rs`; its types and `AutocompleteState` remain crate-visible only, not
+  delegates their pure projection to `finch-ui-model`. Command-completion metadata is owned
+  directly by this capsule in `command_autocomplete.rs`; its types and `AutocompleteState` remain crate-visible only, not
   facade exports. The unused contextual-suggestion subsystem was removed.
 - **`crate::ABOUT`** — startup header copy.
 - **`crate::is_editor_active` and `crate::finch_ipc_capnp` in `async_input.rs`** — the input task
