@@ -43,6 +43,7 @@ pub mod activity;
 mod async_input;
 mod autocomplete_widget;
 mod cell_format;
+mod command_autocomplete;
 mod dialog;
 mod dialog_widget;
 #[cfg(test)]
@@ -50,6 +51,7 @@ mod isolation;
 mod mouse_capture;
 mod scroll_view;
 mod shadow_buffer; // kept – good architecture for future diffing
+mod suggestions; // Contextual prompt suggestions (like Claude Code)
 mod tabbed_dialog;
 mod tabbed_dialog_widget; // kept for wizard helpers
 mod tool_viewport;
@@ -73,11 +75,13 @@ use tool_viewport::{
 pub use async_input::{spawn_input_task, InputEvent};
 pub use autocomplete_widget::AutocompleteState;
 use autocomplete_widget::{completion_pane_lines, replace_command_prefix, replace_mention_prefix};
+pub use command_autocomplete::{CommandCategory, CommandRegistry, CommandSpec};
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use shadow_buffer::{
     extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
 };
+pub use suggestions::{Suggestion, SuggestionContext, SuggestionManager, SuggestionSource};
 
 /// One speakable project-resource row offered by the composer mention picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,10 +466,7 @@ fn visible_prefix(line: &str, columns: usize) -> String {
 ///
 /// Returns `Some(suffix)` when `input` is a `/command` prefix that unambiguously
 /// completes to a single command; returns `None` otherwise.
-pub(crate) fn compute_ghost_text(
-    input: &str,
-    registry: &crate::cli::command_autocomplete::CommandRegistry,
-) -> Option<String> {
+pub(crate) fn compute_ghost_text(input: &str, registry: &CommandRegistry) -> Option<String> {
     if input.trim().is_empty() || !input.starts_with('/') {
         return None;
     }
@@ -513,11 +514,8 @@ fn selected_completion_ghost(
 fn command_completion_at_cursor(
     lines: &[String],
     cursor: (usize, usize),
-    registry: &crate::cli::command_autocomplete::CommandRegistry,
-) -> (
-    Vec<crate::cli::command_autocomplete::CommandSpec>,
-    Option<String>,
-) {
+    registry: &CommandRegistry,
+) -> (Vec<CommandSpec>, Option<String>) {
     let (cursor_row, cursor_col) = cursor;
     let prefix = if cursor_row == 0 {
         lines
@@ -724,7 +722,7 @@ pub(crate) fn compute_effective_status(
     ghost_text: Option<&str>,
     raw_status: &str,
     current_input: &str,
-    registry: &crate::cli::command_autocomplete::CommandRegistry,
+    registry: &CommandRegistry,
 ) -> String {
     // Operational and error state is never hidden by command help. The
     // completion pane carries command descriptions in its own rows.
@@ -1364,8 +1362,8 @@ pub struct TuiRenderer {
 
     // Autocomplete / suggestions
     pub(crate) ghost_text: Option<String>,
-    suggestions: crate::cli::suggestions::SuggestionManager,
-    command_registry: crate::cli::command_autocomplete::CommandRegistry,
+    suggestions: suggestions::SuggestionManager,
+    command_registry: CommandRegistry,
     pub autocomplete_state: AutocompleteState,
 
     // Image paste support
@@ -1459,8 +1457,8 @@ impl TuiRenderer {
             pending_cancellation: false,
             pending_dialog_result: None,
             ghost_text: None,
-            suggestions: crate::cli::suggestions::SuggestionManager::new(),
-            command_registry: crate::cli::command_autocomplete::CommandRegistry::new(),
+            suggestions: suggestions::SuggestionManager::new(),
+            command_registry: CommandRegistry::new(),
             autocomplete_state: AutocompleteState::default(),
             pending_images: Vec::new(),
             image_counter: 0,
@@ -1545,8 +1543,8 @@ impl TuiRenderer {
             pending_dialog_result: None,
 
             ghost_text: None,
-            suggestions: crate::cli::suggestions::SuggestionManager::new(),
-            command_registry: crate::cli::command_autocomplete::CommandRegistry::new(),
+            suggestions: suggestions::SuggestionManager::new(),
+            command_registry: CommandRegistry::new(),
             autocomplete_state: AutocompleteState::default(),
 
             pending_images: Vec::new(),
@@ -4812,7 +4810,6 @@ mod tests {
     }
 
     use super::*;
-    use crate::cli::command_autocomplete::CommandRegistry;
     use crate::cli::diff::{summarize_files, DiffColorMode, FileDiff};
     use crate::cli::messages::{Message, MessageId, MessageRef, WorkUnit};
     use crate::cli::tui::vt_oracle::{VtColor, VtOracle, VtStyle};

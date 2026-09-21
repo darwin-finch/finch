@@ -1,7 +1,7 @@
 //! Slash-command and `@`-mention completion state and raw-mode pane rendering.
 
-use crate::cli::command_autocomplete::CommandSpec;
-use crate::cli::tui::MentionCandidate;
+use super::command_autocomplete::CommandSpec;
+use super::MentionCandidate;
 
 /// Maximum number of autocomplete suggestions to show at once
 pub(crate) const MAX_VISIBLE_SUGGESTIONS: usize = 8;
@@ -351,8 +351,8 @@ pub(crate) fn replace_mention_prefix(
 
 #[cfg(test)]
 mod tests {
+    use super::super::command_autocomplete::{CommandCategory, CommandRegistry};
     use super::*;
-    use crate::cli::command_autocomplete::{CommandCategory, CommandRegistry};
 
     #[test]
     fn test_autocomplete_state() {

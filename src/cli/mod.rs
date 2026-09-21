@@ -2,7 +2,6 @@
 // Public interface for command-line interface
 
 mod chatgpt_auth;
-mod command_autocomplete;
 mod commands;
 mod conversation;
 mod conversation_compactor; // Infinite context: summarise dropped messages
@@ -21,7 +20,6 @@ mod repl;
 mod repl_event; // Phase 2-3: Event loop infrastructure
 mod setup_wizard; // First-run setup wizard (API keys + device selection)
 mod status_bar;
-mod suggestions; // Contextual prompt suggestions (like Claude Code)
 mod tui;
 mod usage; // Phase 2: Terminal UI
 
@@ -73,5 +71,7 @@ pub use setup_wizard::{
     SetupResult,
 };
 pub use status_bar::{StatusBar, StatusLine, StatusLineType};
-pub use suggestions::{Suggestion, SuggestionContext, SuggestionManager, SuggestionSource};
-pub use tui::{Dialog, DialogOption, DialogResult, TabbedDialog, TabbedDialogResult, TuiRenderer};
+pub use tui::{
+    Dialog, DialogOption, DialogResult, Suggestion, SuggestionContext, SuggestionManager,
+    SuggestionSource, TabbedDialog, TabbedDialogResult, TuiRenderer,
+};
