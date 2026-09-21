@@ -47,7 +47,7 @@ LLM continues with user's choices
    - Intercepts AskUserQuestion before regular tool execution
    - Special handling path for user dialogs
 
-3. **TUI Renderer** (`src/cli/tui/mod.rs`)
+3. **TUI Renderer** (`crates/finch-tui/src/lib.rs`)
    - `show_llm_question()` method to display dialogs
    - Collects answers sequentially (1-4 questions)
    - Returns HashMap<String, String> of answers
@@ -188,7 +188,7 @@ pub struct AskUserQuestionOutput {
    - TODO: Route to special handler instead of ToolExecutor
    - TODO: Package result and return to LLM
 
-4. **TUI Integration** (`src/cli/tui/mod.rs`)
+4. **TUI Integration** (`crates/finch-tui/src/lib.rs`)
    - TODO: `show_llm_question(input)` method
    - TODO: Display questions sequentially
    - TODO: Collect answers into HashMap
@@ -404,5 +404,5 @@ async fn test_llm_question_flow() {
 ## References
 
 - Claude Agent SDK: https://platform.claude.com/docs/en/agent-sdk/user-input
-- Existing dialog system: `src/cli/tui/dialog.rs`
+- Existing dialog system: `crates/finch-tui/src/dialog.rs`
 - Tool confirmation system: `src/cli/repl_event/event_loop.rs`

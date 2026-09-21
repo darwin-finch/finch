@@ -14,7 +14,7 @@ Two callers illustrate the boundary:
    starts that unit, stores it as a `MessageRef`, and gives the renderer a stable identity while
    the same unit accumulates rows and reaches a terminal status. Query ordering and execution
    stay with the application; this module owns the message's lifecycle and snapshot.
-2. The [TUI adapter](../../src/cli/tui/view_model.rs) reads a `MessageRef` at blit time. It asks for the
+2. The [TUI adapter](../../crates/finch-tui/src/view_model.rs) reads a `MessageRef` at blit time. It asks for the
    WorkUnit view when present and hands that plain snapshot to `finch-ui-model` for projection;
    ordinary messages supply formatted lines. The renderer owns disclosure and painting, while
    the message's complete transcript remains the canonical text for scrollback and copying.

@@ -3,7 +3,7 @@
 This module owns command handling, the interactive REPL, setup and login flows, conversation
 presentation, and terminal output coordination. It composes lower-level Brain, provider, runtime,
 tool, and UI capabilities; it does not own their execution or storage rules. `mod.rs` is the flat
-facade for other root-package callers. Nested message and TUI capsules own their narrower
+facade for other root-package callers. The message and TUI crates own their narrower
 presentation contracts.
 
 For an interactive turn, `src/main.rs` constructs `Repl` from configuration and providers. The
@@ -18,5 +18,5 @@ annotations are assembled back in the CLI; the renderer never interprets the too
 response schema.
 
 Read [AGENTS.md](AGENTS.md) for allowed dependencies and focused tests, and [mod.rs](mod.rs) for
-the callable facade. The [message README](../../crates/finch-messages/README.md) and [TUI README](tui/README.md)
+the callable facade. The [message README](../../crates/finch-messages/README.md) and [TUI README](../../crates/finch-tui/README.md)
 explain those two presentation boundaries without an API catalog.

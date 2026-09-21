@@ -224,6 +224,8 @@ capnp = "0.24"
 capnp-rpc = "0.24"
 
 [dev-dependencies]
+# Root application tests construct a renderer without taking over a terminal.
+finch-tui = { path = "crates/finch-tui", features = ["test-support"] }
 semver = "1"
 vte = "0.15"  # ANSI/VT byte parser for production console-writer regressions
 h2 = "0.4.16"  # Raw HTTP/2 protocol fixtures for transport-boundary regressions

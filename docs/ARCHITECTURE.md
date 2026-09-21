@@ -357,7 +357,7 @@ Different providers (Claude vs. Gemini vs. Groq vs. Grok) have subtly different 
 
 **Key Files:**
 - `src/daemon/streaming.rs` - SSE event formatting
-- `src/cli/tui/mod.rs` - TUI streaming response handling
+- `crates/finch-tui/src/lib.rs` - TUI streaming response handling
 - `src/generators/qwen.rs` - Token callbacks
 
 ### 7. LoRA Fine-Tuning Infrastructure
@@ -436,11 +436,11 @@ Message updates → Diff-based blitting to visible area only
 - Bottom-aligned content (recent messages visible)
 
 **Key Files:**
-- `src/cli/tui/mod.rs` - TuiRenderer, flush_output_safe(), blit_visible_area()
-- `src/cli/tui/shadow_buffer.rs` - ShadowBuffer, diff_buffers()
-- `src/cli/tui/scrollback.rs` - ScrollbackBuffer (message tracking)
-- `src/cli/tui/input_widget.rs` - Input area rendering
-- `src/cli/tui/status_widget.rs` - Status bar rendering
+- `crates/finch-tui/src/lib.rs` - TuiRenderer, flush_output_safe(), blit_visible_area()
+- `crates/finch-tui/src/shadow_buffer.rs` - ShadowBuffer, diff_buffers()
+- `crates/finch-tui/src/scrollback.rs` - ScrollbackBuffer (message tracking)
+- `crates/finch-tui/src/input_widget.rs` - Input area rendering
+- `crates/finch-tui/src/status_widget.rs` - Status bar rendering
 
 ### 9. Multi-Provider Teacher Support
 

@@ -38,7 +38,7 @@ authoritative.
 - [HTTP route definitions](../src/server/handlers.rs)
 - [Tool execution and permissions](../src/tools/EXECUTION.md)
 - [Context assembly](../src/context/ASSEMBLY.md)
-- [TUI internals](../src/cli/tui/ARCHITECTURE.md)
+- [TUI internals](../crates/finch-tui/ARCHITECTURE.md)
 - [Typed VM migration audit](TYPED_VM_MIGRATION_AUDIT.md)
 - [Local model/backend status](MODEL_BACKEND_STATUS.md) — dated backend investigation, not
   end-to-end routing or conformance evidence; see

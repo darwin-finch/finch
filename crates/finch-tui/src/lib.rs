@@ -159,11 +159,11 @@ pub trait MentionPort: Send + Sync {
     fn restore_submission(&self);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 struct EmptyMentionPort;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl MentionPort for EmptyMentionPort {
     fn query_at(&self, _text: &str, _cursor_chars: usize) -> Option<(usize, String)> {
         None
@@ -202,11 +202,9 @@ pub fn emergency_restore_terminal() {
 }
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
-// The setup wizard's widget host (#812): its screens are views on the same
-// claiming tree and shadow buffer the conversation uses. Like `view_model`,
-// this is reachable crate-wide but not published facade surface — #808 (the
-// GUI setup surface) will decide what a GUI host consumes.
-pub(crate) use wizard_host::{
+// The root setup wizard uses this named widget-host surface; keep the child
+// module private so the crate facade remains the only external path.
+pub use wizard_host::{
     plan_wizard_frame, wizard_bold, wizard_boxed, wizard_centered, wizard_line, wizard_paint,
     wizard_physical_rows, wizard_plain, wizard_visible_length, wizard_wrap, WizardCard,
     WizardColor, WizardFrame, WizardHost, WizardRects, WizardSectionContent, WizardView,
@@ -1451,8 +1449,8 @@ pub struct TuiRenderer {
 // ─── Construction ─────────────────────────────────────────────────────────────
 
 impl TuiRenderer {
-    #[cfg(test)]
-    pub(crate) fn new_headless<S: TuiStatusPort + 'static, O: TuiOutputPort + 'static>(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_headless<S: TuiStatusPort + 'static, O: TuiOutputPort + 'static>(
         output_manager: Arc<O>,
         status_port: Arc<S>,
         colors: ColorScheme,
@@ -4585,9 +4583,9 @@ mod tests {
     }
 
     use super::*;
-    use finch_messages::{Message, MessageId, MessageRef, WorkUnit};
     use crate::vt_oracle::{VtColor, VtOracle, VtStyle};
     use finch_diff::{summarize_files, DiffColorMode, FileDiff};
+    use finch_messages::{Message, MessageId, MessageRef, WorkUnit};
     use finch_theme::ColorTheme;
 
     #[test]
@@ -4745,9 +4743,8 @@ mod tests {
         renderer
             .accordion
             .rebuild_retained_hit_regions(&lines, 0, 80);
-        let root =
-            crate::view_model::try_project_for_test(message.as_ref(), &renderer.colors)
-                .expect("projected row");
+        let root = crate::view_model::try_project_for_test(message.as_ref(), &renderer.colors)
+            .expect("projected row");
 
         assert_eq!(
             renderer.mouse_tracking,
@@ -4949,9 +4946,7 @@ mod tests {
     /// result produced `lines` lines, with the hit regions rebuilt from the
     /// real projection exactly as a paint would. Returns the renderer and the
     /// output row's stable identity.
-    fn committed_tool_result_renderer(
-        lines: usize,
-    ) -> (TuiRenderer, crate::view_model::RowId) {
+    fn committed_tool_result_renderer(lines: usize) -> (TuiRenderer, crate::view_model::RowId) {
         use finch_messages::WorkUnit;
 
         let colors = ColorScheme::default();
@@ -5076,13 +5071,12 @@ mod tests {
             (0..40).map(|n| format!("beta {n}")).collect::<Vec<_>>(),
         );
         second.set_complete();
-        let second_output =
-            crate::view_model::try_project_for_test(second.as_ref(), &colors)
-                .expect("projected row")
-                .children[0]
-                .children[1]
-                .id
-                .clone();
+        let second_output = crate::view_model::try_project_for_test(second.as_ref(), &colors)
+            .expect("projected row")
+            .children[0]
+            .children[1]
+            .id
+            .clone();
         renderer.add_trait_message(second.clone());
         let second_id = second.id();
         renderer.printed_ids.insert(second_id);
@@ -8454,9 +8448,8 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert!(toggled, "clicking the claimed rect must toggle the row");
-        let node_after_toggle =
-            crate::view_model::try_project_for_test(work.as_ref(), &colors)
-                .expect("a WorkUnit projects");
+        let node_after_toggle = crate::view_model::try_project_for_test(work.as_ref(), &colors)
+            .expect("a WorkUnit projects");
         assert_ne!(
             accordion.is_expanded(&node_after_toggle),
             expanded_before,

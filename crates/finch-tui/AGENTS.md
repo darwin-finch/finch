@@ -1,15 +1,15 @@
-# tui capsule: terminal renderer and widgets
+# finch-tui capsule: terminal renderer and widgets
 
-Supplements the root [`AGENTS.md`](../../../CLAUDE.md), which still applies in full.
+Supplements the root [`AGENTS.md`](../../AGENTS.md), which still applies in full.
 
-**Owns** `src/cli/tui/`: the interactive terminal renderer (`TuiRenderer`), dialogs, the live
+**Owns** `crates/finch-tui/`: the interactive terminal renderer (`TuiRenderer`), dialogs, the live
 area, scrollback, the ViewModel projection, the claiming widget tree, the conversation
 ScrollView, disclosure (accordion), and activity rows.
-This is not a published crate. The test is whether production code here can draw without naming
+This is an unpublished workspace crate. The test is whether production code here can draw without naming
 Finch's poset, tool, or runtime vocabularies.
 
 **Boundary:** the [README](README.md) explains the two caller workflows and ownership.
-[`mod.rs`](mod.rs) is the facade; child modules stay private. The presentation types that
+[`src/lib.rs`](src/lib.rs) is the facade; child modules stay private. The presentation types that
 application callers need are re-exported flat, including activity rows and updates. Add public
 surface only when a real caller needs it. Do not recreate a generated symbol catalog.
 `view_model` is private to this module. Application tests project messages through the
@@ -29,7 +29,7 @@ The event loop supplies package-version/tagline text for the startup header and 
 that reports whether an external editor owns the terminal. The input task must consult that
 query before polling and before rendering; quit control messages use `finch-ipc` directly.
 
-**Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::tui::`.
+**Focused tests:** `./scripts/test_brains.sh cargo test -p finch-tui --lib`.
 
 ## The blit pipeline: ViewModel → widget tree → claiming → paint
 
@@ -40,7 +40,7 @@ Every blit converts domain state into one owned ViewModel snapshot, then lays it
    live transcript lines, dialogs. `live_frame_sources` gathers the owned state;
    `plan_live_frame` plans the frame from it and is a pure function (assertable without a
    terminal).
-2. **`view_model::project_message`** is a thin root adapter: it asks the `Message` trait for a
+2. **`view_model::project_message`** is a thin renderer adapter: it asks the `Message` trait for a
    WorkUnit snapshot with the current `ColorScheme`, then delegates the snapshot →
    `TranscriptNode` conversion to `finch_ui_model::project_work_unit`. Widgets never query
    `WorkUnit`, the command registry, or each other to decide visibility; a widget with nothing
@@ -192,7 +192,7 @@ draws a view, and the caller converts.
 |------|-------------------------|----------------|
 | `finch_ui_model::TranscriptNode` | label, body, children, role, default disclosure | WorkUnit snapshot, projected by `finch_ui_model::project_work_unit`; adapted from `Message` in `view_model::project_message` |
 | `finch_ui_model::SayTurnView` | status, program, output, elapsed, toggle state | WorkUnit `say_turn_view()`, projected by `finch_ui_model::say_turn_lines` |
-| [`activity::ActivityRow`](activity.rs) | indented status text | todos / agent tasks, in `cli::repl_event::activity_view` |
+| [`ActivityRow`](src/activity.rs) | indented status text | todos / agent tasks, in `cli::repl_event::activity_view` |
 | `Dialog::tool_approval(name, summary)` | a name and a summary line | Finch `ToolUse`, in `cli::repl_event::tool_display::tool_approval_dialog` |
 | `QuestionView` / `QuestionOptionView` | question text, tab heading, options, selection mode, and optional preview | `AskUserQuestion` request in `cli::llm_dialogs`; converted before `TabbedDialog::new` |
 | `MentionCandidate` / `MentionSubmission` | speakable picker rows, insertion tokens, and provider-independent selected bytes | `context::mention`, through the injected CLI adapter in `cli::mention_session` |
@@ -224,7 +224,7 @@ module of this crate, **or** the remaining ones are written down here with the r
 **Lower crates this directory names in production, and why they stay:**
 
 - **`finch_theme::ColorScheme`** — shared colour vocabulary from the extracted leaf crate,
-  re-exported so existing callers can still write `crate::cli::tui::ColorScheme`.
+  re-exported so callers can use the flat `finch_tui::ColorScheme` facade.
 - **`finch_diff`** — bounded, terminal-safe diff summaries and dialog sanitation from the
   extracted leaf crate. `finch-messages` separately uses it to construct WorkUnit snapshots.
 - **`finch_messages` and `finch_ui_model`** — the renderer reads typed message snapshots and
@@ -248,7 +248,7 @@ the root CLI adapters.
 `test_tui_production_does_not_name_finch_poset` keeps the deleted write-only Poset edge from
 returning. `test_tui_production_does_not_name_project_context` keeps filesystem discovery,
 ignore/budget policy, and attachment snapshots behind the injected `MentionPort`; its application
-adapter is [`src/cli/mention_session.rs`](../mention_session.rs).
+adapter is [`src/cli/mention_session.rs`](../../src/cli/mention_session.rs).
 `test_tui_production_does_not_name_ask_user_question_wire_schema` keeps the tool request and
 response in the CLI while the renderer consumes only `QuestionView`.
 `test_tui_production_does_not_reach_up_for_owned_completion_state` keeps command completion

@@ -1327,7 +1327,7 @@ impl Repl {
         // Moved to global for Phase 5 native ratatui dialogs
         if config.tui_enabled && is_interactive {
             // Timed from here rather than inside `TuiRenderer::new` so that
-            // `src/cli/tui/` is untouched; #264 ("Make terminal-session
+            // `crates/finch-tui/` is untouched; #264 ("Make terminal-session
             // cleanup bounded, signal-complete, and embedding-safe") owns
             // terminal lifecycle.
             let mut phase = crate::startup::phase(crate::startup::PHASE_TERMINAL_INIT);

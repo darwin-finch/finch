@@ -2,7 +2,7 @@
 //! while Finch is running (#221). Mouse capture is off by default so the host
 //! terminal owns drags and the wheel. Accordion expand/collapse stays on the
 //! keyboard. When an opt-in path later holds capture, #441's wheel-release
-//! still applies (covered in `src/cli/tui/mouse_capture.rs`).
+//! still applies (covered in `crates/finch-tui/src/mouse_capture.rs`).
 //!
 //! # What actually breaks
 //!

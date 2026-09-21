@@ -236,7 +236,7 @@ EXPECTED_FIXTURES = {
     )),
     "ordinary_source": (("src/models/mod.rs",), ALWAYS_CHECKS),
     "ordinary_query_tui_provider": (
-        ("src/cli/query.rs", "src/cli/tui/mod.rs", "src/providers/anthropic.rs"), ALWAYS_CHECKS,
+        ("src/cli/query.rs", "crates/finch-tui/src/lib.rs", "src/providers/anthropic.rs"), ALWAYS_CHECKS,
     ),
     "brain_effect": (("crates/finch-brain/src/store.rs", "src/server/handlers.rs"), (
         *ALWAYS_CHECKS, *ISOLATION_CHECKS,

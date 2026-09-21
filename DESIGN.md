@@ -107,7 +107,7 @@ the MCP client should not have to load tool execution and permissions to get the
 | **`providers`** (3): Finch Config mapping onto finch-providers, planning prompts | `src/providers`, `claude`, `oauth`, `llms`, `planning` | Providers compatibility [README](src/providers/README.md), [capsule](src/providers/AGENTS.md), [facade](src/providers/mod.rs); OAuth compatibility [README](src/oauth/README.md), [capsule](src/oauth/AGENTS.md), [facade](src/oauth/mod.rs); planning [README](src/planning/README.md), [capsule](src/planning/AGENTS.md), [facade](src/planning/mod.rs); [Claude client](src/claude/CLIENT.md), [OAuth boundary](docs/OAUTH.md), [ChatGPT subscription transport](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md), [OpenAI transport](docs/OPENAI_TRANSPORT.md) |
 | **`transport`** (3): domain-neutral Cap'n Proto schema/protocol/socket core, node identity, service discovery | `crates/finch-ipc`, `crates/finch-node`, `network`, `service` | IPC [README](crates/finch-ipc/README.md), [capsule](crates/finch-ipc/AGENTS.md), [facade](crates/finch-ipc/src/lib.rs); application client adapter in `src/client`, daemon RPC adapter in `src/server`, Brain codec in `crates/finch-brain/src/ipc_codec.rs`, runtime checkpoint codec in `crates/finch-runtime/src/ipc_codec.rs`; Node [README](crates/finch-node/README.md), [capsule](crates/finch-node/AGENTS.md), [facade](crates/finch-node/src/lib.rs), root compatibility [README](src/node/README.md), [capsule](src/node/AGENTS.md), [facade](src/node/mod.rs); wire schema in [`crates/finch-ipc/schema/finch_ipc.capnp`](crates/finch-ipc/schema/finch_ipc.capnp) |
 | **`brain`** (4): durable named Brains, Brain-specific clients and credentials | `crates/finch-brain`; root `server`, `daemon`, `client`, `agent`, `review`, `registry` (migration only), and `graph` are application composition | [Brain README](crates/finch-brain/README.md), [agent contract](crates/finch-brain/AGENTS.md), [facade](crates/finch-brain/src/lib.rs); attachment [README](crates/finch-brain/src/attachment/README.md), [agent contract](crates/finch-brain/src/attachment/AGENTS.md), [facade](crates/finch-brain/src/attachment/mod.rs); nested persistence capsules [`journal`](crates/finch-brain/src/journal/AGENTS.md), [`projection`](crates/finch-brain/src/projection/AGENTS.md), [`run`](crates/finch-brain/src/run/AGENTS.md), and [`schedule`](crates/finch-brain/src/schedule/AGENTS.md); server [README](src/server/README.md), [agent contract](src/server/AGENTS.md), [facade](src/server/mod.rs); daemon [README](src/daemon/README.md), [agent contract](src/daemon/AGENTS.md), [facade](src/daemon/mod.rs); [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
-| **`frontend`** (5): commands, the interactive REPL, typed messages, rendering, setup | `src/cli`, `crates/finch-messages`, `startup.rs`, `samples.rs`; root `cli::messages` is a compatibility re-export | CLI [README](src/cli/README.md), [agent contract](src/cli/AGENTS.md), [facade](src/cli/mod.rs); event loop [README](src/cli/repl_event/README.md), [agent contract](src/cli/repl_event/AGENTS.md), [facade](src/cli/repl_event/mod.rs); messages [README](crates/finch-messages/README.md), [agent contract](crates/finch-messages/AGENTS.md), [facade](crates/finch-messages/src/lib.rs) for client-local typed messages and WorkUnit snapshots over `finch-ui-model`, `finch-theme`, and `finch-diff`; application presentation [README](crates/finch-ui-model/README.md), [capsule](crates/finch-ui-model/AGENTS.md), [facade](crates/finch-ui-model/src/lib.rs) for component-owned ViewModels and pure projection ([design](docs/TUI_DESIGN.md)); project-mention composition adapter [`src/cli/mention_session.rs`](src/cli/mention_session.rs); TUI [README](src/cli/tui/README.md), [agent contract](src/cli/tui/AGENTS.md), and [facade](src/cli/tui/mod.rs); [TUI renderer](src/cli/tui/ARCHITECTURE.md), [atomic history](src/cli/repl_event/ATOMIC_HISTORY.md) |
+| **`frontend`** (6): commands, the interactive REPL, typed messages, rendering, setup | `src/cli`, `crates/finch-messages`, `crates/finch-tui`, `startup.rs`, `samples.rs`; root `cli::messages` is a compatibility re-export | CLI [README](src/cli/README.md), [agent contract](src/cli/AGENTS.md), [facade](src/cli/mod.rs); event loop [README](src/cli/repl_event/README.md), [agent contract](src/cli/repl_event/AGENTS.md), [facade](src/cli/repl_event/mod.rs); messages [README](crates/finch-messages/README.md), [agent contract](crates/finch-messages/AGENTS.md), [facade](crates/finch-messages/src/lib.rs) for client-local typed messages and WorkUnit snapshots over `finch-ui-model`, `finch-theme`, and `finch-diff`; application presentation [README](crates/finch-ui-model/README.md), [capsule](crates/finch-ui-model/AGENTS.md), [facade](crates/finch-ui-model/src/lib.rs) for component-owned ViewModels and pure projection ([design](docs/TUI_DESIGN.md)); project-mention composition adapter [`src/cli/mention_session.rs`](src/cli/mention_session.rs); TUI [README](crates/finch-tui/README.md), [agent contract](crates/finch-tui/AGENTS.md), and [facade](crates/finch-tui/src/lib.rs); [TUI renderer](crates/finch-tui/ARCHITECTURE.md), [atomic history](src/cli/repl_event/ATOMIC_HISTORY.md) |
 | **`tests`**: integration tests | `tests/` | [Test guide](tests/README.md), [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
 | **`ci`**: repository checks, agent skills, installer | `.github/` (except workflows), `scripts/`, `.agents/`, `.claude/`, `install.sh` | [Repository hygiene](docs/REPOSITORY_HYGIENE.md), [Rust toolchain](docs/RUST_TOOLCHAIN.md) |
 | **`docs`**: project documentation | `docs/` (except the archive), root narrative files | [Documentation map](docs/README.md) |
@@ -187,7 +187,7 @@ typed runtime + capability broker for program effects
 | Local model loader | `src/models/unified_loader.rs` · `src/models/ONNX.md` |
 | Deferred LoRA path | `docs/AUTOMATIC_TRAINING.md` · `src/models/LORA.md` |
 | Router | `src/router/ROUTING.md` |
-| TUI Renderer | `src/cli/tui/ARCHITECTURE.md` |
+| TUI Renderer | `crates/finch-tui/ARCHITECTURE.md` |
 | Tool Execution & Permissions | `src/tools/EXECUTION.md` |
 | Claude Client | `src/claude/CLIENT.md` |
 | Context Assembly | `src/context/ASSEMBLY.md` |
@@ -291,7 +291,7 @@ Known stale or unsupported claims in current-looking documents, awaiting repair 
   provider.
 - [MCP client guide](docs/MCP_USER_GUIDE.md) makes compatibility and permission claims without
   production-boundary evidence.
-- [TUI renderer](src/cli/tui/ARCHITECTURE.md) describes the removed inline-viewport renderer
+- [TUI renderer](crates/finch-tui/ARCHITECTURE.md) describes the removed inline-viewport renderer
   ([#442](https://github.com/darwin-finch/finch/issues/442)).
 
 ## Intended direction
@@ -317,8 +317,9 @@ Design intent, not current fact. The program, its phases, and its measurable gat
   `finch-ui-model` and remains available through the root `ui_model` compatibility facade:
   stable message/row identity, WorkUnit and component snapshots, semantic widget data, pure
   transcript projection (including bounded assistant-prose markdown), line measurement, and pure
-  claiming layout have no outgoing subsystem edges. Terminal painting and the thin root
-  `Message`/colour adapter remain above that facade.
+  claiming layout have no outgoing subsystem edges. `finch-tui` owns terminal painting above
+  that facade; `finch-messages` supplies the `Message` presentation snapshot, while the root
+  CLI injects status, output, and mention ports and owns session policy.
   Application subsystems follow only after their cycles are removed and the VM and memory
   measurements justify continuing.
 - **Target dependency direction**, refined during facade work:

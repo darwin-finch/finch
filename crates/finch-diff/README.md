@@ -10,7 +10,7 @@ Two callers show why this is a shared leaf:
 1. The [WorkUnit message](../finch-messages/src/work_unit.rs) retains a structured `FileDiff`
    with a tool row and asks this crate for a bounded themed preview. The message owns the row's
    lifecycle and canonical transcript; this crate owns escaping, truncation, and diff formatting.
-2. The [TUI dialog](../../src/cli/tui/dialog.rs) sanitizes untrusted tool names and multiline
+2. The [TUI dialog](../../crates/finch-tui/src/dialog.rs) sanitizes untrusted tool names and multiline
    summaries before placing them in an approval card. The renderer decides layout and interaction;
    this crate removes terminal controls and bounds the text. The application decides what tool
    request is being reviewed.

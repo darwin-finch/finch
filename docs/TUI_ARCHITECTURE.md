@@ -1,7 +1,7 @@
 # TUI Architecture - Terminal User Interface Design Document
 
 > **Archived expanded design:** Verify current renderer behavior against the co-located
-> [TUI implementation notes](../src/cli/tui/ARCHITECTURE.md), source, and tests.
+> [TUI implementation notes](../crates/finch-tui/ARCHITECTURE.md), source, and tests.
 
 ## Overview
 
@@ -50,7 +50,7 @@ This document explains the complete architecture, from the lowest-level componen
                    │
                    v
 ┌─────────────────────────────────────────────────────────────────┐
-│ Layer 3: TUI Renderer (tui/mod.rs)                             │
+│ Layer 3: TUI Renderer (crates/finch-tui/src/lib.rs)             │
 │ - Manages Ratatui terminal with inline viewport                │
 │ - Syncs messages from OutputManager to ScrollbackBuffer        │
 │ - Renders input area, status bar, separator                    │
@@ -313,7 +313,7 @@ fn calculate_display_height(content: &str, terminal_width: usize) -> usize {
 
 ---
 
-### 4. TUI Renderer (`cli/tui/mod.rs`)
+### 4. TUI Renderer (`crates/finch-tui/src/lib.rs`)
 
 The TuiRenderer coordinates all TUI operations.
 
@@ -992,7 +992,7 @@ dialog.current_cursor()        // returns current cursor index (pub)
 
 ### Regression Tests
 
-All dialog regression tests live in `src/cli/tui/dialog.rs` `#[cfg(test)] mod tests`:
+All dialog regression tests live in `crates/finch-tui/src/dialog.rs` `#[cfg(test)] mod tests`:
 
 | Test | Covers |
 |------|--------|

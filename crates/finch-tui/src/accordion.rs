@@ -354,8 +354,8 @@ impl AccordionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use finch_messages::{Message, MessageRef, WorkUnit};
     use crate::view_model::project_work_unit;
+    use finch_messages::{Message, MessageRef, WorkUnit};
     use finch_theme::ColorScheme;
     use std::sync::Arc;
 
