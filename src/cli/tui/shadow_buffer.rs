@@ -13,8 +13,7 @@
 // - No truncation or text bleeding
 // - Efficient updates (only changed cells)
 
-use crate::cli::messages::MessageRef;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 
 // Line measurement moved to the widget vocabulary
 // (`crate::ui_model`) so components can measure text without this
@@ -181,88 +180,6 @@ impl ShadowBuffer {
         }
     }
 
-    /// Render messages to shadow buffer with proper wrapping
-    /// Returns bottom-aligned content (last N rows that fit)
-    pub fn render_messages(&mut self, messages: &[MessageRef], colors: &finch_theme::ColorScheme) {
-        // Clear buffer first
-        self.clear();
-
-        // Format all messages and collect lines with their styles
-        let mut all_lines: Vec<(String, Style)> = Vec::new(); // (line_text, style)
-        for msg in messages {
-            let formatted = msg.format(colors);
-            let lines: Vec<_> = formatted.lines().collect();
-            for (line_index, line) in lines.iter().enumerate() {
-                let style = overlay_sgr_style(
-                    line,
-                    msg.background_style_for_line(colors, line_index, lines.len())
-                        .unwrap_or_default(),
-                );
-                all_lines.push((line.to_string(), style));
-            }
-        }
-
-        if all_lines.is_empty() {
-            return;
-        }
-
-        // Calculate how many lines we need (with wrapping)
-        let mut line_row_counts: Vec<usize> = Vec::new();
-
-        for (line, _style) in &all_lines {
-            let visible_len = visible_length(line);
-            let rows = if visible_len == 0 {
-                1
-            } else {
-                (visible_len + self.width - 1) / self.width.max(1)
-            };
-            line_row_counts.push(rows);
-        }
-
-        // Bottom-align: determine which lines to render
-        let mut lines_to_render: Vec<(usize, &String, Style)> = Vec::new(); // (line_idx, line_text, style)
-        let mut accumulated_rows = 0;
-
-        // Walk backwards from last line
-        for (line_idx, ((line, style), row_count)) in
-            all_lines.iter().zip(&line_row_counts).enumerate().rev()
-        {
-            if accumulated_rows + row_count > self.height {
-                break; // Stop when can't fit more
-            }
-            lines_to_render.push((line_idx, line, *style));
-            accumulated_rows += row_count;
-        }
-
-        lines_to_render.reverse(); // Restore chronological order
-
-        // Calculate starting row (bottom-aligned)
-        let start_row = self
-            .height
-            .saturating_sub(accumulated_rows.min(self.height));
-
-        // Render lines with their styles, handling truncation if needed
-        let mut current_y = start_row;
-        for (_line_idx, line, style) in lines_to_render {
-            // Check if we have room left
-            let rows_available = self.height.saturating_sub(current_y);
-            if rows_available == 0 {
-                break; // No more room
-            }
-
-            let rows_consumed = self.write_line(current_y, line, style);
-
-            // If message was truncated (consumed more rows than available), that's ok
-            // The write_line method already handles this by capping at buffer height
-            current_y += rows_consumed;
-
-            // Stop if we've filled the buffer
-            if current_y >= self.height {
-                break;
-            }
-        }
-    }
-
     /// Render already-formatted terminal lines into the buffer, top-aligned.
     ///
     /// This is the entry point the live area uses: a frame is a list of logical
@@ -317,65 +234,6 @@ impl ShadowBuffer {
     }
 }
 
-/// Overlay SGR from a themed diff line onto the transcript band style.
-///
-/// Diff paint emits 38;2 / 48;2 so add/remove/context fill the row. The
-/// shadow buffer previously stripped those codes and kept only the band,
-/// which made header and context land as near-white ink on a light band.
-fn overlay_sgr_style(line: &str, band: Style) -> Style {
-    let mut style = band;
-    let bytes = line.as_bytes();
-    let mut index = 0;
-    while index + 1 < bytes.len() {
-        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
-            index += 1;
-            continue;
-        }
-        let rest = &bytes[index + 2..];
-        let Some(end) = rest.iter().position(|&byte| byte == b'm') else {
-            break;
-        };
-        let params = std::str::from_utf8(&rest[..end]).unwrap_or("");
-        if params.is_empty() || params == "0" {
-            // SGR reset returns to the message band, not the terminal default.
-            // User/tool rows end with `\x1b[0m`; wiping the band made those
-            // tests fail and left unpainted cells on the live viewport.
-            style = band;
-        } else {
-            let numbers = params
-                .split(';')
-                .filter_map(|part| part.parse::<u8>().ok())
-                .collect::<Vec<_>>();
-            let mut cursor = 0;
-            while cursor < numbers.len() {
-                match numbers[cursor] {
-                    0 => style = band,
-                    38 if numbers.get(cursor + 1) == Some(&2) && numbers.len() > cursor + 4 => {
-                        style = style.fg(Color::Rgb(
-                            numbers[cursor + 2],
-                            numbers[cursor + 3],
-                            numbers[cursor + 4],
-                        ));
-                        cursor += 4;
-                    }
-                    48 if numbers.get(cursor + 1) == Some(&2) && numbers.len() > cursor + 4 => {
-                        style = style.bg(Color::Rgb(
-                            numbers[cursor + 2],
-                            numbers[cursor + 3],
-                            numbers[cursor + 4],
-                        ));
-                        cursor += 4;
-                    }
-                    _ => {}
-                }
-                cursor += 1;
-            }
-        }
-        index += 2 + end + 1;
-    }
-    style
-}
-
 /// Diff two shadow buffers and return changed cells
 /// Returns Vec<(x, y, cell)> for cells that changed
 pub fn diff_buffers(current: &ShadowBuffer, previous: &ShadowBuffer) -> Vec<(usize, usize, Cell)> {
@@ -413,9 +271,8 @@ pub fn diff_buffers(current: &ShadowBuffer, previous: &ShadowBuffer) -> Vec<(usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::UserQueryMessage;
+    use crate::cli::messages::{Message, UserQueryMessage};
     use crate::config::{ColorTheme, MessageBand};
-    use std::sync::Arc;
 
     #[test]
     fn test_visible_length() {
@@ -606,10 +463,17 @@ mod tests {
     fn message_band_fills_the_complete_terminal_row() {
         let colors = ColorTheme::Dark.to_scheme();
         let expected = colors.message_band_style(MessageBand::LocalUser);
-        let messages: Vec<MessageRef> = vec![Arc::new(UserQueryMessage::new("hello"))];
+        let message = UserQueryMessage::new("hello");
+        let band = message
+            .background_style_for_line(&colors, 0, 1)
+            .expect("user messages carry a band style");
+        assert_eq!(
+            band, expected,
+            "user message must select the local-user band"
+        );
         let mut buf = ShadowBuffer::new(24, 2);
 
-        buf.render_messages(&messages, &colors);
+        buf.write_line(1, "hello", band);
 
         for column in 0..buf.width {
             assert_eq!(buf.get(column, 1).unwrap().style, expected);
@@ -620,12 +484,22 @@ mod tests {
     fn message_band_paints_interior_blank_rows() {
         let colors = ColorTheme::Dark.to_scheme();
         let expected = colors.message_band_style(MessageBand::LocalUser);
-        let messages: Vec<MessageRef> = vec![Arc::new(UserQueryMessage::new("top\n\nbottom"))];
+        let message = UserQueryMessage::new("top\n\nbottom");
+        let band = message
+            .background_style_for_line(&colors, 1, 3)
+            .expect("blank user-message lines carry a band style");
+        assert_eq!(band, expected, "blank lines must retain the user band");
         let mut buf = ShadowBuffer::new(12, 3);
 
-        buf.render_messages(&messages, &colors);
+        buf.write_line(0, "top", band);
+        buf.write_line(1, "", band);
+        buf.write_line(2, "bottom", band);
 
-        assert_eq!(buf.get(0, 0).unwrap().ch, ' ');
+        assert_eq!(
+            buf.get(0, 0).unwrap().ch,
+            't',
+            "first line must remain visible"
+        );
         for column in 0..buf.width {
             assert_eq!(buf.get(column, 1).unwrap().style, expected);
         }
@@ -636,10 +510,15 @@ mod tests {
     fn message_band_paints_every_wrapped_physical_row() {
         let colors = ColorTheme::Dark.to_scheme();
         let expected = colors.message_band_style(MessageBand::LocalUser);
-        let messages: Vec<MessageRef> = vec![Arc::new(UserQueryMessage::new("abcdefghij"))];
+        let message = UserQueryMessage::new("abcdefghijklm");
+        let band = message
+            .background_style_for_line(&colors, 0, 1)
+            .expect("user messages carry a band style");
+        assert_eq!(band, expected, "wrapped rows must retain the user band");
         let mut buf = ShadowBuffer::new(6, 3);
 
-        buf.render_messages(&messages, &colors);
+        let rows = buf.write_line(0, "abcdefghijklm", band);
+        assert_eq!(rows, 3, "fixture must span every physical row");
 
         for row in 0..buf.height {
             for column in 0..buf.width {
