@@ -344,10 +344,10 @@ fn test_tui_production_does_not_name_project_context() {
 #[test]
 fn test_tui_production_does_not_reach_up_for_owned_completion_state() {
     let autocomplete = production_hits("crate::cli::command_autocomplete");
-    let suggestions = production_hits("crate::cli::suggestions");
+    let suggestions = production_hits("SuggestionManager");
     assert!(
         autocomplete.is_empty() && suggestions.is_empty(),
-        "tui-owned command completion and suggestion state must stay below the TUI facade; \
+        "TUI completion must remain local and the unused suggestion manager must not return; \
          autocomplete={autocomplete:?}, suggestions={suggestions:?}"
     );
 }

@@ -15,7 +15,7 @@ enum CompletionMode {
 
 /// Autocomplete state for TUI rendering
 #[derive(Debug, Clone, Default)]
-pub struct AutocompleteState {
+pub(crate) struct AutocompleteState {
     /// Matched commands from registry
     pub matches: Vec<CommandSpec>,
     mention_matches: Vec<MentionCandidate>,

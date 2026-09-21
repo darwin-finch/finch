@@ -378,14 +378,6 @@ pub struct StatusLine { … }
 pub enum StatusLineType { SessionLabel, SessionUsage, MemoryContext, ConversationTopic, ConversationFocus, ContextLine, BrainContextLine, LiveStats, AgentActivity, TrainingStats, DownloadProgress, OperationStatus, Suggestions, CompactionPercent, Custom }
 /// Streaming response message (for Claude/Qwen) Re-exported from `cli::messages`.
 pub struct StreamingResponseMessage { … }
-/// A single suggestion with optional keyboard shortcut Re-exported from `cli::tui`.
-pub struct Suggestion { … }
-/// Context for generating suggestions Re-exported from `cli::tui`.
-pub enum SuggestionContext { FirstRun, Idle, QueryComplete, QueryError, Streaming, ModelLoading, ToolExecution }
-/// Manages contextual suggestions Re-exported from `cli::tui`.
-pub struct SuggestionManager { … }
-/// Source of suggestions Re-exported from `cli::tui`.
-pub enum SuggestionSource { Hardcoded, LLM }
 /// Tabbed dialog for multiple questions Re-exported from `cli::tui`.
 pub struct TabbedDialog { … }
 /// Result from a tabbed dialog Re-exported from `cli::tui`.

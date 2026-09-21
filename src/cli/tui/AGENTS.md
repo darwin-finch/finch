@@ -8,9 +8,10 @@ ScrollView, disclosure (accordion), and activity rows.
 This is not a published crate. The test is whether production code here can draw without naming
 Finch's poset, tool, or runtime vocabularies.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every item the facade re-exports. Child
-modules stay private except `activity`, which callers already name. Add public surface by
-re-exporting it from `mod.rs`, then regenerate with `python3 scripts/generate_interfaces.py --write`.
+**Boundary:** the [README](README.md) explains the two caller workflows and ownership.
+[`mod.rs`](mod.rs) is the facade; child modules stay private except `activity`, which callers
+already name. Add public surface only when a real caller needs a flat re-export. Do not recreate
+a generated symbol catalog.
 `view_model` is `pub(crate)`: projection-feeding consumers and their tests project messages
 through it, so it is reachable crate-wide but is not published facade surface.
 
@@ -218,8 +219,9 @@ module of this crate, **or** the remaining ones are written down here with the r
 - **Sibling CLI types** (`cli::messages`, `cli::diff`, `cli::llm_dialogs`, `StatusBar`,
   `AskUserQuestion*`) — the renderer uses the `Message` trait to request WorkUnit snapshots and
   delegates their pure projection to `finch-ui-model`; `cli::diff` renders diff bodies while the
-  snapshot is constructed. Command-completion metadata and contextual suggestion state are owned
-  directly by this capsule in `command_autocomplete.rs` and `suggestions.rs`.
+  snapshot is constructed. Command-completion metadata is owned directly by this capsule in
+  `command_autocomplete.rs`; its types and `AutocompleteState` remain crate-visible only, not
+  facade exports. The unused contextual-suggestion subsystem was removed.
 - **`crate::ABOUT`** — startup header copy.
 - **`crate::is_editor_active` and `crate::finch_ipc_capnp` in `async_input.rs`** — the input task
   must not steal keys while `$EDITOR` is in the foreground, and it talks to the local control
@@ -236,8 +238,8 @@ module of this crate, **or** the remaining ones are written down here with the r
 returning. `test_tui_production_does_not_name_project_context` keeps filesystem discovery,
 ignore/budget policy, and attachment snapshots behind the injected `MentionPort`; its application
 adapter is [`src/cli/mention_session.rs`](../mention_session.rs).
-`test_tui_production_does_not_reach_up_for_owned_completion_state` keeps command completion and
-suggestion state under this facade instead of reaching through `crate::cli`.
+`test_tui_production_does_not_reach_up_for_owned_completion_state` keeps command completion
+under this facade instead of reaching through `crate::cli`.
 `test_scanner_would_fail_if_runtime_returned_to_spreadsheet_preview_rows` and
 `test_scanner_would_fail_if_tools_returned_to_tool_approval` fail if the scanner can no longer
 see those production functions (the original leak sites).
