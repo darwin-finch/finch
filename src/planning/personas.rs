@@ -14,7 +14,7 @@
 /// - Security — when the plan touches auth/crypto/secrets/permissions
 /// - Architecture — when the plan introduces modules/traits/dependencies/refactors
 /// - Scope Creep — when the plan has more than 6 numbered steps
-pub fn select_active_personas(plan_text: &str) -> Vec<&'static str> {
+pub(crate) fn select_active_personas(plan_text: &str) -> Vec<&'static str> {
     let lower = plan_text.to_lowercase();
 
     // Tests & Docs is always active: every plan must include regression tests

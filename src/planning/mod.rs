@@ -9,10 +9,7 @@ mod personas;
 mod types;
 
 pub use loop_runner::PlanLoop;
-pub use personas::select_active_personas;
-pub use types::{
-    ConvergenceResult, CritiqueItem, ImpcpdConfig, PlanIteration, PlanResult, UserFeedback,
-};
+pub use types::{CritiqueItem, ImpcpdConfig, PlanIteration, PlanResult};
 
 /// The IMPCPD runtime methodology spec, embedded at compile time.
 ///
@@ -69,9 +66,6 @@ mod tests {
         let _ = std::any::type_name::<PlanResult>();
         let _ = std::any::type_name::<PlanIteration>();
         let _ = std::any::type_name::<CritiqueItem>();
-        let _ = std::any::type_name::<ConvergenceResult>();
-        let _ = std::any::type_name::<UserFeedback>();
-        let _ = select_active_personas;
         let _ = IMPCPD_METHODOLOGY;
     }
 
