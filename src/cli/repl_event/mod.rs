@@ -43,26 +43,23 @@ mod runner_recovery;
 mod tool_display;
 mod tool_execution;
 
-// `EventLoop::new` takes these, so a caller outside this module has to be able to name them.
+// `EventLoop::new` takes the construction parts, so callers must be able to name them.
 pub(crate) use brain_selection::{parse_reasoning_effort, persistable_selection};
 pub use brain_selection::{
     resolve_selection, EffectiveSelection, SelectionRequest, SelectionSource,
 };
 pub(crate) use event_loop::resolve_provider_profile;
 pub use event_loop::EventLoop;
-pub use events::{ConfirmationResult, LlmRequest, ReplEvent};
-pub use llm_loop::LlmLoop;
+pub(crate) use events::LlmRequest;
+pub use events::{ConfirmationResult, ReplEvent};
 pub use memory_commitment::{
     memory_commitment_journal, CommittedMemoryRecord, MemoryCommitmentReceiver,
     MemoryCommitmentTarget, MemoryCommitmentWriter,
 };
 pub use parts::{
-    ContextLimits, DaemonParts, GenerationParts, LlmChannels, LlmGeneration, LlmRuntime,
-    LlmSession, LlmTools, LlmUi, RuntimeParts, SessionParts, ToolParts, UiParts,
+    ContextLimits, DaemonParts, GenerationParts, RuntimeParts, SessionParts, ToolParts, UiParts,
 };
 pub(crate) use plan_handler::{
     is_tool_allowed_in_mode, PLANNING_ALLOWED_TOOLS, PLANNING_ALLOWED_TOOL_ALIASES,
 };
-pub use query_state::{QueryMetadata, QueryState, QueryStateManager};
 pub use tool_display::{format_token_count, format_tool_label};
-pub use tool_execution::ToolExecutionCoordinator;
