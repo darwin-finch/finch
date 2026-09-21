@@ -34,10 +34,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tui_textarea::TextArea;
 
-#[cfg(test)]
-use super::OutputManager;
 use finch_messages::{MessageId, MessageRef, MessageStatus, WorkUnitPresentation};
 use finch_ui_model::input_line_physical_rows_with_ghost;
+#[cfg(test)]
+use test_support::{OutputManager, StatusBar, StatusLineType};
 // Sub-modules
 mod accordion;
 pub mod activity;
@@ -54,6 +54,8 @@ mod scroll_view;
 mod shadow_buffer; // kept – good architecture for future diffing
 mod tabbed_dialog;
 mod tabbed_dialog_widget; // kept for wizard helpers
+#[cfg(test)]
+mod test_support;
 mod tool_viewport;
 #[cfg(test)]
 mod vt_oracle;
@@ -4559,7 +4561,6 @@ mod tests {
     use super::*;
     use crate::cli::messages::{Message, MessageId, MessageRef, WorkUnit};
     use crate::cli::tui::vt_oracle::{VtColor, VtOracle, VtStyle};
-    use crate::cli::{StatusBar, StatusLineType};
     use finch_diff::{summarize_files, DiffColorMode, FileDiff};
     use finch_theme::ColorTheme;
 
@@ -4815,16 +4816,16 @@ mod tests {
     ) {
         let mut renderer = renderer_owning_mouse_capture();
         renderer.active_tabbed_dialog = Some(TabbedDialog::new(
-            vec![crate::cli::llm_dialogs::Question {
+            vec![QuestionView {
                 question: "Which path?".into(),
                 header: "Path".into(),
                 options: vec![
-                    crate::cli::llm_dialogs::QuestionOption {
+                    QuestionOptionView {
                         label: "A".into(),
                         description: "first".into(),
                         markdown: None,
                     },
-                    crate::cli::llm_dialogs::QuestionOption {
+                    QuestionOptionView {
                         label: "B".into(),
                         description: "second".into(),
                         markdown: None,
@@ -5781,13 +5782,13 @@ mod tests {
     fn startup_header_is_plain_scrollback_content() {
         let header = TuiRenderer::startup_header(
             env!("CARGO_PKG_VERSION"),
-            crate::ABOUT,
+            "test tagline",
             "grok-code-fast-1",
             "~/repo",
             "amber-river",
         );
         assert!(header.contains(&format!("finch v{}", env!("CARGO_PKG_VERSION"))));
-        assert!(header.contains(crate::ABOUT));
+        assert!(header.contains("test tagline"));
         assert!(header.contains("grok-code-fast-1"));
         assert!(header.contains("amber-river  ·  ~/repo"));
         assert!(!header.contains('\x1b'));
@@ -5811,7 +5812,7 @@ mod tests {
     fn startup_tagline_renders_below_the_mascot_not_through_it() {
         let header = TuiRenderer::startup_header(
             env!("CARGO_PKG_VERSION"),
-            crate::ABOUT,
+            "test tagline",
             "grok-code-fast-1",
             "~/repo",
             "amber-river",
@@ -5819,7 +5820,7 @@ mod tests {
         let body_at = header
             .find("\u{2580}███████▌")
             .or_else(|| header.find("▐████████▌"));
-        let tagline_at = header.find(crate::ABOUT);
+        let tagline_at = header.find("test tagline");
         let (body_at, tagline_at) = (
             body_at.expect("the mascot body line must be present"),
             tagline_at.expect("the tagline must be present"),
@@ -7302,13 +7303,6 @@ mod tests {
             submitted, selected,
             "Enter must apply the selected completion before submit; composer was still '/' which parses as Help"
         );
-        assert!(
-            !matches!(
-                crate::cli::commands::Command::parse(&submitted),
-                Some(crate::cli::commands::Command::Help)
-            ),
-            "submitted {submitted:?} must not be the Help catch-all"
-        );
     }
 
     #[test]
@@ -7326,10 +7320,6 @@ mod tests {
             submitted, "/",
             "Enter must not apply a completion the user could not see"
         );
-        assert!(matches!(
-            crate::cli::commands::Command::parse(&submitted),
-            Some(crate::cli::commands::Command::Help)
-        ));
     }
 
     #[test]
@@ -7340,10 +7330,6 @@ mod tests {
 
         let submitted = dispatch_composer(&mut renderer, KeyCode::Enter).unwrap();
         assert_eq!(submitted, "/help");
-        assert!(matches!(
-            crate::cli::commands::Command::parse(&submitted),
-            Some(crate::cli::commands::Command::Help)
-        ));
     }
 
     #[test]
@@ -10694,7 +10680,6 @@ mod draw_dialog_tests {
 #[cfg(test)]
 mod attention_bell_tests {
     use super::*;
-    use crate::cli::StatusBar;
     use std::sync::Arc;
 
     fn headless_renderer() -> TuiRenderer {
