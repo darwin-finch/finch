@@ -211,7 +211,7 @@ impl MemTree {
     /// an identical retry returns `Ok` off the wreckage of the failed attempt.
     /// The one production caller restores from the durable snapshot; a new one
     /// must do the same or restore some other way.
-    pub fn insert_with_effect(
+    pub(crate) fn insert_with_effect(
         &mut self,
         text: String,
         embedding: Vec<f32>,

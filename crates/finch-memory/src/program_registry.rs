@@ -147,7 +147,7 @@ impl MemorySystem {
     }
 
     /// Load canonical index rows for every current non-deprecated version.
-    pub async fn latest_program_indexes(&self) -> Result<Vec<ProgramIndexRecord>> {
+    pub(crate) async fn latest_program_indexes(&self) -> Result<Vec<ProgramIndexRecord>> {
         let conn = self.db.lock().await;
         let mut stmt = conn.prepare(
             "SELECT p.id, p.version, p.name, p.language, p.source, p.documentation,

@@ -2698,7 +2698,10 @@ impl MemorySystem {
     /// Returns an empty `lines` vec when no turns have been recorded yet.
     /// Consecutive identical lines are de-duplicated so a short session
     /// (few leaves) produces compact, non-redundant output.
-    pub async fn conversation_summary(&self, depth: usize) -> Result<ConversationSummaryLines> {
+    pub(crate) async fn conversation_summary(
+        &self,
+        depth: usize,
+    ) -> Result<ConversationSummaryLines> {
         if depth == 0 {
             return Ok(ConversationSummaryLines::default());
         }
