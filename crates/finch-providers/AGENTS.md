@@ -7,13 +7,12 @@ boundary, provider-neutral wire types and stream events, model catalog, capabili
 usage/allowance, OAuth lifecycle (`oauth` module), provider-specific OAuth dialects,
 and the Claude / OpenAI-compatible / Gemini / ChatGPT / SuperGrok adapters.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`. Child
-modules are private; the `pub use` list is the whole public surface. Finch consumes
-this crate through compatibility facades at `src/providers` and `src/oauth`.
-
-**Documentation:** [`docs/README.md`](docs/README.md) owns crate-local reference
-material. Provider transport notes remain in the shared docs tree until they are
-extracted here.
+**Boundary:** [README.md](README.md) traces configured-provider and setup-catalog callers.
+[`src/lib.rs`](src/lib.rs) is the facade; handwritten child modules are private except the
+currently public `oauth` path, which has external callers and requires a separate flattening
+decision. Rustdoc renders callable methods. Finch uses compatibility facades at `src/providers`
+and `src/oauth`. Do not regenerate a signature catalog. Provider transport notes remain in the
+shared docs tree until they are extracted here.
 
 **Dependencies:** this unpublished crate depends on HTTP/crypto/async libraries and
 never on the root `finch` crate, Brain, TUI, daemon, CLI orchestration, tools
@@ -54,12 +53,13 @@ Feature-disabled builds: `cargo check -p finch-providers --no-default-features`.
 Default features enable the current Claude, OpenAI-compatible, Gemini, ChatGPT,
 and SuperGrok subscription adapters.
 
-**Agent-context audit:** a worker can understand, implement against, and test this
-crate from this capsule plus `INTERFACE.md` without opening Finch application
-code. Config-taking factory mapping remains in Finch `src/providers`.
+**Agent-context audit:** a worker can implement a transport using this capsule, README, facade,
+and rustdoc without opening Finch application code. Config-taking factory mapping remains in
+Finch `src/providers`.
 
 **Named remainders (not this extraction):**
 - Thread streaming HTTP through adapter constructors (named remainder of #775).
 - Feature-gate optional deps (`reqwest`/`png`/`ring`) so `--no-default-features` drops them (Issue 4 / #775).
 - Stop baking `~/.finch` into crate constructors; Finch should pass cache/store roots (Issue 5 / #775).
-- `generate_interfaces.py` omits `async fn` trait methods (Issue 6 / hygiene).
+- The public `oauth` child module path is an exception to the flat facade convention; audit
+  external callers before flattening it.

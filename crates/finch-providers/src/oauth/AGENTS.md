@@ -12,6 +12,9 @@ injected through `ProviderPorts`.
 ## Boundary
 
 - The public contract is this module's facade. Callers must not name child modules.
+- The [README](README.md) traces ChatGPT and Grok CLI callers. [`mod.rs`](mod.rs) is the
+  callable facade; rustdoc renders methods on its exported types. Do not recreate a signature
+  catalog.
 - `file_store` is a private `OAuthCredentialStore` implementation. Construct
   `FileOAuthCredentialStore` from the module export.
 - Credential types are crate-level (`AudienceBinding`, `CredentialKind`,
@@ -33,5 +36,5 @@ injected through `ProviderPorts`.
 ## Focused tests
 
 ```bash
-./scripts/test_brains.sh cargo test -p finch-providers --lib -- oauth::
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-providers --lib -- oauth::
 ```
