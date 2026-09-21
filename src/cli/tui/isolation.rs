@@ -22,7 +22,7 @@ fn production_source(path: &Path) -> String {
 ///
 /// Only `mod name { ... }` and `mod name;` after the attribute are skipped. A `#[cfg(test)]`
 /// on a fn, method, or `use` is left in place: treating the next `mod` in the file as that
-/// attribute's item blanks the production between them — including `spreadsheet_preview_rows`
+/// attribute's item blanks the production between them — including a later live-area function
 /// and any later production item after `TuiRenderer::new_headless`.
 fn strip_cfg_test_modules(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -224,13 +224,13 @@ fn insert_into_fn(source: &str, fn_name: &str, payload: &str) -> String {
 fn test_strip_does_not_treat_cfg_test_fn_or_use_as_a_module() {
     // Shape of src/cli/tui/mod.rs: a cfg(test) method, then production leak sites, then
     // `mod tests`. The old scanner took the next `mod ` after any `#[cfg(test)]` and blanked
-    // everything between — including spreadsheet_preview_rows and a later Poset leak.
+    // everything between — including a production function and a later Poset leak.
     let src = concat!(
         "impl TuiRenderer {\n",
         "    #[cfg(test)]\n",
         "    pub(crate) fn new_headless() {}\n",
-        "    pub(crate) fn spreadsheet_preview_rows() {\n",
-        "        crate::runtime::workbook_cell_to_string\n",
+        "    pub(crate) fn production_after_test_fn() {\n",
+        "        crate::runtime::example_call\n",
         "    }\n",
         "    pub fn production_poset_adapter() { crate::poset::Poset }\n",
         "}\n",
@@ -247,8 +247,8 @@ fn test_strip_does_not_treat_cfg_test_fn_or_use_as_a_module() {
     let runtime = hits_in(&stripped, "fixture.rs", "crate::runtime");
     assert_eq!(
         runtime,
-        ["fixture.rs:5:crate::runtime::workbook_cell_to_string"],
-        "#[cfg(test)] fn must not blank production spreadsheet_preview_rows; \
+        ["fixture.rs:5:crate::runtime::example_call"],
+        "#[cfg(test)] fn must not blank a later production function; \
          test-module names must stay hidden. hits={runtime:?}\n{stripped}"
     );
     assert!(
@@ -268,24 +268,19 @@ fn test_strip_does_not_treat_cfg_test_fn_or_use_as_a_module() {
 }
 
 #[test]
-fn test_scanner_would_fail_if_runtime_returned_to_spreadsheet_preview_rows() {
+fn test_scanner_would_fail_if_runtime_returned_to_draw_live_area() {
     let src = production_source(&tui_dir().join("mod.rs"));
     assert!(
-        find_fn(&src, "spreadsheet_preview_rows").is_some(),
-        "production scan dropped spreadsheet_preview_rows; the original crate::runtime leak \
-         site is invisible to the isolation tests"
+        find_fn(&src, "draw_live_area").is_some(),
+        "production scan dropped draw_live_area; a runtime leak in active renderer code \
+         would be invisible to the isolation tests"
     );
-    let poisoned = insert_into_fn(
-        &src,
-        "spreadsheet_preview_rows",
-        " crate::runtime::workbook_cell_to_string; ",
-    );
+    let poisoned = insert_into_fn(&src, "draw_live_area", " crate::runtime::example_call; ");
     let hits = hits_in(&poisoned, "mod.rs", "crate::runtime");
     assert!(
-        hits.iter()
-            .any(|hit| hit.contains("workbook_cell_to_string")),
+        hits.iter().any(|hit| hit.contains("example_call")),
         "scanner would not fail if crate::runtime were re-added inside production \
-         spreadsheet_preview_rows: {hits:?}"
+         draw_live_area: {hits:?}"
     );
 }
 
@@ -316,8 +311,8 @@ fn test_tui_production_does_not_name_finch_tools_or_runtime() {
     let runtime = production_hits("crate::runtime");
     assert!(
         runtime.is_empty(),
-        "tui production must not name crate::runtime; spreadsheet cells are formatted by \
-         tui::cell_format, not host-I/O: {runtime:?}"
+        "tui production must not name crate::runtime; the renderer owns terminal projection, \
+         not host effects or workbook parsing: {runtime:?}"
     );
 }
 

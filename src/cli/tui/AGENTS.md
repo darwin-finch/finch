@@ -182,7 +182,6 @@ draws a view, and the caller converts.
 | [`activity::ActivityRow`](activity.rs) | indented status text | todos / agent tasks, in `cli::repl_event::activity_view` |
 | `Dialog::tool_approval(name, summary)` | a name and a summary line | Finch `ToolUse`, in `cli::repl_event::tool_display::tool_approval_dialog` |
 | `MentionCandidate` / `MentionSubmission` | speakable picker rows, insertion tokens, and provider-independent selected bytes | `context::mention`, through the injected CLI adapter in `cli::mention_session` |
-| [`cell_format::workbook_cell_to_string`](cell_format.rs) | one cell as text | calamine `Data`, inside `spreadsheet_preview_rows` |
 
 When `active_dialog` first occupies the live surface, `draw_live_area` writes one terminal bell
 (`\x07`). Redraws of the same pending card stay silent. OS notifications, duration-threshold
@@ -210,10 +209,6 @@ module of this crate, **or** the remaining ones are written down here with the r
 
 **Finch modules this directory still names in production, and why they stay:**
 
-- **`crate::workbook::{bounded_worksheet_range, MAX_WORKBOOK_CELLS}` in `spreadsheet_preview_rows`**
-  — the file viewer still lives in this renderer. It opens a workbook and maps cells through
-  tui-owned `cell_format`. Pulling the viewer out is the cheaper cut if the framework is ever
-  extracted; until then the bound stays next to the preview that needs it.
 - **`crate::theme::ColorScheme`** — leaf colour scheme, re-exported so callers write
   `crate::cli::tui::ColorScheme`. Theme is not Finch domain vocabulary.
 - **Sibling CLI types** (`cli::messages`, `cli::diff`, `cli::llm_dialogs`, `StatusBar`,
@@ -240,6 +235,6 @@ ignore/budget policy, and attachment snapshots behind the injected `MentionPort`
 adapter is [`src/cli/mention_session.rs`](../mention_session.rs).
 `test_tui_production_does_not_reach_up_for_owned_completion_state` keeps command completion
 under this facade instead of reaching through `crate::cli`.
-`test_scanner_would_fail_if_runtime_returned_to_spreadsheet_preview_rows` and
+`test_scanner_would_fail_if_runtime_returned_to_draw_live_area` and
 `test_scanner_would_fail_if_tools_returned_to_tool_approval` fail if the scanner can no longer
-see those production functions (the original leak sites).
+see those production functions; the removed file viewer is no longer a scan target.
