@@ -57,6 +57,8 @@ CURRENT_DOCS = (
     Path("src/cli/README.md"),
     Path("src/cli/tui/AGENTS.md"),
     Path("src/cli/tui/README.md"),
+    Path("src/node/AGENTS.md"),
+    Path("src/node/README.md"),
     Path("src/generators/AGENTS.md"),
     Path("src/generators/README.md"),
     Path("src/config/AGENTS.md"),
