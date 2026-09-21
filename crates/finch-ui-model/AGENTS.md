@@ -13,9 +13,9 @@ does not own their presentation projection.
 lifecycle, `crossterm`, shadow-buffer painting, input handling, or application composition. Those
 layers depend on this capsule; this capsule does not depend back on them.
 
-**Facade:** [`src/lib.rs`](src/lib.rs) is the complete flat facade. There are no public child-module paths.
-[`INTERFACE.md`](INTERFACE.md) is generated with
-`python3 scripts/generate_interfaces.py --write` and must not be edited by hand.
+**Boundary:** the [README](README.md) traces message-producer and TUI callers.
+[`src/lib.rs`](src/lib.rs) is the complete flat facade; rustdoc supplies exact methods on
+exported types. There are no public child-module paths. Do not recreate a signature catalog.
 
 **Dependencies:** none of Finch's other subsystems. `unicode-width` supplies the same terminal-cell
 tables used before extraction, and `uuid` supplies stable message identity. Child modules are
