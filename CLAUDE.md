@@ -17,31 +17,32 @@ or release-readiness claims without dated evidence; see Issues #74, #98, #120, a
 
 [`DESIGN.md`](DESIGN.md) describes how Finch is composed: what the modules are, how they depend on
 each other, operating modes, storage layout, and the technology stack. The tree itself is the
-record — a directory's `AGENTS.md` says what that directory is, and its `INTERFACE.md` says what it
-exposes.
+record — a directory's `AGENTS.md` states its working contract, its `README.md` explains its
+purpose when present, and its Rust facade states what it exports.
 
-### Every source directory has an AGENTS.md; read it first
+### Read the local agent contract and narrative before the facade
 
-A source directory's `AGENTS.md` states what that subtree is for, what it exposes, what it may
-depend on, and how to test it. **Read it, and the `INTERFACE.md` beside it, before you decide
-anything about that subtree** — before grepping, before opening files, and certainly before
-changing code. It exists so you do not have to read the subtree to find out what the subtree does.
-It supplements this file; it never replaces it.
+A source directory's `AGENTS.md` states what that subtree owns, what it may depend on, its
+invariants, and how to test it. A `README.md`, where present, explains why it exists and shows
+caller workflows. **Read both before inspecting that subtree**, then read `mod.rs` or a crate's
+`src/lib.rs` for the exported surface. These documents supplement this file; neither replaces it.
 
-The same document is how you *use* a module from outside it. To call into `src/memory`, read
-`src/memory/INTERFACE.md` — not `src/memory/*.rs`. Reading another module's implementation to
-learn its surface means the surface was not stated well enough; fix the document rather than
-working around it.
+To call into another module, use its README and agent contract for meaning and constraints, its
+facade for exports, and rustdoc for methods on re-exported types. Rustdoc derives the callable
+signatures from source; do not recreate them as a checked-in symbol catalog. If that route still
+requires reading private implementations to answer a caller task, record the gap and improve the
+boundary instead of inventing a generic abstraction.
 
-**Keeping it true is part of the change, not follow-up work.** If you alter what a module exposes,
-what it depends on, or what it is for, you update its `AGENTS.md` in the same commit. A capsule
-that describes the module as it was is worse than no capsule, because it is trusted. `INTERFACE.md`
-is generated from the facade, so you regenerate rather than edit it:
-`python3 scripts/generate_interfaces.py --write`.
+**Keeping it true is part of the change, not follow-up work.** If you alter what a module owns or
+depends on, update its `AGENTS.md` in the same commit. If you change its purpose or caller
+workflow, update its `README.md`. A capsule that describes an obsolete boundary is worse than
+none. Legacy `INTERFACE.md` files are transitional and should be retired with a human README,
+not regenerated for migrated modules.
 
-A module directory earns a capsule when something outside it depends on it. The `mod.rs` is the
-interface: child modules stay private and the `pub use` list is the whole public surface, so a
-reader learns the module from one screen instead of from every file in it.
+A module directory earns a capsule when something outside it depends on it. For a root-package
+module, `mod.rs` is the facade; for a library crate, `src/lib.rs` is the crate-root facade. Keep
+child modules private and use deliberate flat re-exports. The facade identifies entry points;
+rustdoc shows methods on re-exported types without duplicating their signatures in prose.
 
 ## Invariants
 
@@ -78,10 +79,9 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 
 ### Subsystem interfaces
 
-- **Every subsystem's `INTERFACE.md` matches its facade** — an agent must be able to read what a
-  subsystem offers without opening its source, so the file is generated and checked, never hand-
-  edited. Change a public item, then run `python3 scripts/generate_interfaces.py --write` and commit
-  the result — `scripts/test_generate_interfaces.py`, and the check in `repository-hygiene.yml`
+- **The facade defines the public surface** — child modules stay private and callers enter through
+  `mod.rs` or `src/lib.rs`. Migrated modules carry a human README and no generated
+  `INTERFACE.md`; the remaining legacy catalogs are checked only until their modules migrate.
 
 ### GUI Accessibility
 

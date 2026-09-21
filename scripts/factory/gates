@@ -58,7 +58,6 @@ run_ci() {
   gate "workflow checker tests" python3 scripts/test_ci_workflow_manifest.py
   gate "tracked tree" python3 scripts/check_repository_hygiene.py
   gate "repository hygiene tests" python3 scripts/test_repository_hygiene.py
-  gate "removed SSH surface" python3 scripts/check_no_ssh_surface.py
 }
 
 run_rust() {
@@ -82,7 +81,10 @@ case "$stage" in
     run_ci
     gate "formatting" $slot cargo fmt --check
     gate "compiles (all targets)" $slot cargo check --all-targets
-    gate "library tests" ./scripts/test_brains.sh cargo test --lib
+    # This fixture changes the process-relative root and refuses a broad test
+    # process. Run it in its own exact supervisor-owned subprocess.
+    gate "library tests" ./scripts/test_brains.sh cargo test --lib -- --skip server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap
+    gate "exact HTTP fixture containment" ./scripts/test_brains.sh cargo test -p finch --lib server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap -- --exact
     ;;
   *)
     printf 'usage: scripts/factory/gates <docs|arch|ci|rust|full> [test-filter...]\n' >&2

@@ -3,6 +3,10 @@
 //! Forth and Lisp lower into Finch's shared typed runtime. This module gives
 //! definitions a shared identity, metadata model, and discovery manifest; it
 //! must never select a legacy evaluator as an alternate invocation ABI.
+//!
+//! The crate README traces the application registry's use of [`ProgramDefinition`] and
+//! [`VmManifest`], and the REPL's use of [`capture_with_compiler_context_from_env`] with a lazy
+//! [`ProgramCompilerContext`]. Rustdoc renders the callable methods on re-exported types.
 
 mod forth_tokens;
 

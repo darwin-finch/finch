@@ -3,6 +3,12 @@
 //! Speculative/background activity is represented by `BrainRun` records in
 //! the named Brain service. There is deliberately no second client-local
 //! "Brain session" or hidden context-injection path here.
+//!
+//! The crate README follows two callers. The server's lifecycle service uses
+//! [`BrainStore::snapshot`], [`BrainStore::start_run_with_parent`], and [`BrainStore::attach`].
+//! The interactive REPL uses [`AttachedBrainClient::local`], [`AttachedBrainClient::remote`],
+//! and [`RemoteBrainClient::new_with_invitation`]. Rustdoc renders these methods on the
+//! re-exported types without a separate API catalog.
 
 mod attachment;
 mod background;
