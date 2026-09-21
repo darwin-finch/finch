@@ -79,6 +79,7 @@ pub use dialog_widget::DialogWidget;
 pub use shadow_buffer::{
     extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
 };
+pub use tabbed_dialog::{QuestionOptionView, QuestionView};
 
 /// One speakable project-resource row offered by the composer mention picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4313,50 +4314,6 @@ impl TuiRenderer {
         options: Vec<DialogOption>,
     ) -> Result<DialogResult> {
         self.show_dialog(Dialog::select(title, options))
-    }
-
-    /// Show structured questions from the LLM (AskUserQuestion tool).
-    ///
-    /// - 1 question  → single inline `show_dialog` (same as before)
-    /// - 2+ questions → `show_tabbed_dialog` so all questions are visible at once
-    pub fn show_llm_question(
-        &mut self,
-        input: &crate::cli::AskUserQuestionInput,
-    ) -> Result<crate::cli::AskUserQuestionOutput> {
-        use crate::cli::llm_dialogs;
-        use std::collections::HashMap;
-
-        if input.questions.len() > 1 {
-            let tabbed = TabbedDialog::new(input.questions.clone(), None);
-            let result = self.show_tabbed_dialog(tabbed)?;
-            let answers = match result {
-                TabbedDialogResult::Completed(answers) => answers,
-                TabbedDialogResult::Cancelled => HashMap::new(),
-            };
-            let annotations = llm_dialogs::build_annotations(&input.questions, &answers);
-            return Ok(crate::cli::AskUserQuestionOutput {
-                questions: input.questions.clone(),
-                answers,
-                annotations,
-            });
-        }
-
-        // Single question — inline dialog path
-        let mut answers: HashMap<String, String> = HashMap::new();
-        if let Some(question) = input.questions.first() {
-            let dialog = llm_dialogs::question_to_dialog(question);
-            let result = self.show_dialog(dialog)?;
-            if let Some(answer) = llm_dialogs::extract_answer(question, &result) {
-                answers.insert(question.question.clone(), answer);
-            }
-        }
-
-        let annotations = llm_dialogs::build_annotations(&input.questions, &answers);
-        Ok(crate::cli::AskUserQuestionOutput {
-            questions: input.questions.clone(),
-            answers,
-            annotations,
-        })
     }
 }
 

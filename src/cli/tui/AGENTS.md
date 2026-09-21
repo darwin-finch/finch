@@ -181,6 +181,7 @@ draws a view, and the caller converts.
 | `finch_ui_model::SayTurnView` | status, program, output, elapsed, toggle state | WorkUnit `say_turn_view()`, projected by `finch_ui_model::say_turn_lines` |
 | [`activity::ActivityRow`](activity.rs) | indented status text | todos / agent tasks, in `cli::repl_event::activity_view` |
 | `Dialog::tool_approval(name, summary)` | a name and a summary line | Finch `ToolUse`, in `cli::repl_event::tool_display::tool_approval_dialog` |
+| `QuestionView` / `QuestionOptionView` | question text, tab heading, options, selection mode, and optional preview | `AskUserQuestion` request in `cli::llm_dialogs`; converted before `TabbedDialog::new` |
 | `MentionCandidate` / `MentionSubmission` | speakable picker rows, insertion tokens, and provider-independent selected bytes | `context::mention`, through the injected CLI adapter in `cli::mention_session` |
 
 When `active_dialog` first occupies the live surface, `draw_live_area` writes one terminal bell
@@ -213,9 +214,10 @@ module of this crate, **or** the remaining ones are written down here with the r
   re-exported so existing callers can still write `crate::cli::tui::ColorScheme`.
 - **`finch_diff`** — bounded, terminal-safe diff summaries and dialog sanitation from the
   extracted leaf crate. `cli::messages` also uses it when constructing WorkUnit snapshots.
-- **Sibling CLI types** (`cli::messages`, `cli::llm_dialogs`, `StatusBar`,
-  `AskUserQuestion*`) — the renderer uses the `Message` trait to request WorkUnit snapshots and
-  delegates their pure projection to `finch-ui-model`. Command-completion metadata is owned
+- **Sibling CLI types** (`cli::messages`, `StatusBar`) — the renderer uses the `Message` trait to request WorkUnit snapshots and
+  delegates their pure projection to `finch-ui-model`. The AskUserQuestion wire contract and
+  answer annotations stay in `cli::llm_dialogs`; the renderer sees only `QuestionView`.
+  Command-completion metadata is owned
   directly by this capsule in `command_autocomplete.rs`; its types and `AutocompleteState` remain crate-visible only, not
   facade exports. The unused contextual-suggestion subsystem was removed.
 - **`crate::ABOUT`** — startup header copy.
@@ -234,6 +236,8 @@ module of this crate, **or** the remaining ones are written down here with the r
 returning. `test_tui_production_does_not_name_project_context` keeps filesystem discovery,
 ignore/budget policy, and attachment snapshots behind the injected `MentionPort`; its application
 adapter is [`src/cli/mention_session.rs`](../mention_session.rs).
+`test_tui_production_does_not_name_ask_user_question_wire_schema` keeps the tool request and
+response in the CLI while the renderer consumes only `QuestionView`.
 `test_tui_production_does_not_reach_up_for_owned_completion_state` keeps command completion
 under this facade instead of reaching through `crate::cli`.
 `test_scanner_would_fail_if_runtime_returned_to_draw_live_area` and

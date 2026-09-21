@@ -238,17 +238,17 @@ impl<'a> TabbedDialogWidget<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::llm_dialogs::{Question, QuestionOption};
     use crate::cli::tui::tabbed_dialog::TabbedDialog;
+    use crate::cli::tui::{QuestionOptionView, QuestionView};
     use finch_theme::ColorScheme;
 
-    fn make_q(text: &str, opts: &[&str]) -> Question {
-        Question {
+    fn make_q(text: &str, opts: &[&str]) -> QuestionView {
+        QuestionView {
             question: text.to_string(),
             header: text[..text.len().min(12)].to_string(),
             options: opts
                 .iter()
-                .map(|&l| QuestionOption {
+                .map(|&l| QuestionOptionView {
                     label: l.to_string(),
                     description: format!("{l} desc"),
                     markdown: None,

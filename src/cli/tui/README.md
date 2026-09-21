@@ -11,8 +11,10 @@ Two callers show the boundary:
 1. The [interactive REPL](../repl.rs) constructs `TuiRenderer` with its `OutputManager`,
    `StatusBar`, and colors. The [event loop](../repl_event/event_loop.rs) updates the session and
    asks the renderer to draw; the renderer projects each message's presentation snapshot and
-   commits completed rows to terminal scrollback once. The REPL owns conversation timing and
-   Brain/provider events, while this module owns layout and terminal lifecycle.
+   commits completed rows to terminal scrollback once. An AskUserQuestion request is converted by
+   the CLI into `QuestionView` before the renderer presents tabbed cards; answers and annotations
+   return through the CLI, not the renderer. The REPL owns conversation timing and Brain/provider
+   events, while this module owns layout and terminal lifecycle.
 2. The [setup wizard driver](../setup_wizard/driver.rs) converts its form state into a `WizardView`,
    calls `plan_wizard_frame`, and lets `WizardHost` paint the frame. The driver owns provider setup,
    credential flow, and key-driven state transitions; this module owns the shared claiming tree,
