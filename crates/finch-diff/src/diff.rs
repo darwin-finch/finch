@@ -412,7 +412,7 @@ impl FileDiff {
     /// count, no content-omitting elision, and [`Self::to_unified`] would not
     /// hit [`MAX_RENDER_CHARS`]. Informational line-ending notes do not fail
     /// this check.
-    pub fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.counts_are_exact()
             && self.file_count_is_exact()
             && match &self.elided {

@@ -17,4 +17,5 @@ Two callers show why this is a shared leaf:
 
 The application-facing `cli::diff` path remains a compatibility re-export for existing event-loop
 callers. Read the [agent contract](AGENTS.md) for bounds and dependency rules. [`src/lib.rs`](src/lib.rs)
-is the flat callable facade; rustdoc shows methods on its exported model types.
+is the flat callable facade; rustdoc shows methods on its exported model types. Rendering callers
+name `ColorScheme` through `finch-theme` directly; `finch-diff` does not re-export theme types.
