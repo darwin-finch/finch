@@ -1664,6 +1664,7 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "finch-brain",
+ "finch-diff",
  "finch-generation",
  "finch-ipc",
  "finch-language",
@@ -1793,6 +1794,15 @@ dependencies = [
  "finch-vm-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "finch-diff"
+version = "0.7.31"
+dependencies = [
+ "finch-theme",
+ "ratatui 0.29.0",
+ "similar",
 ]
 
 [[package]]

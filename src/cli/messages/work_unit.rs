@@ -59,8 +59,8 @@ use super::{
     SayTurnStatus, SayTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead,
     WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };
-use crate::cli::diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 use crate::config::{ColorScheme, MessageBand};
+use finch_diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 
 // Animation frames: small → large → small (creates a "throb" pulse effect)
 const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];

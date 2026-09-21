@@ -25,6 +25,8 @@ CURRENT_DOCS = (
     Path("DESIGN.md"),
     Path("crates/finch-coforth/AGENTS.md"),
     Path("crates/finch-coforth/README.md"),
+    Path("crates/finch-diff/AGENTS.md"),
+    Path("crates/finch-diff/README.md"),
     Path("crates/finch-colisp/AGENTS.md"),
     Path("crates/finch-colisp/README.md"),
     Path("crates/finch-language/AGENTS.md"),

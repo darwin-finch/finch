@@ -211,8 +211,8 @@ impl Dialog {
     /// File-mutating tools (write/edit) get an extra "Edit in $EDITOR" option.
     /// The title is formatted as `"{tool_name}\n{summary}"` for two-line display.
     pub fn tool_approval(tool_name: &str, summary: &str) -> Self {
-        let tool_name = crate::cli::diff::sanitize_terminal(tool_name);
-        let summary = crate::cli::diff::sanitize_multiline(summary);
+        let tool_name = finch_diff::sanitize_terminal(tool_name);
+        let summary = finch_diff::sanitize_multiline(summary);
         let is_file_mutating = matches!(tool_name.to_lowercase().as_str(), "write" | "edit");
         let options = if is_file_mutating {
             vec![
@@ -240,7 +240,7 @@ impl Dialog {
     /// Set optional body text shown inside the box above the options.
     /// Useful for displaying a plan or other content the user needs to read before deciding.
     pub fn with_body(mut self, body: impl Into<String>) -> Self {
-        self.body = Some(crate::cli::diff::sanitize_multiline(&body.into()));
+        self.body = Some(finch_diff::sanitize_multiline(&body.into()));
         self
     }
 
@@ -948,7 +948,7 @@ pub(crate) fn settled_dialog_record(dialog: &Dialog, result: &DialogResult) -> S
     } else {
         lines.push(format!("✓ Answer: {answer}"));
     }
-    crate::cli::diff::sanitize_multiline(&lines.join("\n"))
+    finch_diff::sanitize_multiline(&lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -2012,7 +2012,7 @@ mod tests {
             &tool,
             "File: src/\u{1b}[31mhostile.rs",
             &finch_theme::ColorTheme::Dark.to_scheme(),
-            crate::cli::diff::DiffColorMode::NoColor,
+            finch_diff::DiffColorMode::NoColor,
         );
         let body = dialog.body.as_deref().unwrap();
         assert!(body.contains(file.path().to_string_lossy().as_ref()));
@@ -2038,13 +2038,13 @@ mod tests {
             &tool,
             "File: src/theme.rs",
             &finch_theme::ColorTheme::Dark.to_scheme(),
-            crate::cli::diff::DiffColorMode::Theme,
+            finch_diff::DiffColorMode::Theme,
         );
         let light = crate::cli::repl_event::tool_display::tool_approval_dialog(
             &tool,
             "File: src/theme.rs",
             &finch_theme::ColorTheme::Light.to_scheme(),
-            crate::cli::diff::DiffColorMode::Theme,
+            finch_diff::DiffColorMode::Theme,
         );
         let dark_body = dark.body.unwrap();
         let light_body = light.body.unwrap();
@@ -2608,7 +2608,7 @@ mod tests {
             &tool,
             &summary,
             &finch_theme::ColorScheme::default(),
-            crate::cli::diff::DiffColorMode::NoColor,
+            finch_diff::DiffColorMode::NoColor,
         );
         assert!(
             dialog.body.is_some(),
