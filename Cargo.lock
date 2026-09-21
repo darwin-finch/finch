@@ -1664,6 +1664,7 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "finch-brain",
+ "finch-conversation",
  "finch-diff",
  "finch-generation",
  "finch-ipc",
@@ -1796,6 +1797,18 @@ dependencies = [
  "finch-vm-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "finch-conversation"
+version = "0.7.31"
+dependencies = [
+ "anyhow",
+ "finch-providers",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

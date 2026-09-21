@@ -7,6 +7,8 @@ Supplements the root [`AGENTS.md`](../../../CLAUDE.md), which still applies in f
 `ReplEvent`, and dispatches it. The selected generator is called by `query_processor`, and
 tool execution is coordinated here through [`crate::tools::ToolLoop`] (shared with the
 scheduler): stream events are observed, then admitted at most once.
+`finch-conversation` owns the committed provider history and staged tool-round ledger; the
+event loop owns the admission, checkpoint, and continuation decisions around those transitions.
 
 **Boundary and dependencies.** The [README](README.md) traces construction by `Repl` and
 event projection by the MemTree console. `mod.rs` is the facade; new callers should use its

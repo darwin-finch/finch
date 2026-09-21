@@ -3,7 +3,7 @@
 
 mod chatgpt_auth;
 mod commands;
-mod conversation;
+use finch_conversation as conversation;
 mod conversation_compactor; // Infinite context: summarise dropped messages
 mod diff;
 mod global_output; // Phase 3.5: Global output system with macros

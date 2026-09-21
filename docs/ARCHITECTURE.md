@@ -698,7 +698,7 @@ The summary is committed to a range that only moves when the window slides past 
 The prefix pair keeps the required alternating user→assistant role ordering expected by all providers. Failure is non-fatal: if the summarisation call fails, nothing is committed, the plain window is used, a warning is logged, and the next turn retries.
 
 **Key Files:**
-- `src/cli/conversation.rs` - `ConversationHistory`
+- `crates/finch-conversation/src/lib.rs` - `ConversationHistory`
 - `src/cli/conversation_compactor.rs` - `ConversationCompactor` (`plan_summary`/`commit_summary`), `SummaryCache`, `inject_summary_prefix()`, `format_messages_for_summary()`
 - `src/cli/repl_event/event_loop.rs` - `apply_sliding_window()`, compactor hook (line ~1295)
 

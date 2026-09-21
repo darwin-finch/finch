@@ -4,6 +4,9 @@ This module runs one interactive session after the application has assembled its
 Brain, tool, terminal, and conversation dependencies. It owns the event types, the concurrent
 event loop and its per-query state, and the handoff between tool results and the next provider
 turn. It does not own provider transports, durable Brain storage, or terminal layout.
+The provider-visible history and ordered staging of tool results belong to
+[`finch-conversation`](../../../crates/finch-conversation/README.md); this module decides when
+to commit a round, generate a summary, and admit a continuation.
 
 Two callers illustrate the boundary:
 
