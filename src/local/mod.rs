@@ -1,7 +1,7 @@
 // Local Generation Module
 //
-// Handles local response generation through pattern classification and learned responses
-// This is the core of Shammah's "95% local processing" capability
+// Coordinates optional local response generation through pattern classification,
+// learned responses, and a configured model when one is available.
 
 mod generator;
 mod patterns;
