@@ -13,10 +13,17 @@ use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
+mod markdown;
 mod say_turn;
+mod work_unit;
 
 pub use say_turn::{
     say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
+};
+pub use work_unit::{
+    project_work_unit, AgentActivityView, AgentToolView, MessageStatus, TranscriptNode,
+    WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead, WorkUnitPresentation,
+    WorkUnitView,
 };
 
 /// Stable identity for one retained application message.

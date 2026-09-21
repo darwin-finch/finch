@@ -10,6 +10,10 @@ Everything below is what callers outside this module can reach. Implementation m
 ## Types
 
 ```rust
+/// One child-agent lifecycle row.
+pub struct AgentActivityView { … }
+/// One tool run inside an agent lifecycle row.
+pub struct AgentToolView { … }
 /// Direction a stack lays its children out in.
 pub enum Axis { Column, Row }
 /// The result of one claiming pass.
@@ -28,6 +32,8 @@ impl MessageId {
     /// Generate a new unique message ID.
     pub fn new() -> Self;
 }
+/// Status of a retained application message.
+pub enum MessageStatus { InProgress, Complete, Failed }
 /// One laid-out node, in depth-first paint order.
 pub struct NodeLayout { … }
 /// Renderer-facing role of one transcript node.
@@ -55,8 +61,26 @@ pub enum SayTurnStatus { Running, Completed }
 pub struct SayTurnView { … }
 /// How one child of a [`Widget::Stack`] claims its extent along the stack's main axis.
 pub enum Track { Natural, Flex, Max, Side }
+/// Widget props for one transcript row, projected from domain data.
+pub struct TranscriptNode { … }
 /// The standard widget kinds.
 pub enum Widget { Stack, Text, Rule, Completions, Composer, Viewport, DialogCard, Marked }
+/// Whether a row is a model tool call or internal lifecycle activity.
+pub enum WorkRowPresentation { Tool, Activity }
+/// Status of an individual tool or activity row.
+pub enum WorkRowStatus { Running, Complete, Error }
+/// One tool or activity row, with diffs already rendered to display lines.
+pub struct WorkRowView { … }
+/// Lightweight snapshot for consumers that classify or filter WorkUnits.
+pub struct WorkUnitHead { … }
+impl WorkUnitHead {
+    /// Visible output body, including transient status and progress.
+    pub fn output_body_lines(&self) -> Vec<String>;
+}
+/// How one WorkUnit is presented in the transcript.
+pub enum WorkUnitPresentation { Assistant, Activity, ProgramSource, ProgramOutput }
+/// Full blit-time domain snapshot of one WorkUnit run.
+pub struct WorkUnitView { … }
 /// The retained ViewModel of one say turn, living on the WorkUnit behind the message's existing lock.
 pub struct WorkUnitViewModel { … }
 ```
@@ -76,6 +100,8 @@ pub fn layout(root: &Widget, frame: Rect) -> Layout { … }
 pub fn natural_size(widget: &Widget, cross: usize, axis: Axis) -> usize { … }
 /// Number of physical terminal rows occupied by one logical line.
 pub fn physical_rows(s: &str, terminal_width: usize) -> usize { … }
+/// Project one WorkUnit snapshot into transcript widget props.
+pub fn project_work_unit(view: &WorkUnitView) -> TranscriptNode { … }
 /// Render the say turn's lines for one frame: exactly one representation for the turn's current state.
 pub fn say_turn_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> { … }
 /// Truncate `s` to at most `columns` display columns.

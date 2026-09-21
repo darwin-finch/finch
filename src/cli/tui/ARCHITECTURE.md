@@ -37,9 +37,11 @@ content cannot drag the reader. Mouse tracking is held by default
 native history is not the reader; drag-selection under capture remains open on
 #221 and a capture opt-out on #244.
 
-**Retained transcript disclosure** (`accordion.rs`, `view_model.rs`):
-- The ViewModel projects a WorkUnit's `domain_view()` into `TranscriptNode` widget props with
-  append-stable semantic row identity (`message id + semantic path`).
+**Retained transcript disclosure** (`accordion.rs`, `view_model.rs`,
+`crates/finch-ui-model/src/work_unit.rs`):
+- `finch_ui_model::project_work_unit` projects a WorkUnit snapshot into `TranscriptNode` widget
+  props with append-stable semantic row identity (`message id + semantic path`); the root
+  `view_model` only adapts the `Message` trait and current colour scheme.
 - Disclosure and focus are renderer state: `AccordionState` owns the open set keyed by row
   identity; a row's default is a projection-time prop, never state on domain data. Completing a
   run must not collapse a result that still has body text.
@@ -129,8 +131,9 @@ settled record (question, options with the picked marker, `Answer:` line) throug
 standard canonical-commit pipeline; approval event semantics are unchanged.
 `TabbedDialog` remains the alternate-screen wizard as a follow-up.
 
-**Assistant prose markdown (#756)** (`markdown.rs`, `view_model.rs`): the one domain→widget
-projection parses assistant prose once into a bounded block model — fenced code blocks,
+**Assistant prose markdown (#756)** (`crates/finch-ui-model/src/markdown.rs`,
+`crates/finch-ui-model/src/work_unit.rs`): the pure snapshot→widget projection parses assistant
+prose once into a bounded block model — fenced code blocks,
 emphasis, inline code, lists — and renders it to styled viewport body lines on
 `TranscriptNode::body`, keeping the raw source lines on `TranscriptNode::raw_body`. The
 viewport paints the rendered body; the canonical commit's fully-expanded projection paints the
@@ -169,10 +172,10 @@ Virtual row helpers:
 ## Key files
 
 - `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
-- `crates/finch-ui-model/` — terminal-independent identity, widget vocabulary, pure say-turn projection, and claiming layout
-  (`say_turn.rs`) (#882)
-- `src/cli/tui/view_model.rs` — the blit-time `LiveViewModel`, the domain → widget projection, and the root claiming tree
-- `src/cli/tui/markdown.rs` — bounded assistant-prose markdown parse/render for the viewport (#756); raw source stays the canonical record
+- `crates/finch-ui-model/` — terminal-independent identity, widget vocabulary, WorkUnit snapshots,
+  pure WorkUnit and say-turn projection, bounded markdown, and claiming layout
+- `src/cli/tui/view_model.rs` — the blit-time `LiveViewModel`, thin root message adapter, and the root claiming tree
+- `crates/finch-ui-model/src/markdown.rs` — private bounded assistant-prose markdown parse/render for the viewport (#756); raw source stays the canonical record
 - `src/cli/tui/widgets.rs` — claiming layout: rects, tracks, hitboxes, resize
 - `src/cli/tui/scroll_view.rs` — the conversation ScrollView: scroll offset, wheel claim, window split
 - `src/cli/tui/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`

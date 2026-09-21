@@ -10,9 +10,9 @@ Everything below is what callers outside this module can reach. Implementation m
 ## Types
 
 ```rust
-/// One child-agent lifecycle row of a [`WorkUnitView`].
+/// One child-agent lifecycle row. Re-exported from `finch-ui-model`.
 pub struct AgentActivityView { … }
-/// One tool run inside an agent lifecycle row.
+/// One tool run inside an agent lifecycle row. Re-exported from `finch-ui-model`.
 pub struct AgentToolView { … }
 /// An attributed message projected from a shared Brain.
 pub struct BrainParticipantMessage { … }
@@ -46,7 +46,7 @@ impl LiveToolMessage {
 pub struct MessageId(Uuid);
 /// Type alias for a shared message reference
 pub type MessageRef = Arc<dyn Message>;
-/// Status of a message
+/// Status of a retained application message. Re-exported from `finch-ui-model`.
 pub enum MessageStatus { InProgress, Complete, Failed }
 /// Live operation message that groups tool calls for a generation turn.
 pub struct OperationMessage { … }
@@ -129,16 +129,12 @@ impl UserQueryMessage {
 }
 /// A single tool-call sub-item rendered below the WorkUnit header
 pub struct WorkRow { … }
-/// Whether a run row presents as a model tool call or as internal lifecycle activity.
+/// Whether a row is a model tool call or internal lifecycle activity. Re-exported from `finch-ui-model`.
 pub enum WorkRowPresentation { Tool, Activity }
-/// Status of an individual tool-call sub-row within a WorkUnit
+/// Status of an individual tool or activity row. Re-exported from `finch-ui-model`.
 pub enum WorkRowStatus { Running, Complete, Error }
-/// One tool or activity row of a [`WorkUnitView`], with diffs already rendered to display lines.
+/// One tool or activity row, with diffs already rendered to display lines. Re-exported from `finch-ui-model`.
 pub struct WorkRowView { … }
-impl WorkRowView {
-    /// True when the row carries any inspectable output.
-    pub fn has_output(&self) -> bool;
-}
 /// A unified message covering one AI generation turn.
 pub struct WorkUnit { … }
 impl WorkUnit {
@@ -207,15 +203,11 @@ impl WorkUnit {
     /// Reconstruct a WorkUnit with the stable ID carried by retained/canonical session data so disclosure state survives frontend reconnects.
     pub fn with_id(id: MessageId, verb: impl Into<String>) -> Self;
 }
-/// Lightweight domain snapshot for consumers that classify or filter WorkUnit messages without projecting their full presentation.
+/// Lightweight snapshot for consumers that classify or filter WorkUnits. Re-exported from `finch-ui-model`.
 pub struct WorkUnitHead { … }
-impl WorkUnitHead {
-    /// The unit's visible output body: response text plus transient status and progress lines an output handle appends.
-    pub fn output_body_lines(&self) -> Vec<String>;
-}
-/// How a completed unit is projected into the transcript.
+/// How one WorkUnit is presented in the transcript. Re-exported from `finch-ui-model`.
 pub enum WorkUnitPresentation { Assistant, Activity, ProgramSource, ProgramOutput }
-/// Full blit-time domain snapshot of one WorkUnit run.
+/// Full blit-time domain snapshot of one WorkUnit run. Re-exported from `finch-ui-model`.
 pub struct WorkUnitView { … }
 /// The retained ViewModel of one say turn, living on the WorkUnit behind the message's existing lock. Re-exported from `finch-ui-model`.
 pub struct WorkUnitViewModel { … }

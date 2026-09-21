@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 pub use finch_ui_model::{
-    MessageId, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
+    AgentActivityView, AgentToolView, MessageId, MessageStatus, OutputVm, ProgramSourceVm,
+    SayTurnStatus, SayTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead,
+    WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };
 
 pub mod concrete;
@@ -23,22 +25,7 @@ pub use concrete::{
     ProgressMessage, StaticMessage, StaticMessageType, StreamingResponseMessage,
     ToolExecutionMessage, UserQueryMessage,
 };
-pub use work_unit::{
-    random_spinner_verb, AgentActivityView, AgentToolView, ComponentAction, ToggleProgram, WorkRow,
-    WorkRowStatus, WorkRowView, WorkUnit, WorkUnitHead, WorkUnitView,
-};
-pub use work_unit::{WorkRowPresentation, WorkUnitPresentation};
-
-/// Status of a message
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageStatus {
-    /// Message is being updated (streaming, downloading, etc.)
-    InProgress,
-    /// Message is complete and won't change
-    Complete,
-    /// Message represents a failed operation
-    Failed,
-}
+pub use work_unit::{random_spinner_verb, ComponentAction, ToggleProgram, WorkRow, WorkUnit};
 
 /// Trait that all messages must implement
 ///

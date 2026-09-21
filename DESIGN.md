@@ -311,9 +311,10 @@ Design intent, not current fact. The program, its phases, and its measurable gat
   tokenizer, Hugging Face, HTTP, or TUI stacks) are extracted workspace crates.
   The [application UI-model capsule](crates/finch-ui-model/AGENTS.md) is extracted as
   `finch-ui-model` and remains available through the root `ui_model` compatibility facade:
-  stable message/row identity, semantic widget data, component snapshots and pure projection,
-  line measurement, and pure claiming layout have no outgoing subsystem edges. Terminal painting
-  remains above that facade.
+  stable message/row identity, WorkUnit and component snapshots, semantic widget data, pure
+  transcript projection (including bounded assistant-prose markdown), line measurement, and pure
+  claiming layout have no outgoing subsystem edges. Terminal painting and the thin root
+  `Message`/colour adapter remain above that facade.
   Application subsystems follow only after their cycles are removed and the VM and memory
   measurements justify continuing.
 - **Target dependency direction**, refined during facade work:

@@ -25,9 +25,9 @@ Every blit converts domain state into one owned ViewModel snapshot, then lays it
    live transcript lines, dialogs. `live_frame_sources` gathers the owned state;
    `plan_live_frame` plans the frame from it and is a pure function (assertable without a
    terminal).
-2. **`view_model::project_message`** is the one domain → widget conversion: a WorkUnit's
-   `domain_view()` (plain domain data — labels, statuses, bodies; see
-   `src/cli/messages/AGENTS.md`) becomes `TranscriptNode` widget props. Widgets never query
+2. **`view_model::project_message`** is a thin root adapter: it asks the `Message` trait for a
+   WorkUnit snapshot with the current `ColorScheme`, then delegates the snapshot →
+   `TranscriptNode` conversion to `finch_ui_model::project_work_unit`. Widgets never query
    `WorkUnit`, the command registry, or each other to decide visibility; a widget with nothing
    to show claims zero rows and stays in the tree.
 3. **`widgets::layout`** is depth-first **frame claiming**: a parent offers a box, children
@@ -82,7 +82,7 @@ projection path.
 
 ## Assistant prose markdown renders in the viewport (#756)
 
-`markdown.rs` (private) is a deliberately bounded inline-subset parser — fenced code blocks,
+`crates/finch-ui-model/src/markdown.rs` (private) is a deliberately bounded inline-subset parser — fenced code blocks,
 bold/italic emphasis, inline code, ordered/unordered lists — chosen over a markdown crate by
 the #756 contract: the acceptance surface is those constructs, everything else must degrade to
 literal text anyway, and the render target is a custom ANSI line model regardless. It is
@@ -176,7 +176,7 @@ draws a view, and the caller converts.
 
 | View | What the renderer needs | Converted from |
 |------|-------------------------|----------------|
-| `view_model::TranscriptNode` | label, body, children, role, default disclosure | WorkUnit `domain_view()`, in `view_model::project_message` |
+| `finch_ui_model::TranscriptNode` | label, body, children, role, default disclosure | WorkUnit snapshot, projected by `finch_ui_model::project_work_unit`; adapted from `Message` in `view_model::project_message` |
 | `finch_ui_model::SayTurnView` | status, program, output, elapsed, toggle state | WorkUnit `say_turn_view()`, projected by `finch_ui_model::say_turn_lines` |
 | [`activity::ActivityRow`](activity.rs) | indented status text | todos / agent tasks, in `cli::repl_event::activity_view` |
 | `Dialog::tool_approval(name, summary)` | a name and a summary line | Finch `ToolUse`, in `cli::repl_event::tool_display::tool_approval_dialog` |
@@ -216,8 +216,8 @@ module of this crate, **or** the remaining ones are written down here with the r
   `crate::cli::tui::ColorScheme`. Theme is not Finch domain vocabulary.
 - **Sibling CLI types** (`cli::messages`, `cli::diff`, `cli::llm_dialogs`,
   `cli::command_autocomplete`, `cli::suggestions`, `StatusBar`, `AskUserQuestion*`) — the renderer
-  consumes `cli::messages` domain snapshots (`WorkUnitView`/`WorkUnitHead`) and projects them
-  itself; `cli::diff` renders diff bodies at projection time.
+  uses the `Message` trait to request WorkUnit snapshots and delegates their pure projection to
+  `finch-ui-model`; `cli::diff` renders diff bodies while the snapshot is constructed.
 - **`crate::context::mention`** — picker rows and pending snapshots. Filesystem policy,
   ignore rules, budgets, and digest identity live in `context::mention`; the renderer only
   draws speakable rows and inserts the visible token.
