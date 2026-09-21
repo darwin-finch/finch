@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate each subsystem's INTERFACE.md from its facade, and check it stays true.
+"""Check the legacy INTERFACE.md files that are still tracked.
 
-An agent working in one subsystem should be able to read what another offers without opening
-its source. INTERFACE.md lists every item the facade re-exports, with its signature and doc
-summary and no bodies. It is generated, and CI fails when it drifts from the code.
+New and migrated capsules use human-authored README.md and AGENTS.md for meaning and
+src/lib.rs or mod.rs as the exact facade. The remaining generated catalogs are transitional;
+this checker must not recreate a catalog that a capsule deliberately retired.
 
 Usage: generate_interfaces.py [--write] [--root PATH]
 """
@@ -699,8 +699,9 @@ def interface_text(
 
 
 def interfaces(root: Path) -> tuple[list[tuple[Path, str]], list[str]]:
-    """Generated (path, text) pairs, and anything the generator could not parse or resolve."""
+    """Tracked legacy catalog pairs, and anything they cannot parse or resolve."""
     files = tracked_files(root)
+    tracked = set(files)
     directories = module_directories(files)
     # Read and scan every source once for the whole tree: each facade resolves
     # its re-exports against the same definitions.
@@ -715,8 +716,13 @@ def interfaces(root: Path) -> tuple[list[tuple[Path, str]], list[str]]:
     elsewhere = definitions_in(root, all_sources)
     generated, problems = [], []
     for directory in directories:
+        catalog = f"{directory}INTERFACE.md"
+        if catalog not in tracked:
+            if f"{directory}README.md" not in tracked:
+                problems.append(f"{directory} has neither a legacy INTERFACE.md nor a README.md")
+            continue
         generated.append((
-            root / f"{directory}INTERFACE.md",
+            root / catalog,
             interface_text(root, files, directories, directory, problems, all_sources, elsewhere),
         ))
     return generated, problems

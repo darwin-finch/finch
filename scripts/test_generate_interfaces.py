@@ -137,6 +137,7 @@ class Fixture:
         self.write("src/vm/ir.rs", IR)
         self.write("src/vm/interpreter.rs", INTERPRETER)
         self.write("src/vm/AGENTS.md", "# vm capsule\n")
+        self.write("src/vm/INTERFACE.md", "")
         self.write("src/app/mod.rs", "/// A type another subsystem re-exports.\npub struct Shared;\n")
         subprocess.run(["git", "-C", str(self.root), "init", "-q"], check=True)
         self.stage()
@@ -213,6 +214,7 @@ class InterfaceGeneratorTests(unittest.TestCase):
     def test_workspace_crate_capsule_generates_from_package_relative_sources(self) -> None:
         self.fixture.write("src/lib.rs", "pub use finch_vm as vm;\n")
         self.fixture.write("crates/finch-vm/AGENTS.md", "# finch-vm capsule\n")
+        self.fixture.write("crates/finch-vm/INTERFACE.md", "")
         self.fixture.write(
             "crates/finch-vm/src/lib.rs",
             "mod types;\npub use types::Value;\n",
@@ -243,6 +245,7 @@ class InterfaceGeneratorTests(unittest.TestCase):
 
     def test_workspace_crate_direct_reexport_resolves_duplicate_name_to_dependency(self) -> None:
         self.fixture.write("crates/finch-vm-core/AGENTS.md", "# core capsule\n")
+        self.fixture.write("crates/finch-vm-core/INTERFACE.md", "")
         self.fixture.write(
             "crates/finch-vm-core/src/lib.rs",
             "mod types;\npub use types::Value;\n",
@@ -252,6 +255,7 @@ class InterfaceGeneratorTests(unittest.TestCase):
             "/// The shared core value.\npub struct Value;\n",
         )
         self.fixture.write("crates/finch-vm/AGENTS.md", "# facade capsule\n")
+        self.fixture.write("crates/finch-vm/INTERFACE.md", "")
         self.fixture.write(
             "crates/finch-vm/src/lib.rs",
             "pub use finch_vm_core::Value;\n",
@@ -409,9 +413,21 @@ class InterfaceGeneratorTests(unittest.TestCase):
         self.assertIn("impl Session {", interface, f"facade-local type lost its methods:\n{interface}")
         self.assertIn("pub fn open() -> Self;", interface)
 
-    def test_missing_interface_file_is_stale(self) -> None:
+    def test_retired_interface_file_is_not_regenerated(self) -> None:
         (self.fixture.root / "src/vm/INTERFACE.md").unlink()
-        self.assert_stale("src/vm/INTERFACE.md is stale")
+        self.fixture.write("src/vm/README.md", "# Why the VM exists\n")
+        result = self.fixture.run()
+        self.assertEqual(0, result.returncode, result.stderr)
+        catalog_paths = [str(path.relative_to(self.fixture.root)) for path, _ in interfaces(self.fixture.root)[0]]
+        self.assertNotIn("src/vm/INTERFACE.md", catalog_paths)
+        self.fixture.generate()
+        self.assertFalse((self.fixture.root / "src/vm/INTERFACE.md").exists())
+
+    def test_retired_interface_requires_a_readme(self) -> None:
+        (self.fixture.root / "src/vm/INTERFACE.md").unlink()
+        result = self.fixture.run()
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("src/vm/ has neither a legacy INTERFACE.md nor a README.md", result.stderr)
 
     def test_cfg_gated_items_are_marked_with_their_condition(self) -> None:
         # A #[cfg(test)] export must not look like production surface.
