@@ -1,7 +1,7 @@
 // Daemon module for background HTTP server mode
 //
 // This module provides daemon lifecycle management, auto-spawn capabilities,
-// and utilities for running Shammah as a persistent background service.
+// and utilities for running Finch as a persistent background service.
 
 mod lifecycle;
 mod log;
