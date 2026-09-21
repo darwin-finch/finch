@@ -21,6 +21,10 @@ that port. Keep status ordering and status-line policy in the application; do no
 `TuiOutputPort` is the stateful conversation-output seam: CLI `OutputManager` implements it,
 retains message identity, controls stdout, and accepts settled dialog records. Production TUI
 code must not import `OutputManager`; blit and canonical commit read its message snapshots.
+The renderer owns its composer draft and failed-frame recovery state. Application callers use
+`restore_input_draft`, `record_render_failure`, and `take_render_failure_for_retry`; they must
+not mutate the textarea, refresh flag, or render-error slot directly. A failed process
+replacement uses `resume_after_emergency_restore` to reacquire terminal modes.
 The event loop supplies package-version/tagline text for the startup header and a function
 that reports whether an external editor owns the terminal. The input task must consult that
 query before polling and before rendering; quit control messages use `finch-ipc` directly.

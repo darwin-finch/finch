@@ -16,7 +16,9 @@ Two callers show the boundary:
    the CLI into `QuestionView` before the renderer presents tabbed cards; answers and annotations
    return through the CLI, not the renderer. The REPL owns conversation timing and Brain/provider
    events and status-line policy; it also supplies startup version/tagline text and the
-   external-editor activity query. This module owns layout, input polling, and terminal lifecycle.
+   external-editor activity query. If a mention submission fails, the event loop asks the
+   renderer to restore the draft; render failures are recorded and acknowledged through
+   renderer methods. This module owns layout, input polling, and terminal lifecycle.
 2. The [setup wizard driver](../setup_wizard/driver.rs) converts its form state into a `WizardView`,
    calls `plan_wizard_frame`, and lets `WizardHost` paint the frame. The driver owns provider setup,
    credential flow, and key-driven state transitions; this module owns the shared claiming tree,

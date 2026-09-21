@@ -26,6 +26,9 @@ remain application concerns, while the TUI receives only rendered snapshots and 
 own child-activity and operation updates. `OutputManager` implements the renderer-owned
 `TuiOutputPort`: the application retains messages and controls stdout, while the renderer reads
 snapshots and records settled dialog answers through that narrow stateful seam.
+The event loop must use the renderer's draft and render-failure recovery methods, not its
+textarea or refresh/error fields. Terminal mode restoration after failed process replacement
+belongs to the renderer.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::`,
 `./scripts/test_brains.sh cargo test --test tui_integration_test`, and
