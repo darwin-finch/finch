@@ -37,14 +37,16 @@ Everything else in this section follows from that:
   beside the code rather than in a central file that drifts from the tree.
 - **Instructions are local.** A capsule beside the code states scope, limits, and focused tests, so
   an agent starting there inherits the root rules plus one page, not the whole project narrative.
-- **Interfaces should be readable without the source.** A generated, signature-level digest of each
-  facade lets a caller read a few kilobytes instead of opening the subsystem.
+- **Facades are the entry points.** A caller reads the module's short README and agent contract
+  for meaning and rules, then its `mod.rs` or `src/lib.rs` for exports and facade-local signatures.
+  Rustdoc renders methods on re-exported types for exact signatures without opening private
+  implementations. Generated signature catalogs are not architectural authority.
 - **Crate extraction is optional.** A crate makes a boundary unforgeable and shrinks the dependency
   surface a change pays for, but the facade is what delivers the context win. Extract only where
   measurement justifies it.
 
 **Measure the goal, not its proxies.** The primary number is the context a representative task
-requires: the capsule, the files being edited, and the interface digests of what they depend on.
+requires: the capsule, the files being edited, and the facades of what they depend on.
 Build and test latency are secondary evidence; they say how fast the loop runs, not how much an
 agent must understand to be correct.
 
@@ -96,7 +98,7 @@ the MCP client should not have to load tool execution and permissions to get the
 | **`tools-api`** (0): the dependency-free tool surface — `Tool` trait, registry, typed requests/results, permission and approval policy, declared effects, tool-round protocol | `crates/finch-tools-api` | Capsule [`crates/finch-tools-api/AGENTS.md`](crates/finch-tools-api/AGENTS.md), interface [`crates/finch-tools-api/INTERFACE.md`](crates/finch-tools-api/INTERFACE.md) |
 | **`tools-mcp`** (0): the client for external Model Context Protocol servers | `src/tools/mcp` | Capsule [`src/tools/mcp/AGENTS.md`](src/tools/mcp/AGENTS.md), interface [`src/tools/mcp/INTERFACE.md`](src/tools/mcp/INTERFACE.md), [user guide](docs/MCP_USER_GUIDE.md) |
 | **`tools`** (1): tool execution and GUI automation — the executor, concrete tool implementations, and MCP wiring over the `tools-api` surface | `src/tools` except `mcp`; re-export shims `src/tools/types.rs`, `src/tools/permissions.rs` | Capsule [`src/tools/AGENTS.md`](src/tools/AGENTS.md), interface [`src/tools/INTERFACE.md`](src/tools/INTERFACE.md); [Tool execution and permissions](src/tools/EXECUTION.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
-| **`runtime`** (2): the program runtime service and task-graph execution | `crates/finch-runtime`, root `poset`; composition adapter [`src/program_registry.rs`](src/program_registry.rs) | Capsule [`crates/finch-runtime/AGENTS.md`](crates/finch-runtime/AGENTS.md), interface [`crates/finch-runtime/INTERFACE.md`](crates/finch-runtime/INTERFACE.md) |
+| **`runtime`** (2): typed program execution, capability authority, host effects, and delivery ABI | `crates/finch-runtime`; root `poset` and [`src/program_registry.rs`](src/program_registry.rs) are application composition, not runtime-crate internals | [Runtime README](crates/finch-runtime/README.md), [agent contract](crates/finch-runtime/AGENTS.md), [facade](crates/finch-runtime/src/lib.rs) |
 | **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | Capsule [`src/models/AGENTS.md`](src/models/AGENTS.md), interface [`src/models/INTERFACE.md`](src/models/INTERFACE.md); local-generation facade [`src/local/AGENTS.md`](src/local/AGENTS.md); generators compatibility facade [`src/generators/AGENTS.md`](src/generators/AGENTS.md), interface [`src/generators/INTERFACE.md`](src/generators/INTERFACE.md); [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
 | **`finch-providers`** (0): reusable provider transports, OAuth, catalogs, and credential ports | `crates/finch-providers` | Capsule [`crates/finch-providers/AGENTS.md`](crates/finch-providers/AGENTS.md), interface [`crates/finch-providers/INTERFACE.md`](crates/finch-providers/INTERFACE.md); OAuth capsule [`crates/finch-providers/src/oauth/AGENTS.md`](crates/finch-providers/src/oauth/AGENTS.md); [crate docs](crates/finch-providers/docs/README.md) |
 | **`finch-generation`** (1): generation contract, lifecycle, strategies, and identity | `crates/finch-generation` | Capsule [`crates/finch-generation/AGENTS.md`](crates/finch-generation/AGENTS.md), interface [`crates/finch-generation/INTERFACE.md`](crates/finch-generation/INTERFACE.md); [crate docs](crates/finch-generation/docs/README.md) |
