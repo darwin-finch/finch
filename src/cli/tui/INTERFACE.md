@@ -101,6 +101,12 @@ impl LiveFrame {
     /// Render this frame into a shadow buffer of the given size, so a test can assert on the cells a terminal would end up holding.
     pub fn to_shadow_buffer(&self, width: usize, height: usize) -> shadow_buffer::ShadowBuffer;
 }
+/// Provider-independent bytes captured for one submitted project mention.
+pub struct MentionAttachment { … }
+/// One speakable project-resource row offered by the composer mention picker.
+pub struct MentionCandidate { … }
+/// Prepared mention data consumed by either local provider history or a Brain prompt.
+pub struct MentionSubmission { … }
 pub enum PosetPanelMode { Graph, Forth, Typing }
 /// Tabbed dialog for multiple questions
 pub struct TabbedDialog { … }
@@ -154,7 +160,7 @@ impl TuiRenderer {
     pub fn is_active(&self) -> bool;
     /// Mark the live area as needing a redraw on the next flush.
     pub fn mark_dirty(&mut self);
-    pub fn new(output_manager: Arc<OutputManager>, status_bar: Arc<StatusBar>, colors: ColorScheme) -> Result<Self>;
+    pub fn new(output_manager: Arc<OutputManager>, status_bar: Arc<StatusBar>, colors: ColorScheme, mention_port: Arc<dyn MentionPort>) -> Result<Self>;
     pub fn read_line(&mut self) -> Result<Option<String>>;
     /// Redraw the live area.
     pub fn render(&mut self) -> Result<()>;
@@ -224,6 +230,21 @@ impl WizardSectionContent {
 }
 /// Everything one wizard frame paints.
 pub struct WizardView { … }
+```
+
+## Traits
+
+```rust
+/// Application-provided mention completion and selection policy.
+pub trait MentionPort: Send + Sync {
+    fn query_at(&self, text: &str, cursor_chars: usize) -> Option<(usize, String)>;
+    fn candidates(&self, query: &str) -> Vec<MentionCandidate>;
+    fn select(&self, relative_path: &str) -> std::result::Result<(), String>;
+    fn retain_visible(&self, input: &str);
+    fn prepare_submission(&self, input: &str) -> std::result::Result<MentionSubmission, String>;
+    fn commit_submission(&self);
+    fn restore_submission(&self);
+}
 ```
 
 ## Functions

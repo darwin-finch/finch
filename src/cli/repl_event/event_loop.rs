@@ -282,6 +282,9 @@ pub struct EventLoop {
     /// TUI renderer
     tui_renderer: Arc<Mutex<TuiRenderer>>,
 
+    /// Application-owned mention catalog and selection-time snapshots.
+    mention_port: Arc<dyn crate::cli::tui::MentionPort>,
+
     /// Output manager
     output_manager: Arc<OutputManager>,
 
@@ -1887,6 +1890,7 @@ impl EventLoop {
             output: output_manager,
             status_bar,
             streaming_enabled,
+            mention_port,
         } = ui;
         let crate::cli::repl_event::parts::ToolParts {
             definitions: tool_definitions,
@@ -2057,6 +2061,7 @@ impl EventLoop {
             generator_state,
             tool_definitions: Arc::new(RwLock::new(tool_definitions)),
             tui_renderer,
+            mention_port,
             output_manager,
             status_bar,
             streaming_enabled,
@@ -2997,13 +3002,14 @@ impl EventLoop {
         chat_only: bool,
     ) -> Result<()> {
         if self.selected_brain().is_some() {
-            let mentions = self.take_mention_snapshots(&input).await;
+            let mentions = self.mention_port.prepare_submission(&input);
             match mentions {
-                Ok(snapshots) => {
+                Ok(submission) => {
+                    self.mention_port.commit_submission();
                     return self
                         .push_remote_brain(crate::brain::BrainEventKind::Prompt {
                             text: input,
-                            attached_mentions: prompt_attachments(&snapshots),
+                            attached_mentions: prompt_attachments(&submission.attachments),
                         })
                         .await;
                 }
@@ -3036,8 +3042,8 @@ impl EventLoop {
             .map(|(_, b64, media_type)| (media_type.clone(), b64.clone()))
             .collect();
 
-        let mention_snapshots = match self.take_mention_snapshots(&input).await {
-            Ok(snapshots) => snapshots,
+        let mention_submission = match self.mention_port.prepare_submission(&input) {
+            Ok(submission) => submission,
             Err(diagnostic) => {
                 {
                     let mut tui = self.tui_renderer.lock().await;
@@ -3060,8 +3066,12 @@ impl EventLoop {
         // Build and durably checkpoint the next provider-visible history
         // before publishing it in memory or dispatching provider work.
         let mut proposed_history = self.conversation.read().await.clone();
-        let mut user_blocks =
-            crate::context::mention::assemble_user_content(&input, &mention_snapshots);
+        let mut user_blocks = vec![ContentBlock::Text {
+            text: input.clone(),
+        }];
+        if let Some(document) = mention_submission.attachment_document {
+            user_blocks.push(ContentBlock::Text { text: document });
+        }
         if !pending_images.is_empty() {
             let mut blocks: Vec<ContentBlock> = pending_images
                 .iter()
@@ -3077,14 +3087,15 @@ impl EventLoop {
             {
                 let mut tui = self.tui_renderer.lock().await;
                 tui.pending_images.extend(pending_image_entries);
-                tui.pending_mentions.extend(mention_snapshots);
             }
+            self.mention_port.restore_submission();
             self.report_checkpoint_error(
                 "Query was not sent; its conversation checkpoint could not be written",
                 &error,
             );
             return Ok(());
         }
+        self.mention_port.commit_submission();
         *self.conversation.write().await = proposed_history;
 
         // Update compaction percentage in status bar
@@ -3105,31 +3116,6 @@ impl EventLoop {
         });
 
         Ok(())
-    }
-
-    async fn take_mention_snapshots(
-        &self,
-        input: &str,
-    ) -> std::result::Result<Vec<crate::context::mention::MentionSnapshot>, String> {
-        let (catalog, prior) = {
-            let mut tui = self.tui_renderer.lock().await;
-            let prior = tui.pending_mentions.drain(..).collect::<Vec<_>>();
-            (tui.mention_catalog.clone(), prior)
-        };
-        match crate::context::mention::snapshots_for_prompt(&catalog, input, &prior) {
-            Ok(snapshots) => Ok(snapshots),
-            Err(errors) => {
-                {
-                    let mut tui = self.tui_renderer.lock().await;
-                    tui.pending_mentions.extend(prior);
-                }
-                Err(errors
-                    .iter()
-                    .map(crate::context::mention::MentionError::speakable)
-                    .collect::<Vec<_>>()
-                    .join("\n"))
-            }
-        }
     }
 
     async fn restore_failed_mention_turn(&mut self, input: String) -> Result<()> {
@@ -4615,13 +4601,13 @@ pub(crate) fn plan_mode_indicator(mode: &ReplMode) -> &'static str {
 }
 
 fn prompt_attachments(
-    snapshots: &[crate::context::mention::MentionSnapshot],
+    snapshots: &[crate::cli::tui::MentionAttachment],
 ) -> Vec<crate::brain::PromptAttachment> {
     snapshots
         .iter()
         .map(|snapshot| crate::brain::PromptAttachment {
-            path: snapshot.relative_path.clone(),
-            kind: snapshot.kind.as_str().to_string(),
+            path: snapshot.path.clone(),
+            kind: snapshot.kind.clone(),
             sha256: snapshot.sha256.clone(),
             byte_len: snapshot.byte_len,
             truncated: snapshot.truncated,
