@@ -7,8 +7,9 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 dialects, wire types, dispatch, and adapter tests live in
 [`crates/finch-providers/AGENTS.md`](../../crates/finch-providers/AGENTS.md).
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item. Callers
-outside this directory use `crate::providers::Item`.
+**Boundary:** the [README](README.md) traces application startup and REPL profile callers.
+[`mod.rs`](mod.rs) is the flat facade; rustdoc renders methods on exported types. Callers
+outside this directory use `crate::providers::Item`. Do not recreate a signature catalog.
 
 **Dependencies:** `finch-providers` (transports and contracts), `config` (application
 `Config` / `ProviderEntry` / `TeacherEntry`). Do not add Brain, TUI, daemon, or tool
