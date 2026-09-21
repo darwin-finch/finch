@@ -354,8 +354,8 @@ impl AccordionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::{Message, MessageRef, WorkUnit};
-    use crate::cli::tui::view_model::project_work_unit;
+    use finch_messages::{Message, MessageRef, WorkUnit};
+    use crate::view_model::project_work_unit;
     use finch_theme::ColorScheme;
     use std::sync::Arc;
 
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn test_unicode_wrapped_hit_region_moves_after_resize() {
         let id = RowId {
-            message_id: crate::cli::messages::MessageId::new(),
+            message_id: finch_messages::MessageId::new(),
             path: vec![0],
         };
         let lines = vec![RenderedTranscriptLine {
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn test_reconnect_projection_reuses_canonical_message_identity() {
-        let id = crate::cli::messages::MessageId::from_uuid(uuid::Uuid::from_u128(69));
+        let id = finch_messages::MessageId::from_uuid(uuid::Uuid::from_u128(69));
         let original = Arc::new(WorkUnit::with_id(id, "program"));
         original.set_program_source("forth");
         original.set_response("a\nb\nc\nd");

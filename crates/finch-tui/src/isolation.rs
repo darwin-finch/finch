@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn tui_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cli/tui")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
 fn production_source(path: &Path) -> String {
@@ -222,7 +222,7 @@ fn insert_into_fn(source: &str, fn_name: &str, payload: &str) -> String {
 
 #[test]
 fn test_strip_does_not_treat_cfg_test_fn_or_use_as_a_module() {
-    // Shape of src/cli/tui/mod.rs: a cfg(test) method, then production leak sites, then
+    // Shape of src/lib.rs: a cfg(test) method, then production leak sites, then
     // `mod tests`. The old scanner took the next `mod ` after any `#[cfg(test)]` and blanked
     // everything between — including a production function and a later Poset leak.
     let src = concat!(
@@ -269,14 +269,14 @@ fn test_strip_does_not_treat_cfg_test_fn_or_use_as_a_module() {
 
 #[test]
 fn test_scanner_would_fail_if_runtime_returned_to_draw_live_area() {
-    let src = production_source(&tui_dir().join("mod.rs"));
+    let src = production_source(&tui_dir().join("lib.rs"));
     assert!(
         find_fn(&src, "draw_live_area").is_some(),
         "production scan dropped draw_live_area; a runtime leak in active renderer code \
          would be invisible to the isolation tests"
     );
     let poisoned = insert_into_fn(&src, "draw_live_area", " crate::runtime::example_call; ");
-    let hits = hits_in(&poisoned, "mod.rs", "crate::runtime");
+    let hits = hits_in(&poisoned, "lib.rs", "crate::runtime");
     assert!(
         hits.iter().any(|hit| hit.contains("example_call")),
         "scanner would not fail if crate::runtime were re-added inside production \
@@ -361,13 +361,13 @@ fn test_tui_production_does_not_reach_up_for_owned_completion_state() {
 
 #[test]
 fn test_scanner_would_fail_if_context_returned_to_mention_completion() {
-    let src = production_source(&tui_dir().join("mod.rs"));
+    let src = production_source(&tui_dir().join("lib.rs"));
     let poisoned = insert_into_fn(
         &src,
         "mention_query_from_textarea",
         " crate::context::mention::mention_query_at; ",
     );
-    let hits = hits_in(&poisoned, "mod.rs", "crate::context");
+    let hits = hits_in(&poisoned, "lib.rs", "crate::context");
     assert!(
         hits.iter().any(|hit| hit.contains("mention_query_at")),
         "scanner would not fail if project-context parsing returned to composer completion: \

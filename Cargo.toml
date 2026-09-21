@@ -29,6 +29,7 @@ members = [
     "crates/finch-providers",
     "crates/finch-runtime",
     "crates/finch-theme",
+    "crates/finch-tui",
     "crates/finch-ui-model",
     "crates/finch-vm",
     "crates/finch-vm-core",
@@ -50,6 +51,7 @@ default-members = [
     "crates/finch-providers",
     "crates/finch-runtime",
     "crates/finch-theme",
+    "crates/finch-tui",
     "crates/finch-ui-model",
     "crates/finch-vm",
     "crates/finch-vm-core",
@@ -70,6 +72,7 @@ finch-programs = { path = "crates/finch-programs" }
 finch-providers = { path = "crates/finch-providers" }
 finch-runtime = { path = "crates/finch-runtime" }
 finch-theme = { path = "crates/finch-theme" }
+finch-tui = { path = "crates/finch-tui" }
 finch-ui-model = { path = "crates/finch-ui-model" }
 finch-vm = { path = "crates/finch-vm" }
 

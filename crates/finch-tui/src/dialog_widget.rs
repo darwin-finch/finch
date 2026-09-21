@@ -553,7 +553,7 @@ impl<'a> Widget for DialogWidget<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::tui::dialog::DialogOption;
+    use crate::dialog::DialogOption;
 
     #[test]
     fn test_widget_creation() {

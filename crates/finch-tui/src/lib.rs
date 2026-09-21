@@ -211,7 +211,7 @@ pub(crate) use wizard_host::{
     wizard_physical_rows, wizard_plain, wizard_visible_length, wizard_wrap, WizardCard,
     WizardColor, WizardFrame, WizardHost, WizardRects, WizardSectionContent, WizardView,
 };
-// Re-export ColorScheme so callers can use `crate::cli::tui::ColorScheme`.
+// Re-export ColorScheme so callers can use `crate::ColorScheme`.
 pub use finch_theme::ColorScheme;
 
 const RESET: SetAttribute = SetAttribute(Attribute::Reset);
@@ -4585,8 +4585,8 @@ mod tests {
     }
 
     use super::*;
-    use crate::cli::messages::{Message, MessageId, MessageRef, WorkUnit};
-    use crate::cli::tui::vt_oracle::{VtColor, VtOracle, VtStyle};
+    use finch_messages::{Message, MessageId, MessageRef, WorkUnit};
+    use crate::vt_oracle::{VtColor, VtOracle, VtStyle};
     use finch_diff::{summarize_files, DiffColorMode, FileDiff};
     use finch_theme::ColorTheme;
 
@@ -4746,7 +4746,7 @@ mod tests {
             .accordion
             .rebuild_retained_hit_regions(&lines, 0, 80);
         let root =
-            crate::cli::tui::view_model::try_project_for_test(message.as_ref(), &renderer.colors)
+            crate::view_model::try_project_for_test(message.as_ref(), &renderer.colors)
                 .expect("projected row");
 
         assert_eq!(
@@ -4951,8 +4951,8 @@ mod tests {
     /// output row's stable identity.
     fn committed_tool_result_renderer(
         lines: usize,
-    ) -> (TuiRenderer, crate::cli::tui::view_model::RowId) {
-        use crate::cli::messages::WorkUnit;
+    ) -> (TuiRenderer, crate::view_model::RowId) {
+        use finch_messages::WorkUnit;
 
         let colors = ColorScheme::default();
         let work = Arc::new(WorkUnit::new("Tools"));
@@ -4963,7 +4963,7 @@ mod tests {
             (0..lines).map(|n| format!("line {n}")).collect::<Vec<_>>(),
         );
         work.set_complete();
-        let output_row = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+        let output_row = crate::view_model::try_project_for_test(work.as_ref(), &colors)
             .expect("projected row")
             .children[0]
             .children[1]
@@ -5063,7 +5063,7 @@ mod tests {
     /// separately addressable, and a wheel on the first never moves the second.
     #[test]
     fn test_wheel_dispatch_reaches_only_the_targeted_tool_result() {
-        use crate::cli::messages::{MessageRef, WorkUnit};
+        use finch_messages::{MessageRef, WorkUnit};
 
         let (mut renderer, _) = committed_tool_result_renderer(40);
         let colors = renderer.colors.clone();
@@ -5077,7 +5077,7 @@ mod tests {
         );
         second.set_complete();
         let second_output =
-            crate::cli::tui::view_model::try_project_for_test(second.as_ref(), &colors)
+            crate::view_model::try_project_for_test(second.as_ref(), &colors)
                 .expect("projected row")
                 .children[0]
                 .children[1]
@@ -5529,7 +5529,7 @@ mod tests {
     /// projection hides lines past the bound.
     #[test]
     fn test_canonical_commit_still_writes_full_tool_output_exactly_once() {
-        use crate::cli::messages::MessageRef;
+        use finch_messages::MessageRef;
 
         let (renderer, _output_row) = committed_tool_result_renderer(40);
         let message: MessageRef = renderer.output_manager.get_messages()[0].clone();
@@ -5590,7 +5590,7 @@ mod tests {
     /// native scrollback is the copyable record and must stay source-faithful.
     #[test]
     fn test_canonical_commit_writes_assistant_markdown_raw_source_byte_exact() {
-        use crate::cli::messages::{MessageRef, WorkUnit};
+        use finch_messages::{MessageRef, WorkUnit};
 
         let source = "Plan:\n```rust\nfn main() {\n    let deep =    1;\n}\n```\n**Note** run:\n- first\n- second\n";
         let unit = WorkUnit::new("Channeling");
@@ -5686,7 +5686,7 @@ mod tests {
     /// cursor, and reports its scroll position in the footer.
     #[test]
     fn test_vt_oracle_expanded_surface_paints_plain_text_and_hides_cursor() {
-        use crate::cli::tui::vt_oracle::VtOracle;
+        use crate::vt_oracle::VtOracle;
 
         let body: Vec<String> = (0..40).map(|n| format!("line {n}")).collect();
         let lines =
@@ -8299,7 +8299,7 @@ mod tests {
         work.complete_row_with_body(call, "done", vec!["step one".to_string()]);
         work.set_complete();
         let colors = ColorScheme::default();
-        let node = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+        let node = crate::view_model::try_project_for_test(work.as_ref(), &colors)
             .expect("a WorkUnit projects");
         let lines = AccordionState::default().render_node(&node);
         let live_rendered = lines;
@@ -8391,7 +8391,7 @@ mod tests {
         work.complete_row_with_body(call, "done", vec!["hi".to_string()]);
         work.set_complete();
         let colors = ColorScheme::default();
-        let node = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+        let node = crate::view_model::try_project_for_test(work.as_ref(), &colors)
             .expect("a WorkUnit projects");
         let live_rendered = AccordionState::default().render_node(&node);
         let width = 80;
@@ -8444,7 +8444,7 @@ mod tests {
             (region.top, region.bottom, region.left, region.right),
             "the adopted region is the rect the pass claimed"
         );
-        let node_after = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+        let node_after = crate::view_model::try_project_for_test(work.as_ref(), &colors)
             .expect("a WorkUnit projects");
         let expanded_before = accordion.is_expanded(&node_after);
         let toggled = accordion.handle_mouse(crossterm::event::MouseEvent {
@@ -8455,7 +8455,7 @@ mod tests {
         });
         assert!(toggled, "clicking the claimed rect must toggle the row");
         let node_after_toggle =
-            crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+            crate::view_model::try_project_for_test(work.as_ref(), &colors)
                 .expect("a WorkUnit projects");
         assert_ne!(
             accordion.is_expanded(&node_after_toggle),
@@ -8472,7 +8472,7 @@ mod tests {
         // characters to decide anything.
         let colors = ColorScheme::default();
         let pending = Arc::new(WorkUnit::new("Analyzing"));
-        let node = crate::cli::tui::view_model::try_project_for_test(pending.as_ref(), &colors)
+        let node = crate::view_model::try_project_for_test(pending.as_ref(), &colors)
             .expect("a WorkUnit projects");
         let rendered = AccordionState::default().render_node(&node);
         let header = &rendered[0].text;
@@ -8495,7 +8495,7 @@ mod tests {
         let call = work.add_row("bash(echo hi)");
         work.complete_row_with_body(call, "done", vec!["hi".to_string()]);
         work.set_complete();
-        let node = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+        let node = crate::view_model::try_project_for_test(work.as_ref(), &colors)
             .expect("a WorkUnit projects");
         let rendered = AccordionState::default().render_node(&node);
         assert!(
@@ -9631,7 +9631,7 @@ mod tests {
     /// top scroll offsets, while the transcript rows above shift behind them.
     #[test]
     fn test_furniture_renders_at_claimed_rects_at_every_scroll_position() {
-        use crate::cli::messages::WorkUnit;
+        use finch_messages::WorkUnit;
         let (mut renderer, _) = committed_tool_result_renderer(10);
         for index in 0..12 {
             let unit = Arc::new(WorkUnit::new(format!("turn {index}")));
@@ -10413,7 +10413,7 @@ mod tests {
 mod draw_dialog_tests {
 
     use super::*;
-    use crate::cli::tui::dialog::{Dialog, DialogOption};
+    use crate::dialog::{Dialog, DialogOption};
 
     /// Strip ANSI escape sequences from a string, returning only visible chars.
     fn strip_ansi(s: &str) -> String {

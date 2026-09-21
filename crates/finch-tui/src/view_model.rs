@@ -382,7 +382,7 @@ pub(crate) fn completion_pane_for_claim(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::WorkUnit;
+    use finch_messages::WorkUnit;
     use std::sync::Arc;
 
     fn colors() -> ColorScheme {
@@ -611,7 +611,7 @@ mod tests {
         // CONTROL (#756): markdown rendering is assistant prose only. A user
         // query (the Plain projection path) and a tool output row must carry
         // their text literally — no marker dropping, no bullet swaps, no SGR.
-        let user: MessageRef = Arc::new(crate::cli::messages::UserQueryMessage::new(
+        let user: MessageRef = Arc::new(finch_messages::UserQueryMessage::new(
             "show **bold** and - lists",
         ));
         assert!(
