@@ -4,10 +4,18 @@ Supplements the root [`AGENTS.md`](../../../CLAUDE.md), which still applies in f
 
 **What this is.** The machinery behind the interactive REPL. A Tokio `select!` in
 `EventLoop::run` reads user input, provider output, and Brain traffic, turns each into a
-`ReplEvent`, and dispatches it. Everything here is driven by that one loop; nothing here talks to a
-provider or a tool directly. Tool execution goes through [`crate::tools::ToolLoop`]
-(shared with the scheduler): stream events are observed, then admitted at most
-once.
+`ReplEvent`, and dispatches it. The selected generator is called by `query_processor`, and
+tool execution is coordinated here through [`crate::tools::ToolLoop`] (shared with the
+scheduler): stream events are observed, then admitted at most once.
+
+**Boundary and dependencies.** The [README](README.md) traces construction by `Repl` and
+event projection by the MemTree console. `mod.rs` is the facade; new callers should use its
+flat exports rather than reaching through child modules. Existing `pub mod` paths still expose
+implementation modules (notably `parts`, `brain_selection`, `memory_commitment`, and
+`tool_display`) to sibling CLI code; moving those callers to flat exports is a separate
+facade repair, not a change this documentation makes. The application injects provider,
+tool, Brain, and UI dependencies; this module may coordinate them but must not become their
+owner. No lower-level crate should depend on the REPL event loop.
 
 **Where the code lives.** `event_loop.rs` holds the `EventLoop` struct, `new`, and `run`. The
 handlers live beside it, grouped by what they handle, and are `pub(super)` so only the loop calls
