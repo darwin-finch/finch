@@ -6447,7 +6447,7 @@ mod tests {
         // source. While the source is still streaming (no card exists yet),
         // its progressive wire text stays visible — pinned by
         // `in_progress_program_source_keeps_received_wire_text_visible` in
-        // src/cli/messages/work_unit.rs; here the structural guard is what
+        // crates/finch-messages/src/work_unit.rs; here the structural guard is what
         // keeps a completed-but-unpaired source visible.
         let colors = ColorScheme::default();
         let streaming = Arc::new(WorkUnit::new("streaming"));

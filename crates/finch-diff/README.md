@@ -7,7 +7,7 @@ cells. Its input and output limits are part of the safety boundary, not merely d
 
 Two callers show why this is a shared leaf:
 
-1. The [WorkUnit message](../../src/cli/messages/work_unit.rs) retains a structured `FileDiff`
+1. The [WorkUnit message](../finch-messages/src/work_unit.rs) retains a structured `FileDiff`
    with a tool row and asks this crate for a bounded themed preview. The message owns the row's
    lifecycle and canonical transcript; this crate owns escaping, truncation, and diff formatting.
 2. The [TUI dialog](../../src/cli/tui/dialog.rs) sanitizes untrusted tool names and multiline

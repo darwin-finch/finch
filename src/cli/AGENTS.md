@@ -3,9 +3,10 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/cli/`: command handling, the interactive REPL and event loop, terminal rendering,
-typed presentation messages, setup and provider-login flows, output routing and dialogs,
-and conversation projection. Nested capsules document the event loop, message model, and TUI
-details. Application startup and daemon composition remain in the root package.
+setup and provider-login flows, output routing and dialogs, and conversation composition.
+Typed presentation messages live in `finch-messages`; `cli::messages` is a flat compatibility
+facade. Nested capsules document the event loop and TUI. Application startup and daemon
+composition remain in the root package.
 
 **Facade:** child modules are private. Callers outside this directory use flat `crate::cli::Item`
 imports from the `pub use` list in `mod.rs`; they must not select implementation paths such as

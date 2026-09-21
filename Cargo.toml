@@ -23,6 +23,7 @@ members = [
     "crates/finch-ipc",
     "crates/finch-language",
     "crates/finch-memory",
+    "crates/finch-messages",
     "crates/finch-node",
     "crates/finch-programs",
     "crates/finch-providers",
@@ -43,6 +44,7 @@ default-members = [
     "crates/finch-ipc",
     "crates/finch-language",
     "crates/finch-memory",
+    "crates/finch-messages",
     "crates/finch-node",
     "crates/finch-programs",
     "crates/finch-providers",
@@ -62,6 +64,7 @@ finch-ipc = { path = "crates/finch-ipc" }
 finch-tools-api = { path = "crates/finch-tools-api" }
 finch-language = { path = "crates/finch-language" }
 finch-memory = { path = "crates/finch-memory" }
+finch-messages = { path = "crates/finch-messages" }
 finch-node = { path = "crates/finch-node" }
 finch-programs = { path = "crates/finch-programs" }
 finch-providers = { path = "crates/finch-providers" }
