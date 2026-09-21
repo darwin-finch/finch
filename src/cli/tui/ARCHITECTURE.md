@@ -179,8 +179,5 @@ Virtual row helpers:
 - `src/cli/tui/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`
 - `src/cli/tui/accordion.rs` — renderer-owned disclosure: open set, focus, hit regions
 - `src/cli/tui/tool_viewport.rs` — bounded tool-result controls: child viewport state, wheel hit regions, expanded surface
-- `src/cli/tui/scrollback.rs` — `ScrollbackBuffer`
 - `src/cli/tui/dialog.rs` — Dialog state machine and approval control pin
 - `src/cli/tui/wizard_host.rs` — the setup wizard's widget host: view snapshot, claiming plan, shadow-buffer row-diff blit (#812)
-- `src/cli/tui/input_widget.rs` — Input area (tui-textarea)
-- `src/cli/tui/status_widget.rs` — Status bar

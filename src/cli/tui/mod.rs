@@ -47,15 +47,12 @@ mod cell_format;
 mod dialog;
 mod dialog_widget;
 mod graph;
-mod input_widget; // kept, used by wizard helpers
 #[cfg(test)]
 mod isolation;
 mod markdown;
 mod mouse_capture;
 mod scroll_view;
-mod scrollback; // kept for future use
 mod shadow_buffer; // kept – good architecture for future diffing
-mod status_widget;
 mod tabbed_dialog;
 mod tabbed_dialog_widget; // kept for wizard helpers
 mod tool_viewport;
