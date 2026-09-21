@@ -9,9 +9,9 @@ This is not a published crate. The test is whether production code here can draw
 Finch's poset, tool, or runtime vocabularies.
 
 **Boundary:** the [README](README.md) explains the two caller workflows and ownership.
-[`mod.rs`](mod.rs) is the facade; child modules stay private except `activity`, which callers
-already name. Add public surface only when a real caller needs a flat re-export. Do not recreate
-a generated symbol catalog.
+[`mod.rs`](mod.rs) is the facade; child modules stay private. The presentation types that
+application callers need are re-exported flat, including activity rows and updates. Add public
+surface only when a real caller needs it. Do not recreate a generated symbol catalog.
 `view_model` is private to this module. Application tests project messages through the
 lower message/UI-model contracts instead of reaching into renderer implementation.
 `TuiStatusPort` is the stateful status seam: CLI `StatusBar` implements it, and the renderer

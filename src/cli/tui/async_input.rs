@@ -302,18 +302,15 @@ pub fn spawn_input_task(
                                                 if m.contains(KeyModifiers::CONTROL) =>
                                             {
                                                 // Ctrl+G: Good feedback
-                                                tui.pending_feedback = Some(
-                                                    crate::cli::tui::activity::Verdict::Approve,
-                                                );
+                                                tui.pending_feedback =
+                                                    Some(super::Verdict::Approve);
                                                 Ok(None)
                                             }
                                             (KeyCode::Char('b'), m)
                                                 if m.contains(KeyModifiers::CONTROL) =>
                                             {
                                                 // Ctrl+B: Bad feedback
-                                                tui.pending_feedback = Some(
-                                                    crate::cli::tui::activity::Verdict::Reject,
-                                                );
+                                                tui.pending_feedback = Some(super::Verdict::Reject);
                                                 Ok(None)
                                             }
                                             (KeyCode::Char('z'), m)

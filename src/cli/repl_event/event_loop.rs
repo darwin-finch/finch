@@ -2787,10 +2787,10 @@ impl EventLoop {
                     if let Some(verdict) = pending_feedback {
                         // The terminal reports the gesture; the weight and the rating are Finch's.
                         let (rating, weight, label) = match verdict {
-                            crate::cli::tui::activity::Verdict::Approve => {
+                            crate::cli::tui::Verdict::Approve => {
                                 (FeedbackRating::Good, 1.0_f64, "👍 Good")
                             }
-                            crate::cli::tui::activity::Verdict::Reject => {
+                            crate::cli::tui::Verdict::Reject => {
                                 (FeedbackRating::Bad, 10.0_f64, "👎 Bad")
                             }
                         };

@@ -40,8 +40,11 @@ use finch_ui_model::input_line_physical_rows_with_ghost;
 use test_support::{OutputManager, StatusBar, StatusLineType};
 // Sub-modules
 mod accordion;
-pub mod activity;
-pub use activity::ActivityUsage;
+mod activity;
+pub use activity::{
+    ActivityRow, ActivityRows, ActivityState, ActivityUpdate, ActivityUsage, ActivityUsageState,
+    SharedActivityRows, Verdict,
+};
 mod async_input;
 mod autocomplete_widget;
 mod command_autocomplete;

@@ -6,14 +6,12 @@
 
 use std::sync::Arc;
 
-use crate::cli::tui::activity::{ActivityRow, ActivityRows, ActivityState, ActivityUpdate};
+use crate::cli::tui::{ActivityRow, ActivityRows, ActivityState, ActivityUpdate};
 use crate::scheduler::{AgentActivitySnapshot, AgentEvent, AgentTaskSnapshot, AgentTaskStatus};
 use crate::tools::{TodoList, TodoPriority, TodoStatus};
 
-fn activity_usage(
-    usage: &crate::scheduler::AgentUsage,
-) -> crate::cli::tui::activity::ActivityUsage {
-    use crate::cli::tui::activity::{ActivityUsage, ActivityUsageState};
+fn activity_usage(usage: &crate::scheduler::AgentUsage) -> crate::cli::tui::ActivityUsage {
+    use crate::cli::tui::{ActivityUsage, ActivityUsageState};
     ActivityUsage {
         state: match usage.state {
             crate::scheduler::AgentUsageState::Complete => ActivityUsageState::Complete,
