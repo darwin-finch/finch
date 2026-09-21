@@ -418,6 +418,23 @@ def capsule_paths(root: Path) -> list[str]:
     return sorted(path.relative_to(root).as_posix() for path in capsules)
 
 
+def check_capsule_files(root: Path, capsules: list[str]) -> list[str]:
+    """Require a human guide beside each capsule and reject retired catalogs."""
+    errors = []
+    for capsule in capsules:
+        guide = Path(capsule).with_name("README.md")
+        if not (root / guide).is_file():
+            errors.append(f"{capsule}: missing human README.md")
+    for area in ("src", "crates"):
+        directory = root / area
+        if directory.is_dir():
+            for catalog in directory.rglob("INTERFACE.md"):
+                errors.append(
+                    f"retired generated interface catalog: {catalog.relative_to(root)}"
+                )
+    return errors
+
+
 def check_design_index(design: str, capsules: list[str], docs_map: str) -> list[str]:
     """The design index must reach every capsule and cite no historical document."""
     errors: list[str] = []
@@ -474,12 +491,23 @@ def self_test() -> int:
         (fixture / "crates/example/src").mkdir(parents=True)
         (fixture / "src/example/AGENTS.md").touch()
         (fixture / "crates/example/AGENTS.md").touch()
+        (fixture / "src/example/README.md").touch()
+        (fixture / "crates/example/README.md").touch()
         observed = capsule_paths(fixture)
         expected = ["crates/example/AGENTS.md", "src/example/AGENTS.md"]
         if observed != expected:
             errors.append(
                 f"workspace-crate capsule discovery failed: expected={expected!r} observed={observed!r}"
             )
+        if check_capsule_files(fixture, observed):
+            errors.append("valid capsule guides were rejected")
+        (fixture / "src/example/INTERFACE.md").touch()
+        if not check_capsule_files(fixture, observed):
+            errors.append("retired interface catalog escaped the docs gate")
+        (fixture / "src/example/INTERFACE.md").unlink()
+        (fixture / "src/example/README.md").unlink()
+        if not check_capsule_files(fixture, observed):
+            errors.append("missing human capsule guide escaped the docs gate")
     if TRANSPORT_DOCUMENT not in CURRENT_DOCS:
         errors.append("native ChatGPT transport guide is not enrolled in CURRENT_DOCS")
 
@@ -601,7 +629,9 @@ def main() -> int:
         errors.extend(check_shell_fences(document, text))
         errors.extend(check_truth_claims(document, text))
         errors.extend(check_cited_identifiers(document, text, defined))
-    errors.extend(check_design_index((ROOT / DESIGN_DOCUMENT).read_text(), capsule_paths(ROOT), (ROOT / DOCS_MAP).read_text()))
+    capsules = capsule_paths(ROOT)
+    errors.extend(check_capsule_files(ROOT, capsules))
+    errors.extend(check_design_index((ROOT / DESIGN_DOCUMENT).read_text(), capsules, (ROOT / DOCS_MAP).read_text()))
 
     # The package description is published to package indexes and mirrored far
     # more widely than any document here, so it is held to the same standard.

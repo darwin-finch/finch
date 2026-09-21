@@ -25,10 +25,46 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from generate_interfaces import module_directories, owning_module  # noqa: E402
 from rust_scan import crate_references, strip_comments_and_tests, tracked_files  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def module_directories(files: list[str]) -> list[str]:
+    """Find directories whose capsule and Rust facade declare a subsystem seam."""
+    tracked = set(files)
+    return sorted(
+        f"{Path(path).parent.as_posix()}/"
+        for path in files
+        if Path(path).name == "AGENTS.md"
+        and Path(path).parent != Path(".")
+        and any(
+            (Path(path).parent / facade).as_posix() in tracked
+            for facade in ("mod.rs", "src/lib.rs")
+        )
+    )
+
+
+def module_identifier(directory: str) -> str:
+    """Name a source module or workspace crate as its caller sees it."""
+    if directory.startswith("src/"):
+        return directory.removeprefix("src/").rstrip("/").replace("/", "::")
+    if directory.startswith("crates/"):
+        return Path(directory.rstrip("/")).name
+    return directory.rstrip("/").replace("/", "::")
+
+
+def owning_module(directories: list[str], path: str) -> str | None:
+    """Name the innermost capsule containing a path, or its root source directory."""
+    best = max(
+        (directory for directory in directories if path.startswith(directory)),
+        key=len,
+        default=None,
+    )
+    if best:
+        return module_identifier(best)
+    parts = path.split("/")
+    return parts[1].removesuffix(".rs") if len(parts) > 1 and parts[0] == "src" else None
 
 
 def rust_sources(root: Path, files: list[str]) -> dict[str, str]:
