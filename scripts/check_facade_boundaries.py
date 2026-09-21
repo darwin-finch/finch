@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-FACADES = ("server", "cli", "local")
+FACADES = ("server", "cli", "local", "config", "context")
 PUBLIC_CHILD = re.compile(r"^\s*pub\s+mod\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
 FLAT_REEXPORT = re.compile(r"^\s*pub(?:\(crate\))?\s+use\s+", re.MULTILINE)
 
@@ -46,7 +46,7 @@ def main() -> int:
         for error in errors:
             print(error, file=sys.stderr)
         return 1
-    print("server, cli, and local facade boundaries are intact")
+    print("server, cli, local, config, and context facade boundaries are intact")
     return 0
 
 

@@ -17,7 +17,7 @@ class FacadeRepository:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        for facade in ("server", "cli", "local"):
+        for facade in ("server", "cli", "local", "config", "context"):
             directory = self.root / "src" / facade
             directory.mkdir(parents=True)
             (directory / "AGENTS.md").write_text(f"# {facade} capsule\n")
@@ -56,6 +56,15 @@ class FacadeBoundaryTests(unittest.TestCase):
         result = self.repo.run()
         self.assertEqual(result.returncode, 1)
         self.assertIn("public child module `handlers`", result.stderr)
+
+    def test_context_child_modules_must_remain_private(self) -> None:
+        (self.repo.root / "src/context/mod.rs").write_text(
+            "pub mod mention;\npub use mention::MentionCatalog;\n"
+        )
+        result = self.repo.run()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("src/context/mod.rs", result.stderr)
+        self.assertIn("public child module `mention`", result.stderr)
 
     def test_rejects_missing_capsule_or_flat_surface(self) -> None:
         (self.repo.root / "src/cli/AGENTS.md").unlink()

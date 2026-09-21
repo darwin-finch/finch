@@ -1477,29 +1477,28 @@ fn named_brain_provider_messages_at(
                 if attached_mentions.is_empty() {
                     vec![Message::user(prompt)]
                 } else {
-                    let bodies: Vec<crate::context::mention::AttachmentBody<'_>> =
-                        attached_mentions
-                            .iter()
-                            .map(|attachment| crate::context::mention::AttachmentBody {
-                                relative_path: &attachment.path,
-                                kind: if attachment.kind == "directory" {
-                                    crate::context::mention::MentionKind::Directory
-                                } else {
-                                    crate::context::mention::MentionKind::File
-                                },
-                                sha256: &attachment.sha256,
-                                byte_len: attachment.byte_len,
-                                truncated: attachment.truncated,
-                                truncation_note: attachment.truncation_note.as_deref(),
-                                content: &attachment.content,
-                            })
-                            .collect();
+                    let bodies: Vec<crate::context::AttachmentBody<'_>> = attached_mentions
+                        .iter()
+                        .map(|attachment| crate::context::AttachmentBody {
+                            relative_path: &attachment.path,
+                            kind: if attachment.kind == "directory" {
+                                crate::context::MentionKind::Directory
+                            } else {
+                                crate::context::MentionKind::File
+                            },
+                            sha256: &attachment.sha256,
+                            byte_len: attachment.byte_len,
+                            truncated: attachment.truncated,
+                            truncation_note: attachment.truncation_note.as_deref(),
+                            content: &attachment.content,
+                        })
+                        .collect();
                     vec![crate::providers::Message {
                         role: "user".to_string(),
                         content: vec![
                             crate::providers::ContentBlock::text(prompt),
                             crate::providers::ContentBlock::text(
-                                crate::context::mention::format_attachment_document(&bodies),
+                                crate::context::format_attachment_document(&bodies),
                             ),
                         ],
                     }]

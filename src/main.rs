@@ -2341,7 +2341,7 @@ fn is_clearly_forth(s: &str) -> bool {
     }
     // Token-boundary `@path` mentions are query attachments, not Forth fetch.
     // A trailing bare `@` (`dup @`, `5 @`) is not a mention and stays Forth.
-    if !finch::context::mention::parse_visible_mentions(t).is_empty() {
+    if !finch::context::parse_visible_mentions(t).is_empty() {
         return false;
     }
     // Forth operator characters that have no place in natural language
@@ -2390,7 +2390,7 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
         return Ok(());
     }
 
-    let query = match finch::context::mention::prepare_prompt_for_query(
+    let query = match finch::context::prepare_prompt_for_query(
         &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         query,
     ) {
