@@ -1842,8 +1842,7 @@ impl finch_vm::CapabilityHandler for TypedHostHandler {
                 let for_status = memory.clone();
                 let values = block_on_host(async move { memory.query(&query, None).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                let observed =
-                    finch_memory::memory_status::observed(before, for_status.hydration_status());
+                let observed = finch_memory::observed(before, for_status.hydration_status());
                 if let finch_memory::HydrationStatus::Failed { reason } = &observed {
                     return Err(host_binding_error(
                         origin,
@@ -1852,7 +1851,7 @@ impl finch_vm::CapabilityHandler for TypedHostHandler {
                         ),
                     ));
                 }
-                if let Some(caveat) = finch_memory::memory_status::caveat(&observed) {
+                if let Some(caveat) = finch_memory::caveat(&observed) {
                     tracing::warn!(%caveat, "mem-recall answered from a partial memory index");
                 }
                 return Ok(vec![TypedValue::List {

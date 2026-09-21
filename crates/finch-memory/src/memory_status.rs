@@ -13,9 +13,9 @@
 //! model — which unlike a user has no status line to glance at — acts on the
 //! sentence and concludes the memory was never recorded.
 //!
-//! Lives beside `src/memory` rather than inside it so the reporting vocabulary
-//! is shared by the TUI status strip, the agent-facing memory tools, and the
-//! typed runtime's `mem-recall` without any of them depending on each other.
+//! Lives in `finch-memory` so the TUI status strip, agent-facing memory tools,
+//! and typed runtime's `mem-recall` share one account of retrieval coverage
+//! without depending on each other's implementations.
 
 use crate::HydrationStatus;
 
@@ -200,7 +200,7 @@ pub fn count_qualifier(status: &HydrationStatus) -> Option<&'static str> {
 /// `entries` rather than `memories` on purpose. The counts are `tree_nodes`
 /// rows, which include the synthetic root and every internal aggregation node,
 /// so they are not the number of things the user would call a memory.
-pub fn status_line(recalled: usize, status: &HydrationStatus) -> String {
+pub(crate) fn status_line(recalled: usize, status: &HydrationStatus) -> String {
     match status {
         HydrationStatus::Ready { .. } => format!("🧠 recalled {recalled}"),
         // Say what fraction was searched, not just that something is happening:

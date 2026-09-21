@@ -763,7 +763,7 @@ async fn persist_completed_turn_memory(
     cwd: &str,
     status_bar: &StatusBar,
     context_lines: usize,
-    memory_recall: finch_memory::memory_status::Recall,
+    memory_recall: finch_memory::Recall,
 ) {
     let brain_provenance = query_states
         .get_metadata(query_id)
@@ -988,7 +988,7 @@ pub(super) async fn dispatch_tool_uses(
     query_states: &Arc<super::query_state::QueryStateManager>,
     tool_coordinator: &super::tool_execution::ToolExecutionCoordinator,
     memory_system: &Option<Arc<finch_memory::MemorySystem>>,
-    memory_recall: finch_memory::memory_status::Recall,
+    memory_recall: finch_memory::Recall,
     session_label: &str,
     cwd: &str,
     status_bar: &Arc<crate::cli::StatusBar>,
@@ -1224,7 +1224,7 @@ async fn dispatch_prepared_calls(
     query_states: &Arc<super::query_state::QueryStateManager>,
     tool_coordinator: &super::tool_execution::ToolExecutionCoordinator,
     memory_system: &Option<Arc<finch_memory::MemorySystem>>,
-    memory_recall: finch_memory::memory_status::Recall,
+    memory_recall: finch_memory::Recall,
     session_label: &str,
     cwd: &str,
     status_bar: &Arc<crate::cli::StatusBar>,
@@ -1356,7 +1356,7 @@ pub(crate) async fn process_query_with_tools(
     };
 
     // Get conversation context, optionally injecting relevant memories
-    let mut memory_recall = finch_memory::memory_status::Recall::none();
+    let mut memory_recall = finch_memory::Recall::none();
     let messages = {
         let all_msgs = conversation.read().await.get_messages();
         // When summarization is enabled and messages have been dropped by the
@@ -1410,8 +1410,7 @@ pub(crate) async fn process_query_with_tools(
                 // direction that matters.
                 let before = mem.hydration_status();
                 let recalled = mem.query_recall(&query, Some(recall_k)).await;
-                memory_recall.index =
-                    finch_memory::memory_status::observed(before, mem.hydration_status());
+                memory_recall.index = finch_memory::observed(before, mem.hydration_status());
                 if let Ok(fresh) = recalled {
                     memory_recall.count = fresh.len();
 
@@ -3560,7 +3559,7 @@ mod tests {
             "/workspace",
             &status,
             4,
-            finch_memory::memory_status::Recall {
+            finch_memory::Recall {
                 count: 3,
                 index: finch_memory::HydrationStatus::Loading {
                     loaded: 512,
@@ -3612,7 +3611,7 @@ mod tests {
             "/workspace",
             &status,
             4,
-            finch_memory::memory_status::Recall {
+            finch_memory::Recall {
                 count: 2,
                 index: finch_memory::HydrationStatus::Ready { nodes: 8 },
             },
@@ -3706,7 +3705,7 @@ mod tests {
                 "/workspace",
                 &status,
                 4,
-                finch_memory::memory_status::Recall {
+                finch_memory::Recall {
                     count: 2,
                     index: finch_memory::HydrationStatus::Ready { nodes: 8 },
                 },
@@ -4652,7 +4651,7 @@ mod tests {
             &query_states,
             &tool_coordinator,
             &None,
-            finch_memory::memory_status::Recall::none(),
+            finch_memory::Recall::none(),
             "test-session",
             "/test/workspace",
             &status,
@@ -4923,7 +4922,7 @@ mod tests {
                 &self.query_states,
                 &self.tool_coordinator,
                 &None,
-                finch_memory::memory_status::Recall::none(),
+                finch_memory::Recall::none(),
                 "test-session",
                 "/test/workspace",
                 &self.status,
@@ -4984,7 +4983,7 @@ mod tests {
                 &self.query_states,
                 &self.tool_coordinator,
                 &None,
-                finch_memory::memory_status::Recall::none(),
+                finch_memory::Recall::none(),
                 "test-session",
                 "/test/workspace",
                 &self.status,
@@ -5438,7 +5437,7 @@ mod tests {
                     &query_states,
                     &tool_coordinator,
                     &None,
-                    finch_memory::memory_status::Recall::none(),
+                    finch_memory::Recall::none(),
                     "test-session",
                     "/test/workspace",
                     &status,
@@ -5634,7 +5633,7 @@ mod tests {
                     &query_states,
                     &tool_coordinator,
                     &None,
-                    finch_memory::memory_status::Recall::none(),
+                    finch_memory::Recall::none(),
                     "test-session",
                     "/test/workspace",
                     &status,
