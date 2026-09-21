@@ -67,6 +67,8 @@ CURRENT_DOCS = (
     Path("src/oauth/README.md"),
     Path("src/providers/AGENTS.md"),
     Path("src/providers/README.md"),
+    Path("src/planning/AGENTS.md"),
+    Path("src/planning/README.md"),
     Path("docs/README.md"),
     Path("docs/language/README.md"),
     Path("docs/AUTOMATIC_TRAINING.md"),
