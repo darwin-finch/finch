@@ -28,7 +28,7 @@ pub trait Tool: Send + Sync {
     /// side-effecting from the command text), declare the worst case here;
     /// input-dependent refinements belong at the approval call sites that
     /// consume the effect (see
-    /// [`crate::tools::refined_effect_for_approval`]), never inside this
+    /// [`crate::refined_effect_for_approval`]), never inside this
     /// method — it takes no input by design.
     fn effect(&self) -> ExecutionEffect;
 

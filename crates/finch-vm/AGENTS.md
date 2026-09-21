@@ -12,16 +12,11 @@ Shared typed IR, verification, capability/effect descriptions, and vocabulary co
 [`finch-runtime`](../finch-runtime/AGENTS.md); the
 program-definition and corpus metadata live in `crates/finch-programs/`.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature;
-it is generated from the `pub use` list in `src/lib.rs`, which is the whole public surface. Child
-modules are private, so reaching past it is a compile error. To expose something new, re-export it
-deliberately. The root crate provides compatibility namespaces for the former `finch::lisp`
-reader and types paths.
-
-**Documentation:** [`docs/README.md`](docs/README.md) owns implemented interpreter, fiber,
-checkpoint, and execution reference material. Cross-frontend planned semantics remain in the shared
-[language design](../../docs/language/README.md); source-compilation separation follows the shared
-[implementation roadmap](../../docs/language/IMPLEMENTATION_ROADMAP.md).
+**Boundary:** the [README](README.md) traces runtime execution and wire-failure classification;
+[`src/lib.rs`](src/lib.rs) is the flat facade, and `cargo doc -p finch-vm --no-deps --open`
+renders public methods. Child modules remain private. To expose something new, re-export it
+deliberately; do not generate a signature catalog. The root crate keeps compatibility namespaces
+for former `finch::lisp` reader and type paths.
 
 **Dependencies:** `finch-vm` depends downward on the unpublished `finch-vm-core` crate and never
 on `finch-colisp`, `finch-coforth`, `finch-language`, or the root `finch` crate. The language
