@@ -35,6 +35,24 @@ impl AutocompleteState {
 }
 /// Color scheme for TUI elements Re-exported from `theme`.
 pub struct ColorScheme { … }
+pub enum CommandCategory { Basic, Model, Mcp, Persona, Patterns, Feedback, Memory, Brain }
+/// Registry of all available commands
+pub struct CommandRegistry { … }
+impl CommandRegistry {
+    /// Get all commands
+    pub fn all_commands(&self) -> &[CommandSpec];
+    /// Get all commands in a category
+    pub fn by_category(&self, category: CommandCategory) -> Vec<CommandSpec>;
+    /// Get all commands matching a prefix
+    pub fn match_prefix(&self, prefix: &str) -> Vec<CommandSpec>;
+    pub fn new() -> Self;
+}
+/// Command definition with description and parameter hints
+pub struct CommandSpec { … }
+impl CommandSpec {
+    /// Get full command syntax (name + params)
+    pub fn full_syntax(&self) -> String;
+}
 /// A dialog to display to the user
 pub struct Dialog { … }
 impl Dialog {
@@ -108,6 +126,44 @@ pub struct MentionCandidate { … }
 /// Prepared mention data consumed by either local provider history or a Brain prompt.
 pub struct MentionSubmission { … }
 pub enum PosetPanelMode { Graph, Forth, Typing }
+/// A single suggestion with optional keyboard shortcut
+pub struct Suggestion { … }
+impl Suggestion {
+    /// Format suggestion for display
+    pub fn format(&self) -> String;
+    pub fn new(text: impl Into<String>) -> Self;
+    pub fn with_priority(mut self, priority: u8) -> Self;
+    pub fn with_shortcut(mut self, shortcut: impl Into<String>) -> Self;
+}
+/// Context for generating suggestions
+pub enum SuggestionContext { FirstRun, Idle, QueryComplete, QueryError, Streaming, ModelLoading, ToolExecution }
+/// Manages contextual suggestions
+pub struct SuggestionManager { … }
+impl SuggestionManager {
+    /// Get a single formatted suggestion line for status bar
+    pub fn get_suggestion_line(&self) -> Option<String>;
+    /// Get the system prompt for generating LLM-based suggestions  This prompt is inspired by Claude Code's suggestion generators
+    pub fn get_suggestion_prompt(conversation_history: &str, user_stated_intent: Option<&str>) -> String;
+    /// Get current suggestions based on context and source
+    pub fn get_suggestions(&self) -> Vec<Suggestion>;
+    /// Increment query count
+    pub fn increment_query_count(&mut self);
+    /// Check if suggestions are enabled
+    pub fn is_enabled(&self) -> bool;
+    pub fn new() -> Self;
+    /// Parse LLM response into Suggestions
+    pub fn parse_llm_suggestions(response: &str) -> Vec<Suggestion>;
+    /// Update the current context
+    pub fn set_context(&mut self, context: SuggestionContext);
+    /// Enable or disable suggestions
+    pub fn set_enabled(&mut self, enabled: bool);
+    /// Set the preferred suggestion source
+    pub fn set_source(&mut self, source: SuggestionSource);
+    /// Update LLM-generated suggestions (call this when you get response from LLM)
+    pub fn update_llm_suggestions(&mut self, suggestions: Vec<Suggestion>);
+}
+/// Source of suggestions
+pub enum SuggestionSource { Hardcoded, LLM }
 /// Tabbed dialog for multiple questions
 pub struct TabbedDialog { … }
 impl TabbedDialog {
@@ -253,9 +309,9 @@ pub trait MentionPort: Send + Sync {
 /// Compute the 0-based row index (from the top of the live area) where the cursor will be parked after draw_live_area() finishes repositioning it into the input…
 pub(crate) fn compute_cursor_row_from_top(total_rows: usize, input_line_count: usize, cursor_row: usize, status_line_count: usize) -> usize { … }
 /// Compute what to display in the status bar.
-pub(crate) fn compute_effective_status(ghost_text: Option<&str>, raw_status: &str, current_input: &str, registry: &crate::cli::command_autocomplete::CommandRegistry) -> String { … }
+pub(crate) fn compute_effective_status(ghost_text: Option<&str>, raw_status: &str, current_input: &str, registry: &CommandRegistry) -> String { … }
 /// Compute the ghost-text suffix to append after the user's current input.
-pub(crate) fn compute_ghost_text(input: &str, registry: &crate::cli::command_autocomplete::CommandRegistry) -> Option<String> { … }
+pub(crate) fn compute_ghost_text(input: &str, registry: &CommandRegistry) -> Option<String> { … }
 /// Count the number of terminal rows an `effective_status` string will occupy.
 pub(crate) fn count_status_lines(status: &str) -> usize { … }
 /// Best-effort terminal restoration for an exit path that cannot acquire the renderer lock.

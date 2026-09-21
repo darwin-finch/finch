@@ -342,6 +342,17 @@ fn test_tui_production_does_not_name_project_context() {
 }
 
 #[test]
+fn test_tui_production_does_not_reach_up_for_owned_completion_state() {
+    let autocomplete = production_hits("crate::cli::command_autocomplete");
+    let suggestions = production_hits("crate::cli::suggestions");
+    assert!(
+        autocomplete.is_empty() && suggestions.is_empty(),
+        "tui-owned command completion and suggestion state must stay below the TUI facade; \
+         autocomplete={autocomplete:?}, suggestions={suggestions:?}"
+    );
+}
+
+#[test]
 fn test_scanner_would_fail_if_context_returned_to_mention_completion() {
     let src = production_source(&tui_dir().join("mod.rs"));
     let poisoned = insert_into_fn(

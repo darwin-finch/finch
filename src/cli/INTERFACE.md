@@ -378,43 +378,13 @@ pub struct StatusLine { … }
 pub enum StatusLineType { SessionLabel, SessionUsage, MemoryContext, ConversationTopic, ConversationFocus, ContextLine, BrainContextLine, LiveStats, AgentActivity, TrainingStats, DownloadProgress, OperationStatus, Suggestions, CompactionPercent, Custom }
 /// Streaming response message (for Claude/Qwen) Re-exported from `cli::messages`.
 pub struct StreamingResponseMessage { … }
-/// A single suggestion with optional keyboard shortcut
+/// A single suggestion with optional keyboard shortcut Re-exported from `cli::tui`.
 pub struct Suggestion { … }
-impl Suggestion {
-    /// Format suggestion for display
-    pub fn format(&self) -> String;
-    pub fn new(text: impl Into<String>) -> Self;
-    pub fn with_priority(mut self, priority: u8) -> Self;
-    pub fn with_shortcut(mut self, shortcut: impl Into<String>) -> Self;
-}
-/// Context for generating suggestions
+/// Context for generating suggestions Re-exported from `cli::tui`.
 pub enum SuggestionContext { FirstRun, Idle, QueryComplete, QueryError, Streaming, ModelLoading, ToolExecution }
-/// Manages contextual suggestions
+/// Manages contextual suggestions Re-exported from `cli::tui`.
 pub struct SuggestionManager { … }
-impl SuggestionManager {
-    /// Get a single formatted suggestion line for status bar
-    pub fn get_suggestion_line(&self) -> Option<String>;
-    /// Get the system prompt for generating LLM-based suggestions  This prompt is inspired by Claude Code's suggestion generators
-    pub fn get_suggestion_prompt(conversation_history: &str, user_stated_intent: Option<&str>) -> String;
-    /// Get current suggestions based on context and source
-    pub fn get_suggestions(&self) -> Vec<Suggestion>;
-    /// Increment query count
-    pub fn increment_query_count(&mut self);
-    /// Check if suggestions are enabled
-    pub fn is_enabled(&self) -> bool;
-    pub fn new() -> Self;
-    /// Parse LLM response into Suggestions
-    pub fn parse_llm_suggestions(response: &str) -> Vec<Suggestion>;
-    /// Update the current context
-    pub fn set_context(&mut self, context: SuggestionContext);
-    /// Enable or disable suggestions
-    pub fn set_enabled(&mut self, enabled: bool);
-    /// Set the preferred suggestion source
-    pub fn set_source(&mut self, source: SuggestionSource);
-    /// Update LLM-generated suggestions (call this when you get response from LLM)
-    pub fn update_llm_suggestions(&mut self, suggestions: Vec<Suggestion>);
-}
-/// Source of suggestions
+/// Source of suggestions Re-exported from `cli::tui`.
 pub enum SuggestionSource { Hardcoded, LLM }
 /// Tabbed dialog for multiple questions Re-exported from `cli::tui`.
 pub struct TabbedDialog { … }
