@@ -36,8 +36,8 @@ boundary instead of inventing a generic abstraction.
 **Keeping it true is part of the change, not follow-up work.** If you alter what a module owns or
 depends on, update its `AGENTS.md` in the same commit. If you change its purpose or caller
 workflow, update its `README.md`. A capsule that describes an obsolete boundary is worse than
-none. Legacy `INTERFACE.md` files are transitional and should be retired with a human README,
-not regenerated for migrated modules.
+none. Do not recreate generated `INTERFACE.md` files; the human README and AGENTS contract
+explain meaning, and the Rust facade plus rustdoc show the callable surface.
 
 A module directory earns a capsule when something outside it depends on it. For a root-package
 module, `mod.rs` is the facade; for a library crate, `src/lib.rs` is the crate-root facade. Keep
@@ -80,8 +80,8 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 ### Subsystem interfaces
 
 - **The facade defines the public surface** — child modules stay private and callers enter through
-  `mod.rs` or `src/lib.rs`. Migrated modules carry a human README and no generated
-  `INTERFACE.md`; the remaining legacy catalogs are checked only until their modules migrate.
+  `mod.rs` or `src/lib.rs`. Modules with external callers carry a human README and AGENTS
+  contract; generated `INTERFACE.md` catalogs are retired and must not return.
 
 ### GUI Accessibility
 
