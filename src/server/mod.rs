@@ -1,4 +1,4 @@
-// Shammah - Agent Server Module
+// Finch - Agent Server Module
 // HTTP daemon mode for multi-tenant agent serving
 
 mod brain_approval;
