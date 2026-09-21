@@ -7,13 +7,10 @@ compiler pipeline that returns `ModuleVerified`, and the compact-wire grammar
 generated from the CoLisp and Co-Forth reader lexicons. It owns no interpreter,
 runtime, fiber scheduler, capability grants, or checkpoint codec.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`.
-Application callers compile here, then submit the certificate to `finch-vm`.
-
-**Documentation:** [`docs/README.md`](docs/README.md) owns the implemented
-compilation-facade contract. Cross-frontend planned semantics remain in the
-shared [language design](../../docs/language/README.md); boundary changes follow
-the [implementation roadmap](../../docs/language/IMPLEMENTATION_ROADMAP.md).
+**Boundary:** the [README](README.md) traces source-only corpus checking and executable
+compilation; [`src/lib.rs`](src/lib.rs) is the flat facade. `cargo doc -p finch-language --no-deps
+--open` renders public methods. Application callers compile here, then submit the certificate to
+`finch-vm`. Do not recreate a generated signature catalog.
 
 **Dependencies:** `finch-language` depends on `finch-vm-core`, `finch-colisp`,
 and `finch-coforth`. It never depends on `finch-vm` or the root `finch` crate.
