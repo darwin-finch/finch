@@ -1,9 +1,9 @@
-//! Components not yet wired into the main render path.
+//! Terminal shadow buffer used by live and wizard frame painting.
 #![allow(dead_code)]
 // Shadow Buffer - 2D character array for proper text wrapping and rendering
 //
 // This module implements a double-buffering system for terminal rendering:
-// 1. ScrollbackBuffer (messages) → ShadowBuffer (2D chars with wrapping)
+// 1. Projected frame rows → ShadowBuffer (2D chars with wrapping)
 // 2. Diff ShadowBuffer with previous frame
 // 3. Update only changed cells in terminal
 //
