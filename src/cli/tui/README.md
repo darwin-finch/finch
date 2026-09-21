@@ -8,8 +8,8 @@ those through message snapshots, status state, and narrow ports such as `Mention
 
 Two callers show the boundary:
 
-1. The [interactive REPL](../repl.rs) constructs `TuiRenderer` with its `OutputManager`,
-   application-owned `StatusBar` through `TuiStatusPort`, and colors. The
+1. The [interactive REPL](../repl.rs) constructs `TuiRenderer` with application-owned
+   `OutputManager` through `TuiOutputPort`, `StatusBar` through `TuiStatusPort`, and colors. The
    [event loop](../repl_event/event_loop.rs) updates the session and
    asks the renderer to draw; the renderer projects each message's presentation snapshot and
    commits completed rows to terminal scrollback once. An AskUserQuestion request is converted by

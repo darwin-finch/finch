@@ -4161,7 +4161,7 @@ impl EventLoop {
             tui.last_render_error = None;
         }
 
-        tui.flush_output_safe(&self.output_manager)?;
+        tui.flush_output_safe()?;
         // check_and_refresh handles the needs_full_refresh flag.
         // We do NOT call tui.render() here: flush_output_safe() already draws
         // when messages are committed or when the 100 ms animation interval

@@ -13,7 +13,9 @@
 //! streamed appends, terminal reflow, and reconnects never lose a choice, and
 //! completing a run cannot collapse a result by flipping a domain default.
 
-use crate::cli::messages::MessageRef;
+#[cfg(test)]
+use finch_messages::Message;
+use finch_messages::MessageRef;
 use finch_theme::ColorScheme;
 
 use super::accordion::RenderedTranscriptLine;
@@ -46,7 +48,7 @@ pub(crate) fn project_message(message: &MessageRef, colors: &ColorScheme) -> Pro
 /// Test-only projection entry through the same message trait adapter.
 #[cfg(test)]
 pub(crate) fn try_project_for_test(
-    message: &dyn crate::cli::messages::Message,
+    message: &dyn Message,
     colors: &ColorScheme,
 ) -> Option<TranscriptNode> {
     message

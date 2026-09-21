@@ -195,7 +195,7 @@ pub(crate) async fn handle_present_plan(
     // is visible while the user reviews it.
     {
         let mut tui = tui_renderer.lock().await;
-        let _ = tui.flush_output_safe(&output_manager);
+        let _ = tui.flush_output_safe();
     }
 
     // Belt-and-suspenders: set active_dialog directly so the dialog is on-screen
