@@ -36,7 +36,7 @@ pub trait Message: Send + Sync {
     fn id(&self) -> MessageId;
 
     /// Format this message for display (with ANSI colors and styling)
-    fn format(&self, colors: &crate::theme::ColorScheme) -> String;
+    fn format(&self, colors: &finch_theme::ColorScheme) -> String;
 
     /// Get the current status of this message
     fn status(&self) -> MessageStatus;
@@ -46,7 +46,7 @@ pub trait Message: Send + Sync {
 
     /// Complete canonical text for permanent terminal scrollback and copying.
     /// Presentation-only disclosure state must never affect this value.
-    fn complete_transcript(&self, colors: &crate::theme::ColorScheme) -> String {
+    fn complete_transcript(&self, colors: &finch_theme::ColorScheme) -> String {
         self.format(colors)
     }
 
@@ -61,7 +61,7 @@ pub trait Message: Send + Sync {
     /// run: plain domain data (labels, statuses, bodies) the renderer's
     /// ViewModel projects into widget props once per frame. A WorkUnit is
     /// domain data, never a widget kind (#805).
-    fn work_unit_view(&self, _colors: &crate::theme::ColorScheme) -> Option<WorkUnitView> {
+    fn work_unit_view(&self, _colors: &finch_theme::ColorScheme) -> Option<WorkUnitView> {
         None
     }
 
@@ -92,7 +92,7 @@ pub trait Message: Send + Sync {
     /// Returns None for default (no background)
     fn background_style(
         &self,
-        _colors: &crate::theme::ColorScheme,
+        _colors: &finch_theme::ColorScheme,
     ) -> Option<ratatui::style::Style> {
         None // Default: no background
     }
@@ -102,7 +102,7 @@ pub trait Message: Send + Sync {
     /// override this without embedding presentation codes in copied text.
     fn background_style_for_line(
         &self,
-        colors: &crate::theme::ColorScheme,
+        colors: &finch_theme::ColorScheme,
         _line_index: usize,
         _line_count: usize,
     ) -> Option<ratatui::style::Style> {

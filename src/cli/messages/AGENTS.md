@@ -9,11 +9,17 @@ module does not own the durable Brain journal, provider/tool execution, terminal
 renderer disclosure state.
 
 **Dependencies and direction:** snapshot types and pure projection belong to `finch-ui-model`;
-color roles belong to the shared theme vocabulary, currently reached through root compatibility
-re-exports. `finch-diff` supplies bounded structured file diffs for WorkUnit rows. Model-loader
+color roles come directly from `finch-theme`, and bounded structured file diffs from
+`finch-diff`. Production message code must not reach back through root `config`, `theme`, or
+`cli::diff` compatibility aliases. Model-loader
 progress adaptation belongs in application-owned `cli::output_manager`, not this message model.
 Brain, runtime, provider, and tool layers must not depend upward on this message model;
 application adapters construct messages at the conversation boundary.
+
+The production outgoing seam is now only those three extracted presentation crates. Some
+message tests still call root TUI projection and REPL tool-display helpers; move or replace
+those test-only reverse edges with equivalent integration coverage before a mechanical
+message-model crate extraction.
 
 **Invariants and lifetimes:** a `MessageId` remains stable across streaming updates. WorkUnit
 row paths are append-only semantic ancestry; never reuse or reorder a path segment. The same
