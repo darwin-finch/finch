@@ -11,11 +11,10 @@ generation contract (`GenerationBackend`, `GenerationEvent`, `ToolCall`,
 DESIGN.md lists this tree on the models row; models owns the Finch adapters.
 Provider transports live in `finch-providers`.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its
-signature. Child modules are private, so the `pub use` list in
-`src/generators/mod.rs` is the whole public surface. Callers outside this
-directory use `crate::generators::Item`; they must not name `claude`,
-`daemon_local`, or `qwen`.
+**Boundary:** the [README](README.md) traces REPL assembly and query streaming.
+[`mod.rs`](mod.rs) is the facade; rustdoc renders methods on exported types. Child modules
+are private, so callers outside this directory use `crate::generators::Item`, not `claude`,
+`daemon_local`, or `qwen`. Do not recreate a signature catalog.
 
 **Dependencies:** `finch-generation` (contract), `finch-providers` /
 `claude` (`ContentBlock`, `Message`), `tools` (`ToolDefinition` wire type
@@ -37,9 +36,11 @@ SSE path and recorded in the catalog, not claimed here. `DaemonLocalGenerator`
 keeps the local profile's name (family-derived for local entries); the exact
 model arrives per turn in `ResponseMetadata.model`.
 
-This facade re-exports `translate_provider_chunk` so
-`ContentBlockComplete(ToolUse)` becomes `ToolCallComplete` at the generation
-layer. Native OpenAI/Claude deltas pass through the same ToolLoop.
+This facade re-exports `translate_provider_chunk` for the development generation contract.
+The current REPL handles provider `StreamChunk` directly; do not claim it calls the translator.
+Native OpenAI/Claude deltas pass through the application ToolLoop.
 
-Add public surface by re-exporting it from `mod.rs`, then regenerate
-`INTERFACE.md` with `python3 scripts/generate_interfaces.py --write`.
+Keep new child-module surface behind deliberate `mod.rs` re-exports; root-defined contracts
+also belong in that facade. Run focused tests with
+`./scripts/test_brains.sh cargo test --lib -- generators::` and the REPL query tests with
+`./scripts/test_brains.sh cargo test --lib -- cli::repl_event::query_processor::`.
