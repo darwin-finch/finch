@@ -71,6 +71,7 @@ CURRENT_DOCS = (
     Path("src/providers/README.md"),
     Path("src/planning/AGENTS.md"),
     Path("src/planning/README.md"),
+    Path("src/tools/EXECUTION.md"),
     Path("docs/README.md"),
     Path("docs/language/README.md"),
     Path("docs/AUTOMATIC_TRAINING.md"),
