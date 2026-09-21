@@ -27,4 +27,5 @@ Two caller workflows show the boundary:
 
 The [agent contract](AGENTS.md) states dependency rules, lifetimes, and focused tests. The
 [`src/lib.rs` facade](src/lib.rs) defines the exports and facade-local signatures; methods on
-re-exported types are still defined in their private implementation files.
+re-exported types appear in `cargo doc -p finch-runtime --no-deps --open`, so callers can inspect
+the callable API without reading private implementations or a separate signature catalog.

@@ -39,8 +39,8 @@ Everything else in this section follows from that:
   an agent starting there inherits the root rules plus one page, not the whole project narrative.
 - **Facades are the entry points.** A caller reads the module's short README and agent contract
   for meaning and rules, then its `mod.rs` or `src/lib.rs` for exports and facade-local signatures.
-  Methods implemented on re-exported types may still require source navigation; generated
-  signature catalogs are not architectural authority.
+  Rustdoc renders methods on re-exported types for exact signatures without opening private
+  implementations. Generated signature catalogs are not architectural authority.
 - **Crate extraction is optional.** A crate makes a boundary unforgeable and shrinks the dependency
   surface a change pays for, but the facade is what delivers the context win. Extract only where
   measurement justifies it.

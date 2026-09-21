@@ -1,4 +1,11 @@
 //! Provider-neutral execution service for Finch's Forth and Lisp VMs.
+//!
+//! The crate README explains the Brain-store and interactive-REPL workflows. For the exact
+//! callable API, rustdoc renders methods on re-exported types as well as items declared in this
+//! facade. The Brain-store workflow uses [`ProgramRuntime::from_checkpoint_at_revision`],
+//! [`ProgramRuntimeAuthorityStore::restore_into`], and [`VmEffectDeliveryLog::open_bound`].
+//! The interactive workflow uses [`ProgramRuntime::submit_tool_program`],
+//! [`ProgramRuntime::resolve_typed_approval`], and [`ProgramRuntime::resume_vm_effect`].
 
 mod abi;
 mod agent_vm;

@@ -3,7 +3,8 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md). Read the [runtime README](README.md) for
 ownership and caller workflows; the flat `pub use` surface and facade-local signatures are in
 [`src/lib.rs`](src/lib.rs). Methods of re-exported types remain defined in private child files.
-Root callers may use the
+Use `cargo doc -p finch-runtime --no-deps --open` to read their public signatures and method
+contracts without opening those implementations. Root callers may use the
 `crate::runtime` compatibility re-export; crate callers use `finch_runtime`.
 
 ## Dependencies and extension rules
