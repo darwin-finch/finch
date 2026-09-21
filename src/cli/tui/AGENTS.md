@@ -4,7 +4,7 @@ Supplements the root [`AGENTS.md`](../../../CLAUDE.md), which still applies in f
 
 **Owns** `src/cli/tui/`: the interactive terminal renderer (`TuiRenderer`), dialogs, the live
 area, scrollback, the ViewModel projection, the claiming widget tree, the conversation
-ScrollView, disclosure (accordion), activity rows, and graph *view types*.
+ScrollView, disclosure (accordion), and activity rows.
 This is not a published crate. The test is whether production code here can draw without naming
 Finch's poset, tool, or runtime vocabularies.
 
@@ -177,7 +177,6 @@ draws a view, and the caller converts.
 |------|-------------------------|----------------|
 | `view_model::TranscriptNode` | label, body, children, role, default disclosure | WorkUnit `domain_view()`, in `view_model::project_message` |
 | [`activity::ActivityRow`](activity.rs) | indented status text | todos / agent tasks, in `cli::repl_event::activity_view` |
-| [`GraphView`](graph.rs) | nodes, edges, camera | TUI-owned graph snapshots and tests |
 | `Dialog::tool_approval(name, summary)` | a name and a summary line | Finch `ToolUse`, in `cli::repl_event::tool_display::tool_approval_dialog` |
 | [`cell_format::workbook_cell_to_string`](cell_format.rs) | one cell as text | calamine `Data`, inside `spreadsheet_preview_rows` |
 
@@ -196,8 +195,9 @@ status glyph — and never invent a `•` bullet or sniff glyph characters (#821
 
 The renderer no longer accepts or stores Finch's `Poset`. The old `set_poset` injection was
 write-only and its Finch-to-`GraphView` adapter had no production caller, so #996 removed both.
-`draw_poset_overlay` continues to paint the user-defined `check` word from `corner`; generic graph
-helpers consume only the TUI-owned `GraphView` vocabulary.
+The remaining graph-to-Forth projection and its public view vocabulary then had only self-tests,
+so #1002 deleted them. `draw_poset_overlay` continues to paint the user-defined `check` word from
+`corner` without accepting a graph or poset.
 
 ## Deliberate remaining production references
 

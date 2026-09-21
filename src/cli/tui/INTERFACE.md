@@ -91,26 +91,6 @@ impl DialogWidget {
     /// Create a new dialog widget
     pub fn new(dialog: &'a Dialog, colors: &'a ColorScheme) -> Self;
 }
-/// One node of the live graph panel.
-pub struct GraphNode { … }
-impl GraphNode {
-    /// A pending user task at the origin.
-    pub fn new(id: usize, label: impl Into<String>) -> Self;
-}
-/// Who created the node.
-pub enum GraphNodeAuthor { User, Ai }
-/// What a graph node is for.
-pub enum GraphNodeKind { Task, Constraint, Question, Observation }
-/// How far along a node's work is.
-pub enum GraphNodeStatus { Pending, Running, Done, Failed }
-/// Nodes and edges the graph widget can draw, plus the camera the overlay uses.
-pub struct GraphView { … }
-impl GraphView {
-    /// True when there is nothing to draw.
-    pub fn is_empty(&self) -> bool;
-    /// An empty graph with the default camera.
-    pub fn new() -> Self;
-}
 /// Events produced by the async input task and consumed by the event loop.
 pub enum InputEvent { Submitted, TypingStarted }
 /// One live-area frame: the exact logical lines to paint, and where the cursor lands once they are painted.
@@ -164,7 +144,7 @@ impl TuiRenderer {
     pub fn create_clean_textarea_with_text(text: &str) -> TextArea<'static>;
     /// Draw the live area from scratch and track `active_rows`.
     pub fn draw_live_area(&mut self) -> Result<()>;
-    /// Render the Co-Forth panel (graph or Forth source) as a floating overlay in the top-right corner of the current terminal viewport.
+    /// Render the user-defined `check` word output in the top-right corner of the current terminal viewport.
     pub fn draw_poset_overlay(&mut self) -> Result<()>;
     /// Move the cursor up to the top of the live area and clear everything below it, ready for a fresh draw.
     pub fn erase_live_area(&mut self) -> Result<()>;
