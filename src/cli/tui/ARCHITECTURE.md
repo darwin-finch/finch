@@ -56,7 +56,7 @@ native history is not the reader; drag-selection under capture remains open on
   terminal rows; the retained-transcript region above is recounted from physical-row geometry
   after every frame and resize. Never persist terminal coordinates as row identity.
 
-**Component-owned say turn (#882)** (`src/cli/components/`): a successful untitled `say`
+**Component-owned say turn (#882)** (`crates/finch-ui-model/src/say_turn.rs`): a successful untitled `say`
 turn renders through its component as **one representation per state** (stage 2 of
 `docs/TUI_DESIGN.md`): Generating (no program yet) is one animated progress line; Running is
 the program source inline, with any already-arrived output bytes beneath it (never hidden);
@@ -169,8 +169,7 @@ Virtual row helpers:
 ## Key files
 
 - `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
-- `crates/finch-ui-model/` — terminal-independent identity, widget vocabulary, and claiming layout
-- `src/cli/components/` — component-owned presentation, including the say-turn component
+- `crates/finch-ui-model/` — terminal-independent identity, widget vocabulary, pure say-turn projection, and claiming layout
   (`say_turn.rs`) (#882)
 - `src/cli/tui/view_model.rs` — the blit-time `LiveViewModel`, the domain → widget projection, and the root claiming tree
 - `src/cli/tui/markdown.rs` — bounded assistant-prose markdown parse/render for the viewport (#756); raw source stays the canonical record

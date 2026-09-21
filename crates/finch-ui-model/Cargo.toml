@@ -5,7 +5,7 @@ publish = false
 rust-version = "1.98"
 edition = "2021"
 license = "LicenseRef-PolyForm-Noncommercial-1.0"
-description = "Terminal-independent application UI identity, semantic widget data, line measurement, and pure claiming layout"
+description = "Terminal-independent application UI state, pure projection, semantic widget data, and claiming layout"
 repository = "https://github.com/darwin-finch/finch"
 
 [dependencies]

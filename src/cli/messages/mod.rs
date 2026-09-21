@@ -11,7 +11,9 @@
 
 use std::sync::Arc;
 
-pub use crate::ui_model::MessageId;
+pub use finch_ui_model::{
+    MessageId, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
+};
 
 pub mod concrete;
 pub mod work_unit;
@@ -22,9 +24,8 @@ pub use concrete::{
     ToolExecutionMessage, UserQueryMessage,
 };
 pub use work_unit::{
-    random_spinner_verb, AgentActivityView, AgentToolView, ComponentAction, OutputVm,
-    ProgramSourceVm, SayTurnStatus, SayTurnView, ToggleProgram, WorkRow, WorkRowStatus,
-    WorkRowView, WorkUnit, WorkUnitHead, WorkUnitView, WorkUnitViewModel,
+    random_spinner_verb, AgentActivityView, AgentToolView, ComponentAction, ToggleProgram, WorkRow,
+    WorkRowStatus, WorkRowView, WorkUnit, WorkUnitHead, WorkUnitView,
 };
 pub use work_unit::{WorkRowPresentation, WorkUnitPresentation};
 

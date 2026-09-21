@@ -54,7 +54,10 @@ pub fn random_spinner_verb() -> &'static str {
     SPINNER_WORDS[idx]
 }
 
-use super::{Message, MessageId, MessageStatus};
+use super::{
+    Message, MessageId, MessageStatus, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView,
+    WorkUnitViewModel,
+};
 use crate::cli::diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 use crate::config::{ColorScheme, MessageBand};
 
@@ -80,58 +83,6 @@ impl fmt::Display for GrayDim {
 }
 
 const GRAY_DIM: GrayDim = GrayDim;
-
-// ============================================================================
-// Say-turn component ViewModel (#882, stage 1 of docs/TUI_DESIGN.md)
-// ============================================================================
-
-/// Status of a component-owned say turn. The completion path transitions it
-/// exactly once; a finished turn therefore cannot keep wearing `running`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SayTurnStatus {
-    #[default]
-    Running,
-    Completed,
-}
-
-/// The program-source part of a say turn's ViewModel: the exact wire text the
-/// provider produced, retained so the reader can reveal it on demand.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ProgramSourceVm {
-    pub language: String,
-    pub lines: Vec<String>,
-}
-
-/// The output part of a say turn's ViewModel, set when the program produces
-/// output and updated live as `say` chunks stream.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OutputVm {
-    pub lines: Vec<String>,
-}
-
-/// The retained ViewModel of one say turn, living on the WorkUnit behind the
-/// message's existing lock. Holds presentation state (status, program,
-/// output) and the ephemeral UI state (`show_program`, default hidden for say
-/// turns — #350's prose ruling). Because it is retained, component state needs
-/// no renderer-side map.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WorkUnitViewModel {
-    pub status: SayTurnStatus,
-    pub program: ProgramSourceVm,
-    pub output: Option<OutputVm>,
-    pub show_program: bool,
-}
-
-/// One frame's component snapshot: the retained ViewModel plus the chrome
-/// timing, captured under the same lock read. The full-resolution elapsed
-/// drives the component's animated generating state; completed turns read the
-/// captured value, so the annotation is stable for scrollback.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SayTurnView {
-    pub message_id: MessageId,
-    pub vm: WorkUnitViewModel,
-    pub elapsed: std::time::Duration,
-}
 
 /// The say component's action vocabulary. The engine's hit-rect routing
 /// carries actions opaquely (`ComponentAction`) — there is no central action

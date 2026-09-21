@@ -65,9 +65,9 @@ impl OperationMessage {
 pub struct OperationRow { … }
 /// Status of an individual row within an OperationMessage
 pub enum OperationRowStatus { Running, Complete, Error }
-/// The output part of a say turn's ViewModel, set when the program produces output and updated live as `say` chunks stream.
+/// The output part of a say turn's ViewModel, set when the program produces output and updated live as `say` chunks stream. Re-exported from `finch-ui-model`.
 pub struct OutputVm { … }
-/// The program-source part of a say turn's ViewModel: the exact wire text the provider produced, retained so the reader can reveal it on demand.
+/// The program-source part of a say turn's ViewModel: the exact wire text the provider produced, retained so the reader can reveal it on demand. Re-exported from `finch-ui-model`.
 pub struct ProgramSourceVm { … }
 /// Progress message for downloads, uploads, etc.
 pub struct ProgressMessage { … }
@@ -80,9 +80,9 @@ impl ProgressMessage {
     /// Update progress
     pub fn update_progress(&self, current: u64);
 }
-/// Status of a component-owned say turn.
+/// Status of a component-owned say turn. Re-exported from `finch-ui-model`.
 pub enum SayTurnStatus { Running, Completed }
-/// One frame's component snapshot: the retained ViewModel plus the chrome timing, captured under the same lock read.
+/// One frame's component snapshot: the retained ViewModel plus the chrome timing, captured under the same lock read. Re-exported from `finch-ui-model`.
 pub struct SayTurnView { … }
 /// Static message (immutable, for errors, system info, etc.)
 pub struct StaticMessage { … }
@@ -217,7 +217,7 @@ impl WorkUnitHead {
 pub enum WorkUnitPresentation { Assistant, Activity, ProgramSource, ProgramOutput }
 /// Full blit-time domain snapshot of one WorkUnit run.
 pub struct WorkUnitView { … }
-/// The retained ViewModel of one say turn, living on the WorkUnit behind the message's existing lock.
+/// The retained ViewModel of one say turn, living on the WorkUnit behind the message's existing lock. Re-exported from `finch-ui-model`.
 pub struct WorkUnitViewModel { … }
 ```
 
