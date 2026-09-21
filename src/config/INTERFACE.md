@@ -38,11 +38,11 @@ pub type BackendDevice = ExecutionTarget;
 pub struct CheckCommandSource { … }
 /// Client configuration for connecting to daemon
 pub struct ClientConfig { … }
-/// Color scheme for TUI elements Re-exported from `theme`.
+/// Color scheme for TUI elements Re-exported from `finch-theme`.
 pub struct ColorScheme { … }
-/// Color specification - supports named colors and RGB Re-exported from `theme`.
+/// Color specification - supports named colors and RGB Re-exported from `finch-theme`.
 pub enum ColorSpec { Named, Rgb }
-/// Predefined color themes for different terminal backgrounds Re-exported from `theme`.
+/// Predefined color themes for different terminal backgrounds Re-exported from `finch-theme`.
 pub enum ColorTheme { Dark, Light, HighContrast, Solarized }
 pub struct Config { … }
 impl Config {
@@ -100,7 +100,7 @@ impl DiagnosticsConfig {
     /// Fail closed on declarations this build must not mis-execute.
     pub fn validate(&self) -> anyhow::Result<()>;
 }
-/// Dialog color configuration Re-exported from `theme`.
+/// Dialog color configuration Re-exported from `finch-theme`.
 pub struct DialogColors { … }
 /// Normalized service family. Re-exported from `finch-providers`.
 pub enum EndpointFamily { AnthropicApi, OpenaiPlatform, ChatgptSubscription, XaiApi, GrokSubscription, GeminiAiStudio, GoogleVertex, MistralApi, GroqApi, OpenrouterApi, Custom }
@@ -130,9 +130,9 @@ pub struct LicenseConfig { … }
 pub enum LicenseType { Noncommercial, Commercial }
 /// Re-exported from `finch-providers`.
 pub struct LifecycleRevocation(Arc<AtomicBool>);
-/// Semantic full-row bands used by the transcript renderer. Re-exported from `theme`.
+/// Semantic full-row bands used by the transcript renderer. Re-exported from `finch-theme`.
 pub enum MessageBand { LocalUser, Participant, Assistant, ProgramSource, Tool, ProgramOutput }
-/// Message display colors Re-exported from `theme`.
+/// Message display colors Re-exported from `finch-theme`.
 pub struct MessageColors { … }
 /// A persona defines how the AI should behave
 pub struct Persona { … }
@@ -206,11 +206,11 @@ pub struct ResolvedCredential { … }
 pub struct ResolvedSecret(String);
 /// Server configuration for daemon mode
 pub struct ServerConfig { … }
-/// Status bar color configuration Re-exported from `theme`.
+/// Status bar color configuration Re-exported from `finch-theme`.
 pub struct StatusColors { … }
 /// A single teacher entry with provider and settings
 pub struct TeacherEntry { … }
-/// UI element colors Re-exported from `theme`.
+/// UI element colors Re-exported from `finch-theme`.
 pub struct UiColors { … }
 ```
 

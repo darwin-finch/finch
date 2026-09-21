@@ -356,7 +356,7 @@ mod tests {
     use super::*;
     use crate::cli::messages::{Message, MessageRef, WorkUnit};
     use crate::cli::tui::view_model::project_work_unit;
-    use crate::theme::ColorScheme;
+    use finch_theme::ColorScheme;
     use std::sync::Arc;
 
     fn colors() -> ColorScheme {

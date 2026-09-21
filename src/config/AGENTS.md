@@ -3,19 +3,19 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/config/` (settings, provider entries, personas, credentials and their resolvers,
-backend selection, colors, notice state, constants), `src/context/` (project instruction loading),
+backend selection, persisted color choices, notice state, constants), `src/context/` (project instruction loading),
 `src/license/`, `src/metrics/`, `src/monitoring/`, `src/errors.rs`, and the `data/` personas.
 The declared post-edit diagnostics sources live in
 [`diagnostics.rs`](diagnostics.rs) and their user-facing contract is documented in
 [`CONFIGURATION.md`](CONFIGURATION.md).
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `src/config/mod.rs` is the whole public surface, and
-`scripts/check_subsystems.py` rejects a `pub mod` there. `src/context` and `src/license` have their
+modules are private, so the `pub use` list in `src/config/mod.rs` is the whole public surface.
+There is no `check_subsystems.py` gate; review the facade directly. `src/context` and `src/license` have their
 own module documents and no separate facade yet.
 
-**Dependencies:** `config` should depend on nothing except the extracted provider
-credential/reasoning types from `finch-providers`. Three unwanted edges remain, to
+**Dependencies:** `config` may use the extracted provider credential/reasoning types from
+`finch-providers` and the persisted color vocabulary from `finch-theme`. Three unwanted edges remain, to
 `memory`, `models`, and `tools::mcp` (`McpServerConfig`). Add no new ones.
 
 **Credentials are secrets.** Resolvers return values that must never reach logs, prompts, metrics,

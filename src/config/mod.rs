@@ -48,9 +48,9 @@ mod settings;
 #[allow(deprecated)]
 pub use backend::BackendDevice; // Deprecated alias for ExecutionTarget
 pub use backend::{BackendConfig, CoreMlComputeUnits, CoreMlConfig, ExecutionTarget};
-// Colours are a rendering vocabulary, not a configuration one: `crate::theme` defines what a
-// scheme is and this module's job is turning a config file into one. Re-exported so callers that
-// think of it as configuration keep working.
+// Colours are a presentation vocabulary, not a configuration one: `finch-theme` defines what a
+// scheme is and this module turns a config file into one. The root `theme` compatibility path
+// keeps existing application callers working.
 pub use crate::theme::{
     ColorScheme, ColorSpec, ColorTheme, DialogColors, MessageBand, MessageColors, StatusColors,
     UiColors,

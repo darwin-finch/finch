@@ -1,0 +1,13 @@
+[package]
+name = "finch-theme"
+version = "0.7.31"
+publish = false
+rust-version = "1.98"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0"
+description = "Shared Finch color themes, schemes, and terminal color mapping"
+repository = "https://github.com/darwin-finch/finch"
+
+[dependencies]
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }

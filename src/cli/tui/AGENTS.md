@@ -209,8 +209,8 @@ module of this crate, **or** the remaining ones are written down here with the r
 
 **Finch modules this directory still names in production, and why they stay:**
 
-- **`crate::theme::ColorScheme`** — leaf colour scheme, re-exported so callers write
-  `crate::cli::tui::ColorScheme`. Theme is not Finch domain vocabulary.
+- **`finch_theme::ColorScheme`** — shared colour vocabulary from the extracted leaf crate,
+  re-exported so existing callers can still write `crate::cli::tui::ColorScheme`.
 - **Sibling CLI types** (`cli::messages`, `cli::diff`, `cli::llm_dialogs`, `StatusBar`,
   `AskUserQuestion*`) — the renderer uses the `Message` trait to request WorkUnit snapshots and
   delegates their pure projection to `finch-ui-model`; `cli::diff` renders diff bodies while the
