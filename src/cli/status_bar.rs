@@ -455,7 +455,7 @@ impl StatusBar {
     pub fn update_agent_activity(
         &self,
         active_children: usize,
-        usage: &crate::cli::tui::activity::ActivityUsage,
+        usage: &crate::cli::tui::ActivityUsage,
     ) {
         if active_children == 0 {
             self.remove_line(&StatusLineType::AgentActivity);
@@ -470,9 +470,9 @@ impl StatusBar {
             .map(|tokens| tokens.to_string())
             .unwrap_or_else(|| "unavailable".to_string());
         let state = match usage.state {
-            crate::cli::tui::activity::ActivityUsageState::Complete => "complete",
-            crate::cli::tui::activity::ActivityUsageState::Partial => "partial",
-            crate::cli::tui::activity::ActivityUsageState::Unavailable => "unavailable",
+            crate::cli::tui::ActivityUsageState::Complete => "complete",
+            crate::cli::tui::ActivityUsageState::Partial => "partial",
+            crate::cli::tui::ActivityUsageState::Unavailable => "unavailable",
         };
         self.update_line(
             StatusLineType::AgentActivity,
@@ -499,11 +499,7 @@ impl super::tui::TuiStatusPort for StatusBar {
         self.get_line(&StatusLineType::SessionLabel)
     }
 
-    fn update_agent_activity(
-        &self,
-        active_children: usize,
-        usage: &super::tui::activity::ActivityUsage,
-    ) {
+    fn update_agent_activity(&self, active_children: usize, usage: &super::tui::ActivityUsage) {
         StatusBar::update_agent_activity(self, active_children, usage);
     }
 
@@ -530,7 +526,7 @@ mod tests {
 
     #[test]
     fn agent_activity_status_formats_usage_and_clears_when_children_finish() {
-        use crate::cli::tui::activity::{ActivityUsage, ActivityUsageState};
+        use crate::cli::tui::{ActivityUsage, ActivityUsageState};
 
         let status = StatusBar::new();
         status.update_agent_activity(

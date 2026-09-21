@@ -123,9 +123,9 @@ pub(crate) struct LiveViewModel<'a> {
     pub render_error: bool,
     /// Polled session task list. A finished row claims no furniture row (the
     /// draw skips it), so the claim shrinks as the list completes.
-    pub task_rows: &'a [crate::cli::tui::activity::ActivityRow],
+    pub task_rows: &'a [super::ActivityRow],
     /// Child-agent rows, already ordered by depth then identity.
-    pub tracked_rows: &'a [crate::cli::tui::activity::ActivityRow],
+    pub tracked_rows: &'a [super::ActivityRow],
     pub live_rendered: &'a [RenderedTranscriptLine],
 }
 
