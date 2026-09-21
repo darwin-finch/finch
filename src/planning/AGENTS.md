@@ -6,19 +6,27 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 embedded methodology spec). DESIGN.md lists this tree on the providers row; this capsule is
 `src/planning/` only. Provider transports, OAuth, and the Claude client live outside this subtree.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `src/planning/mod.rs` is the whole public surface.
-Callers outside this directory use `crate::planning::Item`; they must not name `loop_runner`,
-`personas`, or `types`.
+**Boundary:** the [README](README.md) traces the interactive and live-contract callers.
+[`mod.rs`](mod.rs) is the flat callable facade; rustdoc supplies methods on exported types.
+Child modules are private. Callers outside this directory use `crate::planning::Item`; they must
+not name `loop_runner`, `personas`, or `types`. Do not recreate a signature catalog.
 
-**Dependencies:** `claude` (`Message`), `cli` (`OutputManager`, TUI dialogs), `generators`
-(`Generator`), and `providers` (`UNIVERSAL_ALIGNMENT_PROMPT`). Do not extract `finch-planning`
+**Dependencies:** `cli` (`OutputManager`, TUI dialogs), `generators` (`Generator`), and `providers`
+(`Message`, `UNIVERSAL_ALIGNMENT_PROMPT`). There is no direct `claude` import. The event loop
+owns REPL mode transitions and the timestamped plan file; this module owns generation, critique,
+convergence, and user steering within one loop. Do not extract `finch-planning`
 until those edges are measured and the providers-row ownership is a crate-level contract.
 
-**IMPCPD behavior is not this commit.** Persona activation, scoring, convergence, and the
-methodology spec stay as they are. Do not change plan generation, critique, or steering in a
-facade commit.
+**Invariants and lifetimes:** `PlanLoop` holds shared generator and output handles for one
+bounded run; the caller owns the TUI, REPL mode, and plan file. `run` clears the TUI operation
+status even when the loop errors. Cancellation, user approval, convergence, and the iteration cap
+remain distinct `PlanResult` outcomes. Do not write a plan file or select a provider here.
 
-**Focused tests:** `./scripts/test_brains.sh cargo test --lib -- planning::`. Run CLI plan-mode
-tests when changing a re-exported `pub` item. Regenerate the facade digest with
-`python3 scripts/generate_interfaces.py --write` whenever the public surface changes.
+**Extension:** Keep persona activation, critique scoring, JSON parsing, and the embedded
+methodology in agreement. Add focused parser/convergence tests for a changed critique contract;
+use the ignored live tests only when provider credentials and dated conformance evidence are
+actually available. Do not change plan generation or steering in a documentation-only edit.
+
+**Focused tests:** `./scripts/test_brains.sh cargo test -p finch --lib planning::`. Run CLI
+plan-mode tests when changing a re-exported `pub` item. The ignored live IMPCPD tests require
+provider credentials and are not part of the default focused suite.
