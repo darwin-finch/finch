@@ -60,9 +60,9 @@ mod tool_viewport;
 #[cfg(test)]
 mod vt_oracle;
 mod wizard_host;
-// The ViewModel is crate-visible: projection-feeding consumers outside this
-// module (and its tests) project messages through it.
-pub(crate) mod view_model;
+// Projection stays inside the renderer; application tests compose the lower
+// message and UI-model contracts through cli::test_projection.
+mod view_model;
 mod widgets;
 
 use accordion::{

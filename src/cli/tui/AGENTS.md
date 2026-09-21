@@ -12,8 +12,8 @@ Finch's poset, tool, or runtime vocabularies.
 [`mod.rs`](mod.rs) is the facade; child modules stay private except `activity`, which callers
 already name. Add public surface only when a real caller needs a flat re-export. Do not recreate
 a generated symbol catalog.
-`view_model` is `pub(crate)`: projection-feeding consumers and their tests project messages
-through it, so it is reachable crate-wide but is not published facade surface.
+`view_model` is private to this module. Application tests project messages through the
+lower message/UI-model contracts instead of reaching into renderer implementation.
 `TuiStatusPort` is the stateful status seam: CLI `StatusBar` implements it, and the renderer
 reads printable status/session snapshots and reports child-activity/operation updates through
 that port. Keep status ordering and status-line policy in the application; do not import

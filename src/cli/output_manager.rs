@@ -851,7 +851,7 @@ mod tests {
         projection.append_default("\nProposal awaiting review: intent [run 1, effect 0]");
         response.set_complete();
 
-        let row = crate::cli::tui::view_model::try_project_for_test(
+        let row = crate::cli::test_projection::try_project_for_test(
             response.as_ref(),
             &crate::theme::ColorScheme::default(),
         )
