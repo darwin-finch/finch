@@ -11,12 +11,11 @@ from `finch-providers::StreamChunk`, and scripted test backends. Those types
 are a development seam, not a production wire: change them when justified;
 do not persist a parallel copy or bind an external client as if they were frozen.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from `src/lib.rs`.
-Child modules are private; the `pub use` list is the whole public surface.
-Finch consumes this crate through `src/generators`.
-
-**Documentation:** [`docs/README.md`](docs/README.md) owns crate-local
-reference material.
+**Boundary:** [README.md](README.md) traces the external example and lifecycle-test callers.
+[`src/lib.rs`](src/lib.rs) is the facade; its child modules are private. Rustdoc renders methods
+on exported types. `src/generators` re-exports part of this development contract, but the
+production REPL still uses its older `Generator`/`StreamChunk` path. Do not regenerate a
+signature catalog or claim production adoption without a traced call path.
 
 **Dependencies:** this unpublished crate depends on `finch-providers` and
 async/serde libraries. It never depends on the root `finch` crate, Brain,
@@ -51,10 +50,9 @@ application `Config`. Environmental effects are injected through
 ./scripts/test_brains.sh cargo test -p finch-generation --example scripted_backend
 ```
 
-**Agent-context audit:** a worker can understand, implement against, and test
-this crate from this capsule plus `INTERFACE.md` without opening Finch
-application code. Finch-owned adapters (Claude, Qwen, daemon-local) stay in
-`src/generators`.
+**Agent-context audit:** a worker can implement against the development contract using this
+capsule, README, facade, and rustdoc without opening Finch application code. Finch-owned
+adapters (Claude, Qwen, daemon-local) stay in `src/generators`.
 
 **Named remainders (not this extraction):**
 - IPC projection of native `ThinkingDelta`/`ToolCallDelta` (schema still
@@ -64,10 +62,8 @@ application code. Finch-owned adapters (Claude, Qwen, daemon-local) stay in
   bijective wire-binding tables (issue #241) at the validated dispatch
   boundary; this crate must keep storing semantic names, not provider aliases.
 - Local model architecture rewrite (ONNX/Candle/Qwen internals) is out of scope.
-- `generate_interfaces.py` matches `fn`, not `async fn` (hygiene Issue 6).
-  `GenerationBackend::generate` and `Sleeper::sleep` are therefore absent from
-  `INTERFACE.md`. Read the trait in `src/backend.rs` / `src/ports.rs` for those
-  methods until the generator is fixed.
+- Rustdoc, not a checked-in generated catalog, supplies trait method signatures, including
+  asynchronous `GenerationBackend::generate` and `Sleeper::sleep`.
 - `GenerationPorts` progress/loader/cache/telemetry/scheduler are construction
   scaffolding. The supervisor uses clock, sleeper, and hardware metadata.
   Backends do not receive ports on `generate`; stitch them at construction.
