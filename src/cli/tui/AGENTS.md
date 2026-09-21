@@ -14,6 +14,10 @@ already name. Add public surface only when a real caller needs a flat re-export.
 a generated symbol catalog.
 `view_model` is `pub(crate)`: projection-feeding consumers and their tests project messages
 through it, so it is reachable crate-wide but is not published facade surface.
+`TuiStatusPort` is the stateful status seam: CLI `StatusBar` implements it, and the renderer
+reads printable status/session snapshots and reports child-activity/operation updates through
+that port. Keep status ordering and status-line policy in the application; do not import
+`StatusBar` into production TUI code or add a port around pure line formatting.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::tui::`.
 
