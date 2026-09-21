@@ -235,11 +235,10 @@ module of this crate, **or** the remaining ones are written down here with the r
   application-owned watcher. The TUI does not own the socket or the quit policy; it receives
   the sender and an editor-activity query from its caller.
 
-**Not production, documented so a grep is not a surprise:**
-
-- **`crate::tools::ToolUse` in `dialog.rs` tests** — three fixtures still build a `ToolUse` so they
-  can drive `cli::repl_event::tool_display::tool_approval_dialog`, which is the production assembler
-  (and lives outside this capsule). Dialog production code takes a name and a summary.
+**Boundary checks:** application-owned `ToolUse` approval-assembly fixtures live with
+`cli::repl_event::tool_display` tests. Dialog tests here exercise terminal layout from
+renderer-owned `Dialog` values, and test-only output/status ports avoid a dependency on
+the root CLI adapters.
 `test_tui_production_does_not_name_finch_tools_or_runtime` fails if production source grows a
 `crate::tools` or `crate::runtime` name, and
 `test_tui_production_does_not_name_finch_poset` keeps the deleted write-only Poset edge from

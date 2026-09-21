@@ -1560,6 +1560,7 @@ mod tests {
     #[test]
     fn test_parse_existing_commands() {
         // Ensure existing commands still work
+        assert!(matches!(Command::parse("/"), Some(Command::Help)));
         assert!(matches!(Command::parse("/help"), Some(Command::Help)));
         assert!(matches!(Command::parse("/quit"), Some(Command::Quit)));
         assert!(matches!(Command::parse("/metrics"), Some(Command::Metrics)));

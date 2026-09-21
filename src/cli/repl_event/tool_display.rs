@@ -577,6 +577,109 @@ mod tests {
     use super::*;
     use crate::cli::messages::{Message, WorkUnit};
 
+    #[test]
+    fn file_approval_uses_shared_sanitized_diff_renderer() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "old\n").unwrap();
+        let tool = crate::tools::ToolUse::new(
+            "edit".into(),
+            serde_json::json!({
+                "file_path": file.path(),
+                "old_string": "old\n",
+                "new_string": "new\n"
+            }),
+        );
+        let dialog = tool_approval_dialog(
+            &tool,
+            "File: src/\u{1b}[31mhostile.rs",
+            &finch_theme::ColorTheme::Dark.to_scheme(),
+            finch_diff::DiffColorMode::NoColor,
+        );
+        let body = dialog.body.as_deref().unwrap();
+        assert!(body.contains(file.path().to_string_lossy().as_ref()));
+        assert!(body.contains("- old"));
+        assert!(body.contains("+ new"));
+        assert!(!dialog.title.contains('\u{1b}'));
+        assert!(!body.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn file_approval_preview_composes_with_light_and_dark_themes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "old\n").unwrap();
+        let tool = crate::tools::ToolUse::new(
+            "edit".into(),
+            serde_json::json!({
+                "file_path": file.path(),
+                "old_string": "old\n",
+                "new_string": "new\n"
+            }),
+        );
+        let dark = tool_approval_dialog(
+            &tool,
+            "File: src/theme.rs",
+            &finch_theme::ColorTheme::Dark.to_scheme(),
+            finch_diff::DiffColorMode::Theme,
+        );
+        let light = tool_approval_dialog(
+            &tool,
+            "File: src/theme.rs",
+            &finch_theme::ColorTheme::Light.to_scheme(),
+            finch_diff::DiffColorMode::Theme,
+        );
+        let dark_body = dark.body.unwrap();
+        let light_body = light.body.unwrap();
+        assert_ne!(dark_body, light_body);
+        assert!(
+            dark_body.contains("48;2;20;72;40") && dark_body.contains("38;2;236;246;238"),
+            "dark approval diffs must fill add rows; body={dark_body}"
+        );
+        assert!(
+            light_body.contains("48;2;204;240;214") && light_body.contains("38;2;12;56;28"),
+            "light approval diffs must fill add rows; body={light_body}"
+        );
+    }
+
+    #[test]
+    fn write_approval_summarises_instead_of_dumping_html() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("docs.html");
+        let html = format!(
+            "<!DOCTYPE html>{}",
+            " <div class=\"doc\">page content</div>".repeat(800)
+        );
+        let tool = crate::tools::ToolUse::new(
+            "write".into(),
+            serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "content": html
+            }),
+        );
+        let summary = crate::cli::repl_event::event_loop::tool_approval_summary(&tool);
+        assert!(
+            !summary.contains("<!DOCTYPE") && !summary.contains("page content"),
+            "write approval must summarise, not dump the file: {summary:?}"
+        );
+        assert!(
+            summary.contains("docs.html") && summary.contains("create"),
+            "write approval must lead with path and created-vs-overwritten: {summary:?}"
+        );
+        assert!(
+            summary.contains("KB") || summary.contains("bytes") || summary.contains("MB"),
+            "write approval must include a byte count: {summary:?}"
+        );
+        let dialog = tool_approval_dialog(
+            &tool,
+            &summary,
+            &finch_theme::ColorScheme::default(),
+            finch_diff::DiffColorMode::NoColor,
+        );
+        assert!(
+            dialog.body.is_some(),
+            "full content must remain reachable behind the body disclosure"
+        );
+    }
+
     // ── session task-list rendering (#425) ──────────────────────────────────
 
     fn issue_425_payload() -> serde_json::Value {

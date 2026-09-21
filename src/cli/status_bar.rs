@@ -528,6 +528,54 @@ impl Clone for StatusBar {
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_activity_status_formats_usage_and_clears_when_children_finish() {
+        use crate::cli::tui::activity::{ActivityUsage, ActivityUsageState};
+
+        let status = StatusBar::new();
+        status.update_agent_activity(
+            2,
+            &ActivityUsage {
+                state: ActivityUsageState::Complete,
+                input_tokens: Some(12),
+                output_tokens: Some(7),
+                reported_attempts: 1,
+                started_attempts: 1,
+            },
+        );
+        assert_eq!(
+            status.get_line(&StatusLineType::AgentActivity).as_deref(),
+            Some("Children: 2 active | Tokens: 12 input, 7 output | Usage: complete (1/1 attempts reported)")
+        );
+        status.update_agent_activity(
+            2,
+            &ActivityUsage {
+                state: ActivityUsageState::Partial,
+                input_tokens: Some(17),
+                output_tokens: Some(7),
+                reported_attempts: 2,
+                started_attempts: 3,
+            },
+        );
+        assert_eq!(
+            status.get_line(&StatusLineType::AgentActivity).as_deref(),
+            Some("Children: 2 active | Tokens: 17 input, 7 output | Usage: partial (2/3 attempts reported)")
+        );
+        status.update_agent_activity(
+            1,
+            &ActivityUsage {
+                started_attempts: 1,
+                ..ActivityUsage::default()
+            },
+        );
+        assert_eq!(
+            status.get_line(&StatusLineType::AgentActivity).as_deref(),
+            Some("Children: 1 active | Tokens: unavailable input, unavailable output | Usage: unavailable (0/1 attempts reported)")
+        );
+        status.update_agent_activity(0, &ActivityUsage::default());
+        assert_eq!(status.get_line(&StatusLineType::AgentActivity), None);
+    }
+
     fn ledger_with(input_tokens: u32, output_tokens: u32) -> crate::cli::usage::SessionUsageLedger {
         let mut ledger = crate::cli::usage::SessionUsageLedger::default();
         ledger.record_turn("claude-sonnet-4-6", Some(1500), Some(300));
