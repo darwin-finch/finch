@@ -11,7 +11,7 @@ plain `WorkUnitView` and `WorkUnitHead` snapshots. It also retains the say-turn
 `WorkUnitViewModel` while streaming and completing a turn. The message layer owns the mutation;
 this crate owns the data shapes and pure say-turn line projection.
 
-When the live TUI blits, `src/cli/tui/view_model.rs` asks the message trait for a snapshot and
+When the live TUI blits, `crates/finch-tui/src/view_model.rs` asks the message trait for a snapshot and
 calls `project_work_unit`. The renderer then builds its widget tree and claims frame rectangles
 using this crate's presentation vocabulary. Disclosure and focus remain renderer state; terminal
 painting stays in the TUI.

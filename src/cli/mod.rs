@@ -22,7 +22,7 @@ mod setup_wizard; // First-run setup wizard (API keys + device selection)
 mod status_bar;
 #[cfg(test)]
 pub(crate) mod test_projection;
-mod tui;
+use finch_tui as tui;
 mod usage; // Phase 2: Terminal UI
 
 pub use chatgpt_auth::{

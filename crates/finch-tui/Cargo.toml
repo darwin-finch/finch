@@ -1,0 +1,35 @@
+[package]
+name = "finch-tui"
+version = "0.7.31"
+publish = false
+rust-version = "1.98"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0"
+description = "Terminal renderer, input task, dialogs, and widget layout over injected application ports"
+repository = "https://github.com/darwin-finch/finch"
+
+[features]
+test-support = []
+
+[dependencies]
+anyhow = "1.0"
+arboard = { version = "3.6", features = ["image-data"] }
+base64 = "0.22"
+capnp = "0.24"
+crossterm = "0.28"
+dirs = "5.0"
+finch-diff = { path = "../finch-diff" }
+finch-ipc = { path = "../finch-ipc" }
+finch-messages = { path = "../finch-messages" }
+finch-theme = { path = "../finch-theme" }
+finch-ui-model = { path = "../finch-ui-model" }
+png = "0.17"
+ratatui = "0.29"
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
+tui-textarea = "0.7"
+unicode-width = "0.2"
+uuid = { version = "1.0", features = ["v4"] }
+
+[dev-dependencies]
+vte = "0.15"

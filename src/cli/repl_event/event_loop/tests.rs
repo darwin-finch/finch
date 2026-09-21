@@ -4892,7 +4892,7 @@ fn test_mode_indicator_never_claims_edits_are_accepted_automatically() {
 /// - `Planning` is restricted to inspection tools — `ToolExecutor::execute_tool`
 ///   rejects anything outside read/glob/grep/web_fetch plus the plan tools.
 /// - Shift+tab is live in every mode. `KeyCode::BackTab` maps to `/cycle-mode`
-///   (`src/cli/tui/async_input.rs`). Normal enters AutoAccept; AutoAccept
+///   (`crates/finch-tui/src/async_input.rs`). Normal enters AutoAccept; AutoAccept
 ///   enters Planning; Planning/Executing return to Normal. `/plan` is a
 ///   separate PlanModeToggle and still enters Planning from Normal.
 #[test]
@@ -4951,7 +4951,7 @@ fn test_mode_indicator_describes_each_modes_actual_behavior() {
             !lowered.contains("disabled"),
             "invariant: no mode may report shift+tab as disabled — \
              KeyCode::BackTab maps to /cycle-mode \
-             (src/cli/tui/async_input.rs). \
+             (crates/finch-tui/src/async_input.rs). \
              mode={mode_name} mode_value={mode:?} indicator={indicator:?}"
         );
 

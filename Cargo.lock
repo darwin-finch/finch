@@ -1676,6 +1676,7 @@ dependencies = [
  "finch-runtime",
  "finch-theme",
  "finch-tools-api",
+ "finch-tui",
  "finch-ui-model",
  "finch-vm",
  "fs2",
@@ -2004,6 +2005,31 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "finch-tui"
+version = "0.7.31"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "base64 0.22.1",
+ "capnp",
+ "crossterm",
+ "dirs 5.0.1",
+ "finch-diff",
+ "finch-ipc",
+ "finch-messages",
+ "finch-theme",
+ "finch-ui-model",
+ "png 0.17.16",
+ "ratatui 0.29.0",
+ "tokio",
+ "tracing",
+ "tui-textarea",
+ "unicode-width 0.2.0",
+ "uuid",
+ "vte",
 ]
 
 [[package]]

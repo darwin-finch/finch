@@ -238,8 +238,8 @@ impl<'a> TabbedDialogWidget<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::tui::tabbed_dialog::TabbedDialog;
-    use crate::cli::tui::{QuestionOptionView, QuestionView};
+    use crate::tabbed_dialog::TabbedDialog;
+    use crate::{QuestionOptionView, QuestionView};
     use finch_theme::ColorScheme;
 
     fn make_q(text: &str, opts: &[&str]) -> QuestionView {

@@ -2424,7 +2424,7 @@ mod tests {
         );
 
         // Keyboard equivalence: the same routes the Message trait exposes are
-        // what F6/Enter disclosure drives (src/cli/tui/mod.rs).
+        // what F6/Enter disclosure drives (crates/finch-tui/src/lib.rs).
         let trait_action = output.transcript_action(&[1]).expect("trait route");
         assert!(
             output.handle_transcript_action(&trait_action),

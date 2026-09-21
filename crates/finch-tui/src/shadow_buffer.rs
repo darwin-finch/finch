@@ -271,8 +271,8 @@ pub fn diff_buffers(current: &ShadowBuffer, previous: &ShadowBuffer) -> Vec<(usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::{Message, UserQueryMessage};
-    use crate::config::{ColorTheme, MessageBand};
+    use finch_messages::{Message, UserQueryMessage};
+    use finch_theme::{ColorTheme, MessageBand};
 
     #[test]
     fn test_visible_length() {

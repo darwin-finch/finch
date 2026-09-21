@@ -217,7 +217,7 @@ pub fn spawn_input_task(
                                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
                                     && tui.active_dialog.is_some()
                                 {
-                                    tui.complete_dialog(crate::cli::tui::DialogResult::Cancelled);
+                                    tui.complete_dialog(crate::DialogResult::Cancelled);
                                 }
                                 match tui.dispatch_composer_key(key) {
                                     ComposerDispatch::Submit(input) => {
@@ -440,7 +440,7 @@ pub fn spawn_input_task(
                                     continue;
                                 }
                                 if tui.active_dialog.is_some() {
-                                    tui.complete_dialog(crate::cli::tui::DialogResult::Cancelled);
+                                    tui.complete_dialog(crate::DialogResult::Cancelled);
                                 }
 
                                 if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {

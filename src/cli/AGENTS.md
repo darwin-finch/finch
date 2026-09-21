@@ -3,14 +3,15 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/cli/`: command handling, the interactive REPL and event loop, terminal rendering,
-setup and provider-login flows, output routing and dialogs, and conversation composition.
+setup and provider-login flows, output routing, and conversation composition. Terminal dialogs
+and widget layout are owned by `finch-tui`.
 Typed presentation messages live in `finch-messages`; `cli::messages` is a flat compatibility
-facade. Nested capsules document the event loop and TUI. Application startup and daemon
+facade. The event-loop capsule and TUI crate document their own boundaries. Application startup and daemon
 composition remain in the root package.
 
 **Facade:** child modules are private. Callers outside this directory use flat `crate::cli::Item`
 imports from the `pub use` list in `mod.rs`; they must not select implementation paths such as
-`cli::repl_event`, `cli::tui`, `cli::diff`, or `cli::setup_wizard`. A public item needed by another
+`cli::repl_event`, `cli::diff`, or `cli::setup_wizard`. A public item needed by another
 root module is re-exported deliberately; root-only helpers should be `pub(crate)`. The
 [README](README.md) traces two caller workflows; do not recreate a generated signature catalog.
 

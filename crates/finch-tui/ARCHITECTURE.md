@@ -19,7 +19,7 @@ message only after its staged bytes were written; `prepare_canonical_commit()`
 clears the visible projection first, so a re-commit after a resize cannot spool
 the row into native history twice. Test:
 `canonical_commit_marks_only_after_success_and_follows_resize_clear` in
-`src/cli/tui/mod.rs`.
+`crates/finch-tui/src/lib.rs`.
 
 **Conversation ScrollView** (`scroll_view.rs`, #806): the transcript region —
 the 805 root column's `Flex` `TRANSCRIPT` claim, the leftover frame under the
@@ -69,7 +69,7 @@ hitbox) is deleted; the toggle hit target is the completed output region itself 
 retained ViewModel (`WorkUnitViewModel`, on the WorkUnit behind its own lock). The
 `ProgramSource`/`Output` subwidgets are still built from the outer ViewModel each frame and a
 hidden one claims zero rows. The legacy source-group row does not render beside the card: the
-viewport pairing (`say_turn_consolidated_source_ids` in `tui/mod.rs`) suppresses the adjacent
+viewport pairing (`say_turn_consolidated_source_ids` in `src/lib.rs`) suppresses the adjacent
 completed Program-source unit whose bytes are the turn's program — byte identity holds by
 construction in every producer path and a mismatch suppresses nothing — while the canonical
 record keeps the raw program exactly once (`commit_complete_messages` is untouched). The
@@ -96,7 +96,7 @@ cannot hide it either. Resize is a full layout
 pass — no widget keeps a cell count from the previous frame. `Row` parents place children side
 by side, and `Side` tracks are the width-conditional rails (#810).
 
-**The setup wizard rides the same tree** (`src/cli/tui/wizard_host.rs`, #812): the setup
+**The setup wizard rides the same tree** (`crates/finch-tui/src/wizard_host.rs`, #812): the setup
 wizard is no longer a second terminal app. `setup_wizard/render.rs` converts wizard
 state into one `WizardView` snapshot (tab titles, section lines, help, one optional
 overlay card); `plan_wizard_frame` projects it into the claiming `widgets` tree — a
@@ -114,7 +114,7 @@ screen, mouse capture), so the #265 editor/PTY handoff is unchanged; the view pr
 the speakable canonical form a GUI setup surface (#808) can consume. The general
 z-compositor (#793) remains a follow-up.
 
-**Dialog system** (`src/cli/tui/dialog.rs`):
+**Dialog system** (`crates/finch-tui/src/dialog.rs`):
 - `Select` — Enter submits immediately; `o`/`O` or typing on Other row activates custom input
 - `MultiSelect` — live prompts render the complete `↑/↓`, Space, Enter, and Esc keyboard hint; Space toggles, and Enter on the virtual Submit row emits `DialogResult::MultiSelected`
 - `TextInput` — Enter submits
@@ -144,7 +144,7 @@ covers exactly the prioritized constructs and degrades everything else (and malf
 literal text. Program source/output, tool rows, and user input are structurally outside this
 path; the dialog-option `markdown` preview keeps its own rendering.
 
-**Bounded tool-result controls** (`src/cli/tui/tool_viewport.rs`):
+**Bounded tool-result controls** (`crates/finch-tui/src/tool_viewport.rs`):
 - Every `ToolOutput` transcript row is a reusable semantic control with a bounded
   child viewport (`DEFAULT_TOOL_OUTPUT_ROWS`, currently 4): each body line is
   truncated to the terminal width, so the bound is a hard row bound; one
@@ -171,15 +171,15 @@ Virtual row helpers:
 
 ## Key files
 
-- `src/cli/tui/mod.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
+- `crates/finch-tui/src/lib.rs` — `TuiRenderer`, `flush_output_safe()`, `blit_visible_area()`
 - `crates/finch-ui-model/` — terminal-independent identity, widget vocabulary, WorkUnit snapshots,
   pure WorkUnit and say-turn projection, bounded markdown, and claiming layout
-- `src/cli/tui/view_model.rs` — the blit-time `LiveViewModel`, thin root message adapter, and the root claiming tree
+- `crates/finch-tui/src/view_model.rs` — the blit-time `LiveViewModel`, thin root message adapter, and the root claiming tree
 - `crates/finch-ui-model/src/markdown.rs` — private bounded assistant-prose markdown parse/render for the viewport (#756); raw source stays the canonical record
-- `src/cli/tui/widgets.rs` — claiming layout: rects, tracks, hitboxes, resize
-- `src/cli/tui/scroll_view.rs` — the conversation ScrollView: scroll offset, wheel claim, window split
-- `src/cli/tui/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`
-- `src/cli/tui/accordion.rs` — renderer-owned disclosure: open set, focus, hit regions
-- `src/cli/tui/tool_viewport.rs` — bounded tool-result controls: child viewport state, wheel hit regions, expanded surface
-- `src/cli/tui/dialog.rs` — Dialog state machine and approval control pin
-- `src/cli/tui/wizard_host.rs` — the setup wizard's widget host: view snapshot, claiming plan, shadow-buffer row-diff blit (#812)
+- `crates/finch-tui/src/widgets.rs` — claiming layout: rects, tracks, hitboxes, resize
+- `crates/finch-tui/src/scroll_view.rs` — the conversation ScrollView: scroll offset, wheel claim, window split
+- `crates/finch-tui/src/shadow_buffer.rs` — `ShadowBuffer`, `diff_buffers()`, `visible_length()`
+- `crates/finch-tui/src/accordion.rs` — renderer-owned disclosure: open set, focus, hit regions
+- `crates/finch-tui/src/tool_viewport.rs` — bounded tool-result controls: child viewport state, wheel hit regions, expanded surface
+- `crates/finch-tui/src/dialog.rs` — Dialog state machine and approval control pin
+- `crates/finch-tui/src/wizard_host.rs` — the setup wizard's widget host: view snapshot, claiming plan, shadow-buffer row-diff blit (#812)

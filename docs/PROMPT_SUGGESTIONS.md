@@ -206,5 +206,5 @@ tui_renderer.record_interaction(query, response);
 
 - [Claude Code System Prompts](https://github.com/Piebald-AI/claude-code-system-prompts)
 - Source: `src/cli/suggestions.rs`
-- Integration: `src/cli/tui/mod.rs`
-- Status display: `src/cli/tui/status_widget.rs`
+- Integration: `crates/finch-tui/src/lib.rs`
+- Status display: `crates/finch-tui/src/status_widget.rs`

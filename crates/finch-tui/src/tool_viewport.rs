@@ -384,7 +384,7 @@ pub fn is_left_click(mouse: &MouseEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::{MessageRef, WorkUnit};
+    use finch_messages::{MessageRef, WorkUnit};
     use finch_theme::ColorScheme;
     use std::sync::Arc;
 
@@ -404,7 +404,7 @@ mod tests {
         );
         work.set_complete();
         let colors = ColorScheme::default();
-        let output_row = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+        let output_row = crate::view_model::try_project_for_test(work.as_ref(), &colors)
             .expect("a tool group projects a transcript row")
             .children[0]
             .children[1]
@@ -412,9 +412,9 @@ mod tests {
             .clone();
         let message: MessageRef = work;
         let state = AccordionState::default();
-        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
-            crate::cli::tui::view_model::ProjectedMessage::Node(node) => state.render_node(&node),
-            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+        let projected = match crate::view_model::project_message(&message, &colors) {
+            crate::view_model::ProjectedMessage::Node(node) => state.render_node(&node),
+            crate::view_model::ProjectedMessage::Plain(lines) => {
                 state.render_plain(&lines.join("\n"))
             }
         };
@@ -551,11 +551,11 @@ mod tests {
         work.set_complete();
         let colors = ColorScheme::default();
         let message: MessageRef = work;
-        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
-            crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+        let projected = match crate::view_model::project_message(&message, &colors) {
+            crate::view_model::ProjectedMessage::Node(node) => {
                 AccordionState::default().render_node(&node)
             }
-            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+            crate::view_model::ProjectedMessage::Plain(lines) => {
                 AccordionState::default().render_plain(&lines.join("\n"))
             }
         };
@@ -593,11 +593,11 @@ mod tests {
         work.set_complete();
         let colors = ColorScheme::default();
         let message: MessageRef = work;
-        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
-            crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+        let projected = match crate::view_model::project_message(&message, &colors) {
+            crate::view_model::ProjectedMessage::Node(node) => {
                 AccordionState::default().render_node(&node)
             }
-            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+            crate::view_model::ProjectedMessage::Plain(lines) => {
                 AccordionState::default().render_plain(&lines.join("\n"))
             }
         };
@@ -640,17 +640,17 @@ mod tests {
         );
         work.set_complete();
         let colors = ColorScheme::default();
-        let rows = crate::cli::tui::view_model::try_project_for_test(work.as_ref(), &colors)
+        let rows = crate::view_model::try_project_for_test(work.as_ref(), &colors)
             .unwrap()
             .children;
         let first_output = rows[0].children[1].id.clone();
         let second_output = rows[1].children[1].id.clone();
         let message: MessageRef = work;
-        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
-            crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+        let projected = match crate::view_model::project_message(&message, &colors) {
+            crate::view_model::ProjectedMessage::Node(node) => {
                 AccordionState::default().render_node(&node)
             }
-            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+            crate::view_model::ProjectedMessage::Plain(lines) => {
                 AccordionState::default().render_plain(&lines.join("\n"))
             }
         };
@@ -670,11 +670,11 @@ mod tests {
 
         state.scroll_child(&first_output, 3);
         let rescrolled = state.project(
-            match crate::cli::tui::view_model::project_message(&message, &colors) {
-                crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+            match crate::view_model::project_message(&message, &colors) {
+                crate::view_model::ProjectedMessage::Node(node) => {
                     AccordionState::default().render_node(&node)
                 }
-                crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+                crate::view_model::ProjectedMessage::Plain(lines) => {
                     AccordionState::default().render_plain(&lines.join("\n"))
                 }
             },
@@ -723,11 +723,11 @@ mod tests {
         let message: MessageRef = work.clone();
         let mut state = ToolViewportState::default();
 
-        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
-            crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+        let projected = match crate::view_model::project_message(&message, &colors) {
+            crate::view_model::ProjectedMessage::Node(node) => {
                 AccordionState::default().render_node(&node)
             }
-            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+            crate::view_model::ProjectedMessage::Plain(lines) => {
                 AccordionState::default().render_plain(&lines.join("\n"))
             }
         };
@@ -746,11 +746,11 @@ mod tests {
             "",
             (0..15).map(|n| format!("out {n}")).collect::<Vec<_>>(),
         );
-        let projected = match crate::cli::tui::view_model::project_message(&message, &colors) {
-            crate::cli::tui::view_model::ProjectedMessage::Node(node) => {
+        let projected = match crate::view_model::project_message(&message, &colors) {
+            crate::view_model::ProjectedMessage::Node(node) => {
                 AccordionState::default().render_node(&node)
             }
-            crate::cli::tui::view_model::ProjectedMessage::Plain(lines) => {
+            crate::view_model::ProjectedMessage::Plain(lines) => {
                 AccordionState::default().render_plain(&lines.join("\n"))
             }
         };
