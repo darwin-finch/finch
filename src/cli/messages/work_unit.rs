@@ -1531,6 +1531,18 @@ mod tests {
         ColorScheme::default()
     }
 
+    // Exercise the owned snapshot and pure projection here. The TUI adapter
+    // has its own tests in tui/view_model.rs; message-crate tests must not
+    // depend back on the root renderer.
+    fn try_project_for_test(
+        message: &dyn Message,
+        colors: &ColorScheme,
+    ) -> Option<finch_ui_model::TranscriptNode> {
+        message
+            .work_unit_view(colors)
+            .map(|view| finch_ui_model::project_work_unit(&view))
+    }
+
     // ── Construction ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1578,8 +1590,7 @@ mod tests {
         unit.finish_agent_activity(root_task, "duplicate", vec!["duplicate".into()], false);
         assert_eq!(unit.status(), MessageStatus::Complete);
 
-        let projected =
-            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        let projected = try_project_for_test(&unit, &colors()).unwrap();
         let root = projected.children[spawn]
             .children
             .iter()
@@ -1619,24 +1630,6 @@ mod tests {
                 retained.contains(line),
                 "missing retained diff line: {line:?}\n{retained}"
             );
-        }
-    }
-
-    #[test]
-    fn test_edit_and_write_tool_display_payloads_survive_retained_work_unit() {
-        for tool in ["edit", "write"] {
-            let raw = FileDiff::from_texts("src/file.txt", "old\n", "new\nmore\n").to_unified();
-            let (summary, body) =
-                crate::cli::repl_event::tool_display::tool_result_to_display(tool, &raw);
-            let wu = WorkUnit::new("Tools");
-            let row = wu.add_row(format!("{tool}(src/file.txt)"));
-            wu.complete_row_with_body(row, summary, body);
-            wu.set_complete();
-            let rendered = wu.format(&colors());
-            assert!(rendered.contains("src/file.txt  +2 -1"), "{rendered}");
-            assert!(rendered.contains("- old"), "{rendered}");
-            assert!(rendered.contains("+ new"), "{rendered}");
-            assert!(!rendered.contains("\x1b]"), "{rendered}");
         }
     }
 
@@ -1898,8 +1891,7 @@ mod tests {
             vec!["Test received successfully.".into()],
         );
         unit.set_complete();
-        let projected =
-            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        let projected = try_project_for_test(&unit, &colors()).unwrap();
         assert_eq!(projected.children.len(), 2);
         assert!(
             !projected.children[0].default_open,
@@ -1922,18 +1914,18 @@ mod tests {
         let unit = WorkUnit::new("Tools");
         let row = unit.add_row("catalog.validate provider=chatgpt");
 
-        let running = crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        let running = try_project_for_test(&unit, &colors()).unwrap();
         assert!(running.default_open);
         assert!(running.children[0].default_open);
         assert_eq!(running.children[0].children.len(), 1);
         assert_eq!(
             running.children[0].children[0].role,
-            crate::cli::tui::view_model::NodeRole::Input
+            finch_ui_model::NodeRole::Input
         );
 
         unit.fail_row(row, "catalog unavailable");
         unit.set_failed();
-        let failed = crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        let failed = try_project_for_test(&unit, &colors()).unwrap();
         assert!(!failed.default_open);
         assert!(!failed.children[0].default_open);
         assert!(failed
@@ -1945,8 +1937,7 @@ mod tests {
         let row = completed.add_row("read config");
         completed.complete_row_with_body(row, "3 lines", vec!["one".into(), "two".into()]);
         completed.set_complete();
-        let projected =
-            crate::cli::tui::view_model::try_project_for_test(&completed, &colors()).unwrap();
+        let projected = try_project_for_test(&completed, &colors()).unwrap();
         assert!(!projected.default_open);
         assert!(!projected.children[0].default_open);
         assert_eq!(projected.children[0].children.len(), 2);
@@ -1963,8 +1954,7 @@ mod tests {
                 MessageStatus::InProgress => unreachable!(),
             }
 
-            let projected =
-                crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+            let projected = try_project_for_test(&unit, &colors()).unwrap();
             assert!(projected.default_open);
             assert!(projected.children[0].default_open);
             assert!(projected.children[0].label.contains("running"));
@@ -1983,13 +1973,9 @@ mod tests {
         let canonical_before_activity_projection = unit.complete_transcript(&colors());
         unit.set_activity_presentation("Speculative run 1234");
 
-        let projected =
-            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        let projected = try_project_for_test(&unit, &colors()).unwrap();
         assert!(!projected.default_open);
-        assert_eq!(
-            projected.role,
-            crate::cli::tui::view_model::NodeRole::Activity
-        );
+        assert_eq!(projected.role, finch_ui_model::NodeRole::Activity);
         assert!(!projected.label.contains("Tools"));
         assert!(!projected.label.contains("calls"));
         assert_eq!(
@@ -2013,10 +1999,10 @@ mod tests {
         let unit = WorkUnit::new("Channeling");
         unit.append_response("partial prose");
 
-        let pending = crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        let pending = try_project_for_test(&unit, &colors()).unwrap();
         assert_eq!(
             pending.role,
-            crate::cli::tui::view_model::NodeRole::Response,
+            finch_ui_model::NodeRole::Response,
             "invariant: a plain assistant turn projects as a Response row; \
              projected row: {pending:?}"
         );
@@ -2028,8 +2014,7 @@ mod tests {
         );
 
         unit.set_complete();
-        let completed =
-            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        let completed = try_project_for_test(&unit, &colors()).unwrap();
         assert_eq!(
             completed.label, "\u{23fa}",
             "invariant: a completed assistant prose row is labelled with the \
@@ -2061,8 +2046,7 @@ mod tests {
     fn test_a_wordless_row_with_a_useless_verb_still_names_its_state() {
         for verb in ["", "   ", "\t"] {
             let pending = WorkUnit::new(verb);
-            let row =
-                crate::cli::tui::view_model::try_project_for_test(&pending, &colors()).unwrap();
+            let row = try_project_for_test(&pending, &colors()).unwrap();
             assert_eq!(
                 row.label, "\u{25cb} Working\u{2026}",
                 "invariant: a verb that carries no words falls back to words, never \
@@ -2076,7 +2060,7 @@ mod tests {
     #[test]
     fn test_wordless_assistant_row_still_names_its_state_in_words() {
         let pending = WorkUnit::new("Channeling");
-        let row = crate::cli::tui::view_model::try_project_for_test(&pending, &colors()).unwrap();
+        let row = try_project_for_test(&pending, &colors()).unwrap();
         assert_eq!(
             row.label, "\u{25cb} Channeling\u{2026}",
             "invariant: an assistant row with no words of its own yet keeps readable \
@@ -2091,8 +2075,7 @@ mod tests {
 
         let failed = WorkUnit::new("Channeling");
         failed.set_failed();
-        let failed_row =
-            crate::cli::tui::view_model::try_project_for_test(&failed, &colors()).unwrap();
+        let failed_row = try_project_for_test(&failed, &colors()).unwrap();
         assert_eq!(
             failed_row.label, "\u{2298} Assistant turn failed",
             "invariant: a turn that died before producing any words says so in words; \
@@ -2107,8 +2090,7 @@ mod tests {
         // never happened. A review mutant did exactly that and survived.
         let completed = WorkUnit::new("Channeling");
         completed.set_complete();
-        let completed_row =
-            crate::cli::tui::view_model::try_project_for_test(&completed, &colors()).unwrap();
+        let completed_row = try_project_for_test(&completed, &colors()).unwrap();
         assert_eq!(
             completed_row.label, "\u{23fa} No assistant text",
             "invariant: a completed turn that produced no words says exactly that, \
@@ -2138,12 +2120,8 @@ mod tests {
         unit.complete_row(row, "3 lines");
         unit.set_complete();
 
-        let projected =
-            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
-        assert_eq!(
-            projected.role,
-            crate::cli::tui::view_model::NodeRole::ToolGroup
-        );
+        let projected = try_project_for_test(&unit, &colors()).unwrap();
+        assert_eq!(projected.role, finch_ui_model::NodeRole::ToolGroup);
         assert_eq!(projected.label, "Tools (1 call)");
     }
 
@@ -2158,14 +2136,13 @@ mod tests {
         );
         unit.set_complete();
 
-        let projected =
-            crate::cli::tui::view_model::try_project_for_test(&unit, &colors()).unwrap();
+        let projected = try_project_for_test(&unit, &colors()).unwrap();
         assert!(projected.default_open);
         assert!(projected.children[0].default_open);
         let output = projected.children[0]
             .children
             .iter()
-            .find(|child| child.role == crate::cli::tui::view_model::NodeRole::ToolOutput)
+            .find(|child| child.role == finch_ui_model::NodeRole::ToolOutput)
             .unwrap();
         assert!(output.default_open);
     }
@@ -2210,13 +2187,8 @@ mod tests {
         let streaming = WorkUnit::new("ignored");
         streaming.set_program_source("lisp");
         streaming.set_response("(say \"hi\")");
-        let streaming_row =
-            crate::cli::tui::view_model::try_project_for_test(&streaming, &colors())
-                .expect("projected row");
-        assert_eq!(
-            streaming_row.role,
-            crate::cli::tui::view_model::NodeRole::Program
-        );
+        let streaming_row = try_project_for_test(&streaming, &colors()).expect("projected row");
+        assert_eq!(streaming_row.role, finch_ui_model::NodeRole::Program);
         assert!(
             streaming_row.default_open,
             "IR must stay expanded while the program is still arriving"
@@ -2226,9 +2198,8 @@ mod tests {
         source.set_program_source("lisp");
         source.set_response("(say \"hi\")");
         source.set_complete();
-        let row = crate::cli::tui::view_model::try_project_for_test(&source, &colors())
-            .expect("projected row");
-        assert_eq!(row.role, crate::cli::tui::view_model::NodeRole::Program);
+        let row = try_project_for_test(&source, &colors()).expect("projected row");
+        assert_eq!(row.role, finch_ui_model::NodeRole::Program);
         assert!(
             !row.default_open,
             "completed IR must not stay expanded beside program output"
@@ -2241,12 +2212,11 @@ mod tests {
         source.set_program_source("lisp");
         source.set_response("(say \"Hello\")");
         source.set_complete();
-        let source_row = crate::cli::tui::view_model::try_project_for_test(&source, &colors())
-            .expect("projected row");
+        let source_row = try_project_for_test(&source, &colors()).expect("projected row");
         let source_diag = format!("{source_row:?}");
         assert_eq!(
             source_row.role,
-            crate::cli::tui::view_model::NodeRole::Program,
+            finch_ui_model::NodeRole::Program,
             "invariant: generated source stays a Program row inspectable through disclosure; {source_diag}"
         );
         assert!(
@@ -2263,12 +2233,11 @@ mod tests {
         output.set_response("Hello");
         output.present_as_assistant_prose();
         output.set_complete();
-        let row = crate::cli::tui::view_model::try_project_for_test(&output, &colors())
-            .expect("projected row");
+        let row = try_project_for_test(&output, &colors()).expect("projected row");
         let diag = format!("{row:?}");
         assert_eq!(
             row.role,
-            crate::cli::tui::view_model::NodeRole::Output,
+            finch_ui_model::NodeRole::Output,
             "invariant: kind stays Output so the live IR-swap still finds this row; {diag}"
         );
         assert_eq!(
@@ -2305,8 +2274,7 @@ mod tests {
         output.set_response("VM error: maintenance scheduled");
         output.present_as_assistant_prose();
         output.set_complete();
-        let row = crate::cli::tui::view_model::try_project_for_test(&output, &colors())
-            .expect("projected row");
+        let row = try_project_for_test(&output, &colors()).expect("projected row");
         assert_eq!(
             row.label, "\u{23fa}",
             "invariant: producer-owned success is prose even when the say bytes look like a diagnostic; row={row:?}"
@@ -2323,8 +2291,7 @@ mod tests {
         failed.set_program_output();
         failed.set_response("visible first\nVM error: type error");
         failed.set_complete();
-        let failed_row = crate::cli::tui::view_model::try_project_for_test(&failed, &colors())
-            .expect("projected row");
+        let failed_row = try_project_for_test(&failed, &colors()).expect("projected row");
         let failed_diag = format!("{failed_row:?}");
         assert_eq!(
             failed_row.label, "Program output",
@@ -2347,8 +2314,7 @@ mod tests {
         empty.set_program_output();
         empty.present_as_assistant_prose();
         empty.set_complete();
-        let empty_row = crate::cli::tui::view_model::try_project_for_test(&empty, &colors())
-            .expect("projected row");
+        let empty_row = try_project_for_test(&empty, &colors()).expect("projected row");
         assert_eq!(
             empty_row.label, "Program output",
             "invariant: empty successful output (MissingOutputEffect) is not assistant prose; row={empty_row:?}"
@@ -2359,8 +2325,7 @@ mod tests {
         handle.set_response("bytes");
         handle.present_as_assistant_prose();
         handle.set_complete();
-        let handle_row = crate::cli::tui::view_model::try_project_for_test(&handle, &colors())
-            .expect("projected row");
+        let handle_row = try_project_for_test(&handle, &colors()).expect("projected row");
         assert_eq!(
             handle_row.label, "Download",
             "invariant: titled output handles refuse the prose mark; row={handle_row:?}"
@@ -2373,8 +2338,7 @@ mod tests {
         host.mark_host_lifecycle();
         host.append_response("\nProposal awaiting review: intent [run 1, effect 0]");
         host.set_complete();
-        let host_row = crate::cli::tui::view_model::try_project_for_test(&host, &colors())
-            .expect("projected row");
+        let host_row = try_project_for_test(&host, &colors()).expect("projected row");
         let host_diag = format!("{host_row:?}");
         assert_eq!(
             host_row.label, "Program output",
@@ -2393,9 +2357,7 @@ mod tests {
         marked_then_titled.set_response("rejected");
         marked_then_titled.present_as_assistant_prose();
         marked_then_titled.set_output_handle("VM program rejected");
-        let rejected =
-            crate::cli::tui::view_model::try_project_for_test(&marked_then_titled, &colors())
-                .expect("projected row");
+        let rejected = try_project_for_test(&marked_then_titled, &colors()).expect("projected row");
         assert_eq!(
             rejected.label, "VM program rejected",
             "invariant: retitling as a handle clears the prose mark; row={rejected:?}"
@@ -2467,7 +2429,7 @@ mod tests {
             !output.say_turn_view().expect("say turn").vm.show_program,
             "the second toggle flipped show_program back"
         );
-        let foreign = crate::cli::messages::ComponentAction::new(7u32);
+        let foreign = ComponentAction::new(7u32);
         assert!(
             !output.handle_say_turn_action(&foreign),
             "a foreign action payload is rejected, never misinterpreted"
@@ -2537,7 +2499,7 @@ mod tests {
             vec!["Repeating this call produced no new information.".into()],
         );
         wu.set_complete();
-        let projected = crate::cli::tui::view_model::try_project_for_test(&wu, &colors()).unwrap();
+        let projected = try_project_for_test(&wu, &colors()).unwrap();
         assert!(
             projected.label.contains("bash(git status)"),
             "group label must keep the tool row, not a raw provider id; got {}",
@@ -2557,7 +2519,7 @@ mod tests {
         let output = call
             .children
             .iter()
-            .find(|child| child.role == crate::cli::tui::view_model::NodeRole::ToolOutput)
+            .find(|child| child.role == finch_ui_model::NodeRole::ToolOutput)
             .unwrap_or_else(|| {
                 panic!("loop body must be an expandable output child; call={call:?}")
             });

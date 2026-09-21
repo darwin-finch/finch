@@ -16,10 +16,11 @@ progress adaptation belongs in application-owned `cli::output_manager`, not this
 Brain, runtime, provider, and tool layers must not depend upward on this message model;
 application adapters construct messages at the conversation boundary.
 
-The production outgoing seam is now only those three extracted presentation crates. Some
-message tests still call root TUI projection and REPL tool-display helpers; move or replace
-those test-only reverse edges with equivalent integration coverage before a mechanical
-message-model crate extraction.
+Production and test code now use only those three extracted presentation crates. Message tests
+exercise `finch-ui-model` projection through the `Message` snapshot; the TUI adapter has its own
+tests in `cli::tui::view_model`, and the REPL tool-result/retained-message integration test lives
+with `cli::repl_event::tool_display`. Keep these cross-layer tests outside a future message crate
+so extraction cannot acquire a dev-dependency cycle.
 
 **Invariants and lifetimes:** a `MessageId` remains stable across streaming updates. WorkUnit
 row paths are append-only semantic ancestry; never reuse or reorder a path segment. The same
