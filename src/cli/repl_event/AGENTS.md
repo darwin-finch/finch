@@ -12,10 +12,11 @@ event loop owns the admission, checkpoint, and continuation decisions around tho
 
 **Boundary and dependencies.** The [README](README.md) traces construction by `Repl` and
 event projection by the MemTree console. `mod.rs` is the facade; new callers should use its
-flat exports rather than reaching through child modules. Existing `pub mod` paths still expose
-implementation modules (notably `parts`, `brain_selection`, `memory_commitment`, and
-`tool_display`) to sibling CLI code; moving those callers to flat exports is a separate
-facade repair, not a change this documentation makes. The application injects provider,
+flat exports rather than reaching through child modules. `memory_commitment` is private: the
+REPL obtains its committed-set writer, target, receiver, record type, and constructor through
+named facade exports. Other `pub mod` paths (notably `parts`, `brain_selection`, and
+`tool_display`) still expose implementation paths to sibling CLI code; repair them in bounded
+follow-ups rather than adding new child-path imports. The application injects provider,
 tool, Brain, and UI dependencies; this module may coordinate them but must not become their
 owner. No lower-level crate should depend on the REPL event loop.
 
