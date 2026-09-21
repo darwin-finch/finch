@@ -1,22 +1,32 @@
-# brain/schedule capsule: schedules and due-work selection
+# Brain schedule agent contract
 
-Supplements the root [`AGENTS.md`](../../CLAUDE.md) and the parent
-[`brain` capsule](../../AGENTS.md), which still apply in full.
+Supplements the root [agent rules](../../../../AGENTS.md) and parent
+[Brain contract](../../AGENTS.md). The [README](README.md) traces store and server callers;
+[`mod.rs`](mod.rs) is the nested facade and [`src/lib.rs`](../../lib.rs) is the external one.
 
-**Owns** `crates/finch-brain/src/schedule/`: schedule and initialization records, delivery
-policy, the store-wide due index (`ScheduleIndex`), and due-window arithmetic.
-The daemon selects work by due time and hydrates only named Brains.
+**Owns:** durable schedule and reviewed-initialization vocabulary, delivery policy, the
+store-wide `ScheduleIndex`, and due-window arithmetic. The store journals selected due work;
+the server and daemon choose when to poll and dispatch it.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its
-signature. Child modules are private, so the `pub use` list in `mod.rs` is the
-whole nested surface. Callers outside the crate use the flat `finch_brain::Item` facade.
+**Dependencies:** `attachment` supplies the initiating identity, `run` supplies the queued
+`BrainRun` attached to a due event, `journal` supplies `BrainId`, and `finch-vm` supplies the
+effect ceiling. This module must not depend on `BrainStore` or root server/daemon/CLI code.
+It must not append journal records or acquire runner leases.
 
-**Dependencies:** `attachment` and `run` for initiating identity and the queued
-`BrainRun` snapshot on a due event; `journal` for `BrainId` on the
-initialization contract. Do not append journal records or acquire runner leases
-here. Do not change due-window or coalesce/catch-up semantics in a facade-only
-commit.
+**Facade and extension rule:** outside callers use the flat `finch_brain::Item` surface.
+`ScheduleIndex` and due-window helpers are for Brain's store, not application code. Add a
+crate-level export only for a real caller. Do not publish the child index module or recreate
+a generated symbol catalog.
 
-**Focused tests:** `./scripts/test_brains.sh cargo test -p finch-brain --lib schedule::`.
-Parent `store::` tests cover index warm-up after restart, prune races,
-and archival vs delivery.
+**Invariants and lifetimes:** a due event snapshots source, language, and grant ceiling so a
+later schedule edit cannot change already queued work. Coalescing and bounded catch-up have
+distinct missed-tick behavior; their arithmetic and stable index order must survive restart.
+Reviewed initialization is inert on load and runs only through an explicit scheduled run.
+Its module identity and source digest must match the reviewed built-in module; public schedule
+creation cannot claim that identity. Do not change due-window or delivery semantics in
+documentation-only work.
+
+**Focused tests:** `./scripts/test_brains.sh cargo test -p finch-brain --lib schedule::` for
+due arithmetic and index ordering. Run supervised `store::` tests for index warm-up after
+restart, prune races, and archival versus delivery when scheduling behavior changes; run
+supervised server Brain-service tests when changing an external schedule contract.
