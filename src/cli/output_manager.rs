@@ -508,6 +508,22 @@ impl Default for OutputManager {
     }
 }
 
+// The message model owns progress state; the application adapts it to the
+// model loader's host-facing port where the handle is created.
+impl DownloadProgressDisplay for ProgressMessage {
+    fn update(&self, current: u64) {
+        self.update_progress(current);
+    }
+
+    fn complete(&self) {
+        self.set_complete();
+    }
+
+    fn fail(&self) {
+        self.set_failed();
+    }
+}
+
 impl ModelProgress for OutputManager {
     fn write_progress(&self, content: String) {
         OutputManager::write_progress(self, content);
@@ -545,6 +561,46 @@ mod tests {
         let m = OutputManager::new(crate::theme::ColorScheme::default());
         m.disable_stdout();
         m
+    }
+
+    #[test]
+    fn model_progress_adapter_updates_the_buffered_message() {
+        let manager = silent_manager();
+        let progress =
+            ModelProgress::start_download_progress(&manager, "Downloading test".into(), 10);
+        let messages = manager.get_messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the host progress port must create one buffered message"
+        );
+        assert_eq!(
+            messages[0].status(),
+            crate::cli::MessageStatus::InProgress,
+            "the download must remain live before its terminal update"
+        );
+
+        progress.update(5);
+        assert_eq!(
+            messages[0].status(),
+            crate::cli::MessageStatus::InProgress,
+            "a partial download must not complete the message"
+        );
+        progress.complete();
+        assert_eq!(
+            messages[0].status(),
+            crate::cli::MessageStatus::Complete,
+            "completion through the loader port must update the same buffered message"
+        );
+
+        let failed =
+            ModelProgress::start_download_progress(&manager, "Downloading other".into(), 10);
+        failed.fail();
+        assert_eq!(
+            manager.get_messages()[1].status(),
+            crate::cli::MessageStatus::Failed,
+            "failure through the loader port must remain visible to the renderer"
+        );
     }
 
     #[test]
