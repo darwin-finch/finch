@@ -14,7 +14,7 @@ Its public contract is the facade in `src/lib.rs`; callers must not name child m
   implementations.
 - Must not own distributed protocol, invitation, scheduler, Brain/server, or model-loading policy.
 - `identity.rs`, `node_name.rs`, `stats.rs`, and `tls.rs` are private implementation modules. Add
-  public surface by re-exporting it from `src/lib.rs`, then regenerate `INTERFACE.md`.
+  public surface by re-exporting it from `src/lib.rs`; do not regenerate a signature catalog.
 
 ## Invariants
 
@@ -26,13 +26,14 @@ Its public contract is the facade in `src/lib.rs`; callers must not name child m
 
 ## Focused tests
 
-Run through the repository supervisor with a worktree-specific absolute Cargo target directory:
+Run through the repository supervisor and Cargo slot:
 
 ```bash
-./scripts/test_brains.sh cargo test -p finch-node
-./scripts/test_brains.sh cargo test --lib brain::
-./scripts/test_brains.sh cargo test --lib server::
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-node --lib
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test --lib brain::
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test --lib server::
 ```
 
-Use the smallest matching filter first. Regenerate the facade digest with
-`python3 scripts/generate_interfaces.py --write` whenever the public surface changes.
+Use the smallest matching filter first. The [README](README.md) traces Brain and server callers;
+[`src/lib.rs`](src/lib.rs) is the facade, and `cargo doc -p finch-node --no-deps --open`
+renders public methods on re-exported types.
