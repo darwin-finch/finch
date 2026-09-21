@@ -176,7 +176,7 @@ fn test_peer_permission_policy_tables_name_only_registered_tools_or_aliases() {
         ("VM_DISCOVERY_TOOLS", crate::tools::VM_DISCOVERY_TOOLS),
         (
             "PLANNING_ALLOWED_TOOLS",
-            crate::cli::repl_event::plan_handler::PLANNING_ALLOWED_TOOLS,
+            crate::cli::repl_event::PLANNING_ALLOWED_TOOLS,
         ),
     ];
     let mut unregistered: Vec<String> = Vec::new();
@@ -459,7 +459,7 @@ fn test_planning_allowlists_only_admit_justified_tools() {
     const JUSTIFIED_EXCEPTIONS: &[&str] = &["bash", "enter_plan_mode"];
     for (table, names) in [(
         "PLANNING_ALLOWED_TOOLS",
-        crate::cli::repl_event::plan_handler::PLANNING_ALLOWED_TOOLS,
+        crate::cli::repl_event::PLANNING_ALLOWED_TOOLS,
     )] {
         for name in names {
             let tool = catalog
@@ -495,18 +495,18 @@ fn test_repl_planning_gate_blocks_spellings_nothing_registers() {
     };
     for tool in ["ExitPlanMode"] {
         assert!(
-            !crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode(tool, &mode),
+            !crate::cli::repl_event::is_tool_allowed_in_mode(tool, &mode),
             "{tool} registers as nothing and must not pass the planning gate"
         );
     }
     assert!(
-        crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode("Bash", &mode),
+        crate::cli::repl_event::is_tool_allowed_in_mode("Bash", &mode),
         "Bash is a registered dispatch alias of bash (#765 legacy replay) and \
          must pass the alias-resolving gate"
     );
     for tool in ["bash", "enter_plan_mode", "EnterPlanMode", "read"] {
         assert!(
-            crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode(tool, &mode),
+            crate::cli::repl_event::is_tool_allowed_in_mode(tool, &mode),
             "{tool} must still pass the authoritative planning gate"
         );
     }

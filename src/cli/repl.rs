@@ -51,7 +51,7 @@ use super::repl_event::{
 };
 use super::status_bar::StatusBar;
 use super::tui::TuiRenderer;
-use crate::cli::repl_event::plan_handler::{is_tool_allowed_in_mode, PLANNING_ALLOWED_TOOLS};
+use crate::cli::repl_event::{is_tool_allowed_in_mode, PLANNING_ALLOWED_TOOLS};
 
 // Phase 3.5: Import output macros for global output routing
 use crate::output_status;
@@ -753,8 +753,8 @@ impl Repl {
         self.cli_provider = provider.filter(|value| !value.trim().is_empty());
     }
 
-    fn legacy_selection_request(&self) -> super::repl_event::brain_selection::SelectionRequest {
-        super::repl_event::brain_selection::SelectionRequest {
+    fn legacy_selection_request(&self) -> super::repl_event::SelectionRequest {
+        super::repl_event::SelectionRequest {
             default_provider: self._config.default_provider_name(),
             persisted: self.brain_selection.clone(),
             cli_provider: self.cli_provider.clone(),
@@ -762,10 +762,8 @@ impl Repl {
         }
     }
 
-    fn legacy_effective_selection(
-        &self,
-    ) -> Result<super::repl_event::brain_selection::EffectiveSelection> {
-        super::repl_event::brain_selection::resolve_selection(
+    fn legacy_effective_selection(&self) -> Result<super::repl_event::EffectiveSelection> {
+        super::repl_event::resolve_selection(
             &self.available_providers,
             &self.legacy_selection_request(),
         )
@@ -801,7 +799,7 @@ impl Repl {
     }
 
     async fn persist_legacy_selection(&mut self) -> Result<()> {
-        let persistable = super::repl_event::brain_selection::persistable_selection(
+        let persistable = super::repl_event::persistable_selection(
             &self.legacy_effective_selection()?,
             &self.legacy_selection_request(),
         );
@@ -2538,7 +2536,7 @@ impl Repl {
         // Create EventLoop with all dependencies. Encloses the
         // `input_captured` mark: the terminal reader is installed inside it.
         let event_loop_phase = crate::startup::phase(crate::startup::PHASE_EVENT_LOOP_NEW);
-        use crate::cli::repl_event::parts::{
+        use crate::cli::repl_event::{
             ContextLimits, DaemonParts, GenerationParts, RuntimeParts, SessionParts, ToolParts,
             UiParts,
         };
@@ -4440,16 +4438,14 @@ impl Repl {
 
     /// Handle /provider <name> command.
     async fn handle_provider_switch(&mut self, name: &str) -> Result<()> {
-        let target_index = match super::repl_event::event_loop::resolve_provider_profile(
-            &self.available_providers,
-            name,
-        ) {
-            Ok(index) => index,
-            Err(error) => {
-                self.output_error(error);
-                return Ok(());
-            }
-        };
+        let target_index =
+            match super::repl_event::resolve_provider_profile(&self.available_providers, name) {
+                Ok(index) => index,
+                Err(error) => {
+                    self.output_error(error);
+                    return Ok(());
+                }
+            };
 
         let new_entry = self.available_providers[target_index].clone();
         if new_entry.is_local() {
@@ -4566,7 +4562,7 @@ impl Repl {
             ));
             return Ok(());
         }
-        let effort = match super::repl_event::brain_selection::parse_reasoning_effort(level) {
+        let effort = match super::repl_event::parse_reasoning_effort(level) {
             Ok(effort) => effort,
             Err(error) => {
                 self.output_error(error.to_string());

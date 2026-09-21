@@ -21,6 +21,6 @@ Two callers illustrate the boundary:
    event vocabulary, not the loop's private handlers or provider implementation.
 
 The [agent contract](AGENTS.md) covers event and replay invariants and focused tests.
-[`mod.rs`](mod.rs) is the current facade. Several child modules are still directly visible to
-other CLI code; that is boundary debt, not a recommendation to add new child-path imports. The
-REPL's memory-commitment handle crosses through named facade exports; its worker module is private.
+[`mod.rs`](mod.rs) is the callable facade. Its child modules are private; the REPL receives
+selection, construction, and memory-commitment capabilities through named exports rather than
+implementation paths.
