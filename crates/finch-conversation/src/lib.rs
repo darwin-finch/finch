@@ -156,22 +156,6 @@ impl ConversationHistory {
         true
     }
 
-    /// Add a user message with optional image attachments.
-    /// Each image is `(media_type, base64_data)`.
-    pub fn add_user_message_with_images(&mut self, text: String, images: &[(String, String)]) {
-        let mut blocks: Vec<ContentBlock> = images
-            .iter()
-            .map(|(media_type, data)| ContentBlock::image(media_type.clone(), data.clone()))
-            .collect();
-        blocks.push(ContentBlock::Text { text });
-
-        self.messages.push(Message {
-            role: "user".to_string(),
-            content: blocks,
-        });
-        self.trim_if_needed();
-    }
-
     /// Add an assistant message to the conversation
     pub fn add_assistant_message(&mut self, content: String) {
         self.messages.push(Message {
@@ -348,7 +332,7 @@ impl ConversationHistory {
 
     /// Restore the immediately preceding complete round to provider-invisible
     /// staging if the admitted continuation could not be spawned.
-    pub fn rollback_last_tool_round(
+    pub(crate) fn rollback_last_tool_round(
         &mut self,
         query_id: Uuid,
         token: ToolRoundToken,
@@ -420,7 +404,7 @@ impl ConversationHistory {
         Ok(())
     }
 
-    pub fn staged_round(&self, query_id: Uuid) -> Option<(ToolRoundToken, usize, usize)> {
+    pub(crate) fn staged_round(&self, query_id: Uuid) -> Option<(ToolRoundToken, usize, usize)> {
         self.staged_tool_rounds
             .get(&query_id)
             .map(|stage| (stage.token, stage.expected_ids.len(), stage.results.len()))
@@ -501,13 +485,13 @@ impl ConversationHistory {
     }
 
     /// Get estimated token count (rough approximation)
-    pub fn estimated_tokens(&self) -> usize {
+    pub(crate) fn estimated_tokens(&self) -> usize {
         let total_chars: usize = self.messages.iter().map(|m| m.text().len()).sum();
         total_chars / 4 // Rough estimate: 1 token ≈ 4 characters
     }
 
     /// Get percentage of context window used (0.0 to 1.0)
-    pub fn context_usage_percent(&self) -> f32 {
+    pub(crate) fn context_usage_percent(&self) -> f32 {
         let current_tokens = self.estimated_tokens() as f32;
         let max_tokens = (self.max_tokens_estimate / 4) as f32; // Convert char estimate to tokens
         (current_tokens / max_tokens).min(1.0)
@@ -534,20 +518,9 @@ impl ConversationHistory {
         }
     }
 
-    /// Check if compaction should be triggered
-    pub fn should_compact(&self) -> bool {
-        self.auto_compact_enabled
-            && self.context_usage_percent() >= self.compaction_threshold_percent
-    }
-
     /// Enable or disable auto-compaction
     pub fn set_auto_compact(&mut self, enabled: bool) {
         self.auto_compact_enabled = enabled;
-    }
-
-    /// Set compaction threshold (0.0 to 1.0, e.g., 0.8 = 80%)
-    pub fn set_compaction_threshold(&mut self, threshold: f32) {
-        self.compaction_threshold_percent = threshold.clamp(0.0, 1.0);
     }
 
     /// Save conversation to JSON file
