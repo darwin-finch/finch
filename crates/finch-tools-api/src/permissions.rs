@@ -323,7 +323,7 @@ pub const PEER_SILENT_ALLOW_TOOLS: &[&str] = &[
 /// conformance-tested in `src/cli/repl/always_allow_tests.rs`.
 pub const PEER_REVIEWED_CHANGESET_TOOLS: &[&str] = &["write", "edit", "patch"];
 
-/// Registered tool names the [`crate::tools::ToolExecutor`] admits while the
+/// Registered tool names the application `ToolExecutor` admits while the
 /// session is in `Planning` mode, keyed on the names the `Tool`
 /// implementations register plus the dispatch-only alias keys the REPL
 /// registry covers (issue #466). The executor table is narrower than the
@@ -794,11 +794,11 @@ fn is_readonly_bash(command: &str) -> bool {
 
 /// Effect a tool use presents at the approval boundary.
 ///
-/// [`Tool::effect`] is the declared authority and cannot see the invocation
+/// [`crate::Tool::effect`] is the declared authority and cannot see the invocation
 /// input, so bash declares its worst case (`ExternalWrite`). This refinement
 /// is applied **at the approval call sites that consume the effect**: a
 /// read-only bash command (no shell operators, read-only prefix —
-/// [`is_readonly_bash`]) presents as `WorkspaceRead`, so it stays autonomous
+/// `is_readonly_bash`) presents as `WorkspaceRead`, so it stays autonomous
 /// without ever widening the declared effect itself. Every other tool's
 /// effect passes through untouched.
 ///

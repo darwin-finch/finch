@@ -32,7 +32,7 @@ CURRENT_DOCS = (
     Path("crates/finch-vm-core/AGENTS.md"),
     Path("crates/finch-vm-core/README.md"),
     Path("crates/finch-vm/AGENTS.md"),
-    Path("crates/finch-vm/docs/README.md"),
+    Path("crates/finch-vm/README.md"),
     Path("crates/finch-providers/AGENTS.md"),
     Path("crates/finch-providers/docs/README.md"),
     Path("crates/finch-generation/AGENTS.md"),

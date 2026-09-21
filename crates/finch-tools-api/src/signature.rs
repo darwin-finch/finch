@@ -23,8 +23,8 @@ pub struct ToolSignature {
     /// there is no path slot (not an escape).
     pub path_in_workspace: bool,
     /// True when the one-shot path would constitutionally Deny this command.
-    /// Patterns must not match; [`ToolExecutor::is_approved`] returns
-    /// [`ApprovalSource::NotApproved`].
+    /// Patterns must not match; the application executor rejects approval
+    /// with `ApprovalSource::NotApproved`.
     pub constitutionally_denied: bool,
 }
 

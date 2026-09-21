@@ -34,7 +34,9 @@ from `src/tools/permissions.rs`. The pure policy tests live beside them in
 composition root (`src/tools/permissions/tests.rs`), at their original
 `tools::permissions::tests::*` module path, because only there can the real tools be constructed.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) is generated from [`src/lib.rs`](src/lib.rs); CI fails
-if it drifts. Edit the code, then run `python3 scripts/generate_interfaces.py --write`.
+**Boundary:** the [README](README.md) traces tool execution and REPL tool-round callers;
+[`src/lib.rs`](src/lib.rs) is the flat facade. `cargo doc -p finch-tools-api --no-deps --open`
+renders methods on re-exported types. Child modules remain private; do not regenerate a
+signature catalog.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -p finch-tools-api`.
