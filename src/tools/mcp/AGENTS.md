@@ -10,14 +10,20 @@ This is a sub-subsystem of `tools` — a subsystem declared on a path inside ano
 nesting means: a directory with its own capsule inside another's. Executing a *local* tool is the
 parent's job; nothing here decides permissions or authority.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. The
-child modules are private, so the `pub use` list in `src/tools/mcp/mod.rs` is the whole public
-surface, and `scripts/check_subsystems.py` rejects a `pub mod` there.
+**Facade:** child modules are private, and the flat `pub use` list in [`mod.rs`](mod.rs) is the
+callable surface. Rustdoc gives method signatures; do not recreate a symbol catalog or cite
+the nonexistent `scripts/check_subsystems.py`.
 
-**Dependencies:** none downward, and one unwanted edge back up to its parent — `client.rs` uses the tool
-vocabulary `ToolDefinition` and `ToolInputSchema`. That edge clears when tools splits a
-dependency-free API from its implementations; the parent facade does not remove it. Add no other
-import.
+**Dependencies and direction:** MCP discovery maps untrusted schemas into the already-extracted
+`finch-tools-api` vocabulary directly. `McpClient` implements the `finch-runtime` MCP port so
+the typed VM can discover external tools without importing this client. It must not import root
+tool implementations or approval policy. The parent `tools` module composes the client with the
+executor; this module does not execute local tools or decide their authority.
+
+**Lifetime and extension rules:** a `McpClient` retains enabled server configs for reload and
+connection timeouts. Discovery results are untrusted, and published tool names must keep their
+`mcp_<server>_<tool>` namespace. Keep connection/protocol details private; add flat exports only
+for a caller that can actually name and use the returned type. See the README for current callers.
 
 **Transports are not equal.** STDIO launches a local process and is supported. Streamable HTTP is
 not implemented, and a legacy SSE configuration is rejected explicitly rather than silently
@@ -29,4 +35,5 @@ namespaced (`mcp_<server>_<tool>`) before they reach the registry.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- tools::mcp::`. Run the parent's
 tests too when changing a re-exported item, because the executor and the runtime both hold an
-`McpClient`.
+`McpClient`. Run `python3 scripts/check_docs.py` and
+`python3 scripts/check_facade_boundaries.py` after facade or capsule edits.
