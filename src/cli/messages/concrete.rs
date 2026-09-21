@@ -5,7 +5,6 @@
 
 use super::{Message, MessageId, MessageStatus};
 use crate::config::{ColorScheme, ColorSpec, MessageBand};
-use crate::models::DownloadProgressDisplay;
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use std::fmt;
 use std::sync::{Arc, RwLock};
@@ -891,20 +890,6 @@ impl ProgressMessage {
                 *poisoned.into_inner() = MessageStatus::Failed;
             }
         }
-    }
-}
-
-impl DownloadProgressDisplay for ProgressMessage {
-    fn update(&self, current: u64) {
-        self.update_progress(current);
-    }
-
-    fn complete(&self) {
-        self.set_complete();
-    }
-
-    fn fail(&self) {
-        self.set_failed();
     }
 }
 

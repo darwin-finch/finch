@@ -10,11 +10,10 @@ renderer disclosure state.
 
 **Dependencies and direction:** snapshot types and pure projection belong to `finch-ui-model`;
 color roles belong to the shared theme vocabulary, currently reached through root compatibility
-re-exports. `finch-diff` supplies bounded structured file diffs for WorkUnit rows. The concrete
-progress message still names `models::DownloadProgressDisplay`; that application edge is
-extraction debt, not permission to add more. Brain, runtime, provider, and tool layers must not
-depend upward on this message model; application adapters construct messages at the conversation
-boundary.
+re-exports. `finch-diff` supplies bounded structured file diffs for WorkUnit rows. Model-loader
+progress adaptation belongs in application-owned `cli::output_manager`, not this message model.
+Brain, runtime, provider, and tool layers must not depend upward on this message model;
+application adapters construct messages at the conversation boundary.
 
 **Invariants and lifetimes:** a `MessageId` remains stable across streaming updates. WorkUnit
 row paths are append-only semantic ancestry; never reuse or reorder a path segment. The same
