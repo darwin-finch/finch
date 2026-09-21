@@ -3,13 +3,12 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `src/models/` (ONNX/Candle loaders, bootstrap, download, adapters, sampling,
-threshold routing, LoRA configuration, and neural embedding load), plus the adjacent
-`local`, `generators`, `training`, `feedback`, `router`, and `logging` trees listed on
-the DESIGN.md models row. Those adjacent trees are not this facade; this capsule is
-`src/models/` only.
+threshold routing, LoRA configuration, and neural embedding load). The adjacent `local`,
+`generators`, `training`, `feedback`, `router`, and `logging` trees on the DESIGN.md models
+row have their own ownership and are not part of this facade.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `src/models/mod.rs` is the whole public surface.
+**Facade:** child modules are private, so the deliberate `pub use` list in
+[`mod.rs`](mod.rs) is the callable public surface; rustdoc supplies method signatures.
 Callers outside this directory use `crate::models::Item`; they must not name `bootstrap`,
 `download`, `loaders`, `neural_embedding`, `unified_loader`, `adapters`, or any other child.
 
@@ -18,9 +17,16 @@ neural embeddings), and `tools` (prompt/parser types). Production code under `sr
 must not name `crate::cli`. Bootstrap and download take a models-owned [`ModelProgress`]
 port; CLI implements it and injects it at composition roots (`BootstrapLoader::new`,
 `install_model_progress` in `run_daemon` and interactive `main`). The daemon process is
-the one that loads and downloads models; interactive `main` returns before that install.
+the one that loads and downloads models; its progress sink must be installed in the daemon
+path, independently of the interactive process's sink.
 Do not extract `finch-models` until remaining edges are measured and this reverse edge
 stays gone.
+
+**Lifetimes and extension:** `GeneratorState` is shared across bootstrap and server readers;
+failed or disabled loading must be represented as state, not a fabricated ready model.
+Keep family-specific adapters and engine capability claims here, inject host progress at
+composition roots, and add facade exports only for a demonstrated caller need. Do not let
+loaders import CLI presentation code.
 
 **Loaders are experimental.** Configuration variants and loader code are not proof of
 end-to-end provider or local-model conformance. Do not change ONNX/Candle/loader/routing/training
@@ -38,5 +44,5 @@ query functions were deleted rather than wired, and the adapters' duplicate fami
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- models::` plus a caller
 smoke (`local::`, `config::backend`). Run the full suite when changing a re-exported `pub`
-item. Regenerate the facade digest with `python3 scripts/generate_interfaces.py --write`
-whenever the public surface changes.
+item. Run `python3 scripts/check_docs.py` and `python3 scripts/check_facade_boundaries.py`
+when changing the capsule or facade; do not regenerate a symbol catalog.

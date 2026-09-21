@@ -1,5 +1,5 @@
-// Machine learning models
-// All models support online learning (update after each forward to Claude)
+// Optional local-model loading, adapters, and routing support.
+// Configuration and loader code are not evidence of backend conformance.
 
 mod adapters; // Local model adapters (chat templates, token IDs)
 mod bootstrap; // Progressive bootstrap for instant startup
