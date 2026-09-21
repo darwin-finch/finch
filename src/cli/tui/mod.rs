@@ -1326,7 +1326,7 @@ pub struct TuiRenderer {
     colors: ColorScheme,
 
     // Input — tui-textarea manages multi-line state; we render it manually.
-    pub(crate) input_textarea: TextArea<'static>,
+    input_textarea: TextArea<'static>,
     pub(crate) command_history: Vec<String>,
     pub(crate) history_index: Option<usize>,
     pub(crate) history_draft: Option<String>,
@@ -1383,8 +1383,8 @@ pub struct TuiRenderer {
 
     // Generic flags
     is_active: bool,
-    pub(crate) needs_full_refresh: bool,
-    pub(crate) last_render_error: Option<String>,
+    needs_full_refresh: bool,
+    last_render_error: Option<String>,
     pub pending_feedback: Option<activity::Verdict>,
     pub pending_cancellation: bool,
     pub pending_dialog_result: Option<DialogResult>,
@@ -1714,6 +1714,13 @@ impl TuiRenderer {
             ta.insert_str(line);
         }
         ta
+    }
+
+    /// Restore a submitted draft after the application rejects the turn.
+    /// The renderer owns the composer and its redraw state.
+    pub fn restore_input_draft(&mut self, input: &str) {
+        self.input_textarea = Self::create_clean_textarea_with_text(input);
+        self.mark_dirty();
     }
 }
 
@@ -2555,6 +2562,22 @@ impl TuiRenderer {
     pub fn trigger_refresh(&mut self) {
         self.needs_full_refresh = true;
     }
+
+    /// Retain a render failure for the next frame and request a full refresh.
+    pub fn record_render_failure(&mut self, error: impl Into<String>) {
+        self.needs_full_refresh = true;
+        self.last_render_error = Some(error.into());
+    }
+
+    /// Acknowledge a failed frame before the application retries its render tick.
+    pub fn take_render_failure_for_retry(&mut self) -> bool {
+        if !self.needs_full_refresh {
+            return false;
+        }
+        self.needs_full_refresh = false;
+        self.last_render_error = None;
+        true
+    }
 }
 
 // ─── Startup header ───────────────────────────────────────────────────────────
@@ -2644,7 +2667,7 @@ impl TuiRenderer {
     /// called [`emergency_restore_terminal`] but `exec`/spawn failed.  This is
     /// deliberately stronger than [`Self::resume`]: emergency restoration
     /// also pops keyboard enhancements and disables bracketed paste.
-    pub(crate) fn resume_after_emergency_restore(&mut self) -> anyhow::Result<()> {
+    pub fn resume_after_emergency_restore(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
         let _ = mouse_capture::write_resume_after_emergency_modes(
             &mut io::stdout(),
@@ -4566,6 +4589,28 @@ mod tests {
     use crate::cli::tui::vt_oracle::{VtColor, VtOracle, VtStyle};
     use finch_diff::{summarize_files, DiffColorMode, FileDiff};
     use finch_theme::ColorTheme;
+
+    #[test]
+    fn renderer_owns_render_failure_recovery_state() {
+        let mut renderer = headless_renderer();
+        assert!(!renderer.take_render_failure_for_retry());
+        renderer.record_render_failure("frame failed");
+        assert!(renderer.needs_full_refresh);
+        assert_eq!(renderer.last_render_error.as_deref(), Some("frame failed"));
+        assert!(renderer.take_render_failure_for_retry());
+        assert!(!renderer.needs_full_refresh);
+        assert_eq!(renderer.last_render_error, None);
+        assert!(!renderer.take_render_failure_for_retry());
+    }
+
+    #[test]
+    fn renderer_restores_rejected_input_draft_and_marks_live_area_dirty() {
+        let mut renderer = headless_renderer();
+        renderer.live_area_dirty = false;
+        renderer.restore_input_draft("retry\nsecond line");
+        assert_eq!(renderer.input_textarea.lines(), ["retry", "second line"]);
+        assert!(renderer.live_area_dirty);
+    }
 
     #[derive(Default)]
     struct RecordingStatusPort {

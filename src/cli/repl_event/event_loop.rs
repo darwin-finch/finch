@@ -2804,8 +2804,7 @@ impl EventLoop {
                         tracing::warn!("TUI render failed in event loop: {}", e);
                         // Set recovery flag for next tick
                         let mut tui = self.tui_renderer.lock().await;
-                        tui.needs_full_refresh = true;
-                        tui.last_render_error = Some(e.to_string());
+                        tui.record_render_failure(e.to_string());
                         // Continue event loop - don't crash
                     }
                 }
@@ -3123,9 +3122,7 @@ impl EventLoop {
     async fn restore_failed_mention_turn(&mut self, input: String) -> Result<()> {
         {
             let mut tui = self.tui_renderer.lock().await;
-            tui.input_textarea =
-                crate::cli::tui::TuiRenderer::create_clean_textarea_with_text(&input);
-            tui.mark_dirty();
+            tui.restore_input_draft(&input);
         }
         self.render_tui().await
     }
@@ -4156,11 +4153,8 @@ impl EventLoop {
         }
 
         // Check if recovery needed from previous render failure
-        if tui.needs_full_refresh {
+        if tui.take_render_failure_for_retry() {
             tracing::info!("Performing full TUI refresh after render error");
-            // Try to recover by clearing error state
-            tui.needs_full_refresh = false;
-            tui.last_render_error = None;
         }
 
         tui.flush_output_safe()?;
