@@ -1,5 +1,5 @@
 //! Production-boundary proof that the terminal renderer does not name Finch's
-//! poset, tool, or runtime vocabularies.
+//! poset, tool, runtime, or project-context vocabularies.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -328,5 +328,31 @@ fn test_tui_production_does_not_name_finch_poset() {
         hits.is_empty(),
         "tui production must not name Finch Poset; the active overlay paints only the injected \
          corner text: {hits:?}"
+    );
+}
+
+#[test]
+fn test_tui_production_does_not_name_project_context() {
+    let hits = production_hits("crate::context");
+    assert!(
+        hits.is_empty(),
+        "tui production must not own project filesystem mention policy; the CLI adapter injects \
+         candidates and selection snapshots through MentionPort: {hits:?}"
+    );
+}
+
+#[test]
+fn test_scanner_would_fail_if_context_returned_to_mention_completion() {
+    let src = production_source(&tui_dir().join("mod.rs"));
+    let poisoned = insert_into_fn(
+        &src,
+        "mention_query_from_textarea",
+        " crate::context::mention::mention_query_at; ",
+    );
+    let hits = hits_in(&poisoned, "mod.rs", "crate::context");
+    assert!(
+        hits.iter().any(|hit| hit.contains("mention_query_at")),
+        "scanner would not fail if project-context parsing returned to composer completion: \
+         {hits:?}"
     );
 }

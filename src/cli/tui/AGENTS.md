@@ -180,6 +180,7 @@ draws a view, and the caller converts.
 | `finch_ui_model::SayTurnView` | status, program, output, elapsed, toggle state | WorkUnit `say_turn_view()`, projected by `finch_ui_model::say_turn_lines` |
 | [`activity::ActivityRow`](activity.rs) | indented status text | todos / agent tasks, in `cli::repl_event::activity_view` |
 | `Dialog::tool_approval(name, summary)` | a name and a summary line | Finch `ToolUse`, in `cli::repl_event::tool_display::tool_approval_dialog` |
+| `MentionCandidate` / `MentionSubmission` | speakable picker rows, insertion tokens, and provider-independent selected bytes | `context::mention`, through the injected CLI adapter in `cli::mention_session` |
 | [`cell_format::workbook_cell_to_string`](cell_format.rs) | one cell as text | calamine `Data`, inside `spreadsheet_preview_rows` |
 
 When `active_dialog` first occupies the live surface, `draw_live_area` writes one terminal bell
@@ -218,9 +219,6 @@ module of this crate, **or** the remaining ones are written down here with the r
   `cli::command_autocomplete`, `cli::suggestions`, `StatusBar`, `AskUserQuestion*`) — the renderer
   uses the `Message` trait to request WorkUnit snapshots and delegates their pure projection to
   `finch-ui-model`; `cli::diff` renders diff bodies while the snapshot is constructed.
-- **`crate::context::mention`** — picker rows and pending snapshots. Filesystem policy,
-  ignore rules, budgets, and digest identity live in `context::mention`; the renderer only
-  draws speakable rows and inserts the visible token.
 - **`crate::ABOUT`** — startup header copy.
 - **`crate::is_editor_active` and `crate::finch_ipc_capnp` in `async_input.rs`** — the input task
   must not steal keys while `$EDITOR` is in the foreground, and it talks to the local control
@@ -234,6 +232,9 @@ module of this crate, **or** the remaining ones are written down here with the r
 `test_tui_production_does_not_name_finch_tools_or_runtime` fails if production source grows a
 `crate::tools` or `crate::runtime` name, and
 `test_tui_production_does_not_name_finch_poset` keeps the deleted write-only Poset edge from
-returning. `test_scanner_would_fail_if_runtime_returned_to_spreadsheet_preview_rows` and
+returning. `test_tui_production_does_not_name_project_context` keeps filesystem discovery,
+ignore/budget policy, and attachment snapshots behind the injected `MentionPort`; its application
+adapter is [`src/cli/mention_session.rs`](../mention_session.rs).
+`test_scanner_would_fail_if_runtime_returned_to_spreadsheet_preview_rows` and
 `test_scanner_would_fail_if_tools_returned_to_tool_approval` fail if the scanner can no longer
 see those production functions (the original leak sites).

@@ -12,6 +12,7 @@ mod grok_auth;
 mod input;
 mod llm_dialogs; // LLM-prompted user dialogs (AskUserQuestion)
 mod memtree_console; // Phase 4+: Tree-structured conversation interface
+mod mention_session;
 mod menu;
 mod messages; // Trait-based polymorphic message system
 mod output_layer; // Phase 3.5: Tracing integration

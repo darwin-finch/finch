@@ -638,6 +638,7 @@ pub struct Repl {
     // Output management (Phase 1: Terminal UI refactor)
     output_manager: OutputManager,
     status_bar: StatusBar,
+    mention_port: Arc<dyn crate::cli::tui::MentionPort>,
     // TUI renderer moved to global (Phase 5: Native ratatui dialogs)
 
     // Phase 1: Multi-LLM system
@@ -863,6 +864,8 @@ impl Repl {
             workspace_root,
             project_program_root,
         } = initialization;
+        let mention_port = crate::cli::mention_session::MentionSession::new(workspace_root.clone())
+            as Arc<dyn crate::cli::tui::MentionPort>;
 
         // Determine if we're in daemon mode (suppress local model logs)
         let daemon_mode = daemon_client.is_some();
@@ -1332,6 +1335,7 @@ impl Repl {
                 Arc::new(output_manager.clone()),
                 Arc::new(status_bar.clone()),
                 config.colors.clone(),
+                Arc::clone(&mention_port),
             ) {
                 Ok(renderer) => {
                     // Set global TUI renderer for Menu dialogs (Phase 5)
@@ -1435,6 +1439,7 @@ impl Repl {
             // Output management (Phase 1: Terminal UI refactor)
             output_manager,
             status_bar,
+            mention_port,
             // TUI renderer moved to global (Phase 5: Native ratatui dialogs)
 
             // Phase 1 & 2: Multi-LLM + Persona
@@ -2563,6 +2568,7 @@ impl Repl {
                 output: Arc::new(self.output_manager.clone()),
                 status_bar: Arc::new(self.status_bar.clone()),
                 streaming_enabled: self.streaming_enabled,
+                mention_port: Arc::clone(&self.mention_port),
             },
             ToolParts {
                 definitions: tool_definitions,

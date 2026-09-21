@@ -16,6 +16,8 @@ impl EventLoop {
         let status_bar = Arc::new(StatusBar::new());
         let tui_renderer =
             TuiRenderer::new_headless(Arc::clone(&output_manager), Arc::clone(&status_bar), colors);
+        let mention_port = crate::cli::mention_session::MentionSession::new(".")
+            as Arc<dyn crate::cli::tui::MentionPort>;
         let todo_list = Arc::new(tokio::sync::RwLock::new(crate::tools::TodoList::default()));
         let (_todo_writer, todo_target, todo_receiver) =
             crate::tools::todo_journal(Arc::clone(&todo_list));
@@ -59,6 +61,7 @@ impl EventLoop {
                 output: output_manager,
                 status_bar,
                 streaming_enabled: false,
+                mention_port,
             },
             ToolParts {
                 definitions: tool_definitions,

@@ -49,6 +49,7 @@ pub struct UiParts {
     pub output: Arc<OutputManager>,
     pub status_bar: Arc<StatusBar>,
     pub streaming_enabled: bool,
+    pub mention_port: Arc<dyn crate::cli::tui::MentionPort>,
 }
 
 /// Tools the model may call, and the task list it keeps.

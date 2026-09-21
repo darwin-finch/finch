@@ -1,7 +1,7 @@
 //! Slash-command and `@`-mention completion state and raw-mode pane rendering.
 
 use crate::cli::command_autocomplete::CommandSpec;
-use crate::context::mention::MentionCandidate;
+use crate::cli::tui::MentionCandidate;
 
 /// Maximum number of autocomplete suggestions to show at once
 pub(crate) const MAX_VISIBLE_SUGGESTIONS: usize = 8;
@@ -285,7 +285,7 @@ fn mention_pane_lines(
         } else {
             " "
         };
-        let line = format!("{marker} {}", candidate.speakable_row());
+        let line = format!("{marker} {}", candidate.speakable_row);
         lines.push(fit_line(&line, width));
     }
     state.rendered_rows = lines.len();
@@ -335,10 +335,11 @@ pub(crate) fn replace_mention_prefix(
     lines: &[String],
     cursor: (usize, usize),
     token: &str,
+    query_at: impl FnOnce(&str, usize) -> Option<(usize, String)>,
 ) -> Option<(Vec<String>, (usize, usize))> {
     let (cursor_row, cursor_col) = cursor;
     let line = lines.get(cursor_row)?;
-    let (at_offset, _) = crate::context::mention::mention_query_at(line, cursor_col)?;
+    let (at_offset, _) = query_at(line, cursor_col)?;
     let at_chars = line[..at_offset].chars().count();
     let prefix: String = line.chars().take(at_chars).collect();
     let suffix: String = line.chars().skip(cursor_col).collect();

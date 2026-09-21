@@ -30,7 +30,6 @@ use crossterm::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tui_textarea::TextArea;
@@ -79,6 +78,82 @@ pub use dialog_widget::DialogWidget;
 pub use shadow_buffer::{
     extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
 };
+
+/// One speakable project-resource row offered by the composer mention picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionCandidate {
+    /// Stable project-relative identity used when the row is selected.
+    pub relative_path: String,
+    /// Screen-reader text painted for this row.
+    pub speakable_row: String,
+    /// Visible composer token inserted when this row is selected.
+    pub insert_token: String,
+}
+
+/// Provider-independent bytes captured for one submitted project mention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionAttachment {
+    pub path: String,
+    pub kind: String,
+    pub sha256: String,
+    pub byte_len: u64,
+    pub truncated: bool,
+    pub truncation_note: Option<String>,
+    pub content: String,
+}
+
+/// Prepared mention data consumed by either local provider history or a Brain prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MentionSubmission {
+    pub attachment_document: Option<String>,
+    pub attachments: Vec<MentionAttachment>,
+}
+
+/// Application-provided mention completion and selection policy.
+///
+/// The renderer owns picker interaction, while the application owns filesystem
+/// discovery and selection-time attachment snapshots.
+pub trait MentionPort: Send + Sync {
+    fn query_at(&self, text: &str, cursor_chars: usize) -> Option<(usize, String)>;
+    fn candidates(&self, query: &str) -> Vec<MentionCandidate>;
+    fn select(&self, relative_path: &str) -> std::result::Result<(), String>;
+    fn retain_visible(&self, input: &str);
+    /// Prepare provider-independent attached-context text for one submit.
+    fn prepare_submission(&self, input: &str) -> std::result::Result<MentionSubmission, String>;
+    /// Commit the prepared submit after its conversation checkpoint succeeds.
+    fn commit_submission(&self);
+    /// Restore the prepared submit after a later operation rejects the turn.
+    fn restore_submission(&self);
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct EmptyMentionPort;
+
+#[cfg(test)]
+impl MentionPort for EmptyMentionPort {
+    fn query_at(&self, _text: &str, _cursor_chars: usize) -> Option<(usize, String)> {
+        None
+    }
+
+    fn candidates(&self, _query: &str) -> Vec<MentionCandidate> {
+        Vec::new()
+    }
+
+    fn select(&self, _relative_path: &str) -> std::result::Result<(), String> {
+        Err("Project mentions are unavailable in this renderer".to_string())
+    }
+
+    fn retain_visible(&self, _input: &str) {}
+
+    fn prepare_submission(&self, _input: &str) -> std::result::Result<MentionSubmission, String> {
+        Ok(MentionSubmission::default())
+    }
+
+    fn commit_submission(&self) {}
+
+    fn restore_submission(&self) {}
+}
 
 /// Best-effort terminal restoration for an exit path that cannot acquire the
 /// renderer lock.  This is intentionally independent of [`TuiRenderer`]:
@@ -490,12 +565,19 @@ fn replace_textarea_command(textarea: &mut TextArea<'static>, command_name: &str
     true
 }
 
-fn replace_textarea_mention(textarea: &mut TextArea<'static>, token: &str) -> bool {
+fn replace_textarea_mention(
+    textarea: &mut TextArea<'static>,
+    token: &str,
+    mention_port: &dyn MentionPort,
+) -> bool {
     use tui_textarea::CursorMove;
 
-    let Some((lines, target_cursor)) =
-        replace_mention_prefix(textarea.lines(), textarea.cursor(), token)
-    else {
+    let Some((lines, target_cursor)) = replace_mention_prefix(
+        textarea.lines(),
+        textarea.cursor(),
+        token,
+        |line, cursor| mention_port.query_at(line, cursor),
+    ) else {
         return false;
     };
     *textarea = TuiRenderer::create_clean_textarea_with_text(&lines.join("\n"));
@@ -513,10 +595,13 @@ fn replace_textarea_mention(textarea: &mut TextArea<'static>, token: &str) -> bo
     true
 }
 
-fn mention_query_from_textarea(textarea: &TextArea<'_>) -> Option<(usize, String)> {
+fn mention_query_from_textarea(
+    textarea: &TextArea<'_>,
+    mention_port: &dyn MentionPort,
+) -> Option<(usize, String)> {
     let (row, col) = textarea.cursor();
     let line = textarea.lines().get(row)?;
-    crate::context::mention::mention_query_at(line, col)
+    mention_port.query_at(line, col)
 }
 
 fn dispatch_completion_key(
@@ -1287,10 +1372,8 @@ pub struct TuiRenderer {
     pub pending_images: Vec<(usize, String, String)>,
     pub(crate) image_counter: usize,
 
-    /// Project-rooted `@` mention catalog. Policy lives in `context::mention`.
-    pub(crate) mention_catalog: crate::context::mention::MentionCatalog,
-    /// Snapshots taken when a mention was selected. Submit uses these bytes.
-    pub pending_mentions: Vec<crate::context::mention::MentionSnapshot>,
+    /// Application-owned project mention policy and selection snapshot store.
+    mention_port: Arc<dyn MentionPort>,
 
     // Rate limiting - removed in favor of event loop control
 
@@ -1381,10 +1464,7 @@ impl TuiRenderer {
             autocomplete_state: AutocompleteState::default(),
             pending_images: Vec::new(),
             image_counter: 0,
-            mention_catalog: crate::context::mention::MentionCatalog::new(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            ),
-            pending_mentions: Vec::new(),
+            mention_port: Arc::new(EmptyMentionPort),
             task_rows: None,
             tracked_rows: HashMap::new(),
             tracked_agent_usage: HashMap::new(),
@@ -1406,6 +1486,7 @@ impl TuiRenderer {
         output_manager: Arc<OutputManager>,
         status_bar: Arc<StatusBar>,
         colors: ColorScheme,
+        mention_port: Arc<dyn MentionPort>,
     ) -> Result<Self> {
         enable_raw_mode().context("Failed to enable raw mode")?;
 
@@ -1470,10 +1551,7 @@ impl TuiRenderer {
 
             pending_images: Vec::new(),
             image_counter: 0,
-            mention_catalog: crate::context::mention::MentionCatalog::new(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            ),
-            pending_mentions: Vec::new(),
+            mention_port,
 
             task_rows: None,
             tracked_rows: HashMap::new(),
@@ -3336,8 +3414,10 @@ impl TuiRenderer {
             self.live_area_dirty = true;
             return;
         }
-        if let Some((_, query)) = mention_query_from_textarea(&self.input_textarea) {
-            let rows = self.mention_catalog.candidates(&query);
+        if let Some((_, query)) =
+            mention_query_from_textarea(&self.input_textarea, self.mention_port.as_ref())
+        {
+            let rows = self.mention_port.candidates(&query);
             if rows.is_empty() {
                 self.autocomplete_state.hide();
             } else {
@@ -3407,20 +3487,17 @@ impl TuiRenderer {
         let Some(candidate) = self.autocomplete_state.get_selected_mention().cloned() else {
             return false;
         };
-        let token = format!("{} ", candidate.insert_token());
-        if !replace_textarea_mention(&mut self.input_textarea, &token) {
+        let token = format!("{} ", candidate.insert_token);
+        if !replace_textarea_mention(&mut self.input_textarea, &token, self.mention_port.as_ref()) {
             return false;
         }
-        match self.mention_catalog.resolve_path(&candidate.relative_path) {
-            Ok(snapshot) => {
-                self.pending_mentions
-                    .retain(|existing| existing.relative_path != snapshot.relative_path);
-                self.pending_mentions.push(snapshot);
+        match self.mention_port.select(&candidate.relative_path) {
+            Ok(()) => {
                 self.autocomplete_state.hide();
                 self.ghost_text = None;
             }
             Err(error) => {
-                self.autocomplete_state.set_mention_error(error.speakable());
+                self.autocomplete_state.set_mention_error(error);
             }
         }
         self.live_area_dirty = true;
@@ -3503,13 +3580,7 @@ impl TuiRenderer {
         if input.trim().is_empty() {
             return None;
         }
-        let still_mentioned: std::collections::HashSet<String> =
-            crate::context::mention::parse_visible_mentions(&input)
-                .into_iter()
-                .map(|parsed| parsed.relative_path)
-                .collect();
-        self.pending_mentions
-            .retain(|snapshot| still_mentioned.contains(&snapshot.relative_path));
+        self.mention_port.retain_visible(&input);
         self.command_history.push(input.clone());
         self.history_index = None;
         self.history_draft = None;
@@ -3597,13 +3668,6 @@ impl TuiRenderer {
             self.mark_dirty();
         }
         modified
-    }
-
-    /// Tests and query assembly inject a project root without touching cwd.
-    #[cfg(test)]
-    pub(crate) fn set_mention_root(&mut self, root: impl Into<PathBuf>) {
-        self.mention_catalog = crate::context::mention::MentionCatalog::new(root.into());
-        self.pending_mentions.clear();
     }
 }
 
@@ -7561,19 +7625,86 @@ mod tests {
         completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);
     }
 
-    fn mention_project() -> (tempfile::TempDir, TuiRenderer) {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(tmp.path().join("src/foo.rs"), "fn selected() {}\n").unwrap();
-        std::fs::write(tmp.path().join("src/bar.rs"), "fn other() {}\n").unwrap();
+    #[derive(Default)]
+    struct TestMentionPort {
+        selected: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MentionPort for TestMentionPort {
+        fn query_at(&self, text: &str, cursor_chars: usize) -> Option<(usize, String)> {
+            let cursor_byte = text
+                .chars()
+                .take(cursor_chars)
+                .map(char::len_utf8)
+                .sum::<usize>();
+            let before = text.get(..cursor_byte)?;
+            let at = before.rfind('@')?;
+            if at > 0 {
+                let previous = before[..at].chars().last()?;
+                if previous == '\\' || !previous.is_whitespace() {
+                    return None;
+                }
+            }
+            let trimmed = text.trim_start();
+            let addressee_end = trimmed
+                .strip_prefix("@finch")
+                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                .map(|_| text.len() - trimmed.len() + "@finch".len());
+            if addressee_end.is_some_and(|end| at < end) {
+                return None;
+            }
+            let query = &before[at + 1..];
+            if query.chars().any(char::is_whitespace) {
+                return None;
+            }
+            Some((at, query.to_string()))
+        }
+
+        fn candidates(&self, query: &str) -> Vec<MentionCandidate> {
+            let path = if query.contains("finch") {
+                "src/finch.rs"
+            } else {
+                "src/foo.rs"
+            };
+            vec![MentionCandidate {
+                relative_path: path.to_string(),
+                speakable_row: format!("file {path} 17 B"),
+                insert_token: format!("@{path}"),
+            }]
+        }
+
+        fn select(&self, relative_path: &str) -> std::result::Result<(), String> {
+            self.selected
+                .lock()
+                .unwrap()
+                .push(relative_path.to_string());
+            Ok(())
+        }
+
+        fn retain_visible(&self, _input: &str) {}
+
+        fn prepare_submission(
+            &self,
+            _input: &str,
+        ) -> std::result::Result<MentionSubmission, String> {
+            Ok(MentionSubmission::default())
+        }
+
+        fn commit_submission(&self) {}
+
+        fn restore_submission(&self) {}
+    }
+
+    fn mention_project() -> (Arc<TestMentionPort>, TuiRenderer) {
+        let source = Arc::new(TestMentionPort::default());
         let mut renderer = headless_renderer();
-        renderer.set_mention_root(tmp.path());
-        (tmp, renderer)
+        renderer.mention_port = Arc::clone(&source) as Arc<dyn MentionPort>;
+        (source, renderer)
     }
 
     #[test]
-    fn at_mention_picker_select_submits_exact_snapshot_and_keeps_visible_prompt() {
-        let (tmp, mut renderer) = mention_project();
+    fn at_mention_picker_selects_through_port_and_keeps_visible_prompt() {
+        let (source, mut renderer) = mention_project();
         renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("explain @foo");
         paint_mention_completions(&mut renderer);
         assert!(
@@ -7601,39 +7732,10 @@ mod tests {
             submitted.contains('@'),
             "submitted prompt must keep the visible mention token: {submitted:?}"
         );
-        std::fs::write(tmp.path().join("src/foo.rs"), "CHANGED ON DISK").unwrap();
         assert_eq!(
-            renderer.pending_mentions.len(),
-            1,
-            "selection must snapshot the chosen file"
-        );
-        assert_eq!(
-            renderer.pending_mentions[0].relative_path, selected,
-            "pending snapshot must be the selected path"
-        );
-        assert_eq!(
-            renderer.pending_mentions[0].content, "fn selected() {}\n",
-            "submit must keep selection bytes, not a later disk read"
-        );
-        let blocks =
-            crate::context::mention::assemble_user_content(&submitted, &renderer.pending_mentions);
-        assert_eq!(
-            blocks[0].as_text(),
-            Some(submitted.as_str()),
-            "provider-visible prompt block must equal the composer text"
-        );
-        let attached = blocks[1].as_text().expect("attachment block");
-        assert!(
-            attached.contains("fn selected() {}"),
-            "provider request must receive the exact selected content: {attached}"
-        );
-        assert!(
-            !attached.contains("CHANGED ON DISK"),
-            "changed disk must not replace the snapshot: {attached}"
-        );
-        assert!(
-            attached.contains(&renderer.pending_mentions[0].sha256),
-            "attachment must name the content digest"
+            source.selected.lock().unwrap().as_slice(),
+            [selected],
+            "selection must be delegated to the application-owned port"
         );
     }
 
@@ -7656,12 +7758,7 @@ mod tests {
 
     #[test]
     fn leading_at_finch_addressee_does_not_open_the_mention_picker() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(tmp.path().join("src/finch.rs"), "fn finch() {}\n").unwrap();
-        std::fs::write(tmp.path().join("src/foo.rs"), "fn selected() {}\n").unwrap();
-        let mut renderer = headless_renderer();
-        renderer.set_mention_root(tmp.path());
+        let (_source, mut renderer) = mention_project();
 
         renderer.input_textarea = TuiRenderer::create_clean_textarea_with_text("@finch");
         paint_mention_completions(&mut renderer);
