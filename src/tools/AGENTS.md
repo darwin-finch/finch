@@ -17,19 +17,19 @@ from a check command the user declared in `[diagnostics]` config — nothing is 
 declared command's authority verdict is read from the existing bash approval path
 (`PermissionManager::check_tool_use("bash", …)`), so it never runs where bash would not.
 
-**ToolLoop is the single execution lifecycle.** REPL and scheduler drive it.
-Generators and provider adapters never import or invoke `ToolExecutor`.
-Malformed arguments, duplicate ids, unknown tools, and unsupported tools fail
-closed with a typed result and never execute. Cancel, timeout, disconnect,
-retry, and late-result-after-terminal admit at most one execution and append
-at most one result.
+**ToolLoop owns REPL and scheduler rounds.** Those two callers admit a call through the
+`finch-tools-api` protocol before execution; malformed arguments, duplicate ids, unknown or
+unsupported tools fail closed with a typed result. Cancel, timeout, disconnect, retry, and
+late-result-after-terminal must not admit another execution or append another result. The
+legacy headless `finch agent` loop calls `ToolExecutor` directly and does not have that
+`ToolLoop` admission lifecycle; see the [README](README.md) before extending this path.
+Generators and provider adapters must not import or invoke `ToolExecutor` themselves.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `src/tools/mod.rs` is the whole public surface, and
-the facade convention keeps a `pub mod` out of it. Callers outside this directory use
+**Facade:** child modules are private, so the flat `pub use` list in [`mod.rs`](mod.rs) is the
+callable surface; use rustdoc for methods, not a generated signature catalog. Callers outside this directory use
 `crate::tools::Item` (or `finch::tools::Item`); they must not name `implementations`, `types`,
-`executor`, `permissions`, `todo`, or `mcp`. `mcp` publishes its own interface for work inside that
-subtree. The shared tool surface itself is `finch_tools_api::Item` — `src/tools/mod.rs` and the
+`executor`, `permissions`, `todo`, or `mcp`. `mcp` has its own [guide](mcp/README.md) and facade
+for work inside that subtree. The shared tool surface itself is `finch_tools_api::Item` — `src/tools/mod.rs` and the
 `types.rs`/`permissions.rs` re-export shims keep the crate-internal paths working, and those shims
 carry zero `crate::` imports (the former knot metric).
 
