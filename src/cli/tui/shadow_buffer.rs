@@ -183,7 +183,7 @@ impl ShadowBuffer {
 
     /// Render messages to shadow buffer with proper wrapping
     /// Returns bottom-aligned content (last N rows that fit)
-    pub fn render_messages(&mut self, messages: &[MessageRef], colors: &crate::theme::ColorScheme) {
+    pub fn render_messages(&mut self, messages: &[MessageRef], colors: &finch_theme::ColorScheme) {
         // Clear buffer first
         self.clear();
 

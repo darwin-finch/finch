@@ -14,7 +14,7 @@
 //! completing a run cannot collapse a result by flipping a domain default.
 
 use crate::cli::messages::MessageRef;
-use crate::theme::ColorScheme;
+use finch_theme::ColorScheme;
 
 use super::accordion::RenderedTranscriptLine;
 use super::autocomplete_widget::{completion_pane_lines, AutocompleteState};

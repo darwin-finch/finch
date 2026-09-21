@@ -43,6 +43,8 @@ CURRENT_DOCS = (
     Path("crates/finch-node/AGENTS.md"),
     Path("crates/finch-node/README.md"),
     Path("crates/finch-programs/AGENTS.md"),
+    Path("crates/finch-theme/AGENTS.md"),
+    Path("crates/finch-theme/README.md"),
     Path("src/cli/tui/AGENTS.md"),
     Path("src/cli/tui/README.md"),
     Path("docs/README.md"),

@@ -385,7 +385,7 @@ pub fn is_left_click(mouse: &MouseEvent) -> bool {
 mod tests {
     use super::*;
     use crate::cli::messages::{MessageRef, WorkUnit};
-    use crate::theme::ColorScheme;
+    use finch_theme::ColorScheme;
     use std::sync::Arc;
 
     use super::super::accordion::AccordionState;

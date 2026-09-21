@@ -14,8 +14,8 @@
 //                  The setup wizard uses ratatui in an alternate screen so it
 //                  gets the whole terminal and restores it cleanly.
 //
-// Note: shadow_buffer.rs is retained — it provides ColorScheme re-exports and
-//       may be used for flicker-free live-area diffing in a future pass.
+// Note: shadow_buffer.rs provides row and width helpers shared by the renderer
+//       and wizard widgets; ColorScheme comes from finch-theme.
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -180,7 +180,7 @@ pub(crate) use wizard_host::{
     WizardColor, WizardFrame, WizardHost, WizardRects, WizardSectionContent, WizardView,
 };
 // Re-export ColorScheme so callers can use `crate::cli::tui::ColorScheme`.
-pub use crate::theme::ColorScheme;
+pub use finch_theme::ColorScheme;
 
 const RESET: SetAttribute = SetAttribute(Attribute::Reset);
 const CYAN: SetForegroundColor = SetForegroundColor(Color::Cyan);
@@ -4576,7 +4576,7 @@ mod tests {
     use crate::cli::diff::{summarize_files, DiffColorMode, FileDiff};
     use crate::cli::messages::{Message, MessageId, MessageRef, WorkUnit};
     use crate::cli::tui::vt_oracle::{VtColor, VtOracle, VtStyle};
-    use crate::theme::ColorTheme;
+    use finch_theme::ColorTheme;
 
     fn assert_vt(condition: bool, message: &str, terminal: &VtOracle) {
         assert!(condition, "{message}\n{}", terminal.diagnostic());

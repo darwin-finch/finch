@@ -2011,7 +2011,7 @@ mod tests {
         let dialog = crate::cli::repl_event::tool_display::tool_approval_dialog(
             &tool,
             "File: src/\u{1b}[31mhostile.rs",
-            &crate::theme::ColorTheme::Dark.to_scheme(),
+            &finch_theme::ColorTheme::Dark.to_scheme(),
             crate::cli::diff::DiffColorMode::NoColor,
         );
         let body = dialog.body.as_deref().unwrap();
@@ -2037,13 +2037,13 @@ mod tests {
         let dark = crate::cli::repl_event::tool_display::tool_approval_dialog(
             &tool,
             "File: src/theme.rs",
-            &crate::theme::ColorTheme::Dark.to_scheme(),
+            &finch_theme::ColorTheme::Dark.to_scheme(),
             crate::cli::diff::DiffColorMode::Theme,
         );
         let light = crate::cli::repl_event::tool_display::tool_approval_dialog(
             &tool,
             "File: src/theme.rs",
-            &crate::theme::ColorTheme::Light.to_scheme(),
+            &finch_theme::ColorTheme::Light.to_scheme(),
             crate::cli::diff::DiffColorMode::Theme,
         );
         let dark_body = dark.body.unwrap();
@@ -2607,7 +2607,7 @@ mod tests {
         let dialog = crate::cli::repl_event::tool_display::tool_approval_dialog(
             &tool,
             &summary,
-            &crate::theme::ColorScheme::default(),
+            &finch_theme::ColorScheme::default(),
             crate::cli::diff::DiffColorMode::NoColor,
         );
         assert!(
