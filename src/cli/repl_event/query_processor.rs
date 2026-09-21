@@ -2980,12 +2980,12 @@ mod tests {
         );
         assert_eq!(harness.canonical.id(), harness.canonical_id);
         assert_eq!(harness.canonical.status(), MessageStatus::InProgress);
-        let partial = crate::cli::tui::view_model::try_project_for_test(
+        let partial = crate::cli::test_projection::try_project_for_test(
             harness.canonical.as_ref(),
             &harness.colors,
         )
         .expect("projected row");
-        assert_eq!(partial.role, crate::cli::tui::view_model::NodeRole::Program);
+        assert_eq!(partial.role, crate::cli::test_projection::NodeRole::Program);
         assert_eq!(partial.body, vec!["(say \"".to_string()]);
         assert!(
             partial
@@ -3060,12 +3060,12 @@ mod tests {
             1,
             "named-Brain continuation created a duplicate activity unit"
         );
-        let row = crate::cli::tui::view_model::try_project_for_test(
+        let row = crate::cli::test_projection::try_project_for_test(
             harness.canonical.as_ref(),
             &harness.colors,
         )
         .expect("projected row");
-        assert_eq!(row.role, crate::cli::tui::view_model::NodeRole::Activity);
+        assert_eq!(row.role, crate::cli::test_projection::NodeRole::Activity);
         assert!(
             row.children
                 .iter()
@@ -3418,7 +3418,7 @@ mod tests {
             1,
             "failed partial stream produced another WorkUnit instead of retaining the canonical one"
         );
-        let failed = crate::cli::tui::view_model::try_project_for_test(
+        let failed = crate::cli::test_projection::try_project_for_test(
             harness.canonical.as_ref(),
             &harness.colors,
         )
@@ -4265,8 +4265,8 @@ mod tests {
         }
     }
 
-    fn transcript_of(unit: &Arc<WorkUnit>) -> crate::cli::tui::view_model::TranscriptNode {
-        crate::cli::tui::view_model::try_project_for_test(
+    fn transcript_of(unit: &Arc<WorkUnit>) -> crate::cli::test_projection::TranscriptNode {
+        crate::cli::test_projection::try_project_for_test(
             unit.as_ref(),
             &crate::theme::ColorScheme::default(),
         )
@@ -4311,7 +4311,7 @@ mod tests {
         let row = transcript_of(&execution.output_unit);
         assert_eq!(
             row.role,
-            crate::cli::tui::view_model::NodeRole::Output,
+            crate::cli::test_projection::NodeRole::Output,
             "invariant: kind stays Output so IR-swap still matches; row={row:?}"
         );
         assert_eq!(
@@ -5068,7 +5068,7 @@ mod tests {
         );
         let (name, _, unit, row_idx) = active.get(tool_id).expect("blocked id registered");
         assert_eq!(name, expected_name);
-        let projected = crate::cli::tui::view_model::try_project_for_test(
+        let projected = crate::cli::test_projection::try_project_for_test(
             unit.as_ref(),
             &crate::theme::ColorScheme::default(),
         )

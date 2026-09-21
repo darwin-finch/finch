@@ -20,6 +20,8 @@ mod repl;
 mod repl_event; // Phase 2-3: Event loop infrastructure
 mod setup_wizard; // First-run setup wizard (API keys + device selection)
 mod status_bar;
+#[cfg(test)]
+pub(crate) mod test_projection;
 mod tui;
 mod usage; // Phase 2: Terminal UI
 
