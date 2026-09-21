@@ -611,16 +611,6 @@ impl LiveToolMessage {
             *s = MessageStatus::Failed;
         }
     }
-
-    /// Get a clone of the Arc content for background streaming
-    pub fn content_arc(&self) -> Arc<RwLock<String>> {
-        Arc::clone(&self.content)
-    }
-
-    /// Get a clone of the Arc status for background streaming
-    pub fn status_arc(&self) -> Arc<RwLock<MessageStatus>> {
-        Arc::clone(&self.status)
-    }
 }
 
 const CYAN: SetForegroundColor = SetForegroundColor(Color::Cyan);
