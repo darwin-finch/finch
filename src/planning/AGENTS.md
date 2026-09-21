@@ -10,6 +10,8 @@ embedded methodology spec). DESIGN.md lists this tree on the providers row; this
 [`mod.rs`](mod.rs) is the flat callable facade; rustdoc supplies methods on exported types.
 Child modules are private. Callers outside this directory use `crate::planning::Item`; they must
 not name `loop_runner`, `personas`, or `types`. Do not recreate a signature catalog.
+Persona selection, convergence classification, and steering feedback are internal loop details;
+do not re-export them merely because the implementation uses them.
 
 **Dependencies:** `cli` (`OutputManager`, TUI dialogs), `generators` (`Generator`), and `providers`
 (`Message`, `UNIVERSAL_ALIGNMENT_PROMPT`). There is no direct `claude` import. The event loop

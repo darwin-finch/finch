@@ -59,7 +59,7 @@ pub struct PlanIteration {
 
 /// Result of a convergence check between two successive plan iterations
 #[derive(Debug, Clone)]
-pub enum ConvergenceResult {
+pub(crate) enum ConvergenceResult {
     /// Plan is stable: character delta below threshold AND no must-address items
     Stable { delta_pct: f32 },
     /// Plan grew >40% without resolving must-address items
@@ -114,7 +114,7 @@ impl Default for ImpcpdConfig {
 
 /// Internal user feedback result from the steering dialog
 #[derive(Debug)]
-pub enum UserFeedback {
+pub(crate) enum UserFeedback {
     /// User approved the current plan — stop iterating
     Approve,
     /// User cancelled planning entirely
