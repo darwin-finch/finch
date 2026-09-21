@@ -33,7 +33,7 @@ mod changeset;
 pub mod event_loop;
 pub mod events;
 pub mod llm_loop;
-pub mod memory_commitment;
+mod memory_commitment;
 pub(crate) mod model_selection;
 pub mod parts;
 pub mod plan_handler;
@@ -47,6 +47,10 @@ pub mod tool_execution;
 pub use event_loop::EventLoop;
 pub use events::{ConfirmationResult, LlmRequest, ReplEvent};
 pub use llm_loop::LlmLoop;
+pub use memory_commitment::{
+    memory_commitment_journal, CommittedMemoryRecord, MemoryCommitmentReceiver,
+    MemoryCommitmentTarget, MemoryCommitmentWriter,
+};
 pub use parts::{
     ContextLimits, DaemonParts, GenerationParts, LlmChannels, LlmGeneration, LlmRuntime,
     LlmSession, LlmTools, LlmUi, RuntimeParts, SessionParts, ToolParts, UiParts,

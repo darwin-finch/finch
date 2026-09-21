@@ -45,6 +45,10 @@ use super::conversation::ConversationHistory;
 use super::input::InputHandler;
 use super::menu::{Menu, MenuOption};
 use super::output_manager::OutputManager;
+use super::repl_event::{
+    memory_commitment_journal, CommittedMemoryRecord, MemoryCommitmentReceiver,
+    MemoryCommitmentTarget, MemoryCommitmentWriter,
+};
 use super::status_bar::StatusBar;
 use super::tui::TuiRenderer;
 use crate::cli::repl_event::plan_handler::{is_tool_allowed_in_mode, PLANNING_ALLOWED_TOOLS};
@@ -661,13 +665,10 @@ pub struct Repl {
     // Local mirror of the selected Brain's committed (byte-stable) memory
     // set (#940); the writer/target/receiver trio mirrors the task-list
     // journal above.
-    committed_memories: Arc<
-        tokio::sync::RwLock<Vec<crate::cli::repl_event::memory_commitment::CommittedMemoryRecord>>,
-    >,
-    memory_commitment_writer: crate::cli::repl_event::memory_commitment::MemoryCommitmentWriter,
-    memory_commitment_target: crate::cli::repl_event::memory_commitment::MemoryCommitmentTarget,
-    memory_commitment_receiver:
-        Option<crate::cli::repl_event::memory_commitment::MemoryCommitmentReceiver>,
+    committed_memories: Arc<tokio::sync::RwLock<Vec<CommittedMemoryRecord>>>,
+    memory_commitment_writer: MemoryCommitmentWriter,
+    memory_commitment_target: MemoryCommitmentTarget,
+    memory_commitment_receiver: Option<MemoryCommitmentReceiver>,
 
     // Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
@@ -1137,9 +1138,7 @@ impl Repl {
         // processor decides and requests replacements directly each turn.
         let committed_memories = Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let (memory_commitment_writer, memory_commitment_target, memory_commitment_receiver) =
-            crate::cli::repl_event::memory_commitment::memory_commitment_journal(Arc::clone(
-                &committed_memories,
-            ));
+            memory_commitment_journal(Arc::clone(&committed_memories));
         // Historical vocabulary spellings remain executable for persisted
         // turns and external clients, but providers must see one coherent
         // discovery surface. Aliases are registered after every canonical
