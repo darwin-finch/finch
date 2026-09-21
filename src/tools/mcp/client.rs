@@ -4,8 +4,8 @@
 
 use super::config::McpServerConfig;
 use super::connection::McpConnection;
-use crate::tools::types::{ToolDefinition, ToolInputSchema};
 use anyhow::{Context, Result};
+use finch_tools_api::{ToolDefinition, ToolInputSchema};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
