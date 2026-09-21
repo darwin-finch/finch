@@ -72,6 +72,6 @@ pub use setup_wizard::{
 };
 pub use status_bar::{StatusBar, StatusLine, StatusLineType};
 pub use tui::{
-    Dialog, DialogOption, DialogResult, QuestionOptionView, QuestionView, TabbedDialog,
-    TabbedDialogResult, TuiRenderer,
+    ActivityUsage, Dialog, DialogOption, DialogResult, QuestionOptionView, QuestionView,
+    TabbedDialog, TabbedDialogResult, TuiRenderer, TuiStatusPort,
 };

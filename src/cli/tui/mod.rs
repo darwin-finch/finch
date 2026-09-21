@@ -34,12 +34,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tui_textarea::TextArea;
 
-use super::{OutputManager, StatusBar, StatusLineType};
+use super::OutputManager;
 use crate::cli::messages::{MessageId, MessageRef, MessageStatus, WorkUnitPresentation};
 use crate::ui_model::input_line_physical_rows_with_ghost;
 // Sub-modules
 mod accordion;
 pub mod activity;
+pub use activity::ActivityUsage;
 mod async_input;
 mod autocomplete_widget;
 mod command_autocomplete;
@@ -80,6 +81,18 @@ pub use shadow_buffer::{
     extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
 };
 pub use tabbed_dialog::{QuestionOptionView, QuestionView};
+
+/// Application-owned status state read and updated by the terminal renderer.
+///
+/// The CLI keeps status ordering and operation policy; the renderer only asks
+/// for a printable snapshot and reports its own child-activity aggregate.
+pub trait TuiStatusPort: Send + Sync {
+    fn status_without_session(&self) -> String;
+    fn session_label(&self) -> Option<String>;
+    fn update_agent_activity(&self, active_children: usize, usage: &ActivityUsage);
+    fn set_operation(&self, operation: String);
+    fn clear_operation(&self);
+}
 
 /// One speakable project-resource row offered by the composer mention picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1291,7 +1304,7 @@ pub enum PosetPanelMode {
 #[allow(dead_code)]
 pub struct TuiRenderer {
     output_manager: Arc<OutputManager>,
-    status_bar: Arc<StatusBar>,
+    status_port: Arc<dyn TuiStatusPort>,
     colors: ColorScheme,
 
     // Input — tui-textarea manages multi-line state; we render it manually.
@@ -1421,15 +1434,15 @@ pub struct TuiRenderer {
 
 impl TuiRenderer {
     #[cfg(test)]
-    pub(crate) fn new_headless(
+    pub(crate) fn new_headless<S: TuiStatusPort + 'static>(
         output_manager: Arc<OutputManager>,
-        status_bar: Arc<StatusBar>,
+        status_port: Arc<S>,
         colors: ColorScheme,
     ) -> Self {
         output_manager.disable_stdout();
         Self {
             output_manager,
-            status_bar,
+            status_port,
             colors,
             input_textarea: Self::create_clean_textarea(),
             command_history: Vec::new(),
@@ -1476,9 +1489,9 @@ impl TuiRenderer {
         }
     }
 
-    pub fn new(
+    pub fn new<S: TuiStatusPort + 'static>(
         output_manager: Arc<OutputManager>,
-        status_bar: Arc<StatusBar>,
+        status_port: Arc<S>,
         colors: ColorScheme,
         mention_port: Arc<dyn MentionPort>,
     ) -> Result<Self> {
@@ -1509,7 +1522,7 @@ impl TuiRenderer {
 
         Ok(TuiRenderer {
             output_manager,
-            status_bar,
+            status_port,
             colors,
 
             input_textarea: Self::create_clean_textarea(),
@@ -1613,7 +1626,7 @@ impl TuiRenderer {
                 }
             }
         }
-        self.status_bar.update_agent_activity(
+        self.status_port.update_agent_activity(
             self.tracked_rows.len(),
             &aggregate_agent_usage(self.tracked_agent_usage.values()),
         );
@@ -1887,9 +1900,7 @@ impl TuiRenderer {
     /// borrow it for the planning call.
     fn live_frame_sources(&mut self, term_width: usize) -> LiveFrameSources {
         let input_lines = self.input_textarea.lines().to_vec();
-        let raw_status = self
-            .status_bar
-            .get_status_without(&StatusLineType::SessionLabel);
+        let raw_status = self.status_port.status_without_session();
         let current_input = input_lines.join("\n");
         let effective_status = compute_effective_status(
             self.ghost_text.as_deref(),
@@ -1912,8 +1923,8 @@ impl TuiRenderer {
             .collect::<Vec<_>>();
         let cwd_label = tilde_cwd();
         let session_label = self
-            .status_bar
-            .get_line(&StatusLineType::SessionLabel)
+            .status_port
+            .session_label()
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| self.session_label.clone());
         let live_messages = self.find_live_messages();
@@ -3360,12 +3371,12 @@ impl TuiRenderer {
 impl TuiRenderer {
     /// Set the OperationStatus line in the status bar (visible while queries run).
     pub fn set_operation_status(&self, msg: impl Into<String>) {
-        self.status_bar.update_operation(msg.into());
+        self.status_port.set_operation(msg.into());
     }
 
     /// Clear the OperationStatus line from the status bar.
     pub fn clear_operation_status(&self) {
-        self.status_bar.clear_operation();
+        self.status_port.clear_operation();
     }
 }
 
@@ -4532,8 +4543,74 @@ mod tests {
     use super::*;
     use crate::cli::messages::{Message, MessageId, MessageRef, WorkUnit};
     use crate::cli::tui::vt_oracle::{VtColor, VtOracle, VtStyle};
+    use crate::cli::{StatusBar, StatusLineType};
     use finch_diff::{summarize_files, DiffColorMode, FileDiff};
     use finch_theme::ColorTheme;
+
+    #[derive(Default)]
+    struct RecordingStatusPort {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TuiStatusPort for RecordingStatusPort {
+        fn status_without_session(&self) -> String {
+            "Loading model".to_string()
+        }
+
+        fn session_label(&self) -> Option<String> {
+            Some("test session".to_string())
+        }
+
+        fn update_agent_activity(&self, active_children: usize, _usage: &ActivityUsage) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("children:{active_children}"));
+        }
+
+        fn set_operation(&self, operation: String) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("operation:{operation}"));
+        }
+
+        fn clear_operation(&self) {
+            self.calls.lock().unwrap().push("clear".to_string());
+        }
+    }
+
+    #[test]
+    fn renderer_reads_and_updates_injected_status_without_cli_status_bar() {
+        let colors = ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(RecordingStatusPort::default());
+        let mut renderer = TuiRenderer::new_headless(output, Arc::clone(&status), colors);
+
+        let frame = renderer.live_frame_sources(80);
+        assert_eq!(
+            frame.session_label, "test session",
+            "session identity must come from the injected status port"
+        );
+        assert!(
+            frame.effective_status.contains("Loading model"),
+            "operational status must survive the injected live-frame path; frame_status={:?}",
+            frame.effective_status
+        );
+
+        renderer.set_operation_status("planning");
+        renderer.clear_operation_status();
+        renderer.apply_activity(activity::ActivityUpdate::Upsert {
+            id: uuid::Uuid::new_v4(),
+            row: activity::ActivityRow::new("child", activity::ActivityState::Active),
+            usage: ActivityUsage::default(),
+        });
+        assert_eq!(
+            status.calls.lock().unwrap().as_slice(),
+            ["operation:planning", "clear", "children:1"],
+            "renderer must forward stateful updates only through the injected port"
+        );
+    }
 
     fn assert_vt(condition: bool, message: &str, terminal: &VtOracle) {
         assert!(condition, "{message}\n{}", terminal.diagnostic());
@@ -10581,6 +10658,7 @@ mod draw_dialog_tests {
 #[cfg(test)]
 mod attention_bell_tests {
     use super::*;
+    use crate::cli::StatusBar;
     use std::sync::Arc;
 
     fn headless_renderer() -> TuiRenderer {

@@ -490,6 +490,32 @@ impl Default for StatusBar {
     }
 }
 
+impl super::tui::TuiStatusPort for StatusBar {
+    fn status_without_session(&self) -> String {
+        self.get_status_without(&StatusLineType::SessionLabel)
+    }
+
+    fn session_label(&self) -> Option<String> {
+        self.get_line(&StatusLineType::SessionLabel)
+    }
+
+    fn update_agent_activity(
+        &self,
+        active_children: usize,
+        usage: &super::tui::activity::ActivityUsage,
+    ) {
+        StatusBar::update_agent_activity(self, active_children, usage);
+    }
+
+    fn set_operation(&self, operation: String) {
+        self.update_operation(operation);
+    }
+
+    fn clear_operation(&self) {
+        StatusBar::clear_operation(self);
+    }
+}
+
 impl Clone for StatusBar {
     fn clone(&self) -> Self {
         Self {

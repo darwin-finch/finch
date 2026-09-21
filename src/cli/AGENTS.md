@@ -20,6 +20,9 @@ their owning lower layer or inject a port instead.
 `llm_dialogs` owns the AskUserQuestion wire schema, validation, and answer annotation; it maps
 questions to the renderer-owned `QuestionView` when constructing a tabbed dialog. The renderer
 must not import those wire types.
+`StatusBar` implements the renderer-owned `TuiStatusPort` here: status ordering and line policy
+remain application concerns, while the TUI receives only rendered snapshots and sends back its
+own child-activity and operation updates.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::`,
 `./scripts/test_brains.sh cargo test --test tui_integration_test`, and
