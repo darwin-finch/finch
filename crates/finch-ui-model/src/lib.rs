@@ -2,16 +2,22 @@
 //! needs to build and claim a subtree, without touching `crossterm` or the
 //! shadow buffer (docs/TUI_DESIGN.md, "Dependency direction").
 //!
-//! `cli::tui` (the engine) and `cli::components` (or any future surface
-//! author) both depend on this module; nothing here depends back on either.
-//! The claiming pass lives here because it is pure layout over these types —
-//! the engine supplies the frames, hit-rect routing, and paint.
+//! `cli::tui` (the engine) and message producers both depend on this crate;
+//! nothing here depends back on either. Pure component projection and the
+//! claiming pass live here; the engine supplies frames, hit-rect routing, and
+//! paint.
 
 use std::fmt;
 use std::ops::Range;
 
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
+
+mod say_turn;
+
+pub use say_turn::{
+    say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
+};
 
 /// Stable identity for one retained application message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

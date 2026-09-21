@@ -27,11 +27,11 @@ append-only path), so completing a run or reconnecting cannot lose a choice.
 (`WorkUnitViewModel`: status, program, output, `show_program`) for successful untitled `say`
 turns — stages 1–2 of `docs/TUI_DESIGN.md`, one representation per state. The producer creates
 it (`begin_say_turn`) where the say turn is born and already holds the wire source; streaming
-appends and the completion path update it under the same lock that mutates the unit. The types
-and the say component's action payload (`ToggleProgram`, carried opaquely as
-`ComponentAction`) live here so the domain never depends upward on the component layer; the
-state-based renderer and subwidgets live in `cli::components`. The `Message` trait exposes the
-snapshot (`say_turn_view`, carrying full-resolution elapsed for the animated generating state),
+appends and the completion path update it under the same lock that mutates the unit. The pure
+snapshot types and state-based line projection live in `finch-ui-model`; this module re-exports
+the snapshot types for source compatibility. The action payload (`ToggleProgram`, carried
+opaquely as `ComponentAction`) remains beside the message lifecycle it mutates. The `Message`
+trait exposes the snapshot (`say_turn_view`, carrying full-resolution elapsed for the animated generating state),
 the row action (`transcript_action` — the completed output region, semantic path `[1]`, since
 the stage-1 chrome's `[0]` retired with the chrome), and the handle
 (`handle_transcript_action`); rows without a ViewModel keep the renderer's RowId-keyed

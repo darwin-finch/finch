@@ -2495,7 +2495,7 @@ fn replayed_completed_say_run_reconstructs_the_component_card() {
     );
 
     // The viewport renders the card: prose + `(ran Ns)`, no legacy rows.
-    let card: Vec<String> = crate::cli::components::card_lines(&view)
+    let card: Vec<String> = finch_ui_model::say_turn_lines(&view)
         .into_iter()
         .map(|line| line.text)
         .collect();
@@ -2585,7 +2585,7 @@ fn replayed_midstream_say_run_replays_best_known_state() {
         view.vm.output.is_none(),
         "INVARIANT: no Result arrived, so the card has no output part; view={view:?}"
     );
-    let card: Vec<String> = crate::cli::components::card_lines(&view)
+    let card: Vec<String> = finch_ui_model::say_turn_lines(&view)
         .into_iter()
         .map(|line| line.text)
         .collect();
@@ -2628,7 +2628,7 @@ fn replayed_midstream_say_run_replays_best_known_state() {
         arrived.iter().any(|line| line == greeting),
         "INVARIANT: arrived say bytes are never hidden; output={arrived:?}"
     );
-    let card: Vec<String> = crate::cli::components::card_lines(&view)
+    let card: Vec<String> = finch_ui_model::say_turn_lines(&view)
         .into_iter()
         .map(|line| line.text)
         .collect();

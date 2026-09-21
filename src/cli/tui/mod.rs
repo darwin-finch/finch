@@ -2643,7 +2643,7 @@ impl TuiRenderer {
         // the renderer's RowId-keyed maps never hold it — and the engine
         // never matches on the message type: the Message trait answers.
         if let Some(view) = message.say_turn_view() {
-            let lines = crate::cli::components::card_lines(&view);
+            let lines = finch_ui_model::say_turn_lines(&view);
             return self
                 .tool_viewports
                 .project(lines, width, DEFAULT_TOOL_OUTPUT_ROWS);

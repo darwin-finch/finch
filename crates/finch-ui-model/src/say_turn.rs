@@ -1,4 +1,4 @@
-//! The WorkUnit say-turn component (stage 2 of docs/TUI_DESIGN.md, #882).
+//! Pure WorkUnit say-turn projection (stage 2 of docs/TUI_DESIGN.md, #882).
 //!
 //! One say turn renders as **one** representation per state — never a card
 //! stacked beside a legacy source group:
@@ -17,12 +17,11 @@
 //!   toggles it.
 //!
 //! The ViewModel (status, program, output, `show_program`) lives on the
-//! message behind its own lock (see
-//! [`crate::cli::messages::WorkUnitViewModel`]); subwidgets are constructed
+//! message behind its own lock; subwidgets are constructed
 //! from it each frame and choose to render or not, so a subwidget with
 //! nothing to show contributes zero lines and claims zero rows. The engine
 //! never matches on the message type: it asks the `Message` trait for
-//! [`crate::cli::messages::SayTurnView`] and hands the snapshot here; clicks
+//! [`SayTurnView`] and hands the snapshot here; clicks
 //! resolve to `(RowId, action)` and route to the component's handle, which
 //! toggles `show_program` under the message's lock. Repaints stay
 //! pull-per-frame — the next frame re-renders from the mutated ViewModel.
@@ -31,8 +30,55 @@
 //! hitbox) is deleted: the completed output region is the toggle target, so
 //! no chrome furniture exists to carry an affordance.
 
-use crate::cli::messages::{OutputVm, SayTurnStatus, SayTurnView, WorkUnitViewModel};
-use crate::ui_model::{NodeRole, RenderedTranscriptLine, RowId};
+use crate::{MessageId, NodeRole, RenderedTranscriptLine, RowId};
+
+/// Status of a component-owned say turn. The completion path transitions it
+/// exactly once; a finished turn therefore cannot keep wearing `running`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SayTurnStatus {
+    #[default]
+    Running,
+    Completed,
+}
+
+/// The program-source part of a say turn's ViewModel: the exact wire text the
+/// provider produced, retained so the reader can reveal it on demand.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProgramSourceVm {
+    pub language: String,
+    pub lines: Vec<String>,
+}
+
+/// The output part of a say turn's ViewModel, set when the program produces
+/// output and updated live as `say` chunks stream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputVm {
+    pub lines: Vec<String>,
+}
+
+/// The retained ViewModel of one say turn, living on the WorkUnit behind the
+/// message's existing lock. Holds presentation state (status, program,
+/// output) and the ephemeral UI state (`show_program`, default hidden for say
+/// turns — #350's prose ruling). Because it is retained, component state needs
+/// no renderer-side map.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkUnitViewModel {
+    pub status: SayTurnStatus,
+    pub program: ProgramSourceVm,
+    pub output: Option<OutputVm>,
+    pub show_program: bool,
+}
+
+/// One frame's component snapshot: the retained ViewModel plus the chrome
+/// timing, captured under the same lock read. The full-resolution elapsed
+/// drives the component's animated generating state; completed turns read the
+/// captured value, so the annotation is stable for scrollback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SayTurnView {
+    pub message_id: MessageId,
+    pub vm: WorkUnitViewModel,
+    pub elapsed: std::time::Duration,
+}
 
 /// Semantic path of the say turn's output region: the toggle hit target of a
 /// completed turn. New in stage 2 — the chrome's `[0]` retired with the
@@ -214,7 +260,7 @@ fn completed_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
 /// the turn's current state. The transcript viewport's claiming pass turns
 /// the completed output region into the toggle hitboxes; a hidden subwidget
 /// claims nothing.
-pub(crate) fn card_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
+pub fn say_turn_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
     match say_state(&view.vm) {
         SayTurnState::Generating => generating_lines(view),
         SayTurnState::Running => running_lines(view),
@@ -225,8 +271,7 @@ pub(crate) fn card_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::{MessageId, ProgramSourceVm};
-    use crate::ui_model::{Axis, Rect, Track, Widget};
+    use crate::{Axis, Rect, Track, Widget};
 
     fn say_view(vm: WorkUnitViewModel) -> SayTurnView {
         SayTurnView {
@@ -266,8 +311,8 @@ mod tests {
         lines.iter().map(|line| line.text.clone()).collect()
     }
 
-    fn viewport_layout(lines: Vec<RenderedTranscriptLine>) -> crate::ui_model::Layout {
-        crate::ui_model::layout(
+    fn viewport_layout(lines: Vec<RenderedTranscriptLine>) -> crate::Layout {
+        crate::layout(
             &Widget::Viewport { lines },
             Rect {
                 x: 0,
@@ -290,7 +335,7 @@ mod tests {
         // no program exists yet, the turn is one animated progress line —
         // never the source (there is none) and never chrome furniture.
         let view = say_view(WorkUnitViewModel::default());
-        let lines = card_lines(&view);
+        let lines = say_turn_lines(&view);
         let rendered = texts(&lines);
         assert_eq!(
             rendered.len(),
@@ -338,7 +383,7 @@ mod tests {
         // turn IS its program source, inline — no chrome row, no glyph, no
         // card, no elapsed-on-chrome, no legacy `Program source` label.
         let view = say_view(running_vm());
-        let lines = card_lines(&view);
+        let lines = say_turn_lines(&view);
         let rendered = texts(&lines);
         assert_eq!(
             rendered,
@@ -358,7 +403,7 @@ mod tests {
             );
         }
         assert_eq!(
-            hit_rect_count(card_lines(&view)),
+            hit_rect_count(say_turn_lines(&view)),
             0,
             "nothing is toggleable while the program is still executing"
         );
@@ -374,7 +419,7 @@ mod tests {
             lines: vec!["partial greeting".to_string()],
         });
         let view = say_view(vm);
-        let lines = card_lines(&view);
+        let lines = say_turn_lines(&view);
         let rendered = texts(&lines);
         assert_eq!(
             rendered,
@@ -391,7 +436,7 @@ mod tests {
         // say turn is the prose inline plus `(ran Ns)` — no Program source
         // row, no Brain run row, no UUID, no result row, no card chrome.
         let view = say_view(completed_vm());
-        let lines = card_lines(&view);
+        let lines = say_turn_lines(&view);
         let rendered = texts(&lines);
         assert_eq!(
             rendered,
@@ -422,22 +467,22 @@ mod tests {
         });
         let quick = say_view(vm.clone());
         assert!(
-            texts(&card_lines(&quick))
+            texts(&say_turn_lines(&quick))
                 .last()
                 .is_some_and(|line| *line == "(ran 2s)"),
             "the annotation always renders; got {:?}",
-            texts(&card_lines(&quick))
+            texts(&say_turn_lines(&quick))
         );
         let long = SayTurnView {
             elapsed: std::time::Duration::from_secs(75),
             ..say_view(vm)
         };
         assert!(
-            texts(&card_lines(&long))
+            texts(&say_turn_lines(&long))
                 .last()
                 .is_some_and(|line| *line == "(ran 1m 15s)"),
             "minutes render readably; got {:?}",
-            texts(&card_lines(&long))
+            texts(&say_turn_lines(&long))
         );
     }
 
@@ -448,7 +493,7 @@ mod tests {
         let mut vm = completed_vm();
         vm.output = None;
         let view = say_view(vm);
-        let lines = card_lines(&view);
+        let lines = say_turn_lines(&view);
         let rendered = texts(&lines);
         assert_eq!(rendered, vec!["", "(ran 2s)"], "got {rendered:?}");
         assert!(lines.iter().all(|line| line.row_id.is_some()));
@@ -463,7 +508,7 @@ mod tests {
         // output-region RowId (component-owned), so the whole region is the
         // hit target, and the claiming pass re-claims the swap.
         let view = say_view(completed_vm());
-        let lines = card_lines(&view);
+        let lines = say_turn_lines(&view);
         let target = output_region(&view);
         assert!(
             lines
@@ -479,7 +524,7 @@ mod tests {
             lines.iter().all(|line| line.row_expanded == Some(false)),
             "row_expanded reports show_program=false for assistive consumers"
         );
-        let hit_rects: Vec<_> = viewport_layout(card_lines(&view)).hit_rects().collect();
+        let hit_rects: Vec<_> = viewport_layout(say_turn_lines(&view)).hit_rects().collect();
         assert!(
             hit_rects.len() >= 3,
             "the prose rows, the separator, and the annotation are all part of the \
@@ -491,7 +536,7 @@ mod tests {
         let mut vm = completed_vm();
         vm.show_program = true;
         let toggled = say_view(vm);
-        let toggled_lines = card_lines(&toggled);
+        let toggled_lines = say_turn_lines(&toggled);
         let rendered = texts(&toggled_lines);
         assert_eq!(
             rendered,
@@ -500,14 +545,14 @@ mod tests {
              got {rendered:?}"
         );
         assert!(
-            card_lines(&toggled)
+            say_turn_lines(&toggled)
                 .iter()
                 .all(|line| line.row_expanded == Some(true)),
             "row_expanded tracks the opened state"
         );
         assert_eq!(
-            hit_rect_count(card_lines(&view)),
-            hit_rect_count(card_lines(&toggled)),
+            hit_rect_count(say_turn_lines(&view)),
+            hit_rect_count(say_turn_lines(&toggled)),
             "the swap re-claims one output region either way"
         );
     }
@@ -561,7 +606,7 @@ mod tests {
         let view = say_view(running_vm());
         assert!(view.vm.output.is_none());
         assert_eq!(
-            texts(&card_lines(&view)),
+            texts(&say_turn_lines(&view)),
             vec!["(say \"hello\")"],
             "no output part means no output lines beneath the source"
         );
@@ -577,12 +622,12 @@ mod tests {
             lines: vec!["hel".to_string()],
         });
         let partial_view = say_view(vm.clone());
-        let partial = texts(&card_lines(&partial_view));
+        let partial = texts(&say_turn_lines(&partial_view));
         vm.output = Some(OutputVm {
             lines: vec!["hel".to_string(), "lo".to_string()],
         });
         let streamed_view = say_view(vm);
-        let streamed = texts(&card_lines(&streamed_view));
+        let streamed = texts(&say_turn_lines(&streamed_view));
         assert_eq!(partial.len() + 1, streamed.len());
         assert!(
             streamed.iter().any(|line| *line == "lo"),
@@ -596,13 +641,13 @@ mod tests {
         // whatever the VM says. Re-running completion re-renders identically.
         let mut vm = running_vm();
         let running_view = say_view(vm.clone());
-        let running = card_lines(&running_view);
+        let running = say_turn_lines(&running_view);
         vm.status = SayTurnStatus::Completed;
         vm.output = Some(OutputVm {
             lines: vec!["hello".to_string()],
         });
         let completed_view = say_view(vm.clone());
-        let completed = card_lines(&completed_view);
+        let completed = say_turn_lines(&completed_view);
         vm.status = SayTurnStatus::Completed;
         assert_ne!(
             texts(&running),
@@ -610,7 +655,7 @@ mod tests {
             "the completed representation differs from the running one"
         );
         assert_eq!(
-            texts(&card_lines(&completed_view)),
+            texts(&say_turn_lines(&completed_view)),
             texts(&completed),
             "an already-completed status re-renders identically — the transition \
              happened once"
@@ -630,7 +675,7 @@ mod tests {
                 Widget::Marked(
                     CARD,
                     Box::new(Widget::Text {
-                        lines: card_lines(&view)
+                        lines: say_turn_lines(&view)
                             .into_iter()
                             .map(|line| line.text)
                             .collect(),
@@ -638,7 +683,7 @@ mod tests {
                 ),
             )],
         };
-        let layout = crate::ui_model::layout(
+        let layout = crate::layout(
             &tree,
             Rect {
                 x: 0,

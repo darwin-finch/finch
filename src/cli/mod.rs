@@ -4,7 +4,6 @@
 mod chatgpt_auth;
 mod command_autocomplete;
 mod commands;
-mod components; // component-owned presentation (docs/TUI_DESIGN.md); say turn
 mod conversation;
 mod conversation_compactor; // Infinite context: summarise dropped messages
 mod diff;

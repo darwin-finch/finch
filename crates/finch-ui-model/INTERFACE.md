@@ -32,6 +32,10 @@ impl MessageId {
 pub struct NodeLayout { … }
 /// Renderer-facing role of one transcript node.
 pub enum NodeRole { Response, Activity, Program, Output, ToolGroup, ToolCall, Input, ToolOutput }
+/// The output part of a say turn's ViewModel, set when the program produces output and updated live as `say` chunks stream.
+pub struct OutputVm { … }
+/// The program-source part of a say turn's ViewModel: the exact wire text the provider produced, retained so the reader can reveal it on demand.
+pub struct ProgramSourceVm { … }
 /// A rectangle in the live frame's own coordinate space (row 0 is the top of the live area, column 0 the left terminal edge).
 pub struct Rect { … }
 impl Rect {
@@ -45,10 +49,16 @@ impl Rect {
 pub struct RenderedTranscriptLine { … }
 /// Stable identity for one expandable row within the transcript.
 pub struct RowId { … }
+/// Status of a component-owned say turn.
+pub enum SayTurnStatus { Running, Completed }
+/// One frame's component snapshot: the retained ViewModel plus the chrome timing, captured under the same lock read.
+pub struct SayTurnView { … }
 /// How one child of a [`Widget::Stack`] claims its extent along the stack's main axis.
 pub enum Track { Natural, Flex, Max, Side }
 /// The standard widget kinds.
 pub enum Widget { Stack, Text, Rule, Completions, Composer, Viewport, DialogCard, Marked }
+/// The retained ViewModel of one say turn, living on the WorkUnit behind the message's existing lock.
+pub struct WorkUnitViewModel { … }
 ```
 
 ## Functions
@@ -66,6 +76,8 @@ pub fn layout(root: &Widget, frame: Rect) -> Layout { … }
 pub fn natural_size(widget: &Widget, cross: usize, axis: Axis) -> usize { … }
 /// Number of physical terminal rows occupied by one logical line.
 pub fn physical_rows(s: &str, terminal_width: usize) -> usize { … }
+/// Render the say turn's lines for one frame: exactly one representation for the turn's current state.
+pub fn say_turn_lines(view: &SayTurnView) -> Vec<RenderedTranscriptLine> { … }
 /// Truncate `s` to at most `columns` display columns.
 pub fn truncate_to_columns(s: &str, columns: usize) -> String { … }
 /// Calculate visible display-column width of string (excluding ANSI escape codes).

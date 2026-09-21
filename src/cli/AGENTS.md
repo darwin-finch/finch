@@ -4,8 +4,8 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 
 **Owns** `src/cli/`: command handling, the interactive REPL and event loop, terminal rendering,
 typed presentation messages, setup and provider-login flows, output routing, dialogs, suggestions,
-and conversation projection. Nested capsules document the event loop, message model, components,
-and TUI details. Application startup and daemon composition remain in the root package.
+and conversation projection. Nested capsules document the event loop, message model, and TUI
+details. Application startup and daemon composition remain in the root package.
 
 **Facade:** child modules are private. Callers outside this directory use flat `crate::cli::Item`
 imports from the `pub use` list in `mod.rs`; they must not select implementation paths such as

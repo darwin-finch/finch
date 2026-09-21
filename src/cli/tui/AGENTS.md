@@ -60,7 +60,8 @@ touching `crossterm` or the shadow buffer. The engine keeps its stable `widgets`
 
 A successful untitled `say` turn renders through its **component** as **one representation per
 state** (stage 2 of `docs/TUI_DESIGN.md`): `TuiRenderer::projected_message_lines` asks the
-`Message` trait for `say_turn_view()` and hands the snapshot to `cli::components::card_lines`,
+`Message` trait for `say_turn_view()` and hands the snapshot to
+`finch_ui_model::say_turn_lines`,
 which renders Generating as one animated line, Running as the program source inline (arrived
 output bytes beneath it, never hidden), and Completed as the output prose plus `(ran Ns)` —
 no Program source row, no Brain run row, no result row, no card chrome. The stage-1 chrome
@@ -176,6 +177,7 @@ draws a view, and the caller converts.
 | View | What the renderer needs | Converted from |
 |------|-------------------------|----------------|
 | `view_model::TranscriptNode` | label, body, children, role, default disclosure | WorkUnit `domain_view()`, in `view_model::project_message` |
+| `finch_ui_model::SayTurnView` | status, program, output, elapsed, toggle state | WorkUnit `say_turn_view()`, projected by `finch_ui_model::say_turn_lines` |
 | [`activity::ActivityRow`](activity.rs) | indented status text | todos / agent tasks, in `cli::repl_event::activity_view` |
 | `Dialog::tool_approval(name, summary)` | a name and a summary line | Finch `ToolUse`, in `cli::repl_event::tool_display::tool_approval_dialog` |
 | [`cell_format::workbook_cell_to_string`](cell_format.rs) | one cell as text | calamine `Data`, inside `spreadsheet_preview_rows` |
