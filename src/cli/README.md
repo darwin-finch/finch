@@ -18,5 +18,5 @@ annotations are assembled back in the CLI; the renderer never interprets the too
 response schema.
 
 Read [AGENTS.md](AGENTS.md) for allowed dependencies and focused tests, and [mod.rs](mod.rs) for
-the callable facade. The [message README](messages/README.md) and [TUI README](tui/README.md)
+the callable facade. The [message README](../../crates/finch-messages/README.md) and [TUI README](tui/README.md)
 explain those two presentation boundaries without an API catalog.

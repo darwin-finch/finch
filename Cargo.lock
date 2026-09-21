@@ -1669,6 +1669,7 @@ dependencies = [
  "finch-ipc",
  "finch-language",
  "finch-memory",
+ "finch-messages",
  "finch-node",
  "finch-programs",
  "finch-providers",
@@ -1854,6 +1855,19 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "finch-messages"
+version = "0.7.31"
+dependencies = [
+ "crossterm",
+ "finch-diff",
+ "finch-theme",
+ "finch-ui-model",
+ "ratatui 0.29.0",
  "tracing",
  "uuid",
 ]

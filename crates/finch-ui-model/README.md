@@ -6,7 +6,7 @@ projects WorkUnit snapshots into semantic nodes, formats bounded assistant prose
 and claims layout cells. It does not own message mutation, component action dispatch, input,
 terminal lifecycle, or painting.
 
-When a WorkUnit changes, `src/cli/messages/work_unit.rs` retains the domain event and constructs
+When a WorkUnit changes, `crates/finch-messages/src/work_unit.rs` retains the domain event and constructs
 plain `WorkUnitView` and `WorkUnitHead` snapshots. It also retains the say-turn
 `WorkUnitViewModel` while streaming and completing a turn. The message layer owns the mutation;
 this crate owns the data shapes and pure say-turn line projection.

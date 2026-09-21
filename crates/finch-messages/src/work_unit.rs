@@ -462,7 +462,7 @@ impl WorkUnit {
     ///
     /// Labels may include ANSI from `format_tool_label`; the tool name itself
     /// is still present as a substring.
-    pub(crate) fn spawn_agent_row_indices(&self) -> Vec<usize> {
+    pub fn spawn_agent_row_indices(&self) -> Vec<usize> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         inner
             .rows
@@ -474,7 +474,7 @@ impl WorkUnit {
     }
 
     /// True when this unit is internal lifecycle activity, not a Tools group.
-    pub(crate) fn is_activity_presentation(&self) -> bool {
+    pub fn is_activity_presentation(&self) -> bool {
         matches!(
             self.inner
                 .read()
@@ -632,7 +632,8 @@ impl WorkUnit {
         self.fail_row_with_body(idx, error, Vec::new());
     }
 
-    pub(crate) fn queue_agent_activity(
+    /// Queue one child-agent row, retaining the first live row for a repeated task id.
+    pub fn queue_agent_activity(
         &self,
         owner_row: Option<usize>,
         agent_id: uuid::Uuid,
@@ -669,7 +670,8 @@ impl WorkUnit {
         });
     }
 
-    pub(crate) fn start_agent_activity(&self, task_id: uuid::Uuid) {
+    /// Record that a queued child task started, without duplicating its marker.
+    pub fn start_agent_activity(&self, task_id: uuid::Uuid) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let Some(row) = inner
             .agent_activity
@@ -686,7 +688,8 @@ impl WorkUnit {
         }
     }
 
-    pub(crate) fn start_agent_tool(&self, task_id: uuid::Uuid, name: impl Into<String>) {
+    /// Add one running tool under a live child task.
+    pub fn start_agent_tool(&self, task_id: uuid::Uuid, name: impl Into<String>) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let Some(row) = inner
             .agent_activity
@@ -712,7 +715,8 @@ impl WorkUnit {
         });
     }
 
-    pub(crate) fn complete_agent_tool(&self, task_id: uuid::Uuid, name: &str, is_error: bool) {
+    /// Terminalize the matching running child tool once.
+    pub fn complete_agent_tool(&self, task_id: uuid::Uuid, name: &str, is_error: bool) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let Some(row) = inner
             .agent_activity
@@ -738,7 +742,8 @@ impl WorkUnit {
         };
     }
 
-    pub(crate) fn finish_agent_activity(
+    /// Finish a child task and retain its summary and body for presentation.
+    pub fn finish_agent_activity(
         &self,
         task_id: uuid::Uuid,
         summary: impl Into<String>,

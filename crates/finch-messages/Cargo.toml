@@ -1,0 +1,18 @@
+[package]
+name = "finch-messages"
+version = "0.7.31"
+publish = false
+rust-version = "1.98"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0"
+description = "Client-local typed conversation messages and WorkUnit snapshots"
+repository = "https://github.com/darwin-finch/finch"
+
+[dependencies]
+crossterm = "0.28"
+finch-diff = { path = "../finch-diff" }
+finch-theme = { path = "../finch-theme" }
+finch-ui-model = { path = "../finch-ui-model" }
+ratatui = "0.29"
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4"] }

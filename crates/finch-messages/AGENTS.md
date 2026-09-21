@@ -1,7 +1,7 @@
-# messages capsule: client-local conversation entries
+# Finch messages agent contract
 
-Supplements the root [AGENTS.md](../../../AGENTS.md). The [README](README.md) traces the query
-processor and TUI callers; [`mod.rs`](mod.rs) is the callable facade.
+Supplements the root [AGENTS.md](../../AGENTS.md). The [README](README.md) traces the query
+processor and TUI callers; [`src/lib.rs`](src/lib.rs) is the callable facade.
 
 **Owns:** typed messages, their shared read contract, mutable `WorkUnit` turn lifecycle, and the
 snapshot assembled for each render. A WorkUnit is one generation run, never a widget kind. This
@@ -16,11 +16,11 @@ progress adaptation belongs in application-owned `cli::output_manager`, not this
 Brain, runtime, provider, and tool layers must not depend upward on this message model;
 application adapters construct messages at the conversation boundary.
 
-Production and test code now use only those three extracted presentation crates. Message tests
-exercise `finch-ui-model` projection through the `Message` snapshot; the TUI adapter has its own
-tests in `cli::tui::view_model`, and the REPL tool-result/retained-message integration test lives
-with `cli::repl_event::tool_display`. Keep these cross-layer tests outside a future message crate
-so extraction cannot acquire a dev-dependency cycle.
+Those are this crate's only Finch-crate dependencies. Its tests exercise `finch-ui-model`
+projection through the `Message` snapshot; the root TUI adapter has its own tests in
+`cli::tui::view_model`, and the REPL tool-result/retained-message integration test lives with
+`cli::repl_event::tool_display`. Keep those cross-layer tests at the root, not in this crate,
+to avoid a dev-dependency cycle.
 
 **Invariants and lifetimes:** a `MessageId` remains stable across streaming updates. WorkUnit
 row paths are append-only semantic ancestry; never reuse or reorder a path segment. The same
@@ -36,7 +36,7 @@ provider dispatch here. Child modules stay private; add a flat re-export only wh
 caller needs it. Do not add whole-module exports or recreate a generated `INTERFACE.md`.
 
 **Focused tests:**
-`./scripts/test_brains.sh cargo test --lib -- cli::messages::` for lifecycle and snapshot
+`./scripts/test_brains.sh cargo test -p finch-messages --lib` for lifecycle and snapshot
 assembly, `./scripts/test_brains.sh cargo test -p finch-ui-model` for pure projection, and
-`./scripts/test_brains.sh cargo test --lib -- cli::tui::` when message rendering changes.
+`./scripts/test_brains.sh cargo test -p finch --lib cli::tui::` when message rendering changes.
 Run the supervised workspace suite for facade or persisted-shape changes.
