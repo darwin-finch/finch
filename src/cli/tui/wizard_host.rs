@@ -20,7 +20,6 @@ use std::io::Write;
 
 use super::shadow_buffer::ShadowBuffer;
 use super::widgets::{self, Axis, Rect, Track, Widget};
-use crate::ui_model::char_display_width;
 use anyhow::Result;
 use crossterm::{
     cursor::Hide,
@@ -28,6 +27,7 @@ use crossterm::{
     style::Print,
     terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
+use finch_ui_model::char_display_width;
 
 // ─── Styling ─────────────────────────────────────────────────────────────────
 //

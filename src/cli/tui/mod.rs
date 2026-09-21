@@ -34,9 +34,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tui_textarea::TextArea;
 
+#[cfg(test)]
 use super::OutputManager;
-use crate::cli::messages::{MessageId, MessageRef, MessageStatus, WorkUnitPresentation};
-use crate::ui_model::input_line_physical_rows_with_ghost;
+use finch_messages::{MessageId, MessageRef, MessageStatus, WorkUnitPresentation};
+use finch_ui_model::input_line_physical_rows_with_ghost;
 // Sub-modules
 mod accordion;
 pub mod activity;
@@ -92,6 +93,18 @@ pub trait TuiStatusPort: Send + Sync {
     fn update_agent_activity(&self, active_children: usize, usage: &ActivityUsage);
     fn set_operation(&self, operation: String);
     fn clear_operation(&self);
+}
+
+/// The stateful conversation-output operations needed by the terminal renderer.
+///
+/// The application owns message retention and stdout policy. The renderer reads
+/// snapshots for blits and reports settled dialog records through this port.
+pub trait TuiOutputPort: Send + Sync {
+    fn get_messages(&self) -> Vec<MessageRef>;
+    fn add_trait_message(&self, message: MessageRef);
+    fn write_tool_raw(&self, content: String);
+    fn enable_stdout(&self);
+    fn disable_stdout(&self);
 }
 
 /// One speakable project-resource row offered by the composer mention picker.
@@ -1303,7 +1316,7 @@ pub enum PosetPanelMode {
 
 #[allow(dead_code)]
 pub struct TuiRenderer {
-    output_manager: Arc<OutputManager>,
+    output_manager: Arc<dyn TuiOutputPort>,
     status_port: Arc<dyn TuiStatusPort>,
     colors: ColorScheme,
 
@@ -1434,8 +1447,8 @@ pub struct TuiRenderer {
 
 impl TuiRenderer {
     #[cfg(test)]
-    pub(crate) fn new_headless<S: TuiStatusPort + 'static>(
-        output_manager: Arc<OutputManager>,
+    pub(crate) fn new_headless<S: TuiStatusPort + 'static, O: TuiOutputPort + 'static>(
+        output_manager: Arc<O>,
         status_port: Arc<S>,
         colors: ColorScheme,
     ) -> Self {
@@ -1489,8 +1502,8 @@ impl TuiRenderer {
         }
     }
 
-    pub fn new<S: TuiStatusPort + 'static>(
-        output_manager: Arc<OutputManager>,
+    pub fn new<S: TuiStatusPort + 'static, O: TuiOutputPort + 'static>(
+        output_manager: Arc<O>,
         status_port: Arc<S>,
         colors: ColorScheme,
         mention_port: Arc<dyn MentionPort>,
@@ -1515,7 +1528,7 @@ impl TuiRenderer {
             eprintln!("{info}");
         }));
 
-        // Suppress OutputManager's own stdout writes — we own the terminal.
+        // Suppress the application's stdout writes — we own the terminal.
         output_manager.disable_stdout();
 
         let command_history = Self::load_history();
@@ -2417,7 +2430,7 @@ fn live_view_model<'a>(
 impl TuiRenderer {
     /// Called from the event loop on every tick.
     /// Commits newly-completed messages to permanent scrollback, then redraws.
-    pub fn flush_output_safe(&mut self, _output_manager: &OutputManager) -> Result<()> {
+    pub fn flush_output_safe(&mut self) -> Result<()> {
         let messages = self.output_manager.get_messages();
         let plan = plan_canonical_commit(&messages, &self.printed_ids);
 
@@ -2543,7 +2556,7 @@ impl TuiRenderer {
 
 impl TuiRenderer {
     /// Set session identity without writing to the terminal.  Startup content
-    /// must reach scrollback through `OutputManager` so it participates in the
+    /// must reach scrollback through the output port so it participates in the
     /// same ordered commit path as every other message.
     pub fn set_session_label(&mut self, session_label: impl Into<String>) {
         self.session_label = session_label.into();
@@ -2554,7 +2567,7 @@ impl TuiRenderer {
         self.live_area_dirty = true;
     }
 
-    /// Build the static startup artifact for `OutputManager` projection.
+    /// Build the static startup artifact for application output projection.
     ///
     /// This deliberately returns plain text rather than issuing crossterm
     /// commands: direct header writes can race the shadow-buffer live area and
@@ -2654,8 +2667,7 @@ impl TuiRenderer {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         loop {
-            let om = Arc::clone(&self.output_manager);
-            self.flush_output_safe(&om)?;
+            self.flush_output_safe()?;
             self.render()?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -4211,8 +4223,7 @@ impl TuiRenderer {
         // Commit any pending Complete messages to scrollback before drawing the dialog.
         // This ensures messages written before show_dialog() appear above the dialog,
         // not below it (or deferred until after the dialog closes).
-        let om = Arc::clone(&self.output_manager);
-        self.flush_output_safe(&om)?;
+        self.flush_output_safe()?;
 
         self.active_dialog = Some(dialog);
         self.live_area_dirty = true;
@@ -5236,7 +5247,7 @@ mod tests {
         let second = Arc::new(WorkUnit::new("response"));
         second.set_response("a brand new completed turn");
         second.set_complete();
-        // The commit plan always reads from the OutputManager, so the new
+        // The commit plan always reads from the output port, so the new
         // turn is resident there exactly as the event loop would leave it.
         renderer.add_trait_message(second.clone());
         let second_message: MessageRef = second.clone();

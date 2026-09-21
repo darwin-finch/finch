@@ -502,6 +502,28 @@ impl OutputManager {
     }
 }
 
+impl super::TuiOutputPort for OutputManager {
+    fn get_messages(&self) -> Vec<MessageRef> {
+        OutputManager::get_messages(self)
+    }
+
+    fn add_trait_message(&self, message: MessageRef) {
+        OutputManager::add_trait_message(self, message);
+    }
+
+    fn write_tool_raw(&self, content: String) {
+        OutputManager::write_tool_raw(self, content);
+    }
+
+    fn enable_stdout(&self) {
+        OutputManager::enable_stdout(self);
+    }
+
+    fn disable_stdout(&self) {
+        OutputManager::disable_stdout(self);
+    }
+}
+
 impl Default for OutputManager {
     fn default() -> Self {
         Self::new(crate::theme::ColorScheme::default())
@@ -561,6 +583,33 @@ mod tests {
         let m = OutputManager::new(crate::theme::ColorScheme::default());
         m.disable_stdout();
         m
+    }
+
+    #[test]
+    fn tui_output_port_preserves_message_identity_and_settled_dialog_record() {
+        let manager = silent_manager();
+        let port: &dyn crate::cli::TuiOutputPort = &manager;
+        let message: MessageRef = Arc::new(UserQueryMessage::new("question"));
+        let id = message.id();
+        port.add_trait_message(message);
+        port.write_tool_raw("Answer: approved".to_string());
+        let retained = port.get_messages();
+        assert_eq!(
+            retained.len(),
+            2,
+            "the port must retain both transcript rows"
+        );
+        assert_eq!(
+            retained[0].id(),
+            id,
+            "the port must preserve message identity"
+        );
+        assert!(
+            retained[1]
+                .complete_transcript(&crate::theme::ColorScheme::default())
+                .contains("Answer: approved"),
+            "a settled dialog record must stay copyable in canonical scrollback"
+        );
     }
 
     #[test]

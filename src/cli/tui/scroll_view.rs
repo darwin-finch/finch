@@ -8,7 +8,7 @@
 //! transcript, where `0` is follow mode (the newest content stays in view).
 //!
 //! The window is derived, never stored: every paint projects the retained
-//! transcript from the `OutputManager`, splits off the newest `offset` rows,
+//! transcript from the output port, splits off the newest `offset` rows,
 //! and paints the bottom window of what remains. Resize, reflow, and
 //! disclosure changes therefore never desynchronize the view from the content.
 

@@ -16,10 +16,10 @@
 use ratatui::style::Style;
 
 // Line measurement moved to the widget vocabulary
-// (`crate::ui_model`) so components can measure text without this
+// (`finch_ui_model`) so components can measure text without this
 // buffer; engine call sites keep their stable paths here.
-use crate::ui_model::char_display_width;
-pub use crate::ui_model::{
+use finch_ui_model::char_display_width;
+pub use finch_ui_model::{
     extract_visible_chars, physical_rows, truncate_to_columns, visible_length,
 };
 

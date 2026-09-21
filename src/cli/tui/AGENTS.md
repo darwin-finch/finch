@@ -18,6 +18,9 @@ through it, so it is reachable crate-wide but is not published facade surface.
 reads printable status/session snapshots and reports child-activity/operation updates through
 that port. Keep status ordering and status-line policy in the application; do not import
 `StatusBar` into production TUI code or add a port around pure line formatting.
+`TuiOutputPort` is the stateful conversation-output seam: CLI `OutputManager` implements it,
+retains message identity, controls stdout, and accepts settled dialog records. Production TUI
+code must not import `OutputManager`; blit and canonical commit read its message snapshots.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::tui::`.
 
@@ -55,10 +58,9 @@ Every blit converts domain state into one owned ViewModel snapshot, then lays it
 ## The widget vocabulary lives in `finch-ui-model` (#877/#882)
 
 `Rect`, `Track`, `Axis`, `Widget`, `Layout`, `RenderedTranscriptLine`, `RowId`, `NodeRole`,
-and the pure line-metric functions live in `finch-ui-model`, reached through the root
-`crate::ui_model` compatibility facade (stage-1
-prerequisite of `docs/TUI_DESIGN.md`) so a component can build and claim a subtree without
-touching `crossterm` or the shadow buffer. The engine keeps its stable `widgets` /
+and the pure line-metric functions live in `finch-ui-model`, imported directly so a
+component can build and claim a subtree without touching `crossterm` or the shadow buffer.
+The engine keeps its stable `widgets` /
 `shadow_buffer` paths as re-exports; new surface authors depend on the vocabulary directly.
 
 ## Component-owned say turns (#882, stages 1–2)
@@ -139,7 +141,7 @@ different parent; it is not a second renderer and must blit through the shadow b
 After submit the renderer freezes the settled card into the conversation:
 `complete_dialog` (async input) / `settle_dialog` (blocking `show_dialog`) writes a
 speakable, sanitised record — the question, every option with its radio/checkbox state at
-submit time, and an explicit `Answer:` line — into the OutputManager, so the standard
+submit time, and an explicit `Answer:` line — through `TuiOutputPort`, so the standard
 exactly-once canonical-commit pipeline carries it into native scrollback. Approval
 event semantics (`ToolApprovalNeeded` routing, `pending_dialog_result` consumers) are
 untouched. `TabbedDialog` (2+ question cards) is still the ratatui alternate-screen
@@ -217,10 +219,10 @@ module of this crate, **or** the remaining ones are written down here with the r
 - **`finch_theme::ColorScheme`** — shared colour vocabulary from the extracted leaf crate,
   re-exported so existing callers can still write `crate::cli::tui::ColorScheme`.
 - **`finch_diff`** — bounded, terminal-safe diff summaries and dialog sanitation from the
-  extracted leaf crate. `cli::messages` also uses it when constructing WorkUnit snapshots.
-- **Sibling CLI types** (`cli::messages`, `StatusBar`) — the renderer uses the `Message` trait to request WorkUnit snapshots and
-  delegates their pure projection to `finch-ui-model`. The AskUserQuestion wire contract and
-  answer annotations stay in `cli::llm_dialogs`; the renderer sees only `QuestionView`.
+  extracted leaf crate. `finch-messages` separately uses it to construct WorkUnit snapshots.
+- **`finch_messages` and `finch_ui_model`** — the renderer reads typed message snapshots and
+  delegates pure WorkUnit projection to the lower presentation crate. The AskUserQuestion wire
+  contract and answer annotations stay in `cli::llm_dialogs`; the renderer sees only `QuestionView`.
   Command-completion metadata is owned
   directly by this capsule in `command_autocomplete.rs`; its types and `AutocompleteState` remain crate-visible only, not
   facade exports. The unused contextual-suggestion subsystem was removed. `shadow_buffer.rs`

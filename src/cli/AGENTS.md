@@ -23,7 +23,9 @@ questions to the renderer-owned `QuestionView` when constructing a tabbed dialog
 must not import those wire types.
 `StatusBar` implements the renderer-owned `TuiStatusPort` here: status ordering and line policy
 remain application concerns, while the TUI receives only rendered snapshots and sends back its
-own child-activity and operation updates.
+own child-activity and operation updates. `OutputManager` implements the renderer-owned
+`TuiOutputPort`: the application retains messages and controls stdout, while the renderer reads
+snapshots and records settled dialog answers through that narrow stateful seam.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test --lib -- cli::`,
 `./scripts/test_brains.sh cargo test --test tui_integration_test`, and
