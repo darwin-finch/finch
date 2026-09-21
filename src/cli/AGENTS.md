@@ -2,9 +2,11 @@
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `src/cli/`: command handling, the interactive REPL and event loop, terminal rendering,
+**Owns** `src/cli/`: command handling, the interactive REPL and event loop, terminal output coordination,
 setup and provider-login flows, output routing, and conversation composition. Terminal dialogs
 and widget layout are owned by `finch-tui`.
+Provider-visible history and ordered tool-round staging are owned by `finch-conversation`;
+the root application owns provider calls, summary generation, and checkpoint timing.
 Typed presentation messages live in `finch-messages`; `cli::messages` is a flat compatibility
 facade. The event-loop capsule and TUI crate document their own boundaries. Application startup and daemon
 composition remain in the root package.

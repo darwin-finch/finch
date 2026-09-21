@@ -1,7 +1,7 @@
-// Conversation history manager for multi-turn interactions
+//! Conversation history and ordered tool-round state for multi-turn interactions.
 
-use crate::providers::{ContentBlock, Message};
 use anyhow::{Context, Result};
+use finch_providers::{ContentBlock, Message};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
