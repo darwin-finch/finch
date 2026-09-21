@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::cli::tui::{MentionAttachment, MentionCandidate, MentionPort, MentionSubmission};
-use crate::context::mention::{self, MentionCatalog, MentionError, MentionSnapshot};
+use crate::context::{
+    format_attachment_document, mention_query_at, parse_visible_mentions, snapshots_for_prompt,
+    MentionCatalog, MentionError, MentionSnapshot,
+};
 
 #[derive(Default)]
 struct MentionState {
@@ -35,7 +38,7 @@ impl MentionSession {
 
 impl MentionPort for MentionSession {
     fn query_at(&self, text: &str, cursor_chars: usize) -> Option<(usize, String)> {
-        mention::mention_query_at(text, cursor_chars)
+        mention_query_at(text, cursor_chars)
     }
 
     fn candidates(&self, query: &str) -> Vec<MentionCandidate> {
@@ -65,7 +68,7 @@ impl MentionPort for MentionSession {
     }
 
     fn retain_visible(&self, input: &str) {
-        let visible = mention::parse_visible_mentions(input)
+        let visible = parse_visible_mentions(input)
             .into_iter()
             .map(|parsed| parsed.relative_path)
             .collect::<std::collections::HashSet<_>>();
@@ -80,7 +83,7 @@ impl MentionPort for MentionSession {
             debug_assert!(state.prepared.is_none());
             std::mem::take(&mut state.pending)
         };
-        match mention::snapshots_for_prompt(&self.catalog, input, &prior) {
+        match snapshots_for_prompt(&self.catalog, input, &prior) {
             Ok(snapshots) => {
                 let attachment_document = if snapshots.is_empty() {
                     None
@@ -89,7 +92,7 @@ impl MentionPort for MentionSession {
                         .iter()
                         .map(MentionSnapshot::as_body)
                         .collect::<Vec<_>>();
-                    Some(mention::format_attachment_document(&bodies))
+                    Some(format_attachment_document(&bodies))
                 };
                 let attachments = snapshots
                     .iter()

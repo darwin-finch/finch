@@ -7,8 +7,11 @@ composer `@` mention resolution (`mention`). Instruction files become the
 system prompt. Mentions snapshot selected project files/directories and lower
 them into structured user-turn context. This is not a published crate.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every item the facade
-re-exports. Child modules stay private except the `pub use` list in `mod.rs`.
+**Boundary:** the [README](README.md) traces instruction collection and interactive mentions.
+[`mod.rs`](mod.rs) is the flat facade; rustdoc renders methods on exported types. Both child
+modules stay private. Callers use `crate::context::Item`, not `context::mention::Item` or
+`context::claude_md::Item`. Do not recreate a signature catalog.
+`python3 scripts/check_facade_boundaries.py` enforces private child modules.
 
 **Dependencies:** `providers` for `ContentBlock` only. Do not execute tools,
 spawn processes, or follow credentialed network paths. Directory expansion is

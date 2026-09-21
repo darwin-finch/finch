@@ -14,7 +14,7 @@ fn named_brain_codec_submit_journal_keeps_mention_digest_without_rereading_disk(
     let temp = tempfile::tempdir().unwrap();
     let original = "fn selected() { 1 }\n";
     std::fs::write(temp.path().join("foo.rs"), original).unwrap();
-    let catalog = crate::context::mention::MentionCatalog::new(temp.path());
+    let catalog = crate::context::MentionCatalog::new(temp.path());
     let snapshot = catalog.resolve_path("foo.rs").unwrap();
     assert_eq!(snapshot.content, original);
     let kind = BrainEventKind::Prompt {
@@ -86,16 +86,16 @@ fn named_brain_codec_submit_journal_keeps_mention_digest_without_rereading_disk(
         "journal must keep the selection payload, got {:?}",
         journaled.1[0]
     );
-    let bodies = vec![crate::context::mention::AttachmentBody {
+    let bodies = vec![crate::context::AttachmentBody {
         relative_path: &journaled.1[0].path,
-        kind: crate::context::mention::MentionKind::File,
+        kind: crate::context::MentionKind::File,
         sha256: &journaled.1[0].sha256,
         byte_len: journaled.1[0].byte_len,
         truncated: journaled.1[0].truncated,
         truncation_note: journaled.1[0].truncation_note.as_deref(),
         content: &journaled.1[0].content,
     }];
-    let replayed = crate::context::mention::format_attachment_document(&bodies);
+    let replayed = crate::context::format_attachment_document(&bodies);
     assert!(
         replayed.contains(original) && replayed.contains(&snapshot.sha256),
         "restarted BrainStore replay must use stored payload: {replayed}"

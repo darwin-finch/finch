@@ -2,17 +2,20 @@
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `src/config/` (settings, provider entries, personas, credentials and their resolvers,
-backend selection, persisted color choices, notice state, constants), `src/context/` (project instruction loading),
-`src/license/`, `src/metrics/`, `src/monitoring/`, `src/errors.rs`, and the `data/` personas.
+**Owns** `src/config/` (settings, provider entries, personas, credential bindings and resolver
+re-exports, backend selection, persisted color choices, notice state, constants). The shared color
+vocabulary itself belongs to `finch-theme`.
+The `data/` personas are configuration inputs. `src/context/` has its own capsule; license,
+metrics, monitoring, and errors are other root-map areas, not files owned by `src/config/`.
 The declared post-edit diagnostics sources live in
 [`diagnostics.rs`](diagnostics.rs) and their user-facing contract is documented in
 [`CONFIGURATION.md`](CONFIGURATION.md).
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `src/config/mod.rs` is the whole public surface.
-There is no `check_subsystems.py` gate; review the facade directly. `src/context` and `src/license` have their
-own module documents and no separate facade yet.
+**Boundary:** the [README](README.md) traces startup and provider-factory callers.
+[`mod.rs`](mod.rs) is the flat facade; rustdoc renders methods on exported types. Child modules
+are private. `scripts/check_subsystems.py` does not exist; use
+`python3 scripts/check_facade_boundaries.py` for the current facade check. Do not recreate a
+signature catalog.
 
 **Dependencies:** `config` may use the extracted provider credential/reasoning types from
 `finch-providers` and the persisted color vocabulary from `finch-theme`. Three unwanted edges remain, to
@@ -33,7 +36,7 @@ that drive the real binary are `tests/startup_is_readonly_on_config.rs`.
 [context assembly](../context/ASSEMBLY.md) and are pinned by the root
 [Context invariant](../../CLAUDE.md#context).
 
-**Focused tests:**
-`./scripts/test_brains.sh cargo test --lib -- config:: context:: license:: metrics::`. Run the full
-suite when changing a re-exported `pub` item or the on-disk config format, because every subsystem
-reads configuration.
+**Focused tests:** `./scripts/test_brains.sh cargo test -p finch --lib -- config::` for this
+module, and a separate `./scripts/test_brains.sh cargo test -p finch --lib -- context::` for
+instruction/mention behavior. Run the full suite when changing a re-exported `pub` item or the
+on-disk config format, because every subsystem reads configuration.
