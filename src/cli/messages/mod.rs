@@ -17,8 +17,8 @@ pub use finch_ui_model::{
     WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };
 
-pub mod concrete;
-pub mod work_unit;
+mod concrete;
+mod work_unit;
 
 pub use concrete::{
     BrainParticipantMessage, LiveToolMessage, OperationMessage, OperationRow, OperationRowStatus,
