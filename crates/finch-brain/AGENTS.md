@@ -1,39 +1,50 @@
-# brain capsule: durable named Brains, schedules, events, and credentials
+# Finch Brain agent contract
 
-Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
+Supplements the root [agent rules](../../AGENTS.md). Read the [Brain README](README.md) for
+ownership and caller workflows. The flat public facade is [`src/lib.rs`](src/lib.rs); use
+`cargo doc -p finch-brain --no-deps --open` for method signatures on re-exported types. Root
+callers use the `crate::brain` compatibility path, while direct dependents use `finch_brain`.
 
-**Owns** `crates/finch-brain/src/`: `BrainStore` composition, the credential authority, remote Brain clients,
-Brain-domain Cap'n Proto envelope/value translation, task records, name generation, and the
-in-memory background-process task table (`background`,
-issue #754: `BackgroundTaskManager` owns long-lived commands beyond the turn — bounded in count
-and output retention, killed and reaped by stop or process shutdown, kill-not-adopt on restart).
-Persistence and coordination internals live in nested
-facades: [`journal`](journal/AGENTS.md), [`schedule`](schedule/AGENTS.md), [`run`](run/AGENTS.md),
-[`attachment`](attachment/AGENTS.md), and [`projection`](projection/AGENTS.md). Named-Brain
-portable effect delivery lives beside the reducible checkpoint as
-`{root}/{name}/runtime/effects.jsonl` (`VmEffectDeliveryLog`, Brain-bound). Daemon, server, client,
-and agent composition remain in the root application package; the domain-neutral IPC schema/protocol core lives in
-`crates/finch-ipc`. Root application fixtures that compose Brain with server/client/CLI live in
-`src/brain_application_tests.rs`; they consume only the normal Brain facade plus the
-`test-support` seam.
+## Dependencies and extension rules
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature.
-Child modules are private (`attachment`, `background`, `credential`, `journal`, `names`,
-`projection`, `remote`, `run`, `schedule`, `store`, `tasks`), so the `pub use` list in
-`src/lib.rs` is the whole public surface; `effect_audit_archive` stays private. Root callers use
-`crate::brain::Item` through the compatibility re-export and direct dependents use
-`finch_brain::Item`; neither may name `brain::store::`, `brain::journal::`,
-`brain::schedule::`, `brain::run::`, `brain::attachment::`, `brain::projection::`,
-`brain::tasks::`, `brain::remote::`, `brain::credential::`, `brain::names::`, or
-`brain::background::`, or `brain::ipc_codec::`. The codec implementation remains private; its
-existing application adapters are exposed as flat facade items. The feature-gated flat
-`brain::test_support` facade exposes only fixtures needed by root application tests.
+- Brain may depend on `finch-runtime`, `finch-vm`, `finch-programs`, `finch-providers`,
+  `finch-node`, and `finch-ipc`. Root server, CLI, daemon, and client implementations depend on
+  Brain, never the reverse. Their HTTP routes, dialogs, and process lifecycles stay at the
+  application composition root.
+- Keep Brain identity, event and run records, schedule state, attachment authority, credentials,
+  and Brain-specific remote-client semantics here. The IPC crate owns domain-neutral framing;
+  runtime owns typed execution and effect delivery semantics. Do not move these contracts into a
+  caller just to avoid a dependency.
+- Export a new external capability deliberately as a flat `pub use` in `src/lib.rs`; child modules
+  stay private. Keep the feature-gated `test_support` surface for application integration tests,
+  not production shortcuts. Do not regenerate or hand-maintain an API catalog.
 
-**Dependencies:** the extracted `finch-runtime`, `finch-vm`, `finch-programs`,
-`finch-providers`, `finch-node`, and `finch-ipc` crates. Root server/client/CLI composition is
-test-only and stays outside this capsule. Persistence, isolation, credential, and HTTP behavior are
-not facade concerns: do not change storage layout, journaling, isolation proofs, credential
-handling, or wire behavior in a facade or extraction commit.
+## Invariants and lifetimes
 
-Add public surface by re-exporting it from `src/lib.rs`, then regenerate `INTERFACE.md` with
-`python3 scripts/generate_interfaces.py --write`.
+- `BrainStore` is the durable authority for a named Brain. A daemon restart reconstructs its
+  snapshot, active runs, schedules, and attachments from the Brain journal; a console's
+  `AttachedBrainClient` is a projection and transport connection, not another source of truth.
+- A run, runner lease, attachment, and connection have distinct identities and lifetimes.
+  Detaching a connection must not silently grant runner authority. The server explicitly rejects
+  attaching with `AttachmentRole::Runner`; runner authority goes through a lease.
+- Keep checkpoint, effect-delivery log, and Brain journal roles separate. Preserve idempotent
+  receipt and terminalization behavior through disconnect, retry, and restart. Storage layout,
+  credential verification, and wire compatibility are not facade-cleanup opportunities.
+
+Nested persistence contracts: [attachment](src/attachment/AGENTS.md),
+[journal](src/journal/AGENTS.md), [projection](src/projection/AGENTS.md),
+[run](src/run/AGENTS.md), and [schedule](src/schedule/AGENTS.md).
+
+## Focused proof
+
+Run tests through the repository supervisor and Cargo slot:
+
+```bash
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-brain --lib
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib server::brain_service::
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib cli::repl_event::event_loop::
+```
+
+For persistence or authority changes, also run the supervised Brain integration inventory. The
+requested `scripts/check_subsystems.py` does not exist; inspect `scripts/seam_cost.py` output
+for dependency evidence instead of claiming a nonexistent check passed.

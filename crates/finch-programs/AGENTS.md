@@ -1,28 +1,39 @@
-# programs capsule: program identity, catalog, and corpus
+# Finch programs agent contract
 
-Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
+Supplements the root [agent rules](../../AGENTS.md). The [README](README.md) explains why this
+crate exists and traces two callers. [`src/lib.rs`](src/lib.rs) is its flat facade; use
+`cargo doc -p finch-programs --no-deps --open` for public methods on re-exported types.
 
-**Owns** `crates/finch-programs/`: the durable identity and metadata of a stored program, the script
-envelope (`parse_finch_script`), the wire corpus capture/audit and its source-only
-`ProgramCompilerContext`, and Co-Forth token helpers.
-The typed machine that runs a program is `crates/finch-vm/`; the service that schedules and
-authorizes one is [`finch-runtime`](../finch-runtime/AGENTS.md).
+## Dependencies and extension rules
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
-modules are private, so the `pub use` list in `crates/finch-programs/src/lib.rs` is the whole public
-surface. The repository currently has no `scripts/check_subsystems.py`; facade shape is checked by
-interface generation and review.
+- `finch-vm` supplies typed execution and wire-failure contracts, `finch-language` compiles
+  source, and `finch-tools-api` supplies shared effect vocabulary. The application may compose
+  programs with `finch-memory` and `finch-runtime`; this crate must not depend on their stores,
+  live runtime sessions, CLI, or UI.
+- Own stable program identity and source metadata, script envelopes, the model vocabulary
+  manifest, Co-Forth streaming tokens, and source-only wire-corpus capture. Language meaning
+  belongs to the Forth/Lisp frontends; there is no second evaluator here.
+- Keep the catalog a discovery *model*, not an eager collection of preloaded programs. Canonical
+  authored source and rebuildable index persistence belong to the application registry and
+  memory. Export only real caller capabilities as flat items from `src/lib.rs`.
 
-**Dependencies:** `finch-vm` supplies execution contracts, `finch-language` supplies source
-compilation, and `finch-tools-api` supplies the shared `ExecutionEffect` vocabulary. Corpus capture
-accepts a lazy context supplier; the application runtime may construct that context, but this
-subsystem never knows or clones a `ProgramRuntime` when capture is disabled. Wire-failure
-classification is VM compiler-boundary behavior re-exported here only for compatibility.
+## Invariants and lifetimes
 
-**Language is not decided here.** `ProgramLanguage` lives in `vm` and is re-exported for
-compatibility; a program's meaning belongs to the VM frontends, never to a second evaluator here.
+- Corpus capture gets its `ProgramCompilerContext` lazily: with capture disabled, a caller must
+  not build or clone a live `ProgramRuntime` just for telemetry.
+- A rejected program may get one source-only repair at the compile/link boundary. Runtime
+  limits, approvals, cancellation, and host-effect failures must never become implicit retries
+  of a program that may already have caused effects.
+- Provider-stream tokenization is for safe preview, not incremental execution. Full source is
+  compiled and verified before the VM runs it.
 
-**Focused tests:** `cargo test -p finch-programs`. (`src/poset/`
-looks adjacent but belongs to `runtime`.) Run the full
-suite when changing a re-exported `pub` item, the script envelope, or the corpus format, because
-the CLI, runtime, and live parity tests consume them.
+## Focused proof
+
+```bash
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-programs --lib
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch --lib program_registry::
+```
+
+If a public contract, script envelope, or corpus format changes, run the supervised workspace
+suite and relevant CLI wire-repair tests. `scripts/check_subsystems.py` does not exist; use
+`scripts/seam_cost.py` for dependency evidence.
