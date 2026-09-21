@@ -1,18 +1,18 @@
-// Memory system for Finch
-//
-// Hierarchical semantic memory using MemTree
-// - Client-side storage (CLI, not daemon)
-// - SQLite with WAL mode for concurrency
-// - O(log N) insertion for real-time updates
-// - Cross-session context recall
+//! SQLite-backed MemTree storage and retrieval for Finch.
+//!
+//! The crate README traces REPL connection/embedding injection through
+//! [`MemorySystem::open_connection`] and [`MemorySystem::new_with_connection`], and application
+//! program-index composition through [`MemorySystem::index_program_record`]. Rustdoc renders
+//! the method signatures without a generated interface catalog.
 
 mod embeddings;
-pub mod memory_status;
+mod memory_status;
 mod memtree;
 mod program_registry;
 mod quality;
 
 pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
+pub use memory_status::{caveat, count_qualifier, observed, Recall};
 pub use memtree::{MemTree, NodeId, TreeNode};
 pub use program_registry::{ProgramIndexRecord, ProgramIndexRef};
 pub use quality::{MemoryClassifier, MemoryImportance};

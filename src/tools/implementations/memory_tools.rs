@@ -82,9 +82,8 @@ impl Tool for SearchMemoryTool {
             .memory_system
             .query_with_sources(query, Some(limit))
             .await?;
-        let index =
-            finch_memory::memory_status::observed(before, self.memory_system.hydration_status());
-        let caveat = finch_memory::memory_status::caveat(&index);
+        let index = finch_memory::observed(before, self.memory_system.hydration_status());
+        let caveat = finch_memory::caveat(&index);
 
         if results.is_empty() {
             return Ok(match caveat {
@@ -214,12 +213,9 @@ impl Tool for InspectMemoryTool {
         let from_index = memory_id.trim().starts_with("node:");
         let before = self.memory_system.hydration_status();
         let found = self.memory_system.inspect_memory(memory_id).await?;
-        let index =
-            finch_memory::memory_status::observed(before, self.memory_system.hydration_status());
+        let index = finch_memory::observed(before, self.memory_system.hydration_status());
         let Some(memory) = found else {
-            let caveat = from_index
-                .then(|| finch_memory::memory_status::caveat(&index))
-                .flatten();
+            let caveat = from_index.then(|| finch_memory::caveat(&index)).flatten();
             return Ok(match caveat {
                 None => format!("No memory found for memory_id={memory_id}"),
                 Some(caveat) => {

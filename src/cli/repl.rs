@@ -4615,8 +4615,8 @@ impl Repl {
         if let Some(ref memory) = self.memory_system {
             let before = memory.hydration_status();
             let stats = memory.stats().await?;
-            let index = finch_memory::memory_status::observed(before, memory.hydration_status());
-            self.output_status(match finch_memory::memory_status::count_qualifier(&index) {
+            let index = finch_memory::observed(before, memory.hydration_status());
+            self.output_status(match finch_memory::count_qualifier(&index) {
                 None => format!("Memory: {} nodes", stats.tree_node_count),
                 Some(note) => format!("Memory: {} nodes ({note})", stats.tree_node_count),
             });
@@ -4634,7 +4634,7 @@ impl Repl {
             // no qualification at all (#275).
             let before = memory.hydration_status();
             let stats = memory.stats().await?;
-            let index = finch_memory::memory_status::observed(before, memory.hydration_status());
+            let index = finch_memory::observed(before, memory.hydration_status());
 
             self.output_status("📚 Memory System Statistics:\n");
             self.output_status(format!(
@@ -4646,7 +4646,7 @@ impl Repl {
             // hydration it is a count of what has loaded, not of what the user
             // has stored -- a flatly wrong number about their own data, shown
             // without qualification (#275).
-            if let Some(caveat) = finch_memory::memory_status::caveat(&index) {
+            if let Some(caveat) = finch_memory::caveat(&index) {
                 self.output_status(caveat);
             }
             self.output_status("");
