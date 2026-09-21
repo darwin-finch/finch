@@ -1,6 +1,6 @@
 // Tool execution system for local tool use
 //
-// Enables Shammah to execute tools (WebFetch, Bash, Read, etc.) locally
+// Enables Finch to execute tools (WebFetch, Bash, Read, etc.) locally
 // instead of only generating text responses.
 
 mod diagnostics;
