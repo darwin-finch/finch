@@ -3,11 +3,32 @@
 // Allows Claude to ask multiple questions simultaneously with tab-based navigation
 // similar to Claude Code's implementation.
 
-use crate::cli::llm_dialogs::Question;
-#[cfg(test)]
-use crate::cli::llm_dialogs::QuestionOption;
 use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::{HashMap, HashSet};
+
+/// One option shown in a terminal question card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionOptionView {
+    /// Label shown beside the selection control and returned when selected.
+    pub label: String,
+    /// Short explanation shown under the label.
+    pub description: String,
+    /// Optional preview shown when the option has focus.
+    pub markdown: Option<String>,
+}
+
+/// Terminal presentation of a question, independent of its tool request schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionView {
+    /// Full question text shown inside the card.
+    pub question: String,
+    /// Compact heading shown in the tab strip.
+    pub header: String,
+    /// Choices shown in the question card.
+    pub options: Vec<QuestionOptionView>,
+    /// Whether the card permits selecting multiple choices.
+    pub multi_select: bool,
+}
 
 /// Result from a tabbed dialog
 #[derive(Debug, Clone, PartialEq)]
@@ -22,7 +43,7 @@ pub enum TabbedDialogResult {
 #[derive(Debug, Clone)]
 pub struct TabState {
     /// The question being asked
-    pub question: Question,
+    pub question: QuestionView,
     /// Current selection (for single-select) or cursor position (for multi-select)
     pub selected_index: usize,
     /// Selected indices for multi-select
@@ -40,7 +61,7 @@ pub struct TabState {
 }
 
 impl TabState {
-    fn new(question: Question) -> Self {
+    fn new(question: QuestionView) -> Self {
         Self {
             question,
             selected_index: 0,
@@ -120,8 +141,11 @@ pub struct TabbedDialog {
 
 impl TabbedDialog {
     /// Create a new tabbed dialog from questions
-    pub fn new(questions: Vec<Question>, title: Option<String>) -> Self {
-        let tabs = questions.into_iter().map(TabState::new).collect();
+    pub fn new<Q: Into<QuestionView>>(questions: Vec<Q>, title: Option<String>) -> Self {
+        let tabs = questions
+            .into_iter()
+            .map(|q| TabState::new(q.into()))
+            .collect();
         Self {
             tabs,
             current_tab: 0,
@@ -382,13 +406,13 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn make_question(text: &str, options: &[&str], multi: bool) -> Question {
-        Question {
+    fn make_question(text: &str, options: &[&str], multi: bool) -> QuestionView {
+        QuestionView {
             question: text.to_string(),
             header: text[..text.len().min(12)].to_string(),
             options: options
                 .iter()
-                .map(|&label| QuestionOption {
+                .map(|&label| QuestionOptionView {
                     label: label.to_string(),
                     description: format!("{label} description"),
                     markdown: None,

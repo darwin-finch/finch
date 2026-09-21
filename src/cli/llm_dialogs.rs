@@ -13,6 +13,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::cli::tui::{QuestionOptionView, QuestionView};
+
 /// A single option in a question
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionOption {
@@ -43,6 +45,25 @@ pub struct Question {
     /// Whether user can select multiple options (default: false)
     #[serde(default)]
     pub multi_select: bool,
+}
+
+impl From<Question> for QuestionView {
+    fn from(question: Question) -> Self {
+        Self {
+            question: question.question,
+            header: question.header,
+            options: question
+                .options
+                .into_iter()
+                .map(|option| QuestionOptionView {
+                    label: option.label,
+                    description: option.description,
+                    markdown: option.markdown,
+                })
+                .collect(),
+            multi_select: question.multi_select,
+        }
+    }
 }
 
 /// Input to AskUserQuestion tool
@@ -583,5 +604,45 @@ mod tests {
         assert!(output.annotations.is_empty());
         assert!(output.answers.is_empty());
         assert!(output.questions.is_empty());
+    }
+
+    #[test]
+    fn test_question_view_preserves_terminal_fields_without_wire_schema() {
+        let question = Question {
+            question: "Which renderer?".to_string(),
+            header: "Renderer".to_string(),
+            options: vec![QuestionOption {
+                label: "Inline".to_string(),
+                description: "Keep the conversation visible".to_string(),
+                markdown: Some("```rust\ninline()\n```".to_string()),
+            }],
+            multi_select: true,
+        };
+
+        let view: QuestionView = question.into();
+        assert_eq!(
+            view.question, "Which renderer?",
+            "question text must survive projection"
+        );
+        assert_eq!(view.header, "Renderer", "tab title must survive projection");
+        assert!(view.multi_select, "selection mode must survive projection");
+        assert_eq!(
+            view.options.len(),
+            1,
+            "option count must survive projection"
+        );
+        assert_eq!(
+            view.options[0].label, "Inline",
+            "option label must survive projection"
+        );
+        assert_eq!(
+            view.options[0].description, "Keep the conversation visible",
+            "option explanation must survive projection"
+        );
+        assert_eq!(
+            view.options[0].markdown.as_deref(),
+            Some("```rust\ninline()\n```"),
+            "option preview bytes must survive projection"
+        );
     }
 }

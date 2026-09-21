@@ -53,6 +53,8 @@ CURRENT_DOCS = (
     Path("crates/finch-theme/README.md"),
     Path("src/cli/messages/AGENTS.md"),
     Path("src/cli/messages/README.md"),
+    Path("src/cli/AGENTS.md"),
+    Path("src/cli/README.md"),
     Path("src/cli/tui/AGENTS.md"),
     Path("src/cli/tui/README.md"),
     Path("src/generators/AGENTS.md"),

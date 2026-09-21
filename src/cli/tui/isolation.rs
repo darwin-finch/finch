@@ -1,5 +1,5 @@
 //! Production-boundary proof that the terminal renderer does not name Finch's
-//! poset, tool, runtime, or project-context vocabularies.
+//! poset, tool, runtime, project-context, or AskUserQuestion wire vocabularies.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -333,6 +333,18 @@ fn test_tui_production_does_not_name_project_context() {
         hits.is_empty(),
         "tui production must not own project filesystem mention policy; the CLI adapter injects \
          candidates and selection snapshots through MentionPort: {hits:?}"
+    );
+}
+
+#[test]
+fn test_tui_production_does_not_name_ask_user_question_wire_schema() {
+    let module = production_hits("crate::cli::llm_dialogs");
+    let input = production_hits("AskUserQuestionInput");
+    let output = production_hits("AskUserQuestionOutput");
+    assert!(
+        module.is_empty() && input.is_empty() && output.is_empty(),
+        "TUI must consume QuestionView instead of AskUserQuestion wire types; \
+         module={module:?}, input={input:?}, output={output:?}"
     );
 }
 
