@@ -1,22 +1,32 @@
-# brain/run capsule: run lifecycle, leases, and terminalization
+# Brain run agent contract
 
-Supplements the root [`AGENTS.md`](../../CLAUDE.md) and the parent
-[`brain` capsule](../../AGENTS.md), which still apply in full.
+Supplements the root [agent rules](../../../../AGENTS.md) and the parent
+[Brain contract](../../AGENTS.md). The [README](README.md) traces two caller workflows;
+[`mod.rs`](mod.rs) is the nested facade and [`src/lib.rs`](../../lib.rs) is the external one.
 
-**Owns** `crates/finch-brain/src/run/`: `BrainRun` status and kind, runner leases and
-handoffs, the closed run-transition table, cancellation reservation records,
-and disconnect-terminalization intent files. Exact-once terminal state is an
-invariant of this facade.
+**Owns:** run identity, kind and status; runner leases and handoffs; the closed run-transition
+table; cancellation reservation records; and disconnect-terminalization intent files. Brain's
+store owns durable event application, not this helper module.
 
-**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its
-signature. Child modules are private, so the `pub use` list in `mod.rs` is the
-whole nested surface. Callers outside the crate use the flat `finch_brain::Item` facade.
+**Facade and extension rule:** callers outside the crate use the flat `finch_brain::Item`
+surface, not `run` paths. Keep run-state vocabulary here and publish a type through the crate
+facade only when an external caller needs it. The transition and disconnect-intent helpers are
+for Brain's store, not application callers. Do not recreate a generated API catalog.
 
-**Dependencies:** `attachment` for the initiating attachment id; `journal` for
-durable directory creation used by disconnect intents. Do not depend on
-`schedule` indexing or `BrainStore`. Do not change transition legality, lease
-identity, or terminalization file layout in a facade-only commit.
+**Dependencies:** `attachment` supplies the initiating attachment id; `journal` supplies
+durable directory creation and sync for disconnect intents. This module must not depend on
+`schedule` indexing, `BrainStore`, or root server/CLI code. `BrainStore` applies these rules
+and persists run events; server policy and runner execution remain application-owned.
 
-**Focused tests:** `./scripts/test_brains.sh cargo test -p finch-brain --lib run::`.
-Parent `store::` tests cover cancel-vs-disconnect races, late completion,
-and restart of pending disconnect intents.
+**Invariants and lifetimes:** a run, runner lease, and handoff have separate IDs and
+lifetimes. Terminal run states cannot transition again. `Interrupted` is recoverable, not
+terminal. The transition table lets a queued run become running, cancelled, or failed; the
+store decides whether a runner environment is available before choosing one of those states.
+Disconnect intents are synced to disk before a disconnected runner's run is terminalized and
+cleared only after the state transition is durably recorded. Do not change transition legality,
+lease identity, or intent-file layout in documentation-only work.
+
+**Focused tests:** `./scripts/test_brains.sh cargo test -p finch-brain --lib run::` for the
+transition table and intent files. Run supervised `store::` tests for cancel-vs-disconnect,
+late completion, and restart of pending intents when lifecycle behavior changes. Run the
+supervised server Brain-service tests when changing a caller-visible run contract.
