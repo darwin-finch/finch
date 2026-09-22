@@ -2092,7 +2092,7 @@ impl EventLoop {
         let plan_content = Arc::new(RwLock::new(None));
 
         // Create the tool coordinator. Tool results are conversation events;
-        // they never mutate the unrelated legacy semiotic stack.
+        // they never mutate program stack state.
         let tool_coordinator = ToolExecutionCoordinator::new(
             event_tx.clone(),
             Arc::clone(&tool_executor),

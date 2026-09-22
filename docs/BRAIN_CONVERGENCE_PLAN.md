@@ -594,8 +594,8 @@ durable collaboration remains exclusively in the Brain event log. The sole aggre
 accepts caller-owned message history; its in-memory `SessionManager` and `/v1/session/:id` lifecycle
 were removed rather than retained as a second conversation authority. The old peer registry, gas
 ledger, global-token file transfer, self-registration, and heartbeat are no longer mounted by the
-daemon. Remaining registry/scatter source is migration-only legacy-interpreter code and must be
-deleted with that runtime, not revived as a Brain or compute service.
+daemon, and the remaining registry/scatter source has been deleted with the legacy runtime rather
+than revived as a Brain or compute service.
 
 Status: complete. The canonical Brain aggregate, run, attachment, store, and service have one live
 meaning and one lifecycle path; historical logs remain explicit versioned migration input.
