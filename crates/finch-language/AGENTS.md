@@ -35,11 +35,13 @@ implementation detail cannot leak back in:
 - **Wire surface:** the committed artifact `vocabulary/language/wire.gbnf`, its generator
   output (byte-conformance drift test), and the reader-oracle agreement tests. Helper
   visibility is not part of that contract; the artifact bytes are.
-- **Deferred deletions (defining-crate passes):** `Val::{as_float, as_str, as_list}`
-  (finch-colisp), `ModuleSealed::module` and `SemanticBuilder::finish_closed` (finch-vm-core,
-  issue #964, the vm-core public-surface tightening audit). Zero references through this
-  facade; methods cannot be removed from a re-exported type from this crate, so they
-  disappear when their defining crates drop them.
+- **Deferred deletions (defining-crate passes):** `ModuleSealed::module` and
+  `SemanticBuilder::finish_closed` (finch-vm-core, issue #964, the vm-core public-surface
+  tightening audit). Zero references through this facade; methods cannot be removed from a
+  re-exported type from this crate, so they disappear when their defining crates drop them.
+  The finch-colisp `Val::{as_float, as_str, as_list}` accessors already left this category:
+  their defining crate deleted them unreferenced in the issue-#961 colisp surface-tiers pass
+  (PR #1103), so nothing pending remains from finch-colisp.
 
 **Focused tests:** `./scripts/test_brains.sh cargo test -p finch-language --lib`.
 Include `wire` when changing readers or the published grammar. Execution
