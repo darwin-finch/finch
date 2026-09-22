@@ -13,10 +13,12 @@ use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
+mod component;
 mod markdown;
 mod say_turn;
 mod work_unit;
 
+pub use component::{component_lines, ComponentView};
 pub use say_turn::{
     say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
 };

@@ -28,7 +28,12 @@ shared unit may be read while the event loop appends output, so preserve the exi
 snapshot discipline. A complete transcript is canonical text for copying and permanent
 scrollback; renderer disclosure may change visible rows but must not change that text. A say-turn
 component action mutates its owning ViewModel under the message lock; unmigrated rows keep the
-renderer-owned `RowId` open set. Brain replay remains authoritative for durable state.
+renderer-owned `RowId` open set. Migrated messages answer `Message::component_view` (stage 3 of
+docs/TUI_DESIGN.md, #1120) by constructing their component from retained state under the
+existing lock(s) — no new lock, no OutputManager ownership change; the renderer never matches
+on the message type. Say turns ride the same accessor (`ComponentView::Say`); `say_turn_view`
+stays for the consolidated-source pairing helper and the disclosure-direction read. Brain
+replay remains authoritative for durable state.
 
 **Extension rules:** add a concrete message only for a real application producer and renderer
 need. Keep pure snapshot-to-widget conversion in `finch-ui-model`; do not put terminal I/O or

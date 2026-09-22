@@ -2762,12 +2762,14 @@ impl TuiRenderer {
         message: &MessageRef,
         width: usize,
     ) -> Vec<RenderedTranscriptLine> {
-        // Component-owned say turns (#882): the card renders from the
-        // component ViewModel each frame. Disclosure state lives on the VM —
-        // the renderer's RowId-keyed maps never hold it — and the engine
-        // never matches on the message type: the Message trait answers.
-        if let Some(view) = message.say_turn_view() {
-            let lines = finch_ui_model::say_turn_lines(&view);
+        // Component-owned messages (stage 3 of docs/TUI_DESIGN.md, #1120):
+        // the message constructs its component from its retained ViewModel,
+        // and the engine never matches on the message type — the Message
+        // trait answers with the snapshot, and the component capsule renders
+        // it. Component state lives on the ViewModel, not the renderer's
+        // RowId-keyed maps.
+        if let Some(view) = message.component_view() {
+            let lines = finch_ui_model::component_lines(&view);
             return self
                 .tool_viewports
                 .project(lines, width, DEFAULT_TOOL_OUTPUT_ROWS);
@@ -2775,6 +2777,10 @@ impl TuiRenderer {
         // The ViewModel is the one domain → widget projection: convert the
         // message to props, then render them under the renderer's disclosure
         // state. Widgets never query WorkUnits to decide visibility (#805).
+        // Unmigrated rows — non-say WorkUnit presentations, the open stage-2
+        // scope — keep this legacy path, which is also the canonical-commit
+        // projection: the component is the live reader; the settled record
+        // keeps today's exact bytes (the say-turn precedent, #882).
         let lines = match view_model::project_message(message, &self.colors) {
             view_model::ProjectedMessage::Node(node) => self.accordion.render_node(&node),
             view_model::ProjectedMessage::Plain(formatted) => {

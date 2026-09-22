@@ -348,6 +348,76 @@ fn test_tui_production_does_not_name_ask_user_question_wire_schema() {
     );
 }
 
+/// Stage 3 of docs/TUI_DESIGN.md (#1120): the projection path renders every
+/// migrated message through its component via the `Message` trait — the
+/// maintainer's original decision that the renderer not care what type of
+/// Message was sent. It must never name a concrete message type or downcast.
+/// The say component rides the same generalized accessor
+/// (`Message::component_view`), so no type is special-cased by name.
+#[test]
+fn test_projection_path_never_matches_on_message_type() {
+    for file in ["lib.rs", "view_model.rs", "accordion.rs"] {
+        let src = production_source(&tui_dir().join(file));
+        for needle in [
+            "BrainParticipantMessage",
+            "LiveToolMessage",
+            "OperationMessage",
+            "ProgressMessage",
+            "StaticMessage",
+            "StreamingResponseMessage",
+            "ToolExecutionMessage",
+            "UserQueryMessage",
+            "downcast_ref::<",
+            "is::<",
+        ] {
+            let hits = hits_in(&src, file, needle);
+            assert!(
+                hits.is_empty(),
+                "INVARIANT (stage 3, #1120): the projection path asks the Message trait \
+                 for component snapshots instead of matching on message types or \
+                 downcasting; {file} names {needle:?} at {hits:?}"
+            );
+        }
+    }
+}
+
+/// The scan above can actually fire: a synthetic projection file naming a
+/// concrete message type — by match or by downcast — produces hits, so the
+/// invariant is pinned by a live detector, not a tautology.
+#[test]
+fn test_projection_type_scan_would_fire_on_concrete_message_names() {
+    let by_name = hits_in(
+        "fn project(m: &MessageRef) -> Lines { match m { StaticMessage => todo!() } }\n",
+        "fixture.rs",
+        "StaticMessage",
+    );
+    assert_eq!(
+        by_name.len(),
+        1,
+        "the scan must see a concrete message name in a projection file; hits={by_name:?}"
+    );
+    let by_downcast = hits_in(
+        "fn f(m: &dyn Message) { m.downcast_ref::<OperationMessage>(); }\n",
+        "fixture.rs",
+        "downcast_ref::<",
+    );
+    assert_eq!(
+        by_downcast.len(),
+        1,
+        "the scan must see a downcast in a projection file; hits={by_downcast:?}"
+    );
+    let by_refinement = hits_in(
+        "let typed = any_is::<LiveToolMessage>();\n",
+        "fixture.rs",
+        "is::<",
+    );
+    assert_eq!(
+        by_refinement.len(),
+        1,
+        "the scan must see an `is::<Type>()` refinement; hits={by_refinement:?}"
+    );
+}
+
 #[test]
 fn test_tui_production_does_not_reach_up_for_owned_completion_state() {
     let autocomplete = production_hits("crate::cli::command_autocomplete");
