@@ -342,7 +342,8 @@ pub struct TopKCandidate {
 }
 
 pub struct AdaptiveTopKResult {
-    /// Sorted descending by `cos`, length <= k (fewer only if the tree has fewer real points).
+    /// Sorted descending by `cos`, length <= k (fewer only if the tree has fewer than `k`
+    /// distinct points), and never two entries for the same `point_id`.
     pub top_k: Vec<TopKCandidate>,
     pub nodes_visited: usize,
 }
@@ -355,7 +356,20 @@ struct TopKState {
 }
 
 impl TopKState {
+    /// Offer one point's similarity to the running top-k.
+    ///
+    /// A dual-inserted point (`RoutingTree`'s own boundary-hedging copy) is
+    /// visited once per leaf it sits in, but `top_k_score_leaf` always scores
+    /// it against the same canonical, undeflated embedding -- so a repeat
+    /// offer for a `point_id` already in `top_k` carries an identical `cos`,
+    /// never new information. Without this guard the `top_k.len() < self.k`
+    /// arm below pushed it again as a second, duplicate entry, silently
+    /// evicting a genuinely different point from the result (the dedup bug a
+    /// sibling repo's own `descendAdaptiveTopK` had and fixed the same way).
     fn offer(&mut self, point_id: usize, cos: f64) {
+        if self.top_k.iter().any(|c| c.point_id == point_id) {
+            return;
+        }
         if self.top_k.len() < self.k {
             self.top_k.push(TopKCandidate { point_id, cos });
             self.top_k

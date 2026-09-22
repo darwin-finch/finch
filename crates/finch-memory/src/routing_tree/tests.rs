@@ -502,6 +502,51 @@ fn test_descend_adaptive_top_k_matches_brute_force_top_k() {
     }
 }
 
+/// Regression: `TopKState::offer` must not let a repeated `point_id` occupy two
+/// `top_k` slots.
+///
+/// A dual-inserted point (`RoutingTree`'s own boundary-hedging copy) is visited once
+/// per leaf it sits in, but `top_k_score_leaf` always scores it against the same
+/// canonical, undeflated embedding, so a repeat offer for a `point_id` already in
+/// `top_k` carries an identical `cos` -- never a legitimate second-best. Without the
+/// guard in `offer`, the second `offer(1, 0.9)` below lands in the `top_k.len() <
+/// self.k` branch and pushes point 1 again, so point 3's later, genuinely distinct
+/// offer never displaces the duplicate and is silently dropped.
+///
+/// Written directly against `TopKState`, not through a built tree: a tree-level
+/// version of this test (query a corpus built with `dual_insert_threshold` enabled)
+/// passed even with the bug present, because the specific corpus and queries tried
+/// never happened to make one descent visit both of a dual point's leaves --
+/// `offer`'s own duplicate-call contract is what actually needs pinning, and this
+/// is the exact scenario a sibling repo's own `descendAdaptiveTopK` had this bug in.
+#[test]
+fn test_top_k_state_offer_does_not_duplicate_a_point_id() {
+    let mut state = TopKState {
+        top_k: Vec::new(),
+        k: 3,
+        nodes_visited: 0,
+        done: false,
+    };
+    state.offer(1, 0.9);
+    state.offer(2, 0.8);
+    state.offer(1, 0.9); // same point offered again, as if from its dual-insert leaf
+    state.offer(3, 0.7);
+
+    let ids: Vec<usize> = state.top_k.iter().map(|c| c.point_id).collect();
+    let distinct: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        ids.len(),
+        "offer() must never let a repeated point_id occupy two top_k slots, got {ids:?}"
+    );
+    assert_eq!(
+        distinct,
+        std::collections::HashSet::from([&1, &2, &3]),
+        "three distinct points were offered (one twice); all three must be present, \
+         not two copies of one displacing a real third, got {ids:?}"
+    );
+}
+
 #[test]
 fn test_descend_beam_pools_every_returned_leafs_bucket() {
     let points = synthetic_corpus(15);
