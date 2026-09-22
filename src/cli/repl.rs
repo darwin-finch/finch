@@ -20,7 +20,6 @@ use crate::config::Config;
 use crate::feedback::{FeedbackEntry, FeedbackLogger};
 use crate::local::LocalGenerator;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
-use crate::models::TextTokenizer;
 use crate::models::ThresholdValidator;
 use crate::models::{BootstrapLoader, GeneratorState, ModelProgress, Sampler, SamplingConfig};
 use crate::providers::{ProviderSession, SessionContextConfig};
@@ -616,7 +615,6 @@ pub struct Repl {
     models_dir: Option<PathBuf>,
     // Qwen model bootstrap (progressive loading)
     bootstrap_loader: Arc<BootstrapLoader>,
-    tokenizer: Arc<crate::models::TextTokenizer>,
     // Tool execution
     tool_executor: Arc<tokio::sync::Mutex<ToolExecutor>>,
     tool_definitions: Vec<ToolDefinition>, // Cached tool definitions for Claude API
@@ -1339,7 +1337,7 @@ impl Repl {
         let status_bar = (*status_bar_arc).clone();
 
         // CRITICAL: If TUI will be enabled, disable stdout NOW (before ANY output)
-        // This must happen before tokenizer init, bootstrap spawn, or any other code
+        // This must happen before bootstrap spawn or any other code
         // that might emit tracing logs.
         if config.tui_enabled && is_interactive {
             // Disable stdout on the global OutputManager
@@ -1349,13 +1347,6 @@ impl Repl {
             // and redrawn in place
             (*output_manager_arc).disable_stdout();
         }
-
-        // Initialize tokenizer (still needed for tool execution)
-        let tokenizer = Arc::new(TextTokenizer::stub().unwrap_or_else(|e| {
-            output_status!("⚠️  Failed to create tokenizer: {}", e);
-            output_status!("   Active learning tools may not work correctly");
-            panic!("Cannot create tokenizer")
-        }));
 
         // NOTE: Model loading removed - daemon handles all local inference
         // Create placeholder bootstrap_loader and local_generator for compatibility
@@ -1487,7 +1478,6 @@ impl Repl {
             training_trends: TrainingTrends::new(20), // Track last 20 queries
             models_dir,
             bootstrap_loader,
-            tokenizer,
             tool_executor,
             tool_definitions,
             program_runtime,
@@ -1677,7 +1667,6 @@ impl Repl {
         models_dir: Option<&PathBuf>,
         is_interactive: bool,
         batch_trainer: Arc<RwLock<BatchTrainer>>,
-        _tokenizer: Arc<TextTokenizer>,
     ) -> crate::local::LocalGenerator {
         use crate::local::LocalGenerator;
 
@@ -2620,8 +2609,6 @@ impl Repl {
                 generator: qwen_gen,
                 router: Arc::new(self.router.clone()),
                 state: generator_state,
-                local: Arc::clone(&self.local_generator),
-                tokenizer: Arc::clone(&self.tokenizer),
                 resolver: provider_resolver,
                 available: self.available_providers.clone(),
                 active_index: initial_provider_index,

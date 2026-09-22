@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionTarget {
-    /// CoreML execution provider (macOS only, ONNX Runtime)
+    /// Legacy CoreML target retained so old chat configuration can be migrated.
     #[cfg(target_os = "macos")]
     #[serde(rename = "coreml")]
     CoreML,
@@ -62,8 +62,7 @@ impl ExecutionTarget {
 
     /// Check if this execution target is available on the current system
     ///
-    /// Simplified: assumes platform support = availability
-    /// ONNX Runtime will handle actual device detection at runtime
+    /// Simplified legacy compatibility query; this is not llama.cpp capability detection.
     pub fn is_available(&self) -> bool {
         match self {
             #[cfg(target_os = "macos")]

@@ -15,12 +15,11 @@
 
 - Actual LoRA training
 - Adapter saving to `~/.finch/adapters/`
-- Adapter loading at ONNX inference time
+- Adapter loading into the llama.cpp chat model
 
 ## Why implementation is deferred
 
-- Finch cannot yet apply an adapter in its ONNX inference path:
-  [#1 (LoRA adapter loading at ONNX runtime)](https://github.com/darwin-finch/finch/issues/1).
+- Finch cannot yet apply a generated adapter to the active llama.cpp/GGUF chat model.
 - The investigated training options require unsupported external ML toolchains and a
   memory-bounded merge-and-reload design:
   [#7 (LoRA training memory efficiency)](https://github.com/darwin-finch/finch/issues/7).
@@ -38,8 +37,8 @@ supported Finch feature.
 - Linux/CUDA: PyTorch + PEFT (`peft`, `transformers`)
 
 **Inference (loading the adapter):**
-- `onnxruntime-genai` supports `.onnx_adapter` files via its `Adapters` API
-- MLX/PEFT adapters must be converted via the Olive toolchain first
+- The accepted adapter format and merge-or-runtime-load path for llama.cpp have not been selected.
+- MLX/PEFT output is therefore training evidence, not a Finch-loadable artifact.
 
 ## Key files
 

@@ -36,17 +36,6 @@ impl QwenSize {
         }
     }
 
-    /// Get ONNX community repository ID
-    pub fn onnx_repo_id(&self) -> &'static str {
-        match self {
-            QwenSize::Qwen500M => "onnx-community/Qwen2.5-0.5B-Instruct-ONNX",
-            QwenSize::Qwen1_5B => "onnx-community/Qwen2.5-1.5B-Instruct-ONNX",
-            QwenSize::Qwen3B => "onnx-community/Qwen2.5-3B-Instruct-ONNX",
-            QwenSize::Qwen7B => "onnx-community/Qwen2.5-7B-Instruct-ONNX",
-            QwenSize::Qwen14B => "onnx-community/Qwen2.5-14B-Instruct-ONNX",
-        }
-    }
-
     /// Get approximate RAM requirement in GB
     pub fn ram_requirement_gb(&self) -> usize {
         match self {
@@ -214,13 +203,6 @@ mod tests {
         assert_eq!(QwenSize::Qwen3B.model_id(), "Qwen/Qwen2.5-3B-Instruct");
         assert_eq!(QwenSize::Qwen7B.model_id(), "Qwen/Qwen2.5-7B-Instruct");
         assert_eq!(QwenSize::Qwen14B.model_id(), "Qwen/Qwen2.5-14B-Instruct");
-    }
-
-    #[test]
-    fn test_onnx_repo_ids() {
-        assert!(QwenSize::Qwen500M.onnx_repo_id().contains("0.5B"));
-        assert!(QwenSize::Qwen1_5B.onnx_repo_id().contains("1.5B"));
-        assert!(QwenSize::Qwen14B.onnx_repo_id().contains("14B"));
     }
 
     #[test]

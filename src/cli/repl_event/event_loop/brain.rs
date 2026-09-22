@@ -47,8 +47,6 @@ impl EventLoop {
                 generator,
                 router: Arc::new(Router::new(crate::models::ThresholdRouter::new())),
                 state: Arc::new(RwLock::new(GeneratorState::NotAvailable)),
-                local: Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
-                tokenizer: Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
                 resolver: provider_resolver,
                 available: Vec::new(),
                 active_index: 0,

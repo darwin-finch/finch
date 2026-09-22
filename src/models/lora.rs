@@ -1,18 +1,8 @@
 // LoRA (Low-Rank Adaptation) - Fine-tuning adapter for Qwen models
 // Phase 6: Implemented JSONL queue writer and training coordinator
 //
-// TODO: Current Python-based training is inefficient with ONNX Runtime
-// - ONNX Runtime is inference-only (no training APIs)
-// - PyTorch training requires loading model twice (2x memory usage)
-// - Need pure Rust solution that works with ONNX models
-//
-// Future options:
-// 1. Build custom Rust LoRA implementation on top of ONNX Runtime
-// 2. Use burn.rs or other Rust ML framework with ONNX export
-// 3. Wait for ONNX Runtime training support
-// 4. Implement LoRA as ONNX graph modifications (advanced)
-//
-// For now: Python infrastructure exists but has known limitations
+// The retained Python training helper can produce PEFT/safetensors output, but Finch has no
+// accepted merge or runtime-load path for applying it to the active llama.cpp/GGUF chat model.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -115,8 +105,7 @@ pub struct LoRATrainingAdapter {
 }
 
 impl LoRATrainingAdapter {
-    /// Create new LoRA adapter with given configuration
-    /// Phase 4: device parameter removed (was Candle-based)
+    /// Create a disabled placeholder with the given configuration.
     pub fn new(config: LoRAConfig, _device: ()) -> Result<Self> {
         Ok(Self {
             config,
@@ -139,12 +128,8 @@ impl LoRATrainingAdapter {
     /// # Returns
     /// Error with message "Not yet implemented"
     ///
-    /// # Future Implementation
-    /// Will use:
-    /// - Candle's linear layers for low-rank matrices
-    /// - SGD or AdamW optimizer
-    /// - Cross-entropy loss
-    /// - Gradient accumulation for large batches
+    /// A future implementation must choose a training stack and a format that
+    /// the llama.cpp-backed chat path can actually load.
     pub fn train(
         &mut self,
         _examples: &[(String, String)],
@@ -273,8 +258,8 @@ mod tests {
     }
 }
 
-// Phase 4: Stub types for removed Candle-based LoRA implementation
-// These will be replaced with Python/ONNX-based implementation in Phase 5
+// Retained queue and coordination types. They do not imply that training or
+// adapter loading is active.
 
 /// Weighted training example (Phase 6: Added serialization for JSONL export)
 #[derive(Debug, Clone, Serialize, Deserialize)]

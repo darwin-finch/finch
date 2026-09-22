@@ -35,22 +35,6 @@ impl ModelMetadata {
     }
 }
 
-/// Save model with metadata (DEPRECATED: Phase 4 - Candle-based)
-///
-/// Phase 4: This function used Candle's VarMap which has been removed.
-/// For ONNX models, use ONNX Runtime's save functionality or Python scripts.
-#[deprecated(note = "Candle VarMap removed - use ONNX Runtime save")]
-pub fn save_model_with_metadata(
-    _weights_path: &Path,
-    _varmap: &(), // Placeholder for removed VarMap type
-    _metadata: &ModelMetadata,
-) -> Result<()> {
-    anyhow::bail!(
-        "save_model_with_metadata removed in Phase 4 (Candle VarMap).\n\
-         For ONNX models, use Python scripts with ONNX Runtime."
-    )
-}
-
 /// Load model metadata
 pub fn load_model_metadata(weights_path: &Path) -> Result<ModelMetadata> {
     let metadata_path = weights_path.with_extension("json");

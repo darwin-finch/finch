@@ -1,6 +1,5 @@
-// Common model utilities and types
-// Phase 4: Candle removed, ONNX only
-// DevicePreference is deprecated but kept for config backward-compat and tests.
+// Common model utilities and retained training configuration.
+// DevicePreference is deprecated but kept for serialized training metadata.
 #![allow(deprecated)]
 
 use anyhow::Result;
@@ -71,15 +70,11 @@ impl ModelConfig {
     }
 }
 
-/// Device configuration options (DEPRECATED: Phase 4 - kept for compatibility)
+/// Legacy training-device preference retained for serialized metadata.
 ///
-/// With ONNX Runtime, device selection is handled by execution providers:
-/// - CoreML (requested Apple compute-unit policy; placement is runtime-selected)
-/// - CPU (fallback)
-/// - CUDA/TensorRT (NVIDIA GPUs)
-/// - DirectML (Windows GPUs)
+/// The llama.cpp chat loader does not read this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[deprecated(note = "Use ONNX Runtime execution providers instead")]
+#[deprecated(note = "No active model backend reads this training metadata")]
 #[derive(Default)]
 pub enum DevicePreference {
     /// Use best available device
@@ -89,31 +84,6 @@ pub enum DevicePreference {
     Cpu,
     /// Force Metal (Apple Silicon GPU)
     Metal,
-}
-
-// Phase 4: Device functions removed (Candle-based)
-// ONNX Runtime handles device selection via execution providers
-
-/// Stub: Device selection removed (Phase 4)
-#[deprecated(note = "Device selection removed - use ONNX Runtime execution providers")]
-pub fn get_device_with_preference(_preference: DevicePreference) -> Result<()> {
-    anyhow::bail!(
-        "get_device_with_preference removed in Phase 4.\n\
-         ONNX Runtime handles device selection automatically via execution providers."
-    )
-}
-
-/// Stub: Device info removed (Phase 4)
-#[deprecated(note = "Device info removed - ONNX Runtime manages devices")]
-pub fn device_info() -> String {
-    "ONNX Runtime (device managed automatically)".to_string()
-}
-
-/// Stub: Metal availability check removed (Phase 4)
-#[deprecated(note = "Metal check removed - ONNX Runtime handles CoreML EP")]
-pub fn is_metal_available() -> bool {
-    // Assume true on macOS for compatibility
-    cfg!(target_os = "macos")
 }
 
 /// Model persistence
@@ -164,27 +134,6 @@ mod tests {
             DevicePreference::default(),
             DevicePreference::Auto
         ));
-    }
-
-    #[allow(deprecated)]
-    #[test]
-    fn test_device_info_stub_mentions_onnx() {
-        let info = device_info();
-        assert!(info.contains("ONNX"), "expected ONNX in: {info}");
-    }
-
-    #[allow(deprecated)]
-    #[test]
-    fn test_get_device_with_preference_always_errors() {
-        let result = get_device_with_preference(DevicePreference::Auto);
-        assert!(result.is_err(), "Phase 4 stub should always error");
-    }
-
-    #[allow(deprecated)]
-    #[test]
-    fn test_is_metal_available_returns_bool() {
-        // Just verify it doesn't panic; actual value is platform-dependent
-        let _ = is_metal_available();
     }
 
     #[test]

@@ -186,6 +186,16 @@ parity remain experimental under [#74](https://github.com/darwin-finch/finch/iss
 [#98](https://github.com/darwin-finch/finch/issues/98). Use `--cloud-only` when you need to disable
 daemon local-chat loading.
 
+The removed ONNX and Candle local-chat implementations were last available in commit
+[`0607ccfad8ba790a236f701aa7d25f77488332d7`](https://github.com/darwin-finch/finch/tree/0607ccfad8ba790a236f701aa7d25f77488332d7).
+They were retired on 2026-09-22 because neither path provided a reliable supported chat runtime:
+ONNX/CoreML repeatedly crashed the daemon during Qwen session construction, while Candle's Metal
+path lacked kernels required by the supported model families and produced wrong, absent, or
+impractically slow output. The replacement llama.cpp/GGUF path had completed real buffered,
+streamed, and CPU generation on the target MacBook before the cutover. The historical commit is
+for source archaeology, not a supported installation recommendation. Frontend memory's separately
+owned ONNX embedder is unaffected by this chat-provider decision.
+
 ### HTTP daemon
 
 `finch daemon` binds the foreground HTTP server to `127.0.0.1:8000` unless `--bind` is supplied.

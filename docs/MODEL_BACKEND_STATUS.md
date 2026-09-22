@@ -4,6 +4,10 @@
 > configured model is selected or works end to end. Local routing and provider parity remain
 > unresolved under [#74](https://github.com/darwin-finch/finch/issues/74) and
 > [#98](https://github.com/darwin-finch/finch/issues/98).
+>
+> **Superseded 2026-09-22:** ONNX and Candle local chat were removed in favor of llama.cpp/GGUF.
+> The table and analysis below are retained as historical evidence only. Frontend memory's ONNX
+> embedder is a separate subsystem and was not part of that removal.
 
 **Last Updated**: 2026-08-25
 **Purpose**: Document what works, what doesn't, and why — for both local inference and LoRA fine-tuning.
@@ -14,7 +18,7 @@
 
 ---
 
-## Status: ONNX Runtime is the default path (dated investigation, not conformance)
+## Historical status: ONNX Runtime was the default path
 
 The statuses below record what the backend investigation observed, not a current
 end-to-end conformance claim. Loader configuration is a configuration surface;

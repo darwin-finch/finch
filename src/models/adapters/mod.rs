@@ -1,6 +1,6 @@
 // Local Model Adapters - Format prompts and handle model-specific behavior
 //
-// These adapters handle LOCAL ONNX model specifics (chat templates, tokens, output cleaning).
+// These adapters handle local chat-model specifics (templates, tokens, output cleaning).
 // This is DIFFERENT from the provider transports (crates/finch-providers, surfaced through
 // src/providers/) which handle external API calls.
 //

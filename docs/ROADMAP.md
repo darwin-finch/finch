@@ -1,6 +1,6 @@
 # Finch development roadmap
 
-**Last updated:** 2026-09-02
+**Last updated:** 2026-09-22
 
 This is a forward-looking guide to Finch's intended direction. It is not a release schedule or
 proof that a feature works. The [GitHub issue tracker](https://github.com/darwin-finch/finch/issues)
@@ -25,7 +25,8 @@ Brains must all remain subject to explicit capability and privacy boundaries.
 
 The current source includes an interactive TUI and raw REPL, provider-backed chat, a bounded HTTP
 daemon, named Brain persistence, a typed Lisp/Co-Forth runtime, approval-aware tools, an MCP client,
-explicit feedback storage, and experimental ONNX Runtime and Candle model loaders.
+explicit feedback storage, and a llama.cpp/GGUF local-chat loader. ONNX remains only in the
+separately owned frontend memory embedder; Candle is no longer a dependency.
 
 Those components have uneven end-to-end maturity. In particular, configuration variants do not
 prove provider conformance, configured local models do not prove local routing, and implemented
