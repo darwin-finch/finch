@@ -5,6 +5,7 @@ mod adapters; // Local model adapters (chat templates, token IDs)
 mod bootstrap; // Progressive bootstrap for instant startup
 mod common;
 mod generator_new;
+mod gguf_download;
 mod learning;
 mod loaders;
 mod lora; // LoRA fine-tuning configuration (Python training, Phase 5)
@@ -32,6 +33,7 @@ pub use common::{
     ModelConfig, Saveable,
 };
 pub use generator_new::{GeneratorModel, TextGeneration, TokenCallback};
+pub use gguf_download::{managed_gguf_artifact, GgufQuantization, ManagedGgufArtifact};
 pub use learning::{LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData};
 pub use lora::{
     ExampleBuffer, LoRAConfig, LoRATrainer, LoRATrainingAdapter, TrainingCoordinator,
@@ -42,10 +44,7 @@ pub use model_selector::{ModelSelection, ModelSelector, QwenSize};
 pub use neural_embedding::{select_memory_embedding_engine, NeuralEmbeddingEngine};
 #[allow(deprecated)]
 pub use persistence::{load_model_metadata, model_exists, save_model_with_metadata, ModelMetadata};
-pub use progress::{
-    install_model_progress, installed_model_progress, DownloadProgressDisplay, ModelProgress,
-    SilentModelProgress,
-};
+pub use progress::{ModelProgress, SilentModelProgress};
 pub use sampling::{ComparisonResult, QueryCategory, Sampler, SamplingConfig, SamplingDecision};
 pub use threshold_router::{
     QueryCategory as ThresholdQueryCategory, ThresholdRouter, ThresholdRouterStats,

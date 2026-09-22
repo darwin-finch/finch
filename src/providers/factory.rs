@@ -1703,6 +1703,7 @@ mod tests {
             model_size: ModelSize::Medium,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             name: None,
         });
@@ -1728,6 +1729,7 @@ mod tests {
                 model_size: ModelSize::Medium,
                 model_repo: None,
                 model_path: None,
+                managed_artifact: None,
                 enabled: true,
                 name: None,
             },
@@ -1746,6 +1748,7 @@ mod tests {
             model_size: ModelSize::Medium,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             name: None,
         }];

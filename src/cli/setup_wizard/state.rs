@@ -220,6 +220,7 @@ impl WizardState {
                         execution: config.backend.execution_target,
                         inference_provider: config.backend.inference_provider,
                         model_path: config.backend.model_path.clone(),
+                        managed_artifact: config.backend.managed_artifact.clone(),
                         enabled: true,
                         persisted: Some(ProviderEntry::from_backend_config(&config.backend, None)),
                     });

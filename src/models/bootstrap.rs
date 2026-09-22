@@ -4,8 +4,10 @@
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use super::generator_new::GeneratorModel;
+use super::gguf_download::{ManagedGgufArtifact, ManagedGgufDownloader};
 use super::progress::ModelProgress;
 use super::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize};
 use super::GeneratorConfig;
@@ -43,8 +45,8 @@ pub enum GeneratorState {
 #[derive(Debug, Clone)]
 pub struct DownloadProgressSnapshot {
     pub file_name: String,
-    pub current_file: usize,
-    pub total_files: usize,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
 }
 
 impl GeneratorState {
@@ -62,8 +64,8 @@ impl GeneratorState {
                 progress,
             } => {
                 format!(
-                    "Downloading {} ({}/{}): {}",
-                    model_name, progress.current_file, progress.total_files, progress.file_name
+                    "Downloading {} ({} / {} bytes): {}",
+                    model_name, progress.downloaded_bytes, progress.total_bytes, progress.file_name
                 )
             }
             GeneratorState::Loading { model_name } => {
@@ -84,17 +86,35 @@ impl GeneratorState {
 pub struct BootstrapLoader {
     state: Arc<RwLock<GeneratorState>>,
     output: Option<Arc<dyn ModelProgress>>,
+    download_cancellation: CancellationToken,
+    huggingface_token: Option<String>,
 }
 
 impl BootstrapLoader {
     /// Create new bootstrap loader with shared state
     pub fn new(state: Arc<RwLock<GeneratorState>>, output: Option<Arc<dyn ModelProgress>>) -> Self {
-        Self { state, output }
+        Self {
+            state,
+            output,
+            download_cancellation: CancellationToken::new(),
+            huggingface_token: None,
+        }
+    }
+
+    /// Inject the configured Hugging Face credential at the composition root.
+    pub fn with_huggingface_token(mut self, token: Option<String>) -> Self {
+        self.huggingface_token = token.filter(|value| !value.trim().is_empty());
+        self
     }
 
     /// Get reference to the generator state
     pub fn state(&self) -> &Arc<RwLock<GeneratorState>> {
         &self.state
+    }
+
+    /// Cancel an in-flight managed GGUF download.
+    pub fn cancel_download(&self) {
+        self.download_cancellation.cancel();
     }
 
     /// Load generator in background using UnifiedModelLoader
@@ -107,6 +127,7 @@ impl BootstrapLoader {
         coreml: crate::config::CoreMlConfig,
         model_repo: Option<String>,
         model_path: Option<std::path::PathBuf>,
+        managed_artifact: Option<ManagedGgufArtifact>,
     ) -> Result<()> {
         // Step 1: Initializing
         *self.state.write().await = GeneratorState::Initializing;
@@ -141,6 +162,29 @@ impl BootstrapLoader {
             tracing::info!("Using custom repository: {}", repo);
         }
 
+        let model_path = match (model_path, managed_artifact.as_ref()) {
+            (Some(path), None) => Some(path),
+            (None, Some(artifact)) => {
+                let downloader =
+                    ManagedGgufDownloader::from_environment(self.huggingface_token.clone())?;
+                let (path, _) = downloader
+                    .ensure(
+                        artifact,
+                        &model_name,
+                        Arc::clone(&self.state),
+                        &self.download_cancellation,
+                    )
+                    .await?;
+                Some(path)
+            }
+            (Some(_), Some(_)) => anyhow::bail!(
+                "local chat config cannot select both a managed GGUF and a custom path"
+            ),
+            (None, None) => {
+                anyhow::bail!("local chat requires a managed GGUF or an explicit .gguf path")
+            }
+        };
+
         // Step 3: Create model load config
         let load_config = ModelLoadConfig {
             provider,
@@ -152,7 +196,7 @@ impl BootstrapLoader {
             model_path,
         };
 
-        // Step 4: Load using UnifiedModelLoader (handles download + loading)
+        // Step 4: Load the resolved local artifact using UnifiedModelLoader.
         *self.state.write().await = GeneratorState::Loading {
             model_name: model_name.clone(),
         };
@@ -170,7 +214,7 @@ impl BootstrapLoader {
                 output.write_progress(format!("  └─ Initializing {}...", model_name_clone));
             }
 
-            // GeneratorModel::new() handles download + loading internally
+            // The loader remains path-only; managed download completed above.
             let config = GeneratorConfig::Pretrained(load_config);
             GeneratorModel::new(config)
         })
@@ -231,12 +275,12 @@ mod tests {
     fn test_download_progress_snapshot() {
         let progress = DownloadProgressSnapshot {
             file_name: "config.json".to_string(),
-            current_file: 1,
-            total_files: 4,
+            downloaded_bytes: 1,
+            total_bytes: 4,
         };
 
         assert_eq!(progress.file_name, "config.json");
-        assert_eq!(progress.current_file, 1);
+        assert_eq!(progress.downloaded_bytes, 1);
     }
 
     #[tokio::test]

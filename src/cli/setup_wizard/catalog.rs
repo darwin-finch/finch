@@ -27,9 +27,10 @@ pub(super) enum AddProviderStep {
         inference_provider: InferenceProvider,
         family: ModelFamily,
         size: ModelSize,
+        quantization: GgufQuantization,
         execution: ExecutionTarget,
         model_path: String,
-        focused_field: usize, // 0=Backend, 1=Family, 2=Size, 3=Device, 4=GGUF path
+        focused_field: usize, // 0=Backend, 1=Family, 2=Size, 3=Quant, 4=Device, 5=GGUF path
         editing_idx: Option<usize>,
     },
     // Network scan path
@@ -445,6 +446,7 @@ pub enum ModelConfig {
         execution: ExecutionTarget,
         inference_provider: InferenceProvider,
         model_path: Option<std::path::PathBuf>,
+        managed_artifact: Option<ManagedGgufArtifact>,
         enabled: bool,
         /// Original profile metadata that the local-model editor does not
         /// expose yet (stable name, repository, and resolved model path).
@@ -540,6 +542,7 @@ pub(super) fn model_config_from_provider(provider: &ProviderEntry) -> Option<Mod
             model_family,
             model_size,
             model_path,
+            managed_artifact,
             enabled,
             ..
         } => Some(ModelConfig::Local {
@@ -548,6 +551,7 @@ pub(super) fn model_config_from_provider(provider: &ProviderEntry) -> Option<Mod
             execution: *execution_target,
             inference_provider: *inference_provider,
             model_path: model_path.clone(),
+            managed_artifact: managed_artifact.clone(),
             enabled: *enabled,
             persisted: Some(provider.clone()),
         }),

@@ -9,7 +9,7 @@
 | State | Meaning |
 |-------|---------|
 | `Initializing` | Preparing the configured local chat profile |
-| `Downloading` | Compatibility state exposed to status clients; daemon chat does not download GGUF files |
+| `Downloading` | A managed GGUF is transferring; includes filename and exact byte counts |
 | `Loading` | Loading weights into memory |
 | `Ready` | Model ready for inference |
 | `Failed` | Load failed with error |
@@ -19,10 +19,15 @@
 
 ```
 1. Daemon starts while the configured model loads in a background task.
-2. The composition root passes the user-selected absolute GGUF path.
-3. `UnifiedModelLoader` rejects legacy ONNX/Candle entries, repositories, and unsupported targets.
-4. llama.cpp loads the GGUF and creates the shared generator.
-5. State becomes `Ready`; future eligible queries can use the local model.
+2. A custom profile supplies an existing absolute GGUF path, or a managed profile supplies an
+   immutable Hugging Face artifact identity.
+3. Managed artifacts resume into a partial file, then pass exact-size and SHA-256 checks before
+   an atomic rename. The daemon exposes byte progress through `/v1/status`.
+4. `UnifiedModelLoader` receives only the verified local path and rejects legacy ONNX/Candle
+   entries and unsupported targets.
+5. llama.cpp loads the GGUF and creates the shared generator.
+6. State becomes `Ready`; the client removes its download status entry and eligible queries can
+   use the local model.
 ```
 
 Startup is not unconditionally instant: launch is gated by a daemon health
@@ -35,6 +40,7 @@ While state ≠ `Ready`, `Router::route_with_generator_check(query, false)` forw
 ## Key files
 
 - `src/models/bootstrap.rs` — `BootstrapLoader`, `GeneratorState`
+- `src/models/gguf_download.rs` — managed catalog, resumable transfer, and verification
 - `src/models/unified_loader.rs` — config validation and engine selection
 - `src/models/loaders/llama_cpp.rs` — GGUF loading and generation
 

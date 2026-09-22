@@ -206,6 +206,8 @@ pub enum ProviderEntry {
         model_repo: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_path: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        managed_artifact: Option<crate::models::ManagedGgufArtifact>,
         #[serde(default = "default_true")]
         enabled: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -638,6 +640,7 @@ credential_ref = "work"
             model_size: ModelSize::Medium,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             name: Some("Local Qwen 3B".to_string()),
         };
@@ -696,6 +699,7 @@ credential_ref = "work"
             model_size: ModelSize::Medium,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             name: None,
         };
@@ -721,6 +725,7 @@ credential_ref = "work"
             model_size: ModelSize::Medium,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             name: None,
         };
@@ -761,6 +766,7 @@ credential_ref = "work"
                 model_size: ModelSize::Medium,
                 model_repo: None,
                 model_path: None,
+                managed_artifact: None,
                 enabled: true,
                 name: None,
             }
@@ -795,6 +801,7 @@ credential_ref = "work"
                 model_size: ModelSize::Medium,
                 model_repo: None,
                 model_path: None,
+                managed_artifact: None,
                 enabled: true,
                 name: None,
             },

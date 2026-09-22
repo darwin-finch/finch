@@ -417,6 +417,7 @@ impl ProviderEntry {
             model_size,
             model_repo,
             model_path,
+            managed_artifact,
             enabled,
             ..
         } = self
@@ -430,6 +431,7 @@ impl ProviderEntry {
                 model_size: *model_size,
                 model_repo: model_repo.clone(),
                 model_path: model_path.clone(),
+                managed_artifact: managed_artifact.clone(),
                 fallback_chain: BackendConfig::default().fallback_chain,
                 #[allow(deprecated)]
                 device: None,
@@ -448,6 +450,7 @@ impl ProviderEntry {
             model_size: cfg.model_size,
             model_repo: cfg.model_repo.clone(),
             model_path: cfg.model_path.clone(),
+            managed_artifact: cfg.managed_artifact.clone(),
             enabled: cfg.enabled,
             name,
         }
@@ -1098,6 +1101,7 @@ mod tests {
             model_size: ModelSize::Medium,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             name: None,
         }]);
@@ -1273,6 +1277,7 @@ mod tests {
             model_size: ModelSize::Medium,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             name: None,
         }];
@@ -1305,6 +1310,7 @@ mod tests {
                 model_size: ModelSize::Medium,
                 model_repo: None,
                 model_path: None,
+                managed_artifact: None,
                 enabled: true,
                 name: None,
             },

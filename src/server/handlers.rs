@@ -2659,8 +2659,8 @@ pub enum GeneratorStatus {
     Downloading {
         model_size: String,
         file_name: String,
-        current_file: usize,
-        total_files: usize,
+        downloaded_bytes: u64,
+        total_bytes: u64,
     },
     Loading {
         model_size: String,

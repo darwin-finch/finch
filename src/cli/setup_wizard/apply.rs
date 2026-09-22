@@ -317,6 +317,7 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                 execution,
                 inference_provider,
                 model_path: configured_path,
+                managed_artifact: configured_artifact,
                 enabled,
                 persisted,
             } => {
@@ -365,6 +366,7 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                     model_size: *size,
                     model_repo,
                     model_path,
+                    managed_artifact: configured_artifact.clone(),
                     enabled: *enabled,
                     name,
                 })

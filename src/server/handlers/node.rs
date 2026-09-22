@@ -16,8 +16,8 @@ pub(super) async fn get_status(
         } => GeneratorStatus::Downloading {
             model_size: model_name.clone(),
             file_name: progress.file_name.clone(),
-            current_file: progress.current_file,
-            total_files: progress.total_files,
+            downloaded_bytes: progress.downloaded_bytes,
+            total_bytes: progress.total_bytes,
         },
         GeneratorState::Loading { model_name } => GeneratorStatus::Loading {
             model_size: model_name.clone(),

@@ -15,10 +15,10 @@ Callers outside this directory use `crate::models::Item`; they must not name `bo
 **Dependencies:** `config` (`ExecutionTarget`, `CoreMlConfig`), `memory` (`EmbeddingEngine` for
 neural embeddings), and `tools` (prompt/parser types). Production code under `src/models/**`
 must not name `crate::cli`. Bootstrap takes a models-owned [`ModelProgress`] port; CLI
-implements it and injects it at composition roots (`BootstrapLoader::new`,
-`install_model_progress` in `run_daemon` and interactive `main`). The daemon process is
-the one that loads the user-selected chat GGUF; memory owns its own model download. The
-daemon progress sink must be installed independently of the interactive process's sink.
+implements it and injects it directly through `BootstrapLoader::new`; there is no process-global
+model-progress registry. The daemon process downloads and loads the user-selected chat GGUF;
+memory owns its own model download. Determinate bytes live in `GeneratorState` and cross the
+daemon boundary through `/v1/status`; models must not mutate a terminal status bar.
 Do not extract `finch-models` until remaining edges are measured and this reverse edge
 stays gone.
 
@@ -31,9 +31,11 @@ loaders import CLI presentation code.
 **Loaders are experimental.** Configuration and loader code are not proof of end-to-end
 provider or local-model conformance.
 
-The daemon loads a caller-supplied chat-LLM `.gguf` file through
-`backend.model_path`; that user-configured model selector must not also select memory's
-embedding/reranking models.
+The daemon loads either a Finch-managed, immutable Hugging Face GGUF selected by setup or a
+caller-supplied chat-LLM `.gguf` file through `backend.model_path`. Managed artifacts are pinned
+by repository, commit, filename, byte size, and SHA-256; partial downloads are resumable and a
+file is committed only after verification. This user-configured model selector must not also
+select memory's embedding/reranking models.
 It owns the process-wide llama.cpp backend and creates a fresh context per generation request.
 Memory model selection and persisted embedding identity belong to the separate memory work.
 `execution_target = auto` permits GPU offload on macOS when the compiled llama.cpp backend
