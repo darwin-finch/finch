@@ -44,7 +44,7 @@ pub(super) async fn get_status(
 }
 
 /// Handle GET /health - Health check endpoint
-pub async fn health_check(
+pub(super) async fn health_check(
     State(server): State<Arc<AgentServer>>,
 ) -> Result<Json<HealthStatus>, AppError> {
     // `list()` here was a full store hydration on the unauthenticated probe
@@ -125,7 +125,7 @@ pub async fn metrics_endpoint(
 }
 
 /// Handle GET /v1/node/info — return this node's identity and capabilities
-pub async fn handle_node_info() -> Result<Json<serde_json::Value>, AppError> {
+pub(super) async fn handle_node_info() -> Result<Json<serde_json::Value>, AppError> {
     use crate::config::load_config;
     use crate::node::NodeInfo;
 
@@ -162,7 +162,7 @@ pub(super) fn current_node_capabilities(has_teacher_api: bool) -> crate::node::N
 }
 
 /// Handle GET /v1/node/stats — return this node's work statistics
-pub async fn handle_node_stats() -> Result<Json<serde_json::Value>, AppError> {
+pub(super) async fn handle_node_stats() -> Result<Json<serde_json::Value>, AppError> {
     use crate::node::WorkTracker;
 
     let stats = WorkTracker::load_persisted()?;

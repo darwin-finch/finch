@@ -2684,7 +2684,7 @@ pub struct StatusResponse {
 
 /// Health check response
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HealthStatus {
+pub(super) struct HealthStatus {
     pub status: String,
     pub uptime_seconds: u64,
     pub named_brains: usize,
