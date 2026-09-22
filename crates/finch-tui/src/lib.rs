@@ -7339,6 +7339,78 @@ mod tests {
             "Plain content passes through byte-exactly"
         );
     }
+
+    /// INVARIANT (stage 3, #1120): a ProgressMessage renders its bar/line
+    /// from the VM at the claiming boundary, and growth between frames
+    /// re-renders from the mutated VM (the pull-per-frame discipline). The
+    /// zero-claim furniture rule holds in the live viewport: once committed,
+    /// the message leaves the live surface entirely — no resident row.
+    #[test]
+    fn test_progress_message_renders_the_bar_from_the_vm_and_zero_claims_when_complete() {
+        use finch_messages::ProgressMessage;
+        let mut renderer = headless_renderer();
+        let progress = Arc::new(ProgressMessage::new("weights.safetensors", 100));
+        let message: MessageRef = Arc::clone(&progress) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+
+        let first = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = first.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["weights.safetensors [░░░░░░░░░░] 0%"],
+            "the bar starts empty at zero bytes; got {rendered:?}"
+        );
+
+        // Growth between frames: the producer mutates the VM under its lock;
+        // the next projection re-renders from it with no observers.
+        progress.update_progress(50);
+        let second = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = second.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["weights.safetensors [█████░░░░░] 50%"],
+            "the bar tracks the VM's numbers on the next frame; got {rendered:?}"
+        );
+        assert!(
+            second.iter().all(|line| !line.text.contains('\x1b')),
+            "the component emits plain text; got {rendered:?}"
+        );
+
+        // Zero-claim when complete: a completed progress row is committed
+        // through the canonical pipeline, so the live viewport holds no
+        // resident row for it — the component claims nothing once the
+        // message has left the live surface.
+        progress.set_complete();
+        let mut stdout_buf: Vec<u8> = Vec::new();
+        let committed = commit_complete_messages(
+            &mut stdout_buf,
+            &renderer.output_manager.get_messages(),
+            &mut renderer.accordion,
+            &renderer.colors,
+            &mut renderer.printed_ids,
+            24,
+            80,
+        )
+        .expect("the completed progress row commits once");
+        assert!(committed > 0, "the canonical record carries the bar once");
+        assert!(
+            String::from_utf8_lossy(&stdout_buf).contains("100% ✓"),
+            "the committed record shows the completed bar; got {}",
+            String::from_utf8_lossy(&stdout_buf)
+        );
+        let live = uncommitted_suffix(
+            renderer.output_manager.get_messages(),
+            &renderer.printed_ids,
+        );
+        let live_ids: Vec<_> = live.iter().map(|message| message.id()).collect();
+        assert!(
+            !live_ids.contains(&message.id()),
+            "zero-claim furniture: a completed progress row leaves the live viewport; \
+             live ids were {live_ids:?}"
+        );
+    }
     fn paint_slash_completions(renderer: &mut TuiRenderer) {
         renderer.update_ghost_text();
         completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);

@@ -17,7 +17,7 @@
 //! `format()`-era SGR bytes. This matches the say-turn template (#882) and
 //! this crate's dependency contract (no `finch-theme`).
 
-use crate::{say_turn::SayTurnView, RenderedTranscriptLine};
+use crate::{say_turn::SayTurnView, work_unit::MessageStatus, RenderedTranscriptLine};
 
 /// The component snapshot of one migrated typed message. A message type
 /// constructs the variant that belongs to it from its retained ViewModel;
@@ -31,6 +31,8 @@ pub enum ComponentView {
     Say(SayTurnView),
     /// A static text message (#1120, stage 3): the text IS its view.
     StaticText(StaticTextView),
+    /// A download/upload progress message (#1120, stage 3).
+    Progress(ProgressView),
 }
 
 /// The ViewModel of a [`ComponentView::StaticText`] component: the message's
@@ -56,6 +58,18 @@ pub enum StaticTextKind {
     Plain,
 }
 
+/// The ViewModel of a [`ComponentView::Progress`] component: the label, the
+/// current/total byte counts, and the message status. The message constructs
+/// the snapshot under its existing locks; `current` is the live state the
+/// component re-renders every frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgressView {
+    pub label: String,
+    pub current: u64,
+    pub total: u64,
+    pub status: MessageStatus,
+}
+
 /// Render one component snapshot into the transcript lines it claims this
 /// frame. The engine asks the `Message` trait for the snapshot and this
 /// function for the lines; it never learns which concrete message produced
@@ -64,7 +78,40 @@ pub fn component_lines(view: &ComponentView) -> Vec<RenderedTranscriptLine> {
     match view {
         ComponentView::Say(say) => crate::say_turn_lines(say),
         ComponentView::StaticText(static_text) => static_text_lines(static_text),
+        ComponentView::Progress(progress) => progress_lines(progress),
     }
+}
+
+/// Progress bar furniture constants: a ten-cell bar.
+const PROGRESS_BAR_CELLS: usize = 10;
+
+/// One progress line: `label [████████░░] N%` with a status glyph —
+/// `✓` when complete, `✗` when failed, nothing while running. The VM's
+/// numbers decide the rendering; the component is a pure function of the
+/// snapshot.
+fn progress_lines(view: &ProgressView) -> Vec<RenderedTranscriptLine> {
+    let percentage = if view.total > 0 {
+        (view.current as f64 / view.total as f64 * 100.0) as u8
+    } else {
+        0
+    };
+    let filled = (percentage as usize / 10).min(PROGRESS_BAR_CELLS);
+    let bar = format!(
+        "[{}{}]",
+        "█".repeat(filled),
+        "░".repeat(PROGRESS_BAR_CELLS - filled)
+    );
+    let line = match view.status {
+        MessageStatus::Complete => {
+            format!("{} {bar} 100% ✓", view.label)
+        }
+        MessageStatus::Failed => format!("{} {bar} {percentage}% ✗", view.label),
+        MessageStatus::InProgress => format!("{} {bar} {percentage}%", view.label),
+    };
+    vec![RenderedTranscriptLine {
+        text: line,
+        ..RenderedTranscriptLine::default()
+    }]
 }
 
 /// A static text row's lines: one glyph-prefixed line per content line. An
@@ -268,6 +315,88 @@ mod tests {
                 width: 80,
                 height: 4,
             },
+        );
+    }
+
+    // ── ProgressMessage: the bar from the VM (#1120 stage 3) ────────────────
+
+    fn progress_view(current: u64, total: u64, status: MessageStatus) -> ProgressView {
+        ProgressView {
+            label: "Download".to_string(),
+            current,
+            total,
+            status,
+        }
+    }
+
+    fn progress_text(view: &ProgressView) -> String {
+        component_lines(&ComponentView::Progress(view.clone()))
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// INVARIANT (#1120): the bar is a pure function of the VM's numbers —
+    /// filled cells track the percentage, the remainder stays empty.
+    #[test]
+    fn test_progress_bar_tracks_the_vm_numbers() {
+        let start = progress_view(0, 100, MessageStatus::InProgress);
+        assert_eq!(
+            progress_text(&start),
+            "Download [░░░░░░░░░░] 0%",
+            "zero progress renders an all-empty bar"
+        );
+        let half = progress_view(50, 100, MessageStatus::InProgress);
+        assert_eq!(
+            progress_text(&half),
+            "Download [█████░░░░░] 50%",
+            "half progress fills half the bar"
+        );
+        let almost = progress_view(85, 100, MessageStatus::InProgress);
+        assert_eq!(
+            progress_text(&almost),
+            "Download [████████░░] 85%",
+            "85% fills eight cells"
+        );
+    }
+
+    /// The status decides the glyph and the completed line: `✓` with a fixed
+    /// 100% readout when complete, `✗` with the reached percentage when
+    /// failed, nothing while running.
+    #[test]
+    fn test_progress_status_decides_the_glyph() {
+        let running = progress_view(40, 100, MessageStatus::InProgress);
+        let running_line = progress_text(&running);
+        assert!(
+            !running_line.contains('✓') && !running_line.contains('✗'),
+            "a running bar wears no terminal glyph; got {running_line:?}"
+        );
+        let complete = progress_view(100, 100, MessageStatus::Complete);
+        assert_eq!(
+            progress_text(&complete),
+            "Download [██████████] 100% ✓",
+            "a complete bar reads 100% with the check glyph"
+        );
+        let failed = progress_view(30, 100, MessageStatus::Failed);
+        assert_eq!(
+            progress_text(&failed),
+            "Download [███░░░░░░░] 30% ✗",
+            "a failed bar keeps the reached percentage with the cross glyph"
+        );
+    }
+
+    /// A completed progress row still renders its one line here; the
+    /// zero-claim furniture rule applies to the live viewport, where the
+    /// renderer drops a completed row (the message leaves the live surface
+    /// through the canonical commit). The component itself stays total.
+    #[test]
+    fn test_progress_zero_total_renders_an_empty_bar_without_panicking() {
+        let indeterminate = progress_view(5, 0, MessageStatus::InProgress);
+        assert_eq!(
+            progress_text(&indeterminate),
+            "Download [░░░░░░░░░░] 0%",
+            "a zero total cannot divide by zero; the bar stays empty"
         );
     }
 }

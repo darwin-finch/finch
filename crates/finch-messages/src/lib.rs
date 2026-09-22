@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 pub use finch_ui_model::{
     AgentActivityView, AgentToolView, ComponentView, MessageId, MessageStatus, OutputVm,
-    ProgramSourceVm, SayTurnStatus, SayTurnView, StaticTextKind, StaticTextView,
+    ProgramSourceVm, ProgressView, SayTurnStatus, SayTurnView, StaticTextKind, StaticTextView,
     WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead, WorkUnitPresentation,
     WorkUnitView, WorkUnitViewModel,
 };

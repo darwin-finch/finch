@@ -6,7 +6,7 @@
 use super::{ComponentView, Message, MessageId, MessageStatus};
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use finch_theme::{ColorScheme, ColorSpec, MessageBand};
-use finch_ui_model::{StaticTextKind, StaticTextView};
+use finch_ui_model::{ProgressView, StaticTextKind, StaticTextView};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -887,6 +887,17 @@ impl ProgressMessage {
 impl Message for ProgressMessage {
     fn id(&self) -> MessageId {
         self.id
+    }
+
+    /// Stage 3 (#1120): the bar/line renders from the VM — label, current
+    /// bytes, total, and status — read under the message's existing locks.
+    fn component_view(&self) -> Option<ComponentView> {
+        Some(ComponentView::Progress(ProgressView {
+            label: self.label.clone(),
+            current: *self.current.read().unwrap_or_else(|p| p.into_inner()),
+            total: self.total,
+            status: self.status(),
+        }))
     }
 
     fn format(&self, colors: &ColorScheme) -> String {
