@@ -4,10 +4,12 @@ Supplements the root [`AGENTS.md`](../../AGENTS.md), which still applies in full
 
 **Owns** `crates/finch-ui-model/src/`: stable retained-message and row identity, WorkUnit
 presentation snapshots, semantic transcript nodes, terminal-independent widget data, pure
-component and WorkUnit projections, bounded assistant-prose markdown, line measurement, and the
-claiming layout pass. These are plain data and pure functions shared by message producers and
-render engines. The message layer retains and mutates domain state and constructs snapshots; it
-does not own their presentation projection.
+component and WorkUnit projections, the generalized component view (`component.rs`: every
+migrated typed message yields its `ComponentView`; the per-variant dispatch lives here, never
+in the engine), bounded assistant-prose markdown, line measurement, and the claiming layout
+pass. These are plain data and pure functions shared by message producers and render engines.
+The message layer retains and mutates domain state and constructs snapshots; it does not own
+their presentation projection.
 
 **Does not own** message lifecycle or synchronization, component action dispatch, terminal
 lifecycle, `crossterm`, shadow-buffer painting, input handling, or application composition. Those

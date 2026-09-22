@@ -31,7 +31,7 @@ pub enum WorkUnitPresentation {
 }
 
 /// Status of an individual tool or activity row.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkRowStatus {
     Running,
     Complete(String),

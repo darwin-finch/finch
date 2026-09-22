@@ -23,7 +23,22 @@ rendering beside the card through a viewport pairing rule (`say_turn_consolidate
 the adjacent completed Program-source unit whose bytes are the turn's program; a mismatch
 suppresses nothing) while the canonical record keeps the raw program exactly once. The
 remaining stage-2 scope (other WorkUnit presentations, thinking section #749, agent activity)
-and stages 3+ stay open below.
+stays open below.
+
+**Stage-3 outcome (#1120, 2026-09-22): landed.** Every typed message renders through a
+component via the generalized `Message::component_view` accessor — the maintainer's original
+decision, now the renderer's single projection entry: it asks the trait for the
+`ComponentView` snapshot and hands it to `finch_ui_model::component_lines`; no projection-path
+match on a message type survives (source-scan pinned). `StaticMessage` (text is its view),
+`ProgressMessage` (bar/line from its VM; committed rows zero-claim out of the live viewport),
+`LiveToolMessage` (header + streaming content subwidget), and `OperationMessage` (chrome plus
+the rows subwidget with per-row status glyphs) each construct their snapshot from retained
+state under the existing locks — no new lock, no ownership change. The say turn migrated to
+the same accessor; `say_turn_view` stays for the consolidated-source pairing helper and the
+disclosure-direction read. Components emit plain text (glyphs carry semantics; spans are
+stage 4), and the canonical record is untouched — the legacy projection remains the
+canonical-commit path for unmigrated rows. Remaining scope: other WorkUnit presentations,
+thinking section #749, agent activity (stage-2 remainder), then the DOM lowering (stage 4).
 
 ## The maintainer's constraints, verbatim
 
@@ -183,7 +198,7 @@ ViewModel + component, attach it via the message's component accessor, done.
 |---|---|---|---|
 | 1 | `WorkUnitComponent` for say turns: VM + chrome + ProgramSource/Output subwidgets + click routing; delete the `is_assistant_prose` suppression | dead ▼ affordance; program text unrecoverable by click; #820-class status residue re-checked at the PTY/daemon boundary | existing pinned invariants; new component tests at the claiming boundary |
 | 2 | Say-turn consolidation to the maintainer's target (spec below); remaining WorkUnit presentations; thinking section #749 as a subwidget; agent activity | the stage-1 transition duplication (source group + card both rendering); per-type rendering out of `view_model.rs` | `canonical_commit_marks_only_after_success_and_follows_resize_clear` untouched |
-| 3 | `OperationMessage`, `LiveToolMessage`, `ProgressMessage`, `StaticMessage` (text is its view) get components — completing "every typed message has a view"; the `work_unit_view`-era trait hooks retire | structure flattened to text | RowId stability across message kinds |
+| 3 | `OperationMessage`, `LiveToolMessage`, `ProgressMessage`, `StaticMessage` (text is its view) get components — completing "every typed message has a view" (landed #1120, 2026-09-22: the generalized `component_view` accessor, per-type components, and the type-agnostic projection scan) | structure flattened to text | RowId stability across message kinds |
 | 4 | DOM lowering + spans migration → Tauri #808 | — | one tree, two modes |
 
 ### Stage-2 say-turn target (maintainer spec, 2026-09-18 — verbatim)

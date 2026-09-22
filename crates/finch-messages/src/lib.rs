@@ -12,9 +12,10 @@
 use std::sync::Arc;
 
 pub use finch_ui_model::{
-    AgentActivityView, AgentToolView, MessageId, MessageStatus, OutputVm, ProgramSourceVm,
-    SayTurnStatus, SayTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead,
-    WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
+    AgentActivityView, AgentToolView, ComponentView, LiveToolView, MessageId, MessageStatus,
+    OperationRowView, OperationView, OutputVm, ProgramSourceVm, ProgressView, SayTurnStatus,
+    SayTurnView, StaticTextKind, StaticTextView, WorkRowPresentation, WorkRowStatus, WorkRowView,
+    WorkUnitHead, WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };
 
 mod concrete;
@@ -68,9 +69,21 @@ pub trait Message: Send + Sync {
     /// The component-owned ViewModel snapshot of a migrated say turn (#882,
     /// stage 1 of docs/TUI_DESIGN.md), read under the message's own lock.
     /// `None` for rows that have not migrated to component-owned rendering;
-    /// those keep the renderer's RowId-keyed disclosure maps. The renderer
-    /// asks this instead of matching on the message type.
+    /// those keep the renderer's RowId-keyed disclosure maps. Kept since
+    /// stage 3 for the consolidated-source pairing helper and the
+    /// disclosure-direction read — the renderer's projection path asks
+    /// [`Self::component_view`] instead.
     fn say_turn_view(&self) -> Option<SayTurnView> {
+        None
+    }
+
+    /// The generalized component snapshot of this message (stage 3 of
+    /// docs/TUI_DESIGN.md, #1120): the message constructs its component from
+    /// its retained ViewModel under its own lock, and the renderer asks this
+    /// instead of matching on the message type — the maintainer's original
+    /// decision. `None` for rows that have not migrated to component-owned
+    /// rendering; those keep the legacy projection path.
+    fn component_view(&self) -> Option<ComponentView> {
         None
     }
 
