@@ -81,7 +81,8 @@ fn escape_moves_back_one_top_level_screen_without_cancelling() {
     let expected = [
         (WizardSection::Themes, WizardSection::Themes),
         (WizardSection::Models, WizardSection::Themes),
-        (WizardSection::Personas, WizardSection::Models),
+        (WizardSection::LocalHelpers, WizardSection::Models),
+        (WizardSection::Personas, WizardSection::LocalHelpers),
         (WizardSection::Features, WizardSection::Personas),
         (WizardSection::Review, WizardSection::Features),
     ];
@@ -286,6 +287,67 @@ fn wizard_settings_survive_config_mapping_and_reopen() {
     } else {
         panic!("expected settings section");
     }
+}
+
+/// Regression: the Local Helpers toggle must default true (matching
+/// `finch_memory::MemoryConfig::default().use_neural_embeddings`), survive
+/// Space toggling it off, and reload false from the resulting config -- not
+/// silently reset to the default on reopen, which is the exact defect this
+/// pins for any wizard field that reads from `existing_config`.
+#[test]
+fn test_local_helpers_neural_embeddings_toggle_survives_config_mapping_and_reopen() {
+    let state = WizardState::new(None);
+    assert!(
+        matches!(
+            state.sections.get(&WizardSection::LocalHelpers),
+            Some(SectionState::LocalHelpers {
+                use_neural_embeddings: true
+            })
+        ),
+        "default must be on, matching MemoryConfig::default(); got {:?}",
+        state.sections.get(&WizardSection::LocalHelpers)
+    );
+
+    let mut state = state;
+    state.current_section = WizardSection::LocalHelpers;
+    assert_eq!(
+        handle_wizard_key(&mut state, key(KeyCode::Char(' '))).unwrap(),
+        WizardAction::Continue
+    );
+    assert!(
+        matches!(
+            state.sections.get(&WizardSection::LocalHelpers),
+            Some(SectionState::LocalHelpers {
+                use_neural_embeddings: false
+            })
+        ),
+        "Space must toggle it off; got {:?}",
+        state.sections.get(&WizardSection::LocalHelpers)
+    );
+
+    let result = build_setup_result(&state).unwrap();
+    assert!(
+        !result.use_neural_embeddings,
+        "the off toggle must reach SetupResult"
+    );
+    let config = config_from_setup_result(&result);
+    assert!(
+        !config.memory.use_neural_embeddings,
+        "the off toggle must reach the saved Config"
+    );
+
+    let reopened = WizardState::new(Some(&config));
+    assert!(
+        matches!(
+            reopened.sections.get(&WizardSection::LocalHelpers),
+            Some(SectionState::LocalHelpers {
+                use_neural_embeddings: false
+            })
+        ),
+        "reopening from a saved config with the toggle off must not silently \
+         reset to the true default; got {:?}",
+        reopened.sections.get(&WizardSection::LocalHelpers)
+    );
 }
 
 #[cfg(target_os = "macos")]

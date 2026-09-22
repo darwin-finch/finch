@@ -10,6 +10,7 @@ use super::*;
 pub(super) enum WizardSection {
     Themes,
     Models,
+    LocalHelpers,
     Personas,
     Features,
     Review,
@@ -20,6 +21,7 @@ impl WizardSection {
         vec![
             Self::Themes,
             Self::Models,
+            Self::LocalHelpers,
             Self::Personas,
             Self::Features,
             Self::Review,
@@ -30,6 +32,14 @@ impl WizardSection {
         match self {
             Self::Themes => "Look & Feel",
             Self::Models => "Model Setup",
+            // Deliberately its own tab, not folded into "Model Setup": that
+            // section configures the primary chat provider (cloud, Ollama,
+            // or a local GGUF chat model); this one configures the separate,
+            // local-only models finch-builtin functions use for themselves
+            // (memory embeddings today). Conflating the two was the exact
+            // ambiguity flagged when this was requested -- the segmentation
+            // needs to be unmistakable to the user.
+            Self::LocalHelpers => "Local Helpers",
             Self::Personas => "Style",
             Self::Features => "Settings",
             Self::Review => "Finish",
@@ -59,6 +69,16 @@ pub(super) enum SectionState {
         catalog_refreshed_at: Option<DateTime<Utc>>,
         catalog_error: Option<String>,
         error: Option<String>,
+    },
+    /// The separate local-only models finch-builtin functions use for
+    /// themselves (currently: memory's embedding engine). Distinct from
+    /// `Models`, which configures the primary chat provider.
+    LocalHelpers {
+        /// Real neural embeddings (`all-MiniLM-L6-v2`, ONNX, downloaded once
+        /// from Hugging Face on first use) vs. the built-in TF-IDF fallback,
+        /// which needs no download and no network access at lower recall
+        /// quality. Mirrors `finch_memory::MemoryConfig::use_neural_embeddings`.
+        use_neural_embeddings: bool,
     },
     Personas {
         available_personas: Vec<PersonaInfo>,
@@ -397,6 +417,15 @@ impl WizardState {
             },
         );
 
+        sections.insert(
+            WizardSection::LocalHelpers,
+            SectionState::LocalHelpers {
+                use_neural_embeddings: existing_config
+                    .map(|c| c.memory.use_neural_embeddings)
+                    .unwrap_or(true),
+            },
+        );
+
         // Review section
         sections.insert(WizardSection::Review, SectionState::Review);
 
@@ -512,6 +541,11 @@ pub struct SetupResult {
     pub mdns_discovery: bool,
     pub auto_discover: bool,
     pub memory_context_lines: usize,
+
+    /// The separate local-only model choice for finch-builtin functions
+    /// (memory embeddings today), distinct from `primary_model`/`tool_models`
+    /// which configure the chat provider.
+    pub use_neural_embeddings: bool,
 }
 
 impl SetupResult {

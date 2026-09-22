@@ -156,6 +156,7 @@ fn help_line(state: &WizardState, width: usize) -> String {
     let section_help = match state.current_section {
         WizardSection::Themes => "↑/↓: Choose theme | Enter: Next",
         WizardSection::Models => "Enter: Edit provider | A: Add | D: Remove",
+        WizardSection::LocalHelpers => "Space: Toggle | Enter: Next",
         WizardSection::Personas => "↑/↓: Choose style | E: Edit prompt | Enter: Next",
         WizardSection::Features => "↑/↓: Navigate | Space: Toggle | Enter: Next",
         WizardSection::Review => "Enter: Save & start",
@@ -232,6 +233,40 @@ fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<String> {
         "Selected theme shows with white background. Press Enter to confirm.",
         Color::Blue,
     ));
+    lines
+}
+
+/// Local Helpers section: the separate local-only model choice for
+/// finch-builtin functions (memory embeddings today), distinct from the
+/// "Model Setup" tab's chat-provider configuration.
+fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec<String> {
+    let mut lines = vec![wizard_centered(
+        &wizard_bold("Local Helper Models", Color::Blue),
+        width,
+    )];
+    lines.push(wizard_line(
+        "Separate from the chat model above: these are the local-only models \
+         finch's own built-in features use for themselves.",
+        Color::DarkGray,
+    ));
+
+    let checkbox = if use_neural_embeddings { "[x]" } else { "[ ]" };
+    let item = wizard_bold(
+        &format!(">>> {checkbox} Memory embeddings: use the neural model <<<"),
+        Color::White,
+    );
+    lines.extend(wizard_boxed("Memory", &[item], Color::Blue, width));
+
+    let detail = if use_neural_embeddings {
+        "On: all-MiniLM-L6-v2 (ONNX), downloaded once from Hugging Face on \
+         first use, then runs locally with no further network calls. Better \
+         recall quality than the fallback below."
+    } else {
+        "Off: built-in TF-IDF embeddings. No download, no network access, \
+         ever -- at lower recall quality than the neural model."
+    };
+    lines.push(String::new());
+    lines.push(wizard_line(detail, Color::DarkGray));
     lines
 }
 
@@ -1494,6 +1529,12 @@ pub(super) fn wizard_view_with_permission_target(
         Some(SectionState::Themes { selected_theme }) => {
             WizardSectionContent::plain(themes_section_lines(*selected_theme, width))
         }
+        Some(SectionState::LocalHelpers {
+            use_neural_embeddings,
+        }) => WizardSectionContent::plain(local_helpers_section_lines(
+            *use_neural_embeddings,
+            width,
+        )),
         Some(SectionState::Models {
             primary_model,
             tool_models,

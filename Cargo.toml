@@ -99,8 +99,10 @@ futures = "0.3"
 once_cell = "1.19"
 similar = "2.7"
 
-# HTTP client for Claude API
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# HTTP client for Claude API. `blocking` additionally backs the memory
+# embedding model's mirror fallback (#9), called from inside `spawn_blocking`
+# alongside the existing hf-hub download, never from async code directly.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking"] }
 
 # HTTP server + WebSocket (session transport)
 axum = { version = "0.7", features = ["ws"] }

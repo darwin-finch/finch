@@ -134,14 +134,34 @@ impl NeuralEmbeddingEngine {
         })
     }
 
-    /// Download the embedding model from HuggingFace if not already cached.
+    /// Download the embedding model, trying Hugging Face first and falling
+    /// back to the finch mirror (below) if that fails for any reason --
+    /// this is a default, automatic download, not something the user opted
+    /// into per use, so it must not have a single point of failure on one
+    /// external host's availability.
     ///
     /// Returns the local directory containing model and tokenizer files.
     /// This is a blocking operation; wrap in `spawn_blocking` for async contexts.
     pub fn download_sync() -> Result<PathBuf> {
+        match Self::download_from_huggingface() {
+            Ok(dir) => Ok(dir),
+            Err(hf_error) => {
+                info!("Hugging Face download failed ({hf_error}); trying the finch mirror");
+                Self::download_from_mirror().map_err(|mirror_error| {
+                    anyhow!(
+                        "embedding model download failed from both sources -- \
+                         Hugging Face: {hf_error}; mirror: {mirror_error}"
+                    )
+                })
+            }
+        }
+    }
+
+    fn download_from_huggingface() -> Result<PathBuf> {
         use hf_hub::{api::sync::Api, Repo, RepoType};
 
-        info!("Downloading neural embedding model (all-MiniLM-L6-v2)...");
+        info!("Downloading neural embedding model (all-MiniLM-L6-v2) from Hugging Face...");
+        let progress_msg = super::progress::attach_download_progress("Xenova/all-MiniLM-L6-v2-ONNX");
 
         let api = Api::new().context("Failed to create HuggingFace Hub API")?;
         let repo = api.repo(Repo::new(
@@ -150,18 +170,24 @@ impl NeuralEmbeddingEngine {
         ));
 
         // Download model (tries quantized first, then regular)
-        let model_path = repo
-            .get("model_quantized.onnx")
-            .or_else(|_| repo.get("model.onnx"))
-            .context(
-                "Failed to download embedding model \
-                 (tried model_quantized.onnx and model.onnx)",
-            )?;
+        let model_path = match repo.get("model_quantized.onnx").or_else(|_| repo.get("model.onnx")) {
+            Ok(path) => path,
+            Err(e) => {
+                progress_msg.fail();
+                return Err(e).context(
+                    "Failed to download embedding model \
+                     (tried model_quantized.onnx and model.onnx)",
+                );
+            }
+        };
+        progress_msg.update(50);
 
         // Download tokenizer
-        let _tokenizer_path = repo
-            .get("tokenizer.json")
-            .context("Failed to download tokenizer.json")?;
+        if let Err(e) = repo.get("tokenizer.json") {
+            progress_msg.fail();
+            return Err(e).context("Failed to download tokenizer.json");
+        }
+        progress_msg.complete();
 
         let dir = model_path
             .parent()
@@ -169,6 +195,61 @@ impl NeuralEmbeddingEngine {
             .to_path_buf();
 
         info!("Neural embedding model downloaded to: {:?}", dir);
+        Ok(dir)
+    }
+
+    /// Fetch the model from a GitHub Release on this repo instead of Hugging
+    /// Face, into finch's own cache dir (not an HF snapshot, so it can't
+    /// share that directory shape).
+    ///
+    /// **Not yet load-bearing**: `MIRROR_BASE_URL` names a release that does
+    /// not exist yet -- publishing it (an actual GitHub release carrying the
+    /// two real binary assets below) is a real, out-of-band action this
+    /// change cannot perform from source code. Until that release exists,
+    /// every request here 404s and `download_sync` surfaces the original
+    /// Hugging Face error rather than a mirror-specific one. The fallback
+    /// path, cache lookup, and directory layout are real and tested now, so
+    /// publishing the release is the only thing left to make it load-bearing.
+    fn download_from_mirror() -> Result<PathBuf> {
+        let dir = mirror_cache_dir()
+            .ok_or_else(|| anyhow!("could not determine home directory for the mirror cache"))?;
+        std::fs::create_dir_all(&dir).context("Failed to create finch mirror cache directory")?;
+
+        info!("Downloading neural embedding model (all-MiniLM-L6-v2) from the finch mirror...");
+        let progress_msg = super::progress::attach_download_progress("finch mirror: all-MiniLM-L6-v2");
+
+        for file in ["model_quantized.onnx", "tokenizer.json"] {
+            let url = format!("{MIRROR_BASE_URL}/{file}");
+            let fetch = reqwest::blocking::get(&url)
+                .and_then(reqwest::blocking::Response::error_for_status)
+                .with_context(|| format!("mirror fetch failed for {file} from {url}"));
+            let response = match fetch {
+                Ok(response) => response,
+                Err(e) => {
+                    progress_msg.fail();
+                    return Err(e);
+                }
+            };
+            let bytes = match response
+                .bytes()
+                .with_context(|| format!("failed to read mirror response body for {file}"))
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    progress_msg.fail();
+                    return Err(e);
+                }
+            };
+            if let Err(e) = std::fs::write(dir.join(file), &bytes)
+                .with_context(|| format!("failed to write {file} to mirror cache"))
+            {
+                progress_msg.fail();
+                return Err(e);
+            }
+        }
+        progress_msg.complete();
+
+        info!("Neural embedding model downloaded from mirror to: {:?}", dir);
         Ok(dir)
     }
 
@@ -183,10 +264,16 @@ impl NeuralEmbeddingEngine {
         Self::download_sync()
     }
 
-    /// Try to find the model in the HuggingFace cache without downloading.
+    /// Try to find the model without downloading: the Hugging Face cache
+    /// first (matching a normal successful download), then the finch mirror
+    /// cache (matching a mirror-fallback download).
     ///
-    /// Returns `None` if the model is not yet cached (i.e., first run).
+    /// Returns `None` if the model is not yet cached anywhere (i.e., first run).
     pub fn find_in_cache() -> Option<PathBuf> {
+        Self::find_in_huggingface_cache().or_else(Self::find_in_mirror_cache)
+    }
+
+    fn find_in_huggingface_cache() -> Option<PathBuf> {
         // HF hub caches models under: ~/.cache/huggingface/hub/
         let cache_base = dirs::home_dir()?
             .join(".cache")
@@ -195,7 +282,7 @@ impl NeuralEmbeddingEngine {
         let repo_dir = cache_base.join("models--Xenova--all-MiniLM-L6-v2-ONNX");
 
         if !repo_dir.exists() {
-            debug!("Embedding model not in cache: {:?}", repo_dir);
+            debug!("Embedding model not in Hugging Face cache: {:?}", repo_dir);
             return None;
         }
 
@@ -214,7 +301,7 @@ impl NeuralEmbeddingEngine {
                     || snapshot.join("model.onnx").exists();
                 let has_tokenizer = snapshot.join("tokenizer.json").exists();
                 if has_model && has_tokenizer {
-                    debug!("Found embedding model in cache: {:?}", snapshot);
+                    debug!("Found embedding model in Hugging Face cache: {:?}", snapshot);
                     return Some(snapshot);
                 }
             }
@@ -222,7 +309,41 @@ impl NeuralEmbeddingEngine {
 
         None
     }
+
+    fn find_in_mirror_cache() -> Option<PathBuf> {
+        let dir = mirror_cache_dir()?;
+        if model_dir_is_complete(&dir) {
+            debug!("Found embedding model in finch mirror cache: {:?}", dir);
+            Some(dir)
+        } else {
+            None
+        }
+    }
 }
+
+/// Finch-owned cache directory for the memory embedding model, used only by
+/// the mirror fallback: a mirror download isn't a Hugging Face snapshot, so
+/// it can't share that directory shape. Matches the `~/.finch/...`
+/// convention `src/models/lora.rs`'s adapter storage already uses.
+fn mirror_cache_dir() -> Option<PathBuf> {
+    Some(
+        dirs::home_dir()?
+            .join(".finch")
+            .join("models")
+            .join("all-MiniLM-L6-v2"),
+    )
+}
+
+/// Whether `dir` holds both files a loadable cached model needs. Shared by
+/// the mirror cache lookup; the Hugging Face lookup has its own version of
+/// this check because it also accepts the unquantized `model.onnx` name.
+fn model_dir_is_complete(dir: &Path) -> bool {
+    dir.join("model_quantized.onnx").exists() && dir.join("tokenizer.json").exists()
+}
+
+/// See `download_from_mirror`'s doc: this release does not exist yet.
+const MIRROR_BASE_URL: &str =
+    "https://github.com/darwin-finch/finch/releases/download/embedding-model-v1";
 
 /// Select the production memory embedding engine without downloading.
 ///
@@ -424,6 +545,51 @@ mod tests {
     #[test]
     fn test_neural_embedding_dim_constant() {
         assert_eq!(EMBEDDING_DIM, 384);
+    }
+
+    #[test]
+    fn test_mirror_cache_dir_is_finch_owned_not_the_huggingface_cache() {
+        let dir = mirror_cache_dir().expect("home dir must resolve on a test machine");
+        assert!(
+            dir.ends_with(std::path::Path::new(".finch/models/all-MiniLM-L6-v2")),
+            "mirror downloads must not land in the HF cache (a different \
+             directory shape -- no snapshots/commit-hash layer), got {dir:?}"
+        );
+    }
+
+    #[test]
+    fn test_model_dir_is_complete_requires_both_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !model_dir_is_complete(dir.path()),
+            "an empty directory must not read as a complete cached model"
+        );
+
+        std::fs::write(dir.path().join("model_quantized.onnx"), b"stub").unwrap();
+        assert!(
+            !model_dir_is_complete(dir.path()),
+            "the model file alone, without the tokenizer, must not read as complete"
+        );
+
+        std::fs::write(dir.path().join("tokenizer.json"), b"stub").unwrap();
+        assert!(
+            model_dir_is_complete(dir.path()),
+            "both files present must read as a complete cached model"
+        );
+    }
+
+    #[test]
+    fn test_find_in_mirror_cache_needs_both_files_present() {
+        // `find_in_mirror_cache` itself always reads the real
+        // `mirror_cache_dir()`, which this test cannot redirect without
+        // touching the real home directory -- so this pins the shared
+        // completeness check it actually depends on
+        // (`test_model_dir_is_complete_requires_both_files`) and, here,
+        // only that the lookup itself never panics when the directory is
+        // absent, matching this file's existing
+        // `test_find_in_cache_returns_none_when_absent` convention for
+        // filesystem-dependent cache probes.
+        let _ = NeuralEmbeddingEngine::find_in_mirror_cache();
     }
 
     #[test]

@@ -960,6 +960,35 @@ impl Repl {
                         ),
                     );
                     drop(sync_phase);
+
+                    // Download the neural embedding model in the background,
+                    // for the *next* restart, not this session: it's already
+                    // been chosen (`engine`, above) and a store this session
+                    // opens against TF-IDF cannot switch representations
+                    // mid-session without re-embedding everything already
+                    // written -- TF-IDF and neural embeddings live in
+                    // different vector spaces, so mixing them would silently
+                    // corrupt retrieval, not merely miss an upgrade. Prompt-
+                    // first startup (#242) is never blocked on this either
+                    // way: `tokio::spawn`, not awaited.
+                    if config.memory.use_neural_embeddings
+                        && crate::models::NeuralEmbeddingEngine::find_in_cache().is_none()
+                    {
+                        tokio::spawn(async {
+                            match crate::models::NeuralEmbeddingEngine::ensure_downloaded().await {
+                                Ok(_) => tracing::info!(
+                                    "Neural embedding model downloaded in the background; \
+                                     available from the next restart"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "Background neural embedding model download failed; \
+                                     continuing on the TF-IDF fallback"
+                                ),
+                            }
+                        });
+                    }
+
                     Some(system)
                 }
                 Err(e) => {
