@@ -316,7 +316,7 @@ still blocks the corresponding Brain phase until it is unified.
   context metadata keyed by provider plus model rather than inferring it from a display name.
 - [ ] Refresh Finch's local-model catalogue and runtime compatibility matrix. Inventory newly
   released open-weight families (including current Meta/Facebook releases), distinguish upstream
-  weights from actually usable ONNX/Core ML/Metal exports, and record tokenizer, quantization,
+  weights from actually usable GGUF exports, and record tokenizer, quantization,
   context, memory, tool-use, structured-output, and Finch-wire conformance per model/runtime/hardware
   combination. Discover installed compatible models without silently claiming support for a family
   whose weights cannot run through Finch, keep manual model paths available, and add opt-in local
@@ -1329,7 +1329,7 @@ still blocks the corresponding Brain phase until it is unified.
   Verify those claims against primary product documentation as it becomes accessible, then benchmark
   Finch on the same dimensions: offline task completion, local model/tool conformance, capability and
   data-residency disclosure, per-step cloud-escalation approval, Brain continuity across local/cloud
-  model switches, latency, energy, hardware coverage (Apple Silicon, NVIDIA, CPU, and portable ONNX),
+  model switches, latency, energy, hardware coverage (Apple Silicon, NVIDIA, and portable CPU),
   and actual total cost. Treat “zero token cost” as local inference accounting rather than zero compute
   cost, and keep the Brain log plus VM checkpoint authoritative across every routing decision.
   Reference: https://www.perplexity.ai/hub/products/portable-computer

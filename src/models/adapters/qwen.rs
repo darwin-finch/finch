@@ -251,7 +251,7 @@ mod tests {
         let adapter = QwenAdapter;
 
         // Test case 1: Echo with embedded role (THE MAIN PROBLEM CASE)
-        // This is what the ONNX model currently generates
+        // Some Qwen-family artifacts emit this assistant prefix.
         let raw = "user\nWhat is 2+2?\nassistant\n4";
         let cleaned = adapter.clean_output(raw);
         assert_eq!(cleaned, "4");

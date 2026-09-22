@@ -134,7 +134,7 @@ jobs:
       continue-on-error: true
 
   # The minimal-feature-graph suite proves the core builds and tests without
-  # the default ONNX/Candle stacks. Feature rot is caught here on trusted
+  # optional integration features. Feature rot is caught here on trusted
   # main (with the main breakage filer reporting) rather than on every PR:
   # the row is not the PR critical path, and the check costs billed minutes.
   test-no-default:

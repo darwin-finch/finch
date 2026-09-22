@@ -107,10 +107,9 @@ generator = "~/.claude-proxy/models/generator-7b.mlmodel"
 # Path to constitutional validator model
 validator = "~/.claude-proxy/models/constitutional.mlmodel"
 
-# CoreML compute units Finch requests on Apple platforms. "all" lets CoreML
-# choose among compatible ANE, GPU, and CPU devices; it does not prove where
-# any operator ran. Other values: "cpu_and_neural_engine", "cpu_and_gpu",
-# and "cpu_only".
+# Legacy CoreML chat settings remain readable only so old configuration can be
+# migrated. The recorded policy does not prove where operators ran. The
+# llama.cpp/GGUF chat backend does not read this block.
 [coreml]
 compute_units = "all"
 
@@ -127,11 +126,8 @@ profile_compute_plan = false
 # Whether CoreML may take nodes inside Loop, Scan, and If subgraphs.
 enable_subgraphs = false
 
-# These options currently apply to generative ONNX sessions. The semantic-
-# memory embedder remains explicitly CPU-only. Its current batch is fixed at 1
-# but sequence length varies from 1 to 256 tokens. CoreML latency and placement
-# remain unmeasured, so evaluate that workload separately before changing its
-# provider default or claiming ANE placement.
+# Frontend semantic memory owns its ONNX embedder separately and remains
+# unaffected by the daemon chat-backend migration.
 
 # Storage Configuration
 [storage]

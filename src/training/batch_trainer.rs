@@ -210,8 +210,8 @@ impl BatchTrainer {
 
         // Batch training is not yet implemented.
         //
-        // The current inference stack uses ONNX Runtime; injecting LoRA adapter
-        // weights into a running ONNX session at inference time is tracked as
+        // The current chat inference stack uses llama.cpp; injecting LoRA adapter
+        // weights into a running GGUF session at inference time is tracked as
         // GitHub Issue #1. Until that is resolved, in-process batch training
         // has no effect on the served model.
         //

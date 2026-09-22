@@ -17,7 +17,6 @@ mod progress;
 mod sampling; // Context-aware sampling system
 mod threshold_router;
 mod threshold_validator;
-mod tokenizer; // Phase 4: Stub for compatibility
 mod tool_parser; // Phase 6: Parse tool calls from model output (XML)
 mod tool_prompt; // Phase 6: Format tool definitions for model prompts
 mod unified_loader; // llama.cpp GGUF chat loader
@@ -28,10 +27,7 @@ pub use adapters::{
 };
 pub use bootstrap::{BootstrapLoader, DownloadProgressSnapshot, GeneratorState};
 #[allow(deprecated)]
-pub use common::{
-    device_info, get_device_with_preference, is_metal_available, DevicePreference, GeneratorConfig,
-    ModelConfig, Saveable,
-};
+pub use common::{DevicePreference, GeneratorConfig, ModelConfig, Saveable};
 pub use generator_new::{GeneratorModel, TextGeneration, TokenCallback};
 pub use gguf_download::{managed_gguf_artifact, GgufQuantization, ManagedGgufArtifact};
 pub use learning::{LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData};
@@ -42,15 +38,13 @@ pub use lora::{
 pub use manager::{ModelManager, OverallStats, TrainingReport};
 pub use model_selector::{ModelSelection, ModelSelector, QwenSize};
 pub use neural_embedding::{select_memory_embedding_engine, NeuralEmbeddingEngine};
-#[allow(deprecated)]
-pub use persistence::{load_model_metadata, model_exists, save_model_with_metadata, ModelMetadata};
+pub use persistence::{load_model_metadata, model_exists, ModelMetadata};
 pub use progress::{ModelProgress, SilentModelProgress};
 pub use sampling::{ComparisonResult, QueryCategory, Sampler, SamplingConfig, SamplingDecision};
 pub use threshold_router::{
     QueryCategory as ThresholdQueryCategory, ThresholdRouter, ThresholdRouterStats,
 };
 pub use threshold_validator::{QualitySignal, ThresholdValidator, ValidatorStats};
-pub use tokenizer::TextTokenizer; // Phase 4: Stub for compatibility
 pub use tool_parser::ToolCallParser; // Phase 6: Parse tool calls from model output
 pub use tool_prompt::ToolPromptFormatter; // Phase 6: Format tool definitions for prompts
 pub use unified_loader::{

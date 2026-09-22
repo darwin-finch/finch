@@ -300,7 +300,7 @@ impl TemplateGenerator {
             .try_write()
             .map_err(|_| anyhow::anyhow!("Generator model is locked"))?;
 
-        // Both ONNX and GGUF implement this narrow generation contract.
+        // The GGUF backend implements this narrow generation contract.
         let backend = gen.backend_mut();
         let input_ids = backend.tokenize(&formatted_prompt)?;
 

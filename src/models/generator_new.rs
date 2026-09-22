@@ -42,7 +42,7 @@ pub trait TextGeneration: Send + Sync {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
-// Phase 4: LegacyGenerator removed (depends on Candle-based generator module)
+// The legacy custom-transformer generator was removed with the old local runtimes.
 
 /// Unified generator model supporting multiple backends
 pub struct GeneratorModel {
@@ -71,14 +71,13 @@ impl GeneratorModel {
 
     /// Create new generator from configuration
     ///
-    /// Phase 4: Only supports Pretrained (ONNX-based)
-    /// RandomInit removed with Candle
+    /// Only pre-trained GGUF chat models are loadable.
     pub fn new(config: GeneratorConfig) -> Result<Self> {
         let backend: Box<dyn TextGeneration> = match &config {
             GeneratorConfig::RandomInit(_model_config) => {
                 anyhow::bail!(
-                    "RandomInit removed in Phase 4 (Candle-based).\n\
-                     Use GeneratorConfig::Pretrained with ONNX models."
+                    "RandomInit is not supported.\n\
+                     Use GeneratorConfig::Pretrained with a llama.cpp GGUF model."
                 )
             }
             GeneratorConfig::Pretrained(load_config) => {
@@ -121,9 +120,6 @@ impl GeneratorModel {
     pub fn backend_mut(&mut self) -> &mut dyn TextGeneration {
         self.backend.as_mut()
     }
-
-    // Phase 4: device() removed (Candle-based)
-    // ONNX Runtime manages device selection via execution providers
 
     /// Get configuration
     pub fn config(&self) -> &GeneratorConfig {
@@ -332,25 +328,5 @@ mod tests {
         let result = GeneratorModel::new(config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("RandomInit"));
-    }
-
-    #[test]
-    #[ignore] // Requires downloaded Qwen model
-    fn test_generator_qwen_onnx() {
-        use crate::config::ExecutionTarget;
-        use crate::models::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize};
-
-        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
-            provider: crate::models::unified_loader::InferenceProvider::LlamaCpp,
-            family: ModelFamily::Qwen2,
-            size: ModelSize::Small,
-            target: ExecutionTarget::Cpu,
-            coreml: crate::config::CoreMlConfig::default(),
-            repo_override: None,
-            model_path: None,
-        });
-
-        let gen = GeneratorModel::new(config).expect("Should load Qwen ONNX model");
-        assert!(gen.name().contains("Qwen"));
     }
 }

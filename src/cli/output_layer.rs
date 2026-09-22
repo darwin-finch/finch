@@ -1,7 +1,7 @@
 // Tracing Layer - Routes dependency logs through OutputManager
 //
 // This custom tracing::Layer intercepts all log messages from dependencies
-// (tokio, reqwest, hf-hub, candle, etc.) and routes them through our
+// (tokio, reqwest, hf-hub, native model runtimes, etc.) and routes them through our
 // output macros so they appear in the TUI instead of printing directly.
 
 use std::fmt;

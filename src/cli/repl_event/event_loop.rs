@@ -1964,8 +1964,6 @@ impl EventLoop {
             generator: qwen_gen,
             router,
             state: generator_state,
-            local: local_generator,
-            tokenizer,
             resolver: provider_resolver,
             available: available_providers,
             active_index: active_provider_index,
@@ -2097,9 +2095,6 @@ impl EventLoop {
             event_tx.clone(),
             Arc::clone(&tool_executor),
             Arc::clone(&output_manager),
-            Arc::clone(&conversation),
-            Arc::clone(&local_generator),
-            Arc::clone(&tokenizer),
             Arc::clone(&mode),
             Arc::clone(&plan_content),
         )

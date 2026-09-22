@@ -95,7 +95,7 @@ adapters (Claude, Qwen, daemon-local) stay in `src/generators`.
   semantic identities. `finch-providers` compiles those into per-request
   bijective wire-binding tables (issue #241) at the validated dispatch
   boundary; this crate must keep storing semantic names, not provider aliases.
-- Local model architecture rewrite (ONNX/Candle/Qwen internals) is out of scope.
+- Local llama.cpp/GGUF loader and Qwen adapter internals are out of scope.
 - Rustdoc, not a checked-in generated catalog, supplies trait method signatures, including
   asynchronous `GenerationBackend::generate` and `Sleeper::sleep`.
 - `GenerationPorts` progress/loader/cache/telemetry/scheduler are construction

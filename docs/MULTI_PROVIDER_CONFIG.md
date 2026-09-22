@@ -2,7 +2,7 @@
 
 Finch's configuration accepts entries for multiple cloud AI providers (Claude, OpenAI, Grok,
 Gemini, Mistral, Groq, and others — see the provider entry types in `src/config/provider.rs`) and
-the local ONNX model, all configured through a unified `[[providers]]` array in
+local llama.cpp/GGUF chat models, all configured through a unified `[[providers]]` array in
 `~/.finch/config.toml`. Configuration support is not end-to-end conformance: routing and
 provider parity remain active work (see the root `README.md` provider section).
 
@@ -81,15 +81,17 @@ api_key = "gsk_..."
 model = "llama-3.3-70b-versatile"  # optional
 ```
 
-### Local Model (ONNX)
+### Local Model (llama.cpp/GGUF)
 
 ```toml
 [[providers]]
 type = "local"
-inference_provider = "onnx"
-execution_target = "coreml"   # "coreml" (Apple Silicon) | "cpu"
+inference_provider = "llama_cpp"
+execution_target = "auto"     # "auto" (Metal on supported Macs) | "cpu"
 model_family = "qwen2"
 model_size = "medium"         # "small"=1.5B "medium"=3B "large"=7B "xlarge"=14B
+# Omit model_path for a supported managed download, or provide an existing absolute .gguf file.
+# model_path = "/absolute/path/to/chat-model.gguf"
 enabled = true
 ```
 
@@ -116,8 +118,8 @@ api_key = "sk-proj-..."
 
 [[providers]]
 type = "local"
-inference_provider = "onnx"
-execution_target = "coreml"
+inference_provider = "llama_cpp"
+execution_target = "auto"
 model_family = "qwen2"
 model_size = "medium"
 enabled = true
