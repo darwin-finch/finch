@@ -67,17 +67,13 @@ fn display_name(path: &Path, configured_family: Option<&str>) -> Result<String> 
 }
 
 /// GGUF text-generation backend selected explicitly by the local model loader.
-pub struct LlamaCppGenerator {
+pub(in crate::models) struct LlamaCppGenerator {
     model: Arc<LlamaModel>,
     name: String,
 }
 
 impl LlamaCppGenerator {
-    /// Load a local GGUF artifact without downloading or changing global defaults.
-    pub fn load(path: &Path) -> Result<Self> {
-        Self::load_with_offload(path, true, None)
-    }
-
+    /// Load a local chat GGUF under the configured family and offload policy.
     pub(in crate::models) fn load_with_offload(
         path: &Path,
         allow_gpu_offload: bool,
@@ -300,9 +296,10 @@ mod tests {
 
     #[test]
     fn test_missing_gguf_fails_before_native_initialization() {
-        let error = LlamaCppGenerator::load(Path::new("/nonexistent/finch.gguf"))
-            .err()
-            .expect("missing GGUF must fail");
+        let error =
+            LlamaCppGenerator::load_with_offload(Path::new("/nonexistent/finch.gguf"), true, None)
+                .err()
+                .expect("missing GGUF must fail");
         assert!(error.to_string().contains("does not exist"), "{error:#}");
     }
 
@@ -334,7 +331,8 @@ mod tests {
     #[ignore = "requires FINCH_TEST_GGUF_CHAT pointing to a local chat GGUF"]
     fn test_real_gguf_chat_generates_tokens() {
         let path = std::env::var("FINCH_TEST_GGUF_CHAT").expect("set FINCH_TEST_GGUF_CHAT");
-        let mut generator = LlamaCppGenerator::load(Path::new(&path)).expect("load GGUF chat");
+        let mut generator = LlamaCppGenerator::load_with_offload(Path::new(&path), true, None)
+            .expect("load GGUF chat");
         assert!(
             !generator.name().contains('/'),
             "public model identity must not reveal its local path"
