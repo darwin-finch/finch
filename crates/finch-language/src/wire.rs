@@ -13,17 +13,17 @@ use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 /// Version of the published compact-wire GBNF.
-pub const WIRE_GRAMMAR_VERSION: u32 = 1;
+pub(crate) const WIRE_GRAMMAR_VERSION: u32 = 1;
 
 /// Path of the committed grammar artifact, relative to the repository root.
-pub const WIRE_GRAMMAR_ARTIFACT: &str = "vocabulary/language/wire.gbnf";
+pub(crate) const WIRE_GRAMMAR_ARTIFACT: &str = "vocabulary/language/wire.gbnf";
 
 #[cfg(test)]
 const PUBLISHED_WIRE_GBNF: &str = include_str!("../../../vocabulary/language/wire.gbnf");
 
 /// Why a compact-wire submission was rejected before compilation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WireReject {
+pub(crate) struct WireReject {
     /// Stable diagnostic code such as `E-WIRE-002` or `E-READ-008`.
     pub code: String,
     /// Human-readable reason. Not a semantic safety proof.
@@ -41,7 +41,8 @@ impl std::fmt::Display for WireReject {
 /// Dispatch uses [`ProgramLanguage::infer_wire_source`]. Lisp uses the CoLisp
 /// reader; Co-Forth uses the Co-Forth tokenizer plus syntactic completeness.
 /// Unknown words are accepted.
-pub fn accepts_wire_source(source: &str) -> Result<ProgramLanguage, WireReject> {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn accepts_wire_source(source: &str) -> Result<ProgramLanguage, WireReject> {
     let language = ProgramLanguage::infer_wire_source(source).map_err(dispatch_reject)?;
     match language {
         ProgramLanguage::Lisp => {
@@ -69,12 +70,13 @@ pub fn accepts_wire_source(source: &str) -> Result<ProgramLanguage, WireReject> 
 }
 
 /// True when the published GBNF accepts `source` as a complete submission.
-pub fn accepts_published_grammar(source: &str) -> bool {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn accepts_published_grammar(source: &str) -> bool {
     gbnf::matches(published_grammar(), source)
 }
 
 /// Render the canonical compact-wire GBNF from production reader lexicons.
-pub fn render_wire_gbnf() -> String {
+pub(crate) fn render_wire_gbnf() -> String {
     let lisp = lisp_lexicon();
     let forth = forth_lexicon();
     let mut out = String::new();
