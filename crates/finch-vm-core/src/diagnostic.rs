@@ -34,7 +34,7 @@ pub enum DiagnosticPhase {
 
 impl DiagnosticPhase {
     /// The phase as a reader would name it, matching the serialised form.
-    pub fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Reader => "reader",
             Self::MacroExpansion => "macro expansion",
@@ -75,20 +75,6 @@ pub struct SourceSpan {
     pub start_column: usize,
     pub end_line: usize,
     pub end_column: usize,
-}
-
-impl SourceSpan {
-    pub fn bytes(source_id: impl Into<String>, start_byte: usize, end_byte: usize) -> Self {
-        Self {
-            source_id: source_id.into(),
-            start_byte,
-            end_byte,
-            start_line: 0,
-            start_column: 0,
-            end_line: 0,
-            end_column: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
