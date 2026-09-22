@@ -31,7 +31,7 @@ impl ProviderGenerationBackend {
     }
 
     /// Wrap a provider pinned to `model`, or the provider default when `None`.
-    pub fn for_model(provider: Arc<dyn LlmProvider>, model: Option<&str>) -> Result<Self> {
+    fn for_model(provider: Arc<dyn LlmProvider>, model: Option<&str>) -> Result<Self> {
         let model = model.unwrap_or_else(|| provider.default_model());
         let identity = BackendRef::new(provider.name(), model, BackendKind::Cloud)?;
         let descriptor = provider.capabilities(model);

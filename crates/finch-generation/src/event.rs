@@ -12,13 +12,8 @@ pub struct GenerationId(Uuid);
 
 impl GenerationId {
     /// Mint a new attempt id.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Uuid::new_v4())
-    }
-
-    /// Underlying UUID.
-    pub fn as_uuid(self) -> Uuid {
-        self.0
     }
 }
 
@@ -67,8 +62,8 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
-    /// Successful result.
-    pub fn success(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+    #[cfg(test)]
+    fn success(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             tool_call_id: tool_call_id.into(),
             content: content.into(),
@@ -76,8 +71,8 @@ impl ToolResult {
         }
     }
 
-    /// Failed result.
-    pub fn error(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+    #[cfg(test)]
+    fn error(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             tool_call_id: tool_call_id.into(),
             content: content.into(),
@@ -161,7 +156,7 @@ pub enum TerminalOutcome {
 
 impl TerminalOutcome {
     /// Identity recorded on this terminal.
-    pub fn identity(&self) -> &GenerationIdentity {
+    pub(crate) fn identity(&self) -> &GenerationIdentity {
         match self {
             Self::Completed { metadata, .. } => &metadata.identity,
             Self::Cancelled { identity }
@@ -230,13 +225,6 @@ pub enum GenerationEvent {
     Route(RouteDecision),
     /// Exactly-once terminal. No events follow.
     Terminal(TerminalOutcome),
-}
-
-impl GenerationEvent {
-    /// True for the unique terminal event.
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Terminal(_))
-    }
 }
 
 #[cfg(test)]

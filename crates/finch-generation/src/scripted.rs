@@ -67,7 +67,7 @@ impl ScriptedBackend {
     }
 
     /// Replace the readiness report (background-load tests).
-    pub fn set_readiness(&self, report: ReadinessReport) {
+    fn set_readiness(&self, report: ReadinessReport) {
         *self.readiness.lock().expect("readiness lock") = report;
     }
 

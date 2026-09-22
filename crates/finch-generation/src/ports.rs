@@ -49,6 +49,7 @@ impl FrozenMonotonicClock {
     }
 
     /// Advance the clock by `delta_ms`.
+    #[cfg(test)]
     pub fn advance(&self, delta_ms: u64) {
         self.now_ms.fetch_add(delta_ms, Ordering::SeqCst);
     }
@@ -79,7 +80,7 @@ impl Sleeper for TokioSleeper {
 
 /// Sleeper that never waits. Suitable only for tests that do not race timeout
 /// against a live backend.
-pub struct InstantSleeper;
+struct InstantSleeper;
 
 #[async_trait]
 impl Sleeper for InstantSleeper {
@@ -120,7 +121,7 @@ pub trait ProgressSink: Send + Sync {
 }
 
 /// Tracing progress sink.
-pub struct TracingProgress;
+struct TracingProgress;
 
 impl ProgressSink for TracingProgress {
     fn report(&self, phase: LoadPhase, elapsed_ms: u64) {
@@ -144,7 +145,7 @@ pub trait HardwareDiscovery: Send + Sync {
 }
 
 /// Unknown-hardware default.
-pub struct UnknownHardware;
+struct UnknownHardware;
 
 impl HardwareDiscovery for UnknownHardware {
     fn snapshot(&self) -> HardwareSnapshot {
@@ -162,7 +163,7 @@ pub trait ModelLoader: Send + Sync {
 }
 
 /// Loader that reports ready without claiming a real model is loaded.
-pub struct ReadyLoader;
+struct ReadyLoader;
 
 impl ModelLoader for ReadyLoader {
     fn phase(&self) -> LoadPhase {
@@ -177,7 +178,7 @@ pub trait ArtifactCache: Send + Sync {
 }
 
 /// Empty cache.
-pub struct EmptyCache;
+struct EmptyCache;
 
 impl ArtifactCache for EmptyCache {
     fn has(&self, _key: &str) -> bool {
@@ -192,7 +193,7 @@ pub trait GenerationTelemetry: Send + Sync {
 }
 
 /// Tracing telemetry.
-pub struct TracingTelemetry;
+struct TracingTelemetry;
 
 impl GenerationTelemetry for TracingTelemetry {
     fn event(&self, name: &str, fields: &[(&str, &str)]) {
@@ -207,7 +208,7 @@ pub trait BlockingScheduler: Send + Sync {
 }
 
 /// Scheduler that runs work immediately. Deterministic in tests.
-pub struct InlineScheduler;
+struct InlineScheduler;
 
 impl BlockingScheduler for InlineScheduler {
     fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
@@ -237,20 +238,6 @@ pub struct GenerationPorts {
 }
 
 impl GenerationPorts {
-    /// Production ports: wall monotonic clock, tokio sleep, tracing sinks.
-    pub fn production() -> Self {
-        Self {
-            clock: Arc::new(SystemMonotonicClock::default()),
-            sleeper: Arc::new(TokioSleeper),
-            progress: Arc::new(TracingProgress),
-            loader: Arc::new(ReadyLoader),
-            cache: Arc::new(EmptyCache),
-            hardware: Arc::new(UnknownHardware),
-            telemetry: Arc::new(TracingTelemetry),
-            scheduler: Arc::new(InlineScheduler),
-        }
-    }
-
     /// Deterministic test ports with a frozen clock and instant sleeper.
     pub fn test() -> Self {
         Self {

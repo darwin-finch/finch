@@ -35,7 +35,7 @@ pub struct ResourceBudget {
 
 impl ResourceBudget {
     /// Construct an unbounded budget.
-    pub fn unlimited() -> Self {
+    fn unlimited() -> Self {
         Self {
             max_output_tokens: None,
             timeout: None,
@@ -66,7 +66,7 @@ pub struct GenerationCapabilities {
 
 impl GenerationCapabilities {
     /// Construct capabilities for a scripted or unknown backend.
-    pub fn for_strategy(strategy: GenerationStrategy) -> Self {
+    pub(crate) fn for_strategy(strategy: GenerationStrategy) -> Self {
         Self {
             streaming: true,
             tools: true,
@@ -113,12 +113,6 @@ impl GenerationRequest {
             cancellation: CancellationToken::new(),
             allow_fallback: false,
         }
-    }
-
-    /// Attach tool schemas.
-    pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
-        self.tools = Some(tools);
-        self
     }
 
     /// Attach a budget.
