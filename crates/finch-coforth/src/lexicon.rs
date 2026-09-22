@@ -146,7 +146,7 @@ pub fn forth_lexicon() -> ForthLexicon {
 }
 
 /// Bytes that end a Co-Forth word in the generic (non-type) token loop.
-pub fn forth_word_terminator(byte: u8) -> bool {
+pub(crate) fn forth_word_terminator(byte: u8) -> bool {
     let lex = forth_lexicon();
     byte.is_ascii_whitespace()
         || byte == lex.comma_separator as u8
