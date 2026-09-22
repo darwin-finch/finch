@@ -63,7 +63,7 @@ pub struct ReadinessReport {
 
 impl ReadinessReport {
     /// Construct a ready report with no load failure.
-    pub fn ready(elapsed: Duration, resources: ResourceMetadata) -> Self {
+    pub(crate) fn ready(elapsed: Duration, resources: ResourceMetadata) -> Self {
         Self {
             state: Readiness::Ready,
             phase: Some(LoadPhase::Ready),
