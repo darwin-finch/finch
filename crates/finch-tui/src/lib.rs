@@ -4591,7 +4591,7 @@ mod tests {
     use super::*;
     use crate::vt_oracle::{VtColor, VtOracle, VtStyle};
     use finch_diff::{summarize_files, DiffColorMode, FileDiff};
-    use finch_messages::{Message, MessageId, MessageRef, WorkUnit};
+    use finch_messages::{Message, MessageId, MessageRef, StaticMessage, WorkUnit};
     use finch_theme::ColorTheme;
 
     #[test]
@@ -7298,6 +7298,47 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    // ── Stage-3 components render at the claiming boundary (#1120) ─────────
+
+    /// INVARIANT (stage 3, #1120): a StaticMessage renders its text through
+    /// the component accessor at the claiming boundary — one glyph-prefixed
+    /// line per content line, no SGR, no legacy `format()` fallback path
+    /// (which would carry baked color bytes instead).
+    #[test]
+    fn test_static_message_renders_text_through_its_component() {
+        let mut renderer = headless_renderer();
+        let message: MessageRef = Arc::new(StaticMessage::error("Provider unreachable"));
+        let lines = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = lines.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["❌ Provider unreachable"],
+            "the static text is its view: one error-glyph line; got {rendered:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.text.contains('\x1b')),
+            "the component emits plain text — the retired format() SGR bytes must not \
+             ride the component path; got {rendered:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.row_id.is_none() && !line.component_owned),
+            "a static text row claims no hit target and no component routing"
+        );
+
+        // Plain passthrough: pre-formatted content is byte-exact.
+        let raw: MessageRef = Arc::new(StaticMessage::plain("\x1b[32m[tool] styled\x1b[0m"));
+        let plain = renderer.projected_message_lines(&raw, 80);
+        assert_eq!(
+            plain
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>(),
+            vec!["\x1b[32m[tool] styled\x1b[0m"],
+            "Plain content passes through byte-exactly"
+        );
+    }
     fn paint_slash_completions(renderer: &mut TuiRenderer) {
         renderer.update_ghost_text();
         completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);

@@ -3,9 +3,10 @@
 // Each message type has its own update interface appropriate for its use case.
 // No need for downcasting - handlers receive concrete types directly.
 
-use super::{Message, MessageId, MessageStatus};
+use super::{ComponentView, Message, MessageId, MessageStatus};
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use finch_theme::{ColorScheme, ColorSpec, MessageBand};
+use finch_ui_model::{StaticTextKind, StaticTextView};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -1044,6 +1045,22 @@ impl StaticMessage {
 impl Message for StaticMessage {
     fn id(&self) -> MessageId {
         self.id
+    }
+
+    /// Stage 3 (#1120): the text IS this component's view. The snapshot is
+    /// constructed from the immutable fields — no lock is involved — and the
+    /// renderer renders it through the generalized accessor.
+    fn component_view(&self) -> Option<ComponentView> {
+        Some(ComponentView::StaticText(StaticTextView {
+            kind: match self.message_type {
+                StaticMessageType::Info => StaticTextKind::Info,
+                StaticMessageType::Error => StaticTextKind::Error,
+                StaticMessageType::Success => StaticTextKind::Success,
+                StaticMessageType::Warning => StaticTextKind::Warning,
+                StaticMessageType::Plain => StaticTextKind::Plain,
+            },
+            content_lines: self.content.lines().map(str::to_owned).collect(),
+        }))
     }
 
     fn format(&self, colors: &ColorScheme) -> String {

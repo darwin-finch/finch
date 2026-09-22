@@ -29,6 +29,31 @@ pub enum ComponentView {
     /// generalized hook, and the `Message::say_turn_view` hook stays for the
     /// consolidated-source pairing helper and the disclosure-direction read.
     Say(SayTurnView),
+    /// A static text message (#1120, stage 3): the text IS its view.
+    StaticText(StaticTextView),
+}
+
+/// The ViewModel of a [`ComponentView::StaticText`] component: the message's
+/// immutable content and the kind that decides its glyph. A `StaticMessage`
+/// has no mutable state to retain — the content itself is the ViewModel —
+/// and the message constructs the snapshot from its own immutable fields; no
+/// lock is involved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticTextView {
+    pub kind: StaticTextKind,
+    pub content_lines: Vec<String>,
+}
+
+/// Which glyph a static text row wears. Byte-compatible with the retired
+/// `format()` presentation: `Plain` passes the content through with no
+/// prefix, so pre-formatted text reaches the record byte-exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaticTextKind {
+    Info,
+    Error,
+    Success,
+    Warning,
+    Plain,
 }
 
 /// Render one component snapshot into the transcript lines it claims this
@@ -38,7 +63,33 @@ pub enum ComponentView {
 pub fn component_lines(view: &ComponentView) -> Vec<RenderedTranscriptLine> {
     match view {
         ComponentView::Say(say) => crate::say_turn_lines(say),
+        ComponentView::StaticText(static_text) => static_text_lines(static_text),
     }
+}
+
+/// A static text row's lines: one glyph-prefixed line per content line. An
+/// empty content renders one empty line so the row still claims its place in
+/// the transcript.
+fn static_text_lines(view: &StaticTextView) -> Vec<RenderedTranscriptLine> {
+    let prefix = match view.kind {
+        StaticTextKind::Info => "ℹ️  ",
+        StaticTextKind::Error => "❌ ",
+        StaticTextKind::Success => "✓ ",
+        StaticTextKind::Warning => "⚠️  ",
+        StaticTextKind::Plain => "",
+    };
+    let lines = if view.content_lines.is_empty() {
+        vec![String::new()]
+    } else {
+        view.content_lines.clone()
+    };
+    lines
+        .into_iter()
+        .map(|line| RenderedTranscriptLine {
+            text: format!("{prefix}{line}"),
+            ..RenderedTranscriptLine::default()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -131,6 +182,92 @@ mod tests {
         assert_eq!(
             rect.height, 3,
             "prose + blank + annotation claim three rows; got {rect:?}"
+        );
+    }
+
+    // ── StaticMessage: text is its view (#1120 stage 3) ─────────────────────
+
+    fn static_view(kind: StaticTextKind, content: &str) -> StaticTextView {
+        StaticTextView {
+            kind,
+            content_lines: content.lines().map(str::to_owned).collect(),
+        }
+    }
+
+    fn static_texts(kind: StaticTextKind, content: &str) -> Vec<String> {
+        component_lines(&ComponentView::StaticText(static_view(kind, content)))
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    /// INVARIANT (#1120): a StaticMessage's text IS its view — the component
+    /// renders one glyph-prefixed line per content line, byte-compatible with
+    /// the retired `format()` presentation.
+    #[test]
+    fn test_static_text_renders_one_glyph_prefixed_line_per_content_line() {
+        assert_eq!(
+            static_texts(StaticTextKind::Error, "Provider unreachable"),
+            vec!["❌ Provider unreachable"],
+            "an error row wears the error glyph"
+        );
+        assert_eq!(
+            static_texts(StaticTextKind::Info, "line one\nline two"),
+            vec!["ℹ️  line one", "ℹ️  line two"],
+            "each content line carries the prefix"
+        );
+        assert_eq!(
+            static_texts(StaticTextKind::Success, "done"),
+            vec!["✓ done"],
+            "a success row wears the check glyph"
+        );
+        assert_eq!(
+            static_texts(StaticTextKind::Warning, "careful"),
+            vec!["⚠️  careful"],
+            "a warning row wears the warning glyph"
+        );
+    }
+
+    /// INVARIANT: `Plain` passes pre-formatted content through with no prefix
+    /// and no SGR, so text that already carries its own presentation reaches
+    /// the record byte-exactly.
+    #[test]
+    fn test_static_plain_text_is_byte_exact_passthrough() {
+        let content = "\x1b[32m[tool] styled output\x1b[0m\nsecond line";
+        assert_eq!(
+            static_texts(StaticTextKind::Plain, content),
+            content.lines().map(str::to_owned).collect::<Vec<_>>(),
+            "Plain content is the view itself: no glyph, no prefix, no mutation"
+        );
+    }
+
+    /// A subwidget with nothing to show still claims one empty row (the
+    /// furniture rule for a static row is one row minimum), and the snapshot
+    /// is a plain-data value the message can hand out repeatedly.
+    #[test]
+    fn test_static_text_empty_content_claims_one_row_and_snapshot_is_plain_data() {
+        let empty = static_view(StaticTextKind::Plain, "");
+        assert_eq!(
+            static_texts(StaticTextKind::Plain, ""),
+            vec![String::new()],
+            "empty content renders one empty line so the row claims its place"
+        );
+        let first = component_lines(&ComponentView::StaticText(empty.clone()));
+        let second = component_lines(&ComponentView::StaticText(empty));
+        assert_eq!(
+            first, second,
+            "rendering is a pure function of the snapshot"
+        );
+        let _layout = crate::layout(
+            &Widget::Text {
+                lines: first.into_iter().map(|line| line.text).collect(),
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 4,
+            },
         );
     }
 }
