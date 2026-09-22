@@ -365,8 +365,7 @@ impl Command {
         if trimmed.starts_with(": ") {
             return Some(Command::ForthEval(trimmed.to_string()));
         }
-        // Typed Co-Forth eval via /forth. The former semiotic interpreter has
-        // no public evaluation command.
+        // Typed Co-Forth eval via /forth, executed in the typed VM.
         if let Some(rest) = trimmed.strip_prefix("/forth ") {
             let expr = rest.trim();
             if !expr.is_empty() {

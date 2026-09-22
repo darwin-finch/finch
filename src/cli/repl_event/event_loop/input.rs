@@ -712,7 +712,7 @@ Rules:\n\
         // Plain terminal text is always a user turn. Executable source is
         // deliberately explicit: Lisp begins with `(`, typed definitions begin
         // with `:`, and other Co-Forth uses `/forth`. Never classify prose by
-        // asking the historical semiotic dictionary whether its words exist.
+        // whether its words resemble program vocabulary.
         self.execute_query(input).await
     }
 
