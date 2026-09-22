@@ -32,6 +32,15 @@ loaders import CLI presentation code.
 end-to-end provider or local-model conformance. Do not change ONNX/Candle/loader/routing/training
 behavior in a facade commit.
 
+The opt-in `llama-cpp` feature loads a caller-supplied chat-LLM `.gguf` file through
+`backend.model_path`; that user-configured model selector must not also select memory's
+embedding/reranking models.
+It owns the process-wide llama.cpp backend and creates a fresh context per generation request.
+Memory model selection and persisted embedding identity belong to the separate memory work.
+`execution_target = auto` permits GPU offload on macOS when the compiled llama.cpp backend
+reports it; `cpu` forbids offload. Linux remains CPU-only in this pilot. ONNX and Candle are
+legacy paths pending measured cutover, not removed or silently substituted by this pilot.
+
 **One family declaration, claims from the catalog.** `unified_loader::ModelFamily` is the single
 model-family declaration (its variant names are the persisted config wire form; a source-scan test
 fails if a second enum reappears). Family capability claims exist only as

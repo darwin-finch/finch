@@ -43,6 +43,8 @@ impl ModelCompatibility {
     /// Get repository ID for a specific size and provider
     pub fn get_repository(&self, provider: InferenceProvider, size: ModelSize) -> Option<String> {
         match provider {
+            #[cfg(feature = "llama-cpp")]
+            InferenceProvider::LlamaCpp => None,
             InferenceProvider::Onnx => {
                 // Check for size-specific override first
                 if let Some(size_repos) = self.onnx_size_repos {

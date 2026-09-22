@@ -117,6 +117,10 @@ jobs:
     - name: Compile all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} --no-run
 
+    - name: Compile opt-in llama.cpp local engine on Linux CPU
+      if: matrix.feature_name == 'default'
+      run: cargo check --features llama-cpp --lib
+
     - name: Test all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
 

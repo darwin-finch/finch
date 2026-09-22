@@ -1990,6 +1990,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         let device = config.backend.execution_target;
         let coreml = config.backend.coreml;
         let model_repo = config.backend.model_repo.clone();
+        let model_path = config.backend.model_path.clone();
         tokio::spawn(async move {
             if let Err(e) = loader_clone
                 .load_generator_async(
@@ -1999,6 +2000,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                     device,
                     coreml,
                     model_repo,
+                    model_path,
                 )
                 .await
             {
