@@ -1387,9 +1387,11 @@ pub(crate) async fn process_query_with_tools(
             // grounding through an entire multi-tool task rather than
             // losing it between continuations.
             let committed_before = memory_commitment.mirror.read().await.clone();
-            if let Some(stable_block) = render_committed_memories(&committed_before) {
+            let committed_presented = present_committed(&committed_before);
+            if let Some(stable_block) = render_presented_block(&committed_presented) {
                 inject_committed_memories_prefix(stable_block, &mut msgs);
             }
+            let mut presented_recall = committed_presented;
 
             // Fresh recall, the transient tail, and the commit/decay
             // decision are tied to a genuine new question, not to every
@@ -1424,14 +1426,11 @@ pub(crate) async fn process_query_with_tools(
                         .iter()
                         .filter(|r| !committed_ids.contains(&r.node_id))
                         .collect();
-                    if !transient.is_empty() {
-                        let mem_block = transient
-                            .iter()
-                            .map(|r| r.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n\n---\n\n");
+                    let transient_presented = present_transient(&transient);
+                    if let Some(mem_block) = render_presented_block(&transient_presented) {
                         inject_recall_prefix(mem_block, &mut msgs);
                     }
+                    presented_recall.extend(transient_presented);
 
                     let config = mem.config();
                     let stale_before = memory_commitment.stale_counts.read().await.clone();
@@ -1468,6 +1467,19 @@ pub(crate) async fn process_query_with_tools(
                     memory_recall.line(),
                 );
             }
+            // A direct `output_manager` call, not a `ReplEvent` -- this
+            // function is itself the query task, and the response's own
+            // WorkUnit (below, `output_manager.start_work_unit`) is created
+            // this same way a few lines later. Routing this through the
+            // event channel instead raced it against that direct call from
+            // a completely different task (the main event loop, consuming
+            // `event_tx` concurrently): nothing ordered "my event gets
+            // processed" before "the query task reaches its own next line",
+            // so "before the response" would have been a usual-case
+            // coincidence, not a guarantee. Calling `output_manager`
+            // synchronously, right here, makes the ordering structural
+            // instead.
+            display_recalled_memories(output_manager.as_ref(), &presented_recall);
         }
         // This execution contract is required on *every* provider inference,
         // including internal empty-query continuations after tool results.
@@ -2213,36 +2225,134 @@ fn should_stream_responses(streaming_enabled: bool, provider_supports_streaming:
 /// (user, assistant, user), and ending on `user` keeps the request valid
 /// for generation. The recall block stays transient (never written to
 /// stored history), matching prior behaviour.
+///
+/// Trailing after the question is a real cost, not a free choice: the model
+/// generates its answer as a continuation from wherever the request ends, so
+/// whatever's here has to pull it back to a question it already "moved past"
+/// once. Both messages are worded as an explicit instruction rather than a
+/// passive label for exactly that reason -- moving the block earlier instead
+/// would fix the attention concern outright, but at the cost above, so this
+/// is the mitigation that doesn't touch it.
 fn inject_recall_prefix(mem_block: String, messages: &mut Vec<crate::providers::Message>) {
     if messages.is_empty() {
         return;
     }
     messages.push(crate::providers::Message::assistant(
-        "Noted -- continuing to address your message above.",
+        "Noted -- I'll factor in whatever relevant memory follows before answering.",
     ));
     messages.push(crate::providers::Message::user(format!(
-        "[Relevant memories from past sessions, provided as context for your \
-         previous message:\n\n{}]",
+        "[Relevant memories from past sessions, surfaced for the question you \
+         just asked above. Use whatever here actually bears on it; ignore \
+         the rest. Now answer that question:\n\n{}]",
         mem_block
     )));
 }
 
-/// Render the committed (byte-stable) memory set as the text of the stable
-/// prefix block, or `None` when the set is empty.
+/// Which of the two recall tiers a [`PresentedRecall`] came from (#940's
+/// committed/transient split: the committed set is byte-stable across turns
+/// until staleness evicts it, the transient set is this turn's fresh match
+/// not yet -- or no longer -- committed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallTier {
+    Committed,
+    Transient,
+}
+
+/// One recalled memory's retrieval-time presentation decision (#8's raw-vs-
+/// summarize gate, `recall_gate`), paired with the identity/tier needed for
+/// the visible recall row. Storage's own text is never touched -- this is
+/// purely how a turn's request (and the row reflecting it) renders it.
+struct PresentedRecall {
+    node_id: u64,
+    score: f32,
+    tier: RecallTier,
+    presentation: super::recall_gate::RecallPresentation,
+}
+
+/// Show a collapsed-by-default row for what was actually injected this turn
+/// (#8), or nothing at all when `presented` is empty -- a query with no
+/// relevant memory shows no recall row. Reuses the same
+/// `WorkUnit`/`set_activity_presentation` mechanism tool-activity rows
+/// already use, so it gets the existing accordion collapse/expand for free;
+/// no new TUI plumbing needed.
+fn display_recalled_memories(
+    output_manager: &crate::cli::output_manager::OutputManager,
+    presented: &[PresentedRecall],
+) {
+    if presented.is_empty() {
+        return;
+    }
+    let count = presented.len();
+    let noun = if count == 1 { "memory" } else { "memories" };
+    let unit = output_manager.start_work_unit("Recalling");
+    unit.set_activity_presentation(format!("{count} {noun} retrieved"));
+    for entry in presented {
+        let tier = match entry.tier {
+            RecallTier::Committed => "committed",
+            RecallTier::Transient => "recalled",
+        };
+        let label = format!("{tier} · score {:.2} · node {}", entry.score, entry.node_id);
+        let row_idx = unit.add_row(label);
+        let summary = match &entry.presentation {
+            super::recall_gate::RecallPresentation::Raw(text) => {
+                format!("{} chars, sent raw", text.len())
+            }
+            super::recall_gate::RecallPresentation::Summarized { summary, raw_len } => {
+                format!("summarized from {raw_len} chars to {}", summary.len())
+            }
+        };
+        let body: Vec<String> = entry
+            .presentation
+            .text()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        unit.complete_row_with_body(row_idx, summary, body);
+    }
+}
+
+fn present_committed(committed: &[crate::brain::CommittedMemoryRecord]) -> Vec<PresentedRecall> {
+    committed
+        .iter()
+        .map(|memory| PresentedRecall {
+            node_id: memory.node_id,
+            score: memory.score,
+            tier: RecallTier::Committed,
+            presentation: super::recall_gate::present(&memory.text),
+        })
+        .collect()
+}
+
+fn present_transient(transient: &[&finch_memory::RecalledMemory]) -> Vec<PresentedRecall> {
+    transient
+        .iter()
+        .map(|recalled| PresentedRecall {
+            node_id: recalled.node_id,
+            score: recalled.score,
+            tier: RecallTier::Transient,
+            presentation: super::recall_gate::present(&recalled.text),
+        })
+        .collect()
+}
+
+/// Render a presented recall set as the text of a prefix block, or `None`
+/// when empty.
 ///
-/// Deterministic given the same `committed` slice: `decide_committed_memories`
-/// always returns its result sorted by `node_id`, so this block's bytes only
-/// change when the committed set itself changes -- the `SummaryCache`
-/// invariant shape (`src/cli/conversation_compactor.rs`), applied to recall
-/// instead of conversation summary (#940).
-fn render_committed_memories(committed: &[crate::brain::CommittedMemoryRecord]) -> Option<String> {
-    if committed.is_empty() {
+/// Deterministic given the same input slice -- `recall_gate::present` is a
+/// pure function of the text, and for the committed tier
+/// `decide_committed_memories` always returns its result sorted by
+/// `node_id` -- so this block's bytes only change when the underlying set
+/// itself changes: the `SummaryCache` invariant shape
+/// (`src/cli/conversation_compactor.rs`), applied to recall instead of
+/// conversation summary (#940).
+fn render_presented_block(presented: &[PresentedRecall]) -> Option<String> {
+    if presented.is_empty() {
         return None;
     }
     Some(
-        committed
+        presented
             .iter()
-            .map(|memory| memory.text.as_str())
+            .map(|p| p.presentation.text())
             .collect::<Vec<_>>()
             .join("\n\n---\n\n"),
     )
@@ -2259,11 +2369,17 @@ fn inject_committed_memories_prefix(
     stable_block: String,
     messages: &mut Vec<crate::providers::Message>,
 ) {
-    messages.insert(0, crate::providers::Message::assistant("Noted."));
+    messages.insert(
+        0,
+        crate::providers::Message::assistant(
+            "Noted -- I'll keep this in mind for the rest of this conversation.",
+        ),
+    );
     messages.insert(
         0,
         crate::providers::Message::user(format!(
-            "[Committed memories from past sessions:\n\n{}]",
+            "[Committed memories from past sessions: durable context that applies \
+             for the rest of this conversation, not only the next message:\n\n{}]",
             stable_block
         )),
     );

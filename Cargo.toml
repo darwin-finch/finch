@@ -171,6 +171,12 @@ uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 # Text processing for TF-IDF
 rust-stemmers = "1.2"
 
+# Compressed-size ratio as a cheap redundancy signal for the memory-recall
+# summarization gate (#8: raw vs. extractive-summary at injection time).
+# Pure-Rust DEFLATE backend -- no C toolchain dependency for a signal this
+# small.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # Terminal display-cell widths for the component width vocabulary (#934);
 # the same tables the test-only vt_oracle terminal model uses.
 unicode-width = "0.2"
