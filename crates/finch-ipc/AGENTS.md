@@ -3,8 +3,9 @@
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
 **Owns** `crates/finch-ipc/`: the generated Cap'n Proto namespace facade, protocol-generation and health
-helpers, event bus, JSON-value wire translation, and socket-path helpers. The frontend application
-client adapter lives in `src/client`; the daemon RPC implementation, listener lifecycle, dispatch,
+helpers, JSON-value wire translation, and socket-path helpers. The event-bus harness is test-only,
+not part of the production wire contract. The frontend application client adapter lives in
+`src/client`; the daemon RPC implementation, listener lifecycle, dispatch,
 and authority enforcement live in `src/server`. Brain-envelope translation lives with Brain, and
 typed-runtime checkpoint/frame translation lives with runtime.
 

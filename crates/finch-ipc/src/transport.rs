@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 /// Default path for the IPC Unix domain socket.
-pub const DAEMON_SOCK_PATH: &str = "~/.finch/daemon.sock";
+pub(crate) const DAEMON_SOCK_PATH: &str = "~/.finch/daemon.sock";
 
 /// Expand `~/` prefix in a socket path.
 pub fn sock_path() -> PathBuf {
