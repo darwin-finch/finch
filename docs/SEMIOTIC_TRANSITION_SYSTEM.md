@@ -108,8 +108,9 @@ unresolved cases.
   or Brain-control authority.
 - Any bridge into Finch host effects must pass through the ordinary typed capability verifier and
   approval policy.
-- The legacy semiotic Co-Forth interpreter is historical implementation, not the foundation of this
-  experiment; reuse requires a separate technical evaluation.
+- The legacy semiotic Co-Forth interpreter has been deleted; the typed Co-Forth dialect served by
+  `--forth` and `/forth` is not its successor, and reviving the deleted interpreter would require a
+  separate technical evaluation.
 
 ## Open questions
 
