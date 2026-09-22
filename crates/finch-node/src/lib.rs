@@ -3,7 +3,7 @@
 // Every finch instance is a node. Nodes have:
 //   - A stable UUID (persisted to ~/.finch/node_id)
 //   - Capabilities (what models it can run, what RAM it has)
-//   - Work statistics (queries processed, latency, local vs. teacher)
+//   - Work statistics (queries processed, latency, local vs. cloud)
 //
 // This is the foundation for the distributed worker network where old
 // laptops accept delegated work and earn reputation.
@@ -283,8 +283,10 @@ pub struct NodeCapabilities {
     pub ram_gb: usize,
     /// Local model available (None = cloud-only mode)
     pub local_model: Option<String>,
-    /// Whether a teacher API is configured
-    pub has_teacher_api: bool,
+    /// Whether a cloud provider API is configured. The serde alias keeps
+    /// payloads produced before the rename deserializable.
+    #[serde(alias = "has_teacher_api")]
+    pub has_cloud_provider: bool,
     /// Finch version
     pub version: String,
     /// Operating system
@@ -298,12 +300,12 @@ impl NodeCapabilities {
     pub fn for_current_host(
         ram_gb: usize,
         local_model: Option<String>,
-        has_teacher_api: bool,
+        has_cloud_provider: bool,
     ) -> Self {
         Self {
             ram_gb,
             local_model,
-            has_teacher_api,
+            has_cloud_provider,
             version: env!("CARGO_PKG_VERSION").to_string(),
             os: std::env::consts::OS.to_string(),
         }
@@ -378,7 +380,7 @@ mod tests {
         let caps = NodeCapabilities {
             ram_gb: 1,
             local_model: None,
-            has_teacher_api: true,
+            has_cloud_provider: true,
             version: "test".to_string(),
             os: "test".to_string(),
         };

@@ -1,6 +1,6 @@
 // Provider factory
 //
-// Creates LLM providers based on teacher/provider configuration
+// Creates LLM providers from the unified configuration
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -12,7 +12,7 @@ use super::{
 };
 use crate::config::{
     Config, CredentialProvider, CredentialResolver, EnvironmentCredentialResolver, ProviderEntry,
-    ResolvedCredential, TeacherEntry,
+    ResolvedCredential,
 };
 use finch_providers::{
     ChatGptSubscriptionProvider, ClaudeProvider, GeminiProvider, GrokSubscriptionProvider,
@@ -700,40 +700,12 @@ fn graph_from_boxed_profiles(
 
 /// Construct the named cloud provider graph once. Invalid legacy subscription
 /// entries reject the complete graph before any provider is constructed.
-/// Legacy teacher-only configuration remains supported.
 pub fn create_provider_graph_from_config(config: &Config) -> Result<ProviderGraph> {
-    let profiles = if config.providers.iter().any(|entry| !entry.is_local()) {
-        create_named_profiles_from_config_with_resolver(
-            config,
-            &EnvironmentCredentialResolver,
-            true,
-        )?
-    } else {
-        if config.teachers.is_empty() {
-            bail!("No teacher providers configured");
-        }
-        config
-            .teachers
-            .iter()
-            .enumerate()
-            .map(|(idx, teacher)| {
-                let profile_name = teacher
-                    .name
-                    .clone()
-                    .filter(|name| !name.trim().is_empty())
-                    .or_else(|| {
-                        teacher
-                            .model
-                            .clone()
-                            .filter(|model| !model.trim().is_empty())
-                    })
-                    .unwrap_or_else(|| teacher.provider.clone());
-                create_provider_from_teacher(teacher)
-                    .map(|provider| (profile_name, provider))
-                    .with_context(|| format!("Failed to create teacher provider #{}", idx + 1))
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
+    let profiles = create_named_profiles_from_config_with_resolver(
+        config,
+        &EnvironmentCredentialResolver,
+        true,
+    )?;
     let allow_implicit_fallback = !config
         .providers
         .iter()
@@ -878,23 +850,19 @@ fn create_provider_from_overlaid_entry_with_resolver(
     }
 }
 
-/// Create the ordered cloud provider pool from unified configuration, falling back to legacy
-/// teacher entries only when no cloud `[[providers]]` entries exist.
+/// Create the ordered cloud provider pool from unified configuration.
 pub fn create_providers_from_config(config: &Config) -> Result<Vec<Box<dyn LlmProvider>>> {
-    if config.providers.iter().any(|entry| !entry.is_local()) {
-        return Ok(create_named_profiles_from_config_with_resolver(
-            config,
-            &EnvironmentCredentialResolver,
-            true,
-        )?
-        .into_iter()
-        .map(|(_, provider)| provider)
-        .collect());
-    }
-    create_providers(&config.teachers)
+    Ok(create_named_profiles_from_config_with_resolver(
+        config,
+        &EnvironmentCredentialResolver,
+        true,
+    )?
+    .into_iter()
+    .map(|(_, provider)| provider)
+    .collect())
 }
 
-/// Create the active provider or fallback chain from unified or legacy configuration.
+/// Create the active provider or fallback chain from unified configuration.
 pub fn create_provider_from_config(config: &Config) -> Result<Box<dyn LlmProvider>> {
     let mut providers = create_providers_from_config(config)?;
     if providers.len() == 1
@@ -908,145 +876,14 @@ pub fn create_provider_from_config(config: &Config) -> Result<Box<dyn LlmProvide
     Ok(Box::new(super::FallbackChain::new(providers)))
 }
 
-// ---------------------------------------------------------------------------
-// Legacy API: TeacherEntry-based (kept for backward compat)
-// ---------------------------------------------------------------------------
-
-/// Create providers from teacher entries in priority order.
-pub fn create_providers(teachers: &[TeacherEntry]) -> Result<Vec<Box<dyn LlmProvider>>> {
-    if teachers.is_empty() {
-        bail!("No teacher providers configured");
-    }
-
-    teachers
-        .iter()
-        .enumerate()
-        .map(|(idx, entry)| {
-            create_provider_from_teacher(entry)
-                .with_context(|| format!("Failed to create teacher provider #{}", idx + 1))
-        })
-        .collect()
-}
-
-/// Create a single provider from a `TeacherEntry`.
-pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmProvider>> {
-    match entry.provider.to_lowercase().as_str() {
-        "claude" => {
-            let mut provider = ClaudeProvider::new_with_endpoints(
-                entry.api_key.clone(),
-                entry
-                    .base_url
-                    .as_deref()
-                    .unwrap_or("https://api.anthropic.com"),
-                "/v1/messages",
-                "/v1/models",
-            )?;
-            if let Some(model) = &entry.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        "openai" => {
-            let mut provider = OpenAIProvider::new_compatible(
-                entry.api_key.clone(),
-                entry
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "https://api.openai.com".to_string()),
-                "/v1/chat/completions",
-                "/v1/models",
-                "gpt-4o".to_string(),
-                "openai".to_string(),
-            )?;
-            if let Some(model) = &entry.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        "grok" => {
-            let mut provider = OpenAIProvider::new_compatible(
-                entry.api_key.clone(),
-                entry
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "https://api.x.ai".to_string()),
-                "/v1/chat/completions",
-                "/v1/models",
-                "grok-4.6".to_string(),
-                "grok".to_string(),
-            )?;
-            if let Some(model) = &entry.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        "gemini" => {
-            let mut provider = GeminiProvider::new(entry.api_key.clone())?;
-            if let Some(model) = &entry.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        "mistral" => {
-            let mut provider = OpenAIProvider::new_compatible(
-                entry.api_key.clone(),
-                entry
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "https://api.mistral.ai".to_string()),
-                "/v1/chat/completions",
-                "/v1/models",
-                "mistral-large-2512".to_string(),
-                "mistral".to_string(),
-            )?;
-            if let Some(model) = &entry.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        "groq" => {
-            let mut provider = OpenAIProvider::new_groq(entry.api_key.clone())?;
-            if let Some(model) = &entry.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        _ => bail!(
-            "Unknown provider '{}'. Supported: claude, openai, grok, gemini, mistral, groq",
-            entry.provider
-        ),
-    }
-}
-
-/// Create a fallback chain with all teachers in priority order.
-pub fn create_provider(teachers: &[TeacherEntry]) -> Result<Box<dyn LlmProvider>> {
-    let providers = create_providers(teachers)?;
-
-    if providers.len() == 1 {
-        Ok(providers
-            .into_iter()
-            .next()
-            .expect("len == 1 checked above"))
-    } else {
-        use super::FallbackChain;
-        Ok(Box::new(FallbackChain::new(providers)))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderEntry;
     use crate::config::{
         AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
         CredentialProvider, EndpointFamily, ExecutionTarget, ProviderCredential, ResolvedSecret,
     };
-    use crate::config::{ProviderEntry, TeacherEntry};
     use crate::models::{InferenceProvider, ModelFamily, ModelSize};
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1055,24 +892,66 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    fn entry(provider: &str, api_key: &str) -> TeacherEntry {
-        TeacherEntry {
-            provider: provider.to_string(),
-            api_key: api_key.to_string(),
-            model: None,
-            base_url: None,
-            name: None,
+    fn entry(provider: &str, api_key: &str) -> ProviderEntry {
+        match provider {
+            "openai" => ProviderEntry::Openai {
+                api_key: api_key.to_string(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: None,
+                reasoning_effort: None,
+            },
+            "grok" => ProviderEntry::Grok {
+                api_key: api_key.to_string(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: None,
+            },
+            "gemini" => ProviderEntry::Gemini {
+                api_key: api_key.to_string(),
+                model: None,
+                name: None,
+            },
+            "mistral" => ProviderEntry::Mistral {
+                api_key: api_key.to_string(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: None,
+            },
+            "groq" => ProviderEntry::Groq {
+                api_key: api_key.to_string(),
+                model: None,
+                name: None,
+            },
+            _ => ProviderEntry::Claude {
+                api_key: api_key.to_string(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: None,
+            },
         }
     }
 
-    fn entry_with_model(provider: &str, api_key: &str, model: &str) -> TeacherEntry {
-        TeacherEntry {
-            provider: provider.to_string(),
-            api_key: api_key.to_string(),
-            model: Some(model.to_string()),
-            base_url: None,
-            name: None,
+    fn entry_with_model(provider: &str, api_key: &str, model: &str) -> ProviderEntry {
+        let mut e = entry(provider, api_key);
+        match &mut e {
+            ProviderEntry::Openai { model: m, .. }
+            | ProviderEntry::Claude { model: m, .. }
+            | ProviderEntry::Grok { model: m, .. }
+            | ProviderEntry::Gemini { model: m, .. }
+            | ProviderEntry::Mistral { model: m, .. }
+            | ProviderEntry::Groq { model: m, .. } => *m = Some(model.to_string()),
+            _ => unreachable!("entry() only builds simple cloud variants"),
         }
+        e
     }
 
     fn pentry(variant: ProviderEntry) -> ProviderEntry {
@@ -1181,19 +1060,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TeacherEntry-based tests (legacy API)
+    // Single-entry construction tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_create_claude_provider() {
-        let provider = create_provider_from_teacher(&entry("claude", "test-key"));
+        let provider = create_provider_from_entry(&entry("claude", "test-key"));
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().name(), "claude");
     }
 
     #[test]
     fn test_create_openai_provider() {
-        let provider = create_provider_from_teacher(&entry("openai", "test-key"));
+        let provider = create_provider_from_entry(&entry("openai", "test-key"));
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().name(), "openai");
     }
@@ -1667,28 +1546,28 @@ mod tests {
 
     #[test]
     fn test_create_grok_provider() {
-        let provider = create_provider_from_teacher(&entry("grok", "test-key"));
+        let provider = create_provider_from_entry(&entry("grok", "test-key"));
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().name(), "grok");
     }
 
     #[test]
     fn test_create_gemini_provider() {
-        let provider = create_provider_from_teacher(&entry("gemini", "test-key"));
+        let provider = create_provider_from_entry(&entry("gemini", "test-key"));
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().name(), "gemini");
     }
 
     #[test]
     fn test_create_mistral_provider() {
-        let provider = create_provider_from_teacher(&entry("mistral", "test-key"));
+        let provider = create_provider_from_entry(&entry("mistral", "test-key"));
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().name(), "mistral");
     }
 
     #[test]
     fn test_create_groq_provider() {
-        let provider = create_provider_from_teacher(&entry("groq", "test-key"));
+        let provider = create_provider_from_entry(&entry("groq", "test-key"));
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().name(), "groq");
     }
@@ -1709,74 +1588,58 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_provider_returns_error() {
-        let result = create_provider_from_teacher(&entry("unknown_provider_xyz", "test-key"));
-        assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Unknown provider"));
-    }
-
-    #[test]
-    fn test_empty_teachers_returns_error() {
-        let result = create_providers(&[]);
+    fn test_empty_cloud_entries_returns_error() {
+        let result = create_providers_from_entries(&[]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_multiple_teachers() {
-        let teachers = vec![entry("openai", "key-1"), entry("claude", "key-2")];
-        let providers = create_providers(&teachers).unwrap();
+    fn test_multiple_entries_preserve_priority_order() {
+        let entries = vec![entry("openai", "key-1"), entry("claude", "key-2")];
+        let providers = create_providers_from_entries(&entries).unwrap();
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].name(), "openai");
         assert_eq!(providers[1].name(), "claude");
     }
 
     #[test]
-    fn test_single_teacher_returns_direct_provider_not_fallback() {
-        let teachers = vec![entry("claude", "key-1")];
-        let provider = create_provider(&teachers).unwrap();
+    fn test_single_entry_returns_direct_provider_not_fallback() {
+        let entries = vec![entry("claude", "key-1")];
+        let provider = create_provider_from_entries(&entries).unwrap();
         assert_eq!(provider.name(), "claude");
     }
 
     #[test]
     fn test_custom_model_is_applied() {
         let e = entry_with_model("openai", "key", "gpt-4o-mini");
-        let provider = create_provider_from_teacher(&e).unwrap();
+        let provider = create_provider_from_entry(&e).unwrap();
         assert_eq!(provider.default_model(), "gpt-4o-mini");
     }
 
     #[test]
-    fn test_case_insensitive_provider_name() {
-        let mut e = entry("claude", "key");
-        e.provider = "Claude".to_string();
-        let provider = create_provider_from_teacher(&e);
-        assert!(provider.is_ok());
-        assert_eq!(provider.unwrap().name(), "claude");
-    }
-
-    #[test]
     fn test_same_provider_different_models() {
-        let teachers = vec![
-            TeacherEntry {
-                provider: "openai".to_string(),
+        let entries = vec![
+            ProviderEntry::Openai {
                 api_key: "test-key".to_string(),
                 model: Some("gpt-4o".to_string()),
                 base_url: None,
+                chat_path: None,
+                models_path: None,
                 name: Some("GPT-4o (best)".to_string()),
+                reasoning_effort: None,
             },
-            TeacherEntry {
-                provider: "openai".to_string(),
+            ProviderEntry::Openai {
                 api_key: "test-key".to_string(),
                 model: Some("gpt-5.6-sol".to_string()),
                 base_url: None,
+                chat_path: None,
+                models_path: None,
                 name: Some("GPT-5.6 Sol".to_string()),
+                reasoning_effort: None,
             },
         ];
 
-        let providers = create_providers(&teachers).unwrap();
+        let providers = create_providers_from_entries(&entries).unwrap();
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].name(), "openai");
         assert_eq!(providers[1].name(), "openai");
@@ -1958,7 +1821,6 @@ mod tests {
         .unwrap();
 
         let config = crate::config::load_config_from_path(&path).unwrap();
-        assert!(config.teachers.is_empty());
         let error = create_provider_graph_from_config(&config)
             .err()
             .expect("legacy-only graph must be rejected");
@@ -1969,10 +1831,25 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_startup_provider_preserves_legacy_teacher_config() {
-        let mut config = Config::new(vec![entry("claude", "legacy-key")]);
-        config.providers.clear();
+    fn test_shared_startup_provider_constructs_from_provider_entries() {
+        let config = Config::new(vec![entry("claude", "sk-ant-startup-key-1234567890")]);
         let provider = create_provider_from_config(&config).unwrap();
         assert_eq!(provider.name(), "claude");
+    }
+
+    /// No cloud `[[providers]]` entry must fail closed rather than silently
+    /// forward to an unconfigured provider (the explicit-fallback rule).
+    #[test]
+    fn test_no_cloud_provider_entries_fail_closed() {
+        let config = Config::new(vec![]);
+        let error = create_provider_from_config(&config)
+            .err()
+            .expect("a configuration with no cloud providers must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("No cloud provider entries configured"),
+            "the failure must name the missing cloud provider list, got: {error:#}"
+        );
     }
 }

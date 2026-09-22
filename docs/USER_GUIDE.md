@@ -25,7 +25,7 @@
 
 Shammah is a **local-first AI coding assistant** that combines the power of:
 - **Pre-trained local models** (Qwen via ONNX Runtime) - works offline, preserves privacy
-- **Teacher APIs** (Claude, GPT-4, Gemini, Grok) - high-quality fallback when needed
+- **Cloud provider APIs** (Claude, GPT-4, Gemini, Grok) - high-quality fallback when needed
 - **Tool execution** - can read files, run commands, search code
 - **Explicit feedback** - privately retain ratings for future supported learning
 
@@ -35,7 +35,7 @@ Shammah is a **local-first AI coding assistant** that combines the power of:
 ✅ **Privacy-first** - Code stays on your device
 ✅ **Instant startup** - <100ms to REPL (progressive loading)
 ✅ **Feedback-aware** - Retains only feedback you explicitly submit
-✅ **Multi-provider** - Configure multiple teacher APIs
+✅ **Multi-provider** - Configure multiple cloud provider APIs
 ✅ **Tool-enabled** - Can execute commands with your approval
 
 ---
@@ -97,21 +97,21 @@ When you run `finch` for the first time, the setup wizard will guide you through
 │ Welcome to Shammah Setup                    │
 │                                             │
 │ This wizard will help you configure:       │
-│  • Teacher API (Claude/GPT-4/Gemini/Grok)  │
+│  • Cloud API (Claude/GPT-4/Gemini/Grok)    │
 │  • Local model (optional, offline mode)    │
 │  • Tool permissions                         │
 └─────────────────────────────────────────────┘
 ```
 
-### 2. Teacher API Configuration
+### 2. Cloud Provider Configuration
 
 **Recommended:** Start with Claude API for best results.
 
 ```
-Teacher API Key:
+Cloud Provider API Key:
 > sk-ant-...
 
-Which teachers would you like to configure?
+Which providers would you like to configure?
   [x] Claude (Anthropic)  ← Selected
   [ ] GPT-4 (OpenAI)
   [ ] Gemini (Google)
@@ -127,7 +127,7 @@ You can add multiple providers and Shammah will use them as fallbacks.
 ```
 Would you like to enable local model?
   [x] Yes - Download model for offline use
-  [ ] No - Use teacher APIs only
+  [ ] No - Use cloud provider APIs only
 
 Model size (based on your RAM):
   [ ] Small (1.5B) - 8GB RAM
@@ -300,11 +300,11 @@ Model: qwen-3b | Tokens: 234→156 | Latency: 1.2s | Speed: 130 tok/s | Memory: 
 
 ### Multi-Provider Setup
 
-Add additional teacher providers after initial setup:
+Add additional cloud providers after initial setup:
 
 ```bash
 finch setup
-# Navigate to teacher configuration
+# Navigate to provider configuration
 # Press 'a' to add a new provider
 ```
 
@@ -361,17 +361,18 @@ Config file: `~/.finch/config.toml`
 ### Example Configuration
 
 ```toml
-# Teacher API configuration
-[teachers]
-[[teachers.list]]
+# Cloud provider configuration
+[[providers]]
 provider = "claude"
 api_key = "sk-ant-..."
 model = "claude-sonnet-4-5"
+name = "Claude"
 
-[[teachers.list]]
+[[providers]]
 provider = "openai"
 api_key = "sk-..."
 model = "gpt-4"
+name = "GPT-4"
 
 # Local model configuration
 [backend]
@@ -427,7 +428,7 @@ Local models require:
 - 7B: ~14GB
 - 14B: ~28GB
 
-Free up space or use teacher-only mode (no local model).
+Free up space or use cloud-only mode (no local model).
 
 ### Daemon Issues
 
@@ -463,14 +464,14 @@ finch daemon-start
 1. Use a smaller model size in config
 2. Close other memory-intensive applications
 3. Check memory usage: `finch memory`
-4. Consider teacher-only mode (no local model)
+4. Consider cloud-only mode (no local model)
 
 ### Performance Issues
 
 **Problem:** Slow responses
 
 - **Local model:** Normal on first query (model loading), faster on subsequent queries
-- **Teacher API:** Check network connection
+- **Cloud provider API:** Check network connection
 - **Check status bar** for actual response times
 
 **Problem:** High CPU usage
@@ -522,7 +523,7 @@ tail -f ~/.finch/logs/finch.log  # if enabled
 
 ## Tips & Best Practices
 
-### 1. Start with Teacher APIs
+### 1. Start with Cloud Provider APIs
 
 Use Claude or GPT-4 first while local model downloads. You'll get high-quality responses immediately.
 

@@ -56,7 +56,7 @@ We built **Finch** (https://github.com/darwin-finch/finch) because we wanted a C
 
 **The basic pitch:**
 
-The full agentic loop — Read, Glob, Grep, Bash, WebFetch, multi-turn execution, permission dialogs before every action — works identically with Grok, GPT-4, Claude, Gemini, Mistral, Groq, or a local model running on your own hardware. Switch mid-session with `/teacher grok`. The daemon exposes an OpenAI-compatible API so VS Code and other tools can use it too.
+The full agentic loop — Read, Glob, Grep, Bash, WebFetch, multi-turn execution, permission dialogs before every action — works identically with Grok, GPT-4, Claude, Gemini, Mistral, Groq, or a local model running on your own hardware. Switch mid-session with `/provider grok`. The daemon exposes an OpenAI-compatible API so VS Code and other tools can use it too.
 
 The reason we care about provider flexibility: X Premium+ includes free Grok API credits, so someone who isn't a developer with an Anthropic/OpenAI account can still run a full agentic coding assistant. And switching to the cheapest capable provider matters when you're running it all day.
 

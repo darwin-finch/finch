@@ -228,6 +228,37 @@ impl std::fmt::Debug for ProviderEntry {
 }
 
 impl ProviderEntry {
+    /// Return a copy of this entry with the inline API key replaced.
+    ///
+    /// Entries that do not carry an inline key (credential-bound profiles,
+    /// subscription placeholders, Ollama, remote daemons, local models) return
+    /// an equivalent entry unchanged — they authenticate another way.
+    pub fn with_api_key(&self, api_key: String) -> Self {
+        match self {
+            Self::Claude { .. }
+            | Self::Openai { .. }
+            | Self::Grok { .. }
+            | Self::Gemini { .. }
+            | Self::Mistral { .. }
+            | Self::Groq { .. }
+            | Self::Openrouter { .. } => {
+                let mut copy = self.clone();
+                match &mut copy {
+                    Self::Claude { api_key: key, .. }
+                    | Self::Openai { api_key: key, .. }
+                    | Self::Grok { api_key: key, .. }
+                    | Self::Gemini { api_key: key, .. }
+                    | Self::Mistral { api_key: key, .. }
+                    | Self::Groq { api_key: key, .. }
+                    | Self::Openrouter { api_key: key, .. } => *key = api_key,
+                    _ => unreachable!("outer match guarantees a keyed cloud variant"),
+                }
+                copy
+            }
+            other => other.clone(),
+        }
+    }
+
     /// Stable, user-facing selector for this configured provider profile.
     ///
     /// Explicit `name` values win. Older configs without names remain usable by

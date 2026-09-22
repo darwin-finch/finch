@@ -129,10 +129,10 @@ pub async fn handle_node_info() -> Result<Json<serde_json::Value>, AppError> {
     use crate::config::load_config;
     use crate::node::NodeInfo;
 
-    let has_teacher = load_config()
-        .map(|c| c.active_teacher().is_some())
+    let has_cloud_provider = load_config()
+        .map(|c| c.providers.iter().any(|entry| entry.is_simple_cloud()))
         .unwrap_or(false);
-    let info = NodeInfo::load(current_node_capabilities(has_teacher))?;
+    let info = NodeInfo::load(current_node_capabilities(has_cloud_provider))?;
     Ok(Json(serde_json::to_value(&info)?))
 }
 
@@ -150,7 +150,7 @@ pub async fn handle_node_info_from_state_directory(
     Ok(Json(serde_json::to_value(&info)?))
 }
 
-pub(super) fn current_node_capabilities(has_teacher_api: bool) -> crate::node::NodeCapabilities {
+pub(super) fn current_node_capabilities(has_cloud_provider: bool) -> crate::node::NodeCapabilities {
     use crate::models::{ModelSelection, ModelSelector};
 
     let ram_gb = ModelSelector::get_total_ram_gb();
@@ -158,7 +158,7 @@ pub(super) fn current_node_capabilities(has_teacher_api: bool) -> crate::node::N
         Ok(ModelSelection::Local(size)) => Some(size.description().to_string()),
         _ => None,
     };
-    crate::node::NodeCapabilities::for_current_host(ram_gb, local_model, has_teacher_api)
+    crate::node::NodeCapabilities::for_current_host(ram_gb, local_model, has_cloud_provider)
 }
 
 /// Handle GET /v1/node/stats — return this node's work statistics

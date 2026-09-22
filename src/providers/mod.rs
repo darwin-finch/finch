@@ -10,12 +10,11 @@ mod factory;
 pub use catalog::refresh_from_config;
 pub use factory::preflight_provider_config;
 pub use factory::{
-    create_provider, create_provider_from_config, create_provider_from_entries,
-    create_provider_from_entry, create_provider_from_overlaid_entry, create_provider_from_teacher,
-    create_provider_graph_from_config, create_provider_graph_from_config_with_resolver,
-    create_provider_profile_from_config, create_provider_profile_from_config_with_resolver,
-    create_providers, create_providers_from_config, create_providers_from_entries, ProviderGraph,
-    ProviderProfile,
+    create_provider_from_config, create_provider_from_entries, create_provider_from_entry,
+    create_provider_from_overlaid_entry, create_provider_graph_from_config,
+    create_provider_graph_from_config_with_resolver, create_provider_profile_from_config,
+    create_provider_profile_from_config_with_resolver, create_providers_from_config,
+    create_providers_from_entries, ProviderGraph, ProviderProfile,
 };
 pub use finch_providers::{
     chatgpt_required_scopes, compile_from_definitions, compile_tool_bindings, default_cache_dir,
@@ -30,8 +29,8 @@ pub use finch_providers::{
     NativeToolGrant, OpenAIProvider, OpenAiChatGptOAuthDialect, OpenAiJwksVerifier,
     OpenAiTokenVerifier, OptimizationStats, OutputTokenLimitCapability, ProviderAllowance,
     ProviderBackend, ProviderConcreteType, ProviderEndpoints, ProviderPorts, ProviderRequest,
-    ProviderResponse, ProviderUsage, ReasoningCapability, SemanticTool, StreamChunk,
-    TeacherContextConfig, TeacherSession, ToolAuthority, ToolBindingError, ToolBindingTable,
+    ProviderResponse, ProviderSession, ProviderUsage, ReasoningCapability, SemanticTool,
+    SessionContextConfig, StreamChunk, ToolAuthority, ToolBindingError, ToolBindingTable,
     ToolCompilePolicy, ToolOrigin, ValidatedProviderRequest, VerifiedGrokClaims,
     VerifiedOpenAiClaims, WireProtocol, WireProtocolCapability, XaiGrokOAuthDialect,
     CHATGPT_OAUTH_PROTOCOL_REVISION, DEFAULT_CLAUDE_MODEL, GROK_OAUTH_PROTOCOL_REVISION,

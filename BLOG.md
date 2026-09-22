@@ -40,13 +40,13 @@ After fixing these, the architecture now has a clean `LlmProvider` trait that Cl
 
 Getting a non-developer set up meant one more thing: by default, Finch tries to load a local ONNX model in the background (Qwen 2.5, selected based on your RAM). That means a 1.5–14GB download on first launch. For someone who just wants to use Grok, that's the wrong default.
 
-We added `--cloud-only` (alias: `--teacher-only`):
+We added `--cloud-only`:
 
 ```bash
 finch --cloud-only
 ```
 
-This skips the model download, skips the daemon, and routes everything directly to your configured teacher API. The binary stays completely self-contained — the ONNX Runtime is loaded dynamically only when a local model is actually used, so the binary has no native library dependencies at all when running in cloud-only mode.
+This skips the model download, skips the daemon, and routes everything directly to your configured cloud provider API. The binary stays completely self-contained — the ONNX Runtime is loaded dynamically only when a local model is actually used, so the binary has no native library dependencies at all when running in cloud-only mode.
 
 For our friend with the old Intel MacBook Pro: he gets his Grok API key from `console.x.ai`, runs `finch setup`, picks Grok, and uses `finch --cloud-only`. No model download. No daemon. No Rust toolchain.
 

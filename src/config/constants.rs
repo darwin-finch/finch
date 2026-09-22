@@ -16,7 +16,7 @@ pub const DEFAULT_DAEMON_PORT: u16 = 11435;
 pub const DEFAULT_BRAIN_TLS_ADDR: &str = "0.0.0.0:11436";
 pub const DEFAULT_BRAIN_TLS_PORT: u16 = crate::brain::DEFAULT_BRAIN_PORT;
 
-/// Default maximum tokens for teacher API requests.
+/// Default maximum tokens for cloud provider API requests.
 pub const DEFAULT_MAX_TOKENS: u32 = 8000;
 
 /// Default port for the HTTP daemon / worker server.

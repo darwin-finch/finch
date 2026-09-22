@@ -136,12 +136,8 @@ impl Command {
         // punctuation cleanup used for conversational slash commands.
         let raw = input.trim();
         match raw {
-            "/providers" | "/provider list" | "/teacher list" => {
-                return Some(Command::ProviderList)
-            }
-            "/provider" | "/provider show" | "/teacher" | "/teacher show" => {
-                return Some(Command::ProviderShow)
-            }
+            "/providers" | "/provider list" => return Some(Command::ProviderList),
+            "/provider" | "/provider show" => return Some(Command::ProviderShow),
             "/model" | "/model show" => return Some(Command::ModelShow),
             "/model list" => return Some(Command::ModelList),
             "/thinking" | "/thinking show" | "/reasoning" | "/reasoning show" => {
@@ -151,10 +147,7 @@ impl Command {
             "/config" => return Some(Command::Setup),
             _ => {}
         }
-        if let Some(rest) = raw
-            .strip_prefix("/provider ")
-            .or_else(|| raw.strip_prefix("/teacher "))
-        {
+        if let Some(rest) = raw.strip_prefix("/provider ") {
             let profile_name = rest.trim();
             if profile_name != "list" && profile_name != "show" && !profile_name.is_empty() {
                 return Some(Command::ProviderSwitch(profile_name.to_string()));
@@ -233,12 +226,8 @@ impl Command {
             // Persona commands
             "/persona" | "/persona list" => return Some(Command::PersonaList),
             "/persona show" => return Some(Command::PersonaShow),
-            "/providers" | "/provider list" | "/teacher list" => {
-                return Some(Command::ProviderList)
-            }
-            "/provider" | "/provider show" | "/teacher" | "/teacher show" => {
-                return Some(Command::ProviderShow)
-            }
+            "/providers" | "/provider list" => return Some(Command::ProviderList),
+            "/provider" | "/provider show" => return Some(Command::ProviderShow),
             "/model" | "/model show" => return Some(Command::ModelShow),
             "/model list" => return Some(Command::ModelList),
             "/thinking" | "/thinking show" | "/reasoning" | "/reasoning show" => {
@@ -454,10 +443,7 @@ impl Command {
             }
         }
 
-        if let Some(rest) = trimmed
-            .strip_prefix("/provider ")
-            .or_else(|| trimmed.strip_prefix("/teacher "))
-        {
+        if let Some(rest) = trimmed.strip_prefix("/provider ") {
             let profile_name = rest.trim();
             if profile_name != "list" && profile_name != "show" && !profile_name.is_empty() {
                 return Some(Command::ProviderSwitch(profile_name.to_string()));
@@ -806,7 +792,7 @@ pub fn format_help() -> String {
          {cyan}  /config{reset}            Persistent configuration and setup (alias of /setup)\n\
          {cyan}  /local <query>{reset}     Query local ONNX model directly (bypass routing)\n\
          {reset}\n\
-         {gray}  /model never switches accounts. /provider does. /teacher is a /provider alias.{reset}\n\
+         {gray}  /model never switches accounts. /provider does.{reset}\n\
          {gray}  Overlays persist on this Brain; --model is one-shot for this invocation.{reset}\n\
          {gray}  Conversation history is preserved across switches.{reset}\n\n\
          {yellow_bold}🔌 MCP Plugin Commands:{reset}\n\
@@ -1527,18 +1513,25 @@ mod tests {
             _ => panic!("Expected /model to overlay a model id, preserving punctuation"),
         }
         assert!(matches!(Command::parse("/model"), Some(Command::ModelShow)));
+        // The removed command spelling must not dispatch anything provider
+        // related; only /provider remains. Unrecognized slash commands fall
+        // through to the help catch-all.
+        assert!(
+            matches!(Command::parse("/teacher"), Some(Command::Help)),
+            "the removed spelling must not dispatch a provider action"
+        );
+        assert!(
+            matches!(Command::parse("/teacher list"), Some(Command::Help)),
+            "the removed spelling must not dispatch a provider action"
+        );
+        assert!(
+            matches!(Command::parse("/teacher grok"), Some(Command::Help)),
+            "the removed spelling must not switch providers"
+        );
         assert!(matches!(
-            Command::parse("/teacher"),
-            Some(Command::ProviderShow)
+            Command::parse("/provider grok"),
+            Some(Command::ProviderSwitch(name)) if name == "grok"
         ));
-        assert!(matches!(
-            Command::parse("/teacher list"),
-            Some(Command::ProviderList)
-        ));
-        match Command::parse("/teacher grok") {
-            Some(Command::ProviderSwitch(name)) => assert_eq!(name, "grok"),
-            _ => panic!("Expected ProviderSwitch(grok) via /teacher alias"),
-        }
         assert!(matches!(Command::parse("/status"), Some(Command::Status)));
         assert!(matches!(
             Command::parse("/thinking high"),

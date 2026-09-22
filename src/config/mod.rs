@@ -73,5 +73,5 @@ pub(crate) use loader::{load_config_from_path, load_config_from_path_with_paths}
 pub use persona::Persona;
 pub use provider::ProviderEntry;
 pub use settings::{
-    ClientConfig, Config, FeaturesConfig, LicenseConfig, LicenseType, ServerConfig, TeacherEntry,
+    ClientConfig, Config, FeaturesConfig, LicenseConfig, LicenseType, ServerConfig,
 };

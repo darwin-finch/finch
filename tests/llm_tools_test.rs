@@ -1,66 +1,65 @@
 // Integration tests for Phase 1: LLM Tools and Registry
 
 use anyhow::Result;
-use finch::config::TeacherEntry;
+use finch::config::ProviderEntry;
 use finch::llms::LLMRegistry;
 use finch::tools::create_llm_tools;
 
-fn create_teacher(
+fn create_cloud_entry(
     provider: &str,
     api_key: &str,
     model: Option<&str>,
     name: Option<&str>,
-) -> TeacherEntry {
-    TeacherEntry {
-        provider: provider.to_string(),
-        api_key: api_key.to_string(),
-        model: model.map(|s| s.to_string()),
-        base_url: None,
-        name: name.map(|s| s.to_string()),
-    }
+) -> ProviderEntry {
+    ProviderEntry::from_provider_fields(
+        provider,
+        api_key.to_string(),
+        model.map(|s| s.to_string()),
+        None,
+        name.map(|s| s.to_string()),
+    )
 }
 
 #[test]
-fn test_llm_registry_creation_single_teacher() -> Result<()> {
-    // With only one teacher, registry should not be created
-    let teachers = vec![create_teacher(
+fn test_llm_registry_creation_single_cloud_provider() -> Result<()> {
+    // With only one cloud provider, registry should not be created
+    let cloud = vec![create_cloud_entry(
         "claude",
         "test-key",
         Some("claude-sonnet-4-20250514"),
         Some("Claude"),
     )];
 
-    // Registry requires > 1 teacher
+    // Registry requires > 1 cloud provider
     // This would be checked in the REPL initialization
-    assert!(teachers.len() == 1, "Single teacher case");
+    assert_eq!(cloud.len(), 1, "Single cloud provider case");
 
     Ok(())
 }
 
 #[test]
-fn test_llm_registry_creation_multiple_teachers() -> Result<()> {
-    // With multiple teachers, registry should be created
-    let teachers = vec![
-        create_teacher(
+fn test_llm_registry_creation_multiple_cloud_providers() -> Result<()> {
+    // With multiple cloud providers, registry should be created
+    let cloud = vec![
+        create_cloud_entry(
             "claude",
             "test-key-1",
             Some("claude-sonnet-4-20250514"),
             Some("Claude Sonnet"),
         ),
-        create_teacher("openai", "test-key-2", Some("gpt-4"), Some("GPT-4")),
+        create_cloud_entry("openai", "test-key-2", Some("gpt-4"), Some("GPT-4")),
     ];
 
-    let registry = LLMRegistry::from_teachers(&teachers)?;
+    let registry = LLMRegistry::from_cloud_providers(&cloud)?;
 
     // Verify registry has tools
     let tool_names = registry.tool_names();
-    assert!(!tool_names.is_empty(), "Should have at least one tool");
 
-    // Primary should be first teacher (Claude)
-    // Tools should be remaining teachers (GPT-4)
+    // Primary should be the first cloud provider (Claude)
+    // Tools should be the remaining cloud providers (GPT-4)
     assert!(
-        tool_names.len() >= 1,
-        "Should have tools for non-primary teachers"
+        !tool_names.is_empty(),
+        "Should have tools for non-primary cloud providers"
     );
 
     Ok(())
@@ -68,25 +67,25 @@ fn test_llm_registry_creation_multiple_teachers() -> Result<()> {
 
 #[test]
 fn test_llm_tool_names() -> Result<()> {
-    let teachers = vec![
-        create_teacher(
+    let cloud = vec![
+        create_cloud_entry(
             "claude",
             "key1",
             Some("claude-sonnet-4-20250514"),
             Some("Claude Sonnet"),
         ),
-        create_teacher("openai", "key2", Some("gpt-4"), Some("GPT-4")),
-        create_teacher("gemini", "key3", Some("gemini-pro"), Some("Gemini")),
+        create_cloud_entry("openai", "key2", Some("gpt-4"), Some("GPT-4")),
+        create_cloud_entry("gemini", "key3", Some("gemini-pro"), Some("Gemini")),
     ];
 
-    let registry = LLMRegistry::from_teachers(&teachers)?;
+    let registry = LLMRegistry::from_cloud_providers(&cloud)?;
     let tool_names = registry.tool_names();
 
     // Should have 2 tools (GPT-4 and Gemini, excluding primary Claude)
     assert_eq!(
         tool_names.len(),
         2,
-        "Should have 2 non-primary teachers as tools"
+        "Should have 2 non-primary cloud providers as tools"
     );
 
     Ok(())
@@ -94,20 +93,20 @@ fn test_llm_tool_names() -> Result<()> {
 
 #[test]
 fn test_create_llm_tools() -> Result<()> {
-    let teachers = vec![
-        create_teacher(
+    let cloud = vec![
+        create_cloud_entry(
             "claude",
             "key1",
             Some("claude-sonnet-4-20250514"),
             Some("Claude"),
         ),
-        create_teacher("openai", "key2", Some("gpt-4"), Some("GPT-4")),
+        create_cloud_entry("openai", "key2", Some("gpt-4"), Some("GPT-4")),
     ];
 
-    let registry = LLMRegistry::from_teachers(&teachers)?;
+    let registry = LLMRegistry::from_cloud_providers(&cloud)?;
     let tools = create_llm_tools(&registry);
 
-    // Should create tools for non-primary teachers
+    // Should create tools for non-primary cloud providers
     assert!(!tools.is_empty(), "Should create at least one tool");
 
     // Each tool should have a name
@@ -130,17 +129,17 @@ fn test_create_llm_tools() -> Result<()> {
 
 #[test]
 fn test_llm_tool_input_schema() -> Result<()> {
-    let teachers = vec![
-        create_teacher(
+    let cloud = vec![
+        create_cloud_entry(
             "claude",
             "key",
             Some("claude-sonnet-4-20250514"),
             Some("Claude"),
         ),
-        create_teacher("openai", "key", Some("gpt-4"), Some("GPT-4")),
+        create_cloud_entry("openai", "key", Some("gpt-4"), Some("GPT-4")),
     ];
 
-    let registry = LLMRegistry::from_teachers(&teachers)?;
+    let registry = LLMRegistry::from_cloud_providers(&cloud)?;
     let tools = create_llm_tools(&registry);
 
     for tool in tools {
@@ -176,14 +175,14 @@ fn test_llm_tool_input_schema() -> Result<()> {
 
 #[test]
 fn test_multiple_models_same_provider() -> Result<()> {
-    let teachers = vec![
-        create_teacher(
+    let cloud = vec![
+        create_cloud_entry(
             "claude",
             "key",
             Some("claude-sonnet-4-20250514"),
             Some("Claude Sonnet"),
         ),
-        create_teacher(
+        create_cloud_entry(
             "claude",
             "key",
             Some("claude-opus-4-20250514"),
@@ -191,7 +190,7 @@ fn test_multiple_models_same_provider() -> Result<()> {
         ),
     ];
 
-    let registry = LLMRegistry::from_teachers(&teachers)?;
+    let registry = LLMRegistry::from_cloud_providers(&cloud)?;
     let tools = create_llm_tools(&registry);
 
     // Should create separate tools for different models from same provider

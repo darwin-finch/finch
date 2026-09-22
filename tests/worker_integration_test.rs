@@ -429,7 +429,7 @@ fn test_work_stats_defaults_are_zero() {
     let stats = WorkStats::default();
     assert_eq!(stats.queries_processed, 0);
     assert_eq!(stats.local_queries, 0);
-    assert_eq!(stats.teacher_queries, 0);
+    assert_eq!(stats.forwarded_queries, 0);
     assert_eq!(stats.avg_latency_ms(), 0.0);
     assert_eq!(stats.local_pct(), 0.0);
 }

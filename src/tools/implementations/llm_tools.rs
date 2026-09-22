@@ -197,7 +197,7 @@ mod tests {
         // service, so they declare the worst case (ExternalWrite) and never
         // run autonomously — the same approval-boundary behavior their
         // runtime names had under the deleted legacy table (which classified
-        // them Unclassified). They are constructed dynamically per teacher
+        // them Unclassified). They are constructed dynamically per cloud provider
         // and are not part of the static owner catalog, so the catalog-wide
         // classification conformance does not see them.
         for name in [

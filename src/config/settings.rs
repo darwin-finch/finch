@@ -18,7 +18,7 @@ pub struct FeaturesConfig {
     #[serde(default)]
     pub auto_approve_tools: bool,
 
-    /// Enable streaming responses from teacher models
+    /// Enable streaming responses from cloud providers
     #[serde(default = "default_true")]
     pub streaming_enabled: bool,
 
@@ -157,10 +157,9 @@ pub struct Config {
     /// Client configuration (connecting to daemon)
     pub client: ClientConfig,
 
-    /// Unified provider list — source of truth for config I/O.
-    /// Cloud providers here are also mirrored in `teachers`; local providers
-    /// are also mirrored in `backend`. Use `with_providers()` to construct
-    /// from this list, or `new()` to construct from the legacy fields.
+    /// Unified provider list — the sole source of truth for config I/O.
+    /// Local providers are also mirrored in `backend`. Use `with_providers()`
+    /// to construct from this list.
     pub providers: Vec<ProviderEntry>,
 
     /// Explicit global default provider profile name. New Brains inherit this
@@ -170,9 +169,6 @@ pub struct Config {
     /// Secret-free named provider credential records. Secret material is
     /// resolved through an injected credential store only after graph validation.
     pub(crate) credentials: Vec<ProviderCredential>,
-
-    /// Teacher LLM provider configuration (array of teachers in priority order)
-    pub teachers: Vec<TeacherEntry>,
 
     /// TUI color scheme (customizable for accessibility)
     pub colors: ColorScheme,
@@ -310,138 +306,22 @@ pub struct LicenseConfig {
     pub notice_suppress_until: Option<String>,
 }
 
-/// A single teacher entry with provider and settings
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TeacherEntry {
-    /// Provider name: "claude", "openai", "grok", "gemini", "mistral", "groq"
-    pub provider: String,
-
-    /// API key for this provider
-    pub api_key: String,
-
-    /// Optional model override (uses provider default if not specified)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-
-    /// Optional base URL (for custom endpoints)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-
-    /// Optional name/label for this teacher (for UI/logging)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-impl std::fmt::Debug for TeacherEntry {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TeacherEntry")
-            .field("provider", &self.provider)
-            .field("api_key", &"[REDACTED]")
-            .field("model", &self.model)
-            .field("base_url", &self.base_url)
-            .field("name", &self.name)
-            .finish()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Conversion helpers between ProviderEntry and legacy types
-// (Defined here to avoid circular imports — TeacherEntry lives in this file)
-// ---------------------------------------------------------------------------
-
 impl ProviderEntry {
-    /// Convert this cloud provider to a `TeacherEntry` for backward compat.
-    /// Returns `None` for `Local` variants.
-    pub fn to_teacher_entry(&self) -> Option<TeacherEntry> {
+    /// The `(provider-name, api-key)` projection used by startup validation.
+    /// Returns `None` for variants outside the simple API-key cloud set
+    /// (`Credentialed`, `LegacyChatgptSubscription`, `Ollama`, `RemoteDaemon`,
+    /// `Local`).
+    ///
+    /// This is validation input only — configuration I/O is `[[providers]]`.
+    pub(crate) fn simple_cloud_key(&self) -> Option<(&'static str, &str)> {
         match self {
-            Self::Claude {
-                api_key,
-                model,
-                base_url,
-                name,
-                ..
-            } => Some(TeacherEntry {
-                provider: "claude".to_string(),
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                name: name.clone(),
-            }),
-            Self::Openai {
-                api_key,
-                model,
-                base_url,
-                name,
-                ..
-            } => Some(TeacherEntry {
-                provider: "openai".to_string(),
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                name: name.clone(),
-            }),
-            Self::Grok {
-                api_key,
-                model,
-                base_url,
-                name,
-                ..
-            } => Some(TeacherEntry {
-                provider: "grok".to_string(),
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                name: name.clone(),
-            }),
-            Self::Gemini {
-                api_key,
-                model,
-                name,
-            } => Some(TeacherEntry {
-                provider: "gemini".to_string(),
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: None,
-                name: name.clone(),
-            }),
-            Self::Mistral {
-                api_key,
-                model,
-                base_url,
-                name,
-                ..
-            } => Some(TeacherEntry {
-                provider: "mistral".to_string(),
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                name: name.clone(),
-            }),
-            Self::Groq {
-                api_key,
-                model,
-                name,
-            } => Some(TeacherEntry {
-                provider: "groq".to_string(),
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: None,
-                name: name.clone(),
-            }),
-            Self::Openrouter {
-                api_key,
-                model,
-                base_url,
-                name,
-                ..
-            } => Some(TeacherEntry {
-                provider: "openrouter".to_string(),
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                name: name.clone(),
-            }),
+            Self::Claude { api_key, .. } => Some(("claude", api_key)),
+            Self::Openai { api_key, .. } => Some(("openai", api_key)),
+            Self::Grok { api_key, .. } => Some(("grok", api_key)),
+            Self::Gemini { api_key, .. } => Some(("gemini", api_key)),
+            Self::Mistral { api_key, .. } => Some(("mistral", api_key)),
+            Self::Groq { api_key, .. } => Some(("groq", api_key)),
+            Self::Openrouter { api_key, .. } => Some(("openrouter", api_key)),
             Self::Credentialed { .. }
             | Self::LegacyChatgptSubscription { .. }
             | Self::Ollama { .. }
@@ -450,71 +330,80 @@ impl ProviderEntry {
         }
     }
 
-    /// Build a `ProviderEntry` from a `TeacherEntry`.
-    pub fn from_teacher_entry(entry: &TeacherEntry) -> Self {
-        match entry.provider.to_lowercase().as_str() {
-            "claude" => Self::Claude {
-                api_key: entry.api_key.clone(),
-                model: entry.model.clone(),
-                base_url: entry.base_url.clone(),
-                chat_path: None,
-                models_path: None,
-                name: entry.name.clone(),
-            },
+    /// Whether this entry is a simple API-key cloud provider — the set the
+    /// removed legacy shadow carried. Local and credential-bound providers
+    /// are excluded.
+    pub(crate) fn is_simple_cloud(&self) -> bool {
+        self.simple_cloud_key().is_some()
+    }
+
+    /// Map a provider-family name (for example `"claude"`, `"openai"`) plus
+    /// raw fields onto a cloud `ProviderEntry`.
+    ///
+    /// This is the constructor the removed legacy `[[teachers]]` config rows
+    /// and environment-driven setup use. Unknown provider names map to
+    /// Claude — the same safest-fallback rule the removed conversion used,
+    /// so old files keep loading identically.
+    pub fn from_provider_fields(
+        provider: &str,
+        api_key: String,
+        model: Option<String>,
+        base_url: Option<String>,
+        name: Option<String>,
+    ) -> Self {
+        match provider.to_lowercase().as_str() {
             "openai" => Self::Openai {
-                api_key: entry.api_key.clone(),
-                model: entry.model.clone(),
-                base_url: entry.base_url.clone(),
+                api_key,
+                model,
+                base_url,
                 chat_path: None,
                 models_path: None,
-                name: entry.name.clone(),
+                name,
                 reasoning_effort: None,
             },
             "grok" => Self::Grok {
-                api_key: entry.api_key.clone(),
-                model: entry.model.clone(),
-                base_url: entry.base_url.clone(),
+                api_key,
+                model,
+                base_url,
                 chat_path: None,
                 models_path: None,
-                name: entry.name.clone(),
+                name,
             },
             "gemini" => Self::Gemini {
-                api_key: entry.api_key.clone(),
-                model: entry.model.clone(),
-                name: entry.name.clone(),
+                api_key,
+                model,
+                name,
             },
             "mistral" => Self::Mistral {
-                api_key: entry.api_key.clone(),
-                model: entry.model.clone(),
-                base_url: entry.base_url.clone(),
+                api_key,
+                model,
+                base_url,
                 chat_path: None,
                 models_path: None,
-                name: entry.name.clone(),
+                name,
             },
             "groq" => Self::Groq {
-                api_key: entry.api_key.clone(),
-                model: entry.model.clone(),
-                name: entry.name.clone(),
+                api_key,
+                model,
+                name,
             },
             "openrouter" => Self::Openrouter {
-                api_key: entry.api_key.clone(),
-                model: entry.model.clone(),
-                base_url: entry.base_url.clone(),
+                api_key,
+                model,
+                base_url,
                 chat_path: None,
                 models_path: None,
-                name: entry.name.clone(),
+                name,
             },
-            _ => {
-                // Unknown provider — treat as Claude (safest fallback)
-                Self::Claude {
-                    api_key: entry.api_key.clone(),
-                    model: entry.model.clone(),
-                    base_url: entry.base_url.clone(),
-                    chat_path: None,
-                    models_path: None,
-                    name: entry.name.clone(),
-                }
-            }
+            // "claude" and any unknown provider — Claude is the safest fallback.
+            _ => Self::Claude {
+                api_key,
+                model,
+                base_url,
+                chat_path: None,
+                models_path: None,
+                name,
+            },
         }
     }
 
@@ -670,19 +559,24 @@ impl Config {
             })?;
         }
 
-        // Allow empty teachers — the app can start and will show an error
+        // Allow empty cloud providers — the app can start and will show an error
         // only when an actual API call is attempted (better UX than crashing on startup).
 
-        // Validate each teacher entry
-        for (idx, teacher) in self.teachers.iter().enumerate() {
+        // Validate each simple cloud provider entry (same accept/reject rules
+        // as the removed legacy shadow, including the exact name set and
+        // per-provider key format checks; entries the legacy shadow never
+        // carried are skipped).
+        for (idx, (provider_name, api_key)) in self
+            .providers
+            .iter()
+            .filter_map(ProviderEntry::simple_cloud_key)
+            .enumerate()
+        {
             // Validate provider name
             let valid_providers = ["claude", "openai", "grok", "gemini", "mistral", "groq"];
-            if !valid_providers.contains(&teacher.provider.as_str()) {
+            if !valid_providers.contains(&provider_name) {
                 anyhow::bail!(errors::wrap_error_with_suggestion(
-                    format!(
-                        "Invalid provider '{}' in teacher[{}]",
-                        teacher.provider, idx
-                    ),
+                    format!("Invalid provider '{}' in provider[{}]", provider_name, idx),
                     &format!(
                         "Valid providers: {}\n\n\
                          Update your config:\n  \
@@ -693,43 +587,43 @@ impl Config {
             }
 
             // Validate API key is not empty
-            if teacher.api_key.trim().is_empty() {
-                anyhow::bail!(errors::api_key_invalid_error(&teacher.provider));
+            if api_key.trim().is_empty() {
+                anyhow::bail!(errors::api_key_invalid_error(provider_name));
             }
 
             // Validate API key format based on provider
-            match teacher.provider.as_str() {
+            match provider_name {
                 "claude" => {
-                    if !teacher.api_key.starts_with("sk-ant-") {
+                    if !api_key.starts_with("sk-ant-") {
                         anyhow::bail!(errors::wrap_error_with_suggestion(
-                            format!("Claude API key has incorrect format (teacher[{}])", idx),
+                            format!("Claude API key has incorrect format (provider[{}])", idx),
                             "Claude API keys start with 'sk-ant-'\n\n\
                              Get a valid key from:\n  \
                              https://console.anthropic.com/"
                         ));
                     }
-                    if teacher.api_key.len() < 20 {
+                    if api_key.len() < 20 {
                         anyhow::bail!("Claude API key is too short (should be ~100+ characters)");
                     }
                 }
                 "openai" | "groq" => {
-                    if !teacher.api_key.starts_with("sk-") {
+                    if !api_key.starts_with("sk-") {
                         anyhow::bail!(errors::wrap_error_with_suggestion(
                             format!(
-                                "{} API key has incorrect format (teacher[{}])",
-                                teacher.provider, idx
+                                "{} API key has incorrect format (provider[{}])",
+                                provider_name, idx
                             ),
                             &format!(
                                 "{} API keys start with 'sk-'\n\n\
                                  Get a valid key from:\n  \
                                  https://platform.openai.com/api-keys",
-                                teacher.provider.to_uppercase()
+                                provider_name.to_uppercase()
                             )
                         ));
                     }
                 }
                 "gemini" => {
-                    if teacher.api_key.len() < 30 {
+                    if api_key.len() < 30 {
                         anyhow::bail!("Gemini API key is too short");
                     }
                 }
@@ -814,19 +708,15 @@ impl Config {
         Ok(())
     }
 
-    pub fn new(teachers: Vec<TeacherEntry>) -> Self {
-        // Derive providers from teachers (no local backend by default)
-        let providers: Vec<ProviderEntry> = teachers
-            .iter()
-            .map(ProviderEntry::from_teacher_entry)
-            .collect();
-        Self::new_with_all(teachers, BackendConfig::default(), providers)
+    /// Construct from a unified providers list.
+    pub fn new(providers: Vec<ProviderEntry>) -> Self {
+        Self::with_providers(providers)
     }
 
     /// Construct from a unified providers list.
     ///
-    /// Automatically derives the legacy `teachers` and `backend` fields so
-    /// existing code continues to work without changes.
+    /// Automatically derives the legacy `backend` field so existing code
+    /// continues to work without changes.
     pub fn with_providers(providers: Vec<ProviderEntry>) -> Self {
         Self::with_providers_from_paths_or_else(providers, None, resolve_default_config_paths)
     }
@@ -876,10 +766,6 @@ impl Config {
         F: FnOnce() -> ConfigPaths,
     {
         let paths = paths.unwrap_or_else(resolve_default_paths);
-        let teachers: Vec<TeacherEntry> = providers
-            .iter()
-            .filter_map(ProviderEntry::to_teacher_entry)
-            .collect();
         let backend = providers
             .iter()
             .find_map(ProviderEntry::to_backend_config)
@@ -888,7 +774,6 @@ impl Config {
                 ..BackendConfig::default()
             });
         Self::new_with_all_and_paths(
-            teachers,
             backend,
             providers,
             paths.metrics_dir,
@@ -896,26 +781,7 @@ impl Config {
         )
     }
 
-    #[allow(deprecated)]
-    fn new_with_all(
-        teachers: Vec<TeacherEntry>,
-        backend: BackendConfig,
-        providers: Vec<ProviderEntry>,
-    ) -> Self {
-        let paths = resolve_default_config_paths();
-
-        Self::new_with_all_and_paths(
-            teachers,
-            backend,
-            providers,
-            paths.metrics_dir,
-            paths.constitution_path,
-        )
-    }
-
-    #[allow(deprecated)]
     fn new_with_all_and_paths(
-        teachers: Vec<TeacherEntry>,
         backend: BackendConfig,
         providers: Vec<ProviderEntry>,
         metrics_dir: PathBuf,
@@ -935,7 +801,6 @@ impl Config {
             server: ServerConfig::default(),
             client: ClientConfig::default(),
             colors: ColorScheme::default(),
-            teachers,
             providers,
             default_provider: None,
             credentials: Vec::new(),
@@ -1036,13 +901,6 @@ impl Config {
         Ok(dependents)
     }
 
-    /// Get the active teacher (first cloud provider in priority list).
-    ///
-    /// Deprecated: prefer `active_provider()` for new code.
-    pub fn active_teacher(&self) -> Option<&TeacherEntry> {
-        self.teachers.first()
-    }
-
     /// All cloud providers (excludes Local entries).
     pub fn cloud_providers(&self) -> Vec<&ProviderEntry> {
         self.providers.iter().filter(|p| !p.is_local()).collect()
@@ -1074,21 +932,14 @@ impl Config {
             .context("Configuration validation failed before save")?;
 
         // Build the providers list — prefer the explicit providers field; fall
-        // back to deriving from teachers+backend for configs constructed via
-        // the legacy Config::new(teachers) path.
+        // back to deriving the local backend entry for configs whose provider
+        // list was not populated.
         let providers = if !self.providers.is_empty() {
             self.providers.clone()
+        } else if self.backend.enabled {
+            vec![ProviderEntry::from_backend_config(&self.backend, None)]
         } else {
-            // Derive from legacy fields
-            let mut p: Vec<ProviderEntry> = self
-                .teachers
-                .iter()
-                .map(ProviderEntry::from_teacher_entry)
-                .collect();
-            if self.backend.enabled {
-                p.push(ProviderEntry::from_backend_config(&self.backend, None));
-            }
-            p
+            Vec::new()
         };
 
         // Create serializable config (new [[providers]] format)
@@ -1352,20 +1203,14 @@ mod tests {
     }
 
     #[test]
-    fn test_config_new_has_no_teachers() {
+    fn test_config_new_has_no_providers_when_empty() {
         let config = Config::new(vec![]);
-        assert!(config.active_teacher().is_none());
         assert!(config.active_provider().is_none());
+        assert!(config.cloud_providers().is_empty());
     }
 
     #[test]
-    fn test_config_active_teacher_none_when_empty() {
-        let config = Config::new(vec![]);
-        assert!(config.active_teacher().is_none());
-    }
-
-    #[test]
-    fn test_with_providers_derives_teachers() {
+    fn test_with_providers_keeps_cloud_entries_as_sole_truth() {
         use crate::config::ProviderEntry;
         let providers = vec![ProviderEntry::Claude {
             api_key: "sk-ant-test".to_string(),
@@ -1376,11 +1221,9 @@ mod tests {
             name: Some("Claude".to_string()),
         }];
         let config = Config::with_providers(providers);
-        assert_eq!(config.teachers.len(), 1);
-        assert_eq!(config.teachers[0].provider, "claude");
         assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.cloud_providers().len(), 1);
         assert!(config.active_provider().is_some());
-        assert!(config.active_teacher().is_some());
         assert!(
             !config.backend.enabled,
             "cloud-only provider lists must not start a local model"
@@ -1429,7 +1272,7 @@ mod tests {
             name: None,
         }];
         let config = Config::with_providers(providers);
-        assert!(config.teachers.is_empty()); // no cloud providers
+        assert!(config.cloud_providers().is_empty()); // no cloud providers
         assert!(config.backend.enabled);
         assert_eq!(config.providers.len(), 1);
         assert!(config.active_provider().is_some());

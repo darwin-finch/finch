@@ -59,7 +59,7 @@ test-only isolation supervisor ([`src/bin/finch-test-supervisor.rs`](src/bin/fin
 | Path | Entry in `src/main.rs` | What it wires |
 |------|------------------------|---------------|
 | Typed programs (`--exec`, `--forth`, `--lisp`) | calls to `ProgramRuntime::submit_typed_only` | A fresh `ProgramRuntime` granted only session output; no provider or config |
-| Pipe or `finch query` | `run_query` | Program-shaped input runs directly (`is_clearly_forth`); otherwise `build_query_tool_executor` with `DaemonClient`, or teacher-only |
+| Pipe or `finch query` | `run_query` | Program-shaped input runs directly (`is_clearly_forth`); otherwise `build_query_tool_executor` with `DaemonClient`, or cloud-only |
 | Interactive REPL | `Repl::new`, then `Repl::run_event_loop` | Provider graph (`create_provider_graph_from_config`), HTTP `DaemonClient`, `ipc::IpcClient`; the REPL builds its provider profile again inside `run_event_loop` (`src/cli/repl.rs`) |
 | Daemon (`finch daemon`, `daemon-start`) | `run_daemon` | `DaemonLifecycle::acquire_instance`, provider graph, `BootstrapLoader` background model loading, `AgentServer` over HTTP, `ipc::start_ipc_server` |
 
