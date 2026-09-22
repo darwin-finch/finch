@@ -39,8 +39,10 @@ impl ToolCatalog {
         }
     }
 
-    /// Split offered-this-turn from host-executable names.
-    pub fn new(
+    /// Split offered-this-turn from host-executable names. Test-only: hosts
+    /// split the sets only to verify the split behavior.
+    #[cfg(test)]
+    fn new(
         offered: impl IntoIterator<Item = impl Into<String>>,
         executable: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
@@ -89,7 +91,7 @@ pub enum RejectReason {
 
 impl RejectReason {
     /// Speakable typed-result body. Never execute after this.
-    pub fn typed_message(&self, id: &str, name: &str) -> String {
+    fn typed_message(&self, id: &str, name: &str) -> String {
         match self {
             Self::DuplicateId => {
                 format!("tool call {id} ({name}) was rejected: duplicate tool-call id")
@@ -264,6 +266,9 @@ enum CallState {
 
 /// Single tool-round lifecycle. Sync protocol; execution stays outside.
 pub struct ToolLoop {
+    /// Pinned for the whole round; surfaced to tests via [`Self::identity`]
+    /// and to future diagnostics without changing the round protocol.
+    #[cfg_attr(not(test), allow(dead_code))]
     identity: ToolLoopIdentity,
     catalog: ToolCatalog,
     order: Vec<String>,
@@ -287,28 +292,21 @@ impl ToolLoop {
         }
     }
 
-    /// Identity recorded for this round.
-    pub fn identity(&self) -> &ToolLoopIdentity {
+    /// Identity recorded for this round. (Test-only.)
+    #[cfg(test)]
+    fn identity(&self) -> &ToolLoopIdentity {
         &self.identity
     }
 
-    /// True after cancel, timeout, disconnect, failure, or completed drain.
-    pub fn is_terminal(&self) -> bool {
-        self.terminal.is_some()
-    }
-
-    /// Terminal reason when the round has ended.
-    pub fn terminal(&self) -> Option<&ToolLoopTerminal> {
-        self.terminal.as_ref()
-    }
-
-    /// Number of ids that started execution. At most one start per id.
-    pub fn execution_starts(&self) -> usize {
+    /// Number of ids that started execution. At most one start per id. (Test-only.)
+    #[cfg(test)]
+    fn execution_starts(&self) -> usize {
         self.admitted.len()
     }
 
-    /// Number of ids that appended a result. At most one append per id.
-    pub fn results_appended(&self) -> usize {
+    /// Number of ids that appended a result. At most one append per id. (Test-only.)
+    #[cfg(test)]
+    fn results_appended(&self) -> usize {
         self.appended.len()
     }
 

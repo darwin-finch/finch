@@ -109,8 +109,11 @@ impl ToolPattern {
         }
     }
 
-    /// Create a new structured pattern
-    pub fn new_structured(
+    /// Create a new structured pattern. Crate-internal: structured patterns
+    /// are constructed by the approval pipeline and tests, never by callers
+    /// outside this crate.
+    #[cfg(test)]
+    fn new_structured(
         tool_name: String,
         description: String,
         command_pattern: Option<String>,
@@ -210,12 +213,6 @@ impl ToolPattern {
         self.last_used = Some(Utc::now());
     }
 
-    /// Increment match count (deprecated, use record_match instead)
-    #[deprecated(note = "Use record_match() instead")]
-    pub fn increment_match(&mut self) {
-        self.record_match();
-    }
-
     /// Ensure compiled regex is available (call after deserialization)
     fn ensure_compiled_regex(&mut self) {
         if self.pattern_type == PatternType::Regex && self.compiled_regex.is_none() {
@@ -290,12 +287,12 @@ impl ExactApproval {
     }
 
     /// Check if this approval matches the given signature
-    pub fn matches(&self, signature: &ToolSignature) -> bool {
+    fn matches(&self, signature: &ToolSignature) -> bool {
         self.tool_name == signature.tool_name && self.signature == signature.context_key
     }
 
     /// Increment match count
-    pub fn increment_match(&mut self) {
+    fn increment_match(&mut self) {
         self.match_count += 1;
     }
 }
@@ -448,40 +445,27 @@ impl PersistentPatternStore {
         self.exact_approvals.iter().any(|a| a.matches(signature))
     }
 
-    /// Get pattern by ID
-    pub fn get_pattern(&self, id: &str) -> Option<&ToolPattern> {
+    /// Get pattern by ID (test-only: callers read the public `patterns` field)
+    #[cfg(test)]
+    fn get_pattern(&self, id: &str) -> Option<&ToolPattern> {
         self.patterns.iter().find(|p| p.id == id)
     }
 
-    /// Get exact approval by ID
-    pub fn get_exact(&self, id: &str) -> Option<&ExactApproval> {
-        self.exact_approvals.iter().find(|a| a.id == id)
-    }
-
-    /// Find pattern by ID (returns index)
-    pub fn find_by_id(&self, id: &str) -> Option<usize> {
+    /// Find pattern by ID (returns index) (test-only)
+    #[cfg(test)]
+    fn find_by_id(&self, id: &str) -> Option<usize> {
         self.patterns.iter().position(|p| p.id == id)
     }
 
-    /// Find pattern by ID (returns mutable reference)
-    pub fn find_by_id_mut(&mut self, id: &str) -> Option<&mut ToolPattern> {
+    /// Find pattern by ID (returns mutable reference) (test-only)
+    #[cfg(test)]
+    fn find_by_id_mut(&mut self, id: &str) -> Option<&mut ToolPattern> {
         self.patterns.iter_mut().find(|p| p.id == id)
     }
 
     /// Get total number of patterns and approvals
     pub fn total_count(&self) -> usize {
         self.patterns.len() + self.exact_approvals.len()
-    }
-
-    /// Prune unused patterns (0 matches, older than 30 days)
-    pub fn prune_unused(&mut self) -> usize {
-        let cutoff = Utc::now() - chrono::Duration::days(30);
-        let original_count = self.patterns.len();
-
-        self.patterns
-            .retain(|p| p.match_count > 0 || p.created_at > cutoff);
-
-        original_count - self.patterns.len()
     }
 }
 

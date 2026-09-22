@@ -19,8 +19,8 @@ pub use finch_tools_api::{
     compile_policy_from_registry, semantic_tools_for_advertisement, tool_authority_from_effect,
     AdmitError, ExactApproval, MatchType, ObserveOutcome, PathSlot, PatternType,
     PersistentPatternStore, PreparedCall, RejectReason, RejectedCall, Tool, ToolCatalog, ToolLoop,
-    ToolLoopIdentity, ToolLoopResult, ToolLoopTerminal, ToolPattern, ToolPatternMatcher,
-    ToolRegistry, ToolSignature, ValidatedCall,
+    ToolLoopIdentity, ToolLoopResult, ToolLoopTerminal, ToolPattern, ToolRegistry, ToolSignature,
+    ValidatedCall,
 };
 pub use implementations::llm_tools::create_llm_tools;
 pub use implementations::propose::{propose_artifact_with_decision, ProposalDecision};

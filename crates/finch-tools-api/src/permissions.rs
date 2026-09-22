@@ -72,7 +72,7 @@ pub fn resolve_workspace_root(start: &Path) -> PathBuf {
 /// existing ancestor and joins the lexically normalised remainder. A symlink
 /// whose target cannot be resolved returns `None` (fail closed: treat as
 /// outside the workspace).
-pub fn resolve_canonical_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_canonical_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -160,7 +160,7 @@ pub fn resolve_canonical_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
 }
 
 /// True when `canonical` is the workspace root or a descendant of it.
-pub fn path_is_inside_workspace(canonical: &Path, root: &Path) -> bool {
+fn path_is_inside_workspace(canonical: &Path, root: &Path) -> bool {
     let path_parts: Vec<_> = canonical.components().collect();
     let root_parts: Vec<_> = root.components().collect();
     path_parts.starts_with(&root_parts)
@@ -233,7 +233,7 @@ fn make_absolute(path: &Path) -> PathBuf {
 
 /// True when the tool's path argument resolves outside the workspace, or
 /// cannot be resolved (fail closed). Tools without a path slot never escape.
-pub fn path_argument_escapes_workspace(
+fn path_argument_escapes_workspace(
     tool_name: &str,
     input: &Value,
     workspace_root: &Path,
@@ -372,9 +372,11 @@ impl Default for ToolPermissionConfig {
     }
 }
 
-/// Who is executing the tool — affects permission defaults.
+/// Who is executing the tool — affects permission defaults. Crate-internal:
+/// the role is chosen through [`PermissionManager::new`] and
+/// [`PermissionManager::for_peer`], never set by callers.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ExecutorRole {
+enum ExecutorRole {
     /// The human owner of the session. Default rules apply as configured.
     Owner,
     /// An AI peer in the room. Asymmetric rules:
@@ -398,7 +400,7 @@ pub struct PermissionManager {
     pub max_tool_turns: usize,
 
     /// Role of the executor — Owner gets configured rules, Peer gets asymmetric rules.
-    pub role: ExecutorRole,
+    role: ExecutorRole,
 
     /// Directory relative path arguments resolve against.
     cwd: PathBuf,
@@ -441,19 +443,6 @@ impl PermissionManager {
         }
     }
 
-    /// Load from configuration
-    pub fn from_config(configs: HashMap<String, ToolPermissionConfig>) -> Self {
-        let (cwd, workspace_root) = default_workspace_context();
-        Self {
-            configs,
-            default_rule: PermissionRule::Ask,
-            max_tool_turns: 25,
-            role: ExecutorRole::Owner,
-            cwd,
-            workspace_root,
-        }
-    }
-
     /// Pin path resolution to an explicit workspace (tests: pass a temp dir
     /// that contains `.git`; do not `chdir`).
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
@@ -464,8 +453,11 @@ impl PermissionManager {
         self
     }
 
-    /// Canonical workspace root used for containment.
-    pub fn workspace_root(&self) -> &Path {
+    /// Canonical workspace root used for containment. Crate-internal: callers
+    /// needing the root for their own checks pass it through
+    /// [`PermissionManager::with_workspace_root`] instead.
+    #[cfg(test)]
+    fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
 
@@ -480,12 +472,6 @@ impl PermissionManager {
         self
     }
 
-    /// Set maximum tool turns
-    pub fn with_max_turns(mut self, max_turns: usize) -> Self {
-        self.max_tool_turns = max_turns;
-        self
-    }
-
     /// Register tool-specific configuration
     pub fn register_tool_config(&mut self, tool_name: String, config: ToolPermissionConfig) {
         self.configs.insert(tool_name, config);
@@ -496,7 +482,7 @@ impl PermissionManager {
     /// Input-dependent constitutional checks run at execution, not
     /// advertisement. Disabled tools and explicit Deny rules are not
     /// advertised. Peer hard-deny tools are never advertised to a peer.
-    pub fn allows_advertising(&self, tool_name: &str) -> bool {
+    pub(crate) fn allows_advertising(&self, tool_name: &str) -> bool {
         if self.role == ExecutorRole::Peer && PEER_HARD_DENY_TOOLS.contains(&tool_name) {
             return false;
         }

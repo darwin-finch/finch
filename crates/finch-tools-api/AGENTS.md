@@ -34,6 +34,33 @@ from `src/tools/permissions.rs`. The pure policy tests live beside them in
 composition root (`src/tools/permissions/tests.rs`), at their original
 `tools::permissions::tests::*` module path, because only there can the real tools be constructed.
 
+**Surface tiers (issue #962 audit).** The `pub use` list in [`src/lib.rs`](src/lib.rs) is the
+cross-crate contract; everything below it is tiered so implementation detail cannot leak back in:
+
+- **Crate-internal (`pub(crate)`):** `resolve_canonical_path`,
+  `ToolSignature::full_command`, `PermissionManager::allows_advertising`, and every
+  `ToolPatternMatcher` method (`new`, `with_default_patterns`, `extract_tool_uses`,
+  `matches_any`). Widening any of these is a capsule change, not cleanup.
+- **Module-internal (private):** `path_is_inside_workspace`,
+  `path_argument_escapes_workspace`, `ExecutorRole` (the role is chosen through
+  `PermissionManager::new`/`for_peer`, never set by callers),
+  `ExactApproval::{matches, increment_match}`, `RejectReason::typed_message`.
+- **Test-only (`#[cfg(test)]`):** `PersistentPatternStore::{get_pattern, find_by_id,
+  find_by_id_mut}`, `ToolPattern::new_structured`, `PermissionManager::workspace_root`,
+  `ToolRegistry::{len, dispatch_names}`, `ToolCatalog::new`,
+  `ToolLoop::{identity, execution_starts, results_appended}`, and the five `ContentBlock`
+  accessors (`is_text`, `is_tool_use`, `is_tool_result`, `as_text`, `as_tool_use` — callers
+  match on the enum).
+
+`ToolPatternMatcher` itself stays exported as the retained pre-neural-selector capability even
+though no subsystem calls it yet; its module carries a scoped
+`cfg_attr(not(test), allow(dead_code))` for exactly that reason, and the same scoped allow on
+`ToolLoop.identity` documents the field's pinned-for-the-round role while its accessor is
+test-only. Deleted as unreferenced by the same audit: `PersistentPatternStore::{get_exact,
+prune_unused}`, `ToolPattern::increment_match` (deprecated alias of `record_match`),
+`PermissionManager::{from_config, with_max_turns}`, `ToolRegistry::is_empty`, and
+`ToolLoop::{is_terminal, terminal}`.
+
 **Boundary:** the [README](README.md) traces tool execution and REPL tool-round callers;
 [`src/lib.rs`](src/lib.rs) is the flat facade. `cargo doc -p finch-tools-api --no-deps --open`
 renders methods on re-exported types. Child modules remain private; do not regenerate a
