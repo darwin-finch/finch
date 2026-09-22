@@ -3758,8 +3758,8 @@ mod tests {
         output.disable_stdout();
         assert!(
             finch::models::installed_model_progress().is_some(),
-            "install_daemon_model_progress must latch a host sink; otherwise \
-             ModelDownloader uses SilentModelProgress in the daemon process"
+            "install_daemon_model_progress must latch a host sink; otherwise model work \
+             uses SilentModelProgress in the daemon process"
         );
         let before = output.len();
         let handle = finch::models::installed_model_progress()

@@ -15,10 +15,10 @@ use super::{
 };
 
 /// Family-truthful identity of this generator: the compatibility adapter for
-/// the Qwen2.5-ONNX local path. Status lines, metrics, and provenance record
+/// the Qwen2.5 llama.cpp local path. Status lines, metrics, and provenance record
 /// this instead of a bare "Local", so a reader can tell which family path
 /// produced a turn.
-pub const QWEN_LOCAL_GENERATOR_NAME: &str = "qwen2.5-onnx";
+pub const QWEN_LOCAL_GENERATOR_NAME: &str = "qwen2.5-llama-cpp";
 
 /// Qwen local generator implementation.
 ///

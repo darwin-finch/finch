@@ -268,7 +268,7 @@ async fn handle_chat_completions_streaming(
     });
 
     // Spawn generation task on blocking thread pool
-    // ONNX generation is CPU-bound and synchronous, so we use spawn_blocking
+    // Local generation is synchronous, so keep it off the async executor.
     // to avoid blocking the async runtime. The bounded channel provides natural
     // backpressure - generation will pause if the HTTP stream can't keep up.
     let server_clone = server.clone();

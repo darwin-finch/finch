@@ -1092,7 +1092,7 @@ mod tests {
         let first_path = directory.path().join("config.toml");
         let second_path = directory.path().join("reloaded.toml");
         let mut config = Config::with_providers(vec![ProviderEntry::Local {
-            inference_provider: InferenceProvider::Onnx,
+            inference_provider: InferenceProvider::LlamaCpp,
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
@@ -1118,7 +1118,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn test_legacy_coreml_provider_reloads_with_compatible_default_policy() {
+    fn test_legacy_onnx_entry_reloads_only_for_setup_migration() {
         use crate::config::ExecutionTarget;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1138,6 +1138,11 @@ mod tests {
         .unwrap();
 
         let loaded = crate::config::load_config_from_path(&path).unwrap();
+        assert_eq!(
+            loaded.backend.inference_provider,
+            crate::models::InferenceProvider::LegacyOnnx,
+            "legacy ONNX identity must survive config load so setup can migrate it"
+        );
         assert_eq!(loaded.backend.execution_target, ExecutionTarget::CoreML);
         assert_eq!(loaded.backend.coreml, CoreMlConfig::default());
     }
@@ -1262,7 +1267,7 @@ mod tests {
         use crate::config::ProviderEntry;
         use crate::models::{InferenceProvider, ModelFamily, ModelSize};
         let providers = vec![ProviderEntry::Local {
-            inference_provider: InferenceProvider::Onnx,
+            inference_provider: InferenceProvider::LlamaCpp,
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
@@ -1294,7 +1299,7 @@ mod tests {
                 name: None,
             },
             ProviderEntry::Local {
-                inference_provider: InferenceProvider::Onnx,
+                inference_provider: InferenceProvider::LlamaCpp,
                 execution_target: ExecutionTarget::Auto,
                 model_family: ModelFamily::Qwen2,
                 model_size: ModelSize::Medium,

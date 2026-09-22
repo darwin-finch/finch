@@ -82,7 +82,7 @@ pub(crate) fn download_progress_sink() -> Arc<dyn ModelProgress> {
     installed_model_progress().unwrap_or_else(|| Arc::new(SilentModelProgress))
 }
 
-/// Attach determinate download progress the way [`super::ModelDownloader::download_model`] does.
+/// Attach determinate progress for a host-owned model download.
 pub(crate) fn attach_download_progress(repo_id: &str) -> Arc<dyn DownloadProgressDisplay> {
     download_progress_sink().start_download_progress(format!("Downloading {repo_id}"), 100)
 }

@@ -1,5 +1,4 @@
-// Generator Model - Unified text generation interface
-// Phase 4: ONNX-based (Candle removed)
+// Generator model and the engine-neutral text-generation port.
 
 use anyhow::Result;
 use std::path::Path;
@@ -118,7 +117,7 @@ impl GeneratorModel {
         self.backend.name()
     }
 
-    /// Get mutable reference to backend (for accessing ONNX model directly)
+    /// Get mutable access to the engine-neutral backend.
     pub fn backend_mut(&mut self) -> &mut dyn TextGeneration {
         self.backend.as_mut()
     }
@@ -280,7 +279,7 @@ mod tests {
     #[test]
     fn test_generate_text_uses_trait_not_downcast() {
         // Regression: generate_text() must work via trait methods, not downcast to
-        // LoadedOnnxModel. A non-ONNX backend should succeed here.
+        // a concrete engine type. The injected backend should succeed here.
         use crate::models::unified_loader::ModelLoadConfig;
         use crate::models::GeneratorConfig;
 
@@ -311,7 +310,7 @@ mod tests {
         let mut gen = GeneratorModel {
             backend: Box::new(EchoBackend),
             config: GeneratorConfig::Pretrained(ModelLoadConfig {
-                provider: crate::models::unified_loader::InferenceProvider::Onnx,
+                provider: crate::models::unified_loader::InferenceProvider::LlamaCpp,
                 family: crate::models::unified_loader::ModelFamily::Qwen2,
                 size: crate::models::unified_loader::ModelSize::Small,
                 target: crate::config::ExecutionTarget::Cpu,
@@ -342,7 +341,7 @@ mod tests {
         use crate::models::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize};
 
         let config = GeneratorConfig::Pretrained(ModelLoadConfig {
-            provider: crate::models::unified_loader::InferenceProvider::Onnx,
+            provider: crate::models::unified_loader::InferenceProvider::LlamaCpp,
             family: ModelFamily::Qwen2,
             size: ModelSize::Small,
             target: ExecutionTarget::Cpu,

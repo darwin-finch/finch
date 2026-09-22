@@ -14,7 +14,7 @@ model = "claude-sonnet-4-6"   # optional override
 
 [[providers]]
 type = "local"
-inference_provider = "llama_cpp" # build with --features llama-cpp until default cutover
+inference_provider = "llama_cpp"
 execution_target = "auto"    # "auto" (Metal on supported Macs) | "cpu"
 model_family = "qwen2"
 model_size = "medium"         # descriptive size hint; GGUF file supplies the weights
@@ -26,9 +26,9 @@ enabled = true
 The setup wizard can enter the same absolute GGUF path in its local-model dialog and
 checks that the file exists before adding it. This user-selected path is for
 daemon chat LLMs only; the frontend memory subsystem selects and downloads its
-own models. Existing ONNX/Candle chat entries remain readable during the
-local-provider cutover, but an ONNX repository or file is never treated as a
-GGUF path.
+own models. ONNX and Candle are no longer chat providers. Loading a legacy
+entry reports an actionable `finch setup` migration error; an old repository
+or model file is never treated as a GGUF path.
 
 Automatic training is disabled and there are no active `auto_train` settings.
 Explicit feedback is retained privately in `~/.finch/feedback.jsonl` without

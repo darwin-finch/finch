@@ -1,8 +1,7 @@
 // Progressive Bootstrap - Async model loading with instant startup
 // Enables REPL to start in <100ms while model loads in background
 
-use anyhow::{anyhow, Context, Result};
-use std::path::PathBuf;
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -98,46 +97,6 @@ impl BootstrapLoader {
         &self.state
     }
 
-    /// Check if HuggingFace token exists and is valid
-    fn check_hf_token() -> Result<()> {
-        let token_path = dirs::cache_dir()
-            .ok_or_else(|| anyhow!("Could not determine cache directory"))?
-            .join("huggingface")
-            .join("token");
-
-        if !token_path.exists() {
-            return Err(anyhow!(
-                "HuggingFace token not found at {:?}\n\
-                 \n\
-                 Shammah needs a HuggingFace token to download Qwen models.\n\
-                 \n\
-                 Please follow these steps:\n\
-                 1. Create a token at https://huggingface.co/settings/tokens\n\
-                 2. Save it: echo \"hf_YOUR_TOKEN\" > ~/.cache/huggingface/token\n\
-                 3. Restart Shammah\n\
-                 \n\
-                 See README.md for detailed instructions.",
-                token_path
-            ));
-        }
-
-        // Validate token format (should start with hf_)
-        let token = std::fs::read_to_string(&token_path)
-            .context("Failed to read HuggingFace token file")?;
-
-        let token = token.trim();
-        if !token.starts_with("hf_") {
-            return Err(anyhow!(
-                "Invalid HuggingFace token format in {:?}\n\
-                 Token should start with 'hf_'\n\
-                 Get a new token at https://huggingface.co/settings/tokens",
-                token_path
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Load generator in background using UnifiedModelLoader
     pub async fn load_generator_async(
         &self,
@@ -202,21 +161,6 @@ impl BootstrapLoader {
             output.write_progress(format!("⏳ Loading {}...", model_name));
         }
 
-        // Check HF token before attempting (UnifiedModelLoader will download if needed)
-        #[cfg(feature = "llama-cpp")]
-        let needs_hf_token = provider != super::unified_loader::InferenceProvider::LlamaCpp;
-        #[cfg(not(feature = "llama-cpp"))]
-        let needs_hf_token = true;
-        if needs_hf_token {
-            if let Err(e) = Self::check_hf_token() {
-                tracing::warn!(
-                    "HuggingFace token check failed: {}. Model must be cached.",
-                    e
-                );
-                // Don't fail here - model might be cached
-            }
-        }
-
         // Load in blocking task (model loading + potential download is CPU/IO intensive)
         let model_name_clone = model_name.clone();
         let output_clone = self.output.clone();
@@ -259,30 +203,6 @@ impl BootstrapLoader {
     /// Set state to not available (offline mode)
     pub async fn set_not_available(&self) {
         *self.state.write().await = GeneratorState::NotAvailable;
-    }
-
-    /// Find snapshot directory within cache path
-    #[allow(dead_code)]
-    fn find_snapshot_dir(cache_path: &PathBuf) -> Result<PathBuf> {
-        // Check if cache_path itself is valid
-        if cache_path.join("config.json").exists() {
-            return Ok(cache_path.clone());
-        }
-
-        // Look for snapshot subdirectory
-        if let Ok(entries) = std::fs::read_dir(cache_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() && path.join("config.json").exists() {
-                    return Ok(path);
-                }
-            }
-        }
-
-        Err(anyhow::anyhow!(
-            "Could not find valid model snapshot in {:?}",
-            cache_path
-        ))
     }
 }
 

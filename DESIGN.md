@@ -101,7 +101,7 @@ the MCP client should not have to load tool execution and permissions to get the
 | **`tools-mcp`** (0): the client for external Model Context Protocol servers; depends on `finch-tools-api` and the `finch-runtime` MCP port, not root tool implementations | `src/tools/mcp` | [README](src/tools/mcp/README.md), [agent contract](src/tools/mcp/AGENTS.md), [facade](src/tools/mcp/mod.rs), [user guide](docs/MCP_USER_GUIDE.md) |
 | **`tools`** (1): tool execution and GUI automation — the executor, concrete tool implementations, and MCP wiring over the `tools-api` surface | `src/tools` except `mcp`; re-export shims `src/tools/types.rs`, `src/tools/permissions.rs` | [README](src/tools/README.md), [agent contract](src/tools/AGENTS.md), [facade](src/tools/mod.rs); [Tool execution and permissions](src/tools/EXECUTION.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
 | **`runtime`** (2): typed program execution, capability authority, host effects, and delivery ABI | `crates/finch-runtime`; root `poset` and [`src/program_registry.rs`](src/program_registry.rs) are application composition, not runtime-crate internals | [Runtime README](crates/finch-runtime/README.md), [agent contract](crates/finch-runtime/AGENTS.md), [facade](crates/finch-runtime/src/lib.rs) |
-| **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | Models [README](src/models/README.md), [agent contract](src/models/AGENTS.md), [facade](src/models/mod.rs); local generation [README](src/local/README.md), [agent contract](src/local/AGENTS.md), [facade](src/local/mod.rs); generators compatibility [README](src/generators/README.md), [capsule](src/generators/AGENTS.md), [facade](src/generators/mod.rs); [Local model loader](src/models/unified_loader.rs), [GGUF loader](src/models/loaders/llama_cpp.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
+| **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | Models [README](src/models/README.md), [agent contract](src/models/AGENTS.md), [facade](src/models/mod.rs); local generation [README](src/local/README.md), [agent contract](src/local/AGENTS.md), [facade](src/local/mod.rs); generators compatibility [README](src/generators/README.md), [capsule](src/generators/AGENTS.md), [facade](src/generators/mod.rs); [Local model loader](src/models/unified_loader.rs), [GGUF loader](src/models/loaders/llama_cpp.rs), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
 | **`finch-providers`** (0): reusable provider transports, OAuth, catalogs, and credential ports | `crates/finch-providers` | [README](crates/finch-providers/README.md), [capsule](crates/finch-providers/AGENTS.md), [facade](crates/finch-providers/src/lib.rs); OAuth [README](crates/finch-providers/src/oauth/README.md), [capsule](crates/finch-providers/src/oauth/AGENTS.md), [facade](crates/finch-providers/src/oauth/mod.rs) |
 | **`finch-generation`** (1): development generation contract, lifecycle, strategies, and identity; production REPL still uses older generator path | `crates/finch-generation` | [README](crates/finch-generation/README.md), [capsule](crates/finch-generation/AGENTS.md), [facade](crates/finch-generation/src/lib.rs) |
 | **`providers`** (3): Finch Config mapping onto finch-providers, planning prompts | `src/providers`, `claude`, `oauth`, `llms`, `planning` | Providers compatibility [README](src/providers/README.md), [capsule](src/providers/AGENTS.md), [facade](src/providers/mod.rs); OAuth compatibility [README](src/oauth/README.md), [capsule](src/oauth/AGENTS.md), [facade](src/oauth/mod.rs); planning [README](src/planning/README.md), [capsule](src/planning/AGENTS.md), [facade](src/planning/mod.rs); [Claude client](src/claude/CLIENT.md), [OAuth boundary](docs/OAUTH.md), [ChatGPT subscription transport](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md), [OpenAI transport](docs/OPENAI_TRANSPORT.md) |
@@ -185,7 +185,7 @@ typed runtime + capability broker for program effects
 
 | Component | Module Doc |
 |-----------|-----------|
-| Local model loader | `src/models/unified_loader.rs` · `src/models/loaders/llama_cpp.rs` · `src/models/ONNX.md` |
+| Local chat-model loader | `src/models/unified_loader.rs` · `src/models/loaders/llama_cpp.rs` |
 | Deferred LoRA path | `docs/AUTOMATIC_TRAINING.md` · `src/models/LORA.md` |
 | Router | `src/router/ROUTING.md` |
 | TUI Renderer | `crates/finch-tui/ARCHITECTURE.md` |
@@ -201,9 +201,11 @@ Three historical weight tiers are retained for explicit feedback: high (10x), me
 
 ### Local backend investigation
 
-The source contains ONNX Runtime and Candle loaders plus an opt-in llama.cpp/GGUF loader.
-The production memory selector still uses ONNX or TF-IDF; its replacement and index-identity
-migration belong to separate memory work. Historical backend experiments
+Daemon local chat uses llama.cpp with an explicit user-selected GGUF file. Legacy ONNX/Candle
+chat entries are loadable only as setup-migration markers and cannot reach an inference engine.
+The frontend memory selector still owns its required defaults, automatic model download, and
+current ONNX/TF-IDF implementation; its replacement and index-identity migration belong to
+separate memory work. Historical backend experiments
 are recorded in `docs/MODEL_BACKEND_STATUS.md`, but that document is not end-to-end routing or
 conformance evidence.
 
@@ -240,7 +242,7 @@ Brain and daemon tests must use the isolated launchers and kernel-assigned endpo
 ### Technology stack
 
 - **Language:** Rust (memory safety, performance, Apple Silicon support)
-- **ML frameworks in source:** ONNX Runtime (`ort` crate), Candle, and opt-in llama.cpp (`llama-cpp-2`)
+- **ML frameworks in source:** llama.cpp (`llama-cpp-2`) for daemon chat; ONNX Runtime (`ort`) only for the separately owned frontend memory embedder
 - **Async:** Tokio
 - **HTTP server:** Axum (`/v1/chat/completions`, `/v1/models`, `/v1/messages`, and Finch-specific
   routes; not the full OpenAI API and not the Responses API)
@@ -285,8 +287,7 @@ Known stale or unsupported claims in current-looking documents, awaiting repair 
 [#572](https://github.com/darwin-finch/finch/issues/572) unless noted:
 
 - [Rust toolchain](docs/RUST_TOOLCHAIN.md) contradicts the `rust-version` declared in `Cargo.toml`.
-- [Bootstrap loading](src/models/BOOTSTRAP.md) and [ONNX loader](src/models/ONNX.md) state
-  unmeasured startup timing and treat loader variants as backend support.
+- [Bootstrap loading](src/models/BOOTSTRAP.md) states unmeasured startup timing.
 - [Local model/backend status](docs/MODEL_BACKEND_STATUS.md) is a dated investigation and names a
   Cargo feature that does not exist.
 - [Test guide](tests/README.md) has two build commands that bypass the Cargo slot and cites a

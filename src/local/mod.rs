@@ -139,7 +139,7 @@ impl LocalGenerator {
     /// Try to generate a response from patterns with tools
     ///
     /// This method is used by the daemon to support tool execution.
-    /// Delegates to the neural generator (ONNX model) if available.
+    /// Delegates to the configured local chat generator if available.
     pub fn try_generate_from_pattern_with_tools(
         &mut self,
         messages: &[Message],

@@ -37,7 +37,7 @@ mod tests;
 use crate::cli::chatgpt_auth::EnsuredChatGptCredential;
 use crate::cli::chatgpt_auth::{ChatGptCredentialAuthenticator, ChatGptNamedCredentialStart};
 use crate::config::{CoreMlConfig, ExecutionTarget, ProviderEntry};
-use crate::models::{get_repository, InferenceProvider, ModelFamily, ModelSize};
+use crate::models::{InferenceProvider, ModelFamily, ModelSize};
 use crate::providers::ProviderEndpoints;
 use crate::providers::{
     default_cache_dir, fallback_catalog, profile_cache_identity, read_cache, refresh_from_config,

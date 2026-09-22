@@ -4,7 +4,7 @@
 // This is DIFFERENT from the provider transports (crates/finch-providers, surfaced through
 // src/providers/) which handle external API calls.
 //
-// LocalModelAdapter: Format prompts for local ONNX inference
+// LocalModelAdapter: format prompts for local chat inference.
 // Provider transport: Make HTTP requests to external APIs (Claude, OpenAI, etc.)
 
 pub mod deepseek;

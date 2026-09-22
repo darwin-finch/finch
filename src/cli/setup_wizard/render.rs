@@ -1384,7 +1384,7 @@ pub(super) fn add_provider_card(
         }
         // ── single-screen local model form ───────────────────────────────────
         AddProviderStep::ConfigureLocal {
-            inference_provider,
+            inference_provider: _,
             family,
             size,
             execution,
@@ -1392,44 +1392,15 @@ pub(super) fn add_provider_card(
             focused_field,
             editing_idx,
         } => {
-            let backend_name = match inference_provider {
-                InferenceProvider::Onnx => "ONNX Runtime",
-                #[cfg(feature = "llama-cpp")]
-                InferenceProvider::LlamaCpp => "llama.cpp (GGUF)",
-                #[cfg(feature = "candle")]
-                InferenceProvider::Candle => "Candle",
-            };
-            let mut family_name = family.name().to_string();
-            #[cfg(feature = "candle")]
-            if *inference_provider == InferenceProvider::Candle {
-                family_name = format!("{} (only)", family.name());
-            }
+            let backend_name = "llama.cpp (GGUF)";
+            let family_name = family.name().to_string();
             let size_name = model_size_display(size);
             let device_name = execution_target_display(*execution, coreml);
             let row = |label: &str, value: &str, focused: bool| {
                 remote_form_row(label, value, focused, false)
             };
-            let repo_preview = get_repository(*inference_provider, *family, *size)
-                .map(|repo| format!("→ {repo}"))
-                .unwrap_or_else(|| {
-                    #[cfg(feature = "llama-cpp")]
-                    if *inference_provider == InferenceProvider::LlamaCpp {
-                        return "Choose a local GGUF model file".to_string();
-                    }
-                    "(no model available for this combination)".to_string()
-                });
-            let ram_estimate = match size {
-                ModelSize::Small => "~2 GB RAM",
-                ModelSize::Medium => "~4 GB RAM",
-                ModelSize::Large => "~8 GB RAM",
-                ModelSize::XLarge => "~16 GB RAM",
-            };
-            #[cfg(feature = "llama-cpp")]
-            let ram_estimate = if *inference_provider == InferenceProvider::LlamaCpp {
-                "RAM depends on GGUF file"
-            } else {
-                ram_estimate
-            };
+            let repo_preview = "Choose a local GGUF model file";
+            let ram_estimate = "RAM depends on GGUF file";
             let mut body = vec![
                 String::new(),
                 row("Backend", backend_name, *focused_field == 0),
@@ -1437,23 +1408,18 @@ pub(super) fn add_provider_card(
                 row("Size", size_name, *focused_field == 2),
                 row("Device", &device_name, *focused_field == 3),
             ];
-            #[cfg(feature = "llama-cpp")]
-            if *inference_provider == InferenceProvider::LlamaCpp {
-                let path_display = if model_path.chars().count() > 34 {
-                    let suffix: String = model_path.chars().rev().take(33).collect();
-                    format!("…{}", suffix.chars().rev().collect::<String>())
-                } else {
-                    model_path.clone()
-                };
-                body.push(remote_form_row(
-                    "GGUF file",
-                    &path_display,
-                    *focused_field == 4,
-                    true,
-                ));
-            }
-            #[cfg(not(feature = "llama-cpp"))]
-            let _ = model_path;
+            let path_display = if model_path.chars().count() > 34 {
+                let suffix: String = model_path.chars().rev().take(33).collect();
+                format!("…{}", suffix.chars().rev().collect::<String>())
+            } else {
+                model_path.clone()
+            };
+            body.push(remote_form_row(
+                "GGUF file",
+                &path_display,
+                *focused_field == 4,
+                true,
+            ));
             body.extend([
                 String::new(),
                 format!(
