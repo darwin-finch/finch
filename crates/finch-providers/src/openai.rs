@@ -1156,6 +1156,7 @@ impl OpenAIProvider {
     }
 
     /// Create a new OpenAI provider
+    #[cfg(test)]
     pub fn new_openai(api_key: String) -> Result<Self> {
         Self::new(
             api_key,
@@ -1168,6 +1169,7 @@ impl OpenAIProvider {
     }
 
     /// Create a new Grok provider (uses OpenAI-compatible API)
+    #[cfg(test)]
     pub fn new_grok(api_key: String) -> Result<Self> {
         Self::new(
             api_key,
@@ -1176,18 +1178,6 @@ impl OpenAIProvider {
             "/v1/models",
             "grok-4.6".to_string(),
             "grok".to_string(),
-        )
-    }
-
-    /// Create a new Mistral provider (uses OpenAI-compatible API)
-    pub fn new_mistral(api_key: String) -> Result<Self> {
-        Self::new(
-            api_key,
-            "https://api.mistral.ai".to_string(),
-            "/v1/chat/completions",
-            "/v1/models",
-            "mistral-large-2512".to_string(),
-            "mistral".to_string(),
         )
     }
 
@@ -1312,7 +1302,7 @@ impl OpenAIProvider {
     /// OpenAI-compatible transport that sends the secret as a named header
     /// instead of `Authorization: Bearer`. Used by the SuperGrok subscription
     /// lane (`xai-grok-cli`); never by Console API-key profiles.
-    pub fn new_compatible_named_header(
+    pub(crate) fn new_compatible_named_header(
         api_key: String,
         base_url: String,
         chat_path: impl AsRef<str>,

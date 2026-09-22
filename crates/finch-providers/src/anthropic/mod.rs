@@ -3,5 +3,5 @@
 mod streaming;
 mod types;
 
-pub use streaming::{StreamDelta, StreamEvent};
+pub(crate) use streaming::StreamEvent;
 pub use types::{MessageRequest, MessageResponse};

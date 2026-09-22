@@ -193,5 +193,5 @@ fn strip_cfg_test_items(source: &str) -> String {
 fn public_contract_exports_provider_and_oauth_facades() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<finch_providers::ProviderRequest>();
-    assert_send_sync::<finch_providers::oauth::OAuthDialectDescriptor>();
+    assert_send_sync::<finch_providers::OAuthDialectDescriptor>();
 }

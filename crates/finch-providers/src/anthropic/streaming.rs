@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Server-Sent Event from Claude API
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct StreamEvent {
+pub(crate) struct StreamEvent {
     #[serde(rename = "type")]
     pub event_type: String,
     #[serde(default)]
@@ -15,7 +15,7 @@ pub struct StreamEvent {
 
 /// Content block metadata from content_block_start events
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SseContentBlock {
+pub(crate) struct SseContentBlock {
     #[serde(rename = "type")]
     pub block_type: String,
     #[serde(default)]
@@ -26,7 +26,7 @@ pub struct SseContentBlock {
 
 /// Delta within a streaming event
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct StreamDelta {
+pub(crate) struct StreamDelta {
     #[serde(rename = "type")]
     pub delta_type: String,
     pub text: Option<String>,
@@ -36,6 +36,7 @@ pub struct StreamDelta {
 
 impl StreamEvent {
     /// Check if this event contains a text delta
+    #[cfg(test)]
     pub fn is_text_delta(&self) -> bool {
         self.event_type == "content_block_delta"
             && self
@@ -46,6 +47,7 @@ impl StreamEvent {
     }
 
     /// Check if this event signals a tool_use block starting
+    #[cfg(test)]
     pub fn is_tool_use_start(&self) -> bool {
         self.event_type == "content_block_start"
             && self
@@ -56,6 +58,7 @@ impl StreamEvent {
     }
 
     /// Extract text from the event if available
+    #[cfg(test)]
     pub fn text(&self) -> Option<&str> {
         self.delta.as_ref()?.text.as_deref()
     }

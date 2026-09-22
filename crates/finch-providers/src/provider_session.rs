@@ -23,7 +23,7 @@ pub struct ProviderSession {
 
 /// Tracks the state of conversation with the provider
 #[derive(Debug, Clone, Default)]
-pub struct ConversationState {
+pub(crate) struct ConversationState {
     /// Number of messages sent in the last provider call
     last_provider_message_count: usize,
 
@@ -63,6 +63,7 @@ impl Default for SessionContextConfig {
 
 impl ProviderSession {
     /// Create a new provider session with default config
+    #[cfg(test)]
     pub fn new(provider: Box<dyn LlmProvider>) -> Self {
         Self {
             provider: std::sync::Arc::from(provider),
@@ -72,6 +73,7 @@ impl ProviderSession {
     }
 
     /// Create a new provider session with custom config
+    #[cfg(test)]
     pub fn with_config(provider: Box<dyn LlmProvider>, config: SessionContextConfig) -> Self {
         Self {
             provider: std::sync::Arc::from(provider),
@@ -161,7 +163,8 @@ impl ProviderSession {
     }
 
     /// Get current conversation state (for metrics/debugging)
-    pub fn state(&self) -> &ConversationState {
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> &ConversationState {
         &self.state
     }
 
@@ -171,47 +174,15 @@ impl ProviderSession {
     }
 
     /// Reset conversation state (e.g., when starting new conversation)
+    #[cfg(test)]
     pub fn reset_state(&mut self) {
         self.state = ConversationState::default();
     }
 
     // ==================== Level 2: Basic - Optional Truncation ====================
 
-    /// Send message with optional context truncation (Level 2: Basic)
-    ///
-    /// If max_context_turns is configured, only sends recent conversation history.
-    /// System messages are always preserved.
-    pub async fn send_message_with_truncation(
-        &mut self,
-        request: &ProviderRequest,
-    ) -> Result<ProviderResponse> {
-        let truncated_request = if self.config.max_context_turns > 0 {
-            self.truncate_context(request)
-        } else {
-            request.clone()
-        };
-
-        // Track metrics on truncated context
-        let total_messages = request.messages.len();
-        let sent_messages = truncated_request.messages.len();
-        let dropped_messages = total_messages - sent_messages;
-
-        if dropped_messages > 0 {
-            tracing::info!(
-                provider = %self.provider.name(),
-                total_messages,
-                sent_messages,
-                dropped_messages,
-                max_turns = self.config.max_context_turns,
-                "Context truncated to save tokens"
-            );
-        }
-
-        // Send and track as usual
-        self.send_message(&truncated_request).await
-    }
-
     /// Truncate conversation to recent turns only
+    #[cfg(test)]
     fn truncate_context(&self, request: &ProviderRequest) -> ProviderRequest {
         if self.config.max_context_turns == 0 || request.messages.is_empty() {
             return request.clone();
@@ -377,30 +348,6 @@ impl ProviderSession {
 
         result
     }
-
-    /// Get optimization statistics
-    pub fn optimization_stats(&self) -> OptimizationStats {
-        OptimizationStats {
-            provider_call_count: self.state.provider_call_count,
-            total_input_tokens: self.state.total_input_tokens,
-            estimated_cached_tokens: self.state.estimated_cached_tokens,
-            estimated_savings_percent: if self.state.total_input_tokens > 0 {
-                (self.state.estimated_cached_tokens as f64 / self.state.total_input_tokens as f64)
-                    * 100.0
-            } else {
-                0.0
-            },
-        }
-    }
-}
-
-/// Statistics about context optimization
-#[derive(Debug, Clone)]
-pub struct OptimizationStats {
-    pub provider_call_count: usize,
-    pub total_input_tokens: usize,
-    pub estimated_cached_tokens: usize,
-    pub estimated_savings_percent: f64,
 }
 
 /// Count tool results in messages

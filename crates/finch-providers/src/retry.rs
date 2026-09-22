@@ -12,7 +12,7 @@ const BASE_DELAY_MS: u64 = 1000;
 /// Providers wrap 4xx HTTP client errors in this type so that malformed-request
 /// errors are surfaced immediately rather than wasted on identical retries.
 #[derive(Debug)]
-pub struct NonRetriableError(pub String);
+pub(crate) struct NonRetriableError(pub String);
 
 impl std::fmt::Display for NonRetriableError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -27,7 +27,7 @@ impl std::error::Error for NonRetriableError {}
 /// Errors wrapped in [`NonRetriableError`] are returned immediately without
 /// retrying (e.g. 4xx HTTP client errors where the payload is definitively
 /// malformed and retrying would always produce the same failure).
-pub async fn with_retry<F, Fut, T>(f: F) -> Result<T>
+pub(crate) async fn with_retry<F, Fut, T>(f: F) -> Result<T>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
