@@ -15,10 +15,9 @@ For GGUF, `execution_target = "auto"` permits GPU offload when available;
 `execution_target = "cpu"` disables it. CoreML and CUDA target names refer to other backends
 and are rejected rather than silently remapped.
 
-A separate memory composition path may construct `LlamaCppEmbeddingEngine` with its own embedding-capable GGUF,
-but the production memory selector still uses ONNX or TF-IDF. Existing memory vectors must not
-be mixed with a different embedding model/dimension. ONNX and Candle remain available as
-deprecated legacy choices until the cutover is tested and an index migration is defined.
+Memory embeddings are outside this local chat-provider slice. The production memory selector
+still uses ONNX or TF-IDF; the separate memory work owns its model migration. ONNX and Candle
+remain available as deprecated legacy chat choices until their local-provider paths are removed.
 
 Two callers show the boundary:
 

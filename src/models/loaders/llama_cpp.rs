@@ -1,7 +1,6 @@
 //! In-process GGUF inference. Model identity and selection remain at the composition root.
 
 use anyhow::{anyhow, bail, Context, Result};
-use finch_memory::EmbeddingEngine;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -17,7 +16,7 @@ use std::sync::Arc;
 use super::super::generator_new::{TextGeneration, TokenCallback};
 
 // llama.cpp permits one initialized backend per process. Keep it alive longer
-// than every model and context, including models loaded for memory and chat.
+// than every model and context used for local chat.
 static BACKEND: OnceCell<LlamaBackend> = OnceCell::new();
 
 fn backend() -> Result<&'static LlamaBackend> {
@@ -49,10 +48,8 @@ fn load_model(path: &Path, allow_gpu_offload: bool) -> Result<Arc<LlamaModel>> {
     Ok(Arc::new(model))
 }
 
-fn context_params(embeddings: bool) -> LlamaContextParams {
-    LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(2048))
-        .with_embeddings(embeddings)
+fn context_params() -> LlamaContextParams {
+    LlamaContextParams::default().with_n_ctx(NonZeroU32::new(2048))
 }
 
 fn display_name(path: &Path, configured_family: Option<&str>) -> Result<String> {
@@ -107,7 +104,7 @@ impl LlamaCppGenerator {
         let backend = backend()?;
         let mut context = self
             .model
-            .new_context(backend, context_params(false))
+            .new_context(backend, context_params())
             .context("create llama.cpp generation context")?;
         let capacity = usize::try_from(context.n_ctx()).context("GGUF context size overflow")?;
         if input_ids.len().saturating_add(max_new_tokens) > capacity {
@@ -219,77 +216,6 @@ impl TextGeneration for LlamaCppGenerator {
     }
 }
 
-/// Explicit GGUF embedding engine for memory injection. Callers own index identity/rebuild.
-pub struct LlamaCppEmbeddingEngine {
-    model: Arc<LlamaModel>,
-    dimension: usize,
-}
-
-impl LlamaCppEmbeddingEngine {
-    /// Load an embedding-capable GGUF; a pooling mode is required by `embed`.
-    pub fn load(path: &Path) -> Result<Self> {
-        let mut engine = Self {
-            model: load_model(path, true)?,
-            dimension: 0,
-        };
-        // The pooled output width can differ from the model's hidden width.
-        // Probe the actual embedding port so callers never index a wrong size.
-        engine.dimension = engine.embed("Finch embedding dimension probe")?.len();
-        if engine.dimension < 8 {
-            bail!(
-                "GGUF output width {} is not a vector embedding; a reranker/classifier cannot back MemTree",
-                engine.dimension
-            );
-        }
-        Ok(engine)
-    }
-}
-
-impl EmbeddingEngine for LlamaCppEmbeddingEngine {
-    fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let tokens = self
-            .model
-            .str_to_token(text, AddBos::Always)
-            .context("tokenize GGUF embedding input")?;
-        if tokens.is_empty() {
-            bail!("GGUF embedding input produced no tokens");
-        }
-        let mut context = self
-            .model
-            .new_context(backend()?, context_params(true))
-            .context("create llama.cpp embedding context")?;
-        let capacity = usize::try_from(context.n_ctx()).context("GGUF context size overflow")?;
-        if tokens.len() > capacity {
-            bail!("GGUF embedding input exceeds context ({capacity} tokens)");
-        }
-        let mut batch = LlamaBatch::new(capacity, 1);
-        batch
-            .add_sequence(&tokens, 0, false)
-            .context("batch GGUF embedding input")?;
-        context
-            .decode(&mut batch)
-            .context("decode GGUF embedding input")?;
-        let embedding = context
-            .embeddings_seq_ith(0)
-            .context("GGUF model has no pooled sequence embedding")?;
-        let magnitude = embedding
-            .iter()
-            .map(|value| value * value)
-            .sum::<f32>()
-            .sqrt();
-        if !magnitude.is_finite() || magnitude <= f32::EPSILON {
-            return Err(anyhow!(
-                "GGUF model returned a zero or non-finite embedding"
-            ));
-        }
-        Ok(embedding.iter().map(|value| value / magnitude).collect())
-    }
-
-    fn dimension(&self) -> usize {
-        self.dimension
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,7 +231,7 @@ mod tests {
 
     #[test]
     fn test_non_gguf_fails_before_native_initialization() {
-        let error = LlamaCppEmbeddingEngine::load(Path::new(file!()))
+        let error = LlamaCppGenerator::load_with_offload(Path::new(file!()), true, None)
             .err()
             .expect("non-GGUF must fail");
         assert!(error.to_string().contains(".gguf"), "{error:#}");
@@ -372,45 +298,5 @@ mod tests {
         let prompt = generator.tokenize("Hello").expect("tokenize");
         let output = generator.generate(&prompt, 4).expect("CPU GGUF generation");
         assert!(!output.is_empty(), "CPU GGUF generation must emit tokens");
-    }
-
-    #[test]
-    #[ignore = "requires FINCH_TEST_GGUF_EMBED pointing to a local embedding GGUF"]
-    fn test_real_gguf_embeddings_are_distinct_and_normalized() {
-        let path = std::env::var("FINCH_TEST_GGUF_EMBED").expect("set FINCH_TEST_GGUF_EMBED");
-        let engine = LlamaCppEmbeddingEngine::load(Path::new(&path)).expect("load embedding GGUF");
-        let first = engine.embed("a small red bird").expect("embed first");
-        let second = engine
-            .embed("a database transaction")
-            .expect("embed second");
-        assert_eq!(
-            first.len(),
-            engine.dimension(),
-            "embedding width must match port"
-        );
-        assert_eq!(second.len(), first.len(), "embedding widths must be stable");
-        assert!(
-            first.iter().zip(&second).any(|(a, b)| (a - b).abs() > 1e-4),
-            "distinct inputs must not produce identical embeddings"
-        );
-        let norm = first.iter().map(|value| value * value).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-3,
-            "embedding must be normalized: {norm}"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires FINCH_TEST_GGUF_RERANK pointing to a local ranking GGUF"]
-    fn test_reranker_cannot_be_used_as_memory_embedder() {
-        let path = std::env::var("FINCH_TEST_GGUF_RERANK").expect("set FINCH_TEST_GGUF_RERANK");
-        let error = LlamaCppEmbeddingEngine::load(Path::new(&path))
-            .err()
-            .expect("ranking model must not be accepted as an embedding engine");
-        assert!(
-            error.to_string().contains("not a vector embedding")
-                || error.to_string().contains("no pooled sequence embedding"),
-            "reranker must fail with a model-capability explanation: {error:#}"
-        );
     }
 }

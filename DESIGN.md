@@ -202,8 +202,8 @@ Three historical weight tiers are retained for explicit feedback: high (10x), me
 ### Local backend investigation
 
 The source contains ONNX Runtime and Candle loaders plus an opt-in llama.cpp/GGUF loader.
-The production memory selector still uses ONNX or TF-IDF; GGUF embeddings require explicit
-injection and an index-identity migration before a default switch. Historical backend experiments
+The production memory selector still uses ONNX or TF-IDF; its replacement and index-identity
+migration belong to separate memory work. Historical backend experiments
 are recorded in `docs/MODEL_BACKEND_STATUS.md`, but that document is not end-to-end routing or
 conformance evidence.
 

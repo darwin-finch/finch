@@ -35,9 +35,8 @@ behavior in a facade commit.
 The opt-in `llama-cpp` feature loads a caller-supplied chat-LLM `.gguf` file through
 `backend.model_path`; that user-configured model selector must not also select memory's
 embedding/reranking models.
-It owns the process-wide llama.cpp backend and creates a fresh context per generation or embedding
-request. `LlamaCppEmbeddingEngine` implements memory's injected `EmbeddingEngine` port; do not
-select it for an existing MemTree index without an embedding-identity/rebuild migration.
+It owns the process-wide llama.cpp backend and creates a fresh context per generation request.
+Memory model selection and persisted embedding identity belong to the separate memory work.
 `execution_target = auto` permits GPU offload on macOS when the compiled llama.cpp backend
 reports it; `cpu` forbids offload. Linux remains CPU-only in this pilot. ONNX and Candle are
 legacy paths pending measured cutover, not removed or silently substituted by this pilot.
