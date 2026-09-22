@@ -219,8 +219,9 @@ impl WizardState {
                         size: config.backend.model_size,
                         execution: config.backend.execution_target,
                         inference_provider: config.backend.inference_provider,
+                        model_path: config.backend.model_path.clone(),
                         enabled: true,
-                        persisted: None,
+                        persisted: Some(ProviderEntry::from_backend_config(&config.backend, None)),
                     });
                 }
             }

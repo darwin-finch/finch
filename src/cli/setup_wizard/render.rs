@@ -1388,7 +1388,9 @@ pub(super) fn add_provider_card(
             family,
             size,
             execution,
+            model_path,
             focused_field,
+            editing_idx,
         } => {
             let backend_name = match inference_provider {
                 InferenceProvider::Onnx => "ONNX Runtime",
@@ -1409,30 +1411,69 @@ pub(super) fn add_provider_card(
             };
             let repo_preview = get_repository(*inference_provider, *family, *size)
                 .map(|repo| format!("→ {repo}"))
-                .unwrap_or_else(|| "(no model available for this combination)".to_string());
+                .unwrap_or_else(|| {
+                    #[cfg(feature = "llama-cpp")]
+                    if *inference_provider == InferenceProvider::LlamaCpp {
+                        return "Choose a local GGUF model file".to_string();
+                    }
+                    "(no model available for this combination)".to_string()
+                });
             let ram_estimate = match size {
                 ModelSize::Small => "~2 GB RAM",
                 ModelSize::Medium => "~4 GB RAM",
                 ModelSize::Large => "~8 GB RAM",
                 ModelSize::XLarge => "~16 GB RAM",
             };
-            let body = vec![
+            #[cfg(feature = "llama-cpp")]
+            let ram_estimate = if *inference_provider == InferenceProvider::LlamaCpp {
+                "RAM depends on GGUF file"
+            } else {
+                ram_estimate
+            };
+            let mut body = vec![
                 String::new(),
                 row("Backend", backend_name, *focused_field == 0),
                 row("Family", &family_name, *focused_field == 1),
                 row("Size", size_name, *focused_field == 2),
                 row("Device", &device_name, *focused_field == 3),
+            ];
+            #[cfg(feature = "llama-cpp")]
+            if *inference_provider == InferenceProvider::LlamaCpp {
+                let path_display = if model_path.chars().count() > 34 {
+                    let suffix: String = model_path.chars().rev().take(33).collect();
+                    format!("…{}", suffix.chars().rev().collect::<String>())
+                } else {
+                    model_path.clone()
+                };
+                body.push(remote_form_row(
+                    "GGUF file",
+                    &path_display,
+                    *focused_field == 4,
+                    true,
+                ));
+            }
+            #[cfg(not(feature = "llama-cpp"))]
+            let _ = model_path;
+            body.extend([
                 String::new(),
                 format!(
                     "{}  {}",
                     wizard_line(&format!("{ram_estimate}  "), Color::Cyan),
                     wizard_line(&repo_preview, Color::DarkGray)
                 ),
-            ];
+            ]);
             WizardCard::new(
-                "Add Local Model",
+                if editing_idx.is_some() {
+                    "Edit Local Model"
+                } else {
+                    "Add Local Model"
+                },
                 body,
-                Some("↑↓ navigate · ←→ change · Enter to add · Esc back".to_string()),
+                Some(if editing_idx.is_some() {
+                    "↑↓ navigate · ←→ change · type GGUF path when selected · Enter to save · Esc back".to_string()
+                } else {
+                    "↑↓ navigate · ←→ change · type GGUF path when selected · Enter to add · Esc back".to_string()
+                }),
             )
         }
         // ── network scan path ────────────────────────────────────────────────

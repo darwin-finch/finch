@@ -180,6 +180,8 @@ pub(super) fn handle_models_input(
             // Build option lists used by ConfigureLocal cycling
             let local_backends: Vec<InferenceProvider> = {
                 let mut v = vec![InferenceProvider::Onnx];
+                #[cfg(feature = "llama-cpp")]
+                v.push(InferenceProvider::LlamaCpp);
                 #[cfg(feature = "candle")]
                 v.push(InferenceProvider::Candle);
                 v
@@ -219,13 +221,33 @@ pub(super) fn handle_models_input(
                 ModelSize::Large,
                 ModelSize::XLarge,
             ];
+            let gguf_selected = {
+                #[cfg(feature = "llama-cpp")]
+                {
+                    matches!(
+                        adding_provider,
+                        Some(AddProviderStep::ConfigureLocal {
+                            inference_provider: InferenceProvider::LlamaCpp,
+                            ..
+                        })
+                    )
+                }
+                #[cfg(not(feature = "llama-cpp"))]
+                {
+                    false
+                }
+            };
             let local_devices: Vec<ExecutionTarget> = {
                 let mut v = vec![ExecutionTarget::Auto];
-                #[cfg(target_os = "macos")]
-                v.push(ExecutionTarget::CoreML);
+                if !gguf_selected {
+                    #[cfg(target_os = "macos")]
+                    v.push(ExecutionTarget::CoreML);
+                }
                 v.push(ExecutionTarget::Cpu);
-                #[cfg(feature = "cuda")]
-                v.push(ExecutionTarget::Cuda);
+                if !gguf_selected {
+                    #[cfg(feature = "cuda")]
+                    v.push(ExecutionTarget::Cuda);
+                }
                 v
             };
 
@@ -290,7 +312,8 @@ pub(super) fn handle_models_input(
                         }
                     }
                     Some(AddProviderStep::ConfigureLocal { focused_field, .. }) => {
-                        if *focused_field < 3 {
+                        let max_field = if gguf_selected { 4 } else { 3 };
+                        if *focused_field < max_field {
                             *focused_field += 1;
                         }
                     }
@@ -319,6 +342,7 @@ pub(super) fn handle_models_input(
                             size,
                             execution,
                             focused_field,
+                            ..
                         }) => {
                             match *focused_field {
                                 0 => {
@@ -334,6 +358,15 @@ pub(super) fn handle_models_input(
                                     #[cfg(feature = "candle")]
                                     if *inference_provider == InferenceProvider::Candle {
                                         *family = ModelFamily::Qwen2;
+                                    }
+                                    #[cfg(feature = "llama-cpp")]
+                                    if *inference_provider == InferenceProvider::LlamaCpp
+                                        && !matches!(
+                                            execution,
+                                            ExecutionTarget::Auto | ExecutionTarget::Cpu
+                                        )
+                                    {
+                                        *execution = ExecutionTarget::Auto;
                                     }
                                 }
                                 1 => {
@@ -417,6 +450,7 @@ pub(super) fn handle_models_input(
                             size,
                             execution,
                             focused_field,
+                            ..
                         }) => {
                             match *focused_field {
                                 0 => {
@@ -431,6 +465,15 @@ pub(super) fn handle_models_input(
                                     #[cfg(feature = "candle")]
                                     if *inference_provider == InferenceProvider::Candle {
                                         *family = ModelFamily::Qwen2;
+                                    }
+                                    #[cfg(feature = "llama-cpp")]
+                                    if *inference_provider == InferenceProvider::LlamaCpp
+                                        && !matches!(
+                                            execution,
+                                            ExecutionTarget::Auto | ExecutionTarget::Cpu
+                                        )
+                                    {
+                                        *execution = ExecutionTarget::Auto;
                                     }
                                 }
                                 1 => {
@@ -628,6 +671,16 @@ pub(super) fn handle_models_input(
                     *catalog_error = None;
                 }
                 KeyCode::Char(c) => {
+                    #[cfg(feature = "llama-cpp")]
+                    if let Some(AddProviderStep::ConfigureLocal {
+                        inference_provider: InferenceProvider::LlamaCpp,
+                        model_path,
+                        focused_field: 4,
+                        ..
+                    }) = adding_provider
+                    {
+                        model_path.push(c);
+                    }
                     if let Some(AddProviderStep::ConfigureRemote {
                         provider_idx,
                         name,
@@ -659,6 +712,16 @@ pub(super) fn handle_models_input(
                     }
                 }
                 KeyCode::Backspace => {
+                    #[cfg(feature = "llama-cpp")]
+                    if let Some(AddProviderStep::ConfigureLocal {
+                        inference_provider: InferenceProvider::LlamaCpp,
+                        model_path,
+                        focused_field: 4,
+                        ..
+                    }) = adding_provider
+                    {
+                        model_path.pop();
+                    }
                     if let Some(AddProviderStep::ConfigureRemote {
                         provider_idx,
                         name,
@@ -754,7 +817,9 @@ pub(super) fn handle_models_input(
                                     family: ModelFamily::Qwen2,
                                     size: ModelSize::Medium,
                                     execution: ExecutionTarget::Auto,
+                                    model_path: String::new(),
                                     focused_field: 0,
+                                    editing_idx: None,
                                 })
                             } else {
                                 // Network scan
@@ -1026,29 +1091,76 @@ pub(super) fn handle_models_input(
                             family,
                             size,
                             execution,
-                            ..
+                            model_path,
+                            focused_field,
+                            editing_idx,
                         }) => {
-                            let replace_primary = tool_models.is_empty()
-                                && is_unconfigured_placeholder(primary_model);
-                            if replace_primary {
-                                *primary_model = ModelConfig::Local {
-                                    family,
-                                    size,
-                                    execution,
-                                    inference_provider,
-                                    enabled: true,
-                                    persisted: None,
+                            #[cfg(feature = "llama-cpp")]
+                            let selected_path = if inference_provider == InferenceProvider::LlamaCpp
+                            {
+                                let path = std::path::PathBuf::from(model_path.trim());
+                                if !path.is_absolute()
+                                    || !path.is_file()
+                                    || path.extension().and_then(|s| s.to_str()) != Some("gguf")
+                                {
+                                    *error = Some(
+                                        "Choose an existing absolute local .gguf file for llama.cpp".into(),
+                                    );
+                                    *adding_provider = Some(AddProviderStep::ConfigureLocal {
+                                        inference_provider,
+                                        family,
+                                        size,
+                                        execution,
+                                        model_path,
+                                        focused_field,
+                                        editing_idx,
+                                    });
+                                    return Ok(false);
+                                }
+                                Some(path)
+                            } else {
+                                (!model_path.is_empty())
+                                    .then(|| std::path::PathBuf::from(&model_path))
+                            };
+                            #[cfg(not(feature = "llama-cpp"))]
+                            let selected_path = (!model_path.is_empty())
+                                .then(|| std::path::PathBuf::from(&model_path));
+                            let persisted = editing_idx.and_then(|idx| {
+                                let slot = if idx == 0 {
+                                    Some(&*primary_model)
+                                } else {
+                                    tool_models.get(idx - 1)
                                 };
+                                match slot {
+                                    Some(ModelConfig::Local { persisted, .. }) => persisted.clone(),
+                                    _ => None,
+                                }
+                            });
+                            let edited = ModelConfig::Local {
+                                family,
+                                size,
+                                execution,
+                                inference_provider,
+                                model_path: selected_path,
+                                enabled: true,
+                                persisted,
+                            };
+                            if let Some(idx) = editing_idx {
+                                if idx == 0 {
+                                    *primary_model = edited;
+                                } else if let Some(slot) = tool_models.get_mut(idx - 1) {
+                                    let enabled = slot.enabled();
+                                    *slot = edited;
+                                    slot.set_enabled(enabled);
+                                }
+                                *selected_idx = idx;
+                            } else if tool_models.is_empty()
+                                && is_unconfigured_placeholder(primary_model)
+                            {
+                                *primary_model = edited;
                                 *selected_idx = 0;
                             } else {
-                                tool_models.push(ModelConfig::Local {
-                                    family,
-                                    size,
-                                    execution,
-                                    inference_provider,
-                                    enabled: true,
-                                    persisted: None,
-                                });
+                                tool_models.push(edited);
                                 *selected_idx = tool_models.len();
                             }
                             None
@@ -1259,10 +1371,34 @@ pub(super) fn handle_models_input(
                             focused_field: 1,
                             editing_idx: Some(*selected_idx),
                         });
-                    } else {
-                        *error = Some(
-                            "Local-model editing is available when adding a replacement".into(),
-                        );
+                    } else if let Some(ModelConfig::Local {
+                        family,
+                        size,
+                        execution,
+                        inference_provider,
+                        model_path,
+                        ..
+                    }) = selected
+                    {
+                        #[cfg(feature = "llama-cpp")]
+                        let focused_field = if *inference_provider == InferenceProvider::LlamaCpp {
+                            4
+                        } else {
+                            0
+                        };
+                        #[cfg(not(feature = "llama-cpp"))]
+                        let focused_field = 0;
+                        *adding_provider = Some(AddProviderStep::ConfigureLocal {
+                            inference_provider: *inference_provider,
+                            family: *family,
+                            size: *size,
+                            execution: *execution,
+                            model_path: model_path.as_ref().map_or_else(String::new, |path| {
+                                path.to_string_lossy().into_owned()
+                            }),
+                            focused_field,
+                            editing_idx: Some(*selected_idx),
+                        });
                     }
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
