@@ -1,6 +1,6 @@
-// Teacher session management with context optimization
+// Provider session management with context optimization
 //
-// Tracks teacher context to minimize redundant token usage and provide
+// Tracks conversation context to minimize redundant token usage and provide
 // configurable truncation strategies for long conversations.
 
 use anyhow::Result;
@@ -9,37 +9,37 @@ use tokio::sync::mpsc;
 use super::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
 use crate::{ContentBlock, Message};
 
-/// Teacher session with context tracking
+/// Provider session with context tracking
 ///
-/// Tracks what context has been sent to the teacher provider to enable:
+/// Tracks what context has been sent to the cloud provider to enable:
 /// - Metrics on new vs repeated context
 /// - Optional truncation of old messages
 /// - Smart retention strategies (e.g., keep system prompts, drop old tool results)
-pub struct TeacherSession {
+pub struct ProviderSession {
     provider: std::sync::Arc<dyn LlmProvider>,
     state: ConversationState,
-    config: TeacherContextConfig,
+    config: SessionContextConfig,
 }
 
-/// Tracks the state of conversation with teacher
+/// Tracks the state of conversation with the provider
 #[derive(Debug, Clone, Default)]
 pub struct ConversationState {
-    /// Number of messages sent to teacher in last call
-    last_teacher_message_count: usize,
+    /// Number of messages sent in the last provider call
+    last_provider_message_count: usize,
 
-    /// Total input tokens sent to teacher (cumulative)
+    /// Total input tokens sent to the provider (cumulative)
     total_input_tokens: usize,
 
     /// Estimated cached tokens (based on repeated context)
     estimated_cached_tokens: usize,
 
-    /// Number of times teacher has been called
-    teacher_call_count: usize,
+    /// Number of times the provider has been called
+    provider_call_count: usize,
 }
 
-/// Configuration for teacher context management
+/// Configuration for provider context management
 #[derive(Debug, Clone)]
-pub struct TeacherContextConfig {
+pub struct SessionContextConfig {
     /// Maximum number of conversation turns to send (0 = unlimited)
     /// One turn = user message + assistant response
     pub max_context_turns: usize,
@@ -51,7 +51,7 @@ pub struct TeacherContextConfig {
     pub prompt_caching_enabled: bool,
 }
 
-impl Default for TeacherContextConfig {
+impl Default for SessionContextConfig {
     fn default() -> Self {
         Self {
             max_context_turns: 0,           // Unlimited by default
@@ -61,18 +61,18 @@ impl Default for TeacherContextConfig {
     }
 }
 
-impl TeacherSession {
-    /// Create a new teacher session with default config
+impl ProviderSession {
+    /// Create a new provider session with default config
     pub fn new(provider: Box<dyn LlmProvider>) -> Self {
         Self {
             provider: std::sync::Arc::from(provider),
             state: ConversationState::default(),
-            config: TeacherContextConfig::default(),
+            config: SessionContextConfig::default(),
         }
     }
 
-    /// Create a new teacher session with custom config
-    pub fn with_config(provider: Box<dyn LlmProvider>, config: TeacherContextConfig) -> Self {
+    /// Create a new provider session with custom config
+    pub fn with_config(provider: Box<dyn LlmProvider>, config: SessionContextConfig) -> Self {
         Self {
             provider: std::sync::Arc::from(provider),
             state: ConversationState::default(),
@@ -83,7 +83,7 @@ impl TeacherSession {
     /// Create a session from an already validated shared provider.
     pub fn with_shared_provider(
         provider: std::sync::Arc<dyn LlmProvider>,
-        config: TeacherContextConfig,
+        config: SessionContextConfig,
     ) -> Self {
         Self {
             provider,
@@ -99,7 +99,7 @@ impl TeacherSession {
     pub async fn send_message(&mut self, request: &ProviderRequest) -> Result<ProviderResponse> {
         // Calculate metrics
         let total_messages = request.messages.len();
-        let new_messages = total_messages.saturating_sub(self.state.last_teacher_message_count);
+        let new_messages = total_messages.saturating_sub(self.state.last_provider_message_count);
         let repeated_messages = total_messages - new_messages;
 
         // Estimate tokens (rough: ~100 tokens per message)
@@ -109,25 +109,25 @@ impl TeacherSession {
 
         // Log metrics
         tracing::info!(
-            teacher = %self.provider.name(),
-            call_count = self.state.teacher_call_count + 1,
+            provider = %self.provider.name(),
+            call_count = self.state.provider_call_count + 1,
             total_messages,
             new_messages,
             repeated_messages,
             estimated_total_tokens,
             estimated_new_tokens,
             estimated_cached_tokens,
-            "Teacher context metrics"
+            "Provider context metrics"
         );
 
-        // Send to teacher (full context)
+        // Send to the provider (full context)
         let response = self.provider.send_message(request).await?;
 
         // Update state
-        self.state.last_teacher_message_count = total_messages;
+        self.state.last_provider_message_count = total_messages;
         self.state.total_input_tokens += estimated_total_tokens;
         self.state.estimated_cached_tokens += estimated_cached_tokens;
-        self.state.teacher_call_count += 1;
+        self.state.provider_call_count += 1;
 
         Ok(response)
     }
@@ -139,23 +139,23 @@ impl TeacherSession {
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
         // Track metrics (same as non-streaming)
         let total_messages = request.messages.len();
-        let new_messages = total_messages.saturating_sub(self.state.last_teacher_message_count);
+        let new_messages = total_messages.saturating_sub(self.state.last_provider_message_count);
         let repeated_messages = total_messages - new_messages;
 
         tracing::info!(
-            teacher = %self.provider.name(),
-            call_count = self.state.teacher_call_count + 1,
+            provider = %self.provider.name(),
+            call_count = self.state.provider_call_count + 1,
             total_messages,
             new_messages,
             repeated_messages,
-            "Teacher streaming context metrics"
+            "Provider streaming context metrics"
         );
 
         let receiver = self.provider.send_message_stream(request).await?;
 
         // Update state
-        self.state.last_teacher_message_count = total_messages;
-        self.state.teacher_call_count += 1;
+        self.state.last_provider_message_count = total_messages;
+        self.state.provider_call_count += 1;
 
         Ok(receiver)
     }
@@ -165,7 +165,7 @@ impl TeacherSession {
         &self.state
     }
 
-    /// Get teacher provider name
+    /// Get the provider name
     pub fn provider_name(&self) -> &str {
         self.provider.name()
     }
@@ -198,7 +198,7 @@ impl TeacherSession {
 
         if dropped_messages > 0 {
             tracing::info!(
-                teacher = %self.provider.name(),
+                provider = %self.provider.name(),
                 total_messages,
                 sent_messages,
                 dropped_messages,
@@ -274,7 +274,7 @@ impl TeacherSession {
         let dropped_tool_results = original_tool_results - optimized_tool_results;
 
         tracing::info!(
-            teacher = %self.provider.name(),
+            provider = %self.provider.name(),
             original_messages,
             optimized_messages,
             dropped,
@@ -381,7 +381,7 @@ impl TeacherSession {
     /// Get optimization statistics
     pub fn optimization_stats(&self) -> OptimizationStats {
         OptimizationStats {
-            teacher_call_count: self.state.teacher_call_count,
+            provider_call_count: self.state.provider_call_count,
             total_input_tokens: self.state.total_input_tokens,
             estimated_cached_tokens: self.state.estimated_cached_tokens,
             estimated_savings_percent: if self.state.total_input_tokens > 0 {
@@ -397,7 +397,7 @@ impl TeacherSession {
 /// Statistics about context optimization
 #[derive(Debug, Clone)]
 pub struct OptimizationStats {
-    pub teacher_call_count: usize,
+    pub provider_call_count: usize,
     pub total_input_tokens: usize,
     pub estimated_cached_tokens: usize,
     pub estimated_savings_percent: f64,
@@ -485,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn test_context_tracking() {
         let provider = Box::new(MockProvider);
-        let mut session = TeacherSession::new(provider);
+        let mut session = ProviderSession::new(provider);
 
         // First call: 2 messages (new)
         let request1 = ProviderRequest {
@@ -515,8 +515,8 @@ mod tests {
 
         session.send_message(&request1).await.unwrap();
 
-        assert_eq!(session.state().last_teacher_message_count, 2);
-        assert_eq!(session.state().teacher_call_count, 1);
+        assert_eq!(session.state().last_provider_message_count, 2);
+        assert_eq!(session.state().provider_call_count, 1);
 
         // Second call: 4 messages (2 new, 2 repeated)
         let request2 = ProviderRequest {
@@ -558,8 +558,8 @@ mod tests {
 
         session.send_message(&request2).await.unwrap();
 
-        assert_eq!(session.state().last_teacher_message_count, 4);
-        assert_eq!(session.state().teacher_call_count, 2);
+        assert_eq!(session.state().last_provider_message_count, 4);
+        assert_eq!(session.state().provider_call_count, 2);
         // Estimated: 400 total tokens, 200 cached
         assert!(session.state().estimated_cached_tokens >= 200);
     }
@@ -567,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn test_reset_state() {
         let provider = Box::new(MockProvider);
-        let mut session = TeacherSession::new(provider);
+        let mut session = ProviderSession::new(provider);
 
         let request = ProviderRequest {
             messages: vec![Message {
@@ -587,23 +587,23 @@ mod tests {
         };
 
         session.send_message(&request).await.unwrap();
-        assert_eq!(session.state().teacher_call_count, 1);
+        assert_eq!(session.state().provider_call_count, 1);
 
         session.reset_state();
-        assert_eq!(session.state().teacher_call_count, 0);
-        assert_eq!(session.state().last_teacher_message_count, 0);
+        assert_eq!(session.state().provider_call_count, 0);
+        assert_eq!(session.state().last_provider_message_count, 0);
     }
 
     // Level 2 tests
     #[tokio::test]
     async fn test_context_truncation() {
         let provider = Box::new(MockProvider);
-        let config = TeacherContextConfig {
+        let config = SessionContextConfig {
             max_context_turns: 2, // Only keep 2 turns (4 messages)
             tool_result_retention_turns: 0,
             prompt_caching_enabled: true,
         };
-        let mut session = TeacherSession::with_config(provider, config);
+        let mut session = ProviderSession::with_config(provider, config);
 
         // Create 6 messages (3 turns)
         let messages = vec![
@@ -674,12 +674,12 @@ mod tests {
     #[tokio::test]
     async fn test_system_prompt_preservation() {
         let provider = Box::new(MockProvider);
-        let config = TeacherContextConfig {
+        let config = SessionContextConfig {
             max_context_turns: 1, // Only keep 1 turn (2 messages)
             tool_result_retention_turns: 0,
             prompt_caching_enabled: true,
         };
-        let mut session = TeacherSession::with_config(provider, config);
+        let mut session = ProviderSession::with_config(provider, config);
 
         let messages = vec![
             Message {
@@ -741,12 +741,12 @@ mod tests {
     #[tokio::test]
     async fn test_drop_old_tool_results() {
         let provider = Box::new(MockProvider);
-        let config = TeacherContextConfig {
+        let config = SessionContextConfig {
             max_context_turns: 0,
             tool_result_retention_turns: 1, // Only keep last turn's tool results
             prompt_caching_enabled: true,
         };
-        let session = TeacherSession::with_config(provider, config);
+        let session = ProviderSession::with_config(provider, config);
 
         let messages = vec![
             Message {
@@ -820,12 +820,12 @@ mod tests {
     #[tokio::test]
     async fn test_full_optimization() {
         let provider = Box::new(MockProvider);
-        let config = TeacherContextConfig {
+        let config = SessionContextConfig {
             max_context_turns: 2,           // Keep 2 turns
             tool_result_retention_turns: 1, // Keep 1 turn of tool results
             prompt_caching_enabled: true,
         };
-        let mut session = TeacherSession::with_config(provider, config);
+        let mut session = ProviderSession::with_config(provider, config);
 
         let messages = vec![
             Message {

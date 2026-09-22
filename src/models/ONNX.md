@@ -12,7 +12,7 @@ cloud-only mode. Download sizes come from the same module.
 
 | System RAM | Selected model | Download size |
 |------------|----------------|---------------|
-| < 3 GB | cloud-only (teacher API) | — |
+| < 3 GB | cloud-only (cloud provider API) | — |
 | 3–6 GB | Qwen-2.5-0.5B | 0.5 GB |
 | 6–12 GB | Qwen-2.5-1.5B | 1.5 GB |
 | 12–24 GB | Qwen-2.5-3B | 3 GB |

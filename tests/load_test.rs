@@ -159,7 +159,7 @@ async fn test_work_tracker_atomicity_1000_concurrent() {
     for i in 0..TASKS {
         let t = Arc::clone(&tracker);
         handles.push(tokio::spawn(async move {
-            t.record_query(LATENCY, i % 2 == 0); // even → local, odd → teacher
+            t.record_query(LATENCY, i % 2 == 0); // even → local, odd → forwarded
         }));
     }
 
@@ -174,9 +174,9 @@ async fn test_work_tracker_atomicity_1000_concurrent() {
         "no query updates must be lost"
     );
     assert_eq!(
-        snap.local_queries + snap.teacher_queries,
+        snap.local_queries + snap.forwarded_queries,
         TASKS as u64,
-        "local + teacher must equal total"
+        "local + forwarded must equal total"
     );
     assert_eq!(
         snap.local_queries,
@@ -184,9 +184,9 @@ async fn test_work_tracker_atomicity_1000_concurrent() {
         "exactly half must be local"
     );
     assert_eq!(
-        snap.teacher_queries,
+        snap.forwarded_queries,
         (TASKS / 2) as u64,
-        "exactly half must be teacher"
+        "exactly half must be forwarded"
     );
     assert_eq!(
         snap.total_latency_ms,
@@ -214,7 +214,7 @@ async fn test_work_tracker_no_lost_updates_mixed() {
         let el = Arc::clone(&expected_latency);
         handles.push(tokio::spawn(async move {
             let latency = (i as u64 % 100) + 1; // 1..=100 ms
-            let used_local = i % 3 != 0; // 2/3 local, 1/3 teacher
+            let used_local = i % 3 != 0; // 2/3 local, 1/3 forwarded
             el.fetch_add(latency, Ordering::Relaxed);
             t.record_query(latency, used_local);
         }));
@@ -229,9 +229,9 @@ async fn test_work_tracker_no_lost_updates_mixed() {
 
     assert_eq!(snap.queries_processed, TASKS as u64, "no queries lost");
     assert_eq!(
-        snap.local_queries + snap.teacher_queries,
+        snap.local_queries + snap.forwarded_queries,
         TASKS as u64,
-        "local + teacher == total"
+        "local + forwarded == total"
     );
     assert_eq!(
         snap.total_latency_ms, exp_latency,

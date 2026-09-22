@@ -267,7 +267,7 @@ impl AgentLoop {
             let response = client
                 .send_message(&request)
                 .await
-                .context("Teacher API request failed")?;
+                .context("Cloud provider API request failed")?;
 
             if !response.has_tool_uses() {
                 // Final answer — print it and commit any changes

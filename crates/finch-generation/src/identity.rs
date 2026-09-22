@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn test_for_dispatch_keeps_fallback_backend_identity() {
         let requested = BackendRef::new("local", "missing", BackendKind::Local).unwrap();
-        let backend = BackendRef::new("claude", "teacher", BackendKind::Cloud).unwrap();
+        let backend = BackendRef::new("claude", "cloud-primary", BackendKind::Cloud).unwrap();
         let identity = GenerationIdentity::for_dispatch(requested.clone(), backend.clone());
         assert_eq!(identity.requested, requested);
         assert_eq!(

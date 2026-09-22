@@ -8,7 +8,7 @@ use crate::claude::MessageRequest;
 use crate::config::Persona;
 use crate::providers::Message;
 
-/// Sends completed task summaries to the teacher API and patches the persona file
+/// Sends completed task summaries to the cloud provider API and patches the persona file
 pub struct ReflectionEngine {
     client: ClaudeClient,
     model: String,
@@ -65,7 +65,7 @@ impl ReflectionEngine {
             .client
             .send_message(&request)
             .await
-            .context("Failed to get reflection response from teacher API")?;
+            .context("Failed to get reflection response from the cloud provider API")?;
 
         let new_prompt = response.text().trim().to_string();
 
@@ -242,7 +242,7 @@ git_email = "vesper@local.finch"
 
     #[tokio::test]
     async fn test_reflect_empty_tasks_returns_early_without_api_call() {
-        // The early-exit path (empty tasks) returns before calling the teacher API.
+        // The early-exit path (empty tasks) returns before calling the cloud provider API.
         // We use a mock provider that panics if called, proving no API call is made.
         use crate::claude::ClaudeClient;
         use crate::providers::{ProviderBackend, ValidatedProviderRequest};

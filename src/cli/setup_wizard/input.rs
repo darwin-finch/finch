@@ -141,7 +141,7 @@ fn commit_remote_provider(
     }
 }
 
-/// Handle input for Models section (unified Backend + Teachers)
+/// Handle input for Models section (unified provider entries)
 pub(super) fn handle_models_input(
     state: &mut WizardState,
     key: crossterm::event::KeyEvent,

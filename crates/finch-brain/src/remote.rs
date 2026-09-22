@@ -2575,7 +2575,7 @@ mod tests {
             node: finch_node::NodeCapabilities {
                 ram_gb: 16,
                 local_model: Some("fixture-model".into()),
-                has_teacher_api: true,
+                has_cloud_provider: true,
                 version: "test".into(),
                 os: "test".into(),
             },

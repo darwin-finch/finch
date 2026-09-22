@@ -3,10 +3,10 @@
 // This module provides a unified interface for working with ANY LLM
 // (local or remote) as primary, with other LLMs available as tools.
 
-use crate::config::TeacherEntry;
+use crate::config::ProviderEntry;
 use crate::providers::Message;
-use crate::providers::{self, LlmProvider, ProviderRequest};
-use anyhow::{Context, Result};
+use crate::providers::{LlmProvider, ProviderRequest};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,23 +41,20 @@ pub struct LLMRegistry {
 }
 
 impl LLMRegistry {
-    /// Create registry from teacher configuration
-    pub fn from_teachers(teachers: &[TeacherEntry]) -> Result<Self> {
-        if teachers.is_empty() {
-            anyhow::bail!("No teachers configured - need at least one LLM");
+    /// Create registry from the configured cloud provider entries.
+    pub fn from_cloud_providers(cloud: &[ProviderEntry]) -> Result<Self> {
+        if cloud.is_empty() {
+            anyhow::bail!("No cloud providers configured - need at least one LLM");
         }
 
-        // First teacher is primary
-        let primary: Arc<dyn LLM> = Arc::new(create_llm_from_teacher(&teachers[0])?);
+        // First cloud provider is primary
+        let primary: Arc<dyn LLM> = Arc::new(create_llm_from_entry(&cloud[0])?);
 
         // Rest are tools
         let mut tools = HashMap::new();
-        for teacher in &teachers[1..] {
-            let llm: Arc<dyn LLM> = Arc::new(create_llm_from_teacher(teacher)?);
-            let tool_name = teacher
-                .name
-                .clone()
-                .unwrap_or_else(|| teacher.provider.clone());
+        for entry in &cloud[1..] {
+            let llm: Arc<dyn LLM> = Arc::new(create_llm_from_entry(entry)?);
+            let tool_name = entry.profile_name();
             tools.insert(tool_name, llm);
         }
 
@@ -116,27 +113,37 @@ impl LLM for ProviderLLM {
     }
 }
 
-/// Create an LLM instance from a teacher configuration
-fn create_llm_from_teacher(teacher: &TeacherEntry) -> Result<ProviderLLM> {
-    let provider = providers::create_providers(std::slice::from_ref(teacher))?
-        .into_iter()
-        .next()
-        .context("Failed to create provider")?;
+/// The provider-family name for a simple cloud entry, used for LLM identity.
+fn provider_family(entry: &ProviderEntry) -> &'static str {
+    match entry {
+        ProviderEntry::Claude { .. } => "claude",
+        ProviderEntry::Openai { .. } => "openai",
+        ProviderEntry::Grok { .. } => "grok",
+        ProviderEntry::Gemini { .. } => "gemini",
+        ProviderEntry::Mistral { .. } => "mistral",
+        ProviderEntry::Groq { .. } => "groq",
+        ProviderEntry::Openrouter { .. } => "openrouter",
+        _ => "cloud",
+    }
+}
 
-    let model = teacher
-        .model
-        .clone()
+/// Create an LLM instance from a cloud provider entry
+fn create_llm_from_entry(entry: &ProviderEntry) -> Result<ProviderLLM> {
+    let provider = create_provider_boxed(entry)?;
+    let model = entry
+        .model()
+        .map(str::to_string)
         .unwrap_or_else(|| provider.default_model().to_string());
-
-    let name = teacher
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("{} ({})", teacher.provider, model));
+    let name = entry.profile_name();
 
     Ok(ProviderLLM {
         name,
-        provider: teacher.provider.clone(),
+        provider: provider_family(entry).to_string(),
         model,
         llm_provider: provider,
     })
+}
+
+fn create_provider_boxed(entry: &ProviderEntry) -> Result<Box<dyn LlmProvider>> {
+    crate::providers::create_provider_from_entry(entry)
 }

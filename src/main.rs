@@ -47,14 +47,14 @@ struct Args {
     #[arg(long = "no-tui")]
     no_tui: bool,
 
-    /// Direct mode - talk directly to teacher API, bypass daemon
+    /// Direct mode - talk directly to the cloud provider API, bypass daemon
     #[arg(long = "direct")]
     direct: bool,
 
-    /// Cloud-only mode - skip local model entirely, use teacher API directly.
-    /// No model download, no daemon. Great for machines without much RAM,
-    /// or when you only have a cloud API key (e.g. Grok via X Premium+).
-    #[arg(long = "cloud-only", alias = "teacher-only")]
+    /// Cloud-only mode - skip local model entirely, use the cloud provider
+    /// API directly. No model download, no daemon. Great for machines without
+    /// much RAM, or when you only have a cloud API key (e.g. Grok via X Premium+).
+    #[arg(long = "cloud-only")]
     cloud_only: bool,
 
     /// Evaluate a typed Co-Forth expression directly through the shared VM
@@ -355,10 +355,11 @@ enum LicenseCommand {
     Remove,
 }
 
-/// Build a teacher list from well-known environment variables and config files.
-/// Collects ALL available keys so every provider the user has configured is available.
-fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
-    let mut teachers: Vec<finch::config::TeacherEntry> = Vec::new();
+/// Build a cloud provider list from well-known environment variables and
+/// config files. Collects ALL available keys so every provider the user has
+/// configured is available.
+fn build_cloud_providers_from_env() -> Vec<finch::config::ProviderEntry> {
+    let mut providers: Vec<finch::config::ProviderEntry> = Vec::new();
     let mut seen_providers = std::collections::HashSet::new();
 
     let mut add = |provider: &str, key: &str| {
@@ -366,13 +367,13 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
             return;
         }
         seen_providers.insert(provider.to_string());
-        teachers.push(finch::config::TeacherEntry {
-            provider: provider.to_string(),
-            api_key: key.trim().to_string(),
-            model: None,
-            base_url: None,
-            name: None,
-        });
+        providers.push(finch::config::ProviderEntry::from_provider_fields(
+            provider,
+            key.trim().to_string(),
+            None,
+            None,
+            None,
+        ));
     };
 
     // 1. Claude Code config file (~/.claude/settings.json)
@@ -408,7 +409,7 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
         }
     }
 
-    teachers
+    providers
 }
 
 fn first_run_setup_cancelled() -> anyhow::Error {
@@ -451,7 +452,7 @@ where
 
 /// Create a ClaudeClient with the configured provider
 ///
-/// This function creates a provider based on the teacher configuration
+/// This function creates a provider from the configured cloud providers
 /// and wraps it in a ClaudeClient for backwards compatibility.
 fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
     let graph = finch::providers::create_provider_graph_from_config(config)?;
@@ -728,7 +729,7 @@ mod script_tests {
     }
 
     #[test]
-    fn daemon_and_teacher_one_shot_paths_share_the_vm_wire_contract() {
+    fn daemon_and_cloud_one_shot_paths_share_the_vm_wire_contract() {
         let prompt = vm_wire_system_prompt();
         assert!(prompt.contains("complete body of every text response is one"));
         assert!(prompt.contains("`ProgramSubmission`"));
@@ -1158,10 +1159,12 @@ async fn main() -> Result<()> {
 
                 // Before showing the wizard, try to auto-detect API keys.
                 // If any exist (env vars, Claude Code config, etc.) just start immediately.
-                let auto_teachers = build_teachers_from_env();
-                if !auto_teachers.is_empty() {
-                    let names: Vec<&str> =
-                        auto_teachers.iter().map(|t| t.provider.as_str()).collect();
+                let auto_providers = build_cloud_providers_from_env();
+                if !auto_providers.is_empty() {
+                    let names: Vec<&str> = auto_providers
+                        .iter()
+                        .map(|entry| entry.provider_type())
+                        .collect();
                     use crossterm::style::Stylize as _;
                     eprintln!(
                         "\n{}",
@@ -1173,7 +1176,7 @@ async fn main() -> Result<()> {
                         "{}\n",
                         "  Run `finch setup` any time to change settings.".yellow()
                     );
-                    let cfg = Config::new(auto_teachers);
+                    let cfg = Config::new(auto_providers);
                     cfg.save().ok();
                     cfg
                 } else {
@@ -1216,13 +1219,13 @@ async fn main() -> Result<()> {
         output_manager.enable_stdout();
     }
 
-    // --cloud-only / --teacher-only: skip local model and daemon entirely
+    // --cloud-only: skip local model and daemon entirely
     if args.cloud_only {
         config.backend.enabled = false;
     }
 
     // Check for --direct or --cloud-only flags (both bypass daemon)
-    // In direct/cloud-only mode: no daemon connection, talk directly to teacher API
+    // In direct/cloud-only mode: no daemon connection, talk directly to the cloud provider API
     let use_daemon = !args.direct && !args.cloud_only;
 
     // Load or create threshold router
@@ -2000,7 +2003,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 .await
             {
                 output_status!("⚠️  Model loading failed: {}", e);
-                output_status!("   Will forward all queries to teacher APIs");
+                output_status!("   Will forward all queries to cloud provider APIs");
                 let mut state = state_clone.write().await;
                 *state = GeneratorState::Failed {
                     error: format!("{}", e),
@@ -2010,7 +2013,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     } else {
         // Proxy-only mode: Skip model loading
         output_status!("🔌 Proxy-only mode enabled (no local model)");
-        output_status!("   All queries will be forwarded to teacher APIs");
+        output_status!("   All queries will be forwarded to cloud provider APIs");
         let mut state = generator_state.write().await;
         *state = GeneratorState::NotAvailable;
     }
@@ -2411,7 +2414,7 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     // defeating the flag, that startup attempt can consume the whole caller
     // timeout and makes direct-provider smoke tests look hung.
     if cloud_only {
-        return run_query_teacher_only(
+        return run_query_cloud_only(
             query,
             &config,
             executor,
@@ -2425,8 +2428,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     // Ensure daemon is running (auto-spawn if needed)
     if let Err(e) = ensure_daemon_running(Some(&config.client.daemon_address)).await {
         eprintln!("⚠️  Daemon failed to start: {}", e);
-        eprintln!("   Using teacher API directly (no local model)");
-        return run_query_teacher_only(
+        eprintln!("   Using the cloud provider API directly (no local model)");
+        return run_query_cloud_only(
             query,
             &config,
             executor,
@@ -2577,8 +2580,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     Ok(())
 }
 
-/// Run query using teacher API only (fallback when daemon fails), with tool support
-async fn run_query_teacher_only(
+/// Run query using the cloud provider API only (fallback when daemon fails), with tool support
+async fn run_query_cloud_only(
     query: &str,
     config: &Config,
     executor: Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
@@ -2589,7 +2592,7 @@ async fn run_query_teacher_only(
     use finch::claude::MessageRequest;
     use finch::providers::{ContentBlock, Message};
 
-    eprintln!("⚠️  Running in teacher-only mode (no local model)");
+    eprintln!("⚠️  Running in cloud-only mode (no local model)");
 
     let claude_client = create_claude_client_with_provider(config)?;
     let model = config
@@ -2601,7 +2604,7 @@ async fn run_query_teacher_only(
         .cloud_providers()
         .first()
         .map(|provider| provider.provider_type().to_string())
-        .unwrap_or_else(|| "teacher".to_string());
+        .unwrap_or_else(|| "cloud".to_string());
     let wire_metrics = default_wire_metrics_logger();
     let mut wire_metric =
         finch::metrics::WireAdherenceMetric::first_pass(&provider, model.clone(), "one_shot");
@@ -3028,7 +3031,7 @@ fn command_cancellation() -> tokio_util::sync::CancellationToken {
     cancel
 }
 
-fn current_node_capabilities(has_teacher_api: bool) -> finch::node::NodeCapabilities {
+fn current_node_capabilities(has_cloud_provider: bool) -> finch::node::NodeCapabilities {
     use finch::models::{ModelSelection, ModelSelector};
 
     let ram_gb = ModelSelector::get_total_ram_gb();
@@ -3036,7 +3039,7 @@ fn current_node_capabilities(has_teacher_api: bool) -> finch::node::NodeCapabili
         Ok(ModelSelection::Local(size)) => Some(size.description().to_string()),
         _ => None,
     };
-    finch::node::NodeCapabilities::for_current_host(ram_gb, local_model, has_teacher_api)
+    finch::node::NodeCapabilities::for_current_host(ram_gb, local_model, has_cloud_provider)
 }
 
 /// Show this node's identity and capabilities
@@ -3044,8 +3047,8 @@ async fn run_node_info() -> Result<()> {
     use finch::node::NodeInfo;
 
     let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
-    let has_teacher = !config.cloud_providers().is_empty();
-    let info = NodeInfo::load(current_node_capabilities(has_teacher))?;
+    let has_cloud_provider = !config.cloud_providers().is_empty();
+    let info = NodeInfo::load(current_node_capabilities(has_cloud_provider))?;
 
     println!("╔══════════════════════════════════════╗");
     println!("║           finch node info            ║");
@@ -3058,11 +3061,11 @@ async fn run_node_info() -> Result<()> {
     if let Some(model) = &info.capabilities.local_model {
         println!("  Model    : {}", model);
     } else {
-        println!("  Model    : cloud-only (teacher API)");
+        println!("  Model    : cloud-only (cloud provider API)");
     }
     println!(
-        "  Teacher  : {}",
-        if info.capabilities.has_teacher_api {
+        "  Cloud    : {}",
+        if info.capabilities.has_cloud_provider {
             "configured"
         } else {
             "none"
@@ -3253,8 +3256,8 @@ async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
     use finch::node::NodeInfo;
 
     let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
-    let has_teacher = !config.cloud_providers().is_empty();
-    let info = NodeInfo::load(current_node_capabilities(has_teacher))?;
+    let has_cloud_provider = !config.cloud_providers().is_empty();
+    let info = NodeInfo::load(current_node_capabilities(has_cloud_provider))?;
 
     // Always show node identity when starting as worker
     println!("╔══════════════════════════════════════╗");
@@ -3266,7 +3269,7 @@ async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
     if let Some(model) = &info.capabilities.local_model {
         println!("  Model    : {} (loading in background)", model);
     } else {
-        println!("  Model    : cloud-only — forwarding to teacher API");
+        println!("  Model    : cloud-only — forwarding to the cloud provider API");
     }
     println!("  Bind     : {}", bind_address);
     println!();
@@ -3362,20 +3365,20 @@ async fn run_agent(
 ) -> Result<()> {
     use finch::agent::{AgentConfig, AgentLoop};
 
-    // Load config (needs teacher API for the agentic loop)
+    // Load config (needs a cloud provider for the agentic loop)
     let config = match load_config() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error loading config: {}", e);
-            eprintln!("Run `finch setup` to configure a teacher API key.");
+            eprintln!("Run `finch setup` to configure a cloud provider API key.");
             return Err(e);
         }
     };
 
     if config.cloud_providers().is_empty() {
         anyhow::bail!(
-            "No teacher API configured.\n\
-             Agent mode requires a teacher API (Claude, GPT-4, etc.).\n\
+            "No cloud provider configured.\n\
+             Agent mode requires a cloud provider API (Claude, GPT-4, etc.).\n\
              Run `finch setup` to add one."
         );
     }

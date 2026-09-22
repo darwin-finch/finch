@@ -11,7 +11,7 @@ Two callers show the boundary:
 1. The [daemon startup path](../../src/main.rs) installs a host-owned `ModelProgress` sink,
    creates shared `GeneratorState`, then starts `BootstrapLoader::load_generator_async` only
    when the local backend is enabled. A failed load becomes a failed state and the daemon
-   can forward requests to teacher APIs; proxy-only mode marks the model unavailable.
+   can forward requests to cloud provider APIs; proxy-only mode marks the model unavailable.
    `src/models` reports progress and state, while daemon startup owns the process and fallback.
 2. The [local response generator](../local/generator.rs) selects an adapter through
    `AdapterRegistry` for its configured model family and may receive a shared `GeneratorModel`

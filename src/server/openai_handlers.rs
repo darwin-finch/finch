@@ -577,7 +577,7 @@ pub async fn handle_chat_completions(
     let (content_blocks, routing_decision) = match decision {
         RouteDecision::Forward { reason } => {
             info!(
-                "☁️  ROUTING TO TEACHER API (reason: {:?}, provider: {:?})",
+                "☁️  ROUTING TO CLOUD PROVIDER API (reason: {:?}, provider: {:?})",
                 reason, provider_name
             );
 
@@ -616,7 +616,7 @@ pub async fn handle_chat_completions(
                         }
                         Ok(None) => {
                             drop(generator);
-                            warn!("❌ Local generation returned None, falling back to teacher");
+                            warn!("❌ Local generation returned None, falling back to the cloud provider");
                             match forward_to_cloud(
                                 &server,
                                 Some(&provider_name),
@@ -631,7 +631,10 @@ pub async fn handle_chat_completions(
                         }
                         Err(e) => {
                             drop(generator);
-                            warn!("❌ Local generation error: {}, falling back to teacher", e);
+                            warn!(
+                                "❌ Local generation error: {}, falling back to the cloud provider",
+                                e
+                            );
                             match forward_to_cloud(
                                 &server,
                                 Some(&provider_name),

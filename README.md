@@ -113,7 +113,7 @@ Run `finch --help` and `finch <command> --help` for the full generated CLI refer
 `/help` shows the slash commands present in that build. `/model` overlays a model on the active
 Brain (same credentials). `/provider <name>` binds that Brain to a configured provider entry.
 `/status` inspects the effective identity. `--model` is one-shot for this invocation and does not
-persist; `/model` does. `/teacher` remains a `/provider` compatibility alias.
+persist; `/model` does.
 
 Typing `@` at a token boundary opens a keyboard-navigable file picker. Selecting a file or
 directory inserts a visible `@path` mention and attaches a snapshot of its contents to the

@@ -32,7 +32,7 @@ probe — `GET /health` under a 500 ms client timeout whose expiry costs an
 unconditional two-second sleep in `ensure_daemon_running_after_isolation_gate`
 (`src/main.rs`, daemon-connect phase).
 
-While state ≠ `Ready`, `Router::route_with_generator_check(query, false)` forwards all queries to the configured teacher API.
+While state ≠ `Ready`, `Router::route_with_generator_check(query, false)` forwards all queries to the configured cloud provider API.
 
 ## Key files
 

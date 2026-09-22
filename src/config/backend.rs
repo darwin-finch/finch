@@ -172,7 +172,7 @@ pub struct CoreMlConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
     /// Enable local model inference (default: true)
-    /// Set to false for proxy-only mode (no local model, teacher APIs only)
+    /// Set to false for proxy-only mode (no local model, cloud providers only)
     #[serde(default = "default_backend_enabled")]
     pub enabled: bool,
 

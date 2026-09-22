@@ -3025,7 +3025,7 @@ fn test_cloud_primary_keeps_local_qwen_as_tool_model_on_reopen() {
 }
 
 #[test]
-fn test_wizard_round_trip_preserves_non_teacher_provider_metadata() {
+fn test_wizard_round_trip_preserves_provider_metadata() {
     use crate::config::{Config, ProviderEntry, ReasoningEffort};
 
     let providers = vec![

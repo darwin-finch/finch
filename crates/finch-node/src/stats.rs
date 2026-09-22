@@ -18,8 +18,9 @@ pub struct WorkStats {
     pub queries_processed: u64,
     /// Queries answered by local model
     pub local_queries: u64,
-    /// Queries forwarded to teacher API
-    pub teacher_queries: u64,
+    /// Queries forwarded to a cloud provider
+    #[serde(alias = "teacher_queries")]
+    pub forwarded_queries: u64,
     /// Cumulative response latency in milliseconds
     pub total_latency_ms: u64,
     /// Node start time
@@ -60,7 +61,7 @@ impl WorkStats {
 pub struct WorkTracker {
     queries: AtomicU64,
     local_queries: AtomicU64,
-    teacher_queries: AtomicU64,
+    forwarded_queries: AtomicU64,
     latency_ms_total: AtomicU64,
     started_at: DateTime<Utc>,
 }
@@ -70,7 +71,7 @@ impl WorkTracker {
         Arc::new(Self {
             queries: AtomicU64::new(0),
             local_queries: AtomicU64::new(0),
-            teacher_queries: AtomicU64::new(0),
+            forwarded_queries: AtomicU64::new(0),
             latency_ms_total: AtomicU64::new(0),
             started_at: Utc::now(),
         })
@@ -84,7 +85,7 @@ impl WorkTracker {
         if used_local {
             self.local_queries.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.teacher_queries.fetch_add(1, Ordering::Relaxed);
+            self.forwarded_queries.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -94,7 +95,7 @@ impl WorkTracker {
         WorkStats {
             queries_processed: total,
             local_queries: self.local_queries.load(Ordering::Relaxed),
-            teacher_queries: self.teacher_queries.load(Ordering::Relaxed),
+            forwarded_queries: self.forwarded_queries.load(Ordering::Relaxed),
             total_latency_ms: self.latency_ms_total.load(Ordering::Relaxed),
             started_at: Some(self.started_at),
             last_query_at: if total > 0 { Some(Utc::now()) } else { None },
@@ -182,7 +183,7 @@ mod tests {
         let snap = tracker.snapshot();
         assert_eq!(snap.queries_processed, 3);
         assert_eq!(snap.local_queries, 2);
-        assert_eq!(snap.teacher_queries, 1);
+        assert_eq!(snap.forwarded_queries, 1);
         assert_eq!(snap.total_latency_ms, 450);
     }
 

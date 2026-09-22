@@ -31,7 +31,7 @@ untouched.
 `remote_daemon`, and `local`. The legacy `chatgpt_subscription` value still deserializes only to
 produce migration guidance and is rejected before provider construction.
 
-**Backwards-compatible:** Old `[[teachers]]` format still loads correctly; auto-rewritten to `[[providers]]` on next save.
+**Backwards-compatible:** The removed legacy `[[teachers]]` format still loads (one private migration shim); saves write `[[providers]]` only.
 
 ## Named provider credentials
 
@@ -120,5 +120,5 @@ sources are not accepted yet; unknown keys fail closed at parse time.
 - `src/config/mod.rs` — Config loading, validation, migration; re-exports credential types from `finch-providers`
 - `crates/finch-providers/src/credentials.rs` — named credential schema and binding validator
 - `src/config/provider.rs` — `ProviderEntry` tagged enum
-- `src/config/settings.rs` — `TeacherEntry` (legacy), `LicenseConfig`, `LicenseType`
+- `src/config/settings.rs` — `LicenseConfig`, `LicenseType`
 - `src/config/diagnostics.rs` — declared post-edit diagnostics sources (`DiagnosticsConfig`)

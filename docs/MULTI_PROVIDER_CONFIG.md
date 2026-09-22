@@ -96,7 +96,7 @@ enabled = true
 ## Multi-Provider Example
 
 You can list multiple cloud providers. The first one in the array is the active provider;
-use `/teacher <name>` in the REPL or re-run `finch setup` to switch.
+use `/provider <name>` in the REPL or re-run `finch setup` to switch.
 
 ```toml
 [[providers]]
@@ -126,7 +126,7 @@ enabled = true
 ## How Provider Selection Works
 
 1. **Startup**: Finch reads all `[[providers]]` entries.
-2. **Active provider**: The first cloud entry with a non-empty `api_key` is the default teacher.
+2. **Active provider**: The first cloud entry with a non-empty `api_key` is the default provider.
 3. **Local model**: The `local` entry runs in the background; the REPL routes to it when ready.
 4. **Runtime switching**: `/model list` and `/model <name>` change the active named profile mid-session without clearing conversation history. Give each entry a unique `name` when configuring multiple models from the same provider. Local profiles activate when daemon model startup completes; the current profile remains active while they load.
 5. **Tool execution**: All providers support tool calling.

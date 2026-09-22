@@ -413,7 +413,7 @@ async fn test_daemon_spawn_and_health() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires a live teacher API credential"]
+#[ignore = "requires a live cloud provider API credential"]
 async fn test_daemon_query() -> Result<()> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .context("ANTHROPIC_API_KEY is required for the ignored daemon query smoke")?;

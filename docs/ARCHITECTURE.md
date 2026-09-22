@@ -17,8 +17,8 @@ Shammah provides **immediate, high-quality AI assistance** using pre-trained loc
 - ✅ Tool execution with pass-through (Read, Glob, Grep, Bash, WebFetch, Edit, Write, Patch)
 - ✅ SSE streaming for local and remote
 - ✅ Private explicit feedback collection (no automatic training trigger)
-- ✅ Multi-provider teacher support (6 providers: Claude, GPT-4, Gemini, Grok, Mistral, Groq)
-- ✅ Unified `[[providers]]` config with transparent migration from `[[teachers]]`
+- ✅ Multi-provider cloud support (6 providers: Claude, GPT-4, Gemini, Grok, Mistral, Groq)
+- ✅ Unified `[[providers]]` config; legacy `[[teachers]]` files still load through a private migration shim
 - ✅ Tabbed setup wizard with ONNX model selection and markdown preview dialogs
 - ✅ IMPCPD iterative planning loop (`/plan` command, 7 adversarial personas)
 - ✅ Universal alignment prompt (JSON normalization across providers)
@@ -55,12 +55,12 @@ REPL appears instantly (<100ms)
 │  Router with Model Check             │
 │  - Crisis detection (safety)         │
 │  - Local model ready? Use local      │
-│  - Model loading? Forward to teacher │
+│  - Model loading? Forward to cloud   │
 └──────────┬───────────────────────────┘
            │
     Model Ready?
            │
-    ├─ NO  → Forward to Teacher API (Claude/GPT-4/Gemini/Grok)
+    ├─ NO  → Forward to cloud provider API (Claude/GPT-4/Gemini/Grok)
     └─ YES → Continue
            │
            v
@@ -129,7 +129,7 @@ REPL appears instantly (<100ms)
       ┌─────┴─────┬─────────┐
       v           v         v
 ┌─────────┐ ┌─────────┐ ┌──────┐
-│ ONNX    │ │ Teacher │ │ Tool │
+│ ONNX    │ │ Cloud   │ │ Tool │
 │ Runtime │ │ APIs    │ │ Exec │
 └─────────┘ └─────────┘ └──────┘
 
@@ -442,7 +442,7 @@ Message updates → Diff-based blitting to visible area only
 - `crates/finch-tui/src/input_widget.rs` - Input area rendering
 - `crates/finch-tui/src/status_widget.rs` - Status bar rendering
 
-### 9. Multi-Provider Teacher Support
+### 9. Multi-Provider Cloud Support
 
 **Purpose:** Flexible fallback to multiple cloud AI providers.
 
@@ -464,8 +464,8 @@ Each provider has an adapter that handles:
 **Adaptive Routing:**
 ```
 1. Try local model if ready
-2. On failure/unavailable, try first teacher
-3. On API error, try next teacher in priority list
+2. On failure/unavailable, try first cloud provider
+3. On API error, try next cloud provider in priority list
 4. Graceful degradation ensures user always gets response
 ```
 
@@ -490,12 +490,12 @@ model_size = "medium"
 enabled = true
 ```
 
-The `ProviderEntry` enum (`src/config/provider.rs`) has variants for each cloud provider plus `Local`. The factory (`src/providers/factory.rs`) converts entries to `Arc<dyn LlmProvider>` instances. The old `[[teachers]]` format is still accepted and auto-migrated on save.
+The `ProviderEntry` enum (`src/config/provider.rs`) has variants for each cloud provider plus `Local`. The factory (`src/providers/factory.rs`) converts entries to `Arc<dyn LlmProvider>` instances. The removed legacy `[[teachers]]` format is still accepted on load through one private migration shim; saves write `[[providers]]` only.
 
 **Key Files:**
 - `src/providers/` - Provider-specific adapters
 - `src/config/provider.rs` - `ProviderEntry` tagged enum
-- `src/config/settings.rs` - `TeacherEntry` (legacy, kept for internal use)
+- `src/config/settings.rs` - `ProviderEntry` variants
 - `src/providers/factory.rs` - `create_provider_from_entry()`, `create_providers_from_entries()`
 - `src/cli/setup_wizard.rs` - Multi-provider setup UI
 
@@ -796,7 +796,7 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
 6. Background: Daemon loads ONNX model (if enabled)
 7. User types query
 8. Send HTTP POST to daemon
-9. Daemon routes query (local or teacher)
+9. Daemon routes query (local or cloud)
 10. Stream response tokens back to client (SSE)
 11. TUI renders tokens in real-time (20 FPS)
 12. If tool_use blocks, execute on client side
@@ -830,17 +830,17 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
 ```
 1. Receive user query (HTTP POST)
 2. Validate the caller-supplied message history
-3. Router decision: local vs. teacher
+3. Router decision: local vs. cloud
 5. If local:
      a. ONNX inference → local response
      b. Return response
-6. If teacher:
-     a. Forward to teacher API (Claude/GPT-4/etc.)
+6. If cloud:
+     a. Forward to cloud provider API (Claude/GPT-4/etc.)
      b. Parse tool_use blocks
      c. Return tool_use to client
      d. Client executes tools
      e. Client sends tool results
-     f. Forward tool results to teacher
+     f. Forward tool results to the cloud provider
      g. Return final response
 7. Log metrics (routing, latency, tokens)
 ```
@@ -964,7 +964,7 @@ executable training queue, and does not trigger training or adapter loading.
 **Response Time:**
 - Local generation: 500ms-2s (depending on model size)
 - LoRA adapter overhead: not applicable; adapter loading is disabled
-- Teacher API: Standard API latency (1-3s)
+- Cloud provider API: Standard API latency (1-3s)
 - Tool execution: ~50-200ms per tool
 
 **Resource Usage:**

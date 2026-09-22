@@ -32,9 +32,9 @@ mod openai;
 #[cfg(feature = "chatgpt")]
 mod openai_jwks;
 mod ports;
+mod provider_session;
 mod reasoning;
 mod retry;
-mod teacher_session;
 mod tool_bindings;
 mod tool_contract;
 mod types;
@@ -89,11 +89,11 @@ pub use ports::{
     InstantSleeper, ProviderPorts, ProviderTelemetry, ReqwestTransport, Sleeper, SystemClock,
     TokioSleeper,
 };
+pub use provider_session::{
+    ConversationState, OptimizationStats, ProviderSession, SessionContextConfig,
+};
 pub use reasoning::ReasoningEffort;
 pub use retry::{with_retry, NonRetriableError};
-pub use teacher_session::{
-    ConversationState, OptimizationStats, TeacherContextConfig, TeacherSession,
-};
 pub use tool_bindings::{
     compile_from_definitions, compile_tool_bindings, BoundTool, ResultEncoding, SemanticTool,
     ToolBindingError, ToolBindingTable, ToolOrigin, WireToolIdentity, WireToolKind,

@@ -290,76 +290,8 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         }
     };
 
-    // Build teachers list from primary + tool models
-    let mut teachers: Vec<TeacherEntry> = Vec::new();
-
-    // Primary model as first teacher (if remote)
-    if let ModelConfig::Remote {
-        provider,
-        name,
-        api_key,
-        model,
-        ..
-    } = &primary_model
-    {
-        teachers.push(TeacherEntry {
-            provider: provider.clone(),
-            api_key: api_key.clone(),
-            model: if model.is_empty() {
-                None
-            } else {
-                Some(model.clone())
-            },
-            base_url: None,
-            name: Some(name.clone()),
-        });
-    }
-
-    // Tool models as additional teachers
-    for tool_model in &tool_models {
-        if let ModelConfig::Remote {
-            provider,
-            name,
-            api_key,
-            model,
-            enabled,
-            ..
-        } = tool_model
-        {
-            if *enabled {
-                teachers.push(TeacherEntry {
-                    provider: provider.clone(),
-                    api_key: api_key.clone(),
-                    model: if model.is_empty() {
-                        None
-                    } else {
-                        Some(model.clone())
-                    },
-                    base_url: None,
-                    name: Some(name.clone()),
-                });
-            }
-        }
-    }
-
-    // A profile name is the stable `/model <name>` selector. Keep generated
-    // names unique even when the same provider/model is added more than once.
-    let mut used_names: HashMap<String, usize> = HashMap::new();
-    for teacher in &mut teachers {
-        let base = teacher
-            .name
-            .clone()
-            .unwrap_or_else(|| teacher.provider.clone());
-        let count = used_names.entry(base.to_ascii_lowercase()).or_default();
-        *count += 1;
-        if *count > 1 {
-            teacher.name = Some(format!("{}-{}", base, count));
-        }
-    }
-
-    // Rebuild the unified provider list in the exact order shown. Remote
-    // models have already been normalized in `teachers`; local models must be
-    // emitted directly because they have no teacher representation.
+    // Build the unified provider list in the exact order shown. Remote
+    // models are emitted as cloud entries; local models are emitted directly.
     let providers: Vec<ProviderEntry> = std::iter::once(&primary_model)
         .chain(tool_models.iter())
         .enumerate()
@@ -435,7 +367,6 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         model_family,
         model_size,
         custom_model_repo: None,
-        teachers,
         finch_api_key: finch_api_key_val,
         default_persona,
         custom_system_prompt,
