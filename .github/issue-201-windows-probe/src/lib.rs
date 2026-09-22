@@ -3,7 +3,7 @@
 //! Sources live in `finch-providers`. This probe compiles that crate rather
 //! than `#[path]`-including Finch application files.
 
-pub use finch_providers::oauth::FileOAuthCredentialStore;
+pub use finch_providers::FileOAuthCredentialStore;
 pub use finch_providers::{
     OpenAiChatGptOAuthDialect, OpenAiJwksVerifier, OpenAiTokenVerifier,
     CHATGPT_OAUTH_PROTOCOL_REVISION,
