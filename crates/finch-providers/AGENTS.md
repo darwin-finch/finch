@@ -8,11 +8,51 @@ usage/allowance, OAuth lifecycle (`oauth` module), provider-specific OAuth diale
 and the Claude / OpenAI-compatible / Gemini / ChatGPT / SuperGrok adapters.
 
 **Boundary:** [README.md](README.md) traces configured-provider and setup-catalog callers.
-[`src/lib.rs`](src/lib.rs) is the facade; handwritten child modules are private except the
-currently public `oauth` path, which has external callers and requires a separate flattening
-decision. Rustdoc renders callable methods. Finch uses compatibility facades at `src/providers`
-and `src/oauth`. Do not regenerate a signature catalog. Provider transport notes remain in the
-shared docs tree until they are extracted here.
+[`src/lib.rs`](src/lib.rs) is the flat facade; every handwritten child module is private,
+including `oauth` (its contract is re-exported flat from the facade, issue #958). Rustdoc
+renders callable methods. Finch uses compatibility facades at `src/providers` and `src/oauth`.
+Do not regenerate a signature catalog. Provider transport notes remain in the shared docs tree
+until they are extracted here.
+
+**Surface tiers (issue #958 audit).** The `pub use` list in [`src/lib.rs`](src/lib.rs) is the
+cross-crate contract; everything below it is tiered so implementation detail cannot leak back in:
+
+- **Crate-internal (`pub(crate)`):** the injected-environment seam (`ProviderPorts`,
+  `HttpTransport`, `Clock`, `Sleeper`, `AuthorizationPresenter`, `BillingActionConfirmer`,
+  `ProviderTelemetry`, `ReqwestTransport`, `SystemClock`, `TokioSleeper`, `FrozenClock`,
+  `InstantSleeper` — retained deliberately; `ports.rs` carries a scoped dead-code allow because
+  OAuth today reads only the HTTP transport and the timeout), `with_retry`/`NonRetriableError`,
+  `ToolBindingTable::{empty, entries, is_empty, len, encode_semantic, decode_wire_call}`,
+  `BoundTool` (+`anthropic_tool`, `chatgpt_function`), `WireToolIdentity`, `WireToolKind`,
+  `ResultEncoding`, `MAX_ADVERTISED_TOOLS`, `ToolBindingError`,
+  `compile_tool_bindings`/`compile_from_definitions`, `GrokJwksVerifier::production`,
+  `GrokCredentialSource`, `GrokCredentialLease`,
+  `OpenAIProvider::new_compatible_named_header`, the request helpers
+  (`ProviderRequest::{tool_policy, sanitize_messages, truncate_to_context_limit}`),
+  `ModelCapabilities::validate_request`, `DEFAULT_MAX_OUTPUT_TOKENS`, and the Anthropic
+  SSE-parse types `StreamEvent`/`StreamDelta`/`SseContentBlock`.
+- **Test-only (`#[cfg(test)]`):** `ProviderSession::{new, with_config, state, reset_state}`,
+  `MessageRequest::append_user_message`, `StreamEvent::{is_text_delta, is_tool_use_start, text}`,
+  `OpenAIProvider::{new_openai, new_grok}`, and the `ToolBindingError::UnknownWireProtocol`
+  variant.
+- **Oauth flatten (issue #958):** `oauth` is a private child module; its contract — the 17 items
+  the Finch `src/oauth` facade re-exports — is published flat from the crate facade. No oauth
+  item changed visibility; the module path is no longer nameable by callers.
+
+Deleted as unreferenced by the same audit: `FallbackChain::{len, is_empty}`,
+`GrokJwksVerifier::for_test`, `OpenAIProvider::new_mistral`,
+`ProviderSession::send_message_with_truncation` (+ its now test-only `truncate_context`
+helper), `ProviderSession::optimization_stats` and the `OptimizationStats` type,
+`BoundTool::{openai_tool, gemini_declaration}`, `ToolBindingTable::{protocol, provider, model}`,
+`ProviderRequest::with_tool_policy`, `ToolAuthority::as_str`,
+`ToolCompilePolicy::{with_authority, with_native_grant}`.
+
+Kept `pub` with verified external callers despite sitting in the audited internal families:
+`ClaudeProvider::new` (`src/claude/client.rs`), `ProviderSession::{provider_name,
+with_shared_provider, send_message, send_message_stream}` (`src/cli/repl.rs`),
+`FallbackChain::{new, from_shared, primary_provider}` (`src/providers/factory.rs`,
+`src/server`), and the whole dispatch/wire/capability/credential/oauth surface traced by the
+README and the facade.
 
 **Dependencies:** this unpublished crate depends on HTTP/crypto/async libraries and
 never on the root `finch` crate, Brain, TUI, daemon, CLI orchestration, tools
@@ -61,5 +101,3 @@ Finch `src/providers`.
 - Thread streaming HTTP through adapter constructors (named remainder of #775).
 - Feature-gate optional deps (`reqwest`/`png`/`ring`) so `--no-default-features` drops them (Issue 4 / #775).
 - Stop baking `~/.finch` into crate constructors; Finch should pass cache/store roots (Issue 5 / #775).
-- The public `oauth` child module path is an exception to the flat facade convention; audit
-  external callers before flattening it.

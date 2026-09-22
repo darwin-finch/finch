@@ -4,4 +4,4 @@
 mod client;
 
 pub use client::ClaudeClient;
-pub use finch_providers::{MessageRequest, MessageResponse, StreamDelta, StreamEvent};
+pub use finch_providers::{MessageRequest, MessageResponse};

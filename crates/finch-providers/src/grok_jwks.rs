@@ -74,7 +74,7 @@ struct VerifiedEcKey {
 
 impl GrokJwksVerifier {
     /// Construct the production verifier for the exact pinned xAI authority.
-    pub fn production() -> Result<Self> {
+    pub(crate) fn production() -> Result<Self> {
         Self::new(
             XAI_AUTH_ORIGIN,
             GROK_REQUIRED_TOKEN_ISSUER,
@@ -117,21 +117,6 @@ impl GrokJwksVerifier {
             cache: Mutex::new(KeyCache::default()),
             generation: AtomicU64::new(0),
         })
-    }
-
-    #[cfg(test)]
-    pub fn for_test(
-        authority_origin: &str,
-        expected_issuer: &str,
-        client_id: &str,
-    ) -> Result<Self> {
-        Self::new(
-            authority_origin,
-            expected_issuer,
-            client_id,
-            true,
-            REQUEST_TIMEOUT,
-        )
     }
 
     async fn verify_compact(

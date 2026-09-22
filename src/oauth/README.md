@@ -2,7 +2,8 @@
 
 This module preserves the `crate::oauth` import path for application callers. It owns no OAuth
 state machine, provider dialect, token file, or user-interface behavior. Those belong to
-`finch-providers::oauth`, provider-specific dialects, and the CLI respectively. The facade
+`finch-providers`' private `oauth` module (re-exported flat from that crate's facade),
+provider-specific dialects, and the CLI respectively. The facade
 re-exports selected provider-neutral OAuth contracts while code moves across crate boundaries.
 
 For ChatGPT login, `src/cli/chatgpt_auth.rs` imports `OAuthClient` and

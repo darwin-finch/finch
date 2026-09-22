@@ -11,12 +11,13 @@ injected through `ProviderPorts`.
 
 ## Boundary
 
-- The public contract is this module's facade. Callers must not name child modules.
-- The [README](README.md) traces ChatGPT and Grok CLI callers. [`mod.rs`](mod.rs) is the
-  callable facade; rustdoc renders methods on its exported types. Do not recreate a signature
-  catalog.
+- This module is private; its public contract is the flat re-export in the crate
+  [`lib.rs`](../lib.rs) facade (issue #958). External callers must not name the `oauth` path at
+  all, and callers inside the crate enter through the facade.
+- The [README](README.md) traces ChatGPT and Grok CLI callers. rustdoc renders methods on the
+  facade's exported types. Do not recreate a signature catalog.
 - `file_store` is a private `OAuthCredentialStore` implementation. Construct
-  `FileOAuthCredentialStore` from the module export.
+  `FileOAuthCredentialStore` from the facade export.
 - Credential types are crate-level (`AudienceBinding`, `CredentialKind`,
   `CredentialLifecycle`, `CredentialProvider`, `CredentialResolver`,
   `ProviderCredential`, `ResolvedCredential`, `ResolvedSecret`). This module does

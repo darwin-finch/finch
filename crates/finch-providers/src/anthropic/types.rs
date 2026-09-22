@@ -51,6 +51,7 @@ impl MessageRequest {
     }
 
     /// Append a user message to existing conversation
+    #[cfg(test)]
     pub fn append_user_message(mut self, content: String) -> Self {
         self.messages.push(Message::user(content));
         self

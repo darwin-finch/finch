@@ -358,7 +358,7 @@ impl ModelCapabilities {
     }
 
     /// Validate all request-local requirements before provider work begins.
-    pub fn validate_request(
+    pub(crate) fn validate_request(
         &self,
         request: &ProviderRequest,
         streaming: bool,
@@ -425,23 +425,6 @@ pub enum ToolAuthority {
     Unclassified,
 }
 
-impl ToolAuthority {
-    /// Snake-case name used in diagnostics.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pure => "pure",
-            Self::VmRead => "vm_read",
-            Self::VmWrite => "vm_write",
-            Self::WorkspaceRead => "workspace_read",
-            Self::ExternalRead => "external_read",
-            Self::WorkspaceWrite => "workspace_write",
-            Self::ExternalWrite => "external_write",
-            Self::Destructive => "destructive",
-            Self::Unclassified => "unclassified",
-        }
-    }
-}
-
 /// Grant allowing a provider-native tool to be advertised.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NativeToolGrant {
@@ -469,18 +452,6 @@ impl ToolCompilePolicy {
     /// Empty policy: unclassified authority, no native grants.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Record authority for one semantic identity.
-    pub fn with_authority(mut self, identity: impl Into<String>, authority: ToolAuthority) -> Self {
-        self.authority.insert(identity.into(), authority);
-        self
-    }
-
-    /// Allow one provider-native tool to be advertised.
-    pub fn with_native_grant(mut self, grant: NativeToolGrant) -> Self {
-        self.native_grants.insert(grant);
-        self
     }
 }
 
@@ -565,14 +536,8 @@ impl ProviderRequest {
         self
     }
 
-    /// Attach Finch authority metadata and native-tool grants for compilation.
-    pub fn with_tool_policy(mut self, policy: ToolCompilePolicy) -> Self {
-        self.tool_policy = policy;
-        self
-    }
-
     /// Policy used when compiling this request's tool bindings.
-    pub fn tool_policy(&self) -> &ToolCompilePolicy {
+    pub(crate) fn tool_policy(&self) -> &ToolCompilePolicy {
         &self.tool_policy
     }
 
@@ -603,7 +568,7 @@ impl ProviderRequest {
     /// corresponding ToolResult in the next message. Claude (and others) reject
     /// such histories with a 400 error. This method trims those orphaned tail
     /// messages so the fallback provider sees a clean conversation.
-    pub fn sanitize_messages(&mut self) {
+    pub(crate) fn sanitize_messages(&mut self) {
         use crate::ContentBlock;
 
         loop {
@@ -745,7 +710,7 @@ impl ProviderRequest {
     /// Returns the number of messages dropped.
     ///
     /// The budget is: `token_limit - system_prompt_tokens - max_tokens (response reserve)`
-    pub fn truncate_to_context_limit(&mut self, token_limit: usize) -> usize {
+    pub(crate) fn truncate_to_context_limit(&mut self, token_limit: usize) -> usize {
         let system_tokens = self.system.as_deref().map(|s| s.len() / 3).unwrap_or(0);
         let response_reserve = self.max_tokens as usize;
         let budget = token_limit

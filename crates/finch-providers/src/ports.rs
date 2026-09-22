@@ -3,6 +3,16 @@
 //! Production Finch supplies the default implementations. Deterministic tests
 //! inject fakes for HTTP, time, sleep, cancellation, credential storage,
 //! logging, and billing-action confirmation.
+//!
+//! The clock/sleeper/presenter/billing/telemetry ports are the retained
+//! injected-environment seam (issue #958 surface audit): `ProviderPorts`
+//! always constructs them, OAuth today reads only the HTTP transport and the
+//! timeout, and tests replace the fakes. Narrowed to `pub(crate)`; the
+//! Narrowed to `pub(crate)`; the scoped dead-code allowance marks the seam
+//! as deliberate, not leftover (not every port has an in-crate reader yet,
+//! and the test fakes replace the same slots).
+
+#![allow(dead_code)]
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -16,7 +26,7 @@ use crate::oauth::{OAuthHttpRequest, OAuthRequestBody, MAX_AUTH_BODY_BYTES};
 
 /// Bounded HTTP POST used by OAuth and catalog transports.
 #[async_trait]
-pub trait HttpTransport: Send + Sync {
+pub(crate) trait HttpTransport: Send + Sync {
     async fn post(
         &self,
         request: OAuthHttpRequest,
@@ -26,35 +36,35 @@ pub trait HttpTransport: Send + Sync {
 }
 
 /// Clock used for credential expiry and lease checks.
-pub trait Clock: Send + Sync {
+pub(crate) trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
 
 /// Backoff/sleeper used by OAuth polling and HTTP retry.
 #[async_trait]
-pub trait Sleeper: Send + Sync {
+pub(crate) trait Sleeper: Send + Sync {
     async fn sleep(&self, duration: Duration);
 }
 
 /// Optional presenter for device/browser authorization UX.
-pub trait AuthorizationPresenter: Send + Sync {
+pub(crate) trait AuthorizationPresenter: Send + Sync {
     fn present_device_login(&self, verification_uri: &str, user_code: &str) -> Result<()>;
     fn present_browser_login(&self, authorization_url: &str) -> Result<()>;
 }
 
 /// Billing-action confirmation. Never auto-fallback between billing modes.
-pub trait BillingActionConfirmer: Send + Sync {
+pub(crate) trait BillingActionConfirmer: Send + Sync {
     fn confirm(&self, action: &str, provider: &str) -> Result<bool>;
 }
 
 /// Secret-free log/telemetry sink.
-pub trait ProviderTelemetry: Send + Sync {
+pub(crate) trait ProviderTelemetry: Send + Sync {
     fn event(&self, name: &str, fields: &[(&str, &str)]);
 }
 
 /// Production and test runtime handles.
 #[derive(Clone)]
-pub struct ProviderPorts {
+pub(crate) struct ProviderPorts {
     pub http: Arc<dyn HttpTransport>,
     pub clock: Arc<dyn Clock>,
     pub sleeper: Arc<dyn Sleeper>,
@@ -66,7 +76,7 @@ pub struct ProviderPorts {
 
 impl ProviderPorts {
     /// Production ports: reqwest, wall clock, tokio sleep, fail-closed UX.
-    pub fn production() -> Result<Self> {
+    pub(crate) fn production() -> Result<Self> {
         Ok(Self {
             http: Arc::new(ReqwestTransport::new()?),
             clock: Arc::new(SystemClock),
@@ -80,12 +90,12 @@ impl ProviderPorts {
 }
 
 /// Default reqwest transport. Redirects are rejected.
-pub struct ReqwestTransport {
+pub(crate) struct ReqwestTransport {
     client: Client,
 }
 
 impl ReqwestTransport {
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             client: Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -133,7 +143,7 @@ impl HttpTransport for ReqwestTransport {
 }
 
 /// Wall-clock UTC.
-pub struct SystemClock;
+pub(crate) struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> DateTime<Utc> {
@@ -142,7 +152,7 @@ impl Clock for SystemClock {
 }
 
 /// Tokio sleeper.
-pub struct TokioSleeper;
+pub(crate) struct TokioSleeper;
 
 #[async_trait]
 impl Sleeper for TokioSleeper {
@@ -180,12 +190,12 @@ impl ProviderTelemetry for TracingTelemetry {
 
 /// In-memory clock for deterministic tests.
 #[derive(Debug, Default)]
-pub struct FrozenClock {
+pub(crate) struct FrozenClock {
     pub now: std::sync::Mutex<DateTime<Utc>>,
 }
 
 impl FrozenClock {
-    pub fn new(now: DateTime<Utc>) -> Self {
+    pub(crate) fn new(now: DateTime<Utc>) -> Self {
         Self {
             now: std::sync::Mutex::new(now),
         }
@@ -199,7 +209,7 @@ impl Clock for FrozenClock {
 }
 
 /// Instant sleeper for deterministic tests.
-pub struct InstantSleeper;
+pub(crate) struct InstantSleeper;
 
 #[async_trait]
 impl Sleeper for InstantSleeper {
