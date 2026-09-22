@@ -6,7 +6,7 @@ mod brain_runner;
 mod brain_service;
 mod feedback_handler;
 mod handlers;
-pub(crate) mod ipc;
+mod ipc;
 mod middleware;
 mod openai_handlers;
 mod openai_types;

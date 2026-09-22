@@ -2094,8 +2094,27 @@ fn encode_test_packed_delivery(
     mut encoded: capnp::data_list::Builder<'_>,
     records: &[crate::server::RunnerEffectRecord],
 ) {
-    let frames = crate::server::ipc::encode_packed_delivery_envelopes(records).unwrap();
+    let frames = encode_test_packed_delivery_frames(records);
     encoded.set(0, &frames[0]);
+}
+
+fn encode_test_packed_delivery_frames(
+    records: &[crate::server::RunnerEffectRecord],
+) -> Vec<Vec<u8>> {
+    records
+        .iter()
+        .map(|record| {
+            crate::runtime::encode_runtime_application_message_packed(
+                &crate::runtime::RuntimeApplicationMessage::Envelope {
+                    envelope: crate::runtime::VmEffectEnvelope {
+                        execution_id: record.execution_id,
+                        effect: record.entry.effect.clone(),
+                    },
+                },
+            )
+            .unwrap()
+        })
+        .collect()
 }
 
 fn effect_record() -> crate::server::RunnerEffectRecord {
@@ -2527,9 +2546,7 @@ fn packed_delivery_on_runner_program_result_must_match_the_journal() {
             &expected_effect.entry,
         )
         .unwrap();
-        let frames =
-            crate::server::ipc::encode_packed_delivery_envelopes(&[expected_effect.clone()])
-                .unwrap();
+        let frames = encode_test_packed_delivery_frames(&[expected_effect.clone()]);
         result.reborrow().init_delivery(1).set(0, &frames[0]);
     }
     let reader = message
@@ -2551,7 +2568,7 @@ fn packed_delivery_on_runner_program_result_must_match_the_journal() {
             &expected_effect.entry,
         )
         .unwrap();
-        let frames = crate::server::ipc::encode_packed_delivery_envelopes(&[mismatched]).unwrap();
+        let frames = encode_test_packed_delivery_frames(&[mismatched]);
         result.reborrow().init_delivery(1).set(0, &frames[0]);
     }
     let reader = message
