@@ -38,7 +38,7 @@ impl Fixture {
         let home = temp.path().to_path_buf();
         let finch = home.join(".finch");
         std::fs::create_dir_all(finch.join("brains")).expect("create .finch/brains");
-        std::fs::create_dir_all(finch.join("sessions")).expect("create leftover sessions dir");
+        std::fs::create_dir_all(finch.join("sessions")).expect("create .finch/sessions");
         std::fs::write(
             finch.join("sessions").join(format!("{LEFTOVER_UUID}.json")),
             r#"{"messages":[]}"#,
@@ -1755,6 +1755,175 @@ fn test_reconnected_completed_say_renders_the_component_card() {
     assert!(
         status.success(),
         "a clean /exit must succeed after the replay, status={status:?}, live screen:\n{screen}"
+    );
+}
+
+/// #978 regression at the production boundary: a say turn driven through the
+/// daemon runner — attach, delegated execution — renders the component card
+/// only: no standalone Program source row, no Brain run group, no UUID, no
+/// result row, and the say output exactly once. Mirrors the durable-reattach
+/// fixture: a real daemon owns the disposable HOME and the typed program is
+/// pushed through the Brain (not the local no-Brain typed-program path, which
+/// the stage-2 regression already pins).
+#[test]
+fn daemon_runner_say_turn_renders_component_card_only() {
+    const SAY_TEXT: &str = "attach-say-978";
+    const SOURCE_LINE: &str = "(say \"attach-say-978\")";
+
+    let daemon = IsolatedDaemon::start();
+    let mut first = Session::spawn_on(&daemon.home, &["attach", BRAIN]);
+    first.wait_for(
+        "finch v",
+        READY_DEADLINE,
+        "the attach drew the startup header",
+    );
+    first.wait_for(BRAIN, READY_DEADLINE, "the attach drew the named Brain");
+    first.wait_for_screen(
+        "· runner",
+        READY_DEADLINE,
+        "the attach drew the active runner lease header",
+    );
+
+    first.send_line(SOURCE_LINE);
+    first.wait_for_screen(
+        SAY_TEXT,
+        ECHO_DEADLINE,
+        "the delegated say turn rendered its prose on the live screen",
+    );
+    first.wait_for(
+        "(ran ",
+        ECHO_DEADLINE,
+        "the delegated say turn settled as the completed card",
+    );
+    // The daemon's terminal run events must have landed before the absence
+    // assertions read the screen: the journal is the authoritative delivery
+    // evidence, and this is a liveness gate on the daemon's writer, not a
+    // latency assertion.
+    let journal_deadline = Instant::now() + ECHO_DEADLINE;
+    loop {
+        let journal = std::fs::read_to_string(daemon.events_path()).unwrap_or_default();
+        if journal.lines().any(|line| {
+            line.contains("run_status_changed") && line.contains("\"status\":\"completed\"")
+        }) {
+            break;
+        }
+        if Instant::now() >= journal_deadline {
+            panic!(
+                "INVARIANT: the delegated say turn must reach the durable journal as a \
+                 terminal run before the rendering is judged, so absence assertions read \
+                 the settled transcript. Journal at {} never showed the completed \
+                 status.\njournal:\n{journal}\nlive screen:\n{}\nscrollback:\n{}",
+                daemon.events_path().display(),
+                first.screen_text(),
+                first.scrollback_text()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let screen = first.screen_text();
+    assert!(
+        screen.lines().any(|line| line.contains(SAY_TEXT)),
+        "INVARIANT: the delegated say turn renders its prose on the live screen.\n\
+         live screen:\n{screen}"
+    );
+    assert!(
+        screen.lines().any(|line| line.contains("(ran ")),
+        "INVARIANT: the completed card carries its `(ran Ns)` annotation (stage-2 \
+         verbatim target, docs/TUI_DESIGN.md).\nlive screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Program source") && !screen.contains("Lisp program"),
+        "INVARIANT: the legacy Program source row (the pushed program's run-unaffiliated \
+         echo) does not render beside the card — one representation per state (issue \
+         978).\nlive screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Brain run") && !screen.contains("Interactive run"),
+        "INVARIANT: no Brain run group row renders for the delegated say turn.\n\
+         live screen:\n{screen}"
+    );
+    assert!(
+        !screen.lines().any(|line| line.contains("result")),
+        "INVARIANT: no legacy result row renders beside the card.\nlive screen:\n{screen}"
+    );
+    assert!(
+        uuid_only_lines(&screen).is_empty(),
+        "INVARIANT: no UUID row renders for the delegated say turn.\nlive screen:\n{screen}"
+    );
+
+    // The canonical record keeps the raw program and the say bytes exactly
+    // once, and carries no run-group lifecycle rows.
+    let scrollback = first.scrollback_text();
+    let source_hits = scrollback.matches(SOURCE_LINE).count();
+    assert!(
+        source_hits == 1,
+        "INVARIANT: the canonical record must carry the raw program exactly once in \
+         native scrollback; found {source_hits} occurrence(s). Program={SOURCE_LINE:?}\n\
+         scrollback:\n{scrollback}"
+    );
+    let say_hits = scrollback
+        .lines()
+        .filter(|line| line.trim() == SAY_TEXT)
+        .count();
+    assert!(
+        say_hits == 1,
+        "INVARIANT: the canonical record must carry the say output exactly once in \
+         native scrollback; found {say_hits} prose line(s).\nscrollback:\n{scrollback}"
+    );
+    assert!(
+        !scrollback.contains("Brain run") && !scrollback.contains("Interactive run"),
+        "INVARIANT: the canonical record carries no Brain run lifecycle rows for the \
+         delegated say turn.\nscrollback:\n{scrollback}"
+    );
+    assert!(
+        !scrollback.lines().any(|line| line.contains("result")),
+        "INVARIANT: no result row duplicates the say output in the canonical record.\n\
+         scrollback:\n{scrollback}"
+    );
+
+    // The card's toggle still works through the real input path: F6 focuses
+    // the next semantic row and Enter activates it, swapping the completed
+    // prose to the program source (exactly one new source-line occurrence).
+    let before = first.screen_text().matches(SOURCE_LINE).count();
+    let mut toggled = None;
+    for _ in 0..4 {
+        first.send_line("\x1b[17~"); // F6, then Enter
+        if let Some(screen) = first.wait_for_screen_pred(
+            |screen| {
+                let after = screen.matches(SOURCE_LINE).count();
+                after > before && screen.contains("(ran ")
+            },
+            Duration::from_secs(5),
+        ) {
+            toggled = Some(screen);
+            break;
+        }
+    }
+    let screen = toggled.unwrap_or_else(|| {
+        panic!(
+            "INVARIANT: driving the keyboard disclosure path (F6/Enter) must toggle the \
+             delegated say card's show_program and swap the completed prose to the \
+             program source.\nbefore: {before} occurrence(s) of {SOURCE_LINE:?}.\n\
+             live screen:\n{}",
+            first.screen_text()
+        )
+    });
+    assert_eq!(
+        screen.matches(SOURCE_LINE).count(),
+        before + 1,
+        "INVARIANT: exactly one new occurrence of the source line — the card's reveal, \
+         not a duplicated legacy row.\nlive screen:\n{screen}"
+    );
+
+    first.send_raw(b"\x1b");
+    std::thread::sleep(Duration::from_millis(300));
+    first.send_line("/exit");
+    let status = first.wait_for_exit();
+    assert!(
+        status.success(),
+        "a clean /exit must succeed after the delegated say turn, status={status:?}, \
+         live screen:\n{screen}"
     );
 }
 

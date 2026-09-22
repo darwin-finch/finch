@@ -109,14 +109,36 @@ impl EventLoop {
             .into()));
             return;
         }
+        // The delegated program is executed by this frontend's own runtime,
+        // so the turn renders through the same local units every other local
+        // typed-program path uses (#978): the source unit and the say card.
+        // The run group is never painted for a locally executed run.
+        let language = match request.language {
+            crate::brain::ProgramLanguage::Forth => "forth",
+            crate::brain::ProgramLanguage::Lisp => "lisp",
+        };
+        let source_unit = self.output_manager.start_work_unit("typed program");
+        source_unit.set_program_source(language);
+        source_unit.set_response(request.source.clone());
+        source_unit.set_complete();
+        let card = self.output_manager.start_work_unit("VM program output");
+        card.set_program_output();
+        card.begin_say_turn(language, &request.source);
         let runtime = Arc::clone(&self.program_runtime);
         let agent_scheduler = Arc::clone(&self.agent_scheduler);
         let event_tx = self.event_tx.clone();
         let run_id = request.run_id;
         let request_seq = request.request_seq;
         let cancel = tokio_util::sync::CancellationToken::new();
-        self.pending_named_brain_programs
-            .insert(run_id, cancel.clone());
+        self.pending_named_brain_programs.insert(
+            run_id,
+            PendingNamedBrainProgram {
+                cancel: cancel.clone(),
+                source: request.source.clone(),
+                request_seq,
+                card: Arc::clone(&card),
+            },
+        );
         tokio::task::spawn_local(async move {
             agent_scheduler
                 .set_active_brain_parent(Some(crate::scheduler::AgentBrainContext {
@@ -227,8 +249,20 @@ impl EventLoop {
             };
             let result = execution.await;
             agent_scheduler.set_active_brain_parent(None).await;
+            let finished = match &result {
+                Ok(outcome) => ReplEvent::NamedBrainProgramFinished {
+                    run_id,
+                    output: outcome.output.clone(),
+                    error: None,
+                },
+                Err(failure) => ReplEvent::NamedBrainProgramFinished {
+                    run_id,
+                    output: String::new(),
+                    error: Some(failure.message.clone()),
+                },
+            };
             let _ = request.response_tx.send(result);
-            let _ = event_tx.send(ReplEvent::NamedBrainProgramFinished(run_id));
+            let _ = event_tx.send(finished);
         });
     }
 
@@ -294,17 +328,9 @@ impl EventLoop {
                 .bind_effect_audit(query_id, effect_audit)
                 .await;
         }
-        let run_unit = self
-            .ensure_remote_brain_run_projection(
-                request.run_id,
-                None,
-                crate::brain::BrainRunStatus::Running,
-            )
-            .unit
-            .clone();
-        self.query_states
-            .set_tool_work_unit(query_id, Some(run_unit))
-            .await;
+        // The delegated turn renders through the query processor's own units,
+        // exactly as a local turn does (#978). The daemon's run-group events
+        // for this run stay suppressed, so no run group is projected here.
         *self.active_query_id.write().await = Some(query_id);
         self.pending_named_brain_turns.insert(
             query_id,
@@ -450,6 +476,60 @@ impl EventLoop {
             initial_message_count,
         );
         let _ = response_tx.send(result);
+    }
+
+    /// Settle a delegated typed program: complete the locally rendered say
+    /// card, and register the local projection that suppresses the daemon's
+    /// terminal run events for this run (#978).
+    pub(super) async fn finish_named_brain_program(
+        &mut self,
+        run_id: crate::brain::RunId,
+        output: String,
+        error: Option<String>,
+    ) {
+        let Some(pending) = self.pending_named_brain_programs.remove(&run_id) else {
+            return;
+        };
+        let PendingNamedBrainProgram {
+            cancel: _,
+            source,
+            request_seq,
+            card,
+        } = pending;
+        match &error {
+            None => {
+                if !output.is_empty() {
+                    // Successful untitled `say` presents as assistant prose,
+                    // matching the local typed-program and wire paths (#350/#804).
+                    card.append_response(&output);
+                    card.present_as_assistant_prose();
+                }
+                card.set_complete();
+            }
+            Some(failure) => {
+                card.append_response(&format!("VM error: {failure}"));
+                card.set_complete();
+            }
+        }
+        // The daemon publishes the terminal run events only after this
+        // response is delivered, so a successfully assembled projection is
+        // registered before the events it must suppress can arrive.
+        if error.is_none() {
+            self.local_brain_projections
+                .push_back(LocalBrainProjection {
+                    run_id,
+                    source,
+                    output,
+                    tool_ids: std::collections::HashSet::new(),
+                    approval_ids: std::collections::HashSet::new(),
+                    program_seq: Some(request_seq),
+                    transient_output_unit: Some(card),
+                    failed: false,
+                });
+        }
+        self.render_tui()
+            .await
+            .unwrap_or_else(|error| tracing::warn!("TUI render after delegated program: {error}"));
     }
 
     /// Replace this frontend only after the daemon has acknowledged the
@@ -772,12 +852,15 @@ impl EventLoop {
                     .is_some_and(|client| !client.target.secure)
                     .then_some(brain.environment.machine.as_str());
                 let selected_brain_is_home = self.selected_brain_is_home();
+                let locally_rendered_runs = self.locally_rendered_runs();
                 project_remote_brain_snapshot_runs(
                     &self.output_manager,
                     &mut self.remote_brain_run_units,
                     &mut self.local_brain_projections,
                     selected_brain_is_home,
                     &brain.events,
+                    &locally_rendered_runs,
+                    &mut self.locally_say_projected_runs,
                 );
                 self.todo_list
                     .write()
@@ -971,12 +1054,17 @@ impl EventLoop {
     pub(super) async fn render_remote_brain_event(&mut self, event: &crate::brain::BrainEvent) {
         use crate::brain::BrainEventKind;
         let selected_brain_is_home = self.selected_brain_is_home();
+        let locally_rendered_runs = self.locally_rendered_runs();
+        let local_runner = self.local_runner_attachment(selected_brain_is_home);
         if project_remote_brain_live_run_event(
             &self.output_manager,
             &mut self.remote_brain_run_units,
             &mut self.local_brain_projections,
             selected_brain_is_home,
             event,
+            &locally_rendered_runs,
+            &mut self.locally_say_projected_runs,
+            local_runner,
         ) {
             return;
         }
@@ -1259,6 +1347,13 @@ impl EventLoop {
                     return;
                 }
                 if locally_projected {
+                    return;
+                }
+                // The daemon echoes this frontend's own pushed `Program`
+                // event back over the watch. The delegated execution already
+                // renders the program, so the echo never paints a second
+                // source unit (#978).
+                if self.take_locally_pushed_program_echo(event) {
                     return;
                 }
                 let language = match language {

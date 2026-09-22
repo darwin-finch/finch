@@ -319,14 +319,29 @@ pub struct EventLoop {
     /// so tool continuations use the exact same pipeline as local turns.
     pending_named_brain_turns: std::collections::HashMap<Uuid, PendingNamedBrainTurn>,
 
-    /// Cancellation controls for typed programs delegated by the Brain daemon.
+    /// Delegated typed programs this frontend executes under its runner
+    /// lease, with the locally rendered say card that owns the turn's
+    /// presentation (#978).
     pending_named_brain_programs:
-        std::collections::HashMap<crate::brain::RunId, tokio_util::sync::CancellationToken>,
+        std::collections::HashMap<crate::brain::RunId, PendingNamedBrainProgram>,
 
     /// Source/output already rendered while this frontend serviced its home
     /// Brain callback. Matching canonical events advance this marker without
     /// drawing a second copy in the runner console.
     local_brain_projections: std::collections::VecDeque<LocalBrainProjection>,
+
+    /// Runs whose locally projected say turn already completed. Their daemon
+    /// lifecycle events stay suppressed after the matching projection leaves
+    /// the active queue, and a reconnect snapshot must not rebuild a second
+    /// card for them (#978).
+    locally_say_projected_runs: std::collections::HashSet<crate::brain::RunId>,
+
+    /// Program sources this frontend pushed to its attached Brain as remote
+    /// `Program` events. The daemon echoes each push back over the event
+    /// watch; matching that echo against the marker keeps the run-unaffiliated
+    /// source unit painted exactly once regardless of which arrives first —
+    /// the delegated execution or the echo (#978).
+    locally_pushed_programs: std::collections::VecDeque<String>,
 
     /// Highest canonical revision already incorporated into the visible
     /// projection for each Brain. A watch snapshot and its buffered live tail
@@ -771,6 +786,18 @@ struct DeferredVmApproval {
     prompt: crate::vm::ApprovalPrompt,
 }
 
+/// A typed program delegated to this frontend's runner lease, with the
+/// locally rendered say card that owns its presentation (#978).
+struct PendingNamedBrainProgram {
+    cancel: tokio_util::sync::CancellationToken,
+    source: String,
+    /// The delegated run's request event sequence. The daemon's terminal
+    /// `Result` carries this as its `request_seq`, so the local projection
+    /// matches it and stays suppressed.
+    request_seq: u64,
+    card: Arc<crate::cli::messages::WorkUnit>,
+}
+
 struct PendingNamedBrainTurn {
     brain: String,
     run_id: crate::brain::RunId,
@@ -1156,19 +1183,56 @@ fn apply_brain_run_status(
     }
 }
 
+/// What the event loop knows, per run, about turns this frontend renders
+/// itself. Daemon events for these runs are already on screen through the
+/// local units and must never paint the legacy run group beside them (#978).
+#[derive(Clone, Default)]
+struct LocallyRenderedRuns {
+    /// Runs whose locally projected pure-say turn already completed and left
+    /// the active projection queue. Their lifecycle events stay suppressed
+    /// and a mid-session snapshot must not rebuild a second card.
+    say_completed: std::collections::HashSet<crate::brain::RunId>,
+    /// Runs with a live runner callback (delegated turn or program) in this
+    /// frontend, or a local projection still queued for their terminal event.
+    in_flight: std::collections::HashSet<crate::brain::RunId>,
+}
+
+impl LocallyRenderedRuns {
+    fn renders_locally(&self, run_id: crate::brain::RunId) -> bool {
+        self.say_completed.contains(&run_id) || self.in_flight.contains(&run_id)
+    }
+}
+
 /// Project a correlated event into its canonical RunId work unit. Snapshot
 /// reattachment and live delivery share this path, so acknowledgement never
 /// strips durable run contents from the shadow buffer.
+///
+/// `local_runner` carries the attachment id this frontend would execute runs
+/// for while it holds the runner lease: a run it initiated itself never
+/// projects a run group from `RunStarted`, because the delegated execution
+/// renders the turn locally (#978). Genuinely remote runs keep the group.
 fn project_remote_brain_run_event(
     output_manager: &crate::cli::output_manager::OutputManager,
     projections: &mut std::collections::HashMap<crate::brain::RunId, RemoteBrainRunProjection>,
     event: &crate::brain::BrainEvent,
+    locally_rendered_runs: &LocallyRenderedRuns,
+    local_runner: Option<crate::brain::AttachmentId>,
 ) -> bool {
     use crate::brain::{BrainEventKind, BrainRunKind, BrainRunStatus, ProgramLanguage};
 
     let Some(run_id) = event.run_id else {
         return false;
     };
+    if let BrainEventKind::RunStarted { run } = &event.kind {
+        if locally_rendered_runs.renders_locally(run_id)
+            || local_runner == Some(run.initiating_attachment_id)
+        {
+            // The delegated execution owns this run's presentation.
+            return true;
+        }
+    } else if locally_rendered_runs.renders_locally(run_id) {
+        return true;
+    }
     let (kind, status) = match &event.kind {
         BrainEventKind::RunStarted { run } => (Some(run.kind), run.status),
         BrainEventKind::SpeculativePrompt { .. } => (
@@ -1613,15 +1677,30 @@ fn project_remote_brain_live_run_event(
     local_projections: &mut std::collections::VecDeque<LocalBrainProjection>,
     selected_brain_is_home: bool,
     event: &crate::brain::BrainEvent,
+    locally_rendered_runs: &LocallyRenderedRuns,
+    say_projected_runs: &mut std::collections::HashSet<crate::brain::RunId>,
+    local_runner: Option<crate::brain::AttachmentId>,
 ) -> bool {
     if event.run_id.is_none() {
         return false;
     }
-    let projection_match = selected_brain_is_home
+    let observed = selected_brain_is_home
         .then(|| local_projections.front_mut())
         .flatten()
-        .map(|projection| projection.observe(event))
+        .map(|projection| {
+            let matched = projection.observe(event);
+            // A pure say turn renders entirely through its local card, so its
+            // daemon lifecycle events are suppressed for good once the turn
+            // completes. A tool-bearing turn keeps its run-group rows.
+            let pure_say = matched != LocalProjectionMatch::None
+                && projection.tool_ids.is_empty()
+                && projection.approval_ids.is_empty();
+            (matched, pure_say)
+        });
+    let projection_match = observed
+        .map(|(matched, _)| matched)
         .unwrap_or(LocalProjectionMatch::None);
+    let pure_say = observed.map(|(_, pure_say)| pure_say).unwrap_or(false);
     if projection_match != LocalProjectionMatch::None {
         if let Some(projection) = projections.get_mut(&event.run_id.expect("checked above")) {
             match &event.kind {
@@ -1642,8 +1721,17 @@ fn project_remote_brain_live_run_event(
             }
         }
     }
-    let projected = project_remote_brain_run_event(output_manager, projections, event);
+    let projected = project_remote_brain_run_event(
+        output_manager,
+        projections,
+        event,
+        locally_rendered_runs,
+        local_runner,
+    );
     if projected && projection_match == LocalProjectionMatch::SuppressAndComplete {
+        if pure_say {
+            say_projected_runs.insert(event.run_id.expect("checked above"));
+        }
         if let Some(local) = local_projections.pop_front() {
             if let Some(output_unit) = local.transient_output_unit {
                 // Successful untitled `say` is already assistant prose (#350/#804).
@@ -2074,6 +2162,8 @@ impl EventLoop {
             pending_named_brain_turns: std::collections::HashMap::new(),
             pending_named_brain_programs: std::collections::HashMap::new(),
             local_brain_projections: std::collections::VecDeque::new(),
+            locally_say_projected_runs: std::collections::HashSet::new(),
+            locally_pushed_programs: std::collections::VecDeque::new(),
             brain_projection_revisions: std::collections::HashMap::new(),
             remote_brain_tool_unit: None,
             remote_brain_run_units: std::collections::HashMap::new(),
@@ -2510,7 +2600,7 @@ impl EventLoop {
                         ReplEvent::NamedBrainRunCancelRequested(_) => {
                             "NamedBrainRunCancelRequested"
                         }
-                        ReplEvent::NamedBrainProgramFinished(_) => "NamedBrainProgramFinished",
+                        ReplEvent::NamedBrainProgramFinished { .. } => "NamedBrainProgramFinished",
                         ReplEvent::FrontendRestartReady { .. } => "FrontendRestartReady",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
@@ -3379,8 +3469,8 @@ impl EventLoop {
             )));
             return;
         }
-        if let Some(cancel) = self.pending_named_brain_programs.get(&request.run_id) {
-            cancel.cancel();
+        if let Some(pending) = self.pending_named_brain_programs.get(&request.run_id) {
+            pending.cancel.cancel();
             let _ = request.response_tx.send(Ok(true));
             return;
         }
@@ -3840,6 +3930,74 @@ impl EventLoop {
         self.active_remote_brain.is_none() && self.home_brain.is_some()
     }
 
+    /// Snapshot of the runs whose daemon events this frontend renders
+    /// itself: a runner callback in flight, a local projection queued for
+    /// the terminal event, or a completed pure-say turn (#978).
+    fn locally_rendered_runs(&self) -> LocallyRenderedRuns {
+        LocallyRenderedRuns {
+            say_completed: self.locally_say_projected_runs.clone(),
+            in_flight: self
+                .pending_named_brain_programs
+                .keys()
+                .copied()
+                .chain(
+                    self.pending_named_brain_turns
+                        .values()
+                        .map(|turn| turn.run_id),
+                )
+                .chain(self.local_brain_projections.iter().map(|p| p.run_id))
+                .collect(),
+        }
+    }
+
+    /// The attachment id this frontend executes runs for while it holds the
+    /// home runner lease. Runs it initiated itself are rendered locally, so
+    /// their run group is never painted from daemon events (#978).
+    fn local_runner_attachment(
+        &self,
+        selected_brain_is_home: bool,
+    ) -> Option<crate::brain::AttachmentId> {
+        if !selected_brain_is_home || !self.home_runner_lease_active {
+            return None;
+        }
+        self.selected_brain()
+            .and_then(|client| client.attachment())
+            .map(|attachment| attachment.attachment_id)
+    }
+
+    /// Record the source of a `Program` event this frontend pushed to its
+    /// attached Brain, so the daemon's echo is recognised on the event watch
+    /// regardless of whether it or the delegated execution arrives first
+    /// (#978). Bounded: one entry per pending push, oldest dropped.
+    fn record_locally_pushed_program(&mut self, source: String) {
+        const PUSHED_PROGRAM_MARKER_LIMIT: usize = 16;
+        while self.locally_pushed_programs.len() >= PUSHED_PROGRAM_MARKER_LIMIT {
+            self.locally_pushed_programs.pop_front();
+        }
+        self.locally_pushed_programs.push_back(source);
+    }
+
+    /// Consume the echo of a locally pushed `Program` event: the delegated
+    /// execution already renders the program, so the run-unaffiliated echo
+    /// must not paint a second source unit (#978).
+    fn take_locally_pushed_program_echo(&mut self, event: &crate::brain::BrainEvent) -> bool {
+        if event.run_id.is_some() || event.sender != self.participant_subject {
+            return false;
+        }
+        let crate::brain::BrainEventKind::Program { source, .. } = &event.kind else {
+            return false;
+        };
+        let position = self
+            .locally_pushed_programs
+            .iter()
+            .position(|pushed| pushed == source);
+        let Some(position) = position else {
+            return false;
+        };
+        self.locally_pushed_programs.remove(position);
+        true
+    }
+
     fn selected_brain_matches(&self, target: &str) -> bool {
         self.selected_brain()
             .is_some_and(|client| client.target.display_name() == target)
@@ -3849,6 +4007,9 @@ impl EventLoop {
         let Some(client) = self.selected_brain().cloned() else {
             return Ok(());
         };
+        if let crate::brain::BrainEventKind::Program { source, .. } = &kind {
+            self.record_locally_pushed_program(source.clone());
+        }
         let target = client.target.display_name();
         let event_tx = self.event_tx.clone();
         tokio::task::spawn_local(async move {
@@ -4745,15 +4906,31 @@ fn project_remote_brain_snapshot_runs(
     local_projections: &mut std::collections::VecDeque<LocalBrainProjection>,
     selected_brain_is_home: bool,
     events: &[crate::brain::BrainEvent],
+    locally_rendered_runs: &LocallyRenderedRuns,
+    say_projected_runs: &mut std::collections::HashSet<crate::brain::RunId>,
 ) {
     // Say-turn reconstruction (#970) only targets run units this snapshot
     // creates. A unit that already exists was projected by a live turn or an
     // earlier snapshot: its turn is already on screen (live say card, or a
     // card the previous snapshot rebuilt), so replaying again would stack a
-    // second card or duplicate streamed output bytes.
-    let pre_existing: std::collections::HashSet<crate::brain::RunId> =
-        projections.keys().copied().collect();
+    // second card or duplicate streamed output bytes. The same holds for runs
+    // this frontend rendered locally without ever projecting a run group
+    // (#978): their card is live, so replaying them would stack a second one.
+    let locally_rendered: std::collections::HashSet<crate::brain::RunId> = locally_rendered_runs
+        .in_flight
+        .iter()
+        .chain(locally_rendered_runs.say_completed.iter())
+        .copied()
+        .collect();
+    let pre_existing: std::collections::HashSet<crate::brain::RunId> = projections
+        .keys()
+        .copied()
+        .chain(locally_rendered.iter().copied())
+        .collect();
     for group in projected_brain_run_groups(events) {
+        if locally_rendered.contains(&group.run_id) {
+            continue;
+        }
         ensure_remote_brain_run_projection(
             output_manager,
             projections,
@@ -4770,6 +4947,9 @@ fn project_remote_brain_snapshot_runs(
             local_projections,
             selected_brain_is_home,
             event,
+            locally_rendered_runs,
+            say_projected_runs,
+            None,
         );
     }
     reconstruct_replayed_say_turn_cards(projections, &pre_existing, events);
