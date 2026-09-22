@@ -1845,7 +1845,6 @@ dependencies = [
  "dirs 5.0.1",
  "serde_json",
  "tokio",
- "tracing",
  "uuid",
 ]
 

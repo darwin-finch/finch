@@ -5,7 +5,7 @@ publish = false
 rust-version = "1.98"
 edition = "2021"
 license = "LicenseRef-PolyForm-Noncommercial-1.0"
-description = "Domain-neutral Cap'n Proto schema, protocol, event, JSON-value, and Unix-socket primitives for Finch IPC"
+description = "Domain-neutral Cap'n Proto schema, protocol, JSON-value, and Unix-socket primitives for Finch IPC"
 repository = "https://github.com/darwin-finch/finch"
 
 [dependencies]
@@ -13,12 +13,10 @@ anyhow = "1.0"
 capnp = "0.24"
 dirs = "5.0"
 serde_json = "1.0"
-tokio = { version = "1.35", features = ["rt", "sync"] }
-tracing = "0.1"
-uuid = { version = "1.0", features = ["v4"] }
 
 [build-dependencies]
 capnpc = "0.24"
 
 [dev-dependencies]
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync"] }
+uuid = { version = "1.0", features = ["v4"] }

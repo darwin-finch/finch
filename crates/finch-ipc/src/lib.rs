@@ -14,12 +14,12 @@ pub mod finch_ipc_capnp {
     include!(concat!(env!("OUT_DIR"), "/finch_ipc_capnp.rs"));
 }
 
+#[cfg(test)]
 mod events;
 mod transport;
 mod value_codec;
 
-pub use events::{EventBus, QueuedEvent};
-pub use transport::{sock_path, DAEMON_SOCK_PATH};
+pub use transport::sock_path;
 pub use value_codec::{decode_json_value, encode_json_value};
 
 /// Compatibility generation for the frontend/daemon Cap'n Proto contract.
