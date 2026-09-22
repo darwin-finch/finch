@@ -6,7 +6,7 @@
 use super::{ComponentView, Message, MessageId, MessageStatus};
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use finch_theme::{ColorScheme, ColorSpec, MessageBand};
-use finch_ui_model::{ProgressView, StaticTextKind, StaticTextView};
+use finch_ui_model::{LiveToolView, ProgressView, StaticTextKind, StaticTextView};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -622,6 +622,26 @@ const GRAY_DIM: GrayDim = GrayDim;
 impl Message for LiveToolMessage {
     fn id(&self) -> MessageId {
         self.id
+    }
+
+    /// Stage 3 (#1120): the live surface renders from the VM — header,
+    /// accumulated content lines, and status — read under the message's
+    /// existing lock. Streaming appends land under that same lock and the
+    /// next frame re-renders from the snapshot.
+    fn component_view(&self) -> Option<ComponentView> {
+        Some(ComponentView::LiveTool(LiveToolView {
+            header: self.header.clone(),
+            content_lines: self
+                .content
+                .read()
+                .map(|content| content.lines().map(str::to_owned).collect())
+                .unwrap_or_default(),
+            status: self
+                .status
+                .read()
+                .map(|status| *status)
+                .unwrap_or(MessageStatus::InProgress),
+        }))
     }
 
     fn format(&self, _colors: &finch_theme::ColorScheme) -> String {

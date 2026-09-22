@@ -7411,6 +7411,63 @@ mod tests {
              live ids were {live_ids:?}"
         );
     }
+
+    /// INVARIANT (stage 3, #1120): a LiveToolMessage renders the live tool
+    /// surface from its VM at the claiming boundary, and streaming growth
+    /// renders between frames — the producer appends under the message lock,
+    /// the next projection re-renders from the snapshot (the say-turn
+    /// streaming discipline, mirrored here).
+    #[test]
+    fn test_live_tool_message_streams_content_growth_between_frames() {
+        use finch_messages::LiveToolMessage;
+        let mut renderer = headless_renderer();
+        let live_tool = Arc::new(LiveToolMessage::new("⏺ bash(echo hi)"));
+        let message: MessageRef = Arc::clone(&live_tool) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+
+        let first = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = first.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["⏺ bash(echo hi)…"],
+            "a just-started call is the header with the running ellipsis; got {rendered:?}"
+        );
+
+        // First chunk arrives: the content subwidget claims its rows.
+        live_tool.append_line("hello world");
+        let second = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = second.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["⏺ bash(echo hi)", "hello world"],
+            "streaming growth renders beneath the header between frames; got {rendered:?}"
+        );
+
+        // A second chunk grows the surface again, and completion drops the
+        // running ellipsis.
+        live_tool.append_line("goodbye");
+        live_tool.set_complete();
+        let third = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = third.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["⏺ bash(echo hi)", "hello world", "goodbye"],
+            "the completed surface carries every arrived line and no ellipsis; got \
+             {rendered:?}"
+        );
+        assert!(
+            third.iter().all(|line| !line.text.contains('\x1b')),
+            "the component emits plain text; got {rendered:?}"
+        );
+        assert!(
+            third
+                .iter()
+                .all(|line| line.row_id.is_none() && !line.component_owned),
+            "the live tool surface claims no hit target in stage 3"
+        );
+    }
     fn paint_slash_completions(renderer: &mut TuiRenderer) {
         renderer.update_ghost_text();
         completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);

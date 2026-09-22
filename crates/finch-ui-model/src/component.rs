@@ -33,6 +33,9 @@ pub enum ComponentView {
     StaticText(StaticTextView),
     /// A download/upload progress message (#1120, stage 3).
     Progress(ProgressView),
+    /// A live tool call message (#1120, stage 3): header plus streaming
+    /// content and status.
+    LiveTool(LiveToolView),
 }
 
 /// The ViewModel of a [`ComponentView::StaticText`] component: the message's
@@ -70,6 +73,18 @@ pub struct ProgressView {
     pub status: MessageStatus,
 }
 
+/// The ViewModel of a [`ComponentView::LiveTool`] component: the pre-formatted
+/// header, the accumulated content lines, and the status. The message
+/// constructs the snapshot under its existing lock; `content_lines` is the
+/// live state that grows as the tool streams, and every frame re-renders
+/// from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveToolView {
+    pub header: String,
+    pub content_lines: Vec<String>,
+    pub status: MessageStatus,
+}
+
 /// Render one component snapshot into the transcript lines it claims this
 /// frame. The engine asks the `Message` trait for the snapshot and this
 /// function for the lines; it never learns which concrete message produced
@@ -79,6 +94,7 @@ pub fn component_lines(view: &ComponentView) -> Vec<RenderedTranscriptLine> {
         ComponentView::Say(say) => crate::say_turn_lines(say),
         ComponentView::StaticText(static_text) => static_text_lines(static_text),
         ComponentView::Progress(progress) => progress_lines(progress),
+        ComponentView::LiveTool(live_tool) => live_tool_lines(live_tool),
     }
 }
 
@@ -112,6 +128,53 @@ fn progress_lines(view: &ProgressView) -> Vec<RenderedTranscriptLine> {
         text: line,
         ..RenderedTranscriptLine::default()
     }]
+}
+
+/// A live tool row: the header, then the streaming content beneath it. The
+/// subwidgets are constructed from the outer VM each frame: an empty content
+/// subwidget claims nothing, so a just-started call renders the header with
+/// a trailing `…` (Claude Code style, byte-compatible with the retired
+/// `format()` presentation), and grown content renders beneath the header
+/// with no trailing ellipsis.
+fn live_tool_lines(view: &LiveToolView) -> Vec<RenderedTranscriptLine> {
+    let mut lines = Vec::with_capacity(1 + view.content_lines.len());
+    let mut header = view.header.clone();
+    if view.content_lines.is_empty() && view.status == MessageStatus::InProgress {
+        header.push_str("…");
+    }
+    lines.push(RenderedTranscriptLine {
+        text: header,
+        ..RenderedTranscriptLine::default()
+    });
+    lines.extend(
+        LiveToolContent::from_vm(view)
+            .render()
+            .into_iter()
+            .map(|text| RenderedTranscriptLine {
+                text,
+                ..RenderedTranscriptLine::default()
+            }),
+    );
+    lines
+}
+
+/// The content subwidget: constructed from the outer ViewModel each frame, so
+/// it chooses to render or not based on VM data — a subwidget with nothing to
+/// show claims zero rows and stays in the tree (#882's furniture rule).
+struct LiveToolContent<'a> {
+    lines: &'a [String],
+}
+
+impl<'a> LiveToolContent<'a> {
+    fn from_vm(vm: &'a LiveToolView) -> Self {
+        Self {
+            lines: &vm.content_lines,
+        }
+    }
+
+    fn render(&self) -> Vec<String> {
+        self.lines.to_vec()
+    }
 }
 
 /// A static text row's lines: one glyph-prefixed line per content line. An
@@ -386,10 +449,8 @@ mod tests {
         );
     }
 
-    /// A completed progress row still renders its one line here; the
-    /// zero-claim furniture rule applies to the live viewport, where the
-    /// renderer drops a completed row (the message leaves the live surface
-    /// through the canonical commit). The component itself stays total.
+    /// The component stays total over degenerate VMs: a zero total cannot
+    /// divide by zero, and the bar stays empty.
     #[test]
     fn test_progress_zero_total_renders_an_empty_bar_without_panicking() {
         let indeterminate = progress_view(5, 0, MessageStatus::InProgress);
@@ -397,6 +458,124 @@ mod tests {
             progress_text(&indeterminate),
             "Download [░░░░░░░░░░] 0%",
             "a zero total cannot divide by zero; the bar stays empty"
+        );
+    }
+
+    // ── LiveToolMessage: header + streaming content (#1120 stage 3) ─────────
+
+    fn live_tool_view(header: &str, content_lines: &[&str], status: MessageStatus) -> LiveToolView {
+        LiveToolView {
+            header: header.to_string(),
+            content_lines: content_lines.iter().map(|line| line.to_string()).collect(),
+            status,
+        }
+    }
+
+    fn live_tool_texts(view: &LiveToolView) -> Vec<String> {
+        component_lines(&ComponentView::LiveTool(view.clone()))
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    /// INVARIANT (#1120): a just-started call renders the header with a
+    /// trailing `…` — the empty content subwidget claims zero rows and stays
+    /// constructible from the outer VM.
+    #[test]
+    fn test_live_tool_empty_content_claims_zero_rows_and_the_header_carries_the_ellipsis() {
+        let started = live_tool_view("⏺ bash(echo hi)", &[], MessageStatus::InProgress);
+        assert_eq!(
+            live_tool_texts(&started),
+            vec!["⏺ bash(echo hi)…"],
+            "the header is the whole surface while content is empty"
+        );
+        let hidden = LiveToolContent::from_vm(&started);
+        assert!(
+            hidden.render().is_empty(),
+            "the empty content subwidget renders nothing"
+        );
+    }
+
+    /// INVARIANT: arrived content renders beneath the header and is never
+    /// hidden; growth between frames renders the new lines, and the
+    /// completed state drops the running ellipsis.
+    #[test]
+    fn test_live_tool_content_renders_beneath_the_header_and_grows() {
+        let partial = live_tool_view("⏺ bash(build)", &["compiling…"], MessageStatus::InProgress);
+        assert_eq!(
+            live_tool_texts(&partial),
+            vec!["⏺ bash(build)", "compiling…"],
+            "arrived content renders beneath the header without the ellipsis"
+        );
+        let grown = live_tool_view(
+            "⏺ bash(build)",
+            &["compiling…", "linking…"],
+            MessageStatus::Complete,
+        );
+        let grown_lines = live_tool_texts(&grown);
+        assert_eq!(
+            grown_lines,
+            vec!["⏺ bash(build)", "compiling…", "linking…"],
+            "growth between frames renders the new lines; got {grown_lines:?}"
+        );
+        assert!(
+            grown_lines[0].ends_with("bash(build)"),
+            "a completed call wears no running ellipsis"
+        );
+    }
+
+    /// A completed call with no output is the header alone; a failed call
+    /// keeps its diagnostic visible.
+    #[test]
+    fn test_live_tool_completed_header_only_and_failed_keeps_diagnostics() {
+        let silent = live_tool_view("⏺ bash(true)", &[], MessageStatus::Complete);
+        assert_eq!(
+            live_tool_texts(&silent),
+            vec!["⏺ bash(true)"],
+            "a completed call with no output is the header alone"
+        );
+        let failed = live_tool_view("⏺ bash(bad)", &["command not found"], MessageStatus::Failed);
+        assert_eq!(
+            live_tool_texts(&failed),
+            vec!["⏺ bash(bad)", "command not found"],
+            "the failure diagnostic stays visible"
+        );
+    }
+
+    /// The card participates in a claiming frame: one row for the header plus
+    /// one row per content line.
+    #[test]
+    fn test_live_tool_claims_one_row_per_line_in_a_layout_frame() {
+        let view = live_tool_view("⏺ bash(build)", &["a", "b"], MessageStatus::InProgress);
+        const CARD: u16 = 11;
+        let tree = Widget::Stack {
+            axis: Axis::Column,
+            children: vec![(
+                Track::Natural,
+                Widget::Marked(
+                    CARD,
+                    Box::new(Widget::Text {
+                        lines: component_lines(&ComponentView::LiveTool(view))
+                            .into_iter()
+                            .map(|line| line.text)
+                            .collect(),
+                    }),
+                ),
+            )],
+        };
+        let layout = crate::layout(
+            &tree,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 20,
+            },
+        );
+        let rect = layout.keyed(CARD).expect("the card claims a rect");
+        assert_eq!(
+            rect.height, 3,
+            "header + two content lines claim three rows; got {rect:?}"
         );
     }
 }

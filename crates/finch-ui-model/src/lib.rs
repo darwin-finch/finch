@@ -18,7 +18,9 @@ mod markdown;
 mod say_turn;
 mod work_unit;
 
-pub use component::{component_lines, ComponentView, ProgressView, StaticTextKind, StaticTextView};
+pub use component::{
+    component_lines, ComponentView, LiveToolView, ProgressView, StaticTextKind, StaticTextView,
+};
 pub use say_turn::{
     say_turn_lines, OutputVm, ProgramSourceVm, SayTurnStatus, SayTurnView, WorkUnitViewModel,
 };
