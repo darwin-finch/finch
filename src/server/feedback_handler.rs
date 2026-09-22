@@ -16,7 +16,7 @@ use crate::feedback::{FeedbackEntry, FeedbackLogger, FeedbackQuotaExceeded};
 
 /// Request body for /v1/feedback endpoint
 #[derive(Debug, Deserialize)]
-pub struct FeedbackRequest {
+pub(super) struct FeedbackRequest {
     /// Original query
     pub query: String,
     /// Model response
@@ -30,7 +30,7 @@ pub struct FeedbackRequest {
 
 /// Response body for /v1/feedback endpoint
 #[derive(Debug, Serialize)]
-pub struct FeedbackResponse {
+pub(super) struct FeedbackResponse {
     /// Status: "recorded", "error"
     pub status: String,
     /// Optional message
@@ -39,7 +39,7 @@ pub struct FeedbackResponse {
 }
 
 /// Handle POST /v1/feedback - durably retain explicit feedback
-pub async fn handle_feedback(
+pub(super) async fn handle_feedback(
     State(feedback_store): State<Arc<FeedbackLogger>>,
     Json(request): Json<FeedbackRequest>,
 ) -> Result<Json<FeedbackResponse>, Response> {
@@ -117,7 +117,7 @@ fn feedback_error_category(error: &anyhow::Error) -> &'static str {
 
 /// Training status information
 #[derive(Debug, Serialize)]
-pub struct TrainingStatusResponse {
+pub(super) struct TrainingStatusResponse {
     /// Queue length (examples waiting to be processed)
     pub queue_length: usize,
     /// Whether training is currently active
@@ -130,7 +130,7 @@ pub struct TrainingStatusResponse {
 }
 
 /// Handle GET /v1/training/status - Get training queue status
-pub async fn handle_training_status() -> Json<TrainingStatusResponse> {
+pub(super) async fn handle_training_status() -> Json<TrainingStatusResponse> {
     // TODO: Implement actual status tracking
     // For now, return placeholder data
     Json(TrainingStatusResponse {

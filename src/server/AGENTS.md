@@ -11,9 +11,11 @@ state. Daemon process lifecycle belongs to `src/daemon`; durable Brain state bel
 **Facade:** callers outside this directory use flat `crate::server::Item` imports from the
 `pub use` list in [`mod.rs`](mod.rs); they must not name `server::handlers` or
 `server::openai_types`. The daemon-side `ipc` child is private; the client uses runtime's
-delivery-frame encoder directly. #1050 tracks public-signature types missing from the flat
-surface. Keep wire behavior, authentication, persistence, and runner semantics unchanged in
-facade-only work. Do not recreate a generated symbol catalog.
+delivery-frame encoder directly. Route-only HTTP payloads and approval handles stay out of the
+public facade; root Brain application tests retain crate-visible approval registration access.
+The flat facade exports `AppError` so external state-directory node-handler callers can name
+their result type. Keep wire behavior, authentication, persistence, and runner semantics unchanged
+in facade-only work. Do not recreate a generated symbol catalog.
 
 **Dependencies:** Brain services and persistence, IPC-facing runner callbacks, provider and model
 adapters, the program runtime, tool execution, configuration, metrics, and local generation. The

@@ -19,6 +19,5 @@ Two callers show the boundary:
    delivery-frame encoding.
 
 Read [AGENTS.md](AGENTS.md) for dependency and lifecycle rules, and [`mod.rs`](mod.rs) for the
-callable facade. A few public methods return types not yet exported by that facade;
-[#1050](https://github.com/darwin-finch/finch/issues/1050) tracks those API gaps separately from
-this documentation slice.
+callable facade. The direct state-directory node handlers expose `AppError` through that facade;
+route-only feedback and health payloads remain implementation details.

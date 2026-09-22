@@ -21,6 +21,15 @@ use std::sync::{
 };
 use tower::ServiceExt;
 
+#[test]
+fn test_state_directory_node_error_is_nameable_through_server_facade() {
+    let _typed_handler = |state: IsolatedNodeTestState| async move {
+        let result: Result<axum::Json<serde_json::Value>, finch::server::AppError> =
+            handle_node_stats_from_state_directory(state).await;
+        result
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
