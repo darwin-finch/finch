@@ -7,8 +7,8 @@ for the optional local-model path. Model loading belongs to `src/models`; provid
 generation contracts belong to `finch-generation`; Finch adapters belong to `src/generators`.
 
 **Facade:** `generator` and `patterns` are private children. Callers outside this directory use
-flat `crate::local::{LocalGenerator, GeneratedResponse, TemplateGenerator, PatternClassifier,
-QueryPattern}` imports. Do not expose child-module paths as a shortcut.
+`crate::local::{LocalGenerator, GeneratedResponse}`. The template generator and pattern
+classifier are implementation details; do not expose child-module paths as a shortcut.
 
 **Dependencies:** model adapters, generation responses, provider messages, tool wire definitions,
 training support, and configuration. This module generates candidate responses; it does not own

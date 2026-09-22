@@ -6,8 +6,10 @@
 mod generator;
 mod patterns;
 
-pub use generator::{GeneratedResponse, TemplateGenerator};
-pub use patterns::{PatternClassifier, QueryPattern};
+pub use generator::GeneratedResponse;
+
+use generator::TemplateGenerator;
+use patterns::PatternClassifier;
 
 use crate::generators::GeneratorResponse;
 use crate::models::GeneratorModel;
@@ -217,16 +219,6 @@ impl LocalGenerator {
     /// Check if enabled
     pub fn is_enabled(&self) -> bool {
         self.enabled
-    }
-
-    /// Get pattern classifier
-    pub fn pattern_classifier(&self) -> &PatternClassifier {
-        &self.pattern_classifier
-    }
-
-    /// Get response generator
-    pub fn response_generator(&mut self) -> &mut TemplateGenerator {
-        &mut self.response_generator
     }
 
     /// Get the model adapter for cleaning

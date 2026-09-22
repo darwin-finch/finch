@@ -25,7 +25,6 @@ use crate::providers::{ContentBlock, Message};
 use crate::runtime::{
     decode_checkpoint, decode_packed_runtime_application_frames, encode_checkpoint,
 };
-use crate::server::ipc::encode_packed_delivery_envelopes;
 use crate::tools::{ToolDefinition, ToolUse};
 
 pub struct BrainRunnerBootstrap {
@@ -1618,10 +1617,17 @@ fn encode_runner_delivery(
     mut encoded: capnp::data_list::Builder<'_>,
     records: &[crate::server::RunnerEffectRecord],
 ) -> capnp::Result<()> {
-    let frames = encode_packed_delivery_envelopes(records)
+    for (index, record) in records.iter().enumerate() {
+        let frame = crate::runtime::encode_runtime_application_message_packed(
+            &crate::runtime::RuntimeApplicationMessage::Envelope {
+                envelope: crate::runtime::VmEffectEnvelope {
+                    execution_id: record.execution_id,
+                    effect: record.entry.effect.clone(),
+                },
+            },
+        )
         .map_err(|error| capnp::Error::failed(error.to_string()))?;
-    for (index, frame) in frames.iter().enumerate() {
-        encoded.set(index as u32, frame);
+        encoded.set(index as u32, &frame);
     }
     Ok(())
 }
@@ -2017,6 +2023,54 @@ fn read_query_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_runner_delivery_encodes_runtime_envelope_without_server_adapter() {
+        let record = crate::server::RunnerEffectRecord {
+            execution_id: uuid::Uuid::new_v4(),
+            entry: crate::vm::EffectJournalEntry {
+                effect: crate::vm::VmSideEffect {
+                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    sequence: 3,
+                    requirement: crate::vm::CapabilityRequirement {
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                    },
+                    event: crate::vm::HostSideEffect::Emit {
+                        text: "done".into(),
+                    },
+                    output: Vec::new(),
+                    origin: crate::vm::SourceOrigin::generated("say"),
+                },
+                state: crate::vm::EffectJournalState::Acknowledged { values: Vec::new() },
+            },
+        };
+        let mut message = capnp::message::Builder::new_default();
+        let mut result = message.init_root::<finch_ipc_capnp::brain_program_result::Builder<'_>>();
+        encode_runner_delivery(
+            result.reborrow().init_delivery(1),
+            std::slice::from_ref(&record),
+        )
+        .unwrap();
+
+        let reader = message
+            .get_root_as_reader::<finch_ipc_capnp::brain_program_result::Reader<'_>>()
+            .unwrap();
+        let frames = reader.get_delivery().unwrap();
+        let decoded =
+            crate::runtime::decode_runtime_application_message_packed(frames.get(0).unwrap())
+                .unwrap();
+        assert_eq!(
+            decoded,
+            crate::runtime::RuntimeApplicationMessage::Envelope {
+                envelope: crate::runtime::VmEffectEnvelope {
+                    execution_id: record.execution_id,
+                    effect: record.entry.effect,
+                },
+            },
+            "client delivery must preserve the runner effect in the runtime ABI frame"
+        );
+    }
 
     struct ProtocolFixtureDaemon {
         protocol_version: u32,

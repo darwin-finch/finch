@@ -23,24 +23,6 @@ use crate::runtime::{
 };
 use crate::server::AgentServer;
 
-pub(crate) fn encode_packed_delivery_envelopes(
-    records: &[crate::server::RunnerEffectRecord],
-) -> Result<Vec<Vec<u8>>> {
-    records
-        .iter()
-        .map(|record| {
-            crate::runtime::encode_runtime_application_message_packed(
-                &crate::runtime::RuntimeApplicationMessage::Envelope {
-                    envelope: crate::runtime::VmEffectEnvelope {
-                        execution_id: record.execution_id,
-                        effect: record.entry.effect.clone(),
-                    },
-                },
-            )
-        })
-        .collect()
-}
-
 fn decode_packed_delivery_envelopes(
     frames: capnp::data_list::Reader<'_>,
     journal: &[crate::server::RunnerEffectRecord],
