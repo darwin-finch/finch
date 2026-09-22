@@ -501,6 +501,7 @@ impl TypedRuntime {
         self.grants = grants;
     }
 
+    #[cfg(test)]
     pub fn grant(&mut self, requirement: CapabilityRequirement) {
         self.grants = self.grants.union(&EffectSet::from_requirement(requirement));
     }
@@ -525,7 +526,7 @@ impl TypedRuntime {
         self.execute_with_declaration(module, fuel, None)
     }
 
-    pub fn execute_with_declaration(
+    pub(crate) fn execute_with_declaration(
         &mut self,
         module: &ModuleVerified,
         fuel: u64,

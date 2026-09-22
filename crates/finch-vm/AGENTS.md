@@ -12,6 +12,24 @@ Shared typed IR, verification, capability/effect descriptions, and vocabulary co
 [`finch-runtime`](../finch-runtime/AGENTS.md); the
 program-definition and corpus metadata live in `crates/finch-programs/`.
 
+**Surface tiers (issue #963 audit).** The `pub use` list in [`src/lib.rs`](src/lib.rs) is the
+cross-crate contract; everything below it is tiered so implementation detail cannot leak back in:
+
+- **Crate-internal (`pub(crate)`):** `VmStep`, `VmTrampoline` and all of
+  `{new, start, start_function, resume, run}`, and `TypedRuntime::execute_with_declaration`.
+  The trampoline is the handler-free execution core that `TypedRuntime` drives; external callers
+  execute through `TypedRuntime::{execute, execute_with_handler}`. Widening any of these is a
+  capsule change, not cleanup.
+- **Test-only (`#[cfg(test)]`):** `TypedRuntime::grant` (unit tests seed grants directly).
+- **Contract (stays `pub`):** `PendingHostCall`. The audit's type-name reference pass saw no
+  external callers, but its values are carried by the pub, wire-serialized
+  `TypedSuspension.pending_host_call` field and read by `finch-runtime`'s approval-prompt flow
+  (`crates/finch-runtime/src/lib.rs` `approval_prompts`); narrowing it would break host
+  authorization, so it remains contract surface.
+
+Deleted as unreferenced by the same audit: the `SourceSpan::bytes` constructor in
+`finch-vm-core/src/diagnostic.rs`.
+
 **Boundary:** the [README](README.md) traces runtime execution and wire-failure classification;
 [`src/lib.rs`](src/lib.rs) is the flat facade, and `cargo doc -p finch-vm --no-deps --open`
 renders public methods. Child modules remain private. To expose something new, re-export it

@@ -6,8 +6,8 @@
 //! explicit captures/arguments, and a private VM stack. It never aliases the
 //! parent Brain stack or executes a host capability.
 
-use crate::interpreter::InterpreterConfig;
-use crate::{EffectSet, TypedValue, VerifiedModule, VmDiagnostic, VmStep, VmTrampoline};
+use crate::interpreter::{InterpreterConfig, VmStep, VmTrampoline};
+use crate::{EffectSet, TypedValue, VerifiedModule, VmDiagnostic};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
