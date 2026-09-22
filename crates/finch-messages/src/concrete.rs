@@ -6,7 +6,10 @@
 use super::{ComponentView, Message, MessageId, MessageStatus};
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use finch_theme::{ColorScheme, ColorSpec, MessageBand};
-use finch_ui_model::{LiveToolView, ProgressView, StaticTextKind, StaticTextView};
+use finch_ui_model::{
+    LiveToolView, OperationRowView, OperationView, ProgressView, StaticTextKind, StaticTextView,
+    WorkRowStatus,
+};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -778,6 +781,32 @@ impl Message for OperationMessage {
         self.id
     }
 
+    /// Stage 3 (#1120): the chrome and the row list render from the VM —
+    /// header, whole-operation status, and one row per tool call with its
+    /// per-row status — read under the message's existing locks.
+    fn component_view(&self) -> Option<ComponentView> {
+        Some(ComponentView::Operation(OperationView {
+            header: self.header.clone(),
+            status: *self.status.read().unwrap_or_else(|p| p.into_inner()),
+            rows: self
+                .rows
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .map(|row| OperationRowView {
+                    label: row.label.clone(),
+                    status: match &row.status {
+                        OperationRowStatus::Running => WorkRowStatus::Running,
+                        OperationRowStatus::Complete(summary) => {
+                            WorkRowStatus::Complete(summary.clone())
+                        }
+                        OperationRowStatus::Error(error) => WorkRowStatus::Error(error.clone()),
+                    },
+                })
+                .collect(),
+        }))
+    }
+
     fn format(&self, _colors: &finch_theme::ColorScheme) -> String {
         let rows = self.rows.read().unwrap_or_else(|p| p.into_inner());
         let status = *self.status.read().unwrap_or_else(|p| p.into_inner());
@@ -1468,6 +1497,115 @@ mod tests {
             formatted.contains("permission denied"),
             "error message missing in: {:?}",
             formatted
+        );
+    }
+
+    // ── Stage-3 component views reflect the VMs under the locks (#1120) ────
+
+    #[test]
+    fn component_views_reflect_operation_vm_transitions_under_the_locks() {
+        let operation = OperationMessage::new("Generating");
+        assert!(
+            operation.component_view().is_some(),
+            "an OperationMessage always yields its component"
+        );
+        let first = operation.component_view().expect("component view");
+        let ComponentView::Operation(view) = first else {
+            panic!("an OperationMessage yields its Operation component; got {first:?}")
+        };
+        assert!(
+            view.rows.is_empty() && view.status == MessageStatus::InProgress,
+            "the fresh VM carries the chrome state with zero rows; got {view:?}"
+        );
+
+        let call = operation.add_row("bash(git push)");
+        let ComponentView::Operation(running) = operation.component_view().expect("component view")
+        else {
+            panic!("component kind changed")
+        };
+        assert_eq!(
+            running.rows,
+            vec![OperationRowView {
+                label: "bash(git push)".to_string(),
+                status: WorkRowStatus::Running,
+            }],
+            "the running row rides the VM under the rows lock; got {running:?}"
+        );
+
+        operation.complete_row(call, "pushed");
+        operation.set_complete();
+        let ComponentView::Operation(done) = operation.component_view().expect("component view")
+        else {
+            panic!("component kind changed")
+        };
+        assert_eq!(
+            done.rows[0].status,
+            WorkRowStatus::Complete("pushed".to_string()),
+            "the completed row's summary rides the VM; got {done:?}"
+        );
+        assert_eq!(
+            done.status,
+            MessageStatus::Complete,
+            "the whole-operation status rides the VM; got {done:?}"
+        );
+    }
+
+    #[test]
+    fn component_views_reflect_live_tool_and_progress_vm_transitions_under_the_locks() {
+        let live_tool = LiveToolMessage::new("⏺ bash(echo hi)");
+        let ComponentView::LiveTool(started) = live_tool.component_view().expect("component view")
+        else {
+            panic!("a LiveToolMessage yields its LiveTool component")
+        };
+        assert!(
+            started.content_lines.is_empty(),
+            "a just-started call carries no content lines; got {started:?}"
+        );
+        live_tool.append_line("hello world");
+        live_tool.append_line("goodbye");
+        let ComponentView::LiveTool(grown) = live_tool.component_view().expect("component view")
+        else {
+            panic!("component kind changed")
+        };
+        assert_eq!(
+            grown.content_lines,
+            vec!["hello world".to_string(), "goodbye".to_string()],
+            "streaming appends land under the lock and ride the snapshot; got {grown:?}"
+        );
+
+        let progress = ProgressMessage::new("weights.safetensors", 100);
+        let ComponentView::Progress(initial) = progress.component_view().expect("component view")
+        else {
+            panic!("a ProgressMessage yields its Progress component")
+        };
+        assert_eq!(
+            (initial.current, initial.total),
+            (0, 100),
+            "the fresh VM carries zero progress; got {initial:?}"
+        );
+        progress.update_progress(100);
+        let ComponentView::Progress(complete) = progress.component_view().expect("component view")
+        else {
+            panic!("component kind changed")
+        };
+        assert_eq!(
+            (complete.current, complete.status),
+            (100, MessageStatus::Complete),
+            "the auto-complete transition rides the VM; got {complete:?}"
+        );
+
+        let info = StaticMessage::info("all systems nominal");
+        let ComponentView::StaticText(static_view) = info.component_view().expect("component view")
+        else {
+            panic!("a StaticMessage yields its StaticText component")
+        };
+        assert_eq!(
+            (static_view.kind, static_view.content_lines.as_slice()),
+            (
+                StaticTextKind::Info,
+                &["all systems nominal".to_string()][..]
+            ),
+            "the text IS its view: kind and content ride the snapshot; got {static_view:?}"
         );
     }
 }

@@ -17,7 +17,11 @@
 //! `format()`-era SGR bytes. This matches the say-turn template (#882) and
 //! this crate's dependency contract (no `finch-theme`).
 
-use crate::{say_turn::SayTurnView, work_unit::MessageStatus, RenderedTranscriptLine};
+use crate::{
+    say_turn::SayTurnView,
+    work_unit::{MessageStatus, WorkRowStatus},
+    RenderedTranscriptLine,
+};
 
 /// The component snapshot of one migrated typed message. A message type
 /// constructs the variant that belongs to it from its retained ViewModel;
@@ -36,6 +40,9 @@ pub enum ComponentView {
     /// A live tool call message (#1120, stage 3): header plus streaming
     /// content and status.
     LiveTool(LiveToolView),
+    /// A grouped tool-call operation message (#1120, stage 3): chrome plus a
+    /// row list with per-row status glyphs.
+    Operation(OperationView),
 }
 
 /// The ViewModel of a [`ComponentView::StaticText`] component: the message's
@@ -85,6 +92,25 @@ pub struct LiveToolView {
     pub status: MessageStatus,
 }
 
+/// The ViewModel of a [`ComponentView::Operation`] component: the chrome
+/// header, the whole-operation status, and one row per tool call with its
+/// status. The message constructs the snapshot under its existing locks;
+/// `rows` is the live state that grows and transitions as calls run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperationView {
+    pub header: String,
+    pub status: MessageStatus,
+    pub rows: Vec<OperationRowView>,
+}
+
+/// One tool-call row of an [`OperationView`], with the shared row-status
+/// vocabulary: the per-row glyph is a pure function of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperationRowView {
+    pub label: String,
+    pub status: WorkRowStatus,
+}
+
 /// Render one component snapshot into the transcript lines it claims this
 /// frame. The engine asks the `Message` trait for the snapshot and this
 /// function for the lines; it never learns which concrete message produced
@@ -95,6 +121,7 @@ pub fn component_lines(view: &ComponentView) -> Vec<RenderedTranscriptLine> {
         ComponentView::StaticText(static_text) => static_text_lines(static_text),
         ComponentView::Progress(progress) => progress_lines(progress),
         ComponentView::LiveTool(live_tool) => live_tool_lines(live_tool),
+        ComponentView::Operation(operation) => operation_lines(operation),
     }
 }
 
@@ -174,6 +201,66 @@ impl<'a> LiveToolContent<'a> {
 
     fn render(&self) -> Vec<String> {
         self.lines.to_vec()
+    }
+}
+
+/// An operation row: chrome (`⏺ header…`) then the row list (`⎿ label …`
+/// per call). The rows subwidget is constructed from the outer ViewModel
+/// each frame, so it chooses to render or not based on VM data — an
+/// operation with no rows yet claims only its chrome. Per-row glyphs are a
+/// pure function of the row status: `…` while running, the summary when
+/// complete, `error:` when failed (byte-compatible with the retired
+/// `format()` presentation).
+fn operation_lines(view: &OperationView) -> Vec<RenderedTranscriptLine> {
+    let mut lines = Vec::with_capacity(1 + view.rows.len());
+    let mut chrome = format!("\u{23fa} {}", view.header);
+    if view.status == MessageStatus::InProgress {
+        chrome.push('\u{2026}');
+    }
+    lines.push(RenderedTranscriptLine {
+        text: chrome,
+        ..RenderedTranscriptLine::default()
+    });
+    lines.extend(
+        OperationRows::from_vm(view)
+            .render()
+            .into_iter()
+            .map(|text| RenderedTranscriptLine {
+                text,
+                ..RenderedTranscriptLine::default()
+            }),
+    );
+    lines
+}
+
+/// The rows subwidget: constructed from the outer ViewModel each frame; a
+/// subwidget with nothing to show claims zero rows and stays in the tree
+/// (#882's furniture rule).
+struct OperationRows<'a> {
+    rows: &'a [OperationRowView],
+}
+
+impl<'a> OperationRows<'a> {
+    fn from_vm(vm: &'a OperationView) -> Self {
+        Self { rows: &vm.rows }
+    }
+
+    fn render(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .map(|row| match &row.status {
+                WorkRowStatus::Running => format!("  \u{23bf} {}…", row.label),
+                WorkRowStatus::Complete(summary) if summary.is_empty() => {
+                    format!("  \u{23bf} {}", row.label)
+                }
+                WorkRowStatus::Complete(summary) => {
+                    format!("  \u{23bf} {} {}", row.label, summary)
+                }
+                WorkRowStatus::Error(error) => {
+                    format!("  \u{23bf} {} error: {}", row.label, error)
+                }
+            })
+            .collect()
     }
 }
 
@@ -576,6 +663,157 @@ mod tests {
         assert_eq!(
             rect.height, 3,
             "header + two content lines claim three rows; got {rect:?}"
+        );
+    }
+
+    // ── OperationMessage: chrome + per-row glyphs (#1120 stage 3) ───────────
+
+    fn operation_view(
+        header: &str,
+        status: MessageStatus,
+        rows: &[(&str, WorkRowStatus)],
+    ) -> OperationView {
+        OperationView {
+            header: header.to_string(),
+            status,
+            rows: rows
+                .iter()
+                .map(|(label, status)| OperationRowView {
+                    label: label.to_string(),
+                    status: status.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn operation_texts(view: &OperationView) -> Vec<String> {
+        component_lines(&ComponentView::Operation(view.clone()))
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    /// INVARIANT (#1120): each row renders its status glyph from the VM —
+    /// `…` while running, the summary when complete (bare label when the
+    /// summary is empty), `error:` when failed — and the whole-operation
+    /// chrome carries its running ellipsis only while the operation is
+    /// still in progress.
+    #[test]
+    fn test_operation_rows_render_status_glyphs_from_the_vm() {
+        let running = operation_view(
+            "Generating",
+            MessageStatus::InProgress,
+            &[
+                ("bash(git push)", WorkRowStatus::Running),
+                (
+                    "read(src/foo.rs)",
+                    WorkRowStatus::Complete("45 lines".into()),
+                ),
+                ("read(src/bar.rs)", WorkRowStatus::Complete(String::new())),
+                (
+                    "bash(bad)",
+                    WorkRowStatus::Error("permission denied".into()),
+                ),
+            ],
+        );
+        assert_eq!(
+            operation_texts(&running),
+            vec![
+                "⏺ Generating…",
+                "  ⎿ bash(git push)…",
+                "  ⎿ read(src/foo.rs) 45 lines",
+                "  ⎿ read(src/bar.rs)",
+                "  ⎿ bash(bad) error: permission denied",
+            ],
+            "chrome plus one line per row with the per-row glyph; got {:?}",
+            operation_texts(&running)
+        );
+        let complete = operation_view("Generating", MessageStatus::Complete, &[]);
+        let complete_texts = operation_texts(&complete);
+        assert_eq!(
+            complete_texts,
+            vec!["⏺ Generating"],
+            "a completed operation drops the chrome ellipsis"
+        );
+        assert!(
+            complete_texts
+                .iter()
+                .all(|line| !line.contains('\u{23fa}') || !line.ends_with('…')),
+            "no completed line wears a running ellipsis; got {complete_texts:?}"
+        );
+    }
+
+    /// The rows subwidget is constructed from the outer VM each frame: an
+    /// operation with no rows yet claims only its chrome, and the glyph
+    /// vocabulary stays the pinned ⏺/⎿ pair (U+23FA / U+23BF), never the
+    /// legacy ●/└ pair.
+    #[test]
+    fn test_operation_rows_subwidget_zero_claims_and_glyph_vocabulary_is_pinned() {
+        let empty = operation_view("Generating", MessageStatus::InProgress, &[]);
+        let empty_rows = OperationRows::from_vm(&empty);
+        assert!(
+            empty_rows.render().is_empty(),
+            "the empty rows subwidget renders nothing and stays constructible"
+        );
+        assert_eq!(
+            operation_texts(&empty),
+            vec!["⏺ Generating…"],
+            "chrome alone claims one row while no call has started"
+        );
+        let dumped = operation_texts(&operation_view(
+            "Generating",
+            MessageStatus::Complete,
+            &[("bash(ls)", WorkRowStatus::Complete(String::new()))],
+        ))
+        .join("\n");
+        assert!(
+            dumped.contains('\u{23fa}') && dumped.contains('\u{23bf}'),
+            "the pinned glyph vocabulary renders; got {dumped:?}"
+        );
+        assert!(
+            !dumped.contains('\u{25cf}') && !dumped.contains('\u{2514}'),
+            "the legacy ● (U+25CF) / └ (U+2514) pair must not return; got {dumped:?}"
+        );
+    }
+
+    /// The operation card claims one row per rendered line in a claiming
+    /// frame.
+    #[test]
+    fn test_operation_card_claims_one_row_per_line_in_a_layout_frame() {
+        let view = operation_view(
+            "Generating",
+            MessageStatus::InProgress,
+            &[("bash(ls)", WorkRowStatus::Running)],
+        );
+        const CARD: u16 = 12;
+        let tree = Widget::Stack {
+            axis: Axis::Column,
+            children: vec![(
+                Track::Natural,
+                Widget::Marked(
+                    CARD,
+                    Box::new(Widget::Text {
+                        lines: component_lines(&ComponentView::Operation(view))
+                            .into_iter()
+                            .map(|line| line.text)
+                            .collect(),
+                    }),
+                ),
+            )],
+        };
+        let layout = crate::layout(
+            &tree,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 20,
+            },
+        );
+        let rect = layout.keyed(CARD).expect("the card claims a rect");
+        assert_eq!(
+            rect.height, 2,
+            "chrome + one running row claim two rows; got {rect:?}"
         );
     }
 }

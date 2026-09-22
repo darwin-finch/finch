@@ -7468,6 +7468,71 @@ mod tests {
             "the live tool surface claims no hit target in stage 3"
         );
     }
+
+    /// INVARIANT (stage 3, #1120): an OperationMessage renders the chrome and
+    /// the row list with per-row status glyphs from the VM at the claiming
+    /// boundary; row transitions (running → complete/error) and operation
+    /// completion re-render from the VM on the next frame.
+    #[test]
+    fn test_operation_message_renders_row_glyphs_from_the_vm() {
+        use finch_messages::OperationMessage;
+        let mut renderer = headless_renderer();
+        let operation = Arc::new(OperationMessage::new("Generating"));
+        let message: MessageRef = Arc::clone(&operation) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+
+        let first = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = first.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["⏺ Generating…"],
+            "the rows subwidget zero-claims before the first call starts; got {rendered:?}"
+        );
+
+        // A call starts: the row renders with its running glyph.
+        let call = operation.add_row("bash(git push)");
+        let second = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = second.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["⏺ Generating…", "  ⎿ bash(git push)…"],
+            "a running row carries its ellipsis glyph; got {rendered:?}"
+        );
+
+        // The call completes with a summary; a second one fails. The VM's
+        // per-row statuses decide the glyphs on the next frame.
+        operation.complete_row(call, "pushed");
+        let failed_call = operation.add_row("bash(flaky)");
+        operation.fail_row(failed_call, "exit 1");
+        operation.set_complete();
+        let third = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = third.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "⏺ Generating",
+                "  ⎿ bash(git push) pushed",
+                "  ⎿ bash(flaky) error: exit 1",
+            ],
+            "completed and error rows render their VM glyphs; the completed operation \
+             drops the chrome ellipsis; got {rendered:?}"
+        );
+        assert!(
+            third.iter().all(|line| !line.text.contains('\x1b')),
+            "the component emits plain text; got {rendered:?}"
+        );
+        let dumped = rendered.join("\n");
+        assert!(
+            dumped.contains('\u{23fa}') && dumped.contains('\u{23bf}'),
+            "the pinned glyph vocabulary renders at the claiming boundary"
+        );
+        assert!(
+            !dumped.contains('\u{25cf}') && !dumped.contains('\u{2514}'),
+            "the legacy ● (U+25CF) / └ (U+2514) pair must not return; got {dumped:?}"
+        );
+    }
     fn paint_slash_completions(renderer: &mut TuiRenderer) {
         renderer.update_ghost_text();
         completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);
