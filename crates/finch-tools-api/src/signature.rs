@@ -30,7 +30,8 @@ pub struct ToolSignature {
 
 impl ToolSignature {
     /// Reconstruct the bash command string from structured parts.
-    pub fn full_command(&self) -> Option<String> {
+    /// Crate-internal: consumed by the persisted-pattern never-widen gate.
+    pub(crate) fn full_command(&self) -> Option<String> {
         match (&self.command, &self.args) {
             (Some(cmd), Some(args)) if !args.is_empty() => Some(format!("{cmd} {args}")),
             (Some(cmd), _) => Some(cmd.clone()),

@@ -17,10 +17,11 @@
 
 ## Permission system
 
-`PermissionManager` has two roles:
+`PermissionManager` has two roles (chosen through `PermissionManager::new` and
+`PermissionManager::for_peer`; the role enum itself is crate-internal to `finch-tools-api`):
 
-- **`ExecutorRole::Owner`** — human owner; uses configured per-tool rules (Allow/Ask/Deny)
-- **`ExecutorRole::Peer`** — AI peer in a room session; asymmetric rules:
+- **Owner** — human owner; uses configured per-tool rules (Allow/Ask/Deny)
+- **Peer** — AI peer in a room session; asymmetric rules:
   - `read`/`glob`/`grep`: silently Allow
   - `write`/`edit`/`patch`: AskUser (caller converts to DiffPropose event)
   - `bash` (read-only command): silently Allow
@@ -41,4 +42,4 @@ The public surface is the facade in [`mod.rs`](mod.rs); callers outside this dir
 - `crates/finch-tools-api/src/tool_loop.rs` — shared `ToolLoop` admission protocol (REPL + scheduler)
 - `src/tools/executor.rs` — `ToolExecutor`, host execution after REPL/scheduler admission or from the legacy direct headless caller
 - `src/tools/implementations/` — Individual tool implementations
-- `crates/finch-tools-api/src/permissions.rs` — `PermissionManager`, `ExecutorRole`, `is_readonly_bash()`; `src/tools/permissions.rs` is a compatibility re-export
+- `crates/finch-tools-api/src/permissions.rs` — `PermissionManager` and the crate-internal role enum, `is_readonly_bash()`; `src/tools/permissions.rs` is a compatibility re-export
