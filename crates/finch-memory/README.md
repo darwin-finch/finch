@@ -19,3 +19,13 @@ Two callers show the ownership boundary:
 
 The [agent contract](AGENTS.md) covers dependency, hydration, and persistence rules. The
 [flat facade](src/lib.rs) and `cargo doc -p finch-memory --no-deps --open` provide the public API.
+
+## Why MemTree's routing is being replaced
+
+MemTree's own retrieval is a flat, exhaustive cosine scan over every leaf — exact today, but O(n)
+per query, a real ceiling as stored memories grow. [`src/routing_tree.rs`](src/routing_tree.rs) is
+a real, tested, not-yet-wired-in replacement: a binary tree with genuinely fitted split axes
+(candidate-selected PCA via successive Hotelling deflation, not MemTree's similarity-threshold
+promotion) and sub-linear adaptive/beam search, ported from a sibling research repo's validated
+design (see the module's own doc comment for provenance and what was deliberately deferred). The
+[agent contract](AGENTS.md) has the current integration status.

@@ -10,6 +10,7 @@ mod memory_status;
 mod memtree;
 mod program_registry;
 mod quality;
+mod routing_tree;
 
 pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
 pub use memory_status::{caveat, count_qualifier, observed, Recall};

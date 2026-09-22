@@ -92,7 +92,53 @@ CREATE TABLE IF NOT EXISTS program_registry (
     PRIMARY KEY (id, version)
 );
 
+-- RoutingTree persistence (crates/finch-memory/src/routing_tree.rs) -- additive, alongside
+-- tree_nodes/MemTree, not a migration of it. Canonical point content (text + embedding) is stored
+-- exactly once per point regardless of how many leaves reference it via dual-insert; leaf
+-- membership is a lean set of (leaf, point) pointer rows, not duplicated embedding data (a real
+-- point made explicitly while sizing dual-insert's storage cost: dual-insert multiplies membership
+-- rows, never embeddings). `routing_nodes.node_id` matches RoutingTree's own internal node index
+-- (contiguous from 0, never reused). `bucket_deflated` (the per-node deflated residual cache) is
+-- deliberately NOT persisted -- it's deterministically recomputable from a point's canonical
+-- embedding plus the frozen `(anchor, direction)` chain of the nodes it passes through, so hydration
+-- reconstructs it once rather than storing a second, derived copy of embedding-sized data per leaf
+-- entry.
+CREATE TABLE IF NOT EXISTS routing_points (
+    point_id INTEGER PRIMARY KEY,
+    text TEXT NOT NULL,
+    embedding BLOB NOT NULL,  -- f32 array, little-endian, the CANONICAL never-deflated embedding
+    importance INTEGER NOT NULL DEFAULT 1,
+    removed INTEGER NOT NULL DEFAULT 0,  -- tombstone; point_id is never reused/renumbered
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS routing_nodes (
+    node_id INTEGER PRIMARY KEY,
+    parent_id INTEGER,
+    is_leaf INTEGER NOT NULL,
+    left_id INTEGER,
+    right_id INTEGER,
+    anchor BLOB,               -- f64 array, little-endian; NULL while is_leaf
+    direction BLOB,            -- f64 array, little-endian; NULL while is_leaf, frozen forever once set
+    split_at_global_count INTEGER NOT NULL DEFAULT 0,
+    real_centroid BLOB NOT NULL,  -- f64 array, little-endian; incrementally maintained, never a walk-and-average
+    real_count INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (parent_id) REFERENCES routing_nodes(node_id)
+);
+
+CREATE TABLE IF NOT EXISTS routing_leaf_membership (
+    leaf_node_id INTEGER NOT NULL,
+    point_id INTEGER NOT NULL,
+    is_dual INTEGER NOT NULL DEFAULT 0,
+    divergence_node_id INTEGER,  -- meaningful only when is_dual=1: the ancestor this dual copy branched off from
+    PRIMARY KEY (leaf_node_id, point_id),
+    FOREIGN KEY (leaf_node_id) REFERENCES routing_nodes(node_id),
+    FOREIGN KEY (point_id) REFERENCES routing_points(point_id)
+);
+
 -- Indexes for fast retrieval
+CREATE INDEX IF NOT EXISTS idx_routing_nodes_parent ON routing_nodes(parent_id);
+CREATE INDEX IF NOT EXISTS idx_routing_leaf_membership_point ON routing_leaf_membership(point_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_timestamp ON conversations(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
 CREATE INDEX IF NOT EXISTS idx_tree_nodes_parent ON tree_nodes(parent_id);

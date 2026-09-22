@@ -16,6 +16,21 @@ modules, including `memory_status`, are private.
 - Keep external capabilities as deliberate flat exports from `src/lib.rs`. Do not expose child
   module paths or add a generated signature catalog. The four memory-status capabilities used by
   runtime, tools, and CLI are flat exports; `status_line` is crate-only.
+- `src/routing_tree.rs` is a real, tested, standalone binary routing tree (candidate-selected PCA
+  axes via successive Hotelling deflation, dual-insert, stability-gated splitting, incrementally
+  maintained real centroids, adaptive/beam/backtrack search, a verified removal primitive) plus its
+  own `routing_tree/persistence.rs` (save/load against `routing_points`/`routing_nodes`/
+  `routing_leaf_membership`, additive to `schema.sql`). Ported from a sibling research repo's
+  validated D reference (`fractal-corpus-curation`'s `BUILD_ARCHITECTURE.md`/`EXPERIMENT_LOG.md`
+  §29-§56); compiled, unit- and persistence-round-trip-tested (32 tests), **not yet wired into
+  `MemorySystem`** — `MemTree`'s similarity-threshold/promote-on-close-match routing is still the
+  live mechanism. Wiring it in (replacing `MemTree`'s routing internals while keeping this crate's
+  persistence/hydration/quality/provenance layers, which are algorithm-agnostic) is real, scoped,
+  outstanding follow-up work, not a design question still open. A learned per-node scoring layer
+  (the sibling repo's own `self_play_router.d`) was deliberately deferred, not ported — across every
+  tested configuration in that repo and in a separate Rust spike, it has not been shown to reliably
+  beat this plain structural mechanism; `descend_beam`/`descend_adaptive` accept an optional
+  `BranchScorer` closure as the seam it would plug into later, unused for now.
 
 ## Invariants and lifetimes
 
@@ -36,6 +51,7 @@ modules, including `memory_status`, are private.
 
 ```bash
 .agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-memory --lib
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-memory --lib routing_tree
 .agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test --test memory_integration_test
 ```
 
