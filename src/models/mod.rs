@@ -40,6 +40,8 @@ pub use compatibility::{get_repository, ModelCompatibility};
 pub use download::{DownloadProgress, ModelDownloader};
 pub use generator_new::{GeneratorModel, TextGeneration, TokenCallback};
 pub use learning::{LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData};
+#[cfg(feature = "llama-cpp")]
+pub use loaders::llama_cpp::{LlamaCppEmbeddingEngine, LlamaCppGenerator};
 pub use loaders::onnx::LoadedOnnxModel;
 pub use lora::{
     ExampleBuffer, LoRAConfig, LoRATrainer, LoRATrainingAdapter, TrainingCoordinator,

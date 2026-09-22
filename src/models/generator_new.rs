@@ -17,14 +17,14 @@ pub trait TextGeneration: Send + Sync {
 
     /// Generate text with token-by-token callback for streaming
     ///
-    /// Default implementation just calls regular generate (no streaming support).
+    /// Backends without token callbacks must fail rather than claim a streamed turn.
     fn generate_stream(
         &mut self,
-        input_ids: &[u32],
-        max_new_tokens: usize,
+        _input_ids: &[u32],
+        _max_new_tokens: usize,
         _token_callback: TokenCallback,
     ) -> Result<Vec<u32>> {
-        self.generate(input_ids, max_new_tokens)
+        anyhow::bail!("backend does not implement token streaming")
     }
 
     /// Encode a text prompt into token IDs
@@ -61,6 +61,15 @@ impl std::fmt::Debug for GeneratorModel {
 }
 
 impl GeneratorModel {
+    #[cfg(test)]
+    /// Construct a model around a test double without invoking a native loader.
+    pub(crate) fn from_test_backend(
+        backend: Box<dyn TextGeneration>,
+        config: GeneratorConfig,
+    ) -> Self {
+        Self { backend, config }
+    }
+
     /// Create new generator from configuration
     ///
     /// Phase 4: Only supports Pretrained (ONNX-based)
@@ -97,7 +106,7 @@ impl GeneratorModel {
     /// Generate a text response from a text prompt.
     ///
     /// Tokenizes the prompt, calls generate(), and decodes the result.
-    /// Works with any backend (ONNX, Candle, etc.) via the TextGeneration trait.
+    /// Works with any backend implementing `TextGeneration` via token conversion.
     pub fn generate_text(&mut self, prompt: &str, max_new_tokens: usize) -> Result<String> {
         let input_ids = self.backend.tokenize(prompt)?;
         let output_ids = self.generate(&input_ids, max_new_tokens)?;
@@ -256,6 +265,19 @@ mod tests {
     }
 
     #[test]
+    fn test_backend_without_callbacks_cannot_succeed_as_streaming() {
+        let error = MockBackend
+            .generate_stream(&[104, 105], 2, Box::new(|_, _| {}))
+            .expect_err("a backend with no callback implementation must not claim SSE success");
+        assert!(
+            error
+                .to_string()
+                .contains("does not implement token streaming"),
+            "unsupported streaming must explain the missing capability: {error:#}"
+        );
+    }
+
+    #[test]
     fn test_generate_text_uses_trait_not_downcast() {
         // Regression: generate_text() must work via trait methods, not downcast to
         // LoadedOnnxModel. A non-ONNX backend should succeed here.
@@ -295,6 +317,7 @@ mod tests {
                 target: crate::config::ExecutionTarget::Cpu,
                 coreml: crate::config::CoreMlConfig::default(),
                 repo_override: None,
+                model_path: None,
             }),
         };
 
@@ -325,6 +348,7 @@ mod tests {
             target: ExecutionTarget::Cpu,
             coreml: crate::config::CoreMlConfig::default(),
             repo_override: None,
+            model_path: None,
         });
 
         let gen = GeneratorModel::new(config).expect("Should load Qwen ONNX model");

@@ -6,6 +6,20 @@ routing, conversation policy, tool execution, or terminal presentation. A config
 and a loader implementation do not establish that a model has loaded or passed end-to-end
 conformance.
 
+The GGUF pilot is explicit: build with `--features llama-cpp`,
+set `backend.inference_provider = "llama_cpp"`, and point `backend.model_path` at a local
+LLM `.gguf` artifact (for example Qwen or Gemma). The daemon passes that path into
+`UnifiedModelLoader`; it does not infer a GGUF repository or download one. The user-configured
+local model setting is for chat LLMs, not memory embedders or rerankers.
+For GGUF, `execution_target = "auto"` permits GPU offload when available;
+`execution_target = "cpu"` disables it. CoreML and CUDA target names refer to other backends
+and are rejected rather than silently remapped.
+
+A separate memory composition path may construct `LlamaCppEmbeddingEngine` with its own embedding-capable GGUF,
+but the production memory selector still uses ONNX or TF-IDF. Existing memory vectors must not
+be mixed with a different embedding model/dimension. ONNX and Candle remain available as
+deprecated legacy choices until the cutover is tested and an index migration is defined.
+
 Two callers show the boundary:
 
 1. The [daemon startup path](../../src/main.rs) installs a host-owned `ModelProgress` sink,

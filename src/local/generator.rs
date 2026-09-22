@@ -39,6 +39,7 @@ pub struct TemplateGenerator {
     system_prompt: String,
     /// Model adapter for formatting prompts and cleaning output
     model_adapter: Box<dyn LocalModelAdapter>,
+    model_name: String,
 }
 
 /// A response learned from Claude
@@ -110,6 +111,7 @@ impl TemplateGenerator {
             neural_generator,
             system_prompt,
             model_adapter,
+            model_name: model_name.to_string(),
         }
     }
 
@@ -151,8 +153,11 @@ impl TemplateGenerator {
                         }],
                         tool_uses: vec![],
                         metadata: ResponseMetadata {
-                            generator: "qwen-local".to_string(),
-                            model: "Qwen2.5-1.5B-Instruct".to_string(),
+                            generator: format!(
+                                "{}-local",
+                                self.model_adapter.family_name().to_lowercase()
+                            ),
+                            model: self.model_name.clone(),
                             confidence: Some(0.9),
                             stop_reason: None,
                             input_tokens: None,
@@ -295,26 +300,12 @@ impl TemplateGenerator {
             .try_write()
             .map_err(|_| anyhow::anyhow!("Generator model is locked"))?;
 
-        // Get ONNX model backend
-        use crate::models::LoadedOnnxModel;
-        use crate::models::TextGeneration;
-
-        let onnx_model = gen
-            .backend_mut()
-            .as_any_mut()
-            .downcast_mut::<LoadedOnnxModel>()
-            .ok_or_else(|| anyhow::anyhow!("Backend is not an ONNX model"))?;
-
-        // Tokenize input
-        let encoding = onnx_model
-            .tokenizer()
-            .encode(formatted_prompt.as_str(), true)
-            .map_err(|e| anyhow::anyhow!("Failed to encode prompt: {}", e))?;
-
-        let input_ids = encoding.get_ids().to_vec();
+        // Both ONNX and GGUF implement this narrow generation contract.
+        let backend = gen.backend_mut();
+        let input_ids = backend.tokenize(&formatted_prompt)?;
 
         // Generate with streaming callback (filter special tokens)
-        let output_ids = onnx_model.generate_stream(
+        let output_ids = backend.generate_stream(
             &input_ids,
             100, // max 100 new tokens
             Box::new(move |token_id, token_text| {
@@ -337,10 +328,7 @@ impl TemplateGenerator {
         )?;
 
         // Decode full output
-        let raw_response = onnx_model
-            .tokenizer()
-            .decode(&output_ids, true)
-            .map_err(|e| anyhow::anyhow!("Failed to decode output: {}", e))?;
+        let raw_response = backend.decode_tokens(&output_ids)?;
 
         // Clean output using model adapter
         let clean_response = self.model_adapter.clean_output(&raw_response);
@@ -455,6 +443,139 @@ impl TemplateGenerator {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CoreMlConfig, ExecutionTarget};
+    use crate::models::{
+        GeneratorConfig, InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize,
+        TextGeneration, TokenCallback,
+    };
+    #[cfg(feature = "llama-cpp")]
+    use std::path::PathBuf;
+
+    struct MockGemma;
+
+    impl TextGeneration for MockGemma {
+        fn generate(&mut self, _input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+            Ok(b"Hello from mock"
+                .iter()
+                .map(|byte| u32::from(*byte))
+                .collect())
+        }
+
+        fn generate_stream(
+            &mut self,
+            input_ids: &[u32],
+            max_new_tokens: usize,
+            mut callback: TokenCallback,
+        ) -> Result<Vec<u32>> {
+            let output = self.generate(input_ids, max_new_tokens)?;
+            callback(output[0], "Hello from mock");
+            Ok(output)
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+            Ok(text.bytes().map(u32::from).collect())
+        }
+
+        fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
+            let bytes = tokens.iter().map(|token| *token as u8).collect();
+            Ok(String::from_utf8(bytes)?)
+        }
+
+        fn name(&self) -> &str {
+            "Gemma 2 test"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_local_streaming_calls_injected_backend_without_onnx_downcast() {
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::Onnx,
+            family: ModelFamily::Gemma2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            coreml: CoreMlConfig::default(),
+            repo_override: None,
+            model_path: None,
+        });
+        let model = GeneratorModel::from_test_backend(Box::new(MockGemma), config);
+        let shared = Arc::new(RwLock::new(model));
+        let generator = TemplateGenerator::with_models(
+            PatternClassifier::new(),
+            Some(Arc::clone(&shared)),
+            "Gemma 2 test",
+        );
+        let received = Arc::new(std::sync::Mutex::new(String::new()));
+        let chunks = Arc::clone(&received);
+        let response = generator
+            .try_neural_generate_streaming("greet me", &shared, move |_, text| {
+                chunks.lock().expect("lock chunks").push_str(text);
+            })
+            .expect("any TextGeneration backend must reach local streaming");
+        assert!(
+            response.contains("Hello from mock"),
+            "unexpected response: {response}"
+        );
+        assert_eq!(
+            *received.lock().expect("lock chunks"),
+            "Hello from mock",
+            "injected backend callback must reach local streaming caller"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "llama-cpp")]
+    #[ignore = "requires FINCH_TEST_GGUF_CHAT pointing to a local chat GGUF"]
+    fn test_local_streaming_uses_configured_gguf_backend() {
+        let path =
+            PathBuf::from(std::env::var("FINCH_TEST_GGUF_CHAT").expect("set FINCH_TEST_GGUF_CHAT"));
+        let model = GeneratorModel::new(GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Qwen2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Auto,
+            coreml: CoreMlConfig::default(),
+            repo_override: None,
+            model_path: Some(path),
+        }))
+        .expect("load configured GGUF");
+        let name = model.name().to_string();
+        let shared = Arc::new(RwLock::new(model));
+        let generator = TemplateGenerator::with_models(
+            PatternClassifier::new(),
+            Some(Arc::clone(&shared)),
+            &name,
+        );
+        let streamed = Arc::new(std::sync::Mutex::new(String::new()));
+        let received = Arc::clone(&streamed);
+        let response = generator
+            .try_neural_generate_streaming(
+                "Say hello in one short sentence.",
+                &shared,
+                move |_, piece| received.lock().expect("lock stream").push_str(piece),
+            )
+            .expect("configured GGUF must stream through local boundary");
+        assert!(
+            !response.trim().is_empty(),
+            "local GGUF response must contain text"
+        );
+        assert!(
+            !streamed.lock().expect("lock stream").is_empty(),
+            "local GGUF path must call the streaming callback"
+        );
     }
 }
 
@@ -582,6 +703,7 @@ impl<'de> serde::Deserialize<'de> for TemplateGenerator {
             neural_generator: None,
             system_prompt: Self::load_constitution(),
             model_adapter: AdapterRegistry::get_adapter("Qwen"), // Default to Qwen
+            model_name: "Qwen".to_string(),
         })
     }
 }

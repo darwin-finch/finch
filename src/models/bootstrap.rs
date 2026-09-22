@@ -147,6 +147,7 @@ impl BootstrapLoader {
         execution_target: ExecutionTarget,
         coreml: crate::config::CoreMlConfig,
         model_repo: Option<String>,
+        model_path: Option<std::path::PathBuf>,
     ) -> Result<()> {
         // Step 1: Initializing
         *self.state.write().await = GeneratorState::Initializing;
@@ -189,6 +190,7 @@ impl BootstrapLoader {
             target: execution_target,
             coreml,
             repo_override: model_repo.clone(),
+            model_path,
         };
 
         // Step 4: Load using UnifiedModelLoader (handles download + loading)
@@ -201,12 +203,18 @@ impl BootstrapLoader {
         }
 
         // Check HF token before attempting (UnifiedModelLoader will download if needed)
-        if let Err(e) = Self::check_hf_token() {
-            tracing::warn!(
-                "HuggingFace token check failed: {}. Model must be cached.",
-                e
-            );
-            // Don't fail here - model might be cached
+        #[cfg(feature = "llama-cpp")]
+        let needs_hf_token = provider != super::unified_loader::InferenceProvider::LlamaCpp;
+        #[cfg(not(feature = "llama-cpp"))]
+        let needs_hf_token = true;
+        if needs_hf_token {
+            if let Err(e) = Self::check_hf_token() {
+                tracing::warn!(
+                    "HuggingFace token check failed: {}. Model must be cached.",
+                    e
+                );
+                // Don't fail here - model might be cached
+            }
         }
 
         // Load in blocking task (model loading + potential download is CPU/IO intensive)

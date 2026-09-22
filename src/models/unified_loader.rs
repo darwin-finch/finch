@@ -15,11 +15,15 @@ use crate::config::{CoreMlConfig, ExecutionTarget};
 /// Inference provider selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum InferenceProvider {
-    /// ONNX Runtime (recommended, works on all platforms)
+    /// Legacy ONNX Runtime path; retained as the default until GGUF cutover evidence lands.
     #[serde(rename = "onnx")]
     #[default]
     Onnx,
-    /// Candle (alternative, native Rust implementation)
+    /// llama.cpp GGUF local inference (explicit local model path required).
+    #[cfg(feature = "llama-cpp")]
+    #[serde(rename = "llama_cpp")]
+    LlamaCpp,
+    /// Legacy Candle path; retained for existing configurations pending cutover.
     #[cfg(feature = "candle")]
     #[serde(rename = "candle")]
     Candle,
@@ -30,6 +34,8 @@ impl InferenceProvider {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Onnx => "ONNX Runtime",
+            #[cfg(feature = "llama-cpp")]
+            Self::LlamaCpp => "llama.cpp (GGUF)",
             #[cfg(feature = "candle")]
             Self::Candle => "Candle",
         }
@@ -39,7 +45,7 @@ impl InferenceProvider {
 /// Configuration for loading any model on any execution target with any provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelLoadConfig {
-    /// Which inference provider to use (ONNX Runtime or Candle)
+    /// Which local inference engine to use. GGUF requires an explicit local model path.
     #[serde(default)]
     pub provider: InferenceProvider,
     /// Which model architecture to use
@@ -54,6 +60,9 @@ pub struct ModelLoadConfig {
     pub coreml: CoreMlConfig,
     /// Optional: override HuggingFace repository (for custom models)
     pub repo_override: Option<String>,
+    /// Explicit local GGUF artifact for `llama_cpp`; never interpreted as a repository.
+    #[serde(default)]
+    pub model_path: Option<PathBuf>,
 }
 
 impl ModelLoadConfig {
@@ -314,6 +323,17 @@ pub struct UnifiedModelLoader {
     cache: ModelCache,
 }
 
+#[cfg(feature = "llama-cpp")]
+fn llama_cpp_gpu_offload_policy(target: ExecutionTarget) -> Result<bool> {
+    match target {
+        ExecutionTarget::Auto => Ok(true),
+        ExecutionTarget::Cpu => Ok(false),
+        _ => anyhow::bail!(
+            "llama_cpp supports execution_target = auto or cpu; CoreML/CUDA are different backends"
+        ),
+    }
+}
+
 impl UnifiedModelLoader {
     /// Create new unified loader
     pub fn new() -> Result<Self> {
@@ -334,6 +354,19 @@ impl UnifiedModelLoader {
         );
 
         match config.provider {
+            #[cfg(feature = "llama-cpp")]
+            InferenceProvider::LlamaCpp => {
+                let allow_gpu_offload = llama_cpp_gpu_offload_policy(config.target)?;
+                let path = config.model_path.as_ref().context(
+                    "llama_cpp requires backend.model_path pointing to a local .gguf file",
+                )?;
+                let model = super::loaders::llama_cpp::LlamaCppGenerator::load_with_offload(
+                    path,
+                    allow_gpu_offload,
+                    Some(config.family.name()),
+                )?;
+                Ok(Box::new(model))
+            }
             InferenceProvider::Onnx => {
                 // Convert unified ModelLoadConfig to OnnxLoadConfig
                 let onnx_config = self.to_onnx_config(&config)?;
@@ -815,6 +848,7 @@ mod tests {
             target: ExecutionTarget::Cpu,
             coreml: CoreMlConfig::default(),
             repo_override: None,
+            model_path: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
         assert_eq!(repo, "onnx-community/Qwen2.5-1.5B-Instruct");
@@ -827,6 +861,7 @@ mod tests {
             target: ExecutionTarget::Cpu,
             coreml: CoreMlConfig::default(),
             repo_override: None,
+            model_path: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
         assert_eq!(repo, "onnx-community/gemma-3-270m-it-ONNX");
@@ -839,6 +874,7 @@ mod tests {
             target: ExecutionTarget::Cpu,
             coreml: CoreMlConfig::default(),
             repo_override: None,
+            model_path: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
         assert_eq!(repo, "onnx-community/Llama-3.2-3B-Instruct-ONNX");
@@ -857,6 +893,7 @@ mod tests {
             target: ExecutionTarget::CoreML,
             coreml: CoreMlConfig::default(),
             repo_override: None,
+            model_path: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
         assert_eq!(repo, "onnx-community/Qwen2.5-Coder-3B-Instruct");
@@ -873,8 +910,50 @@ mod tests {
             target: ExecutionTarget::Cpu,
             coreml: CoreMlConfig::default(),
             repo_override: Some("custom-org/custom-model".to_string()),
+            model_path: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
         assert_eq!(repo, "custom-org/custom-model");
+    }
+
+    #[test]
+    #[cfg(feature = "llama-cpp")]
+    fn test_llama_cpp_requires_explicit_local_gguf_path() {
+        let loader = UnifiedModelLoader::new().expect("create loader");
+        let config = ModelLoadConfig {
+            provider: InferenceProvider::LlamaCpp,
+            family: ModelFamily::Qwen2,
+            size: ModelSize::Small,
+            target: ExecutionTarget::Cpu,
+            coreml: CoreMlConfig::default(),
+            repo_override: None,
+            model_path: None,
+        };
+        let error = loader.load(config).err().expect("missing GGUF must fail");
+        assert!(
+            error.to_string().contains("backend.model_path"),
+            "missing GGUF must name the configuration field: {error:#}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "llama-cpp")]
+    fn test_llama_cpp_provider_config_round_trips() {
+        let encoded = serde_json::to_string(&InferenceProvider::LlamaCpp).expect("serialize");
+        assert_eq!(encoded, "\"llama_cpp\"");
+        let decoded: InferenceProvider = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, InferenceProvider::LlamaCpp);
+    }
+
+    #[test]
+    #[cfg(feature = "llama-cpp")]
+    fn test_llama_cpp_target_policy_honors_explicit_cpu() {
+        assert!(llama_cpp_gpu_offload_policy(ExecutionTarget::Auto).expect("auto policy"));
+        assert!(!llama_cpp_gpu_offload_policy(ExecutionTarget::Cpu).expect("CPU policy"));
+        #[cfg(target_os = "macos")]
+        assert!(
+            llama_cpp_gpu_offload_policy(ExecutionTarget::CoreML).is_err(),
+            "CoreML must not silently select llama.cpp Metal"
+        );
     }
 }

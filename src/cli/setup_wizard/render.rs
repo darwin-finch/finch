@@ -1392,6 +1392,8 @@ pub(super) fn add_provider_card(
         } => {
             let backend_name = match inference_provider {
                 InferenceProvider::Onnx => "ONNX Runtime",
+                #[cfg(feature = "llama-cpp")]
+                InferenceProvider::LlamaCpp => "llama.cpp (GGUF)",
                 #[cfg(feature = "candle")]
                 InferenceProvider::Candle => "Candle",
             };
