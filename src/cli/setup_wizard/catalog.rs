@@ -28,7 +28,9 @@ pub(super) enum AddProviderStep {
         family: ModelFamily,
         size: ModelSize,
         execution: ExecutionTarget,
-        focused_field: usize, // 0=Backend, 1=Family, 2=Size, 3=Device
+        model_path: String,
+        focused_field: usize, // 0=Backend, 1=Family, 2=Size, 3=Device, 4=GGUF path
+        editing_idx: Option<usize>,
     },
     // Network scan path
     Scanning {
@@ -442,6 +444,7 @@ pub enum ModelConfig {
         size: ModelSize,
         execution: ExecutionTarget,
         inference_provider: InferenceProvider,
+        model_path: Option<std::path::PathBuf>,
         enabled: bool,
         /// Original profile metadata that the local-model editor does not
         /// expose yet (stable name, repository, and resolved model path).
@@ -536,6 +539,7 @@ pub(super) fn model_config_from_provider(provider: &ProviderEntry) -> Option<Mod
             execution_target,
             model_family,
             model_size,
+            model_path,
             enabled,
             ..
         } => Some(ModelConfig::Local {
@@ -543,6 +547,7 @@ pub(super) fn model_config_from_provider(provider: &ProviderEntry) -> Option<Mod
             size: *model_size,
             execution: *execution_target,
             inference_provider: *inference_provider,
+            model_path: model_path.clone(),
             enabled: *enabled,
             persisted: Some(provider.clone()),
         }),

@@ -1003,7 +1003,9 @@ fn default_configure_local(focused_field: usize) -> AddProviderStep {
         family: ModelFamily::Qwen2,
         size: ModelSize::Medium,
         execution: ExecutionTarget::Auto,
+        model_path: String::new(),
         focused_field,
+        editing_idx: None,
     }
 }
 
@@ -2257,7 +2259,9 @@ fn test_configure_local_right_on_device_field_cycles() {
         family: ModelFamily::Qwen2,
         size: ModelSize::Medium,
         execution: ExecutionTarget::Auto,
+        model_path: String::new(),
         focused_field: 3, // Device
+        editing_idx: None,
     });
     // Auto is first in the list; right should cycle to next (Cpu on non-macOS, CoreML on macOS)
     handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
@@ -2309,7 +2313,9 @@ fn test_configure_local_enter_replaces_empty_primary() {
         family: ModelFamily::Phi,
         size: ModelSize::Small,
         execution: ExecutionTarget::Cpu,
+        model_path: String::new(),
         focused_field: 0,
+        editing_idx: None,
     });
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
     // overlay should be gone
@@ -2330,6 +2336,228 @@ fn test_configure_local_enter_replaces_empty_primary() {
     } else {
         panic!("expected Local primary model");
     }
+}
+
+#[test]
+#[cfg(feature = "llama-cpp")]
+fn test_gguf_wizard_requires_existing_file_and_keeps_dialog_open() {
+    let mut state = state_with_step(AddProviderStep::ConfigureLocal {
+        inference_provider: InferenceProvider::LlamaCpp,
+        family: ModelFamily::Qwen2,
+        size: ModelSize::Small,
+        execution: ExecutionTarget::Auto,
+        model_path: "/missing/finch-chat.gguf".to_string(),
+        focused_field: 4,
+        editing_idx: None,
+    });
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureLocal { .. })
+    ));
+    if let Some(SectionState::Models { error, .. }) = state.sections.get(&WizardSection::Models) {
+        assert!(error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("existing absolute local .gguf"));
+    } else {
+        panic!("expected models section");
+    }
+}
+
+#[test]
+#[cfg(feature = "llama-cpp")]
+fn test_gguf_wizard_only_cycles_auto_and_cpu_targets() {
+    let mut state = state_with_step(AddProviderStep::ConfigureLocal {
+        inference_provider: InferenceProvider::LlamaCpp,
+        family: ModelFamily::Qwen2,
+        size: ModelSize::Small,
+        execution: ExecutionTarget::Auto,
+        model_path: String::new(),
+        focused_field: 3,
+        editing_idx: None,
+    });
+    handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureLocal {
+            execution: ExecutionTarget::Cpu,
+            ..
+        })
+    ));
+    handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureLocal {
+            execution: ExecutionTarget::Auto,
+            ..
+        })
+    ));
+}
+
+#[test]
+#[cfg(feature = "llama-cpp")]
+fn test_gguf_wizard_path_survives_provider_save_and_reopen() {
+    let gguf = tempfile::Builder::new().suffix(".gguf").tempfile().unwrap();
+    let path = gguf.path().to_path_buf();
+    let mut state = state_with_step(AddProviderStep::ConfigureLocal {
+        inference_provider: InferenceProvider::LlamaCpp,
+        family: ModelFamily::Gemma2,
+        size: ModelSize::Small,
+        execution: ExecutionTarget::Cpu,
+        model_path: String::new(),
+        focused_field: 4,
+        editing_idx: None,
+    });
+    for character in path.to_string_lossy().chars() {
+        handle_models_input(&mut state, key(KeyCode::Char(character))).unwrap();
+    }
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(get_step(&state).is_none());
+    let result = build_setup_result(&state).unwrap();
+    assert!(matches!(&result.providers[0], ProviderEntry::Local {
+        inference_provider: InferenceProvider::LlamaCpp,
+        model_path: Some(saved),
+        ..
+    } if saved == &path));
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let metrics_dir = directory.path().join("metrics");
+    config_from_setup_result_with_paths(&result, metrics_dir.clone(), None)
+        .save_to(&config_path)
+        .unwrap();
+    let reloaded =
+        crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None).unwrap();
+    assert_eq!(reloaded.backend.model_path.as_deref(), Some(path.as_path()));
+    let mut reopened = WizardState::new(Some(&reloaded));
+    assert!(matches!(get_primary(&reopened), Some(ModelConfig::Local {
+        inference_provider: InferenceProvider::LlamaCpp,
+        model_path: Some(saved),
+        ..
+    }) if saved == &path));
+
+    // Editing the reopened primary changes that row, not the provider count.
+    handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
+    assert!(
+        matches!(get_step(&reopened), Some(AddProviderStep::ConfigureLocal {
+        editing_idx: Some(0), model_path: shown, ..
+    }) if shown.as_str() == path.to_string_lossy().as_ref())
+    );
+    let replacement = tempfile::Builder::new().suffix(".gguf").tempfile().unwrap();
+    for _ in 0..path.to_string_lossy().chars().count() {
+        handle_models_input(&mut reopened, key(KeyCode::Backspace)).unwrap();
+    }
+    for character in replacement.path().to_string_lossy().chars() {
+        handle_models_input(&mut reopened, key(KeyCode::Char(character))).unwrap();
+    }
+    handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
+    let edited = build_setup_result(&reopened).unwrap();
+    assert_eq!(edited.providers.len(), 1);
+    assert!(matches!(&edited.providers[0], ProviderEntry::Local {
+        model_path: Some(saved), ..
+    } if saved == replacement.path()));
+}
+
+#[test]
+#[cfg(feature = "llama-cpp")]
+fn test_editing_legacy_local_chat_to_gguf_clears_onnx_repository() {
+    let original_path = "/models/old-chat.onnx";
+    let config = crate::config::Config::with_providers(vec![ProviderEntry::Local {
+        inference_provider: InferenceProvider::Onnx,
+        execution_target: ExecutionTarget::Cpu,
+        model_family: ModelFamily::Qwen2,
+        model_size: ModelSize::Small,
+        model_repo: Some("onnx-community/old-chat".into()),
+        model_path: Some(original_path.into()),
+        enabled: true,
+        name: Some("my-local-chat".into()),
+    }]);
+    let mut state = WizardState::new(Some(&config));
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    let unchanged = build_setup_result(&state).unwrap();
+    assert!(matches!(&unchanged.providers[0], ProviderEntry::Local {
+        inference_provider: InferenceProvider::Onnx,
+        model_repo: Some(repo),
+        model_path: Some(saved),
+        ..
+    } if repo == "onnx-community/old-chat" && saved == std::path::Path::new(original_path)));
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Right)).unwrap(); // ONNX → GGUF
+    for _ in 0..4 {
+        handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+    }
+    for _ in 0..original_path.len() {
+        handle_models_input(&mut state, key(KeyCode::Backspace)).unwrap();
+    }
+    let gguf = tempfile::Builder::new().suffix(".gguf").tempfile().unwrap();
+    for character in gguf.path().to_string_lossy().chars() {
+        handle_models_input(&mut state, key(KeyCode::Char(character))).unwrap();
+    }
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    let result = build_setup_result(&state).unwrap();
+    assert_eq!(result.providers.len(), 1);
+    assert!(matches!(&result.providers[0], ProviderEntry::Local {
+        inference_provider: InferenceProvider::LlamaCpp,
+        model_repo: None,
+        model_path: Some(saved),
+        name: Some(name),
+        ..
+    } if saved == gguf.path() && name == "my-local-chat"));
+}
+
+#[test]
+fn test_editing_legacy_local_family_drops_stale_artifact_selection() {
+    let config = crate::config::Config::with_providers(vec![ProviderEntry::Local {
+        inference_provider: InferenceProvider::Onnx,
+        execution_target: ExecutionTarget::Cpu,
+        model_family: ModelFamily::Qwen2,
+        model_size: ModelSize::Small,
+        model_repo: Some("onnx-community/old-qwen".into()),
+        model_path: Some("/models/old-qwen.onnx".into()),
+        enabled: true,
+        name: Some("my-local-chat".into()),
+    }]);
+    let mut state = WizardState::new(Some(&config));
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Right)).unwrap(); // Qwen → Gemma
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    let result = build_setup_result(&state).unwrap();
+    assert!(matches!(
+        &result.providers[0],
+        ProviderEntry::Local {
+            model_family: ModelFamily::Gemma2,
+            model_repo: None,
+            model_path: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_backend_only_legacy_local_edit_tracks_original_artifact() {
+    let mut config = crate::config::Config::with_providers(vec![]);
+    config.backend.enabled = true;
+    config.backend.model_family = ModelFamily::Qwen2;
+    config.backend.model_size = ModelSize::Small;
+    config.backend.model_repo = Some("onnx-community/old-qwen".into());
+    config.backend.model_path = Some("/models/old-qwen.onnx".into());
+    let mut state = WizardState::new(Some(&config));
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    let result = build_setup_result(&state).unwrap();
+    assert!(matches!(
+        &result.providers[0],
+        ProviderEntry::Local {
+            model_family: ModelFamily::Gemma2,
+            model_repo: None,
+            model_path: None,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -2779,6 +3007,7 @@ fn test_build_setup_result_uses_inference_provider_from_local_model() {
             size: ModelSize::Large,
             execution: ExecutionTarget::Cpu,
             inference_provider: InferenceProvider::Onnx,
+            model_path: None,
             enabled: true,
             persisted: None,
         };
@@ -2820,6 +3049,7 @@ fn test_model_config_local_stores_inference_provider() {
         size: ModelSize::XLarge,
         execution: ExecutionTarget::Cpu,
         inference_provider: InferenceProvider::Onnx,
+        model_path: None,
         enabled: true,
         persisted: None,
     };

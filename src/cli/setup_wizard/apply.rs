@@ -316,16 +316,25 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                 size,
                 execution,
                 inference_provider,
+                model_path: configured_path,
                 enabled,
                 persisted,
             } => {
-                let (name, model_repo, model_path) = match persisted {
+                let (name, model_repo, legacy_artifact_changed) = match persisted {
                     Some(ProviderEntry::Local {
                         name,
                         model_repo,
-                        model_path,
+                        inference_provider: old_provider,
+                        model_family: old_family,
+                        model_size: old_size,
                         ..
-                    }) => (name.clone(), model_repo.clone(), model_path.clone()),
+                    }) => (
+                        name.clone(),
+                        model_repo.clone(),
+                        old_provider != inference_provider
+                            || old_family != family
+                            || old_size != size,
+                    ),
                     _ => (
                         Some(format!(
                             "local-{}-{}",
@@ -335,8 +344,22 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                                 .replace(' ', "-")
                         )),
                         None,
-                        None,
+                        false,
                     ),
+                };
+                #[cfg(feature = "llama-cpp")]
+                let gguf_selected = *inference_provider == InferenceProvider::LlamaCpp;
+                #[cfg(not(feature = "llama-cpp"))]
+                let gguf_selected = false;
+                let model_repo = if gguf_selected || legacy_artifact_changed {
+                    None
+                } else {
+                    model_repo
+                };
+                let model_path = if !gguf_selected && legacy_artifact_changed {
+                    None
+                } else {
+                    configured_path.clone()
                 };
                 Some(ProviderEntry::Local {
                     inference_provider: *inference_provider,
