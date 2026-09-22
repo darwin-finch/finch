@@ -76,16 +76,22 @@ Every migrated typed message renders through its **component** via the generaliz
 `Message::component_view` accessor (stage 3 of `docs/TUI_DESIGN.md`):
 `TuiRenderer::projected_message_lines` asks the trait for the `ComponentView` snapshot and hands
 it to `finch_ui_model::component_lines` — the engine never matches on the message type (pinned
-by `isolation::test_projection_path_never_matches_on_message_type`). The say turn (stages 1–2)
-rides the same accessor: `say_turn_lines` renders Generating as one animated line, Running as
-the program source inline (arrived output bytes beneath it, never hidden), and Completed as the
-output prose plus `(ran Ns)` — no Program source row, no Brain run row, no result row, no card
-chrome. The stage-1 chrome (glyph + arrow + the `[0]` hitbox) is deleted; the toggle hit target
-is the completed output region (semantic path `[1]`, clicked or driven by F6/Enter), routing the
-opaque action to the message's `handle_transcript_action`, which toggles `show_program` under
-the message's lock; the next frame re-renders from the mutated ViewModel. The legacy
-source-group row does not render beside the card: `TuiRenderer::projected_lines` pairs each
-say-VM unit with the adjacent completed Program-source unit whose response text is
+by `isolation::test_projection_path_never_matches_on_message_type`). Stage 3 completes the
+model: the say turn (#882 stages 1–2) rides the same accessor, and `StaticMessage` (text is its
+view), `ProgressMessage` (the bar/line from its VM; a committed row zero-claims out of the live
+viewport through the canonical pipeline), `LiveToolMessage` (header + streaming content subwidget,
+an empty content claims zero rows and the header carries the running `…`), and `OperationMessage`
+(chrome `⏺ header…` plus the rows subwidget with per-row status glyphs, `⎿` per call) each own
+their semantics in the component capsule. Component renderers emit plain text — glyphs carry the
+semantics; the style-spans migration is stage 4. Say turns: `say_turn_lines` renders Generating as
+one animated line, Running as the program source inline (arrived output bytes beneath it, never
+hidden), and Completed as the output prose plus `(ran Ns)` — no Program source row, no Brain run
+row, no result row, no card chrome. The stage-1 chrome (glyph + arrow + the `[0]` hitbox) is
+deleted; the toggle hit target is the completed output region (semantic path `[1]`, clicked or
+driven by F6/Enter), routing the opaque action to the message's `handle_transcript_action`, which
+toggles `show_program` under the message's lock; the next frame re-renders from the mutated
+ViewModel. The legacy source-group row does not render beside the card: `TuiRenderer::projected_lines`
+pairs each say-VM unit with the adjacent completed Program-source unit whose response text is
 byte-identical to the turn's program (`say_turn_consolidated_source_ids`) and suppresses that
 row from the viewport only — byte identity holds by construction in every producer path and a
 mismatch suppresses nothing, so the rule fails toward rendering more, never less. The canonical

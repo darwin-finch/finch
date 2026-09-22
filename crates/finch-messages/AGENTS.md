@@ -4,9 +4,12 @@ Supplements the root [AGENTS.md](../../AGENTS.md). The [README](README.md) trace
 processor and TUI callers; [`src/lib.rs`](src/lib.rs) is the callable facade.
 
 **Owns:** typed messages, their shared read contract, mutable `WorkUnit` turn lifecycle, and the
-snapshot assembled for each render. A WorkUnit is one generation run, never a widget kind. This
-module does not own the durable Brain journal, provider/tool execution, terminal layout, or
-renderer disclosure state.
+snapshot assembled for each render. A WorkUnit is one generation run, never a widget kind. Migrated
+message types (`WorkUnit` say turns, `StaticMessage`, `ProgressMessage`, `LiveToolMessage`,
+`OperationMessage`) answer `Message::component_view` by constructing their component snapshot from
+retained state under the existing lock(s) — no new lock, no OutputManager ownership change; the
+renderer never matches on the message type. This module does not own the durable Brain journal,
+provider/tool execution, terminal layout, or renderer disclosure state.
 
 **Dependencies and direction:** snapshot types and pure projection belong to `finch-ui-model`;
 color roles come directly from `finch-theme`, and bounded structured file diffs from

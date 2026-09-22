@@ -167,7 +167,7 @@ fn live_tool_lines(view: &LiveToolView) -> Vec<RenderedTranscriptLine> {
     let mut lines = Vec::with_capacity(1 + view.content_lines.len());
     let mut header = view.header.clone();
     if view.content_lines.is_empty() && view.status == MessageStatus::InProgress {
-        header.push_str("…");
+        header.push('\u{2026}');
     }
     lines.push(RenderedTranscriptLine {
         text: header,
