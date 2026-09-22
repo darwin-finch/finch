@@ -40,11 +40,13 @@ impl<Ast> Parsed<Ast> {
     }
 
     /// Source identity retained from the parse boundary.
+    #[cfg(test)]
     pub fn source_id(&self) -> &str {
         &self.source_id
     }
 
     /// Borrow the frontend syntax tree.
+    #[cfg(test)]
     pub fn ast(&self) -> &Ast {
         &self.ast
     }
@@ -65,7 +67,7 @@ pub struct Elaborated {
 
 impl Elaborated {
     /// Start an elaborated module with no functions.
-    pub fn new(name: impl Into<String>, entry: impl Into<String>) -> Self {
+    pub(crate) fn new(name: impl Into<String>, entry: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             entry: entry.into(),
@@ -75,18 +77,19 @@ impl Elaborated {
 
     /// Record a locally certified function. The function body is quarantined
     /// until the module is sealed and independently verified.
-    pub fn add_function(&mut self, certified: FunctionCertified) {
+    #[cfg(test)]
+    pub(crate) fn add_function(&mut self, certified: FunctionCertified) {
         let function = certified.into_function();
         self.functions.insert(function.name.clone(), function);
     }
 
     /// Record an already-lowered dependency that this module may call.
-    pub fn add_linked_function(&mut self, function: Function) {
+    pub(crate) fn add_linked_function(&mut self, function: Function) {
         self.functions.insert(function.name.clone(), function);
     }
 
     /// Freeze declarations, exports, and content identity.
-    pub fn seal(self) -> ModuleSealed {
+    pub(crate) fn seal(self) -> ModuleSealed {
         ModuleSealed {
             module: Module {
                 version: VM_TYPE_SYSTEM_VERSION,
@@ -109,6 +112,7 @@ pub struct FunctionCertified {
 
 impl FunctionCertified {
     /// Local verification of one function against the functions it may call.
+    #[cfg(test)]
     pub fn certify(
         function: Function,
         vocabulary: &Vocabulary,
@@ -119,15 +123,18 @@ impl FunctionCertified {
     }
 
     /// The certified function IR.
+    #[cfg(test)]
     pub fn function(&self) -> &Function {
         &self.function
     }
 
     /// Verifier facts for this function, never a module certificate.
+    #[cfg(test)]
     pub fn facts(&self) -> &VerifiedFunction {
         &self.facts
     }
 
+    #[cfg(test)]
     fn into_function(self) -> Function {
         self.function
     }
@@ -141,14 +148,12 @@ pub struct ModuleSealed {
 
 impl ModuleSealed {
     /// Independent composition and security verification.
-    pub fn verify(self, vocabulary: &Vocabulary) -> Result<ModuleVerified, Vec<VmDiagnostic>> {
+    pub(crate) fn verify(
+        self,
+        vocabulary: &Vocabulary,
+    ) -> Result<ModuleVerified, Vec<VmDiagnostic>> {
         let verified = Verifier::new(vocabulary).verify(self.module)?;
         Ok(ModuleVerified { inner: verified })
-    }
-
-    /// The sealed but unverified module IR.
-    pub fn module(&self) -> &Module {
-        &self.module
     }
 }
 
@@ -442,35 +447,6 @@ impl SemanticBuilder {
                 type_parameters: Vec::new(),
                 input: StackRow::polymorphic("S", self.input),
                 output: StackRow::polymorphic("S", output),
-                effects: self.effects,
-                control: if self.suspension.is_some() {
-                    ControlEffect::MaySuspend
-                } else {
-                    ControlEffect::Returns
-                },
-                suspension: self.suspension,
-            },
-            locals: self.locals,
-            captures: self.captures,
-            entry: 0,
-            blocks: self.blocks,
-        }
-    }
-
-    /// Finish with an explicit closed stack signature, as Co-Forth definitions do.
-    pub fn finish_closed(
-        self,
-        input: Vec<Type>,
-        output: Vec<Type>,
-        documentation: Option<String>,
-    ) -> Function {
-        Function {
-            name: self.name,
-            documentation,
-            signature: StackSignature {
-                type_parameters: Vec::new(),
-                input: StackRow::closed(input),
-                output: StackRow::closed(output),
                 effects: self.effects,
                 control: if self.suspension.is_some() {
                     ControlEffect::MaySuspend
