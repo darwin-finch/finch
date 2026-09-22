@@ -4636,7 +4636,7 @@ impl Repl {
                 "Conversations stored: {}",
                 stats.conversation_count
             ));
-            self.output_status(format!("MemTree nodes: {}", stats.tree_node_count));
+            self.output_status(format!("Memory points: {}", stats.tree_node_count));
             // `tree_node_count` is the size of the in-memory tree, so during
             // hydration it is a count of what has loaded, not of what the user
             // has stored -- a flatly wrong number about their own data, shown

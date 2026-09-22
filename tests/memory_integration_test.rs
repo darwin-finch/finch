@@ -1,9 +1,7 @@
 // Integration tests for Phase 4: Hierarchical Memory System
 
 use anyhow::Result;
-use finch_memory::{
-    cosine_similarity, EmbeddingEngine, MemTree, MemoryConfig, MemorySystem, TfIdfEmbedding,
-};
+use finch_memory::{cosine_similarity, EmbeddingEngine, MemoryConfig, MemorySystem, TfIdfEmbedding};
 use tempfile::NamedTempFile;
 
 #[tokio::test]
@@ -87,7 +85,8 @@ async fn test_memory_stats() -> Result<()> {
     let memory = MemorySystem::new(config)?;
 
     // Insert substantive messages (> 20 chars) so they pass the quality filter
-    // and land in both the SQL history table and the MemTree semantic index.
+    // and land in both the SQL history table and the RoutingTree semantic
+    // index.
     for i in 1..=10 {
         memory
             .insert_conversation(
@@ -102,27 +101,31 @@ async fn test_memory_stats() -> Result<()> {
     let stats = memory.stats().await?;
     // conversation_count is the raw SQL history — always incremented regardless of quality.
     assert_eq!(stats.conversation_count, 10);
-    // tree_node_count is the semantic index. All 10 messages pass the quality
-    // filter, so all 10 are indexed — but the count is not 10, because the
-    // index is a tree: promoting a matched leaf adds an internal node. Asserting
-    // equality with the input count asserted a flat list, which is the defect
-    // #250 was filed about. Assert the invariants instead: every message is
-    // present as a leaf, and the structure has not degenerated into a chain.
-    let (leaves, depth, _widest) = memory.index_shape().await;
+    // tree_node_count is the semantic index size, in real RoutingTree points
+    // (crates/finch-memory/src/routing_memory.rs) -- not MemTree's leaf-node
+    // count, so unlike the old assertion here it equals the input count
+    // directly: all 10 messages are text-distinct (differing only by
+    // number), so each stores as its own point, with no promotion or
+    // internal-node bookkeeping to account for (#250 was about MemTree's own
+    // promotion, which RoutingTree has no equivalent of).
     assert_eq!(
-        leaves, 10,
+        stats.tree_node_count, 10,
         "every indexed message must be present exactly once"
     );
-    assert!(
-        stats.tree_node_count >= leaves,
-        "internal nodes are expected in addition to leaves"
-    );
-    // A constant bound, not `depth < leaves`: the latter permits a 9-deep
-    // chain for 10 memories, which is the regression it is named for.
+
+    // RoutingTree buckets points into leaves up to `leaf_capacity` (10 by
+    // default, crates/finch-memory/src/routing_tree.rs's `RoutingConfig`)
+    // before ever splitting, so ten near-identical, tightly clustered points
+    // can legitimately sit in one unsplit leaf -- that is compact structure
+    // here, not the degenerate chain #250 named (MemTree had no capacity
+    // bound on a leaf, so an unbounded chain of matches was the failure
+    // mode). The structural invariant that still applies regardless of how
+    // many leaves exist is a bounded depth.
+    let (leaves, depth, _widest) = memory.index_shape().await;
+    assert!(leaves >= 1, "an index holding points has at least one leaf");
     assert!(
         depth <= 4,
-        "ten near-identical turns must cluster, not chain; got depth {depth} \
-         for {leaves} memories"
+        "ten near-identical turns must not chain; got depth {depth} for {leaves} leaves"
     );
 
     Ok(())
@@ -175,44 +178,17 @@ async fn test_embedding_similarity() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_memtree_insertion() -> Result<()> {
-    let mut tree = MemTree::new();
-    let engine = TfIdfEmbedding::new();
-
-    // Insert multiple nodes
-    let texts = vec![
-        "rust programming",
-        "rust coding",
-        "python programming",
-        "javascript web development",
-    ];
-
-    for text in texts {
-        let emb = engine.embed(text)?;
-        tree.insert(text.to_string(), emb, 1)?;
-    }
-
-    // Four distinct memories, stored as four leaves. `size()` also counts the
-    // internal nodes the tree creates, so equality with the input count would
-    // be asserting flatness.
-    let leaves = tree
-        .all_nodes()
-        .values()
-        .filter(|node| node.id != 0 && node.children.is_empty())
-        .count();
-    assert_eq!(leaves, 4, "each distinct memory is stored exactly once");
-
-    // Query for similar content
-    let query_emb = engine.embed("rust language")?;
-    let results = tree.retrieve(&query_emb, 2);
-
-    assert_eq!(results.len(), 2);
-    // Should find rust-related content
-    assert!(results.iter().any(|(_, text, _)| text.contains("rust")));
-
-    Ok(())
-}
+// A test previously lived here (`test_memtree_insertion`) constructing a
+// bare `MemTree` directly and exercising its own `insert`/`all_nodes`/
+// `retrieve` API. `MemTree` is gone -- `RoutingTree` replaced it outright
+// (crates/finch-memory/src/routing_tree.rs) -- and is crate-private, so an
+// integration test outside `finch-memory` cannot construct one directly the
+// same way. The properties this test pinned (distinct memories stored once
+// each; a query returns content actually similar to it) are still covered
+// through the public `MemorySystem` API by `test_insert_and_query` and
+// `test_memory_stats` above, and far more thoroughly by
+// `crates/finch-memory/src/routing_tree/tests.rs` and
+// `crates/finch-memory/src/lib.rs`'s own test suite.
 
 #[tokio::test]
 async fn test_memory_persistence() -> Result<()> {

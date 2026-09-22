@@ -116,8 +116,8 @@ impl MemoryClassifier {
     ///
     /// Public because recall holds the same line as insert: a store built
     /// before this classifier existed already carries greetings and acks in
-    /// `tree_nodes`, and nothing rewrites stored rows — so recall filters with
-    /// the predicate below rather than letting the old rows back out.
+    /// `routing_points`, and nothing rewrites stored rows — so recall filters
+    /// with the predicate below rather than letting the old rows back out.
     ///
     /// Deliberately WITHOUT the 20-character floor: the measured store's
     /// smallest node is 23 characters, so the floor never earned its keep

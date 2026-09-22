@@ -14,10 +14,15 @@ use ratatui::{
     Frame,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use finch_memory::{MemTree, NodeId};
+/// This console's own node identity -- an incrementing counter local to the
+/// widget's own `nodes` map, unrelated to `finch_memory`'s point/node ids.
+/// Previously imported from `finch_memory::NodeId`, but the console never
+/// actually read the `MemTree`/`RoutingTree` it held a handle to (confirmed:
+/// no method here ever called `.read()`/`.write()` on it) -- this widget
+/// builds its own tree purely from REPL events (`EventHandler`), so there was
+/// nothing left binding its own node numbering to the memory subsystem's.
+pub type NodeId = u64;
 
 /// A node in the console tree view
 #[derive(Debug, Clone)]
@@ -67,11 +72,7 @@ pub enum ConsoleNodeType {
 }
 
 /// MemTree Console state
-#[allow(dead_code)]
 pub struct MemTreeConsole {
-    /// The underlying memory tree
-    tree: Arc<RwLock<MemTree>>,
-
     /// Mapping from NodeId to ConsoleNode for quick lookup
     nodes: HashMap<NodeId, ConsoleNode>,
 
@@ -88,11 +89,16 @@ pub struct MemTreeConsole {
     input_buffer: String,
 }
 
+impl Default for MemTreeConsole {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemTreeConsole {
     /// Create a new MemTree console
-    pub fn new(tree: Arc<RwLock<MemTree>>) -> Self {
+    pub fn new() -> Self {
         Self {
-            tree,
             nodes: HashMap::new(),
             display_root: None,
             selected: None,
@@ -420,8 +426,7 @@ mod tests {
 
     #[test]
     fn test_basic_tree_structure() {
-        let tree = Arc::new(RwLock::new(MemTree::new()));
-        let mut console = MemTreeConsole::new(tree);
+        let mut console = MemTreeConsole::new();
 
         // Add user message
         let user_id = console.add_user_message("Hello".to_string()).unwrap();
@@ -444,8 +449,7 @@ mod tests {
 
     #[test]
     fn test_expand_collapse() {
-        let tree = Arc::new(RwLock::new(MemTree::new()));
-        let mut console = MemTreeConsole::new(tree);
+        let mut console = MemTreeConsole::new();
 
         let user_id = console.add_user_message("Test".to_string()).unwrap();
         let response_id = console

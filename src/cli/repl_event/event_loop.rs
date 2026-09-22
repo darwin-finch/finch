@@ -2017,10 +2017,11 @@ impl EventLoop {
         )
         .with_poset(Arc::clone(&poset));
 
-        // Initialize memtree console (uses a separate dummy tree for the tree-view UI)
+        // Initialize memtree console (its own self-contained UI tree, built purely from REPL
+        // events -- never actually backed by finch_memory's own tree; see console.rs's own doc
+        // comment on `NodeId`).
         let (memtree_console, memtree_handler) = {
-            let dummy_tree = Arc::new(RwLock::new(finch_memory::MemTree::new()));
-            let console = crate::cli::memtree_console::MemTreeConsole::new(dummy_tree);
+            let console = crate::cli::memtree_console::MemTreeConsole::new();
             let handler = crate::cli::memtree_console::EventHandler::new();
             (
                 Arc::new(RwLock::new(console)),

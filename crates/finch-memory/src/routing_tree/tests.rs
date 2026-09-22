@@ -50,7 +50,10 @@ fn brute_force_best(points: &[Vec<f32>], query: &[f32], exclude: usize) -> (usiz
 /// the `build` half -- required for `descend_adaptive`/`descend_adaptive_top_k` truth-matching
 /// tests, since a query that IS a stored point trivially "finds itself" at cos=1.0 regardless of
 /// search quality (BUILD_ARCHITECTURE.md §9's "no leakage between build and held-out sets" check).
-fn synthetic_corpus_build_heldout(n_build_per_cluster: usize, n_heldout_per_cluster: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+fn synthetic_corpus_build_heldout(
+    n_build_per_cluster: usize,
+    n_heldout_per_cluster: usize,
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let clusters = 4usize;
     let per_cluster = n_build_per_cluster + n_heldout_per_cluster;
     let all = synthetic_corpus(per_cluster);
@@ -157,10 +160,16 @@ fn test_remove_point_correctness_via_independent_replay() {
     // Remove every third point.
     let mut removed = Vec::new();
     for i in (0..points.len()).step_by(3) {
-        tree.remove_point(i).expect("remove_point should succeed on a live point");
+        tree.remove_point(i)
+            .expect("remove_point should succeed on a live point");
         removed.push(i);
     }
-    let surviving: Vec<(usize, Vec<f32>)> = points.iter().enumerate().filter(|(i, _)| !removed.contains(i)).map(|(i, p)| (i, p.clone())).collect();
+    let surviving: Vec<(usize, Vec<f32>)> = points
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !removed.contains(i))
+        .map(|(i, p)| (i, p.clone()))
+        .collect();
 
     let replayed = replay_centroids(&tree, &surviving);
     let mut checked_nodes = 0;
@@ -179,10 +188,16 @@ fn test_remove_point_correctness_via_independent_replay() {
         }
         checked_nodes += 1;
     }
-    assert!(checked_nodes > 0, "the replay should have visited at least one node");
+    assert!(
+        checked_nodes > 0,
+        "the replay should have visited at least one node"
+    );
 }
 
-fn replay_centroids(tree: &RoutingTree, surviving: &[(usize, Vec<f32>)]) -> HashMap<usize, (Vec<f64>, usize)> {
+fn replay_centroids(
+    tree: &RoutingTree,
+    surviving: &[(usize, Vec<f32>)],
+) -> HashMap<usize, (Vec<f64>, usize)> {
     let mut means: HashMap<usize, Vec<f64>> = HashMap::new();
     let mut counts: HashMap<usize, usize> = HashMap::new();
 
@@ -208,10 +223,20 @@ fn replay_centroids(tree: &RoutingTree, surviving: &[(usize, Vec<f32>)]) -> Hash
             let dir = tree.direction_of(node_id).to_vec();
             let go_right = projection(&x, &anchor, &dir) >= 0.0;
             deflate(&mut x, &anchor, &dir, tree.cfg.spherical_mode);
-            node_id = if go_right { tree.right_of(node_id).unwrap() } else { tree.left_of(node_id).unwrap() };
+            node_id = if go_right {
+                tree.right_of(node_id).unwrap()
+            } else {
+                tree.left_of(node_id).unwrap()
+            };
         }
     }
-    means.into_iter().map(|(k, v)| { let c = counts[&k]; (k, (v, c)) }).collect()
+    means
+        .into_iter()
+        .map(|(k, v)| {
+            let c = counts[&k];
+            (k, (v, c))
+        })
+        .collect()
 }
 
 #[test]
@@ -224,9 +249,13 @@ fn test_removed_point_is_unreachable_from_any_bucket_afterward() {
         if tree.is_leaf(node_id) {
             return tree.bucket_of(node_id).contains(&target);
         }
-        contains(tree, tree.left_of(node_id).unwrap(), target) || contains(tree, tree.right_of(node_id).unwrap(), target)
+        contains(tree, tree.left_of(node_id).unwrap(), target)
+            || contains(tree, tree.right_of(node_id).unwrap(), target)
     }
-    assert!(!contains(&tree, tree.root(), 3), "a removed point must not be reachable from any bucket");
+    assert!(
+        !contains(&tree, tree.root(), 3),
+        "a removed point must not be reachable from any bucket"
+    );
 }
 
 #[test]
@@ -235,7 +264,10 @@ fn test_double_removal_errors_rather_than_corrupting_state() {
     let mut tree = build_tree(RoutingConfig::default(), &points);
     tree.remove_point(5).expect("first removal should succeed");
     let second = tree.remove_point(5);
-    assert!(second.is_err(), "removing an already-removed point must return an error, not silently succeed or panic");
+    assert!(
+        second.is_err(),
+        "removing an already-removed point must return an error, not silently succeed or panic"
+    );
 }
 
 #[test]
@@ -249,7 +281,10 @@ fn test_dual_insert_disabled_is_bit_for_bit_identical_to_no_dual_insert_support(
     // insert_into guard is `dual_insert_threshold > 0.0`, never true at 0.0).
     fn assert_no_dual(tree: &RoutingTree, node_id: usize) {
         if tree.is_leaf(node_id) {
-            assert!(tree.nodes[node_id].bucket_is_dual.iter().all(|&d| !d), "node {node_id} has a dual entry despite dual_insert_threshold=0.0");
+            assert!(
+                tree.nodes[node_id].bucket_is_dual.iter().all(|&d| !d),
+                "node {node_id} has a dual entry despite dual_insert_threshold=0.0"
+            );
             return;
         }
         assert_no_dual(tree, tree.left_of(node_id).unwrap());
@@ -300,7 +335,10 @@ fn test_fraction_explained_matches_known_analytic_uniform_value() {
     // sigma_sq_parent = mean(x^2) = (2.25+0.25+0.25+2.25)/4 = 1.25
     // left={-1.5,-0.5} mean=-1.0 var=((-0.5)^2+(0.5)^2)/2=0.25; right similarly 0.25
     // within = 2*0.25 + 2*0.25 = 1.0; f = (4*1.25 - 1.0)/(4*1.25) = 4.0/5.0 = 0.8
-    assert!((f - 0.8).abs() < 1e-9, "fraction_explained on this exact known case should be 0.8, got {f}");
+    assert!(
+        (f - 0.8).abs() < 1e-9,
+        "fraction_explained on this exact known case should be 0.8, got {f}"
+    );
 }
 
 #[test]
@@ -308,7 +346,10 @@ fn test_fraction_explained_degenerate_all_one_side_is_zero() {
     let centered: Vec<Vec<f64>> = vec![vec![1.0], vec![2.0], vec![3.0]];
     let direction = vec![1.0]; // all project positive -- can't discriminate
     let f = fraction_explained(&centered, &direction);
-    assert_eq!(f, 0.0, "a degenerate all-one-side split must score 0.0, got {f}");
+    assert_eq!(
+        f, 0.0,
+        "a degenerate all-one-side split must score 0.0, got {f}"
+    );
 }
 
 #[test]
@@ -321,7 +362,10 @@ fn test_power_iteration_matches_known_dominant_direction() {
         vec![-2.0, -0.02, 0.0],
     ];
     let v = power_iteration_top_eigenvector(&centered, 3, 42);
-    assert!(v[0].abs() > 0.999, "dominant eigenvector should be ~[+-1,0,0], got {v:?}");
+    assert!(
+        v[0].abs() > 0.999,
+        "dominant eigenvector should be ~[+-1,0,0], got {v:?}"
+    );
 }
 
 // --- Core correctness ---
@@ -331,7 +375,11 @@ fn test_insert_returns_permanent_sequential_ids() {
     let points = synthetic_corpus(5);
     let mut tree = RoutingTree::new(RoutingConfig::default(), DIM, 7);
     for (i, p) in points.iter().enumerate() {
-        assert_eq!(tree.insert(p.clone()), i, "point ids must be assigned sequentially starting at 0");
+        assert_eq!(
+            tree.insert(p.clone()),
+            i,
+            "point ids must be assigned sequentially starting at 0"
+        );
     }
 }
 
@@ -344,23 +392,41 @@ fn test_leaf_capacity_triggers_a_real_split() {
     for p in &points {
         tree.insert(p.clone());
     }
-    assert!(!tree.is_leaf(tree.root()), "root should have split with 40 points at leaf_capacity=5");
-    assert!(tree.node_count() > 1, "a split tree must have more than one node");
+    assert!(
+        !tree.is_leaf(tree.root()),
+        "root should have split with 40 points at leaf_capacity=5"
+    );
+    assert!(
+        tree.node_count() > 1,
+        "a split tree must have more than one node"
+    );
 }
 
 #[test]
 fn test_split_seeds_child_real_centroid_from_real_embeddings_not_empty() {
     let points = synthetic_corpus(15);
     let tree = build_tree(RoutingConfig::default(), &points);
-    assert!(!tree.is_leaf(tree.root()), "expected the root to have split on this corpus");
+    assert!(
+        !tree.is_leaf(tree.root()),
+        "expected the root to have split on this corpus"
+    );
     let left = tree.left_of(tree.root()).unwrap();
     let right = tree.right_of(tree.root()).unwrap();
     // A freshly-split child must be seeded from the real embeddings redistributed into it, not
     // start at an empty/zero centroid (the real bug found in the D reference, §54).
-    assert!(tree.real_count_of(left) > 0, "left child must have a non-empty real_count immediately after split");
-    assert!(tree.real_count_of(right) > 0, "right child must have a non-empty real_count immediately after split");
+    assert!(
+        tree.real_count_of(left) > 0,
+        "left child must have a non-empty real_count immediately after split"
+    );
+    assert!(
+        tree.real_count_of(right) > 0,
+        "right child must have a non-empty real_count immediately after split"
+    );
     let left_centroid = tree.centroid_of(left);
-    assert!(left_centroid.iter().any(|&v| v != 0.0), "left child's real_centroid must not be the zero vector immediately after split");
+    assert!(
+        left_centroid.iter().any(|&v| v != 0.0),
+        "left child's real_centroid must not be the zero vector immediately after split"
+    );
 }
 
 #[test]
@@ -390,7 +456,9 @@ fn test_descend_adaptive_finds_the_true_brute_force_nearest_neighbor() {
     for (i, q) in heldout.iter().enumerate() {
         let (true_id, true_cos) = brute_force_best(&build, q, usize::MAX); // heldout points are never in `build`, nothing to exclude
         let result = tree.descend_adaptive(q, None, false);
-        let found_id = result.best_point_id.expect("adaptive search should always find some candidate on a non-empty tree");
+        let found_id = result
+            .best_point_id
+            .expect("adaptive search should always find some candidate on a non-empty tree");
         let found_cos = cosine(&build[found_id], q);
         // descend_adaptive has no fixed budget and provably visits every node in the worst case,
         // so it should always find the TRUE best (or something with an identical cosine in a tie).
@@ -408,13 +476,22 @@ fn test_descend_adaptive_top_k_matches_brute_force_top_k() {
     let tree = build_tree(RoutingConfig::default(), &build);
     let k = 5;
     for (i, q) in heldout.iter().enumerate() {
-        let mut brute: Vec<(usize, f64)> = build.iter().enumerate().map(|(j, p)| (j, cosine(p, q))).collect();
+        let mut brute: Vec<(usize, f64)> = build
+            .iter()
+            .enumerate()
+            .map(|(j, p)| (j, cosine(p, q)))
+            .collect();
         brute.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let brute_top_k: Vec<usize> = brute.iter().take(k).map(|&(id, _)| id).collect();
 
         let result = tree.descend_adaptive_top_k(q, k, false);
         let tree_top_k: Vec<usize> = result.top_k.iter().map(|c| c.point_id).collect();
-        assert_eq!(tree_top_k.len(), k, "heldout query {i}: expected {k} results, got {}", tree_top_k.len());
+        assert_eq!(
+            tree_top_k.len(),
+            k,
+            "heldout query {i}: expected {k} results, got {}",
+            tree_top_k.len()
+        );
 
         let brute_set: std::collections::HashSet<_> = brute_top_k.iter().collect();
         let tree_set: std::collections::HashSet<_> = tree_top_k.iter().collect();
@@ -430,9 +507,16 @@ fn test_descend_beam_pools_every_returned_leafs_bucket() {
     let points = synthetic_corpus(15);
     let tree = build_tree(RoutingConfig::default(), &points);
     let leaves = tree.descend_beam(&points[0], 4, 100, None);
-    assert!(leaves.len() >= 1 && leaves.len() <= 4, "beam_width=4 should return between 1 and 4 leaves, got {}", leaves.len());
+    assert!(
+        leaves.len() >= 1 && leaves.len() <= 4,
+        "beam_width=4 should return between 1 and 4 leaves, got {}",
+        leaves.len()
+    );
     let total_bucket_points: usize = leaves.iter().map(|&l| tree.bucket_of(l).len()).sum();
-    assert!(total_bucket_points > 0, "the pooled bucket set across all returned leaves must be non-empty");
+    assert!(
+        total_bucket_points > 0,
+        "the pooled bucket set across all returned leaves must be non-empty"
+    );
 }
 
 #[test]
@@ -442,7 +526,11 @@ fn test_descend_with_backtrack_zero_backtracks_matches_plain_direction() {
     for q in points.iter().take(10) {
         let plain = tree.descend_plain_direction(q);
         let backtrack = tree.descend_with_backtrack(q, 1.0, 0);
-        assert_eq!(backtrack, vec![plain], "max_backtracks=0 must reduce exactly to descend_plain_direction's single leaf");
+        assert_eq!(
+            backtrack,
+            vec![plain],
+            "max_backtracks=0 must reduce exactly to descend_plain_direction's single leaf"
+        );
     }
 }
 
@@ -452,7 +540,10 @@ fn test_descend_with_backtrack_generous_budget_reaches_more_than_zero() {
     let tree = build_tree(RoutingConfig::default(), &points);
     let zero_budget = tree.descend_with_backtrack(&points[0], 1.0, 0);
     let real_budget = tree.descend_with_backtrack(&points[0], 1.0, 20);
-    assert!(real_budget.len() >= zero_budget.len(), "a real backtrack budget should reach at least as many leaves as zero budget");
+    assert!(
+        real_budget.len() >= zero_budget.len(),
+        "a real backtrack budget should reach at least as many leaves as zero budget"
+    );
 }
 
 #[test]
@@ -471,15 +562,20 @@ fn test_remove_point_from_a_dual_insert_copy_clears_both_leaves() {
         return;
     };
 
-    tree.remove_point(pid).expect("removing a dual-inserted point should succeed");
+    tree.remove_point(pid)
+        .expect("removing a dual-inserted point should succeed");
 
     fn contains(tree: &RoutingTree, node_id: usize, target: usize) -> bool {
         if tree.is_leaf(node_id) {
             return tree.bucket_of(node_id).contains(&target);
         }
-        contains(tree, tree.left_of(node_id).unwrap(), target) || contains(tree, tree.right_of(node_id).unwrap(), target)
+        contains(tree, tree.left_of(node_id).unwrap(), target)
+            || contains(tree, tree.right_of(node_id).unwrap(), target)
     }
-    assert!(!contains(&tree, tree.root(), pid), "a removed dual-inserted point must be unreachable from every leaf, primary and dual");
+    assert!(
+        !contains(&tree, tree.root(), pid),
+        "a removed dual-inserted point must be unreachable from every leaf, primary and dual"
+    );
 }
 
 #[test]
@@ -491,7 +587,10 @@ fn test_candidate_switch_margin_keeps_pc1_unless_beaten_by_a_real_margin() {
     let mut cfg_pc1 = RoutingConfig::default();
     cfg_pc1.max_split_candidates = 1;
     let tree_pc1 = build_tree(cfg_pc1, &points);
-    assert!(!tree_pc1.is_leaf(tree_pc1.root()), "expected a real split with PC1-only candidates on this corpus");
+    assert!(
+        !tree_pc1.is_leaf(tree_pc1.root()),
+        "expected a real split with PC1-only candidates on this corpus"
+    );
     // Just confirms PC1-only mode still produces a usable, real split -- the full
     // candidate-switch-margin behavior is exercised implicitly by every other test using the
     // default (max_split_candidates=3) config, which must also produce valid, orthogonal splits.

@@ -232,7 +232,8 @@ fn fraction_explained(centered: &[Vec<f64>], direction: &[f64]) -> f64 {
     };
     let sigma_sq_left = sigma_sq_side(&left_idx);
     let sigma_sq_right = sigma_sq_side(&right_idx);
-    let within_total = left_idx.len() as f64 * sigma_sq_left + right_idx.len() as f64 * sigma_sq_right;
+    let within_total =
+        left_idx.len() as f64 * sigma_sq_left + right_idx.len() as f64 * sigma_sq_right;
     if sigma_sq_parent > 1e-12 {
         (n as f64 * sigma_sq_parent - within_total) / (n as f64 * sigma_sq_parent)
     } else {
@@ -310,7 +311,8 @@ fn downdate_centroid(node: &mut Node, pt: &[f32], dim: usize) {
         node.real_count = 0;
     } else {
         for i in 0..dim {
-            node.real_centroid[i] = (node.real_centroid[i] * rc as f64 - pt[i] as f64) / (rc - 1) as f64;
+            node.real_centroid[i] =
+                (node.real_centroid[i] * rc as f64 - pt[i] as f64) / (rc - 1) as f64;
         }
         node.real_count = rc - 1;
     }
@@ -356,11 +358,13 @@ impl TopKState {
     fn offer(&mut self, point_id: usize, cos: f64) {
         if self.top_k.len() < self.k {
             self.top_k.push(TopKCandidate { point_id, cos });
-            self.top_k.sort_by(|a, b| b.cos.partial_cmp(&a.cos).unwrap());
+            self.top_k
+                .sort_by(|a, b| b.cos.partial_cmp(&a.cos).unwrap());
         } else if cos > self.top_k[self.top_k.len() - 1].cos {
             let last = self.top_k.len() - 1;
             self.top_k[last] = TopKCandidate { point_id, cos };
-            self.top_k.sort_by(|a, b| b.cos.partial_cmp(&a.cos).unwrap());
+            self.top_k
+                .sort_by(|a, b| b.cos.partial_cmp(&a.cos).unwrap());
         }
         if self.top_k.len() >= self.k && self.top_k[self.top_k.len() - 1].cos >= 1.0 - 1e-9 {
             self.done = true;
@@ -456,7 +460,14 @@ impl RoutingTree {
             .iter()
             .zip(node.bucket_is_dual.iter())
             .map(|(&pid, &is_dual)| {
-                let divergence = if is_dual { self.dual_entries_of[pid].iter().find(|e| e.leaf_id == node_id).map(|e| e.divergence_node_id) } else { None };
+                let divergence = if is_dual {
+                    self.dual_entries_of[pid]
+                        .iter()
+                        .find(|e| e.leaf_id == node_id)
+                        .map(|e| e.divergence_node_id)
+                } else {
+                    None
+                };
                 (pid, is_dual, divergence)
             })
             .collect()
@@ -467,7 +478,13 @@ impl RoutingTree {
     /// (`leaf_node_id, point_id, is_dual, divergence_node_id`) and clears the dirty set, since
     /// freshly loaded state IS by definition what's durable -- matching `MemTree`'s own hydration
     /// convention (`clear_dirty`'s doc comment: "the tree now matches the durable rows").
-    pub(crate) fn install_loaded_state(&mut self, nodes: Vec<Node>, points: Vec<Vec<f32>>, removed_flag: Vec<bool>, memberships: &[(usize, usize, bool, Option<usize>)]) {
+    pub(crate) fn install_loaded_state(
+        &mut self,
+        nodes: Vec<Node>,
+        points: Vec<Vec<f32>>,
+        removed_flag: Vec<bool>,
+        memberships: &[(usize, usize, bool, Option<usize>)],
+    ) {
         let n_points = points.len();
         self.nodes = nodes;
         self.points = points;
@@ -476,7 +493,11 @@ impl RoutingTree {
         self.dual_entries_of = vec![Vec::new(); n_points];
         for &(leaf_id, point_id, is_dual, divergence_node_id) in memberships {
             if is_dual {
-                self.dual_entries_of[point_id].push(DualEntry { leaf_id, divergence_node_id: divergence_node_id.expect("a dual membership row must carry a divergence node id") });
+                self.dual_entries_of[point_id].push(DualEntry {
+                    leaf_id,
+                    divergence_node_id: divergence_node_id
+                        .expect("a dual membership row must carry a divergence node id"),
+                });
             } else {
                 self.current_leaf_of[point_id] = Some(leaf_id);
             }
@@ -570,6 +591,22 @@ impl RoutingTree {
         mean
     }
 
+    /// Depth of the deepest leaf below `node_id` (0 if `node_id` is itself a leaf) -- diagnostic
+    /// use, not on the hot path.
+    pub fn max_depth(&self, node_id: usize) -> usize {
+        if self.nodes[node_id].is_leaf {
+            return 0;
+        }
+        1 + self
+            .max_depth(self.nodes[node_id].left.unwrap())
+            .max(self.max_depth(self.nodes[node_id].right.unwrap()))
+    }
+
+    /// Number of leaf nodes in the whole tree -- diagnostic use.
+    pub fn leaf_count(&self) -> usize {
+        self.nodes.iter().filter(|n| n.is_leaf).count()
+    }
+
     /// Every point id stored under `node_id`'s subtree -- diagnostic use, not on the hot path.
     pub fn collect_subtree_ids(&self, node_id: usize) -> Vec<usize> {
         if self.nodes[node_id].is_leaf {
@@ -603,7 +640,14 @@ impl RoutingTree {
     /// not itself trigger further dual-inserts deeper in its own subtree (one level of hedging, not
     /// cascading) -- but the PRIMARY walk can spawn a dual copy at EVERY qualifying node along its
     /// own path, not just once.
-    fn insert_into(&mut self, start_node_id: usize, point_id: usize, mut x: Vec<f64>, is_dual: bool, dual_divergence_node: Option<usize>) {
+    fn insert_into(
+        &mut self,
+        start_node_id: usize,
+        point_id: usize,
+        mut x: Vec<f64>,
+        is_dual: bool,
+        dual_divergence_node: Option<usize>,
+    ) {
         let mut node_id = start_node_id;
         loop {
             if self.nodes[node_id].real_centroid.is_empty() {
@@ -627,11 +671,16 @@ impl RoutingTree {
                 if is_dual {
                     self.dual_entries_of[point_id].push(DualEntry {
                         leaf_id: node_id,
-                        divergence_node_id: dual_divergence_node.expect("dual insert must carry its divergence node"),
+                        divergence_node_id: dual_divergence_node
+                            .expect("dual insert must carry its divergence node"),
                     });
                 } else {
                     self.current_leaf_of[point_id] = Some(node_id);
-                    let real_count = self.nodes[node_id].bucket_is_dual.iter().filter(|&&d| !d).count();
+                    let real_count = self.nodes[node_id]
+                        .bucket_is_dual
+                        .iter()
+                        .filter(|&&d| !d)
+                        .count();
                     if real_count > self.cfg.leaf_capacity {
                         self.try_split(node_id);
                     }
@@ -644,15 +693,24 @@ impl RoutingTree {
             let proj = projection(&x, &anchor, &dir);
             let margin = proj.abs();
             let (favored_id, other_id) = if proj >= 0.0 {
-                (self.nodes[node_id].right.unwrap(), self.nodes[node_id].left.unwrap())
+                (
+                    self.nodes[node_id].right.unwrap(),
+                    self.nodes[node_id].left.unwrap(),
+                )
             } else {
-                (self.nodes[node_id].left.unwrap(), self.nodes[node_id].right.unwrap())
+                (
+                    self.nodes[node_id].left.unwrap(),
+                    self.nodes[node_id].right.unwrap(),
+                )
             };
 
             let mut x_next = x.clone();
             deflate(&mut x_next, &anchor, &dir, self.cfg.spherical_mode);
 
-            if !is_dual && self.cfg.dual_insert_threshold > 0.0 && margin < self.cfg.dual_insert_threshold {
+            if !is_dual
+                && self.cfg.dual_insert_threshold > 0.0
+                && margin < self.cfg.dual_insert_threshold
+            {
                 self.insert_into(other_id, point_id, x_next.clone(), true, Some(node_id));
             }
 
@@ -698,14 +756,20 @@ impl RoutingTree {
             *v /= n_fit as f64;
         }
 
-        let centered: Vec<Vec<f64>> = fit_idx.iter().map(|&j| (0..self.dim).map(|i| bucket_x[j][i] - mean[i]).collect()).collect();
-        let all_centered: Vec<Vec<f64>> = (0..n).map(|j| (0..self.dim).map(|i| bucket_x[j][i] - mean[i]).collect()).collect();
+        let centered: Vec<Vec<f64>> = fit_idx
+            .iter()
+            .map(|&j| (0..self.dim).map(|i| bucket_x[j][i] - mean[i]).collect())
+            .collect();
+        let all_centered: Vec<Vec<f64>> = (0..n)
+            .map(|j| (0..self.dim).map(|i| bucket_x[j][i] - mean[i]).collect())
+            .collect();
 
         let mut best_fraction = -1.0;
         let mut best_direction = Vec::new();
         let mut residual = centered.clone();
         for candidate_idx in 0..self.cfg.max_split_candidates {
-            let seed_salt = (node_id as u64) ^ (candidate_idx as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            let seed_salt =
+                (node_id as u64) ^ (candidate_idx as u64).wrapping_mul(0x9E3779B97F4A7C15);
             let candidate = power_iteration_top_eigenvector(&residual, self.dim, seed_salt);
             let fraction = fraction_explained(&centered, &candidate);
             if candidate_idx == 0 || fraction > best_fraction + self.cfg.candidate_switch_margin {
@@ -722,10 +786,24 @@ impl RoutingTree {
                 let mut shuffled = fit_idx.clone();
                 self.shuffle(&mut shuffled);
                 let half = shuffled.len() / 2;
-                let half_a: Vec<Vec<f64>> = shuffled[..half].iter().map(|&j| (0..self.dim).map(|i| bucket_x[j][i] - mean[i]).collect()).collect();
-                let half_b: Vec<Vec<f64>> = shuffled[half..].iter().map(|&j| (0..self.dim).map(|i| bucket_x[j][i] - mean[i]).collect()).collect();
-                let dir_a = power_iteration_top_eigenvector(&half_a, self.dim, (node_id as u64) ^ 0x51ED270B3E31A3AD);
-                let dir_b = power_iteration_top_eigenvector(&half_b, self.dim, (node_id as u64) ^ 0x9E92F1C4A7B03D5F);
+                let half_a: Vec<Vec<f64>> = shuffled[..half]
+                    .iter()
+                    .map(|&j| (0..self.dim).map(|i| bucket_x[j][i] - mean[i]).collect())
+                    .collect();
+                let half_b: Vec<Vec<f64>> = shuffled[half..]
+                    .iter()
+                    .map(|&j| (0..self.dim).map(|i| bucket_x[j][i] - mean[i]).collect())
+                    .collect();
+                let dir_a = power_iteration_top_eigenvector(
+                    &half_a,
+                    self.dim,
+                    (node_id as u64) ^ 0x51ED270B3E31A3AD,
+                );
+                let dir_b = power_iteration_top_eigenvector(
+                    &half_b,
+                    self.dim,
+                    (node_id as u64) ^ 0x9E92F1C4A7B03D5F,
+                );
                 let agreement = dot(&dir_a, &dir_b).abs();
                 let chance_sigma = 1.0 / (self.dim as f64).sqrt();
                 let significance_sigmas = 3.0;
@@ -773,8 +851,20 @@ impl RoutingTree {
         // Seed each new child's real_centroid/real_count from the REAL (undeflated) embeddings of
         // the points just redistributed into it -- without this, a freshly-split child reads as the
         // zero vector via centroid_of's own empty-case fallback until enough NEW points arrive.
-        seed_real_centroid(&mut left_node, &left_idx, &bucket_ids, &self.points, self.dim);
-        seed_real_centroid(&mut right_node, &right_idx, &bucket_ids, &self.points, self.dim);
+        seed_real_centroid(
+            &mut left_node,
+            &left_idx,
+            &bucket_ids,
+            &self.points,
+            self.dim,
+        );
+        seed_real_centroid(
+            &mut right_node,
+            &right_idx,
+            &bucket_ids,
+            &self.points,
+            self.dim,
+        );
 
         left_node.parent = Some(node_id);
         right_node.parent = Some(node_id);
@@ -846,14 +936,17 @@ impl RoutingTree {
         let pt = self.points[point_id].clone();
 
         {
-            let mut cur = self.current_leaf_of[point_id].expect("a never-removed point always has a primary leaf");
+            let mut cur = self.current_leaf_of[point_id]
+                .expect("a never-removed point always has a primary leaf");
             loop {
                 downdate_centroid(&mut self.nodes[cur], &pt, self.dim);
                 self.dirty.insert(cur);
                 if cur == self.root_id {
                     break;
                 }
-                cur = self.nodes[cur].parent.expect("a non-root node always has a parent");
+                cur = self.nodes[cur]
+                    .parent
+                    .expect("a non-root node always has a parent");
             }
             self.remove_from_bucket(self.current_leaf_of[point_id].unwrap(), point_id)?;
         }
@@ -864,7 +957,9 @@ impl RoutingTree {
             loop {
                 downdate_centroid(&mut self.nodes[cur], &pt, self.dim);
                 self.dirty.insert(cur);
-                let parent = self.nodes[cur].parent.expect("a dual leaf always has a parent (it is never the root)");
+                let parent = self.nodes[cur]
+                    .parent
+                    .expect("a dual leaf always has a parent (it is never the root)");
                 if parent == entry.divergence_node_id {
                     break; // the shared divergence ancestor was already downdated once, by the primary walk above
                 }
@@ -903,7 +998,11 @@ impl RoutingTree {
             let dir = self.nodes[node_id].direction.clone();
             let go_right = projection(&x, &anchor, &dir) >= 0.0;
             deflate(&mut x, &anchor, &dir, self.cfg.spherical_mode);
-            node_id = if go_right { self.nodes[node_id].right.unwrap() } else { self.nodes[node_id].left.unwrap() };
+            node_id = if go_right {
+                self.nodes[node_id].right.unwrap()
+            } else {
+                self.nodes[node_id].left.unwrap()
+            };
         }
         node_id
     }
@@ -918,7 +1017,13 @@ impl RoutingTree {
     /// seam a future learned scorer plugs into) -- structural deflation for continuing the descent
     /// always still uses the tree's own axis regardless of `scorer`; only branch SELECTION is
     /// pluggable.
-    pub fn descend_beam(&self, query: &[f32], beam_width: usize, max_expansions: usize, mut scorer: Option<&mut BranchScorer>) -> Vec<usize> {
+    pub fn descend_beam(
+        &self,
+        query: &[f32],
+        beam_width: usize,
+        max_expansions: usize,
+        mut scorer: Option<&mut BranchScorer>,
+    ) -> Vec<usize> {
         struct Candidate {
             cost: f64,
             node_id: usize,
@@ -929,7 +1034,11 @@ impl RoutingTree {
         if self.cfg.spherical_mode {
             normalize_in_place(&mut qx);
         }
-        let mut frontier = vec![Candidate { cost: 0.0, node_id: self.root_id, x: qx }];
+        let mut frontier = vec![Candidate {
+            cost: 0.0,
+            node_id: self.root_id,
+            x: qx,
+        }];
         let mut leaves: Vec<usize> = Vec::with_capacity(beam_width);
         let mut expansions = 0usize;
 
@@ -963,13 +1072,27 @@ impl RoutingTree {
             deflate(&mut x_deflated, &anchor, &dir, self.cfg.spherical_mode);
 
             let (favored_id, other_id) = if go_right {
-                (self.nodes[cur.node_id].right.unwrap(), self.nodes[cur.node_id].left.unwrap())
+                (
+                    self.nodes[cur.node_id].right.unwrap(),
+                    self.nodes[cur.node_id].left.unwrap(),
+                )
             } else {
-                (self.nodes[cur.node_id].left.unwrap(), self.nodes[cur.node_id].right.unwrap())
+                (
+                    self.nodes[cur.node_id].left.unwrap(),
+                    self.nodes[cur.node_id].right.unwrap(),
+                )
             };
 
-            frontier.push(Candidate { cost: cur.cost, node_id: favored_id, x: x_deflated.clone() });
-            frontier.push(Candidate { cost: cur.cost + margin, node_id: other_id, x: x_deflated });
+            frontier.push(Candidate {
+                cost: cur.cost,
+                node_id: favored_id,
+                x: x_deflated.clone(),
+            });
+            frontier.push(Candidate {
+                cost: cur.cost + margin,
+                node_id: other_id,
+                x: x_deflated,
+            });
         }
 
         if leaves.len() < beam_width {
@@ -992,17 +1115,35 @@ impl RoutingTree {
     /// structurally different mechanism from [`Self::descend_beam`]'s global best-first search
     /// (local threshold trigger, not a global budget). `max_backtracks` bounds total backtrack
     /// events across the whole descent.
-    pub fn descend_with_backtrack(&self, query: &[f32], closeness_threshold: f64, max_backtracks: usize) -> Vec<usize> {
+    pub fn descend_with_backtrack(
+        &self,
+        query: &[f32],
+        closeness_threshold: f64,
+        max_backtracks: usize,
+    ) -> Vec<usize> {
         let mut x0 = to_double(query);
         if self.cfg.spherical_mode {
             normalize_in_place(&mut x0);
         }
         let mut results = Vec::new();
-        self.backtrack_descend(self.root_id, x0, closeness_threshold, max_backtracks, &mut results);
+        self.backtrack_descend(
+            self.root_id,
+            x0,
+            closeness_threshold,
+            max_backtracks,
+            &mut results,
+        );
         results
     }
 
-    fn backtrack_descend(&self, node_id: usize, x_cur: Vec<f64>, closeness_threshold: f64, backtracks_left: usize, results: &mut Vec<usize>) {
+    fn backtrack_descend(
+        &self,
+        node_id: usize,
+        x_cur: Vec<f64>,
+        closeness_threshold: f64,
+        backtracks_left: usize,
+        results: &mut Vec<usize>,
+    ) {
         if self.nodes[node_id].is_leaf {
             // Only reached when node_id == root_id (whole tree is one leaf).
             results.push(node_id);
@@ -1015,32 +1156,60 @@ impl RoutingTree {
         let mut x_next = x_cur.clone();
         deflate(&mut x_next, &anchor, &dir, self.cfg.spherical_mode);
         let (favored_id, other_id) = if proj >= 0.0 {
-            (self.nodes[node_id].right.unwrap(), self.nodes[node_id].left.unwrap())
+            (
+                self.nodes[node_id].right.unwrap(),
+                self.nodes[node_id].left.unwrap(),
+            )
         } else {
-            (self.nodes[node_id].left.unwrap(), self.nodes[node_id].right.unwrap())
+            (
+                self.nodes[node_id].left.unwrap(),
+                self.nodes[node_id].right.unwrap(),
+            )
         };
 
         if margin < closeness_threshold && backtracks_left > 0 {
             if self.nodes[other_id].is_leaf {
                 results.push(other_id);
             } else {
-                self.backtrack_descend(other_id, x_next.clone(), closeness_threshold, backtracks_left - 1, results);
+                self.backtrack_descend(
+                    other_id,
+                    x_next.clone(),
+                    closeness_threshold,
+                    backtracks_left - 1,
+                    results,
+                );
             }
         }
 
         if self.nodes[favored_id].is_leaf {
             results.push(favored_id);
         } else {
-            self.backtrack_descend(favored_id, x_next, closeness_threshold, backtracks_left, results);
+            self.backtrack_descend(
+                favored_id,
+                x_next,
+                closeness_threshold,
+                backtracks_left,
+                results,
+            );
         }
     }
 
-    fn adaptive_score_leaf(&self, leaf_id: usize, q_orig: &[f64], q_orig_norm: f64, state: &mut AdaptiveState) {
+    fn adaptive_score_leaf(
+        &self,
+        leaf_id: usize,
+        q_orig: &[f64],
+        q_orig_norm: f64,
+        state: &mut AdaptiveState,
+    ) {
         let mut leaf_best_pid = None;
         let mut leaf_best_cos = -2.0;
         for &pid in &self.nodes[leaf_id].bucket_ids {
             let pt = to_double(&self.points[pid]);
-            let c = if q_orig_norm > 1e-12 { dot(q_orig, &pt) / (q_orig_norm * norm(&pt)) } else { 0.0 };
+            let c = if q_orig_norm > 1e-12 {
+                dot(q_orig, &pt) / (q_orig_norm * norm(&pt))
+            } else {
+                0.0
+            };
             if c > leaf_best_cos {
                 leaf_best_cos = c;
                 leaf_best_pid = Some(pid);
@@ -1068,16 +1237,38 @@ impl RoutingTree {
     /// calibration constant -- "is one real cosine bigger than another" needs no scale-matching.
     /// Explicit early exit once `best_so_far_cos` is already close enough to 1.0 that nothing could
     /// improve on it. The current recommended default for real deployment.
-    pub fn descend_adaptive(&self, query: &[f32], mut scorer: Option<&mut BranchScorer>, use_deflated_prune_test: bool) -> AdaptiveResult {
+    pub fn descend_adaptive(
+        &self,
+        query: &[f32],
+        mut scorer: Option<&mut BranchScorer>,
+        use_deflated_prune_test: bool,
+    ) -> AdaptiveResult {
         let mut x0 = to_double(query);
         if self.cfg.spherical_mode {
             normalize_in_place(&mut x0);
         }
         let q_orig = to_double(query);
         let q_orig_norm = norm(&q_orig);
-        let mut state = AdaptiveState { nodes_visited: 0, best_so_far_cos: -2.0, best_point_id: None, done: false };
-        self.adaptive_descend(self.root_id, x0, &q_orig, q_orig_norm, use_deflated_prune_test, scorer.as_deref_mut(), &mut state);
-        AdaptiveResult { best_point_id: state.best_point_id, best_cos: state.best_so_far_cos, nodes_visited: state.nodes_visited }
+        let mut state = AdaptiveState {
+            nodes_visited: 0,
+            best_so_far_cos: -2.0,
+            best_point_id: None,
+            done: false,
+        };
+        self.adaptive_descend(
+            self.root_id,
+            x0,
+            &q_orig,
+            q_orig_norm,
+            use_deflated_prune_test,
+            scorer.as_deref_mut(),
+            &mut state,
+        );
+        AdaptiveResult {
+            best_point_id: state.best_point_id,
+            best_cos: state.best_so_far_cos,
+            nodes_visited: state.nodes_visited,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1111,14 +1302,28 @@ impl RoutingTree {
         deflate(&mut x_next, &anchor, &dir, self.cfg.spherical_mode);
 
         let (favored_id, other_id) = if go_right {
-            (self.nodes[node_id].right.unwrap(), self.nodes[node_id].left.unwrap())
+            (
+                self.nodes[node_id].right.unwrap(),
+                self.nodes[node_id].left.unwrap(),
+            )
         } else {
-            (self.nodes[node_id].left.unwrap(), self.nodes[node_id].right.unwrap())
+            (
+                self.nodes[node_id].left.unwrap(),
+                self.nodes[node_id].right.unwrap(),
+            )
         };
 
         // Favored FIRST -- establishes/improves best_so_far_cos before the other branch's prune
         // decision is even made.
-        self.adaptive_descend(favored_id, x_next.clone(), q_orig, q_orig_norm, use_deflated_prune_test, scorer.as_deref_mut(), state);
+        self.adaptive_descend(
+            favored_id,
+            x_next.clone(),
+            q_orig,
+            q_orig_norm,
+            use_deflated_prune_test,
+            scorer.as_deref_mut(),
+            state,
+        );
 
         if !state.done {
             let other_cos = if use_deflated_prune_test {
@@ -1140,7 +1345,15 @@ impl RoutingTree {
                 }
             };
             if other_cos > state.best_so_far_cos {
-                self.adaptive_descend(other_id, x_next, q_orig, q_orig_norm, use_deflated_prune_test, scorer, state);
+                self.adaptive_descend(
+                    other_id,
+                    x_next,
+                    q_orig,
+                    q_orig_norm,
+                    use_deflated_prune_test,
+                    scorer,
+                    state,
+                );
             }
         }
     }
@@ -1149,27 +1362,65 @@ impl RoutingTree {
     /// tracking a single best candidate to a bounded list of the k best found so far. The prune test
     /// changes from "could this beat my single best" to "could this beat the WORST of my current
     /// k-best" -- the standard k-NN generalization (KD-trees, ball trees, HNSW's own `ef`).
-    pub fn descend_adaptive_top_k(&self, query: &[f32], k: usize, use_deflated_prune_test: bool) -> AdaptiveTopKResult {
+    pub fn descend_adaptive_top_k(
+        &self,
+        query: &[f32],
+        k: usize,
+        use_deflated_prune_test: bool,
+    ) -> AdaptiveTopKResult {
         let mut x0 = to_double(query);
         if self.cfg.spherical_mode {
             normalize_in_place(&mut x0);
         }
         let q_orig = to_double(query);
         let q_orig_norm = norm(&q_orig);
-        let mut state = TopKState { top_k: Vec::new(), k, nodes_visited: 0, done: false };
-        self.top_k_descend(self.root_id, x0, &q_orig, q_orig_norm, use_deflated_prune_test, &mut state);
-        AdaptiveTopKResult { top_k: state.top_k, nodes_visited: state.nodes_visited }
+        let mut state = TopKState {
+            top_k: Vec::new(),
+            k,
+            nodes_visited: 0,
+            done: false,
+        };
+        self.top_k_descend(
+            self.root_id,
+            x0,
+            &q_orig,
+            q_orig_norm,
+            use_deflated_prune_test,
+            &mut state,
+        );
+        AdaptiveTopKResult {
+            top_k: state.top_k,
+            nodes_visited: state.nodes_visited,
+        }
     }
 
-    fn top_k_score_leaf(&self, leaf_id: usize, q_orig: &[f64], q_orig_norm: f64, state: &mut TopKState) {
+    fn top_k_score_leaf(
+        &self,
+        leaf_id: usize,
+        q_orig: &[f64],
+        q_orig_norm: f64,
+        state: &mut TopKState,
+    ) {
         for &pid in &self.nodes[leaf_id].bucket_ids {
             let pt = to_double(&self.points[pid]);
-            let c = if q_orig_norm > 1e-12 { dot(q_orig, &pt) / (q_orig_norm * norm(&pt)) } else { 0.0 };
+            let c = if q_orig_norm > 1e-12 {
+                dot(q_orig, &pt) / (q_orig_norm * norm(&pt))
+            } else {
+                0.0
+            };
             state.offer(pid, c);
         }
     }
 
-    fn top_k_descend(&self, node_id: usize, x_cur: Vec<f64>, q_orig: &[f64], q_orig_norm: f64, use_deflated_prune_test: bool, state: &mut TopKState) {
+    fn top_k_descend(
+        &self,
+        node_id: usize,
+        x_cur: Vec<f64>,
+        q_orig: &[f64],
+        q_orig_norm: f64,
+        use_deflated_prune_test: bool,
+        state: &mut TopKState,
+    ) {
         if state.done {
             return;
         }
@@ -1187,12 +1438,25 @@ impl RoutingTree {
         deflate(&mut x_next, &anchor, &dir, self.cfg.spherical_mode);
 
         let (favored_id, other_id) = if go_right {
-            (self.nodes[node_id].right.unwrap(), self.nodes[node_id].left.unwrap())
+            (
+                self.nodes[node_id].right.unwrap(),
+                self.nodes[node_id].left.unwrap(),
+            )
         } else {
-            (self.nodes[node_id].left.unwrap(), self.nodes[node_id].right.unwrap())
+            (
+                self.nodes[node_id].left.unwrap(),
+                self.nodes[node_id].right.unwrap(),
+            )
         };
 
-        self.top_k_descend(favored_id, x_next.clone(), q_orig, q_orig_norm, use_deflated_prune_test, state);
+        self.top_k_descend(
+            favored_id,
+            x_next.clone(),
+            q_orig,
+            q_orig_norm,
+            use_deflated_prune_test,
+            state,
+        );
 
         if !state.done {
             let other_cos = if use_deflated_prune_test {
@@ -1214,13 +1478,26 @@ impl RoutingTree {
                 }
             };
             if other_cos > state.kth_best_cos() {
-                self.top_k_descend(other_id, x_next, q_orig, q_orig_norm, use_deflated_prune_test, state);
+                self.top_k_descend(
+                    other_id,
+                    x_next,
+                    q_orig,
+                    q_orig_norm,
+                    use_deflated_prune_test,
+                    state,
+                );
             }
         }
     }
 }
 
-fn seed_real_centroid(node: &mut Node, idx: &[usize], bucket_ids: &[usize], points: &[Vec<f32>], dim: usize) {
+fn seed_real_centroid(
+    node: &mut Node,
+    idx: &[usize],
+    bucket_ids: &[usize],
+    points: &[Vec<f32>],
+    dim: usize,
+) {
     if idx.is_empty() {
         return;
     }
@@ -1236,7 +1513,7 @@ fn seed_real_centroid(node: &mut Node, idx: &[usize], bucket_ids: &[usize], poin
     }
 }
 
-mod persistence;
+pub(crate) mod persistence;
 
 #[cfg(test)]
 mod tests;

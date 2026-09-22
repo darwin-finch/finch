@@ -15,7 +15,10 @@
 //! state machine (the `Loading`/`Degraded`/`Ready` progression, batch-by-batch partial reads) is a
 //! separate, larger piece of work, not yet done. What's here is real, tested, and usable standalone.
 
-use super::{normalize_in_place, projection, splitmix64_uniform_half, to_double, Node, RoutingConfig, RoutingTree};
+use super::{
+    normalize_in_place, projection, splitmix64_uniform_half, to_double, Node, RoutingConfig,
+    RoutingTree,
+};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
@@ -24,7 +27,10 @@ fn encode_f32(v: &[f32]) -> Vec<u8> {
 }
 
 fn decode_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 fn encode_f64(v: &[f64]) -> Vec<u8> {
@@ -32,13 +38,23 @@ fn encode_f64(v: &[f64]) -> Vec<u8> {
 }
 
 fn decode_f64(bytes: &[u8]) -> Vec<f64> {
-    bytes.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect()
+    bytes
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 /// Persist a point's canonical content. Separate from tree structure -- called once per new
 /// point, alongside (not instead of) [`save_dirty_nodes`].
 #[allow(dead_code)] // wired into MemorySystem in a follow-up (see module doc)
-pub(crate) fn save_point(conn: &Connection, point_id: usize, text: &str, embedding: &[f32], importance: u8, created_at: i64) -> Result<()> {
+pub(crate) fn save_point(
+    conn: &Connection,
+    point_id: usize,
+    text: &str,
+    embedding: &[f32],
+    importance: u8,
+    created_at: i64,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO routing_points (point_id, text, embedding, importance, removed, created_at)
          VALUES (?1, ?2, ?3, ?4, 0, ?5)
@@ -46,7 +62,13 @@ pub(crate) fn save_point(conn: &Connection, point_id: usize, text: &str, embeddi
              text = excluded.text,
              embedding = excluded.embedding,
              importance = excluded.importance",
-        params![point_id as i64, text, encode_f32(embedding), importance as i64, created_at],
+        params![
+            point_id as i64,
+            text,
+            encode_f32(embedding),
+            importance as i64,
+            created_at
+        ],
     )
     .context("save_point: insert/update routing_points")?;
     Ok(())
@@ -54,7 +76,11 @@ pub(crate) fn save_point(conn: &Connection, point_id: usize, text: &str, embeddi
 
 #[allow(dead_code)] // wired into MemorySystem in a follow-up (see module doc)
 pub(crate) fn mark_point_removed(conn: &Connection, point_id: usize) -> Result<()> {
-    conn.execute("UPDATE routing_points SET removed = 1 WHERE point_id = ?1", params![point_id as i64]).context("mark_point_removed")?;
+    conn.execute(
+        "UPDATE routing_points SET removed = 1 WHERE point_id = ?1",
+        params![point_id as i64],
+    )
+    .context("mark_point_removed")?;
     Ok(())
 }
 
@@ -65,14 +91,31 @@ pub(crate) fn mark_point_removed(conn: &Connection, point_id: usize) -> Result<(
 /// path simple and obviously correct. A node that just converted from leaf to decision node (or
 /// already was one) has any stale membership rows deleted unconditionally first -- harmless if
 /// there were none.
-#[allow(dead_code)] // wired into MemorySystem in a follow-up (see module doc)
 pub(crate) fn save_dirty_nodes(tree: &mut RoutingTree, conn: &Connection) -> Result<()> {
     let dirty = tree.dirty_node_ids();
     if dirty.is_empty() {
         return Ok(());
     }
-    let tx = conn.unchecked_transaction().context("save_dirty_nodes: begin transaction")?;
-    for &node_id in &dirty {
+    let tx = conn
+        .unchecked_transaction()
+        .context("save_dirty_nodes: begin transaction")?;
+    write_dirty_nodes_within(tree, &dirty, &tx)?;
+    tx.commit().context("save_dirty_nodes: commit")?;
+    tree.mark_persisted(&dirty);
+    Ok(())
+}
+
+/// Writes every id in `dirty` against `conn` (a plain connection, or a `Transaction` via deref)
+/// without opening its own transaction or marking anything persisted -- the piece
+/// [`save_dirty_nodes`] wraps for standalone use, and what a caller composing a larger atomic
+/// write (point content, tree structure, and its own provenance row in ONE transaction) calls
+/// directly instead.
+pub(crate) fn write_dirty_nodes_within(
+    tree: &RoutingTree,
+    dirty: &[usize],
+    conn: &Connection,
+) -> Result<()> {
+    for &node_id in dirty {
         let is_leaf = tree.is_leaf(node_id);
         let parent = tree.parent_of(node_id);
         let left = tree.left_of(node_id);
@@ -81,7 +124,7 @@ pub(crate) fn save_dirty_nodes(tree: &mut RoutingTree, conn: &Connection) -> Res
         let direction = tree.direction_of(node_id);
         let real_centroid = tree.real_centroid_raw(node_id);
 
-        tx.execute(
+        conn.execute(
             "INSERT INTO routing_nodes
              (node_id, parent_id, is_leaf, left_id, right_id, anchor, direction, split_at_global_count, real_centroid, real_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -108,21 +151,23 @@ pub(crate) fn save_dirty_nodes(tree: &mut RoutingTree, conn: &Connection) -> Res
                 tree.real_count_of(node_id) as i64,
             ],
         )
-        .context("save_dirty_nodes: upsert routing_nodes")?;
+        .context("write_dirty_nodes_within: upsert routing_nodes")?;
 
-        tx.execute("DELETE FROM routing_leaf_membership WHERE leaf_node_id = ?1", params![node_id as i64]).context("save_dirty_nodes: clear stale membership")?;
+        conn.execute(
+            "DELETE FROM routing_leaf_membership WHERE leaf_node_id = ?1",
+            params![node_id as i64],
+        )
+        .context("write_dirty_nodes_within: clear stale membership")?;
         if is_leaf {
             for (point_id, is_dual, divergence_node_id) in tree.membership_of(node_id) {
-                tx.execute(
+                conn.execute(
                     "INSERT INTO routing_leaf_membership (leaf_node_id, point_id, is_dual, divergence_node_id) VALUES (?1, ?2, ?3, ?4)",
                     params![node_id as i64, point_id as i64, is_dual as i64, divergence_node_id.map(|d| d as i64)],
                 )
-                .context("save_dirty_nodes: insert membership row")?;
+                .context("write_dirty_nodes_within: insert membership row")?;
             }
         }
     }
-    tx.commit().context("save_dirty_nodes: commit")?;
-    tree.mark_persisted(&dirty);
     Ok(())
 }
 
@@ -137,8 +182,15 @@ struct LoadedMembership {
 /// `(point_id, text, importance)` -- `RoutingTree` itself has no notion of text, so the caller owns
 /// that mapping.
 #[allow(dead_code)] // wired into MemorySystem in a follow-up (see module doc)
-pub(crate) fn load_routing_tree(conn: &Connection, cfg: RoutingConfig, dim: usize, seed: u64) -> Result<(RoutingTree, Vec<(usize, String, u8)>)> {
-    let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM routing_nodes", [], |r| r.get(0)).context("load_routing_tree: count routing_nodes")?;
+pub(crate) fn load_routing_tree(
+    conn: &Connection,
+    cfg: RoutingConfig,
+    dim: usize,
+    seed: u64,
+) -> Result<(RoutingTree, Vec<(usize, String, u8)>)> {
+    let node_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM routing_nodes", [], |r| r.get(0))
+        .context("load_routing_tree: count routing_nodes")?;
     let spherical = cfg.spherical_mode;
     let tree = RoutingTree::new(cfg, dim, seed);
     if node_count == 0 {
@@ -158,11 +210,18 @@ pub(crate) fn load_routing_tree(conn: &Connection, cfg: RoutingConfig, dim: usiz
             let embedding_bytes: Vec<u8> = r.get(2)?;
             let importance: i64 = r.get(3)?;
             let removed: i64 = r.get(4)?;
-            Ok((point_id as usize, text, decode_f32(&embedding_bytes), importance as u8, removed != 0))
+            Ok((
+                point_id as usize,
+                text,
+                decode_f32(&embedding_bytes),
+                importance as u8,
+                removed != 0,
+            ))
         })
         .context("load_routing_tree: query points")?;
     for row in rows {
-        let (point_id, text, embedding, importance, removed) = row.context("load_routing_tree: read point row")?;
+        let (point_id, text, embedding, importance, removed) =
+            row.context("load_routing_tree: read point row")?;
         anyhow::ensure!(point_id == points.len(), "load_routing_tree: routing_points.point_id must be contiguous from 0, got {point_id} at position {}", points.len());
         if !removed {
             metadata.push((point_id, text, importance));
@@ -188,11 +247,33 @@ pub(crate) fn load_routing_tree(conn: &Connection, cfg: RoutingConfig, dim: usiz
             let split_at_global_count: i64 = r.get(7)?;
             let real_centroid: Vec<u8> = r.get(8)?;
             let real_count: i64 = r.get(9)?;
-            Ok((node_id as usize, parent_id.map(|p| p as usize), is_leaf != 0, left_id.map(|l| l as usize), right_id.map(|r| r as usize), anchor, direction, split_at_global_count as usize, real_centroid, real_count as usize))
+            Ok((
+                node_id as usize,
+                parent_id.map(|p| p as usize),
+                is_leaf != 0,
+                left_id.map(|l| l as usize),
+                right_id.map(|r| r as usize),
+                anchor,
+                direction,
+                split_at_global_count as usize,
+                real_centroid,
+                real_count as usize,
+            ))
         })
         .context("load_routing_tree: query nodes")?;
     for row in rows {
-        let (node_id, parent, is_leaf, left, right, anchor, direction, split_at_global_count, real_centroid, real_count) = row.context("load_routing_tree: read node row")?;
+        let (
+            node_id,
+            parent,
+            is_leaf,
+            left,
+            right,
+            anchor,
+            direction,
+            split_at_global_count,
+            real_centroid,
+            real_count,
+        ) = row.context("load_routing_tree: read node row")?;
         anyhow::ensure!(node_id == nodes.len(), "load_routing_tree: routing_nodes.node_id must be contiguous from 0, got {node_id} at position {}", nodes.len());
         let mut node = Node::leaf();
         node.is_leaf = is_leaf;
@@ -215,7 +296,12 @@ pub(crate) fn load_routing_tree(conn: &Connection, cfg: RoutingConfig, dim: usiz
             let point_id: i64 = r.get(1)?;
             let is_dual: i64 = r.get(2)?;
             let divergence_node_id: Option<i64> = r.get(3)?;
-            Ok(LoadedMembership { leaf_node_id: leaf_node_id as usize, point_id: point_id as usize, is_dual: is_dual != 0, divergence_node_id: divergence_node_id.map(|d| d as usize) })
+            Ok(LoadedMembership {
+                leaf_node_id: leaf_node_id as usize,
+                point_id: point_id as usize,
+                is_dual: is_dual != 0,
+                divergence_node_id: divergence_node_id.map(|d| d as usize),
+            })
         })
         .context("load_routing_tree: query membership")?
         .collect::<rusqlite::Result<_>>()
@@ -239,21 +325,36 @@ pub(crate) fn load_routing_tree(conn: &Connection, cfg: RoutingConfig, dim: usiz
             let proj = projection(&x, anchor, dir);
             let favored_right = proj >= 0.0;
             let at_divergence = m.is_dual && Some(cur) == m.divergence_node_id;
-            let go_right = if at_divergence { !favored_right } else { favored_right };
+            let go_right = if at_divergence {
+                !favored_right
+            } else {
+                favored_right
+            };
             for i in 0..x.len() {
                 x[i] -= proj * dir[i];
             }
             if spherical {
                 normalize_in_place(&mut x);
             }
-            cur = if go_right { nodes[cur].right.expect("decision node must have a right child") } else { nodes[cur].left.expect("decision node must have a left child") };
+            cur = if go_right {
+                nodes[cur]
+                    .right
+                    .expect("decision node must have a right child")
+            } else {
+                nodes[cur]
+                    .left
+                    .expect("decision node must have a left child")
+            };
         }
         nodes[m.leaf_node_id].bucket_ids.push(m.point_id);
         nodes[m.leaf_node_id].bucket_deflated.push(x);
         nodes[m.leaf_node_id].bucket_is_dual.push(m.is_dual);
     }
 
-    let membership_tuples: Vec<(usize, usize, bool, Option<usize>)> = memberships.iter().map(|m| (m.leaf_node_id, m.point_id, m.is_dual, m.divergence_node_id)).collect();
+    let membership_tuples: Vec<(usize, usize, bool, Option<usize>)> = memberships
+        .iter()
+        .map(|m| (m.leaf_node_id, m.point_id, m.is_dual, m.divergence_node_id))
+        .collect();
     let mut tree = tree;
     tree.install_loaded_state(nodes, points, removed_flag, &membership_tuples);
     Ok((tree, metadata))
@@ -282,7 +383,10 @@ mod tests {
         points
     }
 
-    fn test_corpus_build_heldout(n_build_per_cluster: usize, n_heldout_per_cluster: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    fn test_corpus_build_heldout(
+        n_build_per_cluster: usize,
+        n_heldout_per_cluster: usize,
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         let clusters = 4usize;
         let per_cluster = n_build_per_cluster + n_heldout_per_cluster;
         let all = test_corpus(per_cluster);
@@ -306,37 +410,74 @@ mod tests {
         for (i, p) in points.iter().enumerate() {
             let pid = tree.insert(p.clone());
             assert_eq!(pid, i);
-            save_point(&conn, pid, &format!("memory {pid}"), p, 1, 1000 + pid as i64).unwrap();
+            save_point(
+                &conn,
+                pid,
+                &format!("memory {pid}"),
+                p,
+                1,
+                1000 + pid as i64,
+            )
+            .unwrap();
         }
         save_dirty_nodes(&mut tree, &conn).unwrap();
-        assert!(tree.dirty_node_ids().is_empty(), "save_dirty_nodes must clear the dirty set on success");
+        assert!(
+            tree.dirty_node_ids().is_empty(),
+            "save_dirty_nodes must clear the dirty set on success"
+        );
 
-        let (loaded, metadata) = load_routing_tree(&conn, RoutingConfig::default(), DIM, 7).unwrap();
+        let (loaded, metadata) =
+            load_routing_tree(&conn, RoutingConfig::default(), DIM, 7).unwrap();
         assert_eq!(metadata.len(), points.len());
         assert_eq!(loaded.node_count(), tree.node_count());
 
         for id in 0..tree.node_count() {
-            assert_eq!(loaded.is_leaf(id), tree.is_leaf(id), "node {id}: is_leaf mismatch after reload");
-            assert_eq!(loaded.left_of(id), tree.left_of(id), "node {id}: left mismatch after reload");
-            assert_eq!(loaded.right_of(id), tree.right_of(id), "node {id}: right mismatch after reload");
-            assert_eq!(loaded.real_count_of(id), tree.real_count_of(id), "node {id}: real_count mismatch after reload");
+            assert_eq!(
+                loaded.is_leaf(id),
+                tree.is_leaf(id),
+                "node {id}: is_leaf mismatch after reload"
+            );
+            assert_eq!(
+                loaded.left_of(id),
+                tree.left_of(id),
+                "node {id}: left mismatch after reload"
+            );
+            assert_eq!(
+                loaded.right_of(id),
+                tree.right_of(id),
+                "node {id}: right mismatch after reload"
+            );
+            assert_eq!(
+                loaded.real_count_of(id),
+                tree.real_count_of(id),
+                "node {id}: real_count mismatch after reload"
+            );
             let orig_centroid = tree.centroid_of(id);
             let loaded_centroid = loaded.centroid_of(id);
             for d in 0..DIM {
-                assert!((orig_centroid[d] - loaded_centroid[d]).abs() < 1e-9, "node {id} dim {d}: real_centroid mismatch after reload");
+                assert!(
+                    (orig_centroid[d] - loaded_centroid[d]).abs() < 1e-9,
+                    "node {id} dim {d}: real_centroid mismatch after reload"
+                );
             }
             if !tree.is_leaf(id) {
                 let orig_dir = tree.direction_of(id);
                 let loaded_dir = loaded.direction_of(id);
                 for d in 0..DIM {
-                    assert!((orig_dir[d] - loaded_dir[d]).abs() < 1e-12, "node {id} dim {d}: direction mismatch after reload");
+                    assert!(
+                        (orig_dir[d] - loaded_dir[d]).abs() < 1e-12,
+                        "node {id} dim {d}: direction mismatch after reload"
+                    );
                 }
             } else {
                 let mut orig_bucket = tree.bucket_of(id).to_vec();
                 let mut loaded_bucket = loaded.bucket_of(id).to_vec();
                 orig_bucket.sort_unstable();
                 loaded_bucket.sort_unstable();
-                assert_eq!(orig_bucket, loaded_bucket, "leaf {id}: bucket membership mismatch after reload");
+                assert_eq!(
+                    orig_bucket, loaded_bucket,
+                    "leaf {id}: bucket membership mismatch after reload"
+                );
             }
         }
     }
@@ -350,7 +491,15 @@ mod tests {
         let mut tree = RoutingTree::new(RoutingConfig::default(), DIM, 7);
         for p in &build {
             let pid = tree.insert(p.clone());
-            save_point(&conn, pid, &format!("memory {pid}"), p, 1, 1000 + pid as i64).unwrap();
+            save_point(
+                &conn,
+                pid,
+                &format!("memory {pid}"),
+                p,
+                1,
+                1000 + pid as i64,
+            )
+            .unwrap();
         }
         save_dirty_nodes(&mut tree, &conn).unwrap();
 
@@ -359,7 +508,10 @@ mod tests {
         for q in &heldout {
             let orig = tree.descend_adaptive(q, None, false);
             let reloaded = loaded.descend_adaptive(q, None, false);
-            assert_eq!(orig.best_point_id, reloaded.best_point_id, "a reloaded tree must answer descend_adaptive identically to the original");
+            assert_eq!(
+                orig.best_point_id, reloaded.best_point_id,
+                "a reloaded tree must answer descend_adaptive identically to the original"
+            );
             assert!((orig.best_cos - reloaded.best_cos).abs() < 1e-9);
         }
     }
@@ -373,7 +525,15 @@ mod tests {
         let mut tree = RoutingTree::new(RoutingConfig::default(), DIM, 7);
         for p in &points {
             let pid = tree.insert(p.clone());
-            save_point(&conn, pid, &format!("memory {pid}"), p, 1, 1000 + pid as i64).unwrap();
+            save_point(
+                &conn,
+                pid,
+                &format!("memory {pid}"),
+                p,
+                1,
+                1000 + pid as i64,
+            )
+            .unwrap();
         }
         save_dirty_nodes(&mut tree, &conn).unwrap();
 
@@ -384,7 +544,10 @@ mod tests {
         }
         for id in 0..loaded.node_count() {
             if !loaded.is_leaf(id) {
-                assert!(loaded.left_of(id).is_some() && loaded.right_of(id).is_some(), "node {id}: decision node missing a child after post-reload inserts");
+                assert!(
+                    loaded.left_of(id).is_some() && loaded.right_of(id).is_some(),
+                    "node {id}: decision node missing a child after post-reload inserts"
+                );
             }
         }
     }
@@ -401,7 +564,15 @@ mod tests {
         for (i, p) in points.iter().enumerate() {
             let pid = tree.insert(p.clone());
             assert_eq!(pid, i);
-            save_point(&conn, pid, &format!("memory {pid}"), p, 1, 1000 + pid as i64).unwrap();
+            save_point(
+                &conn,
+                pid,
+                &format!("memory {pid}"),
+                p,
+                1,
+                1000 + pid as i64,
+            )
+            .unwrap();
         }
         save_dirty_nodes(&mut tree, &conn).unwrap();
 
@@ -417,9 +588,16 @@ mod tests {
                 let mut loaded_bucket = loaded.bucket_of(id).to_vec();
                 orig_bucket.sort_unstable();
                 loaded_bucket.sort_unstable();
-                assert_eq!(orig_bucket, loaded_bucket, "leaf {id}: dual-insert-inclusive bucket membership mismatch after reload");
+                assert_eq!(
+                    orig_bucket, loaded_bucket,
+                    "leaf {id}: dual-insert-inclusive bucket membership mismatch after reload"
+                );
             }
-            assert_eq!(loaded.real_count_of(id), tree.real_count_of(id), "node {id}: real_count (which counts dual visits too) mismatch after reload");
+            assert_eq!(
+                loaded.real_count_of(id),
+                tree.real_count_of(id),
+                "node {id}: real_count (which counts dual visits too) mismatch after reload"
+            );
         }
 
         // The reconstructed bucket_deflated must be usable for a real split: force one more
@@ -438,7 +616,15 @@ mod tests {
         for (i, p) in points.iter().enumerate() {
             let pid = tree.insert(p.clone());
             assert_eq!(pid, i);
-            save_point(&conn, pid, &format!("memory {pid}"), p, 1, 1000 + pid as i64).unwrap();
+            save_point(
+                &conn,
+                pid,
+                &format!("memory {pid}"),
+                p,
+                1,
+                1000 + pid as i64,
+            )
+            .unwrap();
         }
         save_dirty_nodes(&mut tree, &conn).unwrap();
         tree.remove_point(3).unwrap();
@@ -446,7 +632,10 @@ mod tests {
         mark_point_removed(&conn, 3).unwrap();
 
         let (_, metadata) = load_routing_tree(&conn, RoutingConfig::default(), DIM, 7).unwrap();
-        assert!(!metadata.iter().any(|(pid, _, _)| *pid == 3), "a removed point must not appear in reload metadata");
+        assert!(
+            !metadata.iter().any(|(pid, _, _)| *pid == 3),
+            "a removed point must not appear in reload metadata"
+        );
         assert_eq!(metadata.len(), points.len() - 1);
     }
 }
