@@ -220,18 +220,19 @@ impl fmt::Display for Val {
 
 impl Val {
     /// Like Display but wraps strings in quotes (for printing inside lists).
-    pub fn repr(&self) -> String {
+    fn repr(&self) -> String {
         match self {
             Val::Str(s) => format!("\"{s}\""),
             other => other.to_string(),
         }
     }
 
-    pub fn is_truthy(&self) -> bool {
+    #[cfg(test)]
+    fn is_truthy(&self) -> bool {
         !matches!(self, Val::Nil | Val::Bool(false) | Val::Int(0))
     }
 
-    pub fn type_name(&self) -> &'static str {
+    pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Val::Nil => "nil",
             Val::Bool(_) => "bool",
@@ -244,7 +245,8 @@ impl Val {
         }
     }
 
-    pub fn as_int(&self) -> anyhow::Result<i64> {
+    #[cfg(test)]
+    fn as_int(&self) -> anyhow::Result<i64> {
         match self {
             Val::Int(n) => Ok(*n),
             Val::Float(f) => Ok(*f as i64),
@@ -252,34 +254,12 @@ impl Val {
         }
     }
 
-    pub fn as_float(&self) -> anyhow::Result<f64> {
-        match self {
-            Val::Int(n) => Ok(*n as f64),
-            Val::Float(f) => Ok(*f),
-            other => anyhow::bail!("expected number, got {}", other.type_name()),
-        }
-    }
-
-    pub fn as_str(&self) -> anyhow::Result<&str> {
-        match self {
-            Val::Str(s) => Ok(s.as_str()),
-            other => anyhow::bail!("expected string, got {}", other.type_name()),
-        }
-    }
-
-    pub fn as_bytes(&self) -> anyhow::Result<&[u8]> {
+    #[cfg(test)]
+    fn as_bytes(&self) -> anyhow::Result<&[u8]> {
         match self {
             Val::Bytes(b) => Ok(b.as_slice()),
             Val::Str(s) => Ok(s.as_bytes()),
             other => anyhow::bail!("expected bytes, got {}", other.type_name()),
-        }
-    }
-
-    pub fn as_list(&self) -> anyhow::Result<&[Val]> {
-        match self {
-            Val::List(v) => Ok(v),
-            Val::Nil => Ok(&[]),
-            other => anyhow::bail!("expected list, got {}", other.type_name()),
         }
     }
 }
