@@ -1697,7 +1697,7 @@ mod tests {
     #[test]
     fn test_provider_entry_local_returns_error() {
         let p = pentry(ProviderEntry::Local {
-            inference_provider: InferenceProvider::Onnx,
+            inference_provider: InferenceProvider::LlamaCpp,
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
@@ -1722,7 +1722,7 @@ mod tests {
                 name: None,
             },
             ProviderEntry::Local {
-                inference_provider: InferenceProvider::Onnx,
+                inference_provider: InferenceProvider::LlamaCpp,
                 execution_target: ExecutionTarget::Auto,
                 model_family: ModelFamily::Qwen2,
                 model_size: ModelSize::Medium,
@@ -1740,7 +1740,7 @@ mod tests {
     #[test]
     fn test_create_providers_from_entries_empty_cloud_errors() {
         let entries = vec![ProviderEntry::Local {
-            inference_provider: InferenceProvider::Onnx,
+            inference_provider: InferenceProvider::LlamaCpp,
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,

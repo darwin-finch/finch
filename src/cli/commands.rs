@@ -789,7 +789,7 @@ pub fn format_help() -> String {
          {cyan}  /provider <name>{reset}   Bind this Brain to a configured provider entry\n\
          {cyan}  /thinking <level>{reset}  Overlay reasoning effort when the provider supports it\n\
          {cyan}  /config{reset}            Persistent configuration and setup (alias of /setup)\n\
-         {cyan}  /local <query>{reset}     Query local ONNX model directly (bypass routing)\n\
+         {cyan}  /local <query>{reset}     Query local GGUF model directly (bypass routing)\n\
          {reset}\n\
          {gray}  /model never switches accounts. /provider does.{reset}\n\
          {gray}  Overlays persist on this Brain; --model is one-shot for this invocation.{reset}\n\

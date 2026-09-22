@@ -2,7 +2,7 @@
 
 Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full.
 
-**Owns** `src/models/` (ONNX/Candle loaders, bootstrap, download, adapters, sampling,
+**Owns** `src/models/` (llama.cpp GGUF chat loading, bootstrap, adapters, sampling,
 threshold routing, LoRA configuration, and neural embedding load). The adjacent `local`,
 `generators`, `training`, `feedback`, `router`, and `logging` trees on the DESIGN.md models
 row have their own ownership and are not part of this facade.
@@ -14,11 +14,11 @@ Callers outside this directory use `crate::models::Item`; they must not name `bo
 
 **Dependencies:** `config` (`ExecutionTarget`, `CoreMlConfig`), `memory` (`EmbeddingEngine` for
 neural embeddings), and `tools` (prompt/parser types). Production code under `src/models/**`
-must not name `crate::cli`. Bootstrap and download take a models-owned [`ModelProgress`]
-port; CLI implements it and injects it at composition roots (`BootstrapLoader::new`,
+must not name `crate::cli`. Bootstrap takes a models-owned [`ModelProgress`] port; CLI
+implements it and injects it at composition roots (`BootstrapLoader::new`,
 `install_model_progress` in `run_daemon` and interactive `main`). The daemon process is
-the one that loads and downloads models; its progress sink must be installed in the daemon
-path, independently of the interactive process's sink.
+the one that loads the user-selected chat GGUF; memory owns its own model download. The
+daemon progress sink must be installed independently of the interactive process's sink.
 Do not extract `finch-models` until remaining edges are measured and this reverse edge
 stays gone.
 
@@ -28,18 +28,17 @@ Keep family-specific adapters and engine capability claims here, inject host pro
 composition roots, and add facade exports only for a demonstrated caller need. Do not let
 loaders import CLI presentation code.
 
-**Loaders are experimental.** Configuration variants and loader code are not proof of
-end-to-end provider or local-model conformance. Do not change ONNX/Candle/loader/routing/training
-behavior in a facade commit.
+**Loaders are experimental.** Configuration and loader code are not proof of end-to-end
+provider or local-model conformance.
 
-The opt-in `llama-cpp` feature loads a caller-supplied chat-LLM `.gguf` file through
+The daemon loads a caller-supplied chat-LLM `.gguf` file through
 `backend.model_path`; that user-configured model selector must not also select memory's
 embedding/reranking models.
 It owns the process-wide llama.cpp backend and creates a fresh context per generation request.
 Memory model selection and persisted embedding identity belong to the separate memory work.
 `execution_target = auto` permits GPU offload on macOS when the compiled llama.cpp backend
-reports it; `cpu` forbids offload. Linux remains CPU-only in this pilot. ONNX and Candle are
-legacy paths pending measured cutover, not removed or silently substituted by this pilot.
+reports it; `cpu` forbids offload. ONNX and Candle are not chat providers. ORT remains only
+behind the separately owned frontend memory model path until that subsystem migrates it.
 
 **One family declaration, claims from the catalog.** `unified_loader::ModelFamily` is the single
 model-family declaration (its variant names are the persisted config wire form; a source-scan test

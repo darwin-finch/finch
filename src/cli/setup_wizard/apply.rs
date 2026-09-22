@@ -282,7 +282,7 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
             (
                 api_key.clone(),
                 false,
-                InferenceProvider::Onnx,
+                InferenceProvider::LlamaCpp,
                 ExecutionTarget::Cpu, // Placeholder
                 ModelFamily::Qwen2,   // Placeholder
                 ModelSize::Medium,    // Placeholder
@@ -347,10 +347,7 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                         false,
                     ),
                 };
-                #[cfg(feature = "llama-cpp")]
                 let gguf_selected = *inference_provider == InferenceProvider::LlamaCpp;
-                #[cfg(not(feature = "llama-cpp"))]
-                let gguf_selected = false;
                 let model_repo = if gguf_selected || legacy_artifact_changed {
                     None
                 } else {

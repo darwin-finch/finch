@@ -19,7 +19,7 @@ fn default_ollama_base_url() -> String {
 }
 
 fn default_inference_provider() -> InferenceProvider {
-    InferenceProvider::Onnx
+    InferenceProvider::LlamaCpp
 }
 
 fn default_execution_target() -> ExecutionTarget {
@@ -44,8 +44,8 @@ fn default_model_size() -> ModelSize {
 ///
 /// [[providers]]
 /// type = "local"
-/// inference_provider = "onnx"
-/// execution_target = "coreml"
+/// inference_provider = "llama_cpp"
+/// execution_target = "auto"
 /// ```
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -632,7 +632,7 @@ credential_ref = "work"
     #[test]
     fn test_local_serde_roundtrip() {
         let entry = ProviderEntry::Local {
-            inference_provider: InferenceProvider::Onnx,
+            inference_provider: InferenceProvider::LlamaCpp,
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
@@ -690,7 +690,7 @@ credential_ref = "work"
     #[test]
     fn test_is_local() {
         let local = ProviderEntry::Local {
-            inference_provider: InferenceProvider::Onnx,
+            inference_provider: InferenceProvider::LlamaCpp,
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
@@ -715,7 +715,7 @@ credential_ref = "work"
     #[test]
     fn test_api_key_none_for_local() {
         let local = ProviderEntry::Local {
-            inference_provider: InferenceProvider::Onnx,
+            inference_provider: InferenceProvider::LlamaCpp,
             execution_target: ExecutionTarget::Auto,
             model_family: ModelFamily::Qwen2,
             model_size: ModelSize::Medium,
@@ -755,7 +755,7 @@ credential_ref = "work"
         );
         assert_eq!(
             ProviderEntry::Local {
-                inference_provider: InferenceProvider::Onnx,
+                inference_provider: InferenceProvider::LlamaCpp,
                 execution_target: ExecutionTarget::Auto,
                 model_family: ModelFamily::Qwen2,
                 model_size: ModelSize::Medium,
@@ -789,7 +789,7 @@ credential_ref = "work"
                 name: None,
             },
             ProviderEntry::Local {
-                inference_provider: InferenceProvider::Onnx,
+                inference_provider: InferenceProvider::LlamaCpp,
                 execution_target: ExecutionTarget::Auto,
                 model_family: ModelFamily::Qwen2,
                 model_size: ModelSize::Medium,

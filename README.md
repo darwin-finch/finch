@@ -35,7 +35,7 @@ The long-term design combines:
 | Durable named Brains | One named conversation, event history, and persistent typed VM can survive frontend disconnects and daemon restarts. | Implemented foundations with experimental reconnect, background-work, and collaboration workflows. |
 | One capability boundary | Code tools, MCP tools, future skills, remote peers, and desktop automation are meant to share typed authority, approval, audit, and revocation rules. | Tool approval and MCP client paths exist; skills and wider automation integration remain planned work. |
 | Provider and account portability | Use cloud APIs, supported subscriptions, remote Finch nodes, or local models without changing the surrounding workflow or concealing which backend ran it. | Multiple profiles exist; subscription support, model-level conformance, and explicit fallback behavior remain active work. |
-| Local models and perception | Keep suitable generation, speech transcription, OCR, image description, and context compression on user-controlled hardware, with explicit cloud fallback when requested. | ONNX Runtime and Candle loaders exist experimentally; the compatible model matrix and local media pipeline are not yet established. |
+| Local models and perception | Keep suitable generation, speech transcription, OCR, image description, and context compression on user-controlled hardware, with explicit cloud fallback when requested. | Daemon chat accepts an explicit GGUF through llama.cpp; frontend memory owns its separate required model defaults and download. Broader media support is not established. |
 | Accessibility-native automation | Operate applications through semantic roles, labels, and domain identifiers so automation remains usable and auditable without pixel coordinates. | A design invariant and long-term integration target, not a complete personal-assistant feature today. |
 
 This direction is incremental. Current interfaces are described below; planned work belongs in the
@@ -176,12 +176,13 @@ authentication must not be inferred from OpenAI API-key support.
 
 ### Local inference
 
-The source contains ONNX Runtime and Candle loaders plus local profiles for several model families.
-Local artifacts can be large and may require Hugging Face access. A configured local profile does
+Daemon local chat loads a user-selected GGUF file through llama.cpp. ONNX and Candle are not chat
+providers; old entries direct the user through `finch setup` migration. Local artifacts can be
+large. A configured local profile does
 not currently guarantee that a query is routed locally; local bootstrap, selection, and provider
 parity remain experimental under [#74](https://github.com/darwin-finch/finch/issues/74) and
-[#98](https://github.com/darwin-finch/finch/issues/98). Use `--cloud-only` when you need to avoid a
-local download attempt.
+[#98](https://github.com/darwin-finch/finch/issues/98). Use `--cloud-only` when you need to disable
+daemon local-chat loading.
 
 ### HTTP daemon
 

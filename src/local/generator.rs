@@ -454,7 +454,6 @@ mod tests {
         GeneratorConfig, InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize,
         TextGeneration, TokenCallback,
     };
-    #[cfg(feature = "llama-cpp")]
     use std::path::PathBuf;
 
     struct MockGemma;
@@ -501,9 +500,9 @@ mod tests {
     }
 
     #[test]
-    fn test_local_streaming_calls_injected_backend_without_onnx_downcast() {
+    fn test_local_streaming_calls_injected_backend_without_engine_downcast() {
         let config = GeneratorConfig::Pretrained(ModelLoadConfig {
-            provider: InferenceProvider::Onnx,
+            provider: InferenceProvider::LlamaCpp,
             family: ModelFamily::Gemma2,
             size: ModelSize::Small,
             target: ExecutionTarget::Cpu,
@@ -537,7 +536,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "llama-cpp")]
     #[ignore = "requires FINCH_TEST_GGUF_CHAT pointing to a local chat GGUF"]
     fn test_local_streaming_uses_configured_gguf_backend() {
         let path =

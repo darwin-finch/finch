@@ -1326,7 +1326,7 @@ mod tests {
 
     fn local_profile() -> ProviderEntry {
         ProviderEntry::Local {
-            inference_provider: crate::models::InferenceProvider::Onnx,
+            inference_provider: crate::models::InferenceProvider::LlamaCpp,
             execution_target: crate::config::ExecutionTarget::Auto,
             model_family: crate::models::ModelFamily::Qwen2,
             model_size: crate::models::ModelSize::Medium,

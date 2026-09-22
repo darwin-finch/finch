@@ -8,8 +8,8 @@
 
 | State | Meaning |
 |-------|---------|
-| `Initializing` | Selecting model based on RAM |
-| `Downloading` | Fetching from HuggingFace Hub (first run) |
+| `Initializing` | Preparing the configured local chat profile |
+| `Downloading` | Compatibility state exposed to status clients; daemon chat does not download GGUF files |
 | `Loading` | Loading weights into memory |
 | `Ready` | Model ready for inference |
 | `Failed` | Load failed with error |
@@ -18,13 +18,11 @@
 ## Flow
 
 ```
-1. REPL starts while the model loads in the background
-2. tokio::spawn background task
-3. Check cache (~/.cache/huggingface/)
-4. Download if needed (progress bar)
-5. Load model weights
-6. state → Ready
-7. Future queries use local model
+1. Daemon starts while the configured model loads in a background task.
+2. The composition root passes the user-selected absolute GGUF path.
+3. `UnifiedModelLoader` rejects legacy ONNX/Candle entries, repositories, and unsupported targets.
+4. llama.cpp loads the GGUF and creates the shared generator.
+5. State becomes `Ready`; future eligible queries can use the local model.
 ```
 
 Startup is not unconditionally instant: launch is gated by a daemon health
@@ -37,5 +35,8 @@ While state ≠ `Ready`, `Router::route_with_generator_check(query, false)` forw
 ## Key files
 
 - `src/models/bootstrap.rs` — `BootstrapLoader`, `GeneratorState`
-- `src/models/download.rs` — `ModelDownloader` with HF Hub integration
-- `src/models/model_selector.rs` — RAM-based model selection
+- `src/models/unified_loader.rs` — config validation and engine selection
+- `src/models/loaders/llama_cpp.rs` — GGUF loading and generation
+
+Frontend memory has its own required model defaults and download lifecycle; it does not use this
+chat bootstrap path.
