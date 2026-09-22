@@ -1,21 +1,17 @@
 use finch_language::{compile_forth, compile_lisp};
-use finch_vm::{core_vocabulary, InterpreterConfig, TypedValue, VmStep, VmTrampoline};
+use finch_vm::{core_vocabulary, TypedExecutionStatus, TypedRuntime, TypedValue};
 
-fn run_pure(module: &finch_vm::VerifiedModule) -> Vec<TypedValue> {
-    let trampoline = VmTrampoline::new(
-        module,
-        &InterpreterConfig {
-            fuel: 100,
-            ..InterpreterConfig::default()
-        },
+fn run_pure(module: &finch_vm::ModuleVerified) -> Vec<TypedValue> {
+    let mut runtime = TypedRuntime::new();
+    let execution = runtime.execute(module, 100);
+    assert_eq!(
+        execution.status,
+        TypedExecutionStatus::Completed,
+        "pure facade fixture must complete through the public runtime entry, observed status {status:?} with diagnostics {diagnostics:?}",
+        status = execution.status,
+        diagnostics = execution.diagnostics,
     );
-    let continuation = trampoline
-        .start(Vec::new())
-        .expect("verified fixture must start through the public facade");
-    match trampoline.run(continuation) {
-        VmStep::Complete { stack } => stack,
-        other => panic!("pure facade fixture must complete, observed {other:?}"),
-    }
+    execution.values
 }
 
 #[test]
