@@ -1332,6 +1332,7 @@ mod tests {
             model_size: crate::models::ModelSize::Medium,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             name: Some("local".into()),
         }

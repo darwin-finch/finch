@@ -6,5 +6,5 @@
 mod daemon_client;
 pub(crate) mod ipc;
 
-pub use daemon_client::{DaemonClient, DaemonConfig, LocalModelStatus};
+pub use daemon_client::{DaemonClient, DaemonConfig, LocalModelDownloadStatus, LocalModelStatus};
 pub use ipc::{BrainRunnerBootstrap, BrainSubmissionResult, IpcClient, QueryResponse};

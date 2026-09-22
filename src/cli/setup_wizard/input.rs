@@ -193,6 +193,7 @@ pub(super) fn handle_models_input(
                 ModelSize::Large,
                 ModelSize::XLarge,
             ];
+            let local_quantizations = [GgufQuantization::Q4KM, GgufQuantization::Q5KM];
             let local_devices = [ExecutionTarget::Auto, ExecutionTarget::Cpu];
 
             match key.code {
@@ -256,7 +257,7 @@ pub(super) fn handle_models_input(
                         }
                     }
                     Some(AddProviderStep::ConfigureLocal { focused_field, .. }) => {
-                        if *focused_field < 4 {
+                        if *focused_field < 5 {
                             *focused_field += 1;
                         }
                     }
@@ -283,6 +284,7 @@ pub(super) fn handle_models_input(
                             inference_provider,
                             family,
                             size,
+                            quantization,
                             execution,
                             focused_field,
                             ..
@@ -318,6 +320,16 @@ pub(super) fn handle_models_input(
                                 }
                             }
                             3 => {
+                                if let Some(pos) = local_quantizations
+                                    .iter()
+                                    .position(|value| *value == *quantization)
+                                {
+                                    *quantization =
+                                        local_quantizations[(pos + local_quantizations.len() - 1)
+                                            % local_quantizations.len()];
+                                }
+                            }
+                            4 => {
                                 if let Some(pos) =
                                     local_devices.iter().position(|x| *x == *execution)
                                 {
@@ -380,6 +392,7 @@ pub(super) fn handle_models_input(
                             inference_provider,
                             family,
                             size,
+                            quantization,
                             execution,
                             focused_field,
                             ..
@@ -413,6 +426,15 @@ pub(super) fn handle_models_input(
                                 }
                             }
                             3 => {
+                                if let Some(pos) = local_quantizations
+                                    .iter()
+                                    .position(|value| *value == *quantization)
+                                {
+                                    *quantization =
+                                        local_quantizations[(pos + 1) % local_quantizations.len()];
+                                }
+                            }
+                            4 => {
                                 if let Some(pos) =
                                     local_devices.iter().position(|x| *x == *execution)
                                 {
@@ -596,7 +618,7 @@ pub(super) fn handle_models_input(
                     if let Some(AddProviderStep::ConfigureLocal {
                         inference_provider: InferenceProvider::LlamaCpp,
                         model_path,
-                        focused_field: 4,
+                        focused_field: 5,
                         ..
                     }) = adding_provider
                     {
@@ -635,7 +657,7 @@ pub(super) fn handle_models_input(
                     if let Some(AddProviderStep::ConfigureLocal {
                         inference_provider: InferenceProvider::LlamaCpp,
                         model_path,
-                        focused_field: 4,
+                        focused_field: 5,
                         ..
                     }) = adding_provider
                     {
@@ -734,6 +756,7 @@ pub(super) fn handle_models_input(
                                     inference_provider: InferenceProvider::LlamaCpp,
                                     family: ModelFamily::Qwen2,
                                     size: ModelSize::Medium,
+                                    quantization: GgufQuantization::Q4KM,
                                     execution: ExecutionTarget::Auto,
                                     model_path: String::new(),
                                     focused_field: 0,
@@ -1008,32 +1031,60 @@ pub(super) fn handle_models_input(
                             inference_provider,
                             family,
                             size,
+                            quantization,
                             execution,
                             model_path,
                             focused_field,
                             editing_idx,
                         }) => {
-                            let path = std::path::PathBuf::from(model_path.trim());
-                            if !path.is_absolute()
-                                || !path.is_file()
-                                || path.extension().and_then(|s| s.to_str()) != Some("gguf")
-                            {
-                                *error = Some(
-                                    "Choose an existing absolute local .gguf file for llama.cpp"
-                                        .into(),
-                                );
-                                *adding_provider = Some(AddProviderStep::ConfigureLocal {
-                                    inference_provider,
-                                    family,
-                                    size,
-                                    execution,
-                                    model_path,
-                                    focused_field,
-                                    editing_idx,
-                                });
-                                return Ok(false);
-                            }
-                            let selected_path = Some(path);
+                            let trimmed_path = model_path.trim();
+                            let (selected_path, managed_artifact) = if trimmed_path.is_empty() {
+                                let Some(artifact) =
+                                    managed_gguf_artifact(family, size, quantization)
+                                else {
+                                    *error = Some(format!(
+                                        "{} {} {} is not in Finch's managed GGUF catalog; choose a supported size or enter an existing absolute .gguf file",
+                                        family.name(),
+                                        size.to_size_string(family),
+                                        quantization.name()
+                                    ));
+                                    *adding_provider = Some(AddProviderStep::ConfigureLocal {
+                                        inference_provider,
+                                        family,
+                                        size,
+                                        quantization,
+                                        execution,
+                                        model_path,
+                                        focused_field,
+                                        editing_idx,
+                                    });
+                                    return Ok(false);
+                                };
+                                (None, Some(artifact))
+                            } else {
+                                let path = std::path::PathBuf::from(trimmed_path);
+                                if !path.is_absolute()
+                                    || !path.is_file()
+                                    || path.extension().and_then(|s| s.to_str()) != Some("gguf")
+                                {
+                                    *error = Some(
+                                        "Leave GGUF file blank for a managed download, or choose an existing absolute local .gguf file"
+                                            .into(),
+                                    );
+                                    *adding_provider = Some(AddProviderStep::ConfigureLocal {
+                                        inference_provider,
+                                        family,
+                                        size,
+                                        quantization,
+                                        execution,
+                                        model_path,
+                                        focused_field,
+                                        editing_idx,
+                                    });
+                                    return Ok(false);
+                                }
+                                (Some(path), None)
+                            };
                             let persisted = editing_idx.and_then(|idx| {
                                 let slot = if idx == 0 {
                                     Some(&*primary_model)
@@ -1051,6 +1102,7 @@ pub(super) fn handle_models_input(
                                 execution,
                                 inference_provider,
                                 model_path: selected_path,
+                                managed_artifact,
                                 enabled: true,
                                 persisted,
                             };
@@ -1286,15 +1338,20 @@ pub(super) fn handle_models_input(
                         execution,
                         inference_provider,
                         model_path,
+                        managed_artifact,
                         ..
                     }) = selected
                     {
                         let migrating_legacy = *inference_provider != InferenceProvider::LlamaCpp;
-                        let focused_field = 4;
+                        let focused_field = 5;
                         *adding_provider = Some(AddProviderStep::ConfigureLocal {
                             inference_provider: InferenceProvider::LlamaCpp,
                             family: *family,
                             size: *size,
+                            quantization: managed_artifact
+                                .as_ref()
+                                .map(|artifact| artifact.quantization)
+                                .unwrap_or_default(),
                             execution: *execution,
                             model_path: if migrating_legacy {
                                 String::new()

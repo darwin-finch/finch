@@ -12,7 +12,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 
 use crate::claude::{ClaudeClient, MessageRequest};
@@ -723,6 +723,59 @@ impl ReplInitialization {
     }
 }
 
+fn project_local_model_download_status(
+    status_bar: &StatusBar,
+    status: &crate::client::LocalModelStatus,
+) -> bool {
+    match status {
+        crate::client::LocalModelStatus::Initializing => false,
+        crate::client::LocalModelStatus::Downloading(progress) => {
+            let percentage = if progress.total_bytes == 0 {
+                0.0
+            } else {
+                progress.downloaded_bytes as f64 / progress.total_bytes as f64
+            };
+            status_bar.update_download_progress(
+                &progress.model,
+                percentage,
+                progress.downloaded_bytes,
+                progress.total_bytes,
+            );
+            false
+        }
+        crate::client::LocalModelStatus::Loading(_)
+        | crate::client::LocalModelStatus::Ready(_)
+        | crate::client::LocalModelStatus::Failed(_)
+        | crate::client::LocalModelStatus::NotAvailable => {
+            status_bar.clear_download_progress();
+            true
+        }
+    }
+}
+
+fn spawn_local_model_download_monitor(
+    client: Arc<crate::client::DaemonClient>,
+    status_bar: StatusBar,
+) {
+    tokio::spawn(async move {
+        loop {
+            match client.local_model_status().await {
+                Ok(status) => {
+                    if project_local_model_download_status(&status_bar, &status) {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    status_bar.clear_download_progress();
+                    tracing::warn!("local model download monitor stopped: {error:#}");
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+}
+
 #[allow(dead_code)]
 impl Repl {
     pub async fn new(
@@ -1406,6 +1459,12 @@ impl Repl {
                 Arc::new(RwLock::new(crate::config::Persona::default()))
             }
         };
+
+        if config.backend.enabled && is_interactive {
+            if let Some(client) = daemon_client.clone() {
+                spawn_local_model_download_monitor(client, status_bar.clone());
+            }
+        }
 
         Self {
             _config: config,
@@ -4843,3 +4902,61 @@ impl Repl {
 
 #[cfg(test)]
 mod always_allow_tests;
+
+#[cfg(test)]
+mod model_download_status_tests {
+    use super::*;
+    use crate::cli::status_bar::StatusLineType;
+    use crate::client::{LocalModelDownloadStatus, LocalModelStatus};
+
+    #[test]
+    fn daemon_download_updates_one_status_line_and_terminal_state_removes_it() {
+        let status_bar = StatusBar::new();
+        let first = LocalModelStatus::Downloading(LocalModelDownloadStatus {
+            model: "Qwen 2.5 3B".to_string(),
+            file_name: "model.gguf".to_string(),
+            downloaded_bytes: 25,
+            total_bytes: 100,
+        });
+        assert!(!project_local_model_download_status(&status_bar, &first));
+        let second = LocalModelStatus::Downloading(LocalModelDownloadStatus {
+            downloaded_bytes: 75,
+            ..match first {
+                LocalModelStatus::Downloading(progress) => progress,
+                _ => unreachable!(),
+            }
+        });
+        assert!(!project_local_model_download_status(&status_bar, &second));
+        let download_lines = status_bar
+            .get_lines()
+            .into_iter()
+            .filter(|line| line.line_type == StatusLineType::DownloadProgress)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            download_lines.len(),
+            1,
+            "progress updates must replace one status line rather than append rows"
+        );
+        assert!(download_lines[0].content.contains("75%"));
+
+        assert!(project_local_model_download_status(
+            &status_bar,
+            &LocalModelStatus::Loading("Qwen 2.5 3B".to_string())
+        ));
+        assert!(
+            status_bar
+                .get_lines()
+                .iter()
+                .all(|line| line.line_type != StatusLineType::DownloadProgress),
+            "the status bar must not retain download progress after download completion"
+        );
+        assert!(project_local_model_download_status(
+            &status_bar,
+            &LocalModelStatus::Failed("later failure".to_string())
+        ));
+        assert!(status_bar
+            .get_lines()
+            .iter()
+            .all(|line| line.line_type != StatusLineType::DownloadProgress));
+    }
+}

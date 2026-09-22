@@ -5672,6 +5672,34 @@ async fn test_status_probe_counts_brains_without_hydrating_the_store() {
     );
 }
 
+#[tokio::test]
+async fn test_status_probe_publishes_exact_managed_download_bytes() {
+    let temp = seed_health_probe_brain_root(0, false);
+    let server = health_probe_server(temp.path());
+    *server.generator_state().write().await = crate::models::GeneratorState::Downloading {
+        model_name: "Qwen 2.5 3B".into(),
+        progress: crate::models::DownloadProgressSnapshot {
+            file_name: "qwen.gguf".into(),
+            downloaded_bytes: 25,
+            total_bytes: 100,
+        },
+    };
+
+    let (status, body) = probe(server, "/v1/status").await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        body.get("generator"),
+        Some(&serde_json::json!({
+            "state": "downloading",
+            "model_size": "Qwen 2.5 3B",
+            "file_name": "qwen.gguf",
+            "downloaded_bytes": 25,
+            "total_bytes": 100
+        }))
+    );
+}
+
 /// One unreadable Brain must not take the probe down.
 ///
 /// With `list()`, `ensure_loaded` propagates the parse failure, the handler

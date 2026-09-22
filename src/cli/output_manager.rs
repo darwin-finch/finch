@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::messages::{
     BrainParticipantMessage, LiveToolMessage, MessageId, MessageRef, OperationMessage,
-    ProgressMessage, StaticMessage, StreamingResponseMessage, UserQueryMessage, WorkUnit,
+    StaticMessage, StreamingResponseMessage, UserQueryMessage, WorkUnit,
 };
-use crate::models::{DownloadProgressDisplay, ModelProgress};
+use crate::models::ModelProgress;
 use crate::runtime::VmEffectEnvelope;
 use crate::vm::{HostSideEffect, TypedValue, UiOperation, VmSideEffect};
 
@@ -530,35 +530,9 @@ impl Default for OutputManager {
     }
 }
 
-// The message model owns progress state; the application adapts it to the
-// model loader's host-facing port where the handle is created.
-impl DownloadProgressDisplay for ProgressMessage {
-    fn update(&self, current: u64) {
-        self.update_progress(current);
-    }
-
-    fn complete(&self) {
-        self.set_complete();
-    }
-
-    fn fail(&self) {
-        self.set_failed();
-    }
-}
-
 impl ModelProgress for OutputManager {
     fn write_progress(&self, content: String) {
         OutputManager::write_progress(self, content);
-    }
-
-    fn start_download_progress(
-        &self,
-        label: String,
-        total: u64,
-    ) -> Arc<dyn DownloadProgressDisplay> {
-        let msg = Arc::new(ProgressMessage::new(label, total));
-        self.add_trait_message(msg.clone());
-        msg
     }
 }
 
@@ -609,46 +583,6 @@ mod tests {
                 .complete_transcript(&crate::theme::ColorScheme::default())
                 .contains("Answer: approved"),
             "a settled dialog record must stay copyable in canonical scrollback"
-        );
-    }
-
-    #[test]
-    fn model_progress_adapter_updates_the_buffered_message() {
-        let manager = silent_manager();
-        let progress =
-            ModelProgress::start_download_progress(&manager, "Downloading test".into(), 10);
-        let messages = manager.get_messages();
-        assert_eq!(
-            messages.len(),
-            1,
-            "the host progress port must create one buffered message"
-        );
-        assert_eq!(
-            messages[0].status(),
-            crate::cli::MessageStatus::InProgress,
-            "the download must remain live before its terminal update"
-        );
-
-        progress.update(5);
-        assert_eq!(
-            messages[0].status(),
-            crate::cli::MessageStatus::InProgress,
-            "a partial download must not complete the message"
-        );
-        progress.complete();
-        assert_eq!(
-            messages[0].status(),
-            crate::cli::MessageStatus::Complete,
-            "completion through the loader port must update the same buffered message"
-        );
-
-        let failed =
-            ModelProgress::start_download_progress(&manager, "Downloading other".into(), 10);
-        failed.fail();
-        assert_eq!(
-            manager.get_messages()[1].status(),
-            crate::cli::MessageStatus::Failed,
-            "failure through the loader port must remain visible to the renderer"
         );
     }
 

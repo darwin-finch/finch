@@ -367,6 +367,7 @@ impl StatusBar {
         total: u64,
     ) {
         let model_name = model_name.into();
+        let percentage = percentage.clamp(0.0, 1.0);
         let bar_width = 20;
         let filled = (percentage * bar_width as f64) as usize;
         let empty = bar_width - filled;
@@ -383,6 +384,11 @@ impl StatusBar {
         );
 
         self.update_line(StatusLineType::DownloadProgress, content);
+    }
+
+    /// Remove the model download line after any terminal outcome.
+    pub fn clear_download_progress(&self) {
+        self.remove_line(&StatusLineType::DownloadProgress);
     }
 
     /// Update operation status line

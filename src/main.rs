@@ -1103,7 +1103,6 @@ async fn main() -> Result<()> {
     use finch::cli::{set_global_output, set_global_status};
     use finch::cli::{OutputManager, StatusBar};
     use finch::config::ColorScheme;
-    use finch::models::ModelProgress;
 
     let output_manager = Arc::new(OutputManager::new(ColorScheme::default()));
     let status_bar = Arc::new(StatusBar::new());
@@ -1114,7 +1113,6 @@ async fn main() -> Result<()> {
     // Set as global BEFORE init_tracing() to prevent lazy initialization
     set_global_output(output_manager.clone());
     set_global_status(status_bar.clone());
-    finch::models::install_model_progress(output_manager.clone() as Arc<dyn ModelProgress>);
 
     // Check if debug logging is enabled in config (before init_tracing)
     // This allows the debug_logging feature flag to control log verbosity
@@ -1805,20 +1803,6 @@ async fn run_train_setup() -> Result<()> {
     Ok(())
 }
 
-/// Install the host progress sink used by daemon model load and download.
-///
-/// Interactive `main` installs after the `Command::Daemon` early return, so the
-/// process that actually calls `BootstrapLoader::load_generator_async` must
-/// install here. Uses the same `GLOBAL_OUTPUT` host `output_progress!` already
-/// writes to (origin/main download attached `ProgressMessage` there).
-fn install_daemon_model_progress() -> Arc<finch::cli::OutputManager> {
-    use finch::cli::global_output;
-    use finch::models::ModelProgress;
-    let output = global_output();
-    finch::models::install_model_progress(Arc::clone(&output) as Arc<dyn ModelProgress>);
-    output
-}
-
 async fn run_daemon(bind_address: String) -> Result<()> {
     use finch::daemon::DaemonLifecycle;
     use finch::local::LocalGenerator;
@@ -1974,11 +1958,11 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Initialize BootstrapLoader for progressive Qwen model loading
     output_progress!("⏳ Initializing Qwen model (background)...");
     let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
-    let model_progress = install_daemon_model_progress();
-    let bootstrap_loader = Arc::new(BootstrapLoader::new(
-        Arc::clone(&generator_state),
-        Some(model_progress as Arc<dyn finch::models::ModelProgress>),
-    ));
+    let model_progress: Arc<dyn finch::models::ModelProgress> = finch::cli::global_output();
+    let bootstrap_loader = Arc::new(
+        BootstrapLoader::new(Arc::clone(&generator_state), Some(model_progress))
+            .with_huggingface_token(config.huggingface_token.clone()),
+    );
 
     // Start background model loading (unless backend is disabled for proxy-only mode)
     if config.backend.enabled {
@@ -1991,6 +1975,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         let coreml = config.backend.coreml;
         let model_repo = config.backend.model_repo.clone();
         let model_path = config.backend.model_path.clone();
+        let managed_artifact = config.backend.managed_artifact.clone();
         tokio::spawn(async move {
             if let Err(e) = loader_clone
                 .load_generator_async(
@@ -2001,6 +1986,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                     coreml,
                     model_repo,
                     model_path,
+                    managed_artifact,
                 )
                 .await
             {
@@ -2175,6 +2161,11 @@ async fn run_daemon(bind_address: String) -> Result<()> {
             }
         }
     }
+
+    // Stop an in-flight managed transfer before tearing down the runtimes. The
+    // verified final file is never published on cancellation; its partial is
+    // retained for the next daemon start to resume.
+    server.bootstrap_loader().cancel_download();
 
     // The IPC accept loop runs in a dedicated current-thread runtime. It must
     // observe cancellation and finish before the PID/instance lock is released;
@@ -3694,83 +3685,6 @@ mod tests {
             Some(value) => std::env::set_var("ORT_LOGGING_LEVEL", value),
             None => std::env::remove_var("ORT_LOGGING_LEVEL"),
         }
-    }
-
-    #[test]
-    fn run_daemon_installs_model_progress_before_loading() {
-        let source = include_str!("main.rs");
-        let start = source
-            .find("async fn run_daemon(")
-            .expect("run_daemon must exist");
-        let body = &source[start..];
-        let install_at = body
-            .find("install_daemon_model_progress")
-            .unwrap_or(usize::MAX);
-        let load_at = body
-            .find("load_generator_async")
-            .expect("run_daemon must call load_generator_async");
-        let bootstrap_at = body
-            .find("BootstrapLoader::new")
-            .expect("run_daemon must construct BootstrapLoader");
-        assert!(
-            install_at < bootstrap_at && install_at < load_at,
-            "run_daemon must call install_daemon_model_progress before BootstrapLoader::new \
-             and load_generator_async (install {install_at}, new {bootstrap_at}, load {load_at})"
-        );
-
-        let helper_start = source
-            .find("fn install_daemon_model_progress(")
-            .expect("daemon composition helper must exist");
-        let helper_end = source[helper_start..]
-            .find("\nasync fn ")
-            .map(|rel| helper_start + rel)
-            .unwrap_or(source.len());
-        let helper = &source[helper_start..helper_end];
-        let install_model = ["install_model", "_progress"].concat();
-        let global_output = ["global_", "output"].concat();
-        assert!(
-            helper.contains(&install_model),
-            "install_daemon_model_progress must call install_model_progress"
-        );
-        assert!(
-            helper.contains(&global_output),
-            "install_daemon_model_progress must use GLOBAL_OUTPUT, the host origin/main download used"
-        );
-
-        let new_end = body[bootstrap_at..]
-            .find(';')
-            .map(|rel| bootstrap_at + rel)
-            .unwrap_or(body.len());
-        let new_call = &body[bootstrap_at..new_end];
-        assert!(
-            new_call.contains("Some(") && new_call.contains("model_progress"),
-            "run_daemon must pass the installed sink into BootstrapLoader::new, found: {new_call}"
-        );
-        assert!(
-            !new_call.contains("None"),
-            "run_daemon must not drop bootstrap progress with None, found: {new_call}"
-        );
-    }
-
-    #[test]
-    fn daemon_model_progress_helper_installs_a_reporting_sink() {
-        let output = super::install_daemon_model_progress();
-        output.disable_stdout();
-        assert!(
-            finch::models::installed_model_progress().is_some(),
-            "install_daemon_model_progress must latch a host sink; otherwise model work \
-             uses SilentModelProgress in the daemon process"
-        );
-        let before = output.len();
-        let handle = finch::models::installed_model_progress()
-            .expect("daemon helper installed a sink")
-            .start_download_progress("Downloading test-repo".into(), 100);
-        assert!(
-            output.len() > before,
-            "daemon progress sink must attach a determinate download item, \
-             matching origin/main ProgressMessage via global_output()"
-        );
-        handle.complete();
     }
 
     /// The printed instructions must compile against the real runtime.

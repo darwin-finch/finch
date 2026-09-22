@@ -23,12 +23,15 @@ enabled = true
 
 ```
 
-The setup wizard can enter the same absolute GGUF path in its local-model dialog and
-checks that the file exists before adding it. This user-selected path is for
-daemon chat LLMs only; the frontend memory subsystem selects and downloads its
-own models. ONNX and Candle are no longer chat providers. Loading a legacy
-entry reports an actionable `finch setup` migration error; an old repository
-or model file is never treated as a GGUF path.
+The setup wizard can enter the same absolute GGUF path and checks that it exists before adding
+it. Leaving the field blank for a catalogued Qwen or Gemma selection instead persists an
+immutable managed-artifact identity (repository, commit, filename, quantization, byte size, and
+SHA-256). On daemon startup Finch resumes the download through Hugging Face, verifies it, and
+loads the cached path. The optional top-level `huggingface_token` is used first; standard hf-hub
+environment/cache credentials remain the fallback. These settings are for daemon chat LLMs only; the frontend memory
+subsystem selects and downloads its own models. ONNX and Candle are no longer chat providers.
+Loading a legacy entry reports an actionable `finch setup` migration error; an old repository or
+model file is never treated as a GGUF path.
 
 Automatic training is disabled and there are no active `auto_train` settings.
 Explicit feedback is retained privately in `~/.finch/feedback.jsonl` without

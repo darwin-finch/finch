@@ -176,7 +176,9 @@ authentication must not be inferred from OpenAI API-key support.
 
 ### Local inference
 
-Daemon local chat loads a user-selected GGUF file through llama.cpp. ONNX and Candle are not chat
+Daemon local chat loads either a Finch-managed, pinned Hugging Face GGUF or a user-selected GGUF
+file through llama.cpp. Managed downloads are resumed, size/checksum verified, and shown as one
+temporary status-bar entry. ONNX and Candle are not chat
 providers; old entries direct the user through `finch setup` migration. Local artifacts can be
 large. A configured local profile does
 not currently guarantee that a query is routed locally; local bootstrap, selection, and provider

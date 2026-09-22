@@ -1387,6 +1387,7 @@ pub(super) fn add_provider_card(
             inference_provider: _,
             family,
             size,
+            quantization,
             execution,
             model_path,
             focused_field,
@@ -1395,18 +1396,27 @@ pub(super) fn add_provider_card(
             let backend_name = "llama.cpp (GGUF)";
             let family_name = family.name().to_string();
             let size_name = model_size_display(size);
+            let quantization_name = quantization.name();
             let device_name = execution_target_display(*execution, coreml);
             let row = |label: &str, value: &str, focused: bool| {
                 remote_form_row(label, value, focused, false)
             };
-            let repo_preview = "Choose a local GGUF model file";
-            let ram_estimate = "RAM depends on GGUF file";
+            let managed = managed_gguf_artifact(*family, *size, *quantization);
+            let repo_preview = managed.as_ref().map_or_else(
+                || "No managed artifact for this combination".to_string(),
+                |artifact| format!("Managed: {}", artifact.repository),
+            );
+            let ram_estimate = managed.as_ref().map_or_else(
+                || "RAM depends on GGUF file".to_string(),
+                |artifact| format!("Download {:.1} GB", artifact.expected_size as f64 / 1e9),
+            );
             let mut body = vec![
                 String::new(),
                 row("Backend", backend_name, *focused_field == 0),
                 row("Family", &family_name, *focused_field == 1),
                 row("Size", size_name, *focused_field == 2),
-                row("Device", &device_name, *focused_field == 3),
+                row("Quantization", quantization_name, *focused_field == 3),
+                row("Device", &device_name, *focused_field == 4),
             ];
             let path_display = if model_path.chars().count() > 34 {
                 let suffix: String = model_path.chars().rev().take(33).collect();
@@ -1415,9 +1425,9 @@ pub(super) fn add_provider_card(
                 model_path.clone()
             };
             body.push(remote_form_row(
-                "GGUF file",
+                "GGUF file (optional)",
                 &path_display,
-                *focused_field == 4,
+                *focused_field == 5,
                 true,
             ));
             body.extend([
@@ -1436,9 +1446,9 @@ pub(super) fn add_provider_card(
                 },
                 body,
                 Some(if editing_idx.is_some() {
-                    "↑↓ navigate · ←→ change · type GGUF path when selected · Enter to save · Esc back".to_string()
+                    "↑↓ navigate · ←→ change · leave path blank to download · Enter to save · Esc back".to_string()
                 } else {
-                    "↑↓ navigate · ←→ change · type GGUF path when selected · Enter to add · Esc back".to_string()
+                    "↑↓ navigate · ←→ change · leave path blank to download · Enter to add · Esc back".to_string()
                 }),
             )
         }

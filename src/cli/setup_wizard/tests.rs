@@ -1002,6 +1002,7 @@ fn default_configure_local(focused_field: usize) -> AddProviderStep {
         inference_provider: InferenceProvider::LlamaCpp,
         family: ModelFamily::Qwen2,
         size: ModelSize::Medium,
+        quantization: GgufQuantization::Q4KM,
         execution: ExecutionTarget::Auto,
         model_path: test_gguf_path(),
         focused_field,
@@ -2214,10 +2215,10 @@ fn test_configure_local_up_clamps_at_zero() {
 
 #[test]
 fn test_configure_local_down_clamps_at_gguf_path() {
-    let mut state = state_with_step(default_configure_local(4));
+    let mut state = state_with_step(default_configure_local(5));
     handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
     if let Some(AddProviderStep::ConfigureLocal { focused_field, .. }) = get_step(&state) {
-        assert_eq!(*focused_field, 4, "should not go past 4 (GGUF path)");
+        assert_eq!(*focused_field, 5, "should not go past 5 (GGUF path)");
     } else {
         panic!("expected ConfigureLocal");
     }
@@ -2261,14 +2262,37 @@ fn test_configure_local_right_cycles_size_forward() {
 }
 
 #[test]
+fn test_configure_local_right_cycles_quantization() {
+    let mut state = state_with_step(AddProviderStep::ConfigureLocal {
+        inference_provider: InferenceProvider::LlamaCpp,
+        family: ModelFamily::Qwen2,
+        size: ModelSize::Medium,
+        quantization: GgufQuantization::Q4KM,
+        execution: ExecutionTarget::Auto,
+        model_path: String::new(),
+        focused_field: 3,
+        editing_idx: None,
+    });
+    handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureLocal {
+            quantization: GgufQuantization::Q5KM,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn test_configure_local_right_on_device_field_cycles() {
     let mut state = state_with_step(AddProviderStep::ConfigureLocal {
         inference_provider: InferenceProvider::LlamaCpp,
         family: ModelFamily::Qwen2,
         size: ModelSize::Medium,
+        quantization: GgufQuantization::Q4KM,
         execution: ExecutionTarget::Auto,
         model_path: test_gguf_path(),
-        focused_field: 3, // Device
+        focused_field: 4, // Device
         editing_idx: None,
     });
     // Auto is first in the list; right should cycle to next (Cpu on non-macOS, CoreML on macOS)
@@ -2320,6 +2344,7 @@ fn test_configure_local_enter_replaces_empty_primary() {
         inference_provider: InferenceProvider::LlamaCpp,
         family: ModelFamily::Phi,
         size: ModelSize::Small,
+        quantization: GgufQuantization::Q4KM,
         execution: ExecutionTarget::Cpu,
         model_path: test_gguf_path(),
         focused_field: 0,
@@ -2352,9 +2377,10 @@ fn test_gguf_wizard_requires_existing_file_and_keeps_dialog_open() {
         inference_provider: InferenceProvider::LlamaCpp,
         family: ModelFamily::Qwen2,
         size: ModelSize::Small,
+        quantization: GgufQuantization::Q4KM,
         execution: ExecutionTarget::Auto,
         model_path: "/missing/finch-chat.gguf".to_string(),
-        focused_field: 4,
+        focused_field: 5,
         editing_idx: None,
     });
     handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
@@ -2378,9 +2404,10 @@ fn test_gguf_wizard_only_cycles_auto_and_cpu_targets() {
         inference_provider: InferenceProvider::LlamaCpp,
         family: ModelFamily::Qwen2,
         size: ModelSize::Small,
+        quantization: GgufQuantization::Q4KM,
         execution: ExecutionTarget::Auto,
         model_path: String::new(),
-        focused_field: 3,
+        focused_field: 4,
         editing_idx: None,
     });
     handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
@@ -2409,9 +2436,10 @@ fn test_gguf_wizard_path_survives_provider_save_and_reopen() {
         inference_provider: InferenceProvider::LlamaCpp,
         family: ModelFamily::Gemma2,
         size: ModelSize::Small,
+        quantization: GgufQuantization::Q4KM,
         execution: ExecutionTarget::Cpu,
         model_path: String::new(),
-        focused_field: 4,
+        focused_field: 5,
         editing_idx: None,
     });
     for character in path.to_string_lossy().chars() {
@@ -2464,6 +2492,81 @@ fn test_gguf_wizard_path_survives_provider_save_and_reopen() {
 }
 
 #[test]
+fn test_managed_gguf_selection_survives_provider_save_and_reopen() {
+    let mut state = state_with_step(AddProviderStep::ConfigureLocal {
+        inference_provider: InferenceProvider::LlamaCpp,
+        family: ModelFamily::Qwen2,
+        size: ModelSize::Medium,
+        quantization: GgufQuantization::Q5KM,
+        execution: ExecutionTarget::Auto,
+        model_path: String::new(),
+        focused_field: 5,
+        editing_idx: None,
+    });
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+    assert!(get_step(&state).is_none());
+
+    let expected = managed_gguf_artifact(
+        ModelFamily::Qwen2,
+        ModelSize::Medium,
+        GgufQuantization::Q5KM,
+    )
+    .unwrap();
+    let result = build_setup_result(&state).unwrap();
+    assert!(matches!(&result.providers[0], ProviderEntry::Local {
+        model_path: None,
+        managed_artifact: Some(artifact),
+        ..
+    } if artifact == &expected));
+
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let metrics_dir = directory.path().join("metrics");
+    config_from_setup_result_with_paths(&result, metrics_dir.clone(), None)
+        .save_to(&config_path)
+        .unwrap();
+    let reloaded =
+        crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None).unwrap();
+    assert_eq!(reloaded.backend.model_path, None);
+    assert_eq!(reloaded.backend.managed_artifact.as_ref(), Some(&expected));
+
+    let reopened = WizardState::new(Some(&reloaded));
+    assert!(matches!(get_primary(&reopened), Some(ModelConfig::Local {
+        model_path: None,
+        managed_artifact: Some(artifact),
+        ..
+    }) if artifact == &expected));
+}
+
+#[test]
+fn test_unsupported_managed_gguf_keeps_dialog_open_with_actionable_error() {
+    let mut state = state_with_step(AddProviderStep::ConfigureLocal {
+        inference_provider: InferenceProvider::LlamaCpp,
+        family: ModelFamily::Phi,
+        size: ModelSize::Small,
+        quantization: GgufQuantization::Q4KM,
+        execution: ExecutionTarget::Auto,
+        model_path: String::new(),
+        focused_field: 5,
+        editing_idx: None,
+    });
+    handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+    assert!(matches!(
+        get_step(&state),
+        Some(AddProviderStep::ConfigureLocal { .. })
+    ));
+    let Some(SectionState::Models {
+        error: Some(error), ..
+    }) = state.sections.get(&WizardSection::Models)
+    else {
+        panic!("expected managed GGUF validation error");
+    };
+    assert!(error.contains("not in Finch's managed GGUF catalog"));
+    assert!(error.contains("existing absolute .gguf file"));
+}
+
+#[test]
 fn test_editing_legacy_local_chat_to_gguf_clears_onnx_repository() {
     let original_path = "/models/old-chat.onnx";
     let config = crate::config::Config::with_providers(vec![ProviderEntry::Local {
@@ -2473,6 +2576,7 @@ fn test_editing_legacy_local_chat_to_gguf_clears_onnx_repository() {
         model_size: ModelSize::Small,
         model_repo: Some("onnx-community/old-chat".into()),
         model_path: Some(original_path.into()),
+        managed_artifact: None,
         enabled: true,
         name: Some("my-local-chat".into()),
     }]);
@@ -2489,7 +2593,7 @@ fn test_editing_legacy_local_chat_to_gguf_clears_onnx_repository() {
         matches!(get_step(&state), Some(AddProviderStep::ConfigureLocal {
         inference_provider: InferenceProvider::LlamaCpp,
         model_path,
-        focused_field: 4,
+        focused_field: 5,
         ..
     }) if model_path.is_empty())
     );
@@ -2957,6 +3061,7 @@ fn test_build_setup_result_uses_inference_provider_from_local_model() {
             execution: ExecutionTarget::Cpu,
             inference_provider: InferenceProvider::LlamaCpp,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             persisted: None,
         };
@@ -2999,6 +3104,7 @@ fn test_model_config_local_stores_inference_provider() {
         execution: ExecutionTarget::Cpu,
         inference_provider: InferenceProvider::LlamaCpp,
         model_path: None,
+        managed_artifact: None,
         enabled: true,
         persisted: None,
     };
@@ -3058,6 +3164,7 @@ fn test_coreml_policy_survives_wizard_mapping_save_and_reload_for_every_compute_
             model_size: ModelSize::Medium,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             name: Some("local-coreml-policy-test".to_string()),
         }];
@@ -3116,6 +3223,7 @@ fn test_reopened_coreml_policy_renders_requested_units_for_every_policy() {
             model_size: ModelSize::Medium,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             enabled: true,
             name: Some("reopened-coreml".to_string()),
         }]);
@@ -3154,6 +3262,7 @@ fn test_cloud_primary_keeps_local_qwen_as_tool_model_on_reopen() {
             model_size: ModelSize::Small,
             model_repo: Some("onnx-community/Qwen2.5-Coder-3B-Instruct".to_string()),
             model_path: Some("/models/qwen-coder".into()),
+            managed_artifact: None,
             enabled: true,
             name: Some("local-qwen".to_string()),
         },
@@ -3525,6 +3634,7 @@ async fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_
             model_size: ModelSize::Medium,
             model_repo: Some("Qwen/Qwen2.5-Coder-7B-Instruct-ONNX".into()),
             model_path: Some(directory.path().join("models/qwen")),
+            managed_artifact: None,
             enabled: true,
             name: Some("Local Qwen Medium".into()),
         },
