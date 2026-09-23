@@ -3,6 +3,7 @@
 // Concrete implementations of various tools
 
 // Read-only tools
+pub mod code_outline;
 pub mod glob;
 pub mod grep;
 pub mod read;
@@ -73,6 +74,7 @@ pub mod spawn;
 pub use ask_user_question::AskUserQuestionTool;
 pub use background::{BackgroundBashTool, BackgroundPollTool, BackgroundStopTool};
 pub use bash::BashTool;
+pub use code_outline::CodeOutlineTool;
 pub use edit::EditTool;
 pub use enter_plan_mode::EnterPlanModeTool;
 pub use glob::GlobTool;

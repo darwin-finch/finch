@@ -172,6 +172,8 @@ pub fn path_argument_for_tool(tool_name: &str, input: &Value) -> Option<String> 
         input.get("file_path").and_then(Value::as_str)?
     } else if tool_name == "grep" {
         input.get("path").and_then(Value::as_str).unwrap_or(".")
+    } else if tool_name == "code_outline" {
+        input.get("path").and_then(Value::as_str)?
     } else if tool_name == "glob" {
         let pattern = input.get("pattern").and_then(Value::as_str)?;
         glob_path_argument(pattern)?
@@ -302,6 +304,7 @@ pub const PEER_SILENT_ALLOW_TOOLS: &[&str] = &[
     "read",
     "glob",
     "grep",
+    "code_outline",
     "get_vm_state",
     "get_language_definition",
     "search_vm_vocabulary",
@@ -453,11 +456,8 @@ impl PermissionManager {
         self
     }
 
-    /// Canonical workspace root used for containment. Crate-internal: callers
-    /// needing the root for their own checks pass it through
-    /// [`PermissionManager::with_workspace_root`] instead.
-    #[cfg(test)]
-    fn workspace_root(&self) -> &Path {
+    /// Canonical workspace root used for path authority decisions.
+    pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
 
@@ -1409,6 +1409,30 @@ mod tests {
             "invariant: a workspace-contained WorkspaceRead still runs autonomously; \
              path={inside:?}"
         );
+        let _keep = workspace;
+    }
+
+    #[test]
+    fn test_code_outline_path_obeys_workspace_containment() {
+        let (workspace, root) = isolated_workspace();
+        let inside = root.join("source.rs");
+        std::fs::write(&inside, "fn source() {}\n").expect("seed source");
+        let manager = PermissionManager::for_peer().with_workspace_root(root);
+        let contained = serde_json::json!({"path": inside.to_string_lossy()});
+        assert_eq!(
+            path_argument_for_tool("code_outline", &contained),
+            Some(inside.to_string_lossy().into_owned())
+        );
+        assert!(matches!(
+            manager.check_tool_use("code_outline", &contained),
+            PermissionCheck::Allow
+        ));
+
+        let escaped = serde_json::json!({"path": "/etc/passwd"});
+        assert!(matches!(
+            manager.check_tool_use("code_outline", &escaped),
+            PermissionCheck::AskUser(_)
+        ));
         let _keep = workspace;
     }
 
