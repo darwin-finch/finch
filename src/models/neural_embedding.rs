@@ -140,14 +140,20 @@ impl NeuralEmbeddingEngine {
     /// into per use, so it must not have a single point of failure on one
     /// external host's availability.
     ///
+    /// `progress` reports bootstrap-style status lines (`ModelProgress` has
+    /// no determinate percentage API); pass `Arc::new(SilentModelProgress)`
+    /// where nothing should be reported.
+    ///
     /// Returns the local directory containing model and tokenizer files.
     /// This is a blocking operation; wrap in `spawn_blocking` for async contexts.
-    pub fn download_sync() -> Result<PathBuf> {
-        match Self::download_from_huggingface() {
+    pub fn download_sync(progress: &Arc<dyn super::progress::ModelProgress>) -> Result<PathBuf> {
+        match Self::download_from_huggingface(progress) {
             Ok(dir) => Ok(dir),
             Err(hf_error) => {
-                info!("Hugging Face download failed ({hf_error}); trying the finch mirror");
-                Self::download_from_mirror().map_err(|mirror_error| {
+                progress.write_progress(format!(
+                    "Hugging Face download failed ({hf_error}); trying the finch mirror"
+                ));
+                Self::download_from_mirror(progress).map_err(|mirror_error| {
                     anyhow!(
                         "embedding model download failed from both sources -- \
                          Hugging Face: {hf_error}; mirror: {mirror_error}"
@@ -157,11 +163,13 @@ impl NeuralEmbeddingEngine {
         }
     }
 
-    fn download_from_huggingface() -> Result<PathBuf> {
+    fn download_from_huggingface(
+        progress: &Arc<dyn super::progress::ModelProgress>,
+    ) -> Result<PathBuf> {
         use hf_hub::{api::sync::Api, Repo, RepoType};
 
         info!("Downloading neural embedding model (all-MiniLM-L6-v2) from Hugging Face...");
-        let progress_msg = super::progress::attach_download_progress("Xenova/all-MiniLM-L6-v2-ONNX");
+        progress.write_progress("Downloading memory embedding model from Hugging Face...".into());
 
         let api = Api::new().context("Failed to create HuggingFace Hub API")?;
         let repo = api.repo(Repo::new(
@@ -170,30 +178,24 @@ impl NeuralEmbeddingEngine {
         ));
 
         // Download model (tries quantized first, then regular)
-        let model_path = match repo.get("model_quantized.onnx").or_else(|_| repo.get("model.onnx")) {
-            Ok(path) => path,
-            Err(e) => {
-                progress_msg.fail();
-                return Err(e).context(
-                    "Failed to download embedding model \
-                     (tried model_quantized.onnx and model.onnx)",
-                );
-            }
-        };
-        progress_msg.update(50);
+        let model_path = repo
+            .get("model_quantized.onnx")
+            .or_else(|_| repo.get("model.onnx"))
+            .context(
+                "Failed to download embedding model \
+                 (tried model_quantized.onnx and model.onnx)",
+            )?;
 
         // Download tokenizer
-        if let Err(e) = repo.get("tokenizer.json") {
-            progress_msg.fail();
-            return Err(e).context("Failed to download tokenizer.json");
-        }
-        progress_msg.complete();
+        repo.get("tokenizer.json")
+            .context("Failed to download tokenizer.json")?;
 
         let dir = model_path
             .parent()
             .ok_or_else(|| anyhow!("Model path has no parent directory"))?
             .to_path_buf();
 
+        progress.write_progress("Memory embedding model downloaded.".into());
         info!("Neural embedding model downloaded to: {:?}", dir);
         Ok(dir)
     }
@@ -210,58 +212,45 @@ impl NeuralEmbeddingEngine {
     /// Hugging Face error rather than a mirror-specific one. The fallback
     /// path, cache lookup, and directory layout are real and tested now, so
     /// publishing the release is the only thing left to make it load-bearing.
-    fn download_from_mirror() -> Result<PathBuf> {
+    fn download_from_mirror(
+        progress: &Arc<dyn super::progress::ModelProgress>,
+    ) -> Result<PathBuf> {
         let dir = mirror_cache_dir()
             .ok_or_else(|| anyhow!("could not determine home directory for the mirror cache"))?;
         std::fs::create_dir_all(&dir).context("Failed to create finch mirror cache directory")?;
 
         info!("Downloading neural embedding model (all-MiniLM-L6-v2) from the finch mirror...");
-        let progress_msg = super::progress::attach_download_progress("finch mirror: all-MiniLM-L6-v2");
+        progress.write_progress("Downloading memory embedding model from the finch mirror...".into());
 
         for file in ["model_quantized.onnx", "tokenizer.json"] {
             let url = format!("{MIRROR_BASE_URL}/{file}");
-            let fetch = reqwest::blocking::get(&url)
+            let response = reqwest::blocking::get(&url)
                 .and_then(reqwest::blocking::Response::error_for_status)
-                .with_context(|| format!("mirror fetch failed for {file} from {url}"));
-            let response = match fetch {
-                Ok(response) => response,
-                Err(e) => {
-                    progress_msg.fail();
-                    return Err(e);
-                }
-            };
-            let bytes = match response
+                .with_context(|| format!("mirror fetch failed for {file} from {url}"))?;
+            let bytes = response
                 .bytes()
-                .with_context(|| format!("failed to read mirror response body for {file}"))
-            {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    progress_msg.fail();
-                    return Err(e);
-                }
-            };
-            if let Err(e) = std::fs::write(dir.join(file), &bytes)
-                .with_context(|| format!("failed to write {file} to mirror cache"))
-            {
-                progress_msg.fail();
-                return Err(e);
-            }
+                .with_context(|| format!("failed to read mirror response body for {file}"))?;
+            std::fs::write(dir.join(file), &bytes)
+                .with_context(|| format!("failed to write {file} to mirror cache"))?;
         }
-        progress_msg.complete();
 
+        progress.write_progress("Memory embedding model downloaded from the finch mirror.".into());
         info!("Neural embedding model downloaded from mirror to: {:?}", dir);
         Ok(dir)
     }
 
     /// Async version: download model using a blocking thread pool.
-    pub async fn ensure_downloaded() -> Result<PathBuf> {
-        tokio::task::spawn_blocking(Self::download_sync)
+    pub async fn ensure_downloaded(
+        progress: Arc<dyn super::progress::ModelProgress>,
+    ) -> Result<PathBuf> {
+        let for_blocking = Arc::clone(&progress);
+        tokio::task::spawn_blocking(move || Self::download_sync(&for_blocking))
             .await
             .context("Embedding model download task panicked")??;
 
         // Re-run synchronously to get the path (spawn_blocking result already dropped)
         // Actually, re-run is cheap since files are already cached after the above
-        Self::download_sync()
+        Self::download_sync(&progress)
     }
 
     /// Try to find the model without downloading: the Hugging Face cache

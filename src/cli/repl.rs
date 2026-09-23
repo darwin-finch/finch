@@ -1024,8 +1024,14 @@ impl Repl {
                     if config.memory.use_neural_embeddings
                         && crate::models::NeuralEmbeddingEngine::find_in_cache().is_none()
                     {
-                        tokio::spawn(async {
-                            match crate::models::NeuralEmbeddingEngine::ensure_downloaded().await {
+                        let progress =
+                            global_output() as Arc<dyn crate::models::ModelProgress>;
+                        tokio::spawn(async move {
+                            match crate::models::NeuralEmbeddingEngine::ensure_downloaded(
+                                progress,
+                            )
+                            .await
+                            {
                                 Ok(_) => tracing::info!(
                                     "Neural embedding model downloaded in the background; \
                                      available from the next restart"
