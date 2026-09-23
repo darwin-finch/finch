@@ -1514,37 +1514,34 @@ mod tests {
         serialized_response_bytes: usize,
         files_read: usize,
         source_body_bytes_disclosed: usize,
-        unsupported_language_success: bool,
     }
 
     fn naive_grep_read_baseline(
         resolver: &SourceResolver,
         snapshot: &RepositorySnapshot,
+        needle: &str,
+        expected_path: &str,
+        expected_symbol: Option<&str>,
     ) -> ComparisonMetrics {
         let mut files_read = 0;
         let mut returned = Vec::new();
         let mut source_body_bytes_disclosed = 0;
         let mut task_success = false;
-        let mut unsupported_language_success = false;
         for file in &snapshot.files {
             let source = resolver
                 .read(&file.outline.source.path)
                 .expect("baseline read");
             files_read += 1;
-            if source.text.contains("admit_claim") {
+            if source.text.contains(needle) {
                 source_body_bytes_disclosed += source.text.len();
                 returned.push((file.outline.source.path.clone(), source.text.clone()));
-                task_success = file.outline.source.path == "src/claim.rs"
-                    && file
-                        .outline
-                        .records
-                        .iter()
-                        .any(|record| record.name == "admit_claim");
-            }
-            if source.text.contains("unusual widgets") {
-                source_body_bytes_disclosed += source.text.len();
-                returned.push((file.outline.source.path.clone(), source.text.clone()));
-                unsupported_language_success = file.outline.source.path == "fallback.txt";
+                task_success = file.outline.source.path == expected_path
+                    && expected_symbol.is_none_or(|symbol| {
+                        file.outline
+                            .records
+                            .iter()
+                            .any(|record| record.name == symbol)
+                    });
             }
         }
         let serialized_response_bytes = serde_json::to_vec(&returned)
@@ -1555,7 +1552,6 @@ mod tests {
             serialized_response_bytes,
             files_read,
             source_body_bytes_disclosed,
-            unsupported_language_success,
         }
     }
 
@@ -1571,7 +1567,11 @@ mod tests {
             })
     }
 
-    fn file_list_baseline(snapshot: &RepositorySnapshot) -> ComparisonMetrics {
+    fn file_list_baseline(
+        snapshot: &RepositorySnapshot,
+        query: &str,
+        expected_path: &str,
+    ) -> ComparisonMetrics {
         let serialized_response_bytes = serde_json::to_vec(
             &snapshot
                 .files
@@ -1581,40 +1581,33 @@ mod tests {
         )
         .expect("file-list JSON")
         .len();
-        let task_success =
-            file_list_pick(snapshot, "where does claim admission live?") == Some("src/claim.rs");
-        let unsupported_language_success =
-            file_list_pick(snapshot, "where are unusual widgets calibrated?")
-                == Some("fallback.txt");
+        let task_success = file_list_pick(snapshot, query) == Some(expected_path);
         ComparisonMetrics {
             task_success,
             serialized_response_bytes,
             files_read: 0,
             source_body_bytes_disclosed: 0,
-            unsupported_language_success,
         }
     }
 
     fn find_code_comparison(
         snapshot: &RepositorySnapshot,
-        primary: &CodeHopResult,
-        unsupported: &CodeHopResult,
+        result: &CodeHopResult,
+        expected_path: &str,
+        expected_symbol: Option<&str>,
     ) -> ComparisonMetrics {
         ComparisonMetrics {
-            task_success: primary.spans.iter().any(|span| {
-                span.path == "src/claim.rs" && span.symbol.as_deref() == Some("admit_claim")
+            task_success: result.spans.iter().any(|span| {
+                span.path == expected_path
+                    && expected_symbol.is_none_or(|symbol| span.symbol.as_deref() == Some(symbol))
             }),
-            serialized_response_bytes: serde_json::to_vec(&compact_response(primary.clone()))
+            serialized_response_bytes: serde_json::to_vec(&compact_response(result.clone()))
                 .expect("complete find_code response")
                 .len(),
             // A current cached query hashes each indexed source once, then
             // generation-validates each returned span before exposing it.
-            files_read: snapshot.files.len() + primary.spans.len(),
-            source_body_bytes_disclosed: primary.metrics.body_bytes_disclosed,
-            unsupported_language_success: unsupported
-                .spans
-                .iter()
-                .any(|span| span.path == "fallback.txt"),
+            files_read: snapshot.files.len() + result.spans.len(),
+            source_body_bytes_disclosed: result.metrics.body_bytes_disclosed,
         }
     }
 
@@ -1939,15 +1932,40 @@ mod tests {
         let cache =
             RepositoryCache::prepare(state.path().join("source-index"), &resolver).expect("cache");
         let snapshot = cache.load().expect("load cache").expect("snapshot");
-        let naive = naive_grep_read_baseline(&resolver, &snapshot);
-        let file_list = file_list_baseline(&snapshot);
         let response = serde_json::to_vec(&compact_response(first.clone()))
             .expect("complete find_code response");
         let unsupported = tool
             .execute_query("where are unusual widgets calibrated?")
             .await
             .expect("unsupported-language route");
-        let find_code = find_code_comparison(&snapshot, &first, &unsupported);
+        let find_code =
+            find_code_comparison(&snapshot, &first, "src/claim.rs", Some("admit_claim"));
+        let naive = naive_grep_read_baseline(
+            &resolver,
+            &snapshot,
+            "admit_claim",
+            "src/claim.rs",
+            Some("admit_claim"),
+        );
+        let file_list = file_list_baseline(
+            &snapshot,
+            "where does claim admission live?",
+            "src/claim.rs",
+        );
+        let unsupported_find_code =
+            find_code_comparison(&snapshot, &unsupported, "fallback.txt", None);
+        let unsupported_naive = naive_grep_read_baseline(
+            &resolver,
+            &snapshot,
+            "unusual widgets",
+            "fallback.txt",
+            None,
+        );
+        let unsupported_file_list = file_list_baseline(
+            &snapshot,
+            "where are unusual widgets calibrated?",
+            "fallback.txt",
+        );
 
         assert!(find_code.task_success);
         assert_eq!(find_code.source_body_bytes_disclosed, 0);
@@ -1967,27 +1985,21 @@ mod tests {
             assert!(!response_text.contains(internal), "{response_text}");
         }
         assert!(naive.task_success);
-        assert!(naive.unsupported_language_success);
         assert_eq!(naive.files_read, snapshot.files.len());
         assert!(naive.serialized_response_bytes > 0);
         assert!(naive.source_body_bytes_disclosed > 0);
-        assert_eq!(
-            file_list.task_success,
-            file_list_pick(&snapshot, "where does claim admission live?") == Some("src/claim.rs")
-        );
-        assert_eq!(
-            file_list.unsupported_language_success,
-            file_list_pick(&snapshot, "where are unusual widgets calibrated?")
-                == Some("fallback.txt")
-        );
+        assert!(file_list.task_success);
         assert_eq!(file_list.files_read, 0);
         assert_eq!(file_list.source_body_bytes_disclosed, 0);
         assert!(file_list.serialized_response_bytes > 0);
-        assert!(
-            find_code.serialized_response_bytes < naive.serialized_response_bytes,
-            "{response_text}"
-        );
-        assert!(find_code.unsupported_language_success);
+        assert!(unsupported_find_code.task_success);
+        assert_eq!(unsupported_find_code.source_body_bytes_disclosed, 0);
+        assert!(unsupported_naive.task_success);
+        assert_eq!(unsupported_naive.files_read, snapshot.files.len());
+        assert!(unsupported_naive.source_body_bytes_disclosed > 0);
+        assert!(!unsupported_file_list.task_success);
+        assert_eq!(unsupported_file_list.files_read, 0);
+        assert_eq!(unsupported_file_list.source_body_bytes_disclosed, 0);
     }
 
     #[tokio::test]
@@ -2310,16 +2322,33 @@ mod tests {
         let root = fixture();
         let state = state_parent();
         let tool = FindCodeTool::new(root.path(), state.path().join("source-index"));
-        let query = "where does claim admission live?";
-        tool.execute_query(query)
+        let primary_query = "where does claim admission live?";
+        let unsupported_query = "where are unusual widgets calibrated?";
+        tool.execute_query(primary_query)
             .await
             .expect("warm repository cache");
+        tool.execute_query(unsupported_query)
+            .await
+            .expect("warm unsupported route");
 
         let start = std::time::Instant::now();
         for _ in 0..ITERATIONS {
-            std::hint::black_box(tool.execute_query(query).await.expect("find_code route"));
+            std::hint::black_box(
+                tool.execute_query(primary_query)
+                    .await
+                    .expect("find_code route"),
+            );
         }
-        let find_code_elapsed = start.elapsed();
+        let primary_find_code_elapsed = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(
+                tool.execute_query(unsupported_query)
+                    .await
+                    .expect("unsupported find_code route"),
+            );
+        }
+        let unsupported_find_code_elapsed = start.elapsed();
 
         let resolver = SourceResolver::new(root.path()).expect("resolver");
         let cache =
@@ -2327,28 +2356,80 @@ mod tests {
         let snapshot = cache.load().expect("load cache").expect("snapshot");
         let start = std::time::Instant::now();
         for _ in 0..ITERATIONS {
-            std::hint::black_box(naive_grep_read_baseline(&resolver, &snapshot));
+            std::hint::black_box(naive_grep_read_baseline(
+                &resolver,
+                &snapshot,
+                "admit_claim",
+                "src/claim.rs",
+                Some("admit_claim"),
+            ));
         }
-        let naive_scan_elapsed = start.elapsed();
+        let primary_naive_elapsed = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(naive_grep_read_baseline(
+                &resolver,
+                &snapshot,
+                "unusual widgets",
+                "fallback.txt",
+                None,
+            ));
+        }
+        let unsupported_naive_elapsed = start.elapsed();
 
         let start = std::time::Instant::now();
         for _ in 0..ITERATIONS {
-            std::hint::black_box(file_list_baseline(&snapshot));
+            std::hint::black_box(file_list_baseline(&snapshot, primary_query, "src/claim.rs"));
         }
-        let file_list_elapsed = start.elapsed();
-        let naive = naive_grep_read_baseline(&resolver, &snapshot);
-        let file_list = file_list_baseline(&snapshot);
-        let final_find_code = tool
-            .execute_query(query)
+        let primary_file_list_elapsed = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(file_list_baseline(
+                &snapshot,
+                unsupported_query,
+                "fallback.txt",
+            ));
+        }
+        let unsupported_file_list_elapsed = start.elapsed();
+
+        let primary_result = tool
+            .execute_query(primary_query)
             .await
             .expect("final find_code route");
-        let unsupported = tool
-            .execute_query("where are unusual widgets calibrated?")
+        let unsupported_result = tool
+            .execute_query(unsupported_query)
             .await
             .expect("unsupported-language route");
-        let find_code = find_code_comparison(&snapshot, &final_find_code, &unsupported);
+        let primary_find_code = find_code_comparison(
+            &snapshot,
+            &primary_result,
+            "src/claim.rs",
+            Some("admit_claim"),
+        );
+        let primary_naive = naive_grep_read_baseline(
+            &resolver,
+            &snapshot,
+            "admit_claim",
+            "src/claim.rs",
+            Some("admit_claim"),
+        );
+        let primary_file_list = file_list_baseline(&snapshot, primary_query, "src/claim.rs");
+        let unsupported_find_code =
+            find_code_comparison(&snapshot, &unsupported_result, "fallback.txt", None);
+        let unsupported_naive = naive_grep_read_baseline(
+            &resolver,
+            &snapshot,
+            "unusual widgets",
+            "fallback.txt",
+            None,
+        );
+        let unsupported_file_list =
+            file_list_baseline(&snapshot, unsupported_query, "fallback.txt");
         eprintln!(
-            "{ITERATIONS} iterations: find_code={find_code_elapsed:?} {find_code:?}, naive_grep_read={naive_scan_elapsed:?} {naive:?}, file_list={file_list_elapsed:?} {file_list:?}"
+            "primary, {ITERATIONS} iterations: find_code={primary_find_code_elapsed:?} {primary_find_code:?}, naive_grep_read={primary_naive_elapsed:?} {primary_naive:?}, file_list={primary_file_list_elapsed:?} {primary_file_list:?}"
+        );
+        eprintln!(
+            "unsupported, {ITERATIONS} iterations: find_code={unsupported_find_code_elapsed:?} {unsupported_find_code:?}, naive_grep_read={unsupported_naive_elapsed:?} {unsupported_naive:?}, file_list={unsupported_file_list_elapsed:?} {unsupported_file_list:?}"
         );
     }
 }
