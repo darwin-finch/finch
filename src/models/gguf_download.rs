@@ -781,7 +781,11 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        // Sleep longer than any reasonable filesystem timestamp granularity (typically ~1 second)
+        // to ensure the modification time changes when we corrupt the file. This prevents the
+        // verification marker's timestamp check from incorrectly succeeding before SHA256 is
+        // re-computed.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         tokio::fs::write(&path, vec![0_u8; bytes.len()])
             .await
             .unwrap();
