@@ -1972,8 +1972,6 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         let model_family = config.backend.model_family;
         let model_size = config.backend.model_size;
         let device = config.backend.execution_target;
-        let coreml = config.backend.coreml;
-        let model_repo = config.backend.model_repo.clone();
         let model_path = config.backend.model_path.clone();
         let managed_artifact = config.backend.managed_artifact.clone();
         tokio::spawn(async move {
@@ -1983,8 +1981,6 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                     model_family,
                     model_size,
                     device,
-                    coreml,
-                    model_repo,
                     model_path,
                     managed_artifact,
                 )

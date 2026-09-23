@@ -23,6 +23,10 @@ fn backend() -> Result<&'static LlamaBackend> {
     BACKEND.get_or_try_init(|| LlamaBackend::init().context("initialize llama.cpp backend"))
 }
 
+fn prompt_contains_explicit_bos(text: &str) -> bool {
+    text.starts_with("<|begin_of_text|>") || text.starts_with("<s>")
+}
+
 fn load_model(path: &Path, allow_gpu_offload: bool) -> Result<Arc<LlamaModel>> {
     if !path.is_file() {
         bail!("GGUF model file does not exist: {}", path.display());
@@ -186,8 +190,13 @@ impl TextGeneration for LlamaCppGenerator {
     }
 
     fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        let add_bos = if prompt_contains_explicit_bos(text) {
+            AddBos::Never
+        } else {
+            AddBos::Always
+        };
         self.model
-            .str_to_token(text, AddBos::Always)
+            .str_to_token(text, add_bos)
             .context("tokenize GGUF prompt")?
             .into_iter()
             .map(|token| u32::try_from(token.0).context("negative GGUF token ID"))
@@ -238,6 +247,15 @@ mod tests {
     }
 
     #[test]
+    fn explicit_chat_template_bos_disables_tokenizer_bos_insertion() {
+        assert!(prompt_contains_explicit_bos(
+            "<|begin_of_text|><|start_header_id|>system"
+        ));
+        assert!(prompt_contains_explicit_bos("<s>[INST] hello [/INST]"));
+        assert!(!prompt_contains_explicit_bos("<|im_start|>system"));
+    }
+
+    #[test]
     fn test_configured_llm_family_survives_generic_gguf_filename() {
         let name =
             display_name(Path::new("/private/model.gguf"), Some("Gemma 2")).expect("display name");
@@ -285,6 +303,27 @@ mod tests {
             *streamed.lock().expect("lock stream"),
             text,
             "streamed chunks must reconstruct the decoded generation"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires FINCH_TEST_LLAMA_GGUF pointing to a Llama 3 GGUF"]
+    fn test_real_llama_gguf_prompt_contains_one_bos_token() {
+        let path = std::env::var("FINCH_TEST_LLAMA_GGUF").expect("set FINCH_TEST_LLAMA_GGUF");
+        let generator =
+            LlamaCppGenerator::load_with_offload(Path::new(&path), true, Some("Llama 3"))
+                .expect("load Llama GGUF");
+        let adapter = crate::models::LlamaAdapter;
+        let prompt = crate::models::LocalModelAdapter::format_chat_prompt(
+            &adapter,
+            "You are helpful.",
+            "Hello",
+        );
+        let tokens = generator.tokenize(&prompt).expect("tokenize Llama prompt");
+        assert_eq!(
+            tokens.iter().filter(|token| **token == 128000).count(),
+            1,
+            "the explicit Llama template BOS must not be duplicated"
         );
     }
 

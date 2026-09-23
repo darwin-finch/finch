@@ -449,7 +449,7 @@ impl TemplateGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CoreMlConfig, ExecutionTarget};
+    use crate::config::ExecutionTarget;
     use crate::models::{
         GeneratorConfig, InferenceProvider, ModelFamily, ModelLoadConfig, ModelSize,
         TextGeneration, TokenCallback,
@@ -506,8 +506,6 @@ mod tests {
             family: ModelFamily::Gemma2,
             size: ModelSize::Small,
             target: ExecutionTarget::Cpu,
-            coreml: CoreMlConfig::default(),
-            repo_override: None,
             model_path: None,
         });
         let model = GeneratorModel::from_test_backend(Box::new(MockGemma), config);
@@ -545,8 +543,6 @@ mod tests {
             family: ModelFamily::Qwen2,
             size: ModelSize::Small,
             target: ExecutionTarget::Auto,
-            coreml: CoreMlConfig::default(),
-            repo_override: None,
             model_path: Some(path),
         }))
         .expect("load configured GGUF");

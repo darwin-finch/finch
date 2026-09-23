@@ -155,8 +155,6 @@ pub(super) struct WizardState {
     pub(super) completed: HashSet<WizardSection>,
     pub(super) confirming_cancel: bool,
     pub(super) catalog_cache_dir: Option<std::path::PathBuf>,
-    /// Typed CoreML policy provenance from the loaded configuration.
-    pub(super) coreml: CoreMlConfig,
     /// Named credential metadata is preserved unchanged by the compact model
     /// editor; it contains no secret material.
     pub(super) credentials: Vec<crate::config::ProviderCredential>,
@@ -395,9 +393,6 @@ impl WizardState {
             completed: HashSet::new(),
             confirming_cancel: false,
             catalog_cache_dir,
-            coreml: existing_config
-                .map(|config| config.backend.coreml)
-                .unwrap_or_default(),
             credentials: existing_config
                 .map(|config| config.credentials().to_vec())
                 .unwrap_or_default(),
@@ -469,11 +464,8 @@ pub struct SetupResult {
     pub backend_enabled: bool,
     pub inference_provider: InferenceProvider,
     pub execution_target: ExecutionTarget,
-    /// CoreML policy loaded into this wizard, including an explicit Auto/All reset.
-    pub coreml: CoreMlConfig,
     pub model_family: ModelFamily,
     pub model_size: ModelSize,
-    pub custom_model_repo: Option<String>,
 
     /// Single key accepted by the daemon's model API for every provider.
     pub finch_api_key: String,

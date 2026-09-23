@@ -14,8 +14,8 @@ path remains available for custom models. Finch's configured Hugging Face token 
 daemon; otherwise the standard hf-hub environment/cache token is used. The user-configured local model setting is for chat
 LLMs, not memory embedders or rerankers.
 For GGUF, `execution_target = "auto"` permits GPU offload when available;
-`execution_target = "cpu"` disables it. CoreML and CUDA target names refer to other backends
-and are rejected rather than silently remapped.
+`execution_target = "cpu"` disables it. Removed CoreML and CUDA chat target names are rejected
+rather than silently remapped.
 
 Memory embeddings are outside this local chat-provider slice. The frontend memory selector,
 defaults, and automatic model download remain independently owned. Its current ONNX dependency

@@ -139,7 +139,7 @@ mod tests {
 
         // Test DeepSeek-R1-Distill-Qwen (contains both "deepseek" and "qwen")
         // Should match DeepSeek, not Qwen
-        let deepseek_qwen = AdapterRegistry::get_adapter("DeepSeek-R1-Distill-Qwen-1.5B-ONNX");
+        let deepseek_qwen = AdapterRegistry::get_adapter("DeepSeek-R1-Distill-Qwen-1.5B-GGUF");
         assert_eq!(deepseek_qwen.family_name(), "DeepSeek");
     }
 }

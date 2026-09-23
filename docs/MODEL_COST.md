@@ -14,7 +14,7 @@ Codex write-up.
 Finch is supposed to be the harness so you stop hopping ChatGPT / Claude / Grok
 UIs when a cap hits. One daemon, many providers, `/provider` to swap. Token
 burn from `/plan` (IMPCPD, seven personas, live) and from implement-then-review
-loops is real. Local Qwen/ONNX is already the cheap path for compression; cloud
+loops is real. Local llama.cpp/GGUF is the intended cheap path for compression; cloud
 is the coding/review path.
 
 Do not take third-party summaries of Finch as inventory. `/plan` is not "six
@@ -40,7 +40,7 @@ fills `compress` / `review` when the user never set it.
 Add a `roles` list (`compress`, `cheap`, `review`, `default`). Heuristics fill
 that from the stable `type` tag, not from the user's display name:
 
-- `type = "local"` (Qwen/ONNX/Candle) → `compress` (and `cheap` if nothing else is)
+- `type = "local"` (llama.cpp/GGUF) → `compress` (and `cheap` if nothing else is)
 - `type = "grok"` → `cheap` / implement default
 - `type = "claude"` → `review` if no review role exists yet
 - first enabled cloud entry → `default` work lane if unset
@@ -55,7 +55,7 @@ different model or thinking level on *this* Brain.
 Those are a **Brain overlay**: optional `model` and `reasoning_effort` on the
 Brain (or BrainRun), applied only if that provider type supports them
 ([#217](https://github.com/darwin-finch/finch/issues/217),
-[#338](https://github.com/darwin-finch/finch/issues/338)). Local/ONNX/Candle:
+[#338](https://github.com/darwin-finch/finch/issues/338)). Local llama.cpp/GGUF:
 effort is meaningless and the control is hidden; model family/size lives on
 the provider entry, not a ChatGPT-style picker. Cap failover (#450) still
 offers the next **named provider**, not a credentials form.
@@ -123,7 +123,7 @@ providers whatever they want; Finch must not grep for `qwen`.
 
 | Role | Default bind | Job |
 |------|----------------|-----|
-| `compress` | bundled local Qwen (ONNX/Candle) if weights exist | summarize Brain log → compact handoff |
+| `compress` | configured local GGUF if weights exist | summarize Brain log → compact handoff |
 | `cheap` / `review` / … | user | actual work |
 
 Setup assigns `compress` once (default: local Qwen; else cheapest configured
@@ -134,7 +134,7 @@ named provider is not a provider swap and does not compress. The summary is
 an event on the Brain, so you can see what was dropped.
 
 Do not use the outgoing flagship to summarize "random back and forth." That
-defeats the point. Local Qwen shipped by default is how this stays free when
+defeats the point. A configured local GGUF is how this stays free when
 the user has no API.
 
 ## Inline recap is the MemTree rollup
