@@ -136,6 +136,7 @@ struct CodeHopMetrics {
     disambiguation_input_bytes: usize,
     mechanical_files_examined: usize,
     mechanical_source_bytes_examined: usize,
+    routing_source_files_read: usize,
     selected_files: usize,
     body_bytes_disclosed: usize,
     disambiguation_calls: usize,
@@ -425,6 +426,9 @@ impl FindCodeTool {
                 break;
             }
             let records = rank_file_records(query, resolver, file)?;
+            if file.outline.provenance.class == RetrievalProvenanceClass::StructuralFallback {
+                metrics.routing_source_files_read += 1;
+            }
             if records.is_empty() {
                 continue;
             }
@@ -949,6 +953,7 @@ fn mechanical_route(
         metrics.mechanical_files_examined += 1;
         metrics.mechanical_source_bytes_examined += file.outline.source.byte_len;
         let source = resolver.read(&file.outline.source.path)?;
+        metrics.routing_source_files_read += 1;
         for (start, _) in source.text.match_indices(&term) {
             let end = start + term.len();
             let (start_line, end_line) = line_coordinates(&source.text, start, end);
@@ -1072,6 +1077,8 @@ fn merge_route_attempts(primary: &mut RouteAttempt, secondary: RouteAttempt) {
     primary.result.metrics.disambiguation_input_bytes +=
         secondary.result.metrics.disambiguation_input_bytes;
     primary.result.metrics.disambiguation_calls += secondary.result.metrics.disambiguation_calls;
+    primary.result.metrics.routing_source_files_read +=
+        secondary.result.metrics.routing_source_files_read;
     primary.result.metrics.selected_files = primary
         .selected
         .iter()
@@ -1088,6 +1095,7 @@ fn mechanical_file_result(
     file: &IndexedOutline,
     why: &str,
 ) -> Result<RouteAttempt> {
+    let mut routing_source_files_read = 0;
     let mut selected_records = file
         .outline
         .records
@@ -1097,6 +1105,7 @@ fn mechanical_file_result(
         .collect::<Vec<_>>();
     if selected_records.is_empty() {
         let source = resolver.read(&file.outline.source.path)?;
+        routing_source_files_read += 1;
         let end_byte = source
             .text
             .match_indices('\n')
@@ -1154,6 +1163,7 @@ fn mechanical_file_result(
             },
             warnings: Vec::new(),
             metrics: CodeHopMetrics {
+                routing_source_files_read,
                 selected_files: 1,
                 ..CodeHopMetrics::default()
             },
@@ -1605,8 +1615,11 @@ mod tests {
                 .expect("complete find_code response")
                 .len(),
             // A current cached query hashes each indexed source once, then
+            // performs any route-local fallback/mechanical reads and finally
             // generation-validates each returned span before exposing it.
-            files_read: snapshot.files.len() + result.spans.len(),
+            files_read: snapshot.files.len()
+                + result.metrics.routing_source_files_read
+                + result.spans.len(),
             source_body_bytes_disclosed: result.metrics.body_bytes_disclosed,
         }
     }
@@ -1972,7 +1985,7 @@ mod tests {
         assert_eq!(find_code.serialized_response_bytes, response.len());
         assert_eq!(
             find_code.files_read,
-            snapshot.files.len() + first.spans.len()
+            snapshot.files.len() + first.metrics.routing_source_files_read + first.spans.len()
         );
         assert_eq!(first.metrics.selected_files, 1);
         assert_eq!(
@@ -1994,6 +2007,11 @@ mod tests {
         assert!(file_list.serialized_response_bytes > 0);
         assert!(unsupported_find_code.task_success);
         assert_eq!(unsupported_find_code.source_body_bytes_disclosed, 0);
+        assert_eq!(unsupported.metrics.routing_source_files_read, 1);
+        assert_eq!(
+            unsupported_find_code.files_read,
+            snapshot.files.len() + 1 + unsupported.spans.len()
+        );
         assert!(unsupported_naive.task_success);
         assert_eq!(unsupported_naive.files_read, snapshot.files.len());
         assert!(unsupported_naive.source_body_bytes_disclosed > 0);
