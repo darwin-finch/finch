@@ -232,9 +232,9 @@ fn themes_section_lines(selected_theme: usize, width: usize) -> Vec<WizardLine> 
 /// Local Helpers section: the separate local-only model choice for
 /// finch-builtin functions (memory embeddings today), distinct from the
 /// "Model Setup" tab's chat-provider configuration.
-fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec<String> {
+fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec<WizardLine> {
     let mut lines = vec![wizard_centered(
-        &wizard_bold("Local Helper Models", Color::Blue),
+        wizard_bold("Local Helper Models", Color::Blue),
         width,
     )];
     lines.push(wizard_line(
@@ -258,7 +258,7 @@ fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec
         "Off: built-in TF-IDF embeddings. No download, no network access, \
          ever -- at lower recall quality than the neural model."
     };
-    lines.push(String::new());
+    lines.push(WizardLine::blank());
     lines.push(wizard_line(detail, Color::DarkGray));
     lines
 }
