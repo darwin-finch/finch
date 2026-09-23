@@ -243,7 +243,14 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
             } else {
                 format!("{} files", count)
             };
-            let body: Vec<String> = lines.iter().take(8).map(|l| l.to_string()).collect();
+            let total = lines.len();
+            let mut body: Vec<String> = lines.iter().take(8).map(|l| l.to_string()).collect();
+            if total > 8 {
+                body.push(format!(
+                    "{GRAY}… +{} more (ctrl+o to expand){RESET}",
+                    total - 8
+                ));
+            }
             (summary, body)
         }
 
@@ -1410,7 +1417,8 @@ mod tests {
         let content = paths.join("\n");
         let (summary, body) = tool_result_to_display("glob", &content);
         assert_eq!(summary, "20 files");
-        assert_eq!(body.len(), 8, "body should be capped at 8 paths");
+        assert_eq!(body.len(), 9, "body should be 8 paths + overflow hint");
+        assert!(body.last().unwrap().contains("ctrl+o to expand"));
     }
 
     #[test]
