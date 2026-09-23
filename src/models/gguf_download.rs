@@ -16,6 +16,9 @@ use super::bootstrap::{DownloadProgressSnapshot, GeneratorState};
 use super::unified_loader::{ModelFamily, ModelSize};
 
 const HUGGING_FACE_ENDPOINT: &str = "https://huggingface.co";
+// Some filesystems expose whole-second metadata timestamps. Re-hash while a
+// marker is this young so a same-tick overwrite cannot inherit its identity.
+const VERIFICATION_MARKER_SETTLE_TIME: Duration = Duration::from_secs(2);
 
 /// Quantizations offered for Finch-managed chat artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -62,6 +65,8 @@ struct VerificationMarker {
     modified_nanos: u128,
     #[serde(default)]
     change_marker: Option<i128>,
+    #[serde(default)]
+    settled: bool,
 }
 
 impl ManagedGgufArtifact {
@@ -420,7 +425,7 @@ impl ManagedGgufDownloader {
         tokio::fs::rename(&part_path, &final_path)
             .await
             .with_context(|| format!("commit managed GGUF {}", final_path.display()))?;
-        write_verification_marker(&marker_path, &final_path, artifact)
+        write_verification_marker(&marker_path, &final_path, artifact, false)
             .await
             .with_context(|| format!("record GGUF verification {}", marker_path.display()))?;
         drop(lock);
@@ -470,16 +475,20 @@ async fn verified_cache_hit(
     if metadata.len() != artifact.expected_size {
         return Ok(false);
     }
+    let mut current_provisional_marker = false;
     if let Ok(contents) = tokio::fs::read_to_string(marker).await {
         if let Ok(verification) = serde_json::from_str::<VerificationMarker>(&contents) {
             let change_marker = metadata_change_marker(path, &metadata);
-            if change_marker.is_some()
+            let metadata_matches = change_marker.is_some()
                 && verification.sha256.eq_ignore_ascii_case(&artifact.sha256)
                 && verification.size == metadata.len()
                 && verification.modified_nanos == modified_nanos(&metadata)?
-                && verification.change_marker == change_marker
-            {
-                return Ok(true);
+                && verification.change_marker == change_marker;
+            if metadata_matches {
+                if verification.settled {
+                    return Ok(true);
+                }
+                current_provisional_marker = true;
             }
         }
     }
@@ -488,14 +497,32 @@ async fn verified_cache_hit(
     if !digest.eq_ignore_ascii_case(&artifact.sha256) {
         return Ok(false);
     }
-    write_verification_marker(marker, path, artifact).await?;
+    if current_provisional_marker {
+        if verification_marker_is_settled(marker).await {
+            write_verification_marker(marker, path, artifact, true).await?;
+        }
+    } else {
+        write_verification_marker(marker, path, artifact, false).await?;
+    }
     Ok(true)
+}
+
+async fn verification_marker_is_settled(marker: &Path) -> bool {
+    let Ok(metadata) = tokio::fs::metadata(marker).await else {
+        return false;
+    };
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= VERIFICATION_MARKER_SETTLE_TIME)
 }
 
 async fn write_verification_marker(
     marker: &Path,
     artifact_path: &Path,
     artifact: &ManagedGgufArtifact,
+    settled: bool,
 ) -> Result<()> {
     let metadata = tokio::fs::metadata(artifact_path)
         .await
@@ -505,6 +532,7 @@ async fn write_verification_marker(
         size: metadata.len(),
         modified_nanos: modified_nanos(&metadata)?,
         change_marker: metadata_change_marker(artifact_path, &metadata),
+        settled,
     };
     let encoded = serde_json::to_vec(&verification).context("encode GGUF verification marker")?;
     tokio::fs::write(marker, encoded)
@@ -712,6 +740,22 @@ mod tests {
             .join(&artifact.revision)
     }
 
+    fn marker_path(cache: &Path, artifact: &ManagedGgufArtifact) -> PathBuf {
+        artifact_dir(cache, artifact).join(format!("{}.verified", artifact.filename))
+    }
+
+    fn age_marker_past_settle_time(marker: &Path) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(marker)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn managed_catalog_is_explicit_and_rejects_unsupported_combinations() {
         let artifact = managed_gguf_artifact(
@@ -876,6 +920,11 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(original_modified))
             .unwrap();
+        let marker = marker_path(cache.path(), &artifact);
+        write_verification_marker(&marker, &path, &artifact, false)
+            .await
+            .unwrap();
+        age_marker_past_settle_time(&marker);
         let (_, disposition) = downloader
             .ensure(&artifact, "Test model", state, &CancellationToken::new())
             .await
