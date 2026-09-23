@@ -126,22 +126,16 @@ impl TemplateGenerator {
     where
         F: FnMut(u32, &str) + Send + 'static,
     {
-        // Extract the user's last message
-        let query = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .and_then(|m| {
-                m.content.iter().find_map(|block| match block {
-                    crate::providers::ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-            })
-            .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
+        let (system_prompt, query) = self.prompt_parts(messages)?;
 
         // Try neural generator with streaming
         if let Some(generator) = &self.neural_generator {
-            match self.try_neural_generate_streaming(query, generator, token_callback) {
+            match self.try_neural_generate_streaming(
+                &system_prompt,
+                query,
+                generator,
+                token_callback,
+            ) {
                 Ok(neural_response) => {
                     // Convert to GeneratorResponse format
                     use crate::generators::ResponseMetadata;
@@ -183,12 +177,34 @@ impl TemplateGenerator {
 
     /// Generate a response for a query
     pub fn generate(&mut self, query: &str) -> Result<GeneratedResponse> {
+        let system_prompt = self.system_prompt.clone();
+        self.generate_with_system(&system_prompt, query)
+    }
+
+    /// Generate from a provider message array without discarding its caller-owned
+    /// system contract. The interactive client injects the Finch VM wire ABI in
+    /// that system message, so replacing it with the generic local constitution
+    /// makes an otherwise healthy model answer in prose.
+    pub fn generate_messages(
+        &mut self,
+        messages: &[crate::providers::Message],
+    ) -> Result<GeneratedResponse> {
+        let (system_prompt, query) = self.prompt_parts(messages)?;
+        let query = query.to_string();
+        self.generate_with_system(&system_prompt, &query)
+    }
+
+    fn generate_with_system(
+        &mut self,
+        system_prompt: &str,
+        query: &str,
+    ) -> Result<GeneratedResponse> {
         // Classify the query pattern
         let (pattern, confidence) = self.pattern_classifier.classify(query);
 
         // 1. Try neural generator FIRST - ALWAYS show the output if generation succeeds
         if let Some(generator) = &self.neural_generator {
-            match self.try_neural_generate(query, generator) {
+            match self.try_neural_generate(system_prompt, query, generator) {
                 Ok(neural_response) => {
                     // Return neural response (quality score used internally for routing)
                     let quality_score = if neural_response.len() < 10 {
@@ -274,15 +290,50 @@ impl TemplateGenerator {
         "You are Shammah, a helpful coding assistant. Be concise and accurate.".to_string()
     }
 
-    /// Format user query with chat template using model-specific adapter
-    fn format_chat_prompt(&self, user_query: &str) -> String {
+    fn format_chat_prompt_with_system(&self, system_prompt: &str, user_query: &str) -> String {
         self.model_adapter
-            .format_chat_prompt(&self.system_prompt, user_query)
+            .format_chat_prompt(system_prompt, user_query)
+    }
+
+    fn prompt_parts<'a>(
+        &self,
+        messages: &'a [crate::providers::Message],
+    ) -> Result<(String, &'a str)> {
+        let query = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .and_then(|message| {
+                message.content.iter().find_map(|block| match block {
+                    crate::providers::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            })
+            .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
+        let caller_system = messages
+            .iter()
+            .filter(|message| message.role == "system")
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                crate::providers::ContentBlock::Text { text } if !text.trim().is_empty() => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let system_prompt = if caller_system.is_empty() {
+            self.system_prompt.clone()
+        } else {
+            caller_system
+        };
+        Ok((system_prompt, query))
     }
 
     /// Try to generate response using neural model with streaming
     fn try_neural_generate_streaming<F>(
         &self,
+        system_prompt: &str,
         query: &str,
         generator: &Arc<RwLock<GeneratorModel>>,
         mut token_callback: F,
@@ -293,7 +344,7 @@ impl TemplateGenerator {
         tracing::info!("[neural_gen_stream] Starting streaming neural generation");
 
         // Format query with system prompt using chat template
-        let formatted_prompt = self.format_chat_prompt(query);
+        let formatted_prompt = self.format_chat_prompt_with_system(system_prompt, query);
 
         // Acquire lock on generator
         let mut gen = generator
@@ -346,6 +397,7 @@ impl TemplateGenerator {
     /// Try to generate response using neural model
     fn try_neural_generate(
         &self,
+        system_prompt: &str,
         query: &str,
         generator: &Arc<RwLock<GeneratorModel>>,
     ) -> Result<String> {
@@ -355,7 +407,7 @@ impl TemplateGenerator {
         );
 
         // Format query with system prompt using chat template
-        let formatted_prompt = self.format_chat_prompt(query);
+        let formatted_prompt = self.format_chat_prompt_with_system(system_prompt, query);
         tracing::debug!(
             "[neural_gen] Formatted prompt length: {} chars",
             formatted_prompt.len()
@@ -518,9 +570,14 @@ mod tests {
         let received = Arc::new(std::sync::Mutex::new(String::new()));
         let chunks = Arc::clone(&received);
         let response = generator
-            .try_neural_generate_streaming("greet me", &shared, move |_, text| {
-                chunks.lock().expect("lock chunks").push_str(text);
-            })
+            .try_neural_generate_streaming(
+                "system contract",
+                "greet me",
+                &shared,
+                move |_, text| {
+                    chunks.lock().expect("lock chunks").push_str(text);
+                },
+            )
             .expect("any TextGeneration backend must reach local streaming");
         assert!(
             response.contains("Hello from mock"),
@@ -557,6 +614,7 @@ mod tests {
         let received = Arc::clone(&streamed);
         let response = generator
             .try_neural_generate_streaming(
+                "You are a concise assistant.",
                 "Say hello in one short sentence.",
                 &shared,
                 move |_, piece| received.lock().expect("lock stream").push_str(piece),
@@ -570,6 +628,26 @@ mod tests {
             !streamed.lock().expect("lock stream").is_empty(),
             "local GGUF path must call the streaming callback"
         );
+    }
+
+    #[test]
+    fn provider_system_contract_replaces_generic_local_constitution() {
+        let generator = TemplateGenerator::new(PatternClassifier::new());
+        let messages = vec![
+            crate::providers::Message {
+                role: "system".to_string(),
+                content: vec![crate::providers::ContentBlock::Text {
+                    text: "FINCH VM WIRE CONTRACT".to_string(),
+                }],
+            },
+            crate::providers::Message::user("emit one raw program"),
+        ];
+
+        let (system, query) = generator.prompt_parts(&messages).unwrap();
+
+        assert_eq!(system, "FINCH VM WIRE CONTRACT");
+        assert_eq!(query, "emit one raw program");
+        assert!(!system.contains("helpful coding assistant"));
     }
 }
 

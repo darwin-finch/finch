@@ -149,21 +149,8 @@ impl LocalGenerator {
             return Ok(None);
         }
 
-        // Extract the user's last message
-        let query = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .and_then(|m| {
-                m.content.iter().find_map(|block| match block {
-                    crate::providers::ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-            })
-            .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
-
         // Generate using the response generator (which tries neural model first)
-        match self.response_generator.generate(query) {
+        match self.response_generator.generate_messages(messages) {
             Ok(generated) => {
                 // Convert generated response to GeneratorResponse format
                 use crate::generators::ResponseMetadata;
