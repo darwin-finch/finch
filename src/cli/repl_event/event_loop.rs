@@ -365,8 +365,18 @@ pub struct EventLoop {
     queued_remote_brain_approvals: std::collections::VecDeque<RemoteBrainApproval>,
     active_remote_brain_approval: Option<RemoteBrainApproval>,
 
-    /// Pending tool approval requests (query_id -> (tool_use, response_tx))
+    /// Pending tool approval requests (query_id -> (tool_use, response_tx)).
+    /// More than one entry can be pending at once (e.g. a subagent's own tool
+    /// approval racing the parent turn's), but only one dialog is ever shown
+    /// at a time -- `active_tool_approval` tracks which entry that is (#899).
     pending_approvals: PendingApprovalsMap,
+
+    /// The query_id whose tool-approval dialog is currently displayed in
+    /// `tui.active_dialog`, if any. A `DialogResult` for tool approval must
+    /// resolve exactly this entry in `pending_approvals`, not an arbitrary
+    /// one -- `HashMap` iteration order is unrelated to which dialog the
+    /// user actually answered (#899).
+    active_tool_approval: Option<Uuid>,
 
     /// Structured approval continuation for an exact typed-VM capability
     /// request. The choices mirror the displayed rows by index.
@@ -2180,6 +2190,7 @@ impl EventLoop {
             queued_remote_brain_approvals: std::collections::VecDeque::new(),
             active_remote_brain_approval: None,
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            active_tool_approval: None,
             pending_vm_approval: None,
             ipc_client,
             daemon_ipc_error,
@@ -2653,232 +2664,7 @@ impl EventLoop {
 
                     // Route pending dialog result (tool approval, brain question, ShowDialog oneshot, etc.)
                     if let Some(dialog_result) = dialog_result {
-                        {
-                            // Priority 0: ShowDialog (used by PresentPlan, AskUserQuestion, etc.)
-                            if let Some(tx) = self.pending_dialog_tx.take() {
-                                let _ = tx.send(dialog_result);
-                            }
-                            // Priority 1: Poset run confirmation (state machine — no oneshot)
-                            else if let Some(pending) = self.pending_poset_run.take() {
-                                if matches!(dialog_result, crate::cli::tui::DialogResult::Selected(0)) {
-                                    let PendingPosetRun { generator, poset, event_tx } = pending;
-                                    tokio::spawn(async move {
-                                        let result = crate::poset::executor::execute_poset(
-                                            Arc::new(tokio::sync::Mutex::new(poset)),
-                                            generator,
-                                        ).await;
-                                        let _ = event_tx.send(super::events::ReplEvent::PosetComplete { result });
-                                    });
-                                    self.output_manager.write_info("running");
-                                    self.render_tui().await.ok();
-                                }
-                            }
-                            // Priority 2: addressed named-Brain approval.
-                            else if let Some(pending) =
-                                self.active_remote_brain_approval.take()
-                            {
-                                let decision = match &pending.kind {
-                                    RemoteBrainApprovalKind::Tool(tool_use) => {
-                                        let is_file_mutating = matches!(
-                                            tool_use.name.as_str(),
-                                            "write" | "Write" | "edit" | "Edit"
-                                        );
-                                        let is_editor_option = is_file_mutating
-                                            && matches!(
-                                                dialog_result,
-                                                crate::cli::tui::DialogResult::Selected(1)
-                                            );
-                                        let confirmation = if is_editor_option {
-                                            let proposed = tool_use
-                                                .input
-                                                .get("content")
-                                                .or_else(|| tool_use.input.get("new_string"))
-                                                .and_then(serde_json::Value::as_str)
-                                                .unwrap_or("");
-                                            match open_in_editor(proposed) {
-                                                Ok(edited) => {
-                                                    let mut input = tool_use.input.clone();
-                                                    if input.get("content").is_some() {
-                                                        input["content"] =
-                                                            serde_json::Value::String(edited);
-                                                    } else {
-                                                        input["new_string"] =
-                                                            serde_json::Value::String(edited);
-                                                    }
-                                                    super::events::ConfirmationResult::ApproveWithInput(
-                                                        input,
-                                                    )
-                                                }
-                                                Err(error) => {
-                                                    tracing::warn!(
-                                                        "remote approval editor failed: {error}"
-                                                    );
-                                                    super::events::ConfirmationResult::Deny
-                                                }
-                                            }
-                                        } else {
-                                            let adjusted = if is_file_mutating {
-                                                match dialog_result {
-                                                    crate::cli::tui::DialogResult::Selected(0) => {
-                                                        crate::cli::tui::DialogResult::Selected(0)
-                                                    }
-                                                    crate::cli::tui::DialogResult::Selected(index) => {
-                                                        crate::cli::tui::DialogResult::Selected(
-                                                            index - 1,
-                                                        )
-                                                    }
-                                                    other => other,
-                                                }
-                                            } else {
-                                                dialog_result
-                                            };
-                                            dialog_result_to_confirmation(adjusted, tool_use)
-                                        };
-                                        confirmation_audit_value(&confirmation)
-                                    }
-                                    RemoteBrainApprovalKind::Vm { choices, .. } => {
-                                        let choice = match dialog_result {
-                                            crate::cli::tui::DialogResult::Selected(index) => choices
-                                                .get(index)
-                                                .cloned()
-                                                .unwrap_or(crate::vm::ApprovalChoice::Deny),
-                                            _ => crate::vm::ApprovalChoice::Deny,
-                                        };
-                                        serde_json::to_value(choice).unwrap_or_else(|_| {
-                                            serde_json::json!({"choice": "deny"})
-                                        })
-                                    }
-                                };
-                                let client = pending.client;
-                                let target = client.target.display_name();
-                                let event_tx = self.event_tx.clone();
-                                tokio::task::spawn_local(async move {
-                                    if let Err(error) = client
-                                        .push(crate::brain::BrainEventKind::ApprovalDecided {
-                                            request_seq: pending.request_seq,
-                                            approval_id: pending.approval_id,
-                                            decision,
-                                        })
-                                        .await
-                                    {
-                                        let _ = event_tx.send(ReplEvent::RemoteBrainError {
-                                            target,
-                                            error: error.to_string(),
-                                        });
-                                    }
-                                });
-                            } else if let Some(pending) = self.pending_vm_approval.take() {
-                                let choice = match dialog_result {
-                                    crate::cli::tui::DialogResult::Selected(index) => pending
-                                        .choices
-                                        .get(index)
-                                        .cloned()
-                                        .unwrap_or(crate::vm::ApprovalChoice::Deny),
-                                    _ => crate::vm::ApprovalChoice::Deny,
-                                };
-                                if let Some(query_id) = pending.query_id {
-                                    if let Some(turn) =
-                                        self.pending_named_brain_turns.get_mut(&query_id)
-                                    {
-                                        turn.turn_events.push(
-                                            crate::server::RunnerTurnEvent::ApprovalDecided {
-                                                approval_id: pending.approval_id,
-                                                decision: serde_json::to_value(&choice)
-                                                    .unwrap_or_else(|_| serde_json::json!({
-                                                        "choice": "serialization_error"
-                                                    })),
-                                            },
-                                        );
-                                    }
-                                }
-                                let _ = pending.response_tx.send(choice);
-                            } else {
-                                // Find which query this dialog was for (tool approval)
-                                let mut approvals = self.pending_approvals.write().await;
-
-                                if approvals.is_empty() {
-                                    // No handler consumed the result — ShowDialog result arrived
-                                    // before pending_dialog_tx was set (belt-and-suspenders race).
-                                    // Put it back so the next tick delivers it once the tx is ready.
-                                    drop(approvals);
-                                    let mut tui = self.tui_renderer.lock().await;
-                                    tui.pending_dialog_result = Some(dialog_result);
-                                } else if let Some((query_id, _pending)) = approvals.iter().next() {
-                                    let query_id = *query_id;
-                                    let PendingToolApproval { tool_use, batch, response_tx } = approvals.remove(&query_id)
-                                        .expect("query_id was just obtained from the same map");
-
-                                    // A multi-file changeset is Yes/No only. Edit-in-editor
-                                    // on one payload would break accept-or-reject-as-a-unit.
-                                    let is_changeset_batch = batch.len() > 1;
-                                    let is_file_mutating = !is_changeset_batch
-                                        && matches!(tool_use.name.as_str(), "write" | "Write" | "edit" | "Edit");
-                                    let is_editor_option = is_file_mutating && matches!(dialog_result, crate::cli::tui::DialogResult::Selected(1));
-
-                                    let confirmation = if is_changeset_batch {
-                                        match dialog_result {
-                                            crate::cli::tui::DialogResult::Selected(0) => {
-                                                super::events::ConfirmationResult::ApproveOnce
-                                            }
-                                            _ => super::events::ConfirmationResult::Deny,
-                                        }
-                                    } else if is_editor_option {
-                                        // Extract proposed content
-                                        let proposed = tool_use.input.get("content")
-                                            .or_else(|| tool_use.input.get("new_string"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-
-                                        // Write to temp file and open editor
-                                        match open_in_editor(&proposed) {
-                                            Ok(edited) => {
-                                                let mut new_input = tool_use.input.clone();
-                                                if tool_use.input.get("content").is_some() {
-                                                    new_input["content"] = serde_json::Value::String(edited);
-                                                } else {
-                                                    new_input["new_string"] = serde_json::Value::String(edited);
-                                                }
-                                                super::events::ConfirmationResult::ApproveWithInput(new_input)
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!("Editor failed: {}", e);
-                                                super::events::ConfirmationResult::Deny
-                                            }
-                                        }
-                                    } else {
-                                        // Shift option indices for file-mutating tools (extra "Edit" option at 1)
-                                        let adjusted_result = if is_file_mutating {
-                                            match dialog_result {
-                                                crate::cli::tui::DialogResult::Selected(0) => dialog_result,
-                                                crate::cli::tui::DialogResult::Selected(n) => crate::cli::tui::DialogResult::Selected(n - 1),
-                                                other => other,
-                                            }
-                                        } else {
-                                            dialog_result
-                                        };
-                                        self.dialog_result_to_confirmation(adjusted_result, &tool_use)
-                                    };
-
-                                    if let Some(turn) =
-                                        self.pending_named_brain_turns.get_mut(&query_id)
-                                    {
-                                        turn.turn_events.push(
-                                            crate::server::RunnerTurnEvent::ApprovalDecided {
-                                                approval_id: tool_use.id.clone(),
-                                                decision: confirmation_audit_value(&confirmation),
-                                            },
-                                        );
-                                    }
-
-                                    // Send confirmation back to tool execution task
-                                    let _ = response_tx.send(confirmation);
-
-                                    tracing::debug!("[EVENT_LOOP] Tool approval processed for query {}", query_id);
-                                }
-                            }
-                        }
-                        self.try_present_remote_brain_approval().await?;
+                        self.resolve_dialog_result(dialog_result).await?;
                     }
 
                     if let Some(verdict) = pending_feedback {
@@ -3003,6 +2789,256 @@ impl EventLoop {
         self.checkpoint_session_usage();
         println!("\n{resume_line}");
 
+        Ok(())
+    }
+
+    /// Route a completed dialog answer to whichever pending request it was
+    /// actually shown for. Extracted from the render-tick select arm so a
+    /// test can drive it directly without the timer (#899's production-
+    /// boundary regression needs this callable on its own).
+    async fn resolve_dialog_result(
+        &mut self,
+        dialog_result: crate::cli::tui::DialogResult,
+    ) -> Result<()> {
+        {
+            // Priority 0: ShowDialog (used by PresentPlan, AskUserQuestion, etc.)
+            if let Some(tx) = self.pending_dialog_tx.take() {
+                let _ = tx.send(dialog_result);
+            }
+            // Priority 1: Poset run confirmation (state machine — no oneshot)
+            else if let Some(pending) = self.pending_poset_run.take() {
+                if matches!(dialog_result, crate::cli::tui::DialogResult::Selected(0)) {
+                    let PendingPosetRun {
+                        generator,
+                        poset,
+                        event_tx,
+                    } = pending;
+                    tokio::spawn(async move {
+                        let result = crate::poset::executor::execute_poset(
+                            Arc::new(tokio::sync::Mutex::new(poset)),
+                            generator,
+                        )
+                        .await;
+                        let _ = event_tx.send(super::events::ReplEvent::PosetComplete { result });
+                    });
+                    self.output_manager.write_info("running");
+                    self.render_tui().await.ok();
+                }
+            }
+            // Priority 2: addressed named-Brain approval.
+            else if let Some(pending) = self.active_remote_brain_approval.take() {
+                let decision = match &pending.kind {
+                    RemoteBrainApprovalKind::Tool(tool_use) => {
+                        let is_file_mutating =
+                            matches!(tool_use.name.as_str(), "write" | "Write" | "edit" | "Edit");
+                        let is_editor_option = is_file_mutating
+                            && matches!(dialog_result, crate::cli::tui::DialogResult::Selected(1));
+                        let confirmation = if is_editor_option {
+                            let proposed = tool_use
+                                .input
+                                .get("content")
+                                .or_else(|| tool_use.input.get("new_string"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            match open_in_editor(proposed) {
+                                Ok(edited) => {
+                                    let mut input = tool_use.input.clone();
+                                    if input.get("content").is_some() {
+                                        input["content"] = serde_json::Value::String(edited);
+                                    } else {
+                                        input["new_string"] = serde_json::Value::String(edited);
+                                    }
+                                    super::events::ConfirmationResult::ApproveWithInput(input)
+                                }
+                                Err(error) => {
+                                    tracing::warn!("remote approval editor failed: {error}");
+                                    super::events::ConfirmationResult::Deny
+                                }
+                            }
+                        } else {
+                            let adjusted = if is_file_mutating {
+                                match dialog_result {
+                                    crate::cli::tui::DialogResult::Selected(0) => {
+                                        crate::cli::tui::DialogResult::Selected(0)
+                                    }
+                                    crate::cli::tui::DialogResult::Selected(index) => {
+                                        crate::cli::tui::DialogResult::Selected(index - 1)
+                                    }
+                                    other => other,
+                                }
+                            } else {
+                                dialog_result
+                            };
+                            dialog_result_to_confirmation(adjusted, tool_use)
+                        };
+                        confirmation_audit_value(&confirmation)
+                    }
+                    RemoteBrainApprovalKind::Vm { choices, .. } => {
+                        let choice = match dialog_result {
+                            crate::cli::tui::DialogResult::Selected(index) => choices
+                                .get(index)
+                                .cloned()
+                                .unwrap_or(crate::vm::ApprovalChoice::Deny),
+                            _ => crate::vm::ApprovalChoice::Deny,
+                        };
+                        serde_json::to_value(choice)
+                            .unwrap_or_else(|_| serde_json::json!({"choice": "deny"}))
+                    }
+                };
+                let client = pending.client;
+                let target = client.target.display_name();
+                let event_tx = self.event_tx.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(error) = client
+                        .push(crate::brain::BrainEventKind::ApprovalDecided {
+                            request_seq: pending.request_seq,
+                            approval_id: pending.approval_id,
+                            decision,
+                        })
+                        .await
+                    {
+                        let _ = event_tx.send(ReplEvent::RemoteBrainError {
+                            target,
+                            error: error.to_string(),
+                        });
+                    }
+                });
+            } else if let Some(pending) = self.pending_vm_approval.take() {
+                let choice = match dialog_result {
+                    crate::cli::tui::DialogResult::Selected(index) => pending
+                        .choices
+                        .get(index)
+                        .cloned()
+                        .unwrap_or(crate::vm::ApprovalChoice::Deny),
+                    _ => crate::vm::ApprovalChoice::Deny,
+                };
+                if let Some(query_id) = pending.query_id {
+                    if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+                        turn.turn_events
+                            .push(crate::server::RunnerTurnEvent::ApprovalDecided {
+                                approval_id: pending.approval_id,
+                                decision: serde_json::to_value(&choice).unwrap_or_else(|_| {
+                                    serde_json::json!({
+                                        "choice": "serialization_error"
+                                    })
+                                }),
+                            });
+                    }
+                }
+                let _ = pending.response_tx.send(choice);
+            } else {
+                // Find which query this dialog was for (tool approval): the
+                // query_id whose dialog is actually on screen (#899), not an
+                // arbitrary HashMap entry -- more than one approval can be
+                // pending at once (e.g. a subagent's own tool approval racing
+                // the parent turn's), and HashMap iteration order has nothing
+                // to do with which dialog the user just answered.
+                let mut approvals = self.pending_approvals.write().await;
+
+                if approvals.is_empty() {
+                    // No handler consumed the result — ShowDialog result arrived
+                    // before pending_dialog_tx was set (belt-and-suspenders race).
+                    // Put it back so the next tick delivers it once the tx is ready.
+                    drop(approvals);
+                    let mut tui = self.tui_renderer.lock().await;
+                    tui.pending_dialog_result = Some(dialog_result);
+                } else {
+                    let query_id = self
+                        .active_tool_approval
+                        .take()
+                        .filter(|id| approvals.contains_key(id))
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                "[EVENT_LOOP] No tracked active tool approval matched a \
+                                 pending entry; falling back to an arbitrary pending \
+                                 approval (#899)"
+                            );
+                            *approvals.keys().next().expect("approvals is non-empty")
+                        });
+                    let PendingToolApproval {
+                        tool_use,
+                        batch,
+                        response_tx,
+                    } = approvals
+                        .remove(&query_id)
+                        .expect("query_id was just obtained from the same map");
+
+                    // A multi-file changeset is Yes/No only. Edit-in-editor
+                    // on one payload would break accept-or-reject-as-a-unit.
+                    let is_changeset_batch = batch.len() > 1;
+                    let is_file_mutating = !is_changeset_batch
+                        && matches!(tool_use.name.as_str(), "write" | "Write" | "edit" | "Edit");
+                    let is_editor_option = is_file_mutating
+                        && matches!(dialog_result, crate::cli::tui::DialogResult::Selected(1));
+
+                    let confirmation = if is_changeset_batch {
+                        match dialog_result {
+                            crate::cli::tui::DialogResult::Selected(0) => {
+                                super::events::ConfirmationResult::ApproveOnce
+                            }
+                            _ => super::events::ConfirmationResult::Deny,
+                        }
+                    } else if is_editor_option {
+                        // Extract proposed content
+                        let proposed = tool_use
+                            .input
+                            .get("content")
+                            .or_else(|| tool_use.input.get("new_string"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        // Write to temp file and open editor
+                        match open_in_editor(&proposed) {
+                            Ok(edited) => {
+                                let mut new_input = tool_use.input.clone();
+                                if tool_use.input.get("content").is_some() {
+                                    new_input["content"] = serde_json::Value::String(edited);
+                                } else {
+                                    new_input["new_string"] = serde_json::Value::String(edited);
+                                }
+                                super::events::ConfirmationResult::ApproveWithInput(new_input)
+                            }
+                            Err(e) => {
+                                tracing::warn!("Editor failed: {}", e);
+                                super::events::ConfirmationResult::Deny
+                            }
+                        }
+                    } else {
+                        // Shift option indices for file-mutating tools (extra "Edit" option at 1)
+                        let adjusted_result = if is_file_mutating {
+                            match dialog_result {
+                                crate::cli::tui::DialogResult::Selected(0) => dialog_result,
+                                crate::cli::tui::DialogResult::Selected(n) => {
+                                    crate::cli::tui::DialogResult::Selected(n - 1)
+                                }
+                                other => other,
+                            }
+                        } else {
+                            dialog_result
+                        };
+                        self.dialog_result_to_confirmation(adjusted_result, &tool_use)
+                    };
+
+                    if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+                        turn.turn_events
+                            .push(crate::server::RunnerTurnEvent::ApprovalDecided {
+                                approval_id: tool_use.id.clone(),
+                                decision: confirmation_audit_value(&confirmation),
+                            });
+                    }
+
+                    // Send confirmation back to tool execution task
+                    let _ = response_tx.send(confirmation);
+
+                    tracing::debug!(
+                        "[EVENT_LOOP] Tool approval processed for query {}",
+                        query_id
+                    );
+                }
+            }
+        }
+        self.try_present_remote_brain_approval().await?;
         Ok(())
     }
 
