@@ -110,6 +110,13 @@ pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool 
 /// Returns `Some(tool_result)` when the tool call is a `PresentPlan` invocation;
 /// returns `None` for every other tool name so the caller can fall through to
 /// normal tool dispatch.
+///
+/// `race_hook` is always `None` in production. A test that needs to land a
+/// cancellation inside the approval-to-`Executing` write window passes
+/// `Some((reached, resume))`: this function notifies `reached` and awaits
+/// `resume` immediately before taking the mode write guard, giving the test a
+/// deterministic pause point instead of racing real thread scheduling
+/// (#464).
 pub(crate) async fn handle_present_plan(
     tool_use: &ToolUse,
     tui_renderer: Arc<tokio::sync::Mutex<TuiRenderer>>,
@@ -118,6 +125,7 @@ pub(crate) async fn handle_present_plan(
     cancel: CancellationToken,
     work_unit: Arc<WorkUnit>,
     event_tx: &mpsc::UnboundedSender<ReplEvent>,
+    race_hook: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 ) -> Option<Result<String>> {
     use chrono::Utc;
     use crossterm::style::Stylize;
@@ -237,16 +245,39 @@ pub(crate) async fn handle_present_plan(
     // Handle dialog result
     match dialog_result {
         crate::cli::tui::DialogResult::Selected(0) => {
+            if let Some(hook) = &race_hook {
+                hook.0.notify_one();
+                hook.1.notified().await;
+            }
+
+            // TOCTOU guard (#464): `cancel` can fire concurrently between the
+            // select above resolving to this arm and the mode write below —
+            // production runs multi-threaded and the query turn is a
+            // separate spawn. Re-check under the same guard that performs
+            // the write so a cancellation landing in that window can never
+            // leave `mode` stuck at `Executing` for a cancelled turn:
+            // `CancelQuery` fires its token strictly before it writes
+            // `Normal`, so if the token is already fired here the guard
+            // below either observes it (this branch) or `CancelQuery`'s own
+            // unconditional `Normal` write is still pending and lands right
+            // after ours.
+            let mut mode_guard = mode.write().await;
+            if cancel.is_cancelled() {
+                drop(mode_guard);
+                return Some(Ok(dismissed_plan_msg()));
+            }
+
             // Approved — transition to executing mode.
             // Do NOT mutate the conversation here; finalize_tool_execution will add
             // the ToolResult message (referencing the assistant's ToolUse block) after
             // we return.  Adding extra user messages here would create consecutive user
             // messages that the Claude API rejects, causing a silent hang.
-            *mode.write().await = crate::cli::ReplMode::Executing {
+            *mode_guard = crate::cli::ReplMode::Executing {
                 task: task.clone(),
                 plan_path: plan_path.clone(),
                 approved_at: Utc::now(),
             };
+            drop(mode_guard);
 
             output_manager.write_info(format!(
                 "{}",
@@ -898,6 +929,99 @@ mod tests {
         assert!(
             has_consecutive_users,
             "expected the old buggy pattern to produce consecutive user messages"
+        );
+    }
+
+    // ── TOCTOU regression (#464) ─────────────────────────────────────────────
+
+    /// Drives `handle_present_plan` to real approval ("Approve and execute"),
+    /// with `race_hook` set so the test can land a cancellation inside the
+    /// exact window between the select resolving to `Selected(0)` and the
+    /// `mode` write — the gap #464 reports. Deterministic: the hook pauses
+    /// the handler at that point instead of racing real thread scheduling
+    /// (CLAUDE.md: assert the structural fact, not comparative timing).
+    #[tokio::test]
+    async fn test_present_plan_approve_race_with_concurrent_cancel_does_not_stick_executing() {
+        use crate::cli::status_bar::StatusBar;
+        use crate::cli::tui::DialogResult;
+        use tokio::sync::{Notify, RwLock};
+
+        let colors = crate::theme::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        let mode = Arc::new(RwLock::new(ReplMode::Planning {
+            task: "test task".to_string(),
+            plan_path: std::path::PathBuf::from("/tmp/plan.md"),
+            created_at: chrono::Utc::now(),
+        }));
+        let cancel = CancellationToken::new();
+        let work_unit = Arc::new(WorkUnit::new("test"));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let tool_use = ToolUse {
+            id: "call-1".to_string(),
+            name: "present_plan".to_string(),
+            input: serde_json::json!({ "plan": "Step 1: do the thing" }),
+        };
+        let hook = Arc::new((Notify::new(), Notify::new()));
+
+        // Answers the ShowDialog event with "Approve and execute" (index 0) as
+        // soon as it arrives, so the handler's internal `select!` resolves via
+        // `dialog_rx`, not `cancel.cancelled()` — the race under test is the
+        // one *after* that select, not the one the select itself guards.
+        let responder = tokio::spawn(async move {
+            if let Some(ReplEvent::ShowDialog { response_tx, .. }) = event_rx.recv().await {
+                let _ = response_tx.send(DialogResult::Selected(0));
+            }
+        });
+
+        let handler_mode = Arc::clone(&mode);
+        let handler_cancel = cancel.clone();
+        let handler_hook = Arc::clone(&hook);
+        let handler = tokio::spawn(async move {
+            handle_present_plan(
+                &tool_use,
+                tui_renderer,
+                handler_mode,
+                output,
+                handler_cancel,
+                work_unit,
+                &event_tx,
+                Some(handler_hook),
+            )
+            .await
+        });
+
+        // Wait until the handler has committed to the approved branch and is
+        // parked right before taking the mode write guard, then fire the
+        // cancellation that #464 says can land in that exact window.
+        hook.0.notified().await;
+        cancel.cancel();
+        hook.1.notify_one();
+
+        let result = handler
+            .await
+            .expect("handler task must not panic")
+            .expect("PresentPlan tool call must produce a result");
+        responder.await.expect("responder task must not panic");
+
+        let final_mode = mode.read().await;
+        assert!(
+            !matches!(&*final_mode, ReplMode::Executing { .. }),
+            "a cancellation that lands between dialog approval and the mode \
+             write must never leave `mode` stuck at Executing for a turn the \
+             user cancelled; got {final_mode:?}"
+        );
+        drop(final_mode);
+
+        let message = result.expect("cancelled-race path must return Ok, not Err");
+        assert!(
+            message.contains("cancelled"),
+            "expected the cancelled-race path to report cancellation, got: {message}"
         );
     }
 }

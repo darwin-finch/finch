@@ -1107,6 +1107,7 @@ pub(super) async fn dispatch_tool_uses(
                 .unwrap_or_else(CancellationToken::new),
             Arc::clone(work_unit),
             event_tx,
+            None,
         )
         .await
         {
