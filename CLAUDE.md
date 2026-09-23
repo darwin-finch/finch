@@ -59,7 +59,7 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 
 ### Routing
 
-- **Router forwards to teacher for ALL queries while model is loading** — `test_route_with_generator_not_ready_always_forwards` in `src/router/decision.rs`
+- **Router forwards to a cloud provider for ALL queries while model is loading** — `test_route_with_generator_not_ready_always_forwards` in `src/router/decision.rs`
 - **Router does not return `ModelNotReady` when generator IS ready** — `test_route_with_generator_ready_uses_normal_routing` in `src/router/decision.rs`
 
 ### TUI

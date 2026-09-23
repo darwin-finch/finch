@@ -6,7 +6,7 @@ use std::collections::HashSet;
 /// Calculate semantic similarity between two texts (0.0 = different, 1.0 = identical)
 ///
 /// Phase 1: Uses Jaccard similarity (word overlap) as a fast approximation
-/// TODO Phase 2: Replace with actual embeddings (sentence-transformers via candle)
+/// TODO: Replace with an injected semantic-embedding implementation.
 pub fn semantic_similarity(text1: &str, text2: &str) -> Result<f64> {
     let words1 = tokenize(text1);
     let words2 = tokenize(text2);

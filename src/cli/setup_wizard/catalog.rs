@@ -27,8 +27,11 @@ pub(super) enum AddProviderStep {
         inference_provider: InferenceProvider,
         family: ModelFamily,
         size: ModelSize,
+        quantization: GgufQuantization,
         execution: ExecutionTarget,
-        focused_field: usize, // 0=Backend, 1=Family, 2=Size, 3=Device
+        model_path: String,
+        focused_field: usize, // 0=Backend, 1=Family, 2=Size, 3=Quant, 4=Device, 5=GGUF path
+        editing_idx: Option<usize>,
     },
     // Network scan path
     Scanning {
@@ -442,6 +445,8 @@ pub enum ModelConfig {
         size: ModelSize,
         execution: ExecutionTarget,
         inference_provider: InferenceProvider,
+        model_path: Option<std::path::PathBuf>,
+        managed_artifact: Option<ManagedGgufArtifact>,
         enabled: bool,
         /// Original profile metadata that the local-model editor does not
         /// expose yet (stable name, repository, and resolved model path).
@@ -511,8 +516,6 @@ impl ModelConfig {
 }
 
 /// Convert a persisted provider profile into the wizard's editable model form.
-/// Local providers live only in the unified provider list, not the legacy
-/// `teachers` projection.
 pub(super) fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
     match provider {
         ProviderEntry::Credentialed {
@@ -538,6 +541,8 @@ pub(super) fn model_config_from_provider(provider: &ProviderEntry) -> Option<Mod
             execution_target,
             model_family,
             model_size,
+            model_path,
+            managed_artifact,
             enabled,
             ..
         } => Some(ModelConfig::Local {
@@ -545,6 +550,8 @@ pub(super) fn model_config_from_provider(provider: &ProviderEntry) -> Option<Mod
             size: *model_size,
             execution: *execution_target,
             inference_provider: *inference_provider,
+            model_path: model_path.clone(),
+            managed_artifact: managed_artifact.clone(),
             enabled: *enabled,
             persisted: Some(provider.clone()),
         }),
@@ -564,19 +571,59 @@ pub(super) fn model_config_from_provider(provider: &ProviderEntry) -> Option<Mod
             enabled: true,
             persisted: Some(provider.clone()),
         }),
-        _ => provider
-            .to_teacher_entry()
-            .map(|teacher| ModelConfig::Remote {
-                provider: teacher.provider.clone(),
-                name: teacher
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| teacher.provider.clone()),
-                api_key: teacher.api_key,
-                model: teacher.model.unwrap_or_default(),
+        _ => {
+            let (family, api_key, model, name) = match provider {
+                ProviderEntry::Claude {
+                    api_key,
+                    model,
+                    name,
+                    ..
+                } => ("claude", api_key, model, name),
+                ProviderEntry::Openai {
+                    api_key,
+                    model,
+                    name,
+                    ..
+                } => ("openai", api_key, model, name),
+                ProviderEntry::Grok {
+                    api_key,
+                    model,
+                    name,
+                    ..
+                } => ("grok", api_key, model, name),
+                ProviderEntry::Gemini {
+                    api_key,
+                    model,
+                    name,
+                } => ("gemini", api_key, model, name),
+                ProviderEntry::Mistral {
+                    api_key,
+                    model,
+                    name,
+                    ..
+                } => ("mistral", api_key, model, name),
+                ProviderEntry::Groq {
+                    api_key,
+                    model,
+                    name,
+                } => ("groq", api_key, model, name),
+                ProviderEntry::Openrouter {
+                    api_key,
+                    model,
+                    name,
+                    ..
+                } => ("openrouter", api_key, model, name),
+                _ => return None,
+            };
+            Some(ModelConfig::Remote {
+                provider: family.to_string(),
+                name: name.clone().unwrap_or_else(|| family.to_string()),
+                api_key: api_key.clone(),
+                model: model.clone().unwrap_or_default(),
                 enabled: true,
                 persisted: Some(provider.clone()),
-            }),
+            })
+        }
     }
 }
 
@@ -611,13 +658,14 @@ pub(super) fn is_unconfigured_placeholder(model: &ModelConfig) -> bool {
         // the unconfigured placeholder; one that never takes a key — a ChatGPT
         // subscription, an Ollama server, a discovered Finch daemon — is real.
         None => provider_requires_inline_api_key(provider),
-        // Persisted. `to_teacher_entry` returns `None` for credential-backed,
-        // Ollama, remote-daemon and local entries, each of which authenticates or
-        // addresses itself without an inline key; only a legacy key-based entry
-        // holding no key is the "[Not configured]" empty state.
+        // Persisted. Simple API-key cloud entries authenticate through an
+        // inline key; credential-backed, Ollama, remote-daemon and local
+        // entries authenticate or address themselves without one. Only a
+        // simple cloud entry holding no key is the "[Not configured]" empty
+        // state.
         Some(entry) => entry
-            .to_teacher_entry()
-            .is_some_and(|teacher| teacher.api_key.is_empty()),
+            .simple_cloud_key()
+            .is_some_and(|(_, api_key)| api_key.is_empty()),
     }
 }
 
@@ -777,13 +825,7 @@ pub(super) fn provider_entry_from_remote_model(
             name,
             reasoning_effort: Some(crate::config::ReasoningEffort::Medium),
         },
-        _ => ProviderEntry::from_teacher_entry(&TeacherEntry {
-            provider: provider.to_string(),
-            api_key: api_key.to_string(),
-            model,
-            base_url: None,
-            name,
-        }),
+        _ => ProviderEntry::from_provider_fields(provider, api_key.to_string(), model, None, name),
     }
 }
 

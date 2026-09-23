@@ -19,10 +19,6 @@ pub use finch_vm_core::{
     certify_module, Elaborated, FunctionCertified, ModuleSealed, ModuleVerified, Parsed,
     SemanticBuilder, SEMANTIC_CONSTRUCTION_VERSION,
 };
-pub use wire::{
-    accepts_published_grammar, accepts_wire_source, render_wire_gbnf, WireReject,
-    WIRE_GRAMMAR_ARTIFACT, WIRE_GRAMMAR_VERSION,
-};
 
 /// Compile source in `language` through the shared compiler pipeline.
 pub fn compile(

@@ -584,7 +584,7 @@ where
     }
 
     /// Construct with injected HTTP/clock/sleeper ports.
-    pub fn with_ports(dialect: Arc<D>, store: Arc<S>, ports: ProviderPorts) -> Result<Self> {
+    pub(crate) fn with_ports(dialect: Arc<D>, store: Arc<S>, ports: ProviderPorts) -> Result<Self> {
         dialect.descriptor().validate()?;
         dialect.preflight()?;
         Ok(Self {

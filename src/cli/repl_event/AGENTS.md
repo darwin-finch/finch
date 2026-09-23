@@ -45,8 +45,8 @@ commits sticky conversation rows between program source and output (#819). Lefto
 environment mismatch at startup still uses `apply_home_runner_startup` (header plus the detailed
 startup TUI line, #794).
 
-**Snapshot replay reconstructs say-turn cards (#970).** The say ViewModel is produced only by the
-live paths, so `project_remote_brain_snapshot_runs` also runs
+**Snapshot replay reconstructs say-turn cards (#970).** The say ViewModel is produced only by
+the live paths, so `project_remote_brain_snapshot_runs` also runs
 `reconstruct_replayed_say_turn_cards`: a freshly replayed Interactive run whose journal pattern is
 one typed `Program` (the run-correlated provider event, or the run-unaffiliated event at
 `run.request_seq` for typed programs) plus a successful `Result`, with no tool or approval events,
@@ -59,8 +59,22 @@ than one Program, an errored Result, a failed/cancelled/completed-without-output
 this snapshot did not create (a locally rendered live turn or an earlier snapshot), or a unit that
 already carries a card (a later snapshot must not reset `show_program` or duplicate output). The
 Snapshot branch also skips the run-unaffiliated Program source unit for programs a replayed card
-already covers, so one turn never wears two representations. The live event path
-(`project_remote_brain_live_run_event`) is untouched.
+already covers, so one turn never wears two representations.
+
+**Locally executed runs never wear the legacy run group (#978).** When this frontend holds the
+home runner lease, runs it initiated are executed by its own callback paths and rendered through
+the same local units every other local path uses, so daemon lifecycle events for those runs never
+create or paint the run group — `project_remote_brain_live_run_event` consults
+`LocallyRenderedRuns` (delegated turns and programs in flight, queued local projections, and
+completed pure-say runs marked in `locally_say_projected_runs`) plus the initiating-attachment
+prediction on `RunStarted`. The delegated typed-program path (`dispatch_named_brain_program`)
+paints the source unit and `begin_say_turn` card itself and registers a `LocalBrainProjection`
+(`program_seq` = the run's request sequence) when the VM settles; `finish_named_brain_turn` does
+the same for delegated provider turns, so a pure-say turn's terminal `Result` is suppressed and
+marked, while a tool-bearing turn keeps its run-group rows. The pushed-program echo is matched
+against a bounded `locally_pushed_programs` marker so the run-unaffiliated source unit renders
+exactly once whichever arrives first. A peer's run on another Brain, or one this frontend did not
+initiate or execute, keeps its legacy rows (the control regressions pin this).
 
 **The state is shared, and that is the known weakness.** Every handler takes `&mut self` on an
 `EventLoop` whose field list is long. Before adding a field, check whether the state belongs to a

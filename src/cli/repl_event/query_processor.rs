@@ -2973,9 +2973,6 @@ mod tests {
                 event_tx.clone(),
                 Arc::new(tokio::sync::Mutex::new(executor)),
                 Arc::clone(&output),
-                Arc::clone(&conversation),
-                Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
-                Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
                 Arc::new(RwLock::new(ReplMode::Normal)),
                 Arc::new(RwLock::new(None)),
             );
@@ -4707,9 +4704,6 @@ mod tests {
             event_tx.clone(),
             Arc::new(tokio::sync::Mutex::new(executor)),
             Arc::clone(&output),
-            Arc::clone(&conversation),
-            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
-            Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
             Arc::clone(&mode),
             Arc::new(RwLock::new(None)),
         );
@@ -4974,9 +4968,6 @@ mod tests {
                 event_tx.clone(),
                 Arc::new(tokio::sync::Mutex::new(executor)),
                 Arc::clone(&output),
-                Arc::clone(&conversation),
-                Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
-                Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
                 Arc::clone(&mode),
                 Arc::new(RwLock::new(None)),
             );
@@ -5438,9 +5429,6 @@ mod tests {
             event_tx.clone(),
             Arc::new(tokio::sync::Mutex::new(executor)),
             Arc::clone(&output),
-            Arc::clone(&conversation),
-            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
-            Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
             Arc::clone(&mode),
             Arc::new(RwLock::new(None)),
         );
@@ -6391,9 +6379,6 @@ mod tests {
             event_tx.clone(),
             Arc::new(tokio::sync::Mutex::new(executor)),
             Arc::clone(&output),
-            Arc::clone(&conversation),
-            Arc::new(tokio::sync::RwLock::new(crate::local::LocalGenerator::new())),
-            Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
             Arc::new(tokio::sync::RwLock::new(ReplMode::Normal)),
             Arc::new(tokio::sync::RwLock::new(None)),
         );
@@ -6482,9 +6467,6 @@ mod tests {
             event_tx.clone(),
             Arc::new(tokio::sync::Mutex::new(executor)),
             Arc::clone(&output),
-            Arc::clone(&conversation),
-            Arc::new(tokio::sync::RwLock::new(crate::local::LocalGenerator::new())),
-            Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
             Arc::new(tokio::sync::RwLock::new(ReplMode::Normal)),
             Arc::new(tokio::sync::RwLock::new(None)),
         );

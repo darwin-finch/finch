@@ -179,31 +179,36 @@ pub enum ContentBlock {
 }
 
 impl ContentBlock {
-    /// Check if this is a text block
-    pub fn is_text(&self) -> bool {
+    /// Check if this is a text block. (Test-only; callers match on the enum.)
+    #[cfg(test)]
+    fn is_text(&self) -> bool {
         matches!(self, ContentBlock::Text { .. })
     }
 
-    /// Check if this is a tool use block
-    pub fn is_tool_use(&self) -> bool {
+    /// Check if this is a tool use block. (Test-only; callers match on the enum.)
+    #[cfg(test)]
+    fn is_tool_use(&self) -> bool {
         matches!(self, ContentBlock::ToolUse { .. })
     }
 
-    /// Check if this is a tool result block
-    pub fn is_tool_result(&self) -> bool {
+    /// Check if this is a tool result block. (Test-only; callers match on the enum.)
+    #[cfg(test)]
+    fn is_tool_result(&self) -> bool {
         matches!(self, ContentBlock::ToolResult { .. })
     }
 
-    /// Extract text from text block
-    pub fn as_text(&self) -> Option<&str> {
+    /// Extract text from text block. (Test-only; callers match on the enum.)
+    #[cfg(test)]
+    fn as_text(&self) -> Option<&str> {
         match self {
             ContentBlock::Text { text } => Some(text),
             _ => None,
         }
     }
 
-    /// Extract tool use from tool use block
-    pub fn as_tool_use(&self) -> Option<ToolUse> {
+    /// Extract tool use from tool use block. (Test-only; callers match on the enum.)
+    #[cfg(test)]
+    fn as_tool_use(&self) -> Option<ToolUse> {
         match self {
             ContentBlock::ToolUse { id, name, input } => Some(ToolUse {
                 id: id.clone(),

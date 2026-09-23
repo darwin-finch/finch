@@ -28,7 +28,7 @@ needs.
 [`crate::tools::ToolLoop`] (REPL and scheduler).
 
 **Generator names are family-truthful.** `QwenGenerator::name()` reports the
-served family path (`QWEN_LOCAL_GENERATOR_NAME`, "qwen2.5-onnx"), never a bare
+served family path (`QWEN_LOCAL_GENERATOR_NAME`, "qwen2.5-llama-cpp"), never a bare
 "Local"; capability claims derive from the models family catalog
 (`ModelFamily::local_engine_capabilities`) instead of hardcoded prose. The
 adapter buffers complete turns — engine streaming is served through the daemon

@@ -67,7 +67,7 @@ pub fn lisp_lexicon() -> LispLexicon {
 }
 
 /// True when `ch` ends a CoLisp atom outside a `<...>` type argument list.
-pub fn lisp_atom_delimiter(ch: char, angle_depth: usize) -> bool {
+pub(crate) fn lisp_atom_delimiter(ch: char, angle_depth: usize) -> bool {
     let lex = lisp_lexicon();
     ch.is_whitespace()
         || ch == lex.list_open

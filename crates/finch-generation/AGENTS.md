@@ -23,6 +23,40 @@ TUI, daemon, CLI orchestration, tool execution (`ToolExecutor`), or
 application `Config`. Environmental effects are injected through
 [`GenerationPorts`](src/ports.rs).
 
+**Surface tiers (issue #959 audit).** The `pub use` list in
+[`src/lib.rs`](src/lib.rs) is the cross-crate contract; everything below it is
+tiered so implementation detail cannot leak back in:
+
+- **Crate-internal (`pub(crate)`):** `GenerationId::new`,
+  `GenerationIdentity::{for_dispatch, with_actual_model}`,
+  `TerminalOutcome::identity`, `ReadinessReport::ready`, and
+  `GenerationCapabilities::for_strategy`. Widening any of these is a capsule
+  change, not cleanup.
+- **Module-internal (private):** `validate_model_id`,
+  `ProviderGenerationBackend::for_model` (construct through `new`),
+  `ResourceBudget::unlimited`, `ScriptedBackend::set_readiness` (callers use
+  `set_phase`), and the default port fixtures behind `GenerationPorts::test()`
+  (`InstantSleeper`, `TracingProgress`, `UnknownHardware`, `ReadyLoader`,
+  `EmptyCache`, `TracingTelemetry`, `InlineScheduler`).
+- **Test-only (`#[cfg(test)]`):** `ToolResult::{success, error}` and
+  `FrozenMonotonicClock::advance`.
+
+Kept exported though production code never calls them, each with a traced
+external-caller seam: `select_backend` (production-boundary selection tests in
+`tests/lifecycle.rs`), the `GenerationBackend` trait and methods (dynamic
+dispatch through `Arc<dyn GenerationBackend>` in the supervisor and lifecycle
+tests), `GenerationMetadata`/`Usage`/`RejectedBackend` (variant and field
+types of public items), the eight port traits (public field types of
+`GenerationPorts`, whose `clock`/`sleeper` fields lifecycle tests inject
+through), `ControllableSleeper`/`FrozenMonotonicClock`/`ScriptedBackend`/
+`ScriptedStep` (lifecycle tests and the `scripted_backend` example), and
+`SystemMonotonicClock`/`TokioSleeper` (production clock/sleeper constructors;
+`GenerationPorts` must stay constructible outside the crate). Deleted as
+unreferenced by the same audit: `GenerationEvent::is_terminal`,
+`GenerationId::as_uuid`, `GenerationPorts::production`, and
+`GenerationRequest::with_tools` (every `.with_tools` hit is a provider-layer
+request type, not this one).
+
 **Invariants:**
 - Callers use the generation interface without Finch application types.
 - Local, cloud, and test backends share the same lifecycle and cancellation
@@ -61,7 +95,7 @@ adapters (Claude, Qwen, daemon-local) stay in `src/generators`.
   semantic identities. `finch-providers` compiles those into per-request
   bijective wire-binding tables (issue #241) at the validated dispatch
   boundary; this crate must keep storing semantic names, not provider aliases.
-- Local model architecture rewrite (ONNX/Candle/Qwen internals) is out of scope.
+- Local llama.cpp/GGUF loader and Qwen adapter internals are out of scope.
 - Rustdoc, not a checked-in generated catalog, supplies trait method signatures, including
   asynchronous `GenerationBackend::generate` and `Sleeper::sleep`.
 - `GenerationPorts` progress/loader/cache/telemetry/scheduler are construction

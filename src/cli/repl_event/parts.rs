@@ -17,7 +17,6 @@ use crate::cli::output_manager::OutputManager;
 use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::TuiRenderer;
-use crate::local::LocalGenerator;
 use crate::models::GeneratorState;
 
 /// Who is talking, as what, and in which mode.
@@ -33,8 +32,6 @@ pub struct GenerationParts {
     pub generator: Arc<dyn crate::generators::Generator>,
     pub router: Arc<crate::router::Router>,
     pub state: Arc<RwLock<GeneratorState>>,
-    pub local: Arc<RwLock<LocalGenerator>>,
-    pub tokenizer: Arc<crate::models::TextTokenizer>,
     pub resolver: crate::scheduler::ProviderResolver,
     pub available: Vec<crate::config::ProviderEntry>,
     pub active_index: usize,

@@ -166,7 +166,7 @@ fn commit_remote_provider(
     }
 }
 
-/// Handle input for Models section (unified Backend + Teachers)
+/// Handle input for Models section (unified provider entries)
 pub(super) fn handle_models_input(
     state: &mut WizardState,
     key: crossterm::event::KeyEvent,
@@ -203,56 +203,23 @@ pub(super) fn handle_models_input(
         // Handle add-provider overlay first
         if adding_provider.is_some() {
             // Build option lists used by ConfigureLocal cycling
-            let local_backends: Vec<InferenceProvider> = {
-                let mut v = vec![InferenceProvider::Onnx];
-                #[cfg(feature = "candle")]
-                v.push(InferenceProvider::Candle);
-                v
-            };
-            // When Candle is selected, only Qwen 2.5 is currently supported
-            let candle_selected = {
-                #[cfg(feature = "candle")]
-                {
-                    matches!(
-                        adding_provider,
-                        Some(AddProviderStep::ConfigureLocal {
-                            inference_provider: InferenceProvider::Candle,
-                            ..
-                        })
-                    )
-                }
-                #[cfg(not(feature = "candle"))]
-                {
-                    false
-                }
-            };
-            let local_families: Vec<ModelFamily> = if candle_selected {
-                vec![ModelFamily::Qwen2]
-            } else {
-                vec![
-                    ModelFamily::Qwen2,
-                    ModelFamily::Gemma2,
-                    ModelFamily::Llama3,
-                    ModelFamily::Mistral,
-                    ModelFamily::Phi,
-                    ModelFamily::DeepSeek,
-                ]
-            };
+            let local_backends = [InferenceProvider::LlamaCpp];
+            let local_families = [
+                ModelFamily::Qwen2,
+                ModelFamily::Gemma2,
+                ModelFamily::Llama3,
+                ModelFamily::Mistral,
+                ModelFamily::Phi,
+                ModelFamily::DeepSeek,
+            ];
             let local_sizes = [
                 ModelSize::Small,
                 ModelSize::Medium,
                 ModelSize::Large,
                 ModelSize::XLarge,
             ];
-            let local_devices: Vec<ExecutionTarget> = {
-                let mut v = vec![ExecutionTarget::Auto];
-                #[cfg(target_os = "macos")]
-                v.push(ExecutionTarget::CoreML);
-                v.push(ExecutionTarget::Cpu);
-                #[cfg(feature = "cuda")]
-                v.push(ExecutionTarget::Cuda);
-                v
-            };
+            let local_quantizations = [GgufQuantization::Q4KM, GgufQuantization::Q5KM];
+            let local_devices = [ExecutionTarget::Auto, ExecutionTarget::Cpu];
 
             match key.code {
                 KeyCode::Esc => {
@@ -315,7 +282,7 @@ pub(super) fn handle_models_input(
                         }
                     }
                     Some(AddProviderStep::ConfigureLocal { focused_field, .. }) => {
-                        if *focused_field < 3 {
+                        if *focused_field < 5 {
                             *focused_field += 1;
                         }
                     }
@@ -342,51 +309,61 @@ pub(super) fn handle_models_input(
                             inference_provider,
                             family,
                             size,
+                            quantization,
                             execution,
                             focused_field,
-                        }) => {
-                            match *focused_field {
-                                0 => {
-                                    if let Some(pos) = local_backends
-                                        .iter()
-                                        .position(|x| *x == *inference_provider)
-                                    {
-                                        *inference_provider =
-                                            local_backends[(pos + local_backends.len() - 1)
-                                                % local_backends.len()];
-                                    }
-                                    // Candle only supports Qwen 2.5; reset family if needed
-                                    #[cfg(feature = "candle")]
-                                    if *inference_provider == InferenceProvider::Candle {
-                                        *family = ModelFamily::Qwen2;
-                                    }
+                            ..
+                        }) => match *focused_field {
+                            0 => {
+                                if let Some(pos) = local_backends
+                                    .iter()
+                                    .position(|x| *x == *inference_provider)
+                                {
+                                    *inference_provider = local_backends
+                                        [(pos + local_backends.len() - 1) % local_backends.len()];
                                 }
-                                1 => {
-                                    if let Some(pos) =
-                                        local_families.iter().position(|x| *x == *family)
-                                    {
-                                        *family = local_families[(pos + local_families.len() - 1)
-                                            % local_families.len()];
-                                    }
+                                if *inference_provider == InferenceProvider::LlamaCpp
+                                    && !matches!(
+                                        execution,
+                                        ExecutionTarget::Auto | ExecutionTarget::Cpu
+                                    )
+                                {
+                                    *execution = ExecutionTarget::Auto;
                                 }
-                                2 => {
-                                    if let Some(pos) = local_sizes.iter().position(|x| *x == *size)
-                                    {
-                                        *size = local_sizes
-                                            [(pos + local_sizes.len() - 1) % local_sizes.len()];
-                                    }
-                                }
-                                3 => {
-                                    if let Some(pos) =
-                                        local_devices.iter().position(|x| *x == *execution)
-                                    {
-                                        *execution = local_devices
-                                            [(pos + local_devices.len() - 1) % local_devices.len()];
-                                    }
-                                }
-                                _ => {}
                             }
-                        }
+                            1 => {
+                                if let Some(pos) = local_families.iter().position(|x| *x == *family)
+                                {
+                                    *family = local_families
+                                        [(pos + local_families.len() - 1) % local_families.len()];
+                                }
+                            }
+                            2 => {
+                                if let Some(pos) = local_sizes.iter().position(|x| *x == *size) {
+                                    *size = local_sizes
+                                        [(pos + local_sizes.len() - 1) % local_sizes.len()];
+                                }
+                            }
+                            3 => {
+                                if let Some(pos) = local_quantizations
+                                    .iter()
+                                    .position(|value| *value == *quantization)
+                                {
+                                    *quantization =
+                                        local_quantizations[(pos + local_quantizations.len() - 1)
+                                            % local_quantizations.len()];
+                                }
+                            }
+                            4 => {
+                                if let Some(pos) =
+                                    local_devices.iter().position(|x| *x == *execution)
+                                {
+                                    *execution = local_devices
+                                        [(pos + local_devices.len() - 1) % local_devices.len()];
+                                }
+                            }
+                            _ => {}
+                        },
                         Some(AddProviderStep::ConfigureRemote {
                             provider_idx,
                             model,
@@ -440,47 +417,57 @@ pub(super) fn handle_models_input(
                             inference_provider,
                             family,
                             size,
+                            quantization,
                             execution,
                             focused_field,
-                        }) => {
-                            match *focused_field {
-                                0 => {
-                                    if let Some(pos) = local_backends
-                                        .iter()
-                                        .position(|x| *x == *inference_provider)
-                                    {
-                                        *inference_provider =
-                                            local_backends[(pos + 1) % local_backends.len()];
-                                    }
-                                    // Candle only supports Qwen 2.5; reset family if needed
-                                    #[cfg(feature = "candle")]
-                                    if *inference_provider == InferenceProvider::Candle {
-                                        *family = ModelFamily::Qwen2;
-                                    }
+                            ..
+                        }) => match *focused_field {
+                            0 => {
+                                if let Some(pos) = local_backends
+                                    .iter()
+                                    .position(|x| *x == *inference_provider)
+                                {
+                                    *inference_provider =
+                                        local_backends[(pos + 1) % local_backends.len()];
                                 }
-                                1 => {
-                                    if let Some(pos) =
-                                        local_families.iter().position(|x| *x == *family)
-                                    {
-                                        *family = local_families[(pos + 1) % local_families.len()];
-                                    }
+                                if *inference_provider == InferenceProvider::LlamaCpp
+                                    && !matches!(
+                                        execution,
+                                        ExecutionTarget::Auto | ExecutionTarget::Cpu
+                                    )
+                                {
+                                    *execution = ExecutionTarget::Auto;
                                 }
-                                2 => {
-                                    if let Some(pos) = local_sizes.iter().position(|x| *x == *size)
-                                    {
-                                        *size = local_sizes[(pos + 1) % local_sizes.len()];
-                                    }
-                                }
-                                3 => {
-                                    if let Some(pos) =
-                                        local_devices.iter().position(|x| *x == *execution)
-                                    {
-                                        *execution = local_devices[(pos + 1) % local_devices.len()];
-                                    }
-                                }
-                                _ => {}
                             }
-                        }
+                            1 => {
+                                if let Some(pos) = local_families.iter().position(|x| *x == *family)
+                                {
+                                    *family = local_families[(pos + 1) % local_families.len()];
+                                }
+                            }
+                            2 => {
+                                if let Some(pos) = local_sizes.iter().position(|x| *x == *size) {
+                                    *size = local_sizes[(pos + 1) % local_sizes.len()];
+                                }
+                            }
+                            3 => {
+                                if let Some(pos) = local_quantizations
+                                    .iter()
+                                    .position(|value| *value == *quantization)
+                                {
+                                    *quantization =
+                                        local_quantizations[(pos + 1) % local_quantizations.len()];
+                                }
+                            }
+                            4 => {
+                                if let Some(pos) =
+                                    local_devices.iter().position(|x| *x == *execution)
+                                {
+                                    *execution = local_devices[(pos + 1) % local_devices.len()];
+                                }
+                            }
+                            _ => {}
+                        },
                         Some(AddProviderStep::ConfigureRemote {
                             provider_idx,
                             model,
@@ -653,8 +640,16 @@ pub(super) fn handle_models_input(
                     *catalog_error = None;
                 }
                 KeyCode::Char(c) => {
+                    if let Some(AddProviderStep::ConfigureLocal {
+                        inference_provider: InferenceProvider::LlamaCpp,
+                        model_path,
+                        focused_field: 5,
+                        ..
+                    }) = adding_provider
+                    {
+                        model_path.push(c);
+                    }
                     if let Some(AddProviderStep::ConfigureRemote {
-                        provider_idx,
                         name,
                         model,
                         api_key,
@@ -684,8 +679,16 @@ pub(super) fn handle_models_input(
                     }
                 }
                 KeyCode::Backspace => {
+                    if let Some(AddProviderStep::ConfigureLocal {
+                        inference_provider: InferenceProvider::LlamaCpp,
+                        model_path,
+                        focused_field: 5,
+                        ..
+                    }) = adding_provider
+                    {
+                        model_path.pop();
+                    }
                     if let Some(AddProviderStep::ConfigureRemote {
-                        provider_idx,
                         name,
                         model,
                         api_key,
@@ -775,11 +778,14 @@ pub(super) fn handle_models_input(
                             } else if selected == n_cloud {
                                 // Open single-screen local model dialog
                                 Some(AddProviderStep::ConfigureLocal {
-                                    inference_provider: InferenceProvider::Onnx,
+                                    inference_provider: InferenceProvider::LlamaCpp,
                                     family: ModelFamily::Qwen2,
                                     size: ModelSize::Medium,
+                                    quantization: GgufQuantization::Q4KM,
                                     execution: ExecutionTarget::Auto,
+                                    model_path: String::new(),
                                     focused_field: 0,
+                                    editing_idx: None,
                                 })
                             } else {
                                 // Network scan
@@ -1050,30 +1056,97 @@ pub(super) fn handle_models_input(
                             inference_provider,
                             family,
                             size,
+                            quantization,
                             execution,
-                            ..
+                            model_path,
+                            focused_field,
+                            editing_idx,
                         }) => {
-                            let replace_primary = tool_models.is_empty()
-                                && is_unconfigured_placeholder(primary_model);
-                            if replace_primary {
-                                *primary_model = ModelConfig::Local {
-                                    family,
-                                    size,
-                                    execution,
-                                    inference_provider,
-                                    enabled: true,
-                                    persisted: None,
+                            let trimmed_path = model_path.trim();
+                            let (selected_path, managed_artifact) = if trimmed_path.is_empty() {
+                                let Some(artifact) =
+                                    managed_gguf_artifact(family, size, quantization)
+                                else {
+                                    *error = Some(format!(
+                                        "{} {} {} is not in Finch's managed GGUF catalog; choose a supported size or enter an existing absolute .gguf file",
+                                        family.name(),
+                                        size.to_size_string(family),
+                                        quantization.name()
+                                    ));
+                                    *adding_provider = Some(AddProviderStep::ConfigureLocal {
+                                        inference_provider,
+                                        family,
+                                        size,
+                                        quantization,
+                                        execution,
+                                        model_path,
+                                        focused_field,
+                                        editing_idx,
+                                    });
+                                    return Ok(false);
                                 };
+                                (None, Some(artifact))
+                            } else {
+                                let path = std::path::PathBuf::from(trimmed_path);
+                                if !path.is_absolute()
+                                    || !path.is_file()
+                                    || path.extension().and_then(|s| s.to_str()) != Some("gguf")
+                                {
+                                    *error = Some(
+                                        "Leave GGUF file blank for a managed download, or choose an existing absolute local .gguf file"
+                                            .into(),
+                                    );
+                                    *adding_provider = Some(AddProviderStep::ConfigureLocal {
+                                        inference_provider,
+                                        family,
+                                        size,
+                                        quantization,
+                                        execution,
+                                        model_path,
+                                        focused_field,
+                                        editing_idx,
+                                    });
+                                    return Ok(false);
+                                }
+                                (Some(path), None)
+                            };
+                            let persisted = editing_idx.and_then(|idx| {
+                                let slot = if idx == 0 {
+                                    Some(&*primary_model)
+                                } else {
+                                    tool_models.get(idx - 1)
+                                };
+                                match slot {
+                                    Some(ModelConfig::Local { persisted, .. }) => persisted.clone(),
+                                    _ => None,
+                                }
+                            });
+                            let edited = ModelConfig::Local {
+                                family,
+                                size,
+                                execution,
+                                inference_provider,
+                                model_path: selected_path,
+                                managed_artifact,
+                                enabled: true,
+                                persisted,
+                            };
+                            if let Some(idx) = editing_idx {
+                                if idx == 0 {
+                                    *primary_model = edited;
+                                } else if let Some(slot) = tool_models.get_mut(idx - 1) {
+                                    let enabled = slot.enabled();
+                                    *slot = edited;
+                                    slot.set_enabled(enabled);
+                                }
+                                *selected_idx = idx;
+                            } else if tool_models.is_empty()
+                                && is_unconfigured_placeholder(primary_model)
+                            {
+                                *primary_model = edited;
                                 *selected_idx = 0;
                             } else {
-                                tool_models.push(ModelConfig::Local {
-                                    family,
-                                    size,
-                                    execution,
-                                    inference_provider,
-                                    enabled: true,
-                                    persisted: None,
-                                });
+                                tool_models.push(edited);
                                 *selected_idx = tool_models.len();
                             }
                             None
@@ -1284,10 +1357,37 @@ pub(super) fn handle_models_input(
                             focused_field: 1,
                             editing_idx: Some(*selected_idx),
                         });
-                    } else {
-                        *error = Some(
-                            "Local-model editing is available when adding a replacement".into(),
-                        );
+                    } else if let Some(ModelConfig::Local {
+                        family,
+                        size,
+                        execution,
+                        inference_provider,
+                        model_path,
+                        managed_artifact,
+                        ..
+                    }) = selected
+                    {
+                        let migrating_legacy = *inference_provider != InferenceProvider::LlamaCpp;
+                        let focused_field = 5;
+                        *adding_provider = Some(AddProviderStep::ConfigureLocal {
+                            inference_provider: InferenceProvider::LlamaCpp,
+                            family: *family,
+                            size: *size,
+                            quantization: managed_artifact
+                                .as_ref()
+                                .map(|artifact| artifact.quantization)
+                                .unwrap_or_default(),
+                            execution: *execution,
+                            model_path: if migrating_legacy {
+                                String::new()
+                            } else {
+                                model_path.as_ref().map_or_else(String::new, |path| {
+                                    path.to_string_lossy().into_owned()
+                                })
+                            },
+                            focused_field,
+                            editing_idx: Some(*selected_idx),
+                        });
                     }
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {

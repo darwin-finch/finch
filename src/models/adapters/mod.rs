@@ -1,10 +1,11 @@
 // Local Model Adapters - Format prompts and handle model-specific behavior
 //
-// These adapters handle LOCAL ONNX model specifics (chat templates, tokens, output cleaning).
-// This is DIFFERENT from TeacherProviders (src/providers/) which handle external API calls.
+// These adapters handle local chat-model specifics (templates, tokens, output cleaning).
+// This is DIFFERENT from the provider transports (crates/finch-providers, surfaced through
+// src/providers/) which handle external API calls.
 //
-// LocalModelAdapter: Format prompts for local ONNX inference
-// TeacherProvider: Make HTTP requests to external APIs (Claude, OpenAI, etc.)
+// LocalModelAdapter: format prompts for local chat inference.
+// Provider transport: Make HTTP requests to external APIs (Claude, OpenAI, etc.)
 
 pub mod deepseek;
 pub mod llama;

@@ -59,7 +59,7 @@ test-only isolation supervisor ([`src/bin/finch-test-supervisor.rs`](src/bin/fin
 | Path | Entry in `src/main.rs` | What it wires |
 |------|------------------------|---------------|
 | Typed programs (`--exec`, `--forth`, `--lisp`) | calls to `ProgramRuntime::submit_typed_only` | A fresh `ProgramRuntime` granted only session output; no provider or config |
-| Pipe or `finch query` | `run_query` | Program-shaped input runs directly (`is_clearly_forth`); otherwise `build_query_tool_executor` with `DaemonClient`, or teacher-only |
+| Pipe or `finch query` | `run_query` | Program-shaped input runs directly (`is_clearly_forth`); otherwise `build_query_tool_executor` with `DaemonClient`, or cloud-only |
 | Interactive REPL | `Repl::new`, then `Repl::run_event_loop` | Provider graph (`create_provider_graph_from_config`), HTTP `DaemonClient`, `ipc::IpcClient`; the REPL builds its provider profile again inside `run_event_loop` (`src/cli/repl.rs`) |
 | Daemon (`finch daemon`, `daemon-start`) | `run_daemon` | `DaemonLifecycle::acquire_instance`, provider graph, `BootstrapLoader` background model loading, `AgentServer` over HTTP, `ipc::start_ipc_server` |
 
@@ -101,12 +101,12 @@ the MCP client should not have to load tool execution and permissions to get the
 | **`tools-mcp`** (0): the client for external Model Context Protocol servers; depends on `finch-tools-api` and the `finch-runtime` MCP port, not root tool implementations | `src/tools/mcp` | [README](src/tools/mcp/README.md), [agent contract](src/tools/mcp/AGENTS.md), [facade](src/tools/mcp/mod.rs), [user guide](docs/MCP_USER_GUIDE.md) |
 | **`tools`** (1): tool execution and GUI automation — the executor, concrete tool implementations, and MCP wiring over the `tools-api` surface | `src/tools` except `mcp`; re-export shims `src/tools/types.rs`, `src/tools/permissions.rs` | [README](src/tools/README.md), [agent contract](src/tools/AGENTS.md), [facade](src/tools/mod.rs); [Tool execution and permissions](src/tools/EXECUTION.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
 | **`runtime`** (2): typed program execution, capability authority, host effects, and delivery ABI | `crates/finch-runtime`; root `poset` and [`src/program_registry.rs`](src/program_registry.rs) are application composition, not runtime-crate internals | [Runtime README](crates/finch-runtime/README.md), [agent contract](crates/finch-runtime/AGENTS.md), [facade](crates/finch-runtime/src/lib.rs) |
-| **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | Models [README](src/models/README.md), [agent contract](src/models/AGENTS.md), [facade](src/models/mod.rs); local generation [README](src/local/README.md), [agent contract](src/local/AGENTS.md), [facade](src/local/mod.rs); generators compatibility [README](src/generators/README.md), [capsule](src/generators/AGENTS.md), [facade](src/generators/mod.rs); [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
+| **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | Models [README](src/models/README.md), [agent contract](src/models/AGENTS.md), [facade](src/models/mod.rs); local generation [README](src/local/README.md), [agent contract](src/local/AGENTS.md), [facade](src/local/mod.rs); generators compatibility [README](src/generators/README.md), [capsule](src/generators/AGENTS.md), [facade](src/generators/mod.rs); [Local model loader](src/models/unified_loader.rs), [GGUF loader](src/models/loaders/llama_cpp.rs), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
 | **`finch-providers`** (0): reusable provider transports, OAuth, catalogs, and credential ports | `crates/finch-providers` | [README](crates/finch-providers/README.md), [capsule](crates/finch-providers/AGENTS.md), [facade](crates/finch-providers/src/lib.rs); OAuth [README](crates/finch-providers/src/oauth/README.md), [capsule](crates/finch-providers/src/oauth/AGENTS.md), [facade](crates/finch-providers/src/oauth/mod.rs) |
 | **`finch-generation`** (1): development generation contract, lifecycle, strategies, and identity; production REPL still uses older generator path | `crates/finch-generation` | [README](crates/finch-generation/README.md), [capsule](crates/finch-generation/AGENTS.md), [facade](crates/finch-generation/src/lib.rs) |
 | **`providers`** (3): Finch Config mapping onto finch-providers, planning prompts | `src/providers`, `claude`, `oauth`, `llms`, `planning` | Providers compatibility [README](src/providers/README.md), [capsule](src/providers/AGENTS.md), [facade](src/providers/mod.rs); OAuth compatibility [README](src/oauth/README.md), [capsule](src/oauth/AGENTS.md), [facade](src/oauth/mod.rs); planning [README](src/planning/README.md), [capsule](src/planning/AGENTS.md), [facade](src/planning/mod.rs); [Claude client](src/claude/CLIENT.md), [OAuth boundary](docs/OAUTH.md), [ChatGPT subscription transport](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md), [OpenAI transport](docs/OPENAI_TRANSPORT.md) |
 | **`transport`** (3): domain-neutral Cap'n Proto schema/protocol/socket core, node identity, service discovery | `crates/finch-ipc`, `crates/finch-node`, `network`, `service` | IPC [README](crates/finch-ipc/README.md), [capsule](crates/finch-ipc/AGENTS.md), [facade](crates/finch-ipc/src/lib.rs); application client adapter in `src/client`, daemon RPC adapter in `src/server`, Brain codec in `crates/finch-brain/src/ipc_codec.rs`, runtime checkpoint codec in `crates/finch-runtime/src/ipc_codec.rs`; Node [README](crates/finch-node/README.md), [capsule](crates/finch-node/AGENTS.md), [facade](crates/finch-node/src/lib.rs), root compatibility [README](src/node/README.md), [capsule](src/node/AGENTS.md), [facade](src/node/mod.rs); wire schema in [`crates/finch-ipc/schema/finch_ipc.capnp`](crates/finch-ipc/schema/finch_ipc.capnp) |
-| **`brain`** (4): durable named Brains, Brain-specific clients and credentials | `crates/finch-brain`; root `server`, `daemon`, `client`, `agent`, `review`, `registry` (migration only), and `graph` are application composition | [Brain README](crates/finch-brain/README.md), [agent contract](crates/finch-brain/AGENTS.md), [facade](crates/finch-brain/src/lib.rs); attachment [README](crates/finch-brain/src/attachment/README.md), [agent contract](crates/finch-brain/src/attachment/AGENTS.md), [facade](crates/finch-brain/src/attachment/mod.rs); nested persistence capsules [`journal`](crates/finch-brain/src/journal/AGENTS.md), [`projection`](crates/finch-brain/src/projection/AGENTS.md), [`run`](crates/finch-brain/src/run/AGENTS.md), and [`schedule`](crates/finch-brain/src/schedule/AGENTS.md); server [README](src/server/README.md), [agent contract](src/server/AGENTS.md), [facade](src/server/mod.rs); daemon [README](src/daemon/README.md), [agent contract](src/daemon/AGENTS.md), [facade](src/daemon/mod.rs); [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
+| **`brain`** (4): durable named Brains, Brain-specific clients and credentials | `crates/finch-brain`; root `server`, `daemon`, `client`, `agent`, `review`, and `graph` are application composition | [Brain README](crates/finch-brain/README.md), [agent contract](crates/finch-brain/AGENTS.md), [facade](crates/finch-brain/src/lib.rs); attachment [README](crates/finch-brain/src/attachment/README.md), [agent contract](crates/finch-brain/src/attachment/AGENTS.md), [facade](crates/finch-brain/src/attachment/mod.rs); nested persistence capsules [`journal`](crates/finch-brain/src/journal/AGENTS.md), [`projection`](crates/finch-brain/src/projection/AGENTS.md), [`run`](crates/finch-brain/src/run/AGENTS.md), and [`schedule`](crates/finch-brain/src/schedule/AGENTS.md); server [README](src/server/README.md), [agent contract](src/server/AGENTS.md), [facade](src/server/mod.rs); daemon [README](src/daemon/README.md), [agent contract](src/daemon/AGENTS.md), [facade](src/daemon/mod.rs); [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
 | **`frontend`** (6): commands, the interactive REPL, typed messages, rendering, setup | `src/cli`, `crates/finch-messages`, `crates/finch-tui`, `startup.rs`, `samples.rs`; root `cli::messages` is a compatibility re-export | CLI [README](src/cli/README.md), [agent contract](src/cli/AGENTS.md), [facade](src/cli/mod.rs); event loop [README](src/cli/repl_event/README.md), [agent contract](src/cli/repl_event/AGENTS.md), [facade](src/cli/repl_event/mod.rs); messages [README](crates/finch-messages/README.md), [agent contract](crates/finch-messages/AGENTS.md), [facade](crates/finch-messages/src/lib.rs) for client-local typed messages and WorkUnit snapshots over `finch-ui-model`, `finch-theme`, and `finch-diff`; application presentation [README](crates/finch-ui-model/README.md), [capsule](crates/finch-ui-model/AGENTS.md), [facade](crates/finch-ui-model/src/lib.rs) for component-owned ViewModels and pure projection ([design](docs/TUI_DESIGN.md)); project-mention composition adapter [`src/cli/mention_session.rs`](src/cli/mention_session.rs); TUI [README](crates/finch-tui/README.md), [agent contract](crates/finch-tui/AGENTS.md), and [facade](crates/finch-tui/src/lib.rs); [TUI renderer](crates/finch-tui/ARCHITECTURE.md), [atomic history](src/cli/repl_event/ATOMIC_HISTORY.md) |
 | **`conversation-state`** (1): provider-visible history, ordered tool-round staging, and client-local JSON snapshots | `crates/finch-conversation`; depends on `finch-providers` wire types; root CLI owns the event loop, summary generation, checkpoint timing, and Brain composition | [README](crates/finch-conversation/README.md), [agent contract](crates/finch-conversation/AGENTS.md), [flat facade](crates/finch-conversation/src/lib.rs) |
 | **`tests`**: integration tests | `tests/` | [Test guide](tests/README.md), [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
@@ -185,7 +185,7 @@ typed runtime + capability broker for program effects
 
 | Component | Module Doc |
 |-----------|-----------|
-| Local model loader | `src/models/unified_loader.rs` · `src/models/ONNX.md` |
+| Local chat-model loader | `src/models/unified_loader.rs` · `src/models/loaders/llama_cpp.rs` |
 | Deferred LoRA path | `docs/AUTOMATIC_TRAINING.md` · `src/models/LORA.md` |
 | Router | `src/router/ROUTING.md` |
 | TUI Renderer | `crates/finch-tui/ARCHITECTURE.md` |
@@ -201,8 +201,15 @@ Three historical weight tiers are retained for explicit feedback: high (10x), me
 
 ### Local backend investigation
 
-The source contains ONNX Runtime and Candle loaders. Historical backend experiments are recorded in
-`docs/MODEL_BACKEND_STATUS.md`, but that document is not end-to-end routing or conformance evidence.
+Daemon local chat uses llama.cpp with either a verified, commit-pinned Hugging Face GGUF managed
+by Finch or an explicit user-selected GGUF file. Download bytes cross the daemon boundary through
+`/v1/status`; terminal presentation remains client-owned. Legacy ONNX/Candle
+chat entries are loadable only as setup-migration markers and cannot reach an inference engine.
+The frontend memory selector still owns its required defaults, automatic model download, and
+current ONNX/TF-IDF implementation; its replacement and index-identity migration belong to
+separate memory work. Historical backend experiments
+are recorded in `docs/MODEL_BACKEND_STATUS.md`, but that document is not end-to-end routing or
+conformance evidence.
 
 ### Storage layout
 
@@ -237,7 +244,7 @@ Brain and daemon tests must use the isolated launchers and kernel-assigned endpo
 ### Technology stack
 
 - **Language:** Rust (memory safety, performance, Apple Silicon support)
-- **ML frameworks in source:** ONNX Runtime (`ort` crate) and Candle
+- **ML frameworks in source:** llama.cpp (`llama-cpp-2`) for daemon chat; ONNX Runtime (`ort`) only for the separately owned frontend memory embedder
 - **Async:** Tokio
 - **HTTP server:** Axum (`/v1/chat/completions`, `/v1/models`, `/v1/messages`, and Finch-specific
   routes; not the full OpenAI API and not the Responses API)
@@ -282,8 +289,7 @@ Known stale or unsupported claims in current-looking documents, awaiting repair 
 [#572](https://github.com/darwin-finch/finch/issues/572) unless noted:
 
 - [Rust toolchain](docs/RUST_TOOLCHAIN.md) contradicts the `rust-version` declared in `Cargo.toml`.
-- [Bootstrap loading](src/models/BOOTSTRAP.md) and [ONNX loader](src/models/ONNX.md) state
-  unmeasured startup timing and treat loader variants as backend support.
+- [Bootstrap loading](src/models/BOOTSTRAP.md) states unmeasured startup timing.
 - [Local model/backend status](docs/MODEL_BACKEND_STATUS.md) is a dated investigation and names a
   Cargo feature that does not exist.
 - [Test guide](tests/README.md) has two build commands that bypass the Cargo slot and cites a

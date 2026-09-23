@@ -20,7 +20,7 @@ pub mod parity;
 #[path = "live/providers.rs"]
 pub mod providers;
 
-use finch::config::TeacherEntry;
+use finch::config::ProviderEntry;
 use finch::providers::LlmProvider;
 
 /// Returns true when live tests should run (FINCH_LIVE_TESTS=1 or =true).
@@ -76,26 +76,22 @@ pub fn make_provider(name: &str) -> Option<Box<dyn LlmProvider>> {
     // only the resolved key silently selected obsolete provider defaults (for
     // example `grok-2`) and made live conformance test a different deployment
     // than the Finch session it was meant to measure.
-    let mut entry = finch::config::load_config()
+    let entry = finch::config::load_config()
         .ok()
         .and_then(|config| {
             config
                 .providers
                 .iter()
                 .find(|provider| provider.provider_type() == name)
-                .and_then(|provider| provider.to_teacher_entry())
+                .cloned()
         })
-        .unwrap_or_else(|| TeacherEntry {
-            provider: name.to_string(),
-            api_key: key.clone(),
-            model: None,
-            base_url: None,
-            name: None,
+        .unwrap_or_else(|| {
+            ProviderEntry::from_provider_fields(name, key.clone(), None, None, None)
         });
     // An explicit environment key wins without discarding the rest of the
     // locally configured profile.
-    entry.api_key = key;
-    finch::providers::create_provider_from_teacher(&entry).ok()
+    let entry = entry.with_api_key(key);
+    finch::providers::create_provider_from_entry(&entry).ok()
 }
 
 /// Return all providers for which an API key is available.

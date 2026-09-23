@@ -1,5 +1,4 @@
-// Generator Model - Unified text generation interface
-// Phase 4: ONNX-based (Candle removed)
+// Generator model and the engine-neutral text-generation port.
 
 use anyhow::Result;
 use std::path::Path;
@@ -17,14 +16,14 @@ pub trait TextGeneration: Send + Sync {
 
     /// Generate text with token-by-token callback for streaming
     ///
-    /// Default implementation just calls regular generate (no streaming support).
+    /// Backends without token callbacks must fail rather than claim a streamed turn.
     fn generate_stream(
         &mut self,
-        input_ids: &[u32],
-        max_new_tokens: usize,
+        _input_ids: &[u32],
+        _max_new_tokens: usize,
         _token_callback: TokenCallback,
     ) -> Result<Vec<u32>> {
-        self.generate(input_ids, max_new_tokens)
+        anyhow::bail!("backend does not implement token streaming")
     }
 
     /// Encode a text prompt into token IDs
@@ -43,7 +42,7 @@ pub trait TextGeneration: Send + Sync {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
-// Phase 4: LegacyGenerator removed (depends on Candle-based generator module)
+// The legacy custom-transformer generator was removed with the old local runtimes.
 
 /// Unified generator model supporting multiple backends
 pub struct GeneratorModel {
@@ -61,16 +60,24 @@ impl std::fmt::Debug for GeneratorModel {
 }
 
 impl GeneratorModel {
+    #[cfg(test)]
+    /// Construct a model around a test double without invoking a native loader.
+    pub(crate) fn from_test_backend(
+        backend: Box<dyn TextGeneration>,
+        config: GeneratorConfig,
+    ) -> Self {
+        Self { backend, config }
+    }
+
     /// Create new generator from configuration
     ///
-    /// Phase 4: Only supports Pretrained (ONNX-based)
-    /// RandomInit removed with Candle
+    /// Only pre-trained GGUF chat models are loadable.
     pub fn new(config: GeneratorConfig) -> Result<Self> {
         let backend: Box<dyn TextGeneration> = match &config {
             GeneratorConfig::RandomInit(_model_config) => {
                 anyhow::bail!(
-                    "RandomInit removed in Phase 4 (Candle-based).\n\
-                     Use GeneratorConfig::Pretrained with ONNX models."
+                    "RandomInit is not supported.\n\
+                     Use GeneratorConfig::Pretrained with a llama.cpp GGUF model."
                 )
             }
             GeneratorConfig::Pretrained(load_config) => {
@@ -97,7 +104,7 @@ impl GeneratorModel {
     /// Generate a text response from a text prompt.
     ///
     /// Tokenizes the prompt, calls generate(), and decodes the result.
-    /// Works with any backend (ONNX, Candle, etc.) via the TextGeneration trait.
+    /// Works with any backend implementing `TextGeneration` via token conversion.
     pub fn generate_text(&mut self, prompt: &str, max_new_tokens: usize) -> Result<String> {
         let input_ids = self.backend.tokenize(prompt)?;
         let output_ids = self.generate(&input_ids, max_new_tokens)?;
@@ -109,13 +116,10 @@ impl GeneratorModel {
         self.backend.name()
     }
 
-    /// Get mutable reference to backend (for accessing ONNX model directly)
+    /// Get mutable access to the engine-neutral backend.
     pub fn backend_mut(&mut self) -> &mut dyn TextGeneration {
         self.backend.as_mut()
     }
-
-    // Phase 4: device() removed (Candle-based)
-    // ONNX Runtime manages device selection via execution providers
 
     /// Get configuration
     pub fn config(&self) -> &GeneratorConfig {
@@ -256,9 +260,22 @@ mod tests {
     }
 
     #[test]
+    fn test_backend_without_callbacks_cannot_succeed_as_streaming() {
+        let error = MockBackend
+            .generate_stream(&[104, 105], 2, Box::new(|_, _| {}))
+            .expect_err("a backend with no callback implementation must not claim SSE success");
+        assert!(
+            error
+                .to_string()
+                .contains("does not implement token streaming"),
+            "unsupported streaming must explain the missing capability: {error:#}"
+        );
+    }
+
+    #[test]
     fn test_generate_text_uses_trait_not_downcast() {
         // Regression: generate_text() must work via trait methods, not downcast to
-        // LoadedOnnxModel. A non-ONNX backend should succeed here.
+        // a concrete engine type. The injected backend should succeed here.
         use crate::models::unified_loader::ModelLoadConfig;
         use crate::models::GeneratorConfig;
 
@@ -289,12 +306,13 @@ mod tests {
         let mut gen = GeneratorModel {
             backend: Box::new(EchoBackend),
             config: GeneratorConfig::Pretrained(ModelLoadConfig {
-                provider: crate::models::unified_loader::InferenceProvider::Onnx,
+                provider: crate::models::unified_loader::InferenceProvider::LlamaCpp,
                 family: crate::models::unified_loader::ModelFamily::Qwen2,
                 size: crate::models::unified_loader::ModelSize::Small,
                 target: crate::config::ExecutionTarget::Cpu,
                 coreml: crate::config::CoreMlConfig::default(),
                 repo_override: None,
+                model_path: None,
             }),
         };
 
@@ -310,24 +328,5 @@ mod tests {
         let result = GeneratorModel::new(config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("RandomInit"));
-    }
-
-    #[test]
-    #[ignore] // Requires downloaded Qwen model
-    fn test_generator_qwen_onnx() {
-        use crate::config::ExecutionTarget;
-        use crate::models::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize};
-
-        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
-            provider: crate::models::unified_loader::InferenceProvider::Onnx,
-            family: ModelFamily::Qwen2,
-            size: ModelSize::Small,
-            target: ExecutionTarget::Cpu,
-            coreml: crate::config::CoreMlConfig::default(),
-            repo_override: None,
-        });
-
-        let gen = GeneratorModel::new(config).expect("Should load Qwen ONNX model");
-        assert!(gen.name().contains("Qwen"));
     }
 }

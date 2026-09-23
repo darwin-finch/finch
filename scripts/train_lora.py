@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-LoRA Fine-Tuning for Qwen ONNX Models
+Experimental LoRA fine-tuning helper for Qwen-family base models
 
 Reads weighted training examples from JSONL queue, trains LoRA adapters,
-and exports to safetensors format for Rust runtime loading.
+and exports PEFT weights in safetensors format. Finch does not currently load
+this output into its llama.cpp chat runtime.
 
 Usage:
     python3 scripts/train_lora.py <queue_jsonl> <output_adapter> --base-model <model_path>

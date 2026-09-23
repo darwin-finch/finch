@@ -12,7 +12,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 
 use crate::claude::{ClaudeClient, MessageRequest};
@@ -20,10 +20,9 @@ use crate::config::Config;
 use crate::feedback::{FeedbackEntry, FeedbackLogger};
 use crate::local::LocalGenerator;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
-use crate::models::TextTokenizer;
 use crate::models::ThresholdValidator;
 use crate::models::{BootstrapLoader, GeneratorState, ModelProgress, Sampler, SamplingConfig};
-use crate::providers::{TeacherContextConfig, TeacherSession};
+use crate::providers::{ProviderSession, SessionContextConfig};
 use crate::router::{ForwardReason, RouteDecision, Router};
 #[cfg(target_os = "macos")]
 use crate::runtime::{permission_context_key, permission_target_description, AutomationState};
@@ -266,14 +265,14 @@ mod disabled_training_tests {
         // These values deliberately cannot authenticate or reach a provider. The
         // fallback boundary must use the explicitly injected provider above,
         // never reconstruct one from Config or ambient user credentials.
-        let teacher = crate::config::TeacherEntry {
-            provider: "claude".into(),
+        let provider = crate::config::ProviderEntry::Claude {
             api_key: "POISON_REAL_PROVIDER_CREDENTIAL_MUST_NOT_BE_READ".into(),
             model: Some("poison-real-provider-model".into()),
             base_url: Some("http://127.0.0.1:1/provider-must-not-be-reached".into()),
+            chat_path: None,
+            models_path: None,
             name: Some("poison-configured-provider".into()),
         };
-        let provider = crate::config::ProviderEntry::from_teacher_entry(&teacher);
         let mut features = crate::config::FeaturesConfig::default();
         features.streaming_enabled = false;
         #[allow(deprecated)]
@@ -291,7 +290,6 @@ mod disabled_training_tests {
             client: crate::config::ClientConfig::default(),
             providers: vec![provider],
             default_provider: None,
-            teachers: vec![teacher],
             colors: crate::theme::ColorScheme::default(),
             features,
             mcp_servers: HashMap::new(),
@@ -351,7 +349,7 @@ mod disabled_training_tests {
         assert_eq!(streaming_calls.load(Ordering::SeqCst), 0);
         assert_eq!(ambient_input_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            repl.teacher_session.read().await.provider_name(),
+            repl.provider_session.read().await.provider_name(),
             "hermetic-fallback"
         );
 
@@ -596,16 +594,16 @@ pub struct Repl {
     // IPC client — Cap'n Proto channel to the daemon (preferred over daemon_client)
     ipc_client: Option<crate::client::IpcClient>,
     daemon_ipc_error: Option<String>,
-    // Teacher session with context optimization
-    teacher_session: Arc<RwLock<TeacherSession>>,
+    // Cloud provider session with context optimization
+    provider_session: Arc<RwLock<ProviderSession>>,
     // Provider management (for runtime switching)
     available_providers: Vec<crate::config::ProviderEntry>,
-    available_teachers: Vec<crate::config::TeacherEntry>,
+    available_cloud_providers: Vec<crate::config::ProviderEntry>,
     active_provider_index: usize,
     cli_model: Option<String>,
     cli_provider: Option<String>,
     brain_selection: crate::brain::BrainProviderSelection,
-    active_teacher_index: usize,
+    active_cloud_provider_index: usize,
     router: Router, // Now contains ThresholdRouter
     metrics_logger: MetricsLogger,
     // Online learning models
@@ -617,7 +615,6 @@ pub struct Repl {
     models_dir: Option<PathBuf>,
     // Qwen model bootstrap (progressive loading)
     bootstrap_loader: Arc<BootstrapLoader>,
-    tokenizer: Arc<crate::models::TextTokenizer>,
     // Tool execution
     tool_executor: Arc<tokio::sync::Mutex<ToolExecutor>>,
     tool_definitions: Vec<ToolDefinition>, // Cached tool definitions for Claude API
@@ -724,6 +721,59 @@ impl ReplInitialization {
     }
 }
 
+fn project_local_model_download_status(
+    status_bar: &StatusBar,
+    status: &crate::client::LocalModelStatus,
+) -> bool {
+    match status {
+        crate::client::LocalModelStatus::Initializing => false,
+        crate::client::LocalModelStatus::Downloading(progress) => {
+            let percentage = if progress.total_bytes == 0 {
+                0.0
+            } else {
+                progress.downloaded_bytes as f64 / progress.total_bytes as f64
+            };
+            status_bar.update_download_progress(
+                &progress.model,
+                percentage,
+                progress.downloaded_bytes,
+                progress.total_bytes,
+            );
+            false
+        }
+        crate::client::LocalModelStatus::Loading(_)
+        | crate::client::LocalModelStatus::Ready(_)
+        | crate::client::LocalModelStatus::Failed(_)
+        | crate::client::LocalModelStatus::NotAvailable => {
+            status_bar.clear_download_progress();
+            true
+        }
+    }
+}
+
+fn spawn_local_model_download_monitor(
+    client: Arc<crate::client::DaemonClient>,
+    status_bar: StatusBar,
+) {
+    tokio::spawn(async move {
+        loop {
+            match client.local_model_status().await {
+                Ok(status) => {
+                    if project_local_model_download_status(&status_bar, &status) {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    status_bar.clear_download_progress();
+                    tracing::warn!("local model download monitor stopped: {error:#}");
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+}
+
 #[allow(dead_code)]
 impl Repl {
     pub async fn new(
@@ -778,20 +828,20 @@ impl Repl {
                 .with_reasoning_effort_overlay(effective.reasoning_effort);
             let provider =
                 crate::providers::create_provider_from_overlaid_entry(&self._config, &entry)?;
-            *self.teacher_session.write().await = TeacherSession::with_shared_provider(
+            *self.provider_session.write().await = ProviderSession::with_shared_provider(
                 provider,
-                TeacherContextConfig {
+                SessionContextConfig {
                     max_context_turns: 15,
                     tool_result_retention_turns: 5,
                     prompt_caching_enabled: true,
                 },
             );
             if let Some(index) = self
-                .available_teachers
+                .available_cloud_providers
                 .iter()
-                .position(|teacher| teacher.provider.eq_ignore_ascii_case(entry.provider_type()))
+                .position(|candidate| candidate.provider_type() == entry.provider_type())
             {
-                self.active_teacher_index = index;
+                self.active_cloud_provider_index = index;
             }
         }
         self.active_provider_index = effective.provider_index;
@@ -1089,14 +1139,20 @@ impl Repl {
         tool_registry.register(Box::new(AskUserQuestionTool));
 
         // Phase 1: Initialize LLM registry (before ToolExecutor creation)
-        let llm_registry = if config.teachers.len() > 1 {
-            match crate::llms::LLMRegistry::from_teachers(&config.teachers) {
+        let simple_cloud: Vec<crate::config::ProviderEntry> = config
+            .providers
+            .iter()
+            .filter(|entry| entry.is_simple_cloud())
+            .cloned()
+            .collect();
+        let llm_registry = if simple_cloud.len() > 1 {
+            match crate::llms::LLMRegistry::from_cloud_providers(&simple_cloud) {
                 Ok(registry) => {
                     if is_interactive && !daemon_mode {
                         output_status!(
                             "✓ Multi-LLM system enabled ({} primary + {} tools)",
                             1,
-                            config.teachers.len() - 1
+                            simple_cloud.len() - 1
                         );
                     }
                     Some(Arc::new(registry))
@@ -1310,7 +1366,7 @@ impl Repl {
         let status_bar = (*status_bar_arc).clone();
 
         // CRITICAL: If TUI will be enabled, disable stdout NOW (before ANY output)
-        // This must happen before tokenizer init, bootstrap spawn, or any other code
+        // This must happen before bootstrap spawn or any other code
         // that might emit tracing logs.
         if config.tui_enabled && is_interactive {
             // Disable stdout on the global OutputManager
@@ -1320,13 +1376,6 @@ impl Repl {
             // and redrawn in place
             (*output_manager_arc).disable_stdout();
         }
-
-        // Initialize tokenizer (still needed for tool execution)
-        let tokenizer = Arc::new(TextTokenizer::stub().unwrap_or_else(|e| {
-            output_status!("⚠️  Failed to create tokenizer: {}", e);
-            output_status!("   Active learning tools may not work correctly");
-            panic!("Cannot create tokenizer")
-        }));
 
         // NOTE: Model loading removed - daemon handles all local inference
         // Create placeholder bootstrap_loader and local_generator for compatibility
@@ -1380,24 +1429,29 @@ impl Repl {
             }
         }
 
-        // Initialize TeacherSession with context optimization
-        let teacher_config = TeacherContextConfig {
+        // Initialize the provider session with context optimization
+        let session_config = SessionContextConfig {
             max_context_turns: 15,          // Keep last 15 turns
             tool_result_retention_turns: 5, // Keep last 5 turns of tool results
             prompt_caching_enabled: true,
         };
 
-        // Store providers and teachers for runtime switching
+        // Store providers for runtime switching
         let available_providers = config.providers.clone();
         let active_provider_index = available_providers
             .iter()
             .position(|entry| !entry.is_local())
             .unwrap_or(0);
-        let available_teachers = config.teachers.clone();
+        let available_cloud_providers: Vec<crate::config::ProviderEntry> = config
+            .providers
+            .iter()
+            .filter(|entry| entry.is_simple_cloud())
+            .cloned()
+            .collect();
 
-        let teacher_session = Arc::new(RwLock::new(TeacherSession::with_shared_provider(
+        let provider_session = Arc::new(RwLock::new(ProviderSession::with_shared_provider(
             claude_client.shared_provider(),
-            teacher_config,
+            session_config,
         )));
 
         // The direct-provider fallback is normal standalone operation.  Do not
@@ -1426,28 +1480,33 @@ impl Repl {
             }
         };
 
+        if config.backend.enabled && is_interactive {
+            if let Some(client) = daemon_client.clone() {
+                spawn_local_model_download_monitor(client, status_bar.clone());
+            }
+        }
+
         Self {
             _config: config,
             claude_client,
             daemon_client,
             ipc_client: None, // Set after construction via set_ipc_client()
             daemon_ipc_error: None,
-            teacher_session,
+            provider_session,
             available_providers,
-            available_teachers,
+            available_cloud_providers,
             active_provider_index,
             cli_model: None,
             cli_provider: None,
             brain_selection: crate::brain::BrainProviderSelection::default(),
-            active_teacher_index: 0, // First teacher is active by default
-            router,                  // Contains ThresholdRouter now
+            active_cloud_provider_index: 0, // First cloud provider is active by default
+            router,                         // Contains ThresholdRouter now
             metrics_logger,
             threshold_validator,
             local_generator,
             training_trends: TrainingTrends::new(20), // Track last 20 queries
             models_dir,
             bootstrap_loader,
-            tokenizer,
             tool_executor,
             tool_definitions,
             program_runtime,
@@ -1537,8 +1596,8 @@ impl Repl {
         }
     }
 
-    /// Call teacher with context optimization (helper for MessageRequest → ProviderRequest conversion)
-    async fn call_teacher(
+    /// Call the cloud provider with context optimization (helper for MessageRequest → ProviderRequest conversion)
+    async fn call_cloud_provider(
         &self,
         request: &MessageRequest,
     ) -> Result<crate::claude::MessageResponse> {
@@ -1578,7 +1637,7 @@ impl Repl {
         };
 
         // Send with Level 3 optimization (smart strategies)
-        let mut session = self.teacher_session.write().await;
+        let mut session = self.provider_session.write().await;
         let response = session
             .send_message_with_optimization(&provider_request)
             .await?;
@@ -1587,8 +1646,8 @@ impl Repl {
         Ok(response.into())
     }
 
-    /// Call teacher with streaming and context optimization
-    async fn call_teacher_stream(
+    /// Call the cloud provider with streaming and context optimization
+    async fn call_cloud_provider_stream(
         &self,
         request: &MessageRequest,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<crate::providers::StreamChunk>>> {
@@ -1628,7 +1687,7 @@ impl Repl {
         };
 
         // Send with streaming (Level 1 tracking only, no truncation for streaming)
-        let mut session = self.teacher_session.write().await;
+        let mut session = self.provider_session.write().await;
         session.send_message_stream(&provider_request).await
     }
 
@@ -1637,7 +1696,6 @@ impl Repl {
         models_dir: Option<&PathBuf>,
         is_interactive: bool,
         batch_trainer: Arc<RwLock<BatchTrainer>>,
-        _tokenizer: Arc<TextTokenizer>,
     ) -> crate::local::LocalGenerator {
         use crate::local::LocalGenerator;
 
@@ -2270,12 +2328,12 @@ impl Repl {
                 .await
                 .add_user_message(tool_result_text);
 
-            // Re-invoke teacher with tool results (using optimized context)
+            // Re-invoke the cloud provider with tool results (using optimized context)
             let request =
                 MessageRequest::with_context(self.conversation.read().await.get_messages())
                     .with_tools(self.tool_definitions.clone());
 
-            current_response = self.call_teacher(&request).await?;
+            current_response = self.call_cloud_provider(&request).await?;
         }
 
         // Handle max iterations or completion
@@ -2580,8 +2638,6 @@ impl Repl {
                 generator: qwen_gen,
                 router: Arc::new(self.router.clone()),
                 state: generator_state,
-                local: Arc::clone(&self.local_generator),
-                tokenizer: Arc::clone(&self.tokenizer),
                 resolver: provider_resolver,
                 available: self.available_providers.clone(),
                 active_index: initial_provider_index,
@@ -3748,7 +3804,7 @@ impl Repl {
         }
 
         // Explicit local profiles use the daemon-owned model. Cloud profiles
-        // continue through the selected TeacherSession below.
+        // continue through the selected ProviderSession below.
         let local_profile_active = self
             .available_providers
             .get(self.active_provider_index)
@@ -3799,7 +3855,7 @@ impl Repl {
             }
         }
 
-        // FALLBACK: Normal routing (local model or teacher API)
+        // FALLBACK: Normal routing (local model or cloud provider)
         // Make routing decision (uses threshold router internally)
         // Check if local generator is ready before routing (progressive bootstrap support)
         let generator_ready = matches!(
@@ -3863,7 +3919,7 @@ impl Repl {
                     let use_streaming = self.streaming_enabled && self.is_interactive;
 
                     if use_streaming {
-                        let rx = self.call_teacher_stream(&request).await?;
+                        let rx = self.call_cloud_provider_stream(&request).await?;
                         match self.display_streaming_response(rx).await {
                             Ok(text) => {
                                 claude_response = text;
@@ -3874,7 +3930,7 @@ impl Repl {
                                         "\n🔧 Tools needed - switching to buffered mode...",
                                     );
                                 }
-                                let response = self.call_teacher(&request).await?;
+                                let response = self.call_cloud_provider(&request).await?;
                                 let elapsed = start_time.elapsed().as_millis();
                                 if self.is_interactive {
                                     self.output_status(format!(
@@ -3887,7 +3943,7 @@ impl Repl {
                             Err(e) => return Err(e),
                         }
                     } else {
-                        let response = self.call_teacher(&request).await?;
+                        let response = self.call_cloud_provider(&request).await?;
                         let elapsed = start_time.elapsed().as_millis();
                         if self.is_interactive {
                             self.output_status(format!("✓ Received response ({}ms)", elapsed));
@@ -3939,7 +3995,7 @@ impl Repl {
                             let use_streaming = self.streaming_enabled && self.is_interactive;
 
                             if use_streaming {
-                                let rx = self.call_teacher_stream(&request).await?;
+                                let rx = self.call_cloud_provider_stream(&request).await?;
                                 match self.display_streaming_response(rx).await {
                                     Ok(text) => {
                                         claude_response = text;
@@ -3951,7 +4007,7 @@ impl Repl {
 🔧 Tools needed - switching to buffered mode...",
                                             );
                                         }
-                                        let response = self.call_teacher(&request).await?;
+                                        let response = self.call_cloud_provider(&request).await?;
                                         let elapsed = start_time.elapsed().as_millis();
                                         if self.is_interactive {
                                             self.output_status(format!(
@@ -3964,7 +4020,7 @@ impl Repl {
                                     Err(e) => return Err(e),
                                 }
                             } else {
-                                let response = self.call_teacher(&request).await?;
+                                let response = self.call_cloud_provider(&request).await?;
                                 let elapsed = start_time.elapsed().as_millis();
                                 if self.is_interactive {
                                     self.output_status(format!(
@@ -3996,11 +4052,11 @@ impl Repl {
                                 state.status_message()
                             }; // Drop the state guard here
                             self.output_status(format!("ℹ️  Model status: {}", status_msg));
-                            self.output_status("→ Routing: FORWARDING TO TEACHER");
+                            self.output_status("→ Routing: FORWARDING TO CLOUD");
                         }
                         _ => {
                             self.output_status("✗ Threshold check: FAIL (confidence too low)");
-                            self.output_status("→ Routing: FORWARDING TO TEACHER");
+                            self.output_status("→ Routing: FORWARDING TO CLOUD");
                         }
                     }
                 }
@@ -4015,7 +4071,7 @@ impl Repl {
 
                 if use_streaming {
                     // Streaming path - will abort if tools detected
-                    let rx = self.call_teacher_stream(&request).await?;
+                    let rx = self.call_cloud_provider_stream(&request).await?;
                     match self.display_streaming_response(rx).await {
                         Ok(text) => {
                             // Streaming succeeded (no tools)
@@ -4028,7 +4084,7 @@ impl Repl {
                                     "\n🔧 Tools needed - switching to buffered mode...",
                                 );
                             }
-                            let response = self.call_teacher(&request).await?;
+                            let response = self.call_cloud_provider(&request).await?;
 
                             let elapsed = start_time.elapsed().as_millis();
                             if self.is_interactive {
@@ -4045,7 +4101,7 @@ impl Repl {
                     }
                 } else {
                     // Non-streaming path (supports tool use detection)
-                    let response = self.call_teacher(&request).await?;
+                    let response = self.call_cloud_provider(&request).await?;
 
                     let elapsed = start_time.elapsed().as_millis();
                     if self.is_interactive {
@@ -4150,7 +4206,7 @@ impl Repl {
         let model_name = if routing_decision_str == "local" {
             "local".to_string()
         } else {
-            "teacher".to_string()
+            "cloud".to_string()
         };
         let metric = RequestMetric::new(
             query_hash,
@@ -4744,13 +4800,13 @@ impl Repl {
 
         self.output_status("📝 Generating conversation summary...");
 
-        // Get summary from teacher
+        // Get summary from the cloud provider
         use crate::providers::Message;
         use crate::providers::ProviderRequest;
 
         let request = ProviderRequest::new(vec![Message::user(summary_prompt)]);
         let summary_result = self
-            .teacher_session
+            .provider_session
             .write()
             .await
             .send_message(&request)
@@ -4862,3 +4918,61 @@ impl Repl {
 
 #[cfg(test)]
 mod always_allow_tests;
+
+#[cfg(test)]
+mod model_download_status_tests {
+    use super::*;
+    use crate::cli::status_bar::StatusLineType;
+    use crate::client::{LocalModelDownloadStatus, LocalModelStatus};
+
+    #[test]
+    fn daemon_download_updates_one_status_line_and_terminal_state_removes_it() {
+        let status_bar = StatusBar::new();
+        let first = LocalModelStatus::Downloading(LocalModelDownloadStatus {
+            model: "Qwen 2.5 3B".to_string(),
+            file_name: "model.gguf".to_string(),
+            downloaded_bytes: 25,
+            total_bytes: 100,
+        });
+        assert!(!project_local_model_download_status(&status_bar, &first));
+        let second = LocalModelStatus::Downloading(LocalModelDownloadStatus {
+            downloaded_bytes: 75,
+            ..match first {
+                LocalModelStatus::Downloading(progress) => progress,
+                _ => unreachable!(),
+            }
+        });
+        assert!(!project_local_model_download_status(&status_bar, &second));
+        let download_lines = status_bar
+            .get_lines()
+            .into_iter()
+            .filter(|line| line.line_type == StatusLineType::DownloadProgress)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            download_lines.len(),
+            1,
+            "progress updates must replace one status line rather than append rows"
+        );
+        assert!(download_lines[0].content.contains("75%"));
+
+        assert!(project_local_model_download_status(
+            &status_bar,
+            &LocalModelStatus::Loading("Qwen 2.5 3B".to_string())
+        ));
+        assert!(
+            status_bar
+                .get_lines()
+                .iter()
+                .all(|line| line.line_type != StatusLineType::DownloadProgress),
+            "the status bar must not retain download progress after download completion"
+        );
+        assert!(project_local_model_download_status(
+            &status_bar,
+            &LocalModelStatus::Failed("later failure".to_string())
+        ));
+        assert!(status_bar
+            .get_lines()
+            .iter()
+            .all(|line| line.line_type != StatusLineType::DownloadProgress));
+    }
+}

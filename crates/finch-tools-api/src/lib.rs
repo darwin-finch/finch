@@ -36,12 +36,10 @@ pub use patterns::{
     ExactApproval, MatchType, PathSlot, PatternType, PersistentPatternStore, ToolPattern,
 };
 pub use permissions::{
-    bash_command_is_constitutionally_denied, invocation_runs_autonomously,
-    path_argument_escapes_workspace, path_argument_for_tool, path_is_inside_workspace,
-    raw_path_escapes_workspace, refined_effect_for_approval, resolve_canonical_path,
-    resolve_workspace_root, ExecutorRole, PermissionCheck, PermissionManager, PermissionRule,
-    ToolPermissionConfig, PEER_HARD_DENY_TOOLS, PEER_REVIEWED_CHANGESET_TOOLS,
-    PEER_SILENT_ALLOW_TOOLS, VM_DISCOVERY_TOOLS,
+    bash_command_is_constitutionally_denied, invocation_runs_autonomously, path_argument_for_tool,
+    raw_path_escapes_workspace, refined_effect_for_approval, resolve_workspace_root,
+    PermissionCheck, PermissionManager, PermissionRule, ToolPermissionConfig, PEER_HARD_DENY_TOOLS,
+    PEER_REVIEWED_CHANGESET_TOOLS, PEER_SILENT_ALLOW_TOOLS, VM_DISCOVERY_TOOLS,
 };
 pub use registry::{Tool, ToolRegistry};
 pub use semantic::{

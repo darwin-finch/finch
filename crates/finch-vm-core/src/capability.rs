@@ -123,6 +123,7 @@ pub struct GrantSet {
 }
 
 impl GrantSet {
+    #[cfg(test)]
     pub fn active_global_requirements(
         &self,
         now_unix_ms: u64,
@@ -184,7 +185,7 @@ impl GrantSet {
         AuthorizationDecision::ApprovalRequired
     }
 
-    pub fn revoke(&mut self, grant_id: Uuid, now_unix_ms: u64) -> bool {
+    pub(crate) fn revoke(&mut self, grant_id: Uuid, now_unix_ms: u64) -> bool {
         let Some(grant) = self.grants.iter_mut().find(|grant| grant.id == grant_id) else {
             return false;
         };
@@ -353,6 +354,7 @@ impl CapabilityLedger {
         Ok(id)
     }
 
+    #[cfg(test)]
     pub fn grant_global(
         &mut self,
         requirement: CapabilityRequirement,

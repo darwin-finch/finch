@@ -1128,8 +1128,12 @@ impl EventLoop {
             ReplEvent::NamedBrainRunCancelRequested(request) => {
                 self.cancel_named_brain_run(request).await;
             }
-            ReplEvent::NamedBrainProgramFinished(run_id) => {
-                self.pending_named_brain_programs.remove(&run_id);
+            ReplEvent::NamedBrainProgramFinished {
+                run_id,
+                output,
+                error,
+            } => {
+                self.finish_named_brain_program(run_id, output, error).await;
             }
             ReplEvent::FrontendRestartReady {
                 brain,

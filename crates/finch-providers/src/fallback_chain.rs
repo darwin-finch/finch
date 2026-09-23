@@ -30,16 +30,6 @@ impl FallbackChain {
         }
     }
 
-    /// Get the number of providers in the chain
-    pub fn len(&self) -> usize {
-        self.providers.len()
-    }
-
-    /// Check if the chain is empty
-    pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
-    }
-
     /// Get the primary provider (first in chain)
     pub fn primary_provider(&self) -> Option<&dyn LlmProvider> {
         self.providers.first().map(|p| p.as_ref())

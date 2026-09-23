@@ -165,7 +165,7 @@ async fn exec_node(
 
 /// Execute a reviewed node without an LLM or external process. Both source
 /// syntaxes enter the shared typed runtime; the poset is a scheduling/review
-/// artifact and never selects the historical semiotic interpreter.
+/// artifact and never selects an interpreter of its own.
 async fn run_compiled(
     lang: &str,
     code: &str,

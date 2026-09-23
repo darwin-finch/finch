@@ -1,125 +1,116 @@
-// Generic model loader supporting multiple families via ONNX Runtime
-// Enables users to run Qwen, Gemma, Llama, or Mistral using ONNX Runtime with various execution providers
+//! Local chat-model identity and the llama.cpp GGUF loader.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
-use super::download::ModelDownloader;
 use super::generator_new::TextGeneration;
-use super::loaders::onnx::{LoadedOnnxModel, OnnxLoader};
-use super::loaders::onnx_config::{ModelSize as OnnxModelSize, OnnxLoadConfig};
-use super::model_selector::QwenSize;
 use crate::config::{CoreMlConfig, ExecutionTarget};
 
-/// Inference provider selection
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// The daemon's local chat inference engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 pub enum InferenceProvider {
-    /// ONNX Runtime (recommended, works on all platforms)
-    #[serde(rename = "onnx")]
+    /// llama.cpp loading a caller-selected GGUF file.
+    #[serde(rename = "llama_cpp")]
     #[default]
-    Onnx,
-    /// Candle (alternative, native Rust implementation)
-    #[cfg(feature = "candle")]
+    LlamaCpp,
+    /// Persisted ONNX chat configuration retained only so setup can migrate it.
+    #[serde(rename = "onnx")]
+    LegacyOnnx,
+    /// Persisted Candle chat configuration retained only so setup can migrate it.
     #[serde(rename = "candle")]
-    Candle,
+    LegacyCandle,
+}
+
+impl<'de> Deserialize<'de> for InferenceProvider {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "llama_cpp" => Ok(Self::LlamaCpp),
+            "onnx" => Ok(Self::LegacyOnnx),
+            "candle" => Ok(Self::LegacyCandle),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["llama_cpp", "onnx", "candle"],
+            )),
+        }
+    }
 }
 
 impl InferenceProvider {
-    /// Get human-readable name
-    pub fn name(&self) -> &'static str {
+    /// Human-readable engine name.
+    pub fn name(self) -> &'static str {
         match self {
-            Self::Onnx => "ONNX Runtime",
-            #[cfg(feature = "candle")]
-            Self::Candle => "Candle",
+            Self::LlamaCpp => "llama.cpp (GGUF)",
+            Self::LegacyOnnx => "Unsupported legacy ONNX chat entry",
+            Self::LegacyCandle => "Unsupported legacy Candle chat entry",
         }
     }
 }
 
-/// Configuration for loading any model on any execution target with any provider
+/// Configuration for loading a local chat model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelLoadConfig {
-    /// Which inference provider to use (ONNX Runtime or Candle)
+    /// Engine identity; legacy values are accepted only for migration errors.
     #[serde(default)]
     pub provider: InferenceProvider,
-    /// Which model architecture to use
+    /// Prompt/adaptation family selected by the user.
     pub family: ModelFamily,
-    /// Which size variant (Small = 1-3B, Medium = 3-9B, Large = 7-14B, XLarge = 14B+)
+    /// Descriptive size used in profile labels.
     pub size: ModelSize,
-    /// Which execution target to run on (CoreML/CPU/CUDA)
-    #[serde(alias = "backend")] // Support old field name
+    /// `auto` allows GPU offload and `cpu` disables it.
+    #[serde(alias = "backend")]
     pub target: ExecutionTarget,
-    /// Requested CoreML policy and opt-in diagnostics.
+    /// Legacy CoreML policy retained while old configs are migrated.
     #[serde(default)]
     pub coreml: CoreMlConfig,
-    /// Optional: override HuggingFace repository (for custom models)
+    /// Legacy repository field. GGUF loading never resolves a repository.
+    #[serde(default)]
     pub repo_override: Option<String>,
+    /// Explicit local GGUF artifact.
+    #[serde(default)]
+    pub model_path: Option<PathBuf>,
 }
 
 impl ModelLoadConfig {
-    /// Describe the requested target policy without implying observed placement.
+    /// Human-readable requested execution policy.
     pub fn requested_target_name(&self) -> String {
-        #[cfg(target_os = "macos")]
-        if self.target == ExecutionTarget::CoreML {
-            return format!("CoreML ({})", self.coreml.compute_units.name());
-        }
-
         self.target.name().to_string()
-    }
-
-    /// Legacy field accessor for backward compatibility
-    #[deprecated(note = "Use target field directly")]
-    pub fn backend(&self) -> ExecutionTarget {
-        self.target
     }
 }
 
-/// Supported model families
-///
-/// This is the single `ModelFamily` declaration in the codebase. Its variant
-/// names are the persisted config wire form (`backend.model_family` in
-/// `config.toml`), so they must not change silently. A source-scan regression
-/// (`test_exactly_one_model_family_declaration`) fails if a second family enum
-/// reappears.
+/// Supported chat-model families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelFamily {
-    /// Qwen 2.5 series (1.5B, 3B, 7B, 14B)
+    /// Qwen 2.x family.
     Qwen2,
-    /// Google Gemma 2 series (2B, 9B, 27B)
+    /// Gemma 2 family.
     Gemma2,
-    /// Meta Llama 3.x series (3B, 8B, 70B)
+    /// Llama 3 family.
     Llama3,
-    /// Mistral series (7B, 22B)
+    /// Mistral family.
     Mistral,
-    /// Microsoft Phi series (2B, 3.8B, 14B)
+    /// Phi family.
     Phi,
-    /// DeepSeek Coder series (1.3B, 6.7B, 33B)
+    /// DeepSeek family.
     DeepSeek,
 }
 
-/// Capability claims for a model family's local runtime path.
-///
-/// Every `true` here must correspond to a path the engine executes today;
-/// claims are recorded from the engine, never aspirational, and never carry
-/// quality or fitness marketing. Families without an engine-proven local path
-/// carry no claims at all — dated loadability evidence belongs to the
-/// compatibility-matrix work (#74).
+/// Capabilities proven through Finch's local chat path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FamilyEngineCapabilities {
-    /// The engine exposes a per-token streaming callback for this family:
-    /// the ONNX backend implements `TextGeneration::generate_stream`, driven
-    /// through `LocalGenerator::try_generate_from_pattern_streaming` and
-    /// served by the daemon's SSE endpoint.
+    /// The served path emits incremental token callbacks.
     pub engine_streaming: bool,
-    /// The local path proposes tool calls for this family by parsing its
-    /// tool markup (`ToolCallParser` over the adapter's prompt format);
-    /// the event loop owns execution.
+    /// The served path proposes parsed tool markup.
     pub tool_markup_proposals: bool,
 }
 
 impl ModelFamily {
-    /// Get human-readable name
-    pub fn name(&self) -> &'static str {
+    /// Stable user-facing family name.
+    pub fn name(self) -> &'static str {
         match self {
             Self::Qwen2 => "Qwen 2.5",
             Self::Gemma2 => "Gemma 2",
@@ -130,13 +121,8 @@ impl ModelFamily {
         }
     }
 
-    /// Capability claims for this family's local runtime path.
-    ///
-    /// This is the only place a family's local capability claim may be made.
-    /// Generator adapters derive their capability fields from it rather than
-    /// hardcoding claims with prose justifications, so two surfaces cannot
-    /// contradict each other about the same model.
-    pub fn local_engine_capabilities(&self) -> FamilyEngineCapabilities {
+    /// Capabilities proven by Finch's integration for this family.
+    pub fn local_engine_capabilities(self) -> FamilyEngineCapabilities {
         match self {
             Self::Qwen2 => FamilyEngineCapabilities {
                 engine_streaming: true,
@@ -150,731 +136,144 @@ impl ModelFamily {
     }
 }
 
-/// Model size categories (family-specific)
+/// Descriptive model-size category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelSize {
-    /// ~1-3B parameters (fastest, lowest memory)
+    /// Small local model.
     Small,
-    /// ~3-9B parameters (balanced)
+    /// Medium local model.
     Medium,
-    /// ~7-14B parameters (high quality)
+    /// Large local model.
     Large,
-    /// ~14B+ parameters (maximum quality, high memory)
+    /// Extra-large local model.
     XLarge,
 }
 
 impl ModelSize {
-    /// Convert legacy QwenSize to generic ModelSize
-    pub fn from_qwen(qwen_size: QwenSize) -> Self {
-        match qwen_size {
-            QwenSize::Qwen500M => Self::Small, // 0.5B maps to Small slot
-            QwenSize::Qwen1_5B => Self::Small,
-            QwenSize::Qwen3B => Self::Medium,
-            QwenSize::Qwen7B => Self::Large,
-            QwenSize::Qwen14B => Self::XLarge,
-        }
-    }
-
-    /// Convert to family-specific size string for repository resolution
-    pub fn to_size_string(&self, family: ModelFamily) -> &'static str {
+    /// Family-specific display label retained for profile identity.
+    pub fn to_size_string(self, family: ModelFamily) -> &'static str {
         match (family, self) {
-            // Qwen: 1.5B, 3B, 7B, 14B
             (ModelFamily::Qwen2, Self::Small) => "1.5B",
             (ModelFamily::Qwen2, Self::Medium) => "3B",
             (ModelFamily::Qwen2, Self::Large) => "7B",
             (ModelFamily::Qwen2, Self::XLarge) => "14B",
-
-            // Gemma: 2b, 9b, 27b (lowercase convention)
             (ModelFamily::Gemma2, Self::Small) => "2b",
             (ModelFamily::Gemma2, Self::Medium) => "9b",
-            (ModelFamily::Gemma2, Self::Large) => "27b",
-            (ModelFamily::Gemma2, Self::XLarge) => "27b", // No larger Gemma
-
-            // Llama: 3B, 8B, 70B
+            (ModelFamily::Gemma2, Self::Large | Self::XLarge) => "27b",
             (ModelFamily::Llama3, Self::Small) => "3B",
             (ModelFamily::Llama3, Self::Medium) => "8B",
-            (ModelFamily::Llama3, Self::Large) => "70B",
-            (ModelFamily::Llama3, Self::XLarge) => "70B",
-
-            // Mistral: 7B, 22B
-            (ModelFamily::Mistral, Self::Small) => "7B",
-            (ModelFamily::Mistral, Self::Medium) => "7B",
-            (ModelFamily::Mistral, Self::Large) => "22B",
-            (ModelFamily::Mistral, Self::XLarge) => "22B",
-
-            // Phi: 2B (Phi-2), 3.8B (Phi-3-mini), 14B (Phi-3-medium)
+            (ModelFamily::Llama3, Self::Large | Self::XLarge) => "70B",
+            (ModelFamily::Mistral, Self::Small | Self::Medium) => "7B",
+            (ModelFamily::Mistral, Self::Large | Self::XLarge) => "22B",
             (ModelFamily::Phi, Self::Small) => "2B",
             (ModelFamily::Phi, Self::Medium) => "3.8B",
-            (ModelFamily::Phi, Self::Large) => "14B",
-            (ModelFamily::Phi, Self::XLarge) => "14B",
-
-            // DeepSeek: 1.3B, 6.7B, 16B (V2-Lite), 33B
+            (ModelFamily::Phi, Self::Large | Self::XLarge) => "14B",
             (ModelFamily::DeepSeek, Self::Small) => "1.3B",
             (ModelFamily::DeepSeek, Self::Medium) => "6.7B",
             (ModelFamily::DeepSeek, Self::Large) => "16B",
             (ModelFamily::DeepSeek, Self::XLarge) => "33B",
         }
     }
+}
 
-    /// Select appropriate size based on available RAM
-    pub fn from_ram(ram_gb: usize) -> Result<Self> {
-        match ram_gb {
-            0..=7 => anyhow::bail!("Insufficient RAM ({}GB) - need at least 8GB", ram_gb),
-            8..=15 => Ok(Self::Small),   // 1-3B models (~3-6GB RAM)
-            16..=31 => Ok(Self::Medium), // 3-9B models (~6-12GB RAM)
-            32..=63 => Ok(Self::Large),  // 7-14B models (~14-28GB RAM)
-            _ => Ok(Self::XLarge),       // 14B+ models (~28GB+ RAM)
-        }
+fn gpu_offload_policy(target: ExecutionTarget) -> Result<bool> {
+    match target {
+        ExecutionTarget::Auto => Ok(true),
+        ExecutionTarget::Cpu => Ok(false),
+        _ => anyhow::bail!(
+            "llama.cpp local chat supports execution_target = auto or cpu; run `finch setup` to migrate the old target"
+        ),
     }
 }
 
-/// Model cache management
-struct ModelCache {
-    cache_root: PathBuf,
-}
-
-impl ModelCache {
-    fn new() -> Result<Self> {
-        // Use standard HuggingFace cache location
-        let cache_root = dirs::home_dir()
-            .context("Failed to determine home directory")?
-            .join(".cache/huggingface/hub");
-
-        std::fs::create_dir_all(&cache_root)
-            .context("Failed to create HuggingFace cache directory")?;
-
-        Ok(Self { cache_root })
-    }
-
-    fn get_cache_path(&self, repo_id: &str) -> PathBuf {
-        // Convert repo ID to cache directory name
-        // e.g., "Qwen/Qwen2.5-1.5B-Instruct" -> "models--Qwen--Qwen2.5-1.5B-Instruct"
-        let cache_name = format!("models--{}", repo_id.replace('/', "--"));
-        let model_dir = self.cache_root.join(cache_name);
-
-        // Return the latest snapshot directory if it exists
-        let snapshots_dir = model_dir.join("snapshots");
-        if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
-            // Find the most recent snapshot (last modified)
-            let mut snapshots: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .collect();
-
-            snapshots.sort_by_key(|e| {
-                e.metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            });
-
-            if let Some(latest) = snapshots.last() {
-                return latest.path();
-            }
-        }
-
-        // Fallback to model_dir if no snapshots found
-        model_dir
-    }
-
-    fn is_cached(&self, repo_id: &str) -> bool {
-        let cache_path = self.get_cache_path(repo_id);
-        if !cache_path.exists() {
-            return false;
-        }
-
-        // Check for snapshots directory (HF Hub structure)
-        let snapshots_dir = cache_path.join("snapshots");
-        if !snapshots_dir.exists() {
-            return false;
-        }
-
-        // Check if any snapshot has required files
-        if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
-            for entry in entries.flatten() {
-                let snapshot_path = entry.path();
-                if snapshot_path.is_dir() {
-                    // Check for required files
-                    let has_config = snapshot_path.join("config.json").exists();
-                    let has_tokenizer = snapshot_path.join("tokenizer.json").exists();
-
-                    if has_config && has_tokenizer {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
-    }
-}
-
-/// Generic model loader supporting multiple families and backends
-pub struct UnifiedModelLoader {
-    downloader: ModelDownloader,
-    cache: ModelCache,
-}
+/// Loads the daemon's configured GGUF chat model.
+pub struct UnifiedModelLoader;
 
 impl UnifiedModelLoader {
-    /// Create new unified loader
+    /// Construct the stateless GGUF loader.
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            downloader: ModelDownloader::new()?,
-            cache: ModelCache::new()?,
-        })
+        Ok(Self)
     }
 
-    /// Load model with configuration (supports both ONNX and Candle providers)
+    /// Load the configured GGUF through llama.cpp.
     pub fn load(&self, config: ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
-        tracing::info!(
-            "Loading model: {:?} {:?} ({:?}) on {:?}",
-            config.family,
-            config.size,
-            config.provider,
-            config.target
-        );
-
-        match config.provider {
-            InferenceProvider::Onnx => {
-                // Convert unified ModelLoadConfig to OnnxLoadConfig
-                let onnx_config = self.to_onnx_config(&config)?;
-
-                // Load via ONNX
-                let onnx_loader = OnnxLoader::new(onnx_config.cache_dir.clone());
-                let model = onnx_loader
-                    .load_model_sync(&onnx_config)
-                    .context("Failed to load ONNX model")?;
-
-                tracing::info!("Successfully loaded ONNX model: {}", model.model_name());
-
-                // Box and return as TextGeneration trait object
-                Ok(Box::new(model))
-            }
-
-            #[cfg(feature = "candle")]
-            InferenceProvider::Candle => {
-                // Load via Candle
-                self.load_candle(&config)
-            }
+        if config.provider != InferenceProvider::LlamaCpp {
+            anyhow::bail!(
+                "{}; run `finch setup` and select a local GGUF file for llama.cpp",
+                config.provider.name()
+            );
         }
-    }
-
-    /// Load model using Candle provider
-    #[cfg(feature = "candle")]
-    fn load_candle(&self, config: &ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
-        use super::loaders::candle::CandleLoader;
-
-        tracing::info!("Loading Candle model");
-
-        // Resolve repository ID
-        let repo_id = self.resolve_repository(config)?;
-
-        // Check if model is cached
-        let model_path = if self.cache.is_cached(&repo_id) {
-            tracing::debug!("Model found in cache");
-            self.cache.get_cache_path(&repo_id)
-        } else {
-            tracing::info!("Model not cached, downloading from HuggingFace...");
-
-            // Estimate download size
-            let estimated_size_gb = match config.size {
-                ModelSize::Small => 3.0,
-                ModelSize::Medium => 8.0,
-                ModelSize::Large => 16.0,
-                ModelSize::XLarge => 30.0,
-            };
-
-            // Download model
-            let (cache_path, _rx) = self
-                .downloader
-                .download_model(&repo_id, estimated_size_gb)
-                .with_context(|| format!("Failed to download model from {}", repo_id))?;
-
-            cache_path
-        };
-
-        // Load via Candle loader
-        let candle_loader = CandleLoader::new();
-        let model = candle_loader
-            .load(&model_path, config.family, config.size, config.target)
-            .context("Failed to load Candle model")?;
-
-        tracing::info!("Successfully loaded Candle model");
-
-        Ok(model)
-    }
-
-    /// Convert ModelLoadConfig to OnnxLoadConfig (Phase 5 helper)
-    fn to_onnx_config(&self, config: &ModelLoadConfig) -> Result<OnnxLoadConfig> {
-        // Get cache directory
-        let cache_dir = dirs::home_dir()
-            .context("Failed to determine home directory")?
-            .join(".cache/huggingface/hub");
-
-        // Map unified ModelSize to ONNX ModelSize
-        let onnx_size = match config.size {
-            ModelSize::Small => OnnxModelSize::Medium,  // 1.5B
-            ModelSize::Medium => OnnxModelSize::Large,  // 3B
-            ModelSize::Large => OnnxModelSize::XLarge,  // 7B
-            ModelSize::XLarge => OnnxModelSize::XLarge, // 7B (max for ONNX currently)
-        };
-
-        // Resolve HuggingFace repository ID based on family and size
-        let repo_id = self.resolve_repository(config)?;
-
-        // Extract model name from repo ID (e.g., "onnx-community/Qwen2.5-1.5B-Instruct" → "Qwen2.5-1.5B-Instruct")
-        let model_name = repo_id
-            .split('/')
-            .next_back()
-            .unwrap_or(&repo_id)
-            .to_string();
-
-        // Map ExecutionTarget to ONNX Runtime execution providers
-        use super::loaders::onnx_config::ExecutionProvider;
-
-        let execution_providers = match config.target {
-            #[cfg(target_os = "macos")]
-            ExecutionTarget::CoreML => {
-                Some(vec![ExecutionProvider::CoreML, ExecutionProvider::CPU])
-            }
-            #[cfg(feature = "cuda")]
-            ExecutionTarget::Cuda => Some(vec![ExecutionProvider::CUDA, ExecutionProvider::CPU]),
-            ExecutionTarget::Cpu => Some(vec![ExecutionProvider::CPU]),
-            ExecutionTarget::Auto => None, // Let ONNX loader decide
-        };
-        let coreml_profile_output = if config.coreml.profile_compute_plan {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .context("System clock is before the Unix epoch")?
-                .as_nanos();
-            Some(
-                dirs::home_dir()
-                    .context("Failed to determine home directory")?
-                    .join(".finch/diagnostics")
-                    .join(format!(
-                        "coreml-compute-plan-{}-{timestamp}.ndjson",
-                        std::process::id()
-                    )),
-            )
-        } else {
-            None
-        };
-
-        Ok(OnnxLoadConfig {
-            model_name,
-            repo_id,
-            size: onnx_size,
-            cache_dir,
-            execution_providers,
-            coreml: config.coreml,
-            coreml_profile_output,
-        })
-    }
-
-    /// DEPRECATED: Candle-based loading removed
-    #[allow(dead_code)]
-    fn load_legacy(&self, config: ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
-        // 1. Resolve repository ID
-        let repo_id = self.resolve_repository(&config)?;
-
-        tracing::info!(
-            "Loading {} {} on {}",
-            config.family.name(),
-            config.size.to_size_string(config.family),
-            config.requested_target_name()
-        );
-
-        // 2. Check cache or download
-        let model_path = if self.cache.is_cached(&repo_id) {
-            tracing::debug!("Model found in cache");
-            self.cache.get_cache_path(&repo_id)
-        } else {
-            tracing::info!("Model not cached, downloading from HuggingFace...");
-
-            // Estimate download size based on model size
-            let estimated_size_gb = match config.size {
-                ModelSize::Small => 3.0,   // ~1-3B models
-                ModelSize::Medium => 8.0,  // ~3-9B models
-                ModelSize::Large => 16.0,  // ~7-14B models
-                ModelSize::XLarge => 30.0, // ~14B+ models
-            };
-
-            // Download model (blocking)
-            let (cache_path, _rx) = self
-                .downloader
-                .download_model(&repo_id, estimated_size_gb)
-                .with_context(|| format!("Failed to download model from {}", repo_id))?;
-
-            cache_path
-        };
-
-        // 3. Load model based on family + backend combination
-        self.load_model_variant(&config, &model_path)
-    }
-
-    /// Resolve HuggingFace repository ID based on provider, family, and size
-    ///
-    /// Uses the compatibility matrix to get the correct repository
-    fn resolve_repository(&self, config: &ModelLoadConfig) -> Result<String> {
-        // Check for user override first
-        if let Some(ref repo) = config.repo_override {
-            return Ok(repo.clone());
+        if config.repo_override.is_some() {
+            anyhow::bail!(
+                "local chat model repositories are no longer supported; run `finch setup` and select an explicit .gguf file"
+            );
         }
-
-        // Use compatibility matrix to resolve repository
-        super::compatibility::get_repository(config.provider, config.family, config.size)
-            .with_context(|| {
-                format!(
-                    "No {:?} model repository available for {:?} {:?}",
-                    config.provider, config.family, config.size
-                )
-            })
-    }
-
-    /// Load model variant based on family + backend combination
-    ///
-    /// DEPRECATED: References deleted Candle loaders (Phase 4)
-    #[allow(dead_code, unused_variables)]
-    fn load_model_variant(
-        &self,
-        config: &ModelLoadConfig,
-        model_path: &std::path::Path,
-    ) -> Result<Box<dyn TextGeneration>> {
-        anyhow::bail!("Candle loaders removed - use load_onnx() instead")
-    }
-
-    /// DEPRECATED: Old Candle-based implementation
-    #[allow(dead_code, unused_variables)]
-    fn load_model_variant_legacy(
-        &self,
-        config: &ModelLoadConfig,
-        model_path: &std::path::Path,
-    ) -> Result<Box<dyn TextGeneration>> {
-        /*
-        match (&config.family, &config.backend) {
-            // Qwen on CoreML (macOS only)
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Qwen2, BackendDevice::CoreML) => {
-                loaders::coreml::load(model_path, config.family, config.size)
-            }
-
-            // Qwen on Metal (macOS only)
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Qwen2, BackendDevice::Metal) => {
-                let device = Device::new_metal(0)
-                    .context("Failed to initialize Metal device")?;
-                loaders::qwen::load(model_path, config.size, device)
-            }
-
-            // Qwen on CUDA (Linux/Windows)
-            #[cfg(feature = "cuda")]
-            (ModelFamily::Qwen2, BackendDevice::Cuda) => {
-                let device = Device::new_cuda(0)
-                    .context("Failed to initialize CUDA device")?;
-                loaders::qwen::load(model_path, config.size, device)
-            }
-
-            // Qwen on CPU (all platforms)
-            (ModelFamily::Qwen2, BackendDevice::Cpu) => {
-                loaders::qwen::load(model_path, config.size, Device::Cpu)
-            }
-
-            // Gemma on Metal (macOS)
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Gemma2, BackendDevice::Metal) => {
-                let device = Device::new_metal(0)
-                    .context("Failed to initialize Metal device")?;
-                loaders::gemma::load(model_path, config.size, device)
-            }
-
-            // Gemma on CUDA (Linux/Windows)
-            #[cfg(feature = "cuda")]
-            (ModelFamily::Gemma2, BackendDevice::Cuda) => {
-                let device = Device::new_cuda(0)
-                    .context("Failed to initialize CUDA device")?;
-                loaders::gemma::load(model_path, config.size, device)
-            }
-
-            // Gemma on CPU (all platforms)
-            (ModelFamily::Gemma2, BackendDevice::Cpu) => {
-                loaders::gemma::load(model_path, config.size, Device::Cpu)
-            }
-
-            // Llama on CoreML (macOS only) - uses community conversions
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Llama3, BackendDevice::CoreML) => {
-                // For Small/Medium, use CoreML conversions if downloaded
-                // Otherwise fall back to Metal (handled by error)
-                loaders::coreml::load(model_path, config.family, config.size)
-            }
-
-            // Llama on Metal (macOS)
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Llama3, BackendDevice::Metal) => {
-                let device = Device::new_metal(0)
-                    .context("Failed to initialize Metal device")?;
-                loaders::llama::load(model_path, config.size, device)
-            }
-
-            // Llama on CUDA (Linux/Windows)
-            #[cfg(feature = "cuda")]
-            (ModelFamily::Llama3, BackendDevice::Cuda) => {
-                let device = Device::new_cuda(0)
-                    .context("Failed to initialize CUDA device")?;
-                loaders::llama::load(model_path, config.size, device)
-            }
-
-            // Llama on CPU (all platforms)
-            (ModelFamily::Llama3, BackendDevice::Cpu) => {
-                loaders::llama::load(model_path, config.size, Device::Cpu)
-            }
-
-            // Mistral on CoreML (macOS only) - uses Apple's official conversion
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Mistral, BackendDevice::CoreML) => {
-                loaders::coreml::load(model_path, config.family, config.size)
-            }
-
-            // Mistral on Metal (macOS)
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Mistral, BackendDevice::Metal) => {
-                let device = Device::new_metal(0)
-                    .context("Failed to initialize Metal device")?;
-                loaders::mistral::load(model_path, config.size, device)
-            }
-
-            // Mistral on CUDA (Linux/Windows)
-            #[cfg(feature = "cuda")]
-            (ModelFamily::Mistral, BackendDevice::Cuda) => {
-                let device = Device::new_cuda(0)
-                    .context("Failed to initialize CUDA device")?;
-                loaders::mistral::load(model_path, config.size, device)
-            }
-
-            // Mistral on CPU (all platforms)
-            (ModelFamily::Mistral, BackendDevice::Cpu) => {
-                loaders::mistral::load(model_path, config.size, Device::Cpu)
-            }
-
-            // Unsupported combinations
-            _ => {
-                anyhow::bail!(
-                    "Unsupported combination: {} on {}",
-                    config.family.name(),
-                    config.backend.name()
-                )
-            }
+        let path = config
+            .model_path
+            .as_ref()
+            .context("llama.cpp requires backend.model_path pointing to a local .gguf file; run `finch setup`")?;
+        if path.extension().and_then(|value| value.to_str()) != Some("gguf") {
+            anyhow::bail!("backend.model_path must point to a .gguf chat model; run `finch setup`");
         }
-        */
-        // Commented out - Candle loaders removed in Phase 4
-        anyhow::bail!("Legacy Candle loading removed")
-    }
-
-    /// Load ONNX model (Phase 4: Primary loading method)
-    ///
-    /// This will replace the Candle-based loaders in Phase 4.
-    /// For now, it coexists with the old loaders for testing.
-    pub fn load_onnx(&self, ram_gb: Option<usize>) -> Result<LoadedOnnxModel> {
-        tracing::info!("Loading model via ONNX Runtime (Phase 3)");
-
-        // Create cache directory
-        let cache_dir = dirs::home_dir()
-            .context("Failed to determine home directory")?
-            .join(".cache/huggingface/hub");
-
-        std::fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
-
-        // Create ONNX config with automatic size selection
-        let config = if let Some(ram) = ram_gb {
-            let size = OnnxModelSize::from_ram(ram);
-            OnnxLoadConfig::with_size(size, cache_dir)
-        } else {
-            OnnxLoadConfig::from_system_ram(cache_dir)
-        };
-
-        // Create ONNX loader
-        let loader = OnnxLoader::new(config.cache_dir.clone());
-
-        // Load model
-        let model = loader
-            .load_model_sync(&config)
-            .context("Failed to load ONNX model")?;
-
-        tracing::info!("Successfully loaded ONNX model: {}", model.model_name());
-
-        Ok(model)
+        let model = super::loaders::llama_cpp::LlamaCppGenerator::load_with_offload(
+            path,
+            gpu_offload_policy(config.target)?,
+            Some(config.family.name()),
+        )?;
+        Ok(Box::new(model))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
-    fn test_model_size_from_ram() {
-        assert_eq!(ModelSize::from_ram(8).unwrap(), ModelSize::Small);
-        assert_eq!(ModelSize::from_ram(16).unwrap(), ModelSize::Medium);
-        assert_eq!(ModelSize::from_ram(32).unwrap(), ModelSize::Large);
-        assert_eq!(ModelSize::from_ram(64).unwrap(), ModelSize::XLarge);
-
-        // Insufficient RAM
-        assert!(ModelSize::from_ram(4).is_err());
-    }
-
-    /// #781: there must be exactly one `ModelFamily` declaration. Two competing
-    /// family enums each carried their own name/description tables and drifted
-    /// independently; this scan fails if a second declaration reappears.
-    #[test]
-    fn test_exactly_one_model_family_declaration() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let mut declarations = Vec::new();
-        for tree in ["src", "crates", "tests"] {
-            scan_for_model_family_declarations(&root.join(tree), &root, &mut declarations);
-        }
+    fn legacy_chat_provider_names_deserialize_only_for_migration() {
         assert_eq!(
-            declarations.len(),
-            1,
-            "ModelFamily must be declared exactly once so family naming cannot drift; \
-             found {declarations:?}"
+            serde_json::from_str::<InferenceProvider>("\"onnx\"").unwrap(),
+            InferenceProvider::LegacyOnnx
         );
+        assert_eq!(
+            serde_json::from_str::<InferenceProvider>("\"candle\"").unwrap(),
+            InferenceProvider::LegacyCandle
+        );
+    }
+
+    #[test]
+    fn llama_cpp_provider_round_trips() {
+        let encoded = serde_json::to_string(&InferenceProvider::LlamaCpp).unwrap();
+        assert_eq!(encoded, "\"llama_cpp\"");
+        assert_eq!(
+            serde_json::from_str::<InferenceProvider>(&encoded).unwrap(),
+            InferenceProvider::LlamaCpp
+        );
+    }
+
+    #[test]
+    fn target_policy_honors_explicit_cpu() {
+        assert!(gpu_offload_policy(ExecutionTarget::Auto).unwrap());
+        assert!(!gpu_offload_policy(ExecutionTarget::Cpu).unwrap());
+    }
+
+    #[test]
+    fn legacy_chat_provider_cannot_reach_a_loader() {
+        let error = UnifiedModelLoader::new()
+            .unwrap()
+            .load(ModelLoadConfig {
+                provider: InferenceProvider::LegacyOnnx,
+                family: ModelFamily::Qwen2,
+                size: ModelSize::Small,
+                target: ExecutionTarget::Cpu,
+                coreml: CoreMlConfig::default(),
+                repo_override: None,
+                model_path: Some("/tmp/old.onnx".into()),
+            })
+            .err()
+            .expect("legacy provider must have no loader");
         assert!(
-            declarations.first().is_some_and(|path| path.ends_with("src/models/unified_loader.rs")),
-            "the single ModelFamily declaration must live in the models loader; found {declarations:?}"
+            error.to_string().contains("finch setup") && error.to_string().contains("GGUF"),
+            "legacy entry must provide migration direction without loading: {error:#}"
         );
-    }
-
-    /// #781: capability claims must match what the engine actually runs. Only
-    /// the Qwen2 path has an engine-proven streaming callback and tool-markup
-    /// parser; every other family must carry no claims.
-    #[test]
-    fn test_local_engine_capabilities_claim_only_engine_proven_paths() {
-        let qwen = ModelFamily::Qwen2.local_engine_capabilities();
-        assert!(
-            qwen.engine_streaming && qwen.tool_markup_proposals,
-            "the Qwen2 local path has an engine streaming callback and tool-markup \
-             proposals; catalog said {qwen:?}"
-        );
-        for family in [
-            ModelFamily::Gemma2,
-            ModelFamily::Llama3,
-            ModelFamily::Mistral,
-            ModelFamily::Phi,
-            ModelFamily::DeepSeek,
-        ] {
-            let caps = family.local_engine_capabilities();
-            assert!(
-                !caps.engine_streaming && !caps.tool_markup_proposals,
-                "{family:?} has no engine-proven local streaming or tool path, so its \
-                 catalog entry must carry no claims; said {caps:?}"
-            );
-        }
-    }
-
-    fn scan_for_model_family_declarations(
-        dir: &Path,
-        root: &Path,
-        declarations: &mut Vec<PathBuf>,
-    ) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|name| name == "target") {
-                    continue;
-                }
-                scan_for_model_family_declarations(&path, root, declarations);
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
-            }
-            let Ok(source) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if source
-                .lines()
-                .any(|line| line.trim_start().starts_with("pub enum ModelFamily"))
-            {
-                declarations.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
-            }
-        }
-    }
-
-    #[test]
-    fn test_repository_resolution() {
-        let loader = UnifiedModelLoader::new().unwrap();
-
-        // Qwen standard (ONNX community)
-        let config = ModelLoadConfig {
-            provider: InferenceProvider::Onnx,
-            family: ModelFamily::Qwen2,
-            size: ModelSize::Small,
-            target: ExecutionTarget::Cpu,
-            coreml: CoreMlConfig::default(),
-            repo_override: None,
-        };
-        let repo = loader.resolve_repository(&config).unwrap();
-        assert_eq!(repo, "onnx-community/Qwen2.5-1.5B-Instruct");
-
-        // Gemma (onnx-community)
-        let config = ModelLoadConfig {
-            provider: InferenceProvider::Onnx,
-            family: ModelFamily::Gemma2,
-            size: ModelSize::Small,
-            target: ExecutionTarget::Cpu,
-            coreml: CoreMlConfig::default(),
-            repo_override: None,
-        };
-        let repo = loader.resolve_repository(&config).unwrap();
-        assert_eq!(repo, "onnx-community/gemma-3-270m-it-ONNX");
-
-        // Llama (onnx-community)
-        let config = ModelLoadConfig {
-            provider: InferenceProvider::Onnx,
-            family: ModelFamily::Llama3,
-            size: ModelSize::Medium,
-            target: ExecutionTarget::Cpu,
-            coreml: CoreMlConfig::default(),
-            repo_override: None,
-        };
-        let repo = loader.resolve_repository(&config).unwrap();
-        assert_eq!(repo, "onnx-community/Llama-3.2-3B-Instruct-ONNX");
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn test_coreml_repository_resolution() {
-        let loader = UnifiedModelLoader::new().unwrap();
-
-        // CoreML uses same onnx-community repos (execution provider difference only)
-        let config = ModelLoadConfig {
-            provider: InferenceProvider::Onnx,
-            family: ModelFamily::Qwen2,
-            size: ModelSize::Medium,
-            target: ExecutionTarget::CoreML,
-            coreml: CoreMlConfig::default(),
-            repo_override: None,
-        };
-        let repo = loader.resolve_repository(&config).unwrap();
-        assert_eq!(repo, "onnx-community/Qwen2.5-Coder-3B-Instruct");
-    }
-
-    #[test]
-    fn test_repo_override() {
-        let loader = UnifiedModelLoader::new().unwrap();
-
-        let config = ModelLoadConfig {
-            provider: InferenceProvider::Onnx,
-            family: ModelFamily::Qwen2,
-            size: ModelSize::Small,
-            target: ExecutionTarget::Cpu,
-            coreml: CoreMlConfig::default(),
-            repo_override: Some("custom-org/custom-model".to_string()),
-        };
-        let repo = loader.resolve_repository(&config).unwrap();
-        assert_eq!(repo, "custom-org/custom-model");
     }
 }

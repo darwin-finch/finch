@@ -2,7 +2,7 @@
 
 Finch's configuration accepts entries for multiple cloud AI providers (Claude, OpenAI, Grok,
 Gemini, Mistral, Groq, and others — see the provider entry types in `src/config/provider.rs`) and
-the local ONNX model, all configured through a unified `[[providers]]` array in
+local llama.cpp/GGUF chat models, all configured through a unified `[[providers]]` array in
 `~/.finch/config.toml`. Configuration support is not end-to-end conformance: routing and
 provider parity remain active work (see the root `README.md` provider section).
 
@@ -81,22 +81,24 @@ api_key = "gsk_..."
 model = "llama-3.3-70b-versatile"  # optional
 ```
 
-### Local Model (ONNX)
+### Local Model (llama.cpp/GGUF)
 
 ```toml
 [[providers]]
 type = "local"
-inference_provider = "onnx"
-execution_target = "coreml"   # "coreml" (Apple Silicon) | "cpu"
+inference_provider = "llama_cpp"
+execution_target = "auto"     # "auto" (Metal on supported Macs) | "cpu"
 model_family = "qwen2"
 model_size = "medium"         # "small"=1.5B "medium"=3B "large"=7B "xlarge"=14B
+# Omit model_path for a supported managed download, or provide an existing absolute .gguf file.
+# model_path = "/absolute/path/to/chat-model.gguf"
 enabled = true
 ```
 
 ## Multi-Provider Example
 
 You can list multiple cloud providers. The first one in the array is the active provider;
-use `/teacher <name>` in the REPL or re-run `finch setup` to switch.
+use `/provider <name>` in the REPL or re-run `finch setup` to switch.
 
 ```toml
 [[providers]]
@@ -116,8 +118,8 @@ api_key = "sk-proj-..."
 
 [[providers]]
 type = "local"
-inference_provider = "onnx"
-execution_target = "coreml"
+inference_provider = "llama_cpp"
+execution_target = "auto"
 model_family = "qwen2"
 model_size = "medium"
 enabled = true
@@ -126,7 +128,7 @@ enabled = true
 ## How Provider Selection Works
 
 1. **Startup**: Finch reads all `[[providers]]` entries.
-2. **Active provider**: The first cloud entry with a non-empty `api_key` is the default teacher.
+2. **Active provider**: The first cloud entry with a non-empty `api_key` is the default provider.
 3. **Local model**: The `local` entry runs in the background; the REPL routes to it when ready.
 4. **Runtime switching**: `/model list` and `/model <name>` change the active named profile mid-session without clearing conversation history. Give each entry a unique `name` when configuring multiple models from the same provider. Local profiles activate when daemon model startup completes; the current profile remains active while they load.
 5. **Tool execution**: All providers support tool calling.

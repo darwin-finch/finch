@@ -16,8 +16,11 @@ Two callers illustrate the boundary:
    stay with the application; this module owns the message's lifecycle and snapshot.
 2. The [TUI adapter](../../crates/finch-tui/src/view_model.rs) reads a `MessageRef` at blit time. It asks for the
    WorkUnit view when present and hands that plain snapshot to `finch-ui-model` for projection;
-   ordinary messages supply formatted lines. The renderer owns disclosure and painting, while
-   the message's complete transcript remains the canonical text for scrollback and copying.
+   migrated messages — say turns plus `StaticMessage`, `ProgressMessage`, `LiveToolMessage`, and
+   `OperationMessage` (#1120) — answer the generalized `component_view` accessor instead, so the
+   renderer never matches on the message type. Ordinary un-migrated messages supply formatted
+   lines. The renderer owns disclosure and painting, while the message's complete transcript
+   remains the canonical text for scrollback and copying.
 
 The presentation snapshot vocabulary and pure projection live in
 [`finch-ui-model`](../finch-ui-model/AGENTS.md); this crate re-exports

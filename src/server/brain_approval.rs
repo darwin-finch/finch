@@ -34,15 +34,15 @@ pub struct BrainApprovalBroker {
     mutation_locks: Arc<Mutex<HashMap<ApprovalKey, Weak<AsyncMutex<()>>>>>,
 }
 
-pub struct ApprovalRegistration {
+pub(crate) struct ApprovalRegistration {
     broker: BrainApprovalBroker,
     key: ApprovalKey,
     response_rx: Option<oneshot::Receiver<Result<serde_json::Value, String>>>,
 }
 
-pub struct ClaimedApproval {
-    pub request_seq: u64,
-    pub audience: BrainApprovalAudience,
+pub(super) struct ClaimedApproval {
+    pub(super) request_seq: u64,
+    pub(super) audience: BrainApprovalAudience,
     response_tx: Option<oneshot::Sender<Result<serde_json::Value, String>>>,
 }
 
@@ -73,7 +73,7 @@ impl BrainApprovalBroker {
         lock
     }
 
-    pub fn register(
+    pub(super) fn register(
         &self,
         request_seq: u64,
         approval_id: impl Into<String>,
@@ -82,7 +82,8 @@ impl BrainApprovalBroker {
         self.register_inner(request_seq, approval_id, audience, None)
     }
 
-    pub fn register_for_connection(
+    #[cfg(test)]
+    pub(super) fn register_for_connection(
         &self,
         request_seq: u64,
         approval_id: impl Into<String>,
@@ -92,7 +93,7 @@ impl BrainApprovalBroker {
         self.register_inner(request_seq, approval_id, audience, Some(connection_id))
     }
 
-    pub(crate) fn register_for_connection_with_authority<T>(
+    pub(super) fn register_for_connection_with_authority<T>(
         &self,
         request_seq: u64,
         approval_id: impl Into<String>,
@@ -249,7 +250,7 @@ impl BrainApprovalBroker {
         Ok(())
     }
 
-    pub fn claim(
+    pub(super) fn claim(
         &self,
         brain_id: BrainId,
         request_seq: u64,
@@ -279,7 +280,7 @@ impl BrainApprovalBroker {
         })
     }
 
-    pub fn claim_connection(
+    pub(super) fn claim_connection(
         &self,
         brain_id: BrainId,
         request_seq: u64,
@@ -436,7 +437,7 @@ impl BrainApprovalBroker {
 }
 
 impl ApprovalRegistration {
-    pub async fn wait(mut self) -> Result<serde_json::Value> {
+    pub(crate) async fn wait(mut self) -> Result<serde_json::Value> {
         let response_rx = self
             .response_rx
             .take()
@@ -459,13 +460,13 @@ impl Drop for ApprovalRegistration {
 }
 
 impl ClaimedApproval {
-    pub fn complete(mut self, decision: serde_json::Value) {
+    pub(super) fn complete(mut self, decision: serde_json::Value) {
         if let Some(response_tx) = self.response_tx.take() {
             let _ = response_tx.send(Ok(decision));
         }
     }
 
-    pub fn fail(mut self, error: impl Into<String>) {
+    pub(super) fn fail(mut self, error: impl Into<String>) {
         if let Some(response_tx) = self.response_tx.take() {
             let _ = response_tx.send(Err(error.into()));
         }

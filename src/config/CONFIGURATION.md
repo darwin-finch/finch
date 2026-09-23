@@ -14,13 +14,24 @@ model = "claude-sonnet-4-6"   # optional override
 
 [[providers]]
 type = "local"
-inference_provider = "onnx"
-execution_target = "coreml"   # "coreml" | "cpu"
+inference_provider = "llama_cpp"
+execution_target = "auto"    # "auto" (Metal on supported Macs) | "cpu"
 model_family = "qwen2"
-model_size = "medium"         # small=1.5B medium=3B large=7B xlarge=14B
+model_size = "medium"         # descriptive size hint; GGUF file supplies the weights
+model_path = "/absolute/path/to/chat-model.gguf"
 enabled = true
 
 ```
+
+The setup wizard can enter the same absolute GGUF path and checks that it exists before adding
+it. Leaving the field blank for a catalogued Qwen or Gemma selection instead persists an
+immutable managed-artifact identity (repository, commit, filename, quantization, byte size, and
+SHA-256). On daemon startup Finch resumes the download through Hugging Face, verifies it, and
+loads the cached path. The optional top-level `huggingface_token` is used first; standard hf-hub
+environment/cache credentials remain the fallback. These settings are for daemon chat LLMs only; the frontend memory
+subsystem selects and downloads its own models. ONNX and Candle are no longer chat providers.
+Loading a legacy entry reports an actionable `finch setup` migration error; an old repository or
+model file is never treated as a GGUF path.
 
 Automatic training is disabled and there are no active `auto_train` settings.
 Explicit feedback is retained privately in `~/.finch/feedback.jsonl` without
@@ -31,7 +42,7 @@ untouched.
 `remote_daemon`, and `local`. The legacy `chatgpt_subscription` value still deserializes only to
 produce migration guidance and is rejected before provider construction.
 
-**Backwards-compatible:** Old `[[teachers]]` format still loads correctly; auto-rewritten to `[[providers]]` on next save.
+**Backwards-compatible:** The removed legacy `[[teachers]]` format still loads (one private migration shim); saves write `[[providers]]` only.
 
 ## Named provider credentials
 
@@ -120,5 +131,5 @@ sources are not accepted yet; unknown keys fail closed at parse time.
 - `src/config/mod.rs` — Config loading, validation, migration; re-exports credential types from `finch-providers`
 - `crates/finch-providers/src/credentials.rs` — named credential schema and binding validator
 - `src/config/provider.rs` — `ProviderEntry` tagged enum
-- `src/config/settings.rs` — `TeacherEntry` (legacy), `LicenseConfig`, `LicenseType`
+- `src/config/settings.rs` — `LicenseConfig`, `LicenseType`
 - `src/config/diagnostics.rs` — declared post-edit diagnostics sources (`DiagnosticsConfig`)

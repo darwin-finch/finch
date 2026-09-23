@@ -2659,8 +2659,8 @@ pub enum GeneratorStatus {
     Downloading {
         model_size: String,
         file_name: String,
-        current_file: usize,
-        total_files: usize,
+        downloaded_bytes: u64,
+        total_bytes: u64,
     },
     Loading {
         model_size: String,
@@ -2684,7 +2684,7 @@ pub struct StatusResponse {
 
 /// Health check response
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HealthStatus {
+pub(super) struct HealthStatus {
     pub status: String,
     pub uptime_seconds: u64,
     pub named_brains: usize,

@@ -20,12 +20,10 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use uuid::Uuid;
 
 use super::events::ConfirmationResult;
-use crate::cli::conversation::{ConversationHistory, ToolRoundToken};
+use crate::cli::conversation::ToolRoundToken;
 use crate::cli::messages::WorkUnit;
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::ReplMode;
-use crate::local::LocalGenerator;
-use crate::models::TextTokenizer;
 use crate::tools::{
     generate_tool_signature, ToolExecutor, ToolLoop, ToolLoopResult, ToolLoopTerminal,
 };
@@ -44,15 +42,6 @@ pub struct ToolExecutionCoordinator {
 
     /// Reactive scrollback host for portable typed VM effects.
     output_manager: Arc<OutputManager>,
-
-    /// Conversation history (for tools that need context)
-    conversation: Arc<RwLock<ConversationHistory>>,
-
-    /// Local generator (for training tools)
-    local_generator: Arc<RwLock<LocalGenerator>>,
-
-    /// Tokenizer (for training tools)
-    tokenizer: Arc<TextTokenizer>,
 
     /// REPL mode (for plan mode state)
     repl_mode: Arc<RwLock<ReplMode>>,
@@ -131,9 +120,6 @@ impl ToolExecutionCoordinator {
         event_tx: mpsc::UnboundedSender<ReplEvent>,
         tool_executor: Arc<tokio::sync::Mutex<ToolExecutor>>,
         output_manager: Arc<OutputManager>,
-        conversation: Arc<RwLock<ConversationHistory>>,
-        local_generator: Arc<RwLock<LocalGenerator>>,
-        tokenizer: Arc<TextTokenizer>,
         repl_mode: Arc<RwLock<ReplMode>>,
         plan_content: Arc<RwLock<Option<String>>>,
     ) -> Self {
@@ -141,9 +127,6 @@ impl ToolExecutionCoordinator {
             event_tx,
             tool_executor,
             output_manager,
-            conversation,
-            local_generator,
-            tokenizer,
             repl_mode,
             plan_content,
             poset: None,
@@ -266,9 +249,6 @@ impl ToolExecutionCoordinator {
     ) {
         let event_tx = self.event_tx.clone();
         let tool_executor = Arc::clone(&self.tool_executor);
-        let conversation = Arc::clone(&self.conversation);
-        let local_generator = Arc::clone(&self.local_generator);
-        let tokenizer = Arc::clone(&self.tokenizer);
         let repl_mode = Arc::clone(&self.repl_mode);
         let plan_content = Arc::clone(&self.plan_content);
         let output_manager = Arc::clone(&self.output_manager);
@@ -474,9 +454,6 @@ impl ToolExecutionCoordinator {
 
         let event_tx = self.event_tx.clone();
         let tool_executor = Arc::clone(&self.tool_executor);
-        let conversation = Arc::clone(&self.conversation);
-        let local_generator = Arc::clone(&self.local_generator);
-        let tokenizer = Arc::clone(&self.tokenizer);
         let repl_mode = Arc::clone(&self.repl_mode);
         let plan_content = Arc::clone(&self.plan_content);
         let poset = self.poset.clone();
@@ -741,6 +718,7 @@ async fn publish_tool_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::conversation::ConversationHistory;
     use crate::providers::{ContentBlock, Message};
     use crate::theme::ColorScheme;
     use crate::tools::{
@@ -783,6 +761,7 @@ mod tests {
         ToolExecutionCoordinator,
         mpsc::UnboundedReceiver<ReplEvent>,
         tempfile::TempDir,
+        Arc<RwLock<ConversationHistory>>,
     ) {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(AutoAcceptWriteProbe));
@@ -794,22 +773,21 @@ mod tests {
         )
         .expect("construct executor for auto-accept write probe");
         let (event_tx, events) = mpsc::unbounded_channel();
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
         let coordinator = ToolExecutionCoordinator::new(
             event_tx,
             Arc::new(tokio::sync::Mutex::new(executor)),
             Arc::new(OutputManager::new(ColorScheme::default())),
-            Arc::new(RwLock::new(ConversationHistory::new())),
-            Arc::new(RwLock::new(LocalGenerator::new())),
-            Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
             Arc::new(RwLock::new(mode)),
             Arc::new(RwLock::new(None)),
         );
-        (coordinator, events, tempdir)
+        (coordinator, events, tempdir, conversation)
     }
 
     async fn spawn_write_probe(
         coordinator: &ToolExecutionCoordinator,
         events: &mut mpsc::UnboundedReceiver<ReplEvent>,
+        conversation: &Arc<RwLock<ConversationHistory>>,
     ) -> ReplEvent {
         let query_id = Uuid::new_v4();
         let tool_use = ToolUse::new(
@@ -817,8 +795,7 @@ mod tests {
             serde_json::json!({"path": "src/lib.rs", "content": "must not wait for a dialog"}),
         );
         let tool_id = tool_use.id.clone();
-        let round_token = coordinator
-            .conversation
+        let round_token = conversation
             .write()
             .await
             .stage_assistant(
@@ -844,9 +821,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_auto_accept_still_emits_tool_approval_needed_for_named_brain_route() {
-        let (coordinator, mut events, _tempdir) =
+        let (coordinator, mut events, _tempdir, conversation) =
             coordinator_with_write_probe(ReplMode::AutoAccept);
-        let event = spawn_write_probe(&coordinator, &mut events).await;
+        let event = spawn_write_probe(&coordinator, &mut events, &conversation).await;
         match event {
             ReplEvent::ToolApprovalNeeded { tool_use, .. } => {
                 assert_eq!(
@@ -862,8 +839,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_normal_mode_still_requests_write_approval() {
-        let (coordinator, mut events, _tempdir) = coordinator_with_write_probe(ReplMode::Normal);
-        let event = spawn_write_probe(&coordinator, &mut events).await;
+        let (coordinator, mut events, _tempdir, conversation) =
+            coordinator_with_write_probe(ReplMode::Normal);
+        let event = spawn_write_probe(&coordinator, &mut events, &conversation).await;
         match event {
             ReplEvent::ToolApprovalNeeded { tool_use, .. } => {
                 assert_eq!(

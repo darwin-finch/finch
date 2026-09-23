@@ -300,7 +300,7 @@ fn bounded_child_stderr(_stderr: &std::fs::File) -> String {
 }
 
 // `[backend]` must stay disabled here: `BackendConfig::default()` (enabled=true)
-// spawns real ONNX Qwen model loading as a plain `tokio::spawn` task that does
+// spawns real local GGUF model loading as a plain `tokio::spawn` task that does
 // not yield, which on a 2-vCPU CI runner starves the same multi-thread runtime
 // the HTTP listener needs to reach `publish_isolated_test_address` — the
 // isolated daemon stays alive but doesn't publish its address for 40s+, well
@@ -413,7 +413,7 @@ async fn test_daemon_spawn_and_health() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires a live teacher API credential"]
+#[ignore = "requires a live cloud provider API credential"]
 async fn test_daemon_query() -> Result<()> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .context("ANTHROPIC_API_KEY is required for the ignored daemon query smoke")?;
@@ -447,7 +447,7 @@ fn test_daemon_config_parsing() {
 // Regression for the isolation-gate flake root-caused on 2026-09-18: without
 // `[backend] enabled = false`, `write_config` produces a config that falls
 // back to `BackendConfig::default()` (enabled=true), which makes the isolated
-// daemon load a real ONNX Qwen model on a plain (non-yielding) `tokio::spawn`
+// daemon load a real local GGUF model on a plain (non-yielding) `tokio::spawn`
 // task. On the 2-vCPU ubuntu-24.04 CI runner that starves the multi-thread
 // runtime's other worker for 40s+, so `TestDaemon::start` misses its
 // address-publication bound even though the test never exercises local
@@ -470,7 +470,7 @@ fn test_write_config_disables_local_backend() {
         config["backend"]["enabled"].as_bool(),
         Some(false),
         "isolated daemon test config must disable the local model backend, or the daemon \
-         spawns real ONNX model loading and can miss its address-publication bound under CI \
+         spawns real local model loading and can miss its address-publication bound under CI \
          load: config={contents:?}"
     );
 }

@@ -27,24 +27,23 @@ mod grok_oauth;
 #[cfg(feature = "grok_subscription")]
 mod grok_subscription;
 mod model_catalog;
+mod oauth;
 #[cfg(feature = "openai")]
 mod openai;
 #[cfg(feature = "chatgpt")]
 mod openai_jwks;
 mod ports;
+mod provider_session;
 mod reasoning;
 mod retry;
-mod teacher_session;
 mod tool_bindings;
 mod tool_contract;
 mod types;
 mod validated_boundary;
 mod wire_types;
 
-pub mod oauth;
-
 pub use alignment::{with_alignment, UNIVERSAL_ALIGNMENT_PROMPT};
-pub use anthropic::{MessageRequest, MessageResponse, StreamDelta, StreamEvent};
+pub use anthropic::{MessageRequest, MessageResponse};
 pub use chatgpt_oauth::{
     chatgpt_required_scopes, ChatGptAuthStageError, ChatGptDeviceEndpointError,
     OpenAiChatGptOAuthDialect, OpenAiTokenVerifier, VerifiedOpenAiClaims,
@@ -80,25 +79,21 @@ pub use model_catalog::{
     refresh_with_fallback, static_fallback, CatalogAuth, CatalogSource, ModelCatalog,
     ModelCatalogProfile, STATIC_FALLBACK_AS_OF,
 };
+pub use oauth::{
+    validate_reference, AuthorizationCodeGrant, DeviceAuthorization, DevicePoll,
+    FileOAuthCredentialStore, OAuthClient, OAuthCredentialCommit, OAuthCredentialPersistenceError,
+    OAuthCredentialStore, OAuthDeviceAuthorizationError, OAuthDialect, OAuthDialectDescriptor,
+    OAuthHttpRequest, OAuthRequestBody, OAuthTokenRecord, PendingBrowserAuthorization,
+    StoredOAuthCredentialResolver, TokenValidationContext,
+};
 #[cfg(feature = "openai")]
 pub use openai::OpenAIProvider;
 #[cfg(feature = "chatgpt")]
 pub use openai_jwks::OpenAiJwksVerifier;
-pub use ports::{
-    AuthorizationPresenter, BillingActionConfirmer, Clock, FrozenClock, HttpTransport,
-    InstantSleeper, ProviderPorts, ProviderTelemetry, ReqwestTransport, Sleeper, SystemClock,
-    TokioSleeper,
-};
+pub(crate) use ports::ProviderPorts;
+pub use provider_session::{ProviderSession, SessionContextConfig};
 pub use reasoning::ReasoningEffort;
-pub use retry::{with_retry, NonRetriableError};
-pub use teacher_session::{
-    ConversationState, OptimizationStats, TeacherContextConfig, TeacherSession,
-};
-pub use tool_bindings::{
-    compile_from_definitions, compile_tool_bindings, BoundTool, ResultEncoding, SemanticTool,
-    ToolBindingError, ToolBindingTable, ToolOrigin, WireToolIdentity, WireToolKind,
-    MAX_ADVERTISED_TOOLS,
-};
+pub use tool_bindings::{SemanticTool, ToolBindingTable, ToolOrigin};
 pub use tool_contract::{ToolDefinition, ToolInputSchema, ToolUse};
 pub use types::{
     CapabilityProvenance, CapabilitySupport, ContextWindowCapability, EventProvenance,
@@ -115,7 +110,7 @@ pub(crate) use validated_boundary::validate_provider_request;
 /// Default Claude model used when a transport does not override it.
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5";
 /// Default completion budget used by Anthropic request envelopes.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8000;
+pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8000;
 
 const MAX_RESPONSE_MODEL_BYTES: usize = 256;
 

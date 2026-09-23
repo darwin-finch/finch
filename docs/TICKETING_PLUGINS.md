@@ -29,7 +29,7 @@ ticketing MCP so Finch can STDIO to itself.
 
 Disabled plugins skip registration and must not construct HTTP clients until
 enabled and first used. Startup cost is then schema registration, not Jira
-login. Binary size grows by REST adapters (small next to Candle/ONNX). RSS
+login. Binary size grows by REST adapters (small next to native model runtimes). RSS
 grows when a plugin allocates.
 
 ## LLM tools: core, then omit

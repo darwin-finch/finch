@@ -2762,12 +2762,14 @@ impl TuiRenderer {
         message: &MessageRef,
         width: usize,
     ) -> Vec<RenderedTranscriptLine> {
-        // Component-owned say turns (#882): the card renders from the
-        // component ViewModel each frame. Disclosure state lives on the VM —
-        // the renderer's RowId-keyed maps never hold it — and the engine
-        // never matches on the message type: the Message trait answers.
-        if let Some(view) = message.say_turn_view() {
-            let lines = finch_ui_model::say_turn_lines(&view);
+        // Component-owned messages (stage 3 of docs/TUI_DESIGN.md, #1120):
+        // the message constructs its component from its retained ViewModel,
+        // and the engine never matches on the message type — the Message
+        // trait answers with the snapshot, and the component capsule renders
+        // it. Component state lives on the ViewModel, not the renderer's
+        // RowId-keyed maps.
+        if let Some(view) = message.component_view() {
+            let lines = finch_ui_model::component_lines(&view);
             return self
                 .tool_viewports
                 .project(lines, width, DEFAULT_TOOL_OUTPUT_ROWS);
@@ -2775,6 +2777,10 @@ impl TuiRenderer {
         // The ViewModel is the one domain → widget projection: convert the
         // message to props, then render them under the renderer's disclosure
         // state. Widgets never query WorkUnits to decide visibility (#805).
+        // Unmigrated rows — non-say WorkUnit presentations, the open stage-2
+        // scope — keep this legacy path, which is also the canonical-commit
+        // projection: the component is the live reader; the settled record
+        // keeps today's exact bytes (the say-turn precedent, #882).
         let lines = match view_model::project_message(message, &self.colors) {
             view_model::ProjectedMessage::Node(node) => self.accordion.render_node(&node),
             view_model::ProjectedMessage::Plain(formatted) => {
@@ -4585,7 +4591,7 @@ mod tests {
     use super::*;
     use crate::vt_oracle::{VtColor, VtOracle, VtStyle};
     use finch_diff::{summarize_files, DiffColorMode, FileDiff};
-    use finch_messages::{Message, MessageId, MessageRef, WorkUnit};
+    use finch_messages::{Message, MessageId, MessageRef, StaticMessage, WorkUnit};
     use finch_theme::ColorTheme;
 
     #[test]
@@ -7292,6 +7298,241 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    // ── Stage-3 components render at the claiming boundary (#1120) ─────────
+
+    /// INVARIANT (stage 3, #1120): a StaticMessage renders its text through
+    /// the component accessor at the claiming boundary — one glyph-prefixed
+    /// line per content line, no SGR, no legacy `format()` fallback path
+    /// (which would carry baked color bytes instead).
+    #[test]
+    fn test_static_message_renders_text_through_its_component() {
+        let mut renderer = headless_renderer();
+        let message: MessageRef = Arc::new(StaticMessage::error("Provider unreachable"));
+        let lines = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = lines.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["❌ Provider unreachable"],
+            "the static text is its view: one error-glyph line; got {rendered:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.text.contains('\x1b')),
+            "the component emits plain text — the retired format() SGR bytes must not \
+             ride the component path; got {rendered:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.row_id.is_none() && !line.component_owned),
+            "a static text row claims no hit target and no component routing"
+        );
+
+        // Plain passthrough: pre-formatted content is byte-exact.
+        let raw: MessageRef = Arc::new(StaticMessage::plain("\x1b[32m[tool] styled\x1b[0m"));
+        let plain = renderer.projected_message_lines(&raw, 80);
+        assert_eq!(
+            plain
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>(),
+            vec!["\x1b[32m[tool] styled\x1b[0m"],
+            "Plain content passes through byte-exactly"
+        );
+    }
+
+    /// INVARIANT (stage 3, #1120): a ProgressMessage renders its bar/line
+    /// from the VM at the claiming boundary, and growth between frames
+    /// re-renders from the mutated VM (the pull-per-frame discipline). The
+    /// zero-claim furniture rule holds in the live viewport: once committed,
+    /// the message leaves the live surface entirely — no resident row.
+    #[test]
+    fn test_progress_message_renders_the_bar_from_the_vm_and_zero_claims_when_complete() {
+        use finch_messages::ProgressMessage;
+        let mut renderer = headless_renderer();
+        let progress = Arc::new(ProgressMessage::new("weights.safetensors", 100));
+        let message: MessageRef = Arc::clone(&progress) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+
+        let first = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = first.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["weights.safetensors [░░░░░░░░░░] 0%"],
+            "the bar starts empty at zero bytes; got {rendered:?}"
+        );
+
+        // Growth between frames: the producer mutates the VM under its lock;
+        // the next projection re-renders from it with no observers.
+        progress.update_progress(50);
+        let second = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = second.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["weights.safetensors [█████░░░░░] 50%"],
+            "the bar tracks the VM's numbers on the next frame; got {rendered:?}"
+        );
+        assert!(
+            second.iter().all(|line| !line.text.contains('\x1b')),
+            "the component emits plain text; got {rendered:?}"
+        );
+
+        // Zero-claim when complete: a completed progress row is committed
+        // through the canonical pipeline, so the live viewport holds no
+        // resident row for it — the component claims nothing once the
+        // message has left the live surface.
+        progress.set_complete();
+        let mut stdout_buf: Vec<u8> = Vec::new();
+        let committed = commit_complete_messages(
+            &mut stdout_buf,
+            &renderer.output_manager.get_messages(),
+            &mut renderer.accordion,
+            &renderer.colors,
+            &mut renderer.printed_ids,
+            24,
+            80,
+        )
+        .expect("the completed progress row commits once");
+        assert!(committed > 0, "the canonical record carries the bar once");
+        assert!(
+            String::from_utf8_lossy(&stdout_buf).contains("100% ✓"),
+            "the committed record shows the completed bar; got {}",
+            String::from_utf8_lossy(&stdout_buf)
+        );
+        let live = uncommitted_suffix(
+            renderer.output_manager.get_messages(),
+            &renderer.printed_ids,
+        );
+        let live_ids: Vec<_> = live.iter().map(|message| message.id()).collect();
+        assert!(
+            !live_ids.contains(&message.id()),
+            "zero-claim furniture: a completed progress row leaves the live viewport; \
+             live ids were {live_ids:?}"
+        );
+    }
+
+    /// INVARIANT (stage 3, #1120): a LiveToolMessage renders the live tool
+    /// surface from its VM at the claiming boundary, and streaming growth
+    /// renders between frames — the producer appends under the message lock,
+    /// the next projection re-renders from the snapshot (the say-turn
+    /// streaming discipline, mirrored here).
+    #[test]
+    fn test_live_tool_message_streams_content_growth_between_frames() {
+        use finch_messages::LiveToolMessage;
+        let mut renderer = headless_renderer();
+        let live_tool = Arc::new(LiveToolMessage::new("⏺ bash(echo hi)"));
+        let message: MessageRef = Arc::clone(&live_tool) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+
+        let first = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = first.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["⏺ bash(echo hi)…"],
+            "a just-started call is the header with the running ellipsis; got {rendered:?}"
+        );
+
+        // First chunk arrives: the content subwidget claims its rows.
+        live_tool.append_line("hello world");
+        let second = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = second.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["⏺ bash(echo hi)", "hello world"],
+            "streaming growth renders beneath the header between frames; got {rendered:?}"
+        );
+
+        // A second chunk grows the surface again, and completion drops the
+        // running ellipsis.
+        live_tool.append_line("goodbye");
+        live_tool.set_complete();
+        let third = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = third.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["⏺ bash(echo hi)", "hello world", "goodbye"],
+            "the completed surface carries every arrived line and no ellipsis; got \
+             {rendered:?}"
+        );
+        assert!(
+            third.iter().all(|line| !line.text.contains('\x1b')),
+            "the component emits plain text; got {rendered:?}"
+        );
+        assert!(
+            third
+                .iter()
+                .all(|line| line.row_id.is_none() && !line.component_owned),
+            "the live tool surface claims no hit target in stage 3"
+        );
+    }
+
+    /// INVARIANT (stage 3, #1120): an OperationMessage renders the chrome and
+    /// the row list with per-row status glyphs from the VM at the claiming
+    /// boundary; row transitions (running → complete/error) and operation
+    /// completion re-render from the VM on the next frame.
+    #[test]
+    fn test_operation_message_renders_row_glyphs_from_the_vm() {
+        use finch_messages::OperationMessage;
+        let mut renderer = headless_renderer();
+        let operation = Arc::new(OperationMessage::new("Generating"));
+        let message: MessageRef = Arc::clone(&operation) as MessageRef;
+        renderer
+            .output_manager
+            .add_trait_message(Arc::clone(&message));
+
+        let first = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = first.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["⏺ Generating…"],
+            "the rows subwidget zero-claims before the first call starts; got {rendered:?}"
+        );
+
+        // A call starts: the row renders with its running glyph.
+        let call = operation.add_row("bash(git push)");
+        let second = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = second.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec!["⏺ Generating…", "  ⎿ bash(git push)…"],
+            "a running row carries its ellipsis glyph; got {rendered:?}"
+        );
+
+        // The call completes with a summary; a second one fails. The VM's
+        // per-row statuses decide the glyphs on the next frame.
+        operation.complete_row(call, "pushed");
+        let failed_call = operation.add_row("bash(flaky)");
+        operation.fail_row(failed_call, "exit 1");
+        operation.set_complete();
+        let third = renderer.projected_message_lines(&message, 80);
+        let rendered: Vec<String> = third.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "⏺ Generating",
+                "  ⎿ bash(git push) pushed",
+                "  ⎿ bash(flaky) error: exit 1",
+            ],
+            "completed and error rows render their VM glyphs; the completed operation \
+             drops the chrome ellipsis; got {rendered:?}"
+        );
+        assert!(
+            third.iter().all(|line| !line.text.contains('\x1b')),
+            "the component emits plain text; got {rendered:?}"
+        );
+        let dumped = rendered.join("\n");
+        assert!(
+            dumped.contains('\u{23fa}') && dumped.contains('\u{23bf}'),
+            "the pinned glyph vocabulary renders at the claiming boundary"
+        );
+        assert!(
+            !dumped.contains('\u{25cf}') && !dumped.contains('\u{2514}'),
+            "the legacy ● (U+25CF) / └ (U+2514) pair must not return; got {dumped:?}"
+        );
+    }
     fn paint_slash_completions(renderer: &mut TuiRenderer) {
         renderer.update_ghost_text();
         completion_pane_lines(&mut renderer.autocomplete_state, 80, 9);

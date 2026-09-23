@@ -136,7 +136,7 @@ impl ThresholdRouter {
 
     /// Decide whether to try local generation
     pub fn should_try_local(&self, query: &str) -> bool {
-        // CHANGED: Now that we have a real ONNX model, try local by default
+        // Try local by default when a generator is ready.
         // Only forward if we've learned this category fails consistently
 
         // Categorize the query
@@ -153,7 +153,7 @@ impl ThresholdRouter {
             }
         }
 
-        // Default: try local (now that we have ONNX model)
+        // Default: try the ready local generator.
         true
     }
 
@@ -564,7 +564,7 @@ mod tests {
     fn test_learning() {
         let mut router = ThresholdRouter::new();
 
-        // With ONNX model, default is to try local
+        // With a ready local model, the default is to try local.
         // First 10 queries: should try local by default (no statistics yet)
         for _ in 0..10 {
             assert!(router.should_try_local("test query")); // Changed: now tries local by default

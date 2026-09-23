@@ -218,7 +218,7 @@ impl WizardState {
         );
 
         // The ordered unified provider list is authoritative and includes
-        // local secondary models. The legacy teachers projection does not.
+        // local secondary models.
         let mut configured_models: Vec<ModelConfig> = existing_config
             .map(|config| {
                 config
@@ -229,8 +229,8 @@ impl WizardState {
             })
             .unwrap_or_default();
 
-        // Compatibility for Config values constructed from the old split
-        // backend/teachers fields by tests or older callers.
+        // Compatibility for Config values constructed with only the legacy
+        // backend field by tests or older callers.
         if configured_models.is_empty() {
             if let Some(config) = existing_config {
                 if config.backend.enabled {
@@ -239,23 +239,12 @@ impl WizardState {
                         size: config.backend.model_size,
                         execution: config.backend.execution_target,
                         inference_provider: config.backend.inference_provider,
+                        model_path: config.backend.model_path.clone(),
+                        managed_artifact: config.backend.managed_artifact.clone(),
                         enabled: true,
-                        persisted: None,
+                        persisted: Some(ProviderEntry::from_backend_config(&config.backend, None)),
                     });
                 }
-                configured_models.extend(config.teachers.iter().map(|teacher| {
-                    ModelConfig::Remote {
-                        provider: teacher.provider.clone(),
-                        name: teacher
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| teacher.provider.clone()),
-                        api_key: teacher.api_key.clone(),
-                        model: teacher.model.clone().unwrap_or_default(),
-                        enabled: true,
-                        persisted: None,
-                    }
-                }));
             }
         }
 
@@ -514,7 +503,6 @@ pub struct SetupResult {
     pub model_family: ModelFamily,
     pub model_size: ModelSize,
     pub custom_model_repo: Option<String>,
-    pub teachers: Vec<TeacherEntry>,
 
     /// Single key accepted by the daemon's model API for every provider.
     pub finch_api_key: String,

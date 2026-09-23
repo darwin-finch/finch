@@ -49,7 +49,7 @@ pub fn compile_policy_from_registry(
 ///
 /// `definitions` are the Finch-owned schemas (built-in + MCP). Native
 /// provider candidates are included only when a handler is registered and
-/// [`PermissionManager::allows_advertising`] is true. A provider cannot
+/// `PermissionManager::allows_advertising` is true. A provider cannot
 /// invent an executable namespace merely by returning one.
 pub fn semantic_tools_for_advertisement(
     definitions: &[ToolDefinition],

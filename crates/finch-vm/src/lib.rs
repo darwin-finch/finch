@@ -45,7 +45,7 @@ pub const RUNTIME_APPLICATION_ABI_VERSION: u32 = 1;
 pub use interpreter::instantiate_requirement;
 pub use interpreter::{
     CapabilityHandler, HostSideEffect, InterpreterConfig, UiProgress, VmContinuation, VmFrame,
-    VmSideEffect, VmStep, VmTrampoline,
+    VmSideEffect,
 };
 pub use runtime::{
     EffectJournalEntry, EffectJournalState, PendingHostCall, ProducerFiberRecord,

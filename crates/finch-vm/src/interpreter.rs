@@ -434,7 +434,7 @@ pub struct VmContinuation {
 
 /// One result from running the VM until its next observable boundary.
 #[derive(Debug, Clone, PartialEq)]
-pub enum VmStep {
+pub(crate) enum VmStep {
     /// A typed cooperative suspension. The event loop may reschedule a unit
     /// yield as a timeslice or expose a non-unit value through a fiber/range
     /// handle; the continuation itself is never exposed to source programs.
@@ -512,26 +512,26 @@ pub enum VmStep {
 /// It advances pure instructions synchronously and yields at output and host
 /// capability boundaries. `Interpreter::execute` remains a synchronous
 /// adapter for existing callers while the runtime migrates to this interface.
-pub struct VmTrampoline<'a> {
+pub(crate) struct VmTrampoline<'a> {
     module: &'a VerifiedModule,
     fuel: u64,
 }
 
 impl<'a> VmTrampoline<'a> {
-    pub fn new(module: &'a VerifiedModule, config: &InterpreterConfig) -> Self {
+    pub(crate) fn new(module: &'a VerifiedModule, config: &InterpreterConfig) -> Self {
         Self {
             module,
             fuel: config.fuel,
         }
     }
 
-    pub fn start(&self, stack: Vec<TypedValue>) -> Result<VmContinuation, VmDiagnostic> {
+    pub(crate) fn start(&self, stack: Vec<TypedValue>) -> Result<VmContinuation, VmDiagnostic> {
         self.start_function(&self.module.module.entry, Vec::new(), stack)
     }
 
     /// Start an isolated invocation of a verified function. CPU fibers use
     /// this rather than inheriting a parent VM's stack or call frames.
-    pub fn start_function(
+    pub(crate) fn start_function(
         &self,
         function: &str,
         captures: Vec<TypedValue>,
@@ -548,13 +548,17 @@ impl<'a> VmTrampoline<'a> {
 
     /// Resume a yielded continuation with the typed values supplied by the
     /// event loop (for example, an approved file read or child result).
-    pub fn resume(&self, mut continuation: VmContinuation, values: Vec<TypedValue>) -> VmStep {
+    pub(crate) fn resume(
+        &self,
+        mut continuation: VmContinuation,
+        values: Vec<TypedValue>,
+    ) -> VmStep {
         continuation.stack.extend(values);
         self.run(continuation)
     }
 
     /// Run a bounded slice until it emits, awaits, completes, or fails.
-    pub fn run(&self, mut continuation: VmContinuation) -> VmStep {
+    pub(crate) fn run(&self, mut continuation: VmContinuation) -> VmStep {
         loop {
             let Some(frame) = continuation.frames.last_mut() else {
                 return VmStep::Complete {

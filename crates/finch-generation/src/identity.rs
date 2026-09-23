@@ -22,7 +22,7 @@ pub enum BackendKind {
 pub struct BackendRef {
     /// Provider identity (`"claude"`, `"openai"`, `"local"`, `"test"`).
     pub provider: String,
-    /// Exact model id. Must pass [`validate_model_id`].
+    /// Exact model id. Must pass crate-internal `validate_model_id` validation.
     pub model: String,
     /// How this backend is hosted.
     pub kind: BackendKind,
@@ -77,7 +77,7 @@ impl GenerationIdentity {
     /// provider, resolved/actual follow the requested model (what is sent
     /// on the wire), not the backend's default. Explicit fallback to a
     /// different provider keeps the selected backend's identity.
-    pub fn for_dispatch(requested: BackendRef, backend: BackendRef) -> Self {
+    pub(crate) fn for_dispatch(requested: BackendRef, backend: BackendRef) -> Self {
         let resolved = if requested.provider == backend.provider {
             BackendRef {
                 provider: backend.provider,
@@ -95,7 +95,7 @@ impl GenerationIdentity {
     }
 
     /// Record a serving-model correction without changing requested/resolved.
-    pub fn with_actual_model(mut self, model: impl Into<String>) -> Result<Self> {
+    pub(crate) fn with_actual_model(mut self, model: impl Into<String>) -> Result<Self> {
         let model = model.into();
         validate_model_id(&model)?;
         self.actual.model = model;
@@ -125,7 +125,7 @@ pub struct RouteDecision {
 
 /// Reject empty, oversized, non-graphic, or non-ASCII identity strings
 /// without echoing the value into the error.
-pub fn validate_model_id(value: &str) -> Result<()> {
+fn validate_model_id(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > MAX_IDENTITY_BYTES
         || !value.bytes().all(|byte| byte.is_ascii_graphic())
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn test_for_dispatch_keeps_fallback_backend_identity() {
         let requested = BackendRef::new("local", "missing", BackendKind::Local).unwrap();
-        let backend = BackendRef::new("claude", "teacher", BackendKind::Cloud).unwrap();
+        let backend = BackendRef::new("claude", "cloud-primary", BackendKind::Cloud).unwrap();
         let identity = GenerationIdentity::for_dispatch(requested.clone(), backend.clone());
         assert_eq!(identity.requested, requested);
         assert_eq!(

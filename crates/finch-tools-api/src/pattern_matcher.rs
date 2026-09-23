@@ -2,6 +2,12 @@
 //
 // Extracts tool uses from query text using regex patterns
 // Provides immediate value before neural tool selector is trained
+//
+// Crate-internal since #962: no workspace consumer invokes the matcher yet,
+// so every method is `pub(crate)`/private. The pattern chain is retained for
+// the pre-neural-selector path, which is why the unused-in-production parts
+// are allowed to rest rather than deleted.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::types::ToolUse;
 use anyhow::Result;
@@ -107,14 +113,14 @@ pub struct ToolPatternMatcher {
 
 impl ToolPatternMatcher {
     /// Create new matcher with default patterns
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             patterns: Vec::new(),
         }
     }
 
     /// Create matcher with built-in patterns
-    pub fn with_default_patterns() -> Result<Self> {
+    pub(crate) fn with_default_patterns() -> Result<Self> {
         let mut matcher = Self::new();
 
         // Read file patterns
@@ -174,7 +180,7 @@ impl ToolPatternMatcher {
 
     /// Extract tool uses from query
     #[instrument(skip(self))]
-    pub fn extract_tool_uses(&self, query: &str) -> Result<Vec<ToolUse>> {
+    pub(crate) fn extract_tool_uses(&self, query: &str) -> Result<Vec<ToolUse>> {
         let mut tool_uses = Vec::new();
 
         for pattern in &self.patterns {
@@ -190,7 +196,7 @@ impl ToolPatternMatcher {
     }
 
     /// Check if query matches any tool pattern
-    pub fn matches_any(&self, query: &str) -> bool {
+    pub(crate) fn matches_any(&self, query: &str) -> bool {
         self.patterns.iter().any(|p| p.matches(query))
     }
 }

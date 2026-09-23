@@ -2151,6 +2151,8 @@ fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
         &output,
         &mut projections,
         &result,
+        &super::LocallyRenderedRuns::default(),
+        None,
     ));
 
     let mut terminal = brain_event(
@@ -2167,6 +2169,8 @@ fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
         &output,
         &mut projections,
         &terminal,
+        &super::LocallyRenderedRuns::default(),
+        None,
     ));
 
     let unit = projections.get(&run_id).unwrap().unit.clone();
@@ -2249,6 +2253,8 @@ fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
             &output,
             &mut projections,
             &event,
+            &super::LocallyRenderedRuns::default(),
+            None,
         ));
     }
 
@@ -2458,6 +2464,8 @@ fn replayed_completed_say_run_reconstructs_the_component_card() {
         &mut local_projections,
         true,
         &events,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
     );
 
     let unit = projections
@@ -2571,6 +2579,8 @@ fn replayed_midstream_say_run_replays_best_known_state() {
         &mut local_projections,
         true,
         &events,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
     );
     let unit = projections.get(&run_id).expect("run unit").unit.clone();
     let view = unit
@@ -2606,6 +2616,8 @@ fn replayed_midstream_say_run_replays_best_known_state() {
         &mut local_projections,
         true,
         &events,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
     );
     let unit = projections.get(&run_id).expect("run unit").unit.clone();
     let view = unit
@@ -2694,6 +2706,8 @@ fn replayed_say_run_with_tools_keeps_the_legacy_projection() {
         &mut local_projections,
         true,
         &events,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
     );
     let unit = projections.get(&run_id).expect("run unit").unit.clone();
     assert!(
@@ -2735,6 +2749,8 @@ fn replayed_errored_say_result_keeps_the_legacy_projection() {
         &mut local_projections,
         true,
         &events,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
     );
     let unit = projections.get(&run_id).expect("run unit").unit.clone();
     assert!(
@@ -2787,6 +2803,8 @@ fn replayed_non_interactive_run_keeps_the_legacy_projection() {
         &mut local_projections,
         true,
         &events,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
     );
     let unit = projections.get(&run_id).expect("run unit").unit.clone();
     assert!(
@@ -2823,6 +2841,8 @@ fn replayed_say_card_survives_a_second_snapshot_without_duplicating_output() {
         &mut local_projections,
         true,
         &events,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
     );
     let unit = projections.get(&run_id).expect("run unit").unit.clone();
     let action = unit.say_turn_action(&[1]).expect("toggle target");
@@ -2840,6 +2860,8 @@ fn replayed_say_card_survives_a_second_snapshot_without_duplicating_output() {
         &mut local_projections,
         true,
         &events,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
     );
     let view = unit
         .say_turn_view()
@@ -3146,7 +3168,13 @@ fn todo_write_transcript_shows_the_task_list_not_the_raw_json() {
         let mut event = brain_event(index as u64 + 1, "daemon", kind);
         event.run_id = Some(run_id);
         assert!(
-            super::project_remote_brain_run_event(&output, &mut projections, &event),
+            super::project_remote_brain_run_event(
+                &output,
+                &mut projections,
+                &event,
+                &super::LocallyRenderedRuns::default(),
+                None,
+            ),
             "every projected run event must be acknowledged: seq={}",
             index + 1
         );
@@ -3343,6 +3371,8 @@ fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
         &mut local_projections,
         true,
         &events,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
     );
     assert!(local_projections.is_empty());
 
@@ -3554,6 +3584,9 @@ fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
             &mut local_projections,
             true,
             event,
+            &super::LocallyRenderedRuns::default(),
+            &mut std::collections::HashSet::new(),
+            None,
         ));
     }
     assert!(local_projections.is_empty());
@@ -3563,6 +3596,8 @@ fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
         &mut local_projections,
         true,
         &events,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
     );
 
     let messages = output.get_messages();
@@ -3656,6 +3691,9 @@ fn named_brain_live_result_keeps_assistant_prose_say() {
         &mut local_projections,
         true,
         &program,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
+        None,
     ));
 
     let mut result = brain_event(
@@ -3676,6 +3714,9 @@ fn named_brain_live_result_keeps_assistant_prose_say() {
         &mut local_projections,
         true,
         &result,
+        &super::LocallyRenderedRuns::default(),
+        &mut std::collections::HashSet::new(),
+        None,
     ));
 
     let messages = output.get_messages();
@@ -3765,6 +3806,451 @@ fn local_runner_projection_does_not_hide_different_canonical_output() {
     );
     result.run_id = Some(projection.run_id);
     assert_eq!(projection.observe(&result), LocalProjectionMatch::None);
+}
+
+/// #978 regression at the delegation boundary: a typed program the daemon
+/// hands to this frontend's runner lease renders the card through the local
+/// units — no Brain run group, no duplicate rows — and the daemon's terminal
+/// events for the run paint nothing beside it.
+#[tokio::test]
+async fn delegated_program_say_renders_card_without_run_group_or_duplicate_rows() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::brain::{BrainEventKind, ProgramLanguage, RunId};
+            use crate::cli::messages::SayTurnStatus;
+
+            let greeting = "Hello, daemon say turn";
+            let source = format!("(say \"{greeting}\")");
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let tempdir = tempfile::tempdir().expect("delegated say fixture: isolated tool state");
+            let executor = crate::tools::ToolExecutor::new(
+                crate::tools::ToolRegistry::new(),
+                crate::tools::PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("delegated say fixture: construct inert tool executor");
+            let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+            let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                generator,
+                Vec::new(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                runtime,
+            );
+            event_loop.output_manager.disable_stdout();
+            event_loop.runner_brain = Some("home".into());
+            event_loop.home_runner_lease_active = true;
+
+            let run_id = RunId(uuid::Uuid::new_v4());
+            let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_event(super::ReplEvent::NamedBrainProgramRequested(
+                    crate::server::RunnerProgramRequest {
+                        brain: "home".into(),
+                        run_id,
+                        request_seq: 3,
+                        language: ProgramLanguage::Lisp,
+                        source: source.clone(),
+                        interaction: crate::server::RunnerProgramInteraction::Interactive,
+                        grant_ceiling: None,
+                        control_tx: None,
+                        effect_audit: None,
+                        response_tx,
+                    },
+                ))
+                .await
+                .expect("delegated program must dispatch");
+            // Let the spawned VM task run so the delegation settles the way
+            // production does; the completion event lands on the loop channel
+            // and the settle below is the handler the loop would call.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+
+            event_loop
+                .finish_named_brain_program(run_id, greeting.to_string(), None)
+                .await;
+
+            let messages = event_loop.output_manager.get_messages();
+            let rendered = messages
+                .iter()
+                .map(|message| message.format(&crate::theme::ColorScheme::default()))
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            assert!(
+                event_loop.remote_brain_run_units.get(&run_id).is_none(),
+                "INVARIANT: a delegated say program projects no Brain run group; \
+                 rendered=\n{rendered}"
+            );
+            let say_cards = messages
+                .iter()
+                .filter(|message| message.say_turn_view().is_some())
+                .count();
+            assert_eq!(
+                say_cards, 1,
+                "INVARIANT: the delegated program renders exactly one say card; \
+                 cards={say_cards}; rendered=\n{rendered}"
+            );
+            let card_view = messages
+                .iter()
+                .find_map(|message| message.say_turn_view())
+                .expect("the delegated program must carry a say card");
+            assert_eq!(
+                card_view.vm.status,
+                SayTurnStatus::Completed,
+                "INVARIANT: the settled delegated turn is a completed card; view={card_view:?}"
+            );
+            assert_eq!(
+                card_view.vm.program.lines.join("\n"),
+                source,
+                "INVARIANT: the card carries the delegated program for the reveal toggle; \
+                 view={card_view:?}"
+            );
+            assert_eq!(
+                rendered.matches(&source).count(),
+                1,
+                "INVARIANT: the delegated program renders exactly once across the turn's \
+                 units; rendered=\n{rendered}"
+            );
+            assert_eq!(
+                card_view
+                    .vm
+                    .output
+                    .as_ref()
+                    .map(|output| output.lines.join("\n")),
+                Some(greeting.to_string()),
+                "INVARIANT: the completed card's output part carries the say prose; \
+                 view={card_view:?}"
+            );
+            assert!(
+                !rendered.contains("Brain run") && !rendered.contains("Interactive run"),
+                "INVARIANT: no Brain run UUID row renders for the delegated say turn; \
+                 rendered=\n{rendered}"
+            );
+
+            // The daemon's terminal events for the delegated run arrive after
+            // the local projection registered; neither may paint a run group
+            // or a duplicate row beside the card.
+            let locally_rendered = event_loop.locally_rendered_runs();
+            let mut result = brain_event(
+                7,
+                "daemon",
+                BrainEventKind::Result {
+                    request_seq: 3,
+                    output: greeting.to_string(),
+                    error: None,
+                    continuation_messages: Vec::new(),
+                    invocation_metadata: None,
+                },
+            );
+            result.run_id = Some(run_id);
+            assert!(
+                super::project_remote_brain_live_run_event(
+                    &event_loop.output_manager,
+                    &mut event_loop.remote_brain_run_units,
+                    &mut event_loop.local_brain_projections,
+                    true,
+                    &result,
+                    &locally_rendered,
+                    &mut event_loop.locally_say_projected_runs,
+                    None,
+                ),
+                "INVARIANT: the delegated run's terminal Result is handled by the \
+                 projection path"
+            );
+            assert!(
+                event_loop.locally_say_projected_runs.contains(&run_id),
+                "INVARIANT: the completed pure-say turn marks the run so later lifecycle \
+                 events stay suppressed; say_completed={:?}",
+                event_loop.locally_say_projected_runs
+            );
+            assert!(
+                event_loop.remote_brain_run_units.get(&run_id).is_none(),
+                "INVARIANT: the daemon's terminal Result paints no run group for the \
+                 delegated say turn"
+            );
+
+            let mut terminal = brain_event(
+                8,
+                "daemon",
+                BrainEventKind::RunStatusChanged {
+                    run_id,
+                    status: crate::brain::BrainRunStatus::Completed,
+                    detail: None,
+                },
+            );
+            terminal.run_id = Some(run_id);
+            let locally_rendered = event_loop.locally_rendered_runs();
+            super::project_remote_brain_live_run_event(
+                &event_loop.output_manager,
+                &mut event_loop.remote_brain_run_units,
+                &mut event_loop.local_brain_projections,
+                true,
+                &terminal,
+                &locally_rendered,
+                &mut std::collections::HashSet::new(),
+                None,
+            );
+            let rendered_after = event_loop
+                .output_manager
+                .get_messages()
+                .iter()
+                .map(|message| message.format(&crate::theme::ColorScheme::default()))
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            assert!(
+                event_loop.remote_brain_run_units.get(&run_id).is_none(),
+                "INVARIANT: the terminal RunStatusChanged paints no run group for the \
+                 delegated say turn; rendered=\n{rendered_after}"
+            );
+        })
+        .await;
+}
+
+/// #978 regression at the run-group creation boundary: a run this frontend
+/// initiated while it holds the runner lease projects no group from its
+/// `RunStarted` event, while a run initiated by another attachment still does.
+#[tokio::test]
+async fn locally_initiated_run_does_not_project_group_from_started_event() {
+    use crate::brain::{AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus};
+
+    let output = replay_output_manager();
+    let mut projections = std::collections::HashMap::new();
+    let my_attachment = AttachmentId(uuid::Uuid::new_v4());
+    let peer_attachment = AttachmentId(uuid::Uuid::new_v4());
+    let make_run = |request_seq: u64, initiator: AttachmentId, initiated_by: &str| -> BrainRun {
+        BrainRun {
+            run_id: crate::brain::RunId(uuid::Uuid::new_v4()),
+            kind: BrainRunKind::Interactive,
+            parent_run_id: None,
+            request_seq,
+            initiating_attachment_id: initiator,
+            initiated_by: initiated_by.into(),
+            status: BrainRunStatus::Running,
+            started_ms: 1,
+            updated_ms: 1,
+            detail: None,
+        }
+    };
+    let local_run = make_run(1, my_attachment, "shammah");
+    let peer_run = make_run(2, peer_attachment, "peer");
+    let local_run_id = local_run.run_id;
+    let peer_run_id = peer_run.run_id;
+    let mut local_started = brain_event(2, "daemon", BrainEventKind::RunStarted { run: local_run });
+    local_started.run_id = Some(local_run_id);
+    assert!(
+        super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &local_started,
+            &super::LocallyRenderedRuns::default(),
+            Some(my_attachment),
+        ),
+        "a locally initiated run's RunStarted is handled without painting"
+    );
+    assert!(
+        projections.get(&local_run_id).is_none(),
+        "INVARIANT: the locally executed run's RunStarted paints no run group (#978); \
+         projected={}",
+        projections.len()
+    );
+    let mut peer_started = brain_event(3, "daemon", BrainEventKind::RunStarted { run: peer_run });
+    peer_started.run_id = Some(peer_run_id);
+    assert!(super::project_remote_brain_run_event(
+        &output,
+        &mut projections,
+        &peer_started,
+        &super::LocallyRenderedRuns::default(),
+        Some(my_attachment),
+    ));
+    assert!(
+        projections.get(&peer_run_id).is_some(),
+        "INVARIANT: a peer-initiated run still projects its run group (control case); \
+         projected={}",
+        projections.len()
+    );
+}
+
+/// #978 regression at the push boundary: the daemon echoes this frontend's
+/// pushed `Program` event back over the watch; the echo must not paint a
+/// second source unit beside the delegated execution's own one, whichever
+/// arrives first.
+#[tokio::test]
+async fn pushed_program_echo_is_not_painted_twice() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            pushed_program_echo_is_not_painted_twice_body().await;
+        })
+        .await;
+}
+
+async fn pushed_program_echo_is_not_painted_twice_body() {
+    use crate::brain::BrainEventKind;
+
+    let source = "(say \"echo probe\")";
+    let mut event_loop = {
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let tempdir = tempfile::tempdir().expect("echo fixture: isolated tool state");
+        let executor = crate::tools::ToolExecutor::new(
+            crate::tools::ToolRegistry::new(),
+            crate::tools::PermissionManager::new(),
+            tempdir.path().join("patterns.json"),
+        )
+        .expect("echo fixture: construct inert tool executor");
+        let generator: Arc<dyn crate::generators::Generator> = Arc::new(NeverCompletes);
+        let loop_ = super::EventLoop::new_named_brain_test_runner(
+            generator,
+            Vec::new(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            runtime,
+        );
+        loop_.output_manager.disable_stdout();
+        loop_
+    };
+    event_loop.record_locally_pushed_program(source.to_string());
+
+    let mut echo = brain_event(
+        1,
+        &event_loop.participant_subject.clone(),
+        BrainEventKind::Program {
+            language: crate::brain::ProgramLanguage::Lisp,
+            source: source.to_string(),
+        },
+    );
+    echo.run_id = None;
+    assert!(
+        event_loop.take_locally_pushed_program_echo(&echo),
+        "INVARIANT: the daemon's echo of a locally pushed program matches the marker"
+    );
+    assert!(
+        !event_loop.take_locally_pushed_program_echo(&echo),
+        "INVARIANT: the marker is consumed once — a repeated echo is a real event"
+    );
+
+    let mut peer_push = brain_event(
+        2,
+        "peer@elsewhere",
+        BrainEventKind::Program {
+            language: crate::brain::ProgramLanguage::Lisp,
+            source: source.to_string(),
+        },
+    );
+    peer_push.run_id = None;
+    assert!(
+        !event_loop.take_locally_pushed_program_echo(&peer_push),
+        "INVARIANT: a peer's Program event with the same bytes is never treated as \
+         this frontend's echo"
+    );
+    let messages = event_loop.output_manager.get_messages();
+    assert!(
+        messages.is_empty(),
+        "INVARIANT: the probe helper paints nothing; messages={}",
+        messages.len()
+    );
+}
+
+/// #978 control regression: a genuinely remote run's events still project
+/// the legacy run group with its rows even while a local projection exists
+/// for a different run.
+#[tokio::test]
+async fn remote_run_events_still_paint_group_rows_beside_local_projections() {
+    use crate::brain::{AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus};
+
+    let greeting = "remote turn output";
+    let source = "(say \"remote turn output\")";
+    let output = replay_output_manager();
+    let mut projections = std::collections::HashMap::new();
+    let remote_run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+    let run = BrainRun {
+        run_id: remote_run_id,
+        kind: BrainRunKind::Interactive,
+        parent_run_id: None,
+        request_seq: 9,
+        initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+        initiated_by: "peer".into(),
+        status: BrainRunStatus::Running,
+        started_ms: 1,
+        updated_ms: 1,
+        detail: None,
+    };
+    let mut run_started = brain_event(1, "daemon", BrainEventKind::RunStarted { run });
+    run_started.run_id = Some(remote_run_id);
+    let mut program = brain_event(
+        2,
+        "provider",
+        BrainEventKind::Program {
+            language: crate::brain::ProgramLanguage::Lisp,
+            source: source.to_string(),
+        },
+    );
+    program.run_id = Some(remote_run_id);
+    let mut result = brain_event(
+        3,
+        "daemon",
+        BrainEventKind::Result {
+            request_seq: 10,
+            output: greeting.to_string(),
+            error: None,
+            continuation_messages: Vec::new(),
+            invocation_metadata: None,
+        },
+    );
+    result.run_id = Some(remote_run_id);
+    let mut terminal = brain_event(
+        4,
+        "daemon",
+        BrainEventKind::RunStatusChanged {
+            run_id: remote_run_id,
+            status: BrainRunStatus::Completed,
+            detail: None,
+        },
+    );
+    terminal.run_id = Some(remote_run_id);
+
+    // A local projection for a DIFFERENT run stays queued in the active turn.
+    let local_run_id = crate::brain::RunId(uuid::Uuid::new_v4());
+    let mut local_projections = std::collections::VecDeque::from([LocalBrainProjection {
+        run_id: local_run_id,
+        source: "(say \"other turn\")".into(),
+        output: "other turn output".into(),
+        tool_ids: std::collections::HashSet::new(),
+        approval_ids: std::collections::HashSet::new(),
+        program_seq: None,
+        transient_output_unit: None,
+        failed: false,
+    }]);
+
+    for event in [&run_started, &program, &result, &terminal] {
+        assert!(
+            super::project_remote_brain_live_run_event(
+                &output,
+                &mut projections,
+                &mut local_projections,
+                true,
+                event,
+                &super::LocallyRenderedRuns::default(),
+                &mut std::collections::HashSet::new(),
+                None,
+            ),
+            "each remote run event projects through the run-group path"
+        );
+    }
+    assert!(
+        local_projections.front().is_some(),
+        "INVARIANT: the remote run's events must not consume the unrelated local projection"
+    );
+    let projection = projections
+        .get(&remote_run_id)
+        .unwrap_or_else(|| panic!("INVARIANT: a remote run still projects its run group"));
+    let rendered = projection
+        .unit
+        .format(&crate::theme::ColorScheme::default());
+    for expected in ["status", "Lisp program", "result", greeting, "completed"] {
+        assert!(
+            rendered.contains(expected),
+            "INVARIANT: a genuinely remote Brain turn still renders its legacy rows; \
+             missing {expected:?}; rendered=\n{rendered}"
+        );
+    }
 }
 
 #[test]
@@ -5952,22 +6438,14 @@ async fn typed_program_complete_presents_successful_say_as_prose() {
         .await;
 }
 
-fn brain_run_status_child_labels(row: &crate::cli::test_projection::TranscriptNode) -> Vec<String> {
-    row.children
-        .iter()
-        .filter(|child| child.label.contains("status"))
-        .map(|child| child.label.clone())
-        .collect()
-}
-
-/// Production-boundary regression for #820: after a successful named-Brain
-/// `(say …)` the Brain run line must not keep saying `running`.
+/// Production-boundary regression for #820 and #978: after a delegated
+/// named-Brain `(say …)` completes, no Brain run line exists at all — the
+/// run group is never projected for a locally executed turn, so a `running`
+/// residue is impossible by construction and the say card carries the turn.
 #[tokio::test]
 async fn named_brain_say_complete_does_not_leave_run_status_running() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            use crate::cli::messages::{Message, MessageStatus};
-
             let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
             let tempdir =
                 tempfile::tempdir().expect("named-brain say fixture: isolated tool state");
@@ -6015,30 +6493,25 @@ async fn named_brain_say_complete_does_not_leave_run_status_running() {
                 .await
                 .expect("named-Brain turn must dispatch");
 
-            let run_unit = event_loop
-                .remote_brain_run_units
-                .get(&run_id)
-                .expect("dispatch_named_brain_turn must project the Brain run unit")
-                .unit
-                .clone();
-            let before = projected_work_unit(&run_unit);
-            let before_status = brain_run_status_child_labels(&before);
             assert!(
-                before_status
-                    .iter()
-                    .any(|label| label.to_lowercase().contains("running")),
-                "fixture must start from the dump's running status line; labels={before_status:?}; row={before:?}"
+                event_loop.remote_brain_run_units.get(&run_id).is_none(),
+                "invariant: a delegated named-Brain turn projects no Brain run group (#978); \
+                 its say turn renders through the local units only"
             );
-            assert_eq!(
-                run_unit.status(),
-                MessageStatus::InProgress,
-                "fixture run unit must still be InProgress before say completes; row={before:?}"
+            let locally_rendered = event_loop.locally_rendered_runs();
+            assert!(
+                locally_rendered.in_flight.contains(&run_id),
+                "invariant: the delegated turn is in flight locally, so its daemon run \
+                 events are suppressed; in_flight={:?} say_completed={:?}",
+                locally_rendered.in_flight,
+                locally_rendered.say_completed
             );
 
             let output_unit = event_loop
                 .output_manager
                 .start_work_unit("VM program output");
             output_unit.set_program_output();
+            output_unit.begin_say_turn("lisp", "(say \"Hello\")");
             output_unit.append_response("Hello");
             event_loop
                 .handle_event(super::ReplEvent::TypedProgramComplete {
@@ -6048,28 +6521,38 @@ async fn named_brain_say_complete_does_not_leave_run_status_running() {
                 .await
                 .expect("successful typed-program completion must dispatch");
 
-            let after = projected_work_unit(&run_unit);
-            let after_status = brain_run_status_child_labels(&after);
-            let diag = format!(
-                "status_labels={after_status:?}; unit_status={:?}; row={after:?}",
-                run_unit.status()
+            assert!(
+                event_loop.remote_brain_run_units.get(&run_id).is_none(),
+                "invariant: the delegated turn still projects no Brain run group after \
+                 successful say; ids={:?}",
+                event_loop
+                    .output_manager
+                    .get_messages()
+                    .iter()
+                    .map(|message| message.id())
+                    .collect::<Vec<_>>()
+            );
+            let messages = event_loop.output_manager.get_messages();
+            let say_cards = messages
+                .iter()
+                .filter(|message| message.say_turn_view().is_some())
+                .count();
+            assert_eq!(
+                say_cards,
+                1,
+                "invariant: exactly one say card carries the delegated turn's output; \
+                 cards={say_cards}; messages={}",
+                messages.len()
             );
             assert!(
-                !after_status
+                messages
                     .iter()
-                    .any(|label| label.to_lowercase().contains("running")),
-                "invariant: after TypedProgramComplete of untitled say, the Brain run line is not running; {diag}"
-            );
-            assert_ne!(
-                run_unit.status(),
-                MessageStatus::InProgress,
-                "invariant: the Brain run unit is not InProgress after successful say; {diag}"
-            );
-            assert!(
-                after_status
-                    .iter()
-                    .any(|label| label.to_lowercase().contains("completed")),
-                "invariant: Brain run status is completed once say output is shown; {diag}"
+                    .all(|message| message.say_turn_view().is_none_or(|view| {
+                        view.vm.status != crate::cli::messages::SayTurnStatus::Running
+                    })),
+                "invariant: no card keeps wearing `running` (#820-class residue); \
+                 messages={}",
+                messages.len()
             );
         })
         .await;

@@ -26,7 +26,7 @@ async fn test_legacy_conversation_persistence_fails_closed_without_mutation() ->
     let mut logger = ConversationLogger::new(log_path.clone())?;
 
     let error = logger
-        .log_interaction("ordinary query", "ordinary response", "teacher", &[])
+        .log_interaction("ordinary query", "ordinary response", "cloud", &[])
         .await
         .unwrap_err();
 

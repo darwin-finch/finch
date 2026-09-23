@@ -55,9 +55,9 @@ pub fn random_spinner_verb() -> &'static str {
 }
 
 use super::{
-    AgentActivityView, AgentToolView, Message, MessageId, MessageStatus, OutputVm, ProgramSourceVm,
-    SayTurnStatus, SayTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView, WorkUnitHead,
-    WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
+    AgentActivityView, AgentToolView, ComponentView, Message, MessageId, MessageStatus, OutputVm,
+    ProgramSourceVm, SayTurnStatus, SayTurnView, WorkRowPresentation, WorkRowStatus, WorkRowView,
+    WorkUnitHead, WorkUnitPresentation, WorkUnitView, WorkUnitViewModel,
 };
 use finch_diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 use finch_theme::{ColorScheme, MessageBand};
@@ -1056,6 +1056,14 @@ impl Message for WorkUnit {
 
     fn say_turn_view(&self) -> Option<SayTurnView> {
         self.say_turn_snapshot()
+    }
+
+    /// Stage 3 (#1120): the say component rides the generalized accessor. The
+    /// renderer asks `component_view()` for any migrated message and never
+    /// matches on the type; `say_turn_view` stays for the consolidated-source
+    /// pairing helper and the disclosure-direction read.
+    fn component_view(&self) -> Option<ComponentView> {
+        self.say_turn_snapshot().map(ComponentView::Say)
     }
 
     fn transcript_action(&self, path: &[u32]) -> Option<ComponentAction> {
@@ -2370,6 +2378,41 @@ mod tests {
     }
 
     // ── Say-turn component ViewModel (#882) ─────────────────────────────────
+
+    #[test]
+    fn say_turn_rides_the_generalized_component_accessor_and_unmigrated_rows_stay_none() {
+        // Stage 3, #1120: WorkUnit::component_view is the renderer's single
+        // accessor. A migrated say turn yields its Say component through it
+        // without the engine learning the type; a unit that never migrated
+        // yields None and keeps the legacy work_unit_view projection.
+        let unmigrated = WorkUnit::new("Tools");
+        assert!(
+            unmigrated.component_view().is_none(),
+            "a non-say WorkUnit has not migrated; the legacy projection must serve it"
+        );
+        assert!(
+            unmigrated.work_unit_view(&colors()).is_some(),
+            "unmigrated WorkUnits keep the work_unit_view projection path"
+        );
+
+        let output = WorkUnit::new("VM program output");
+        output.set_program_output();
+        output.begin_say_turn("lisp", "(say \"hi\")");
+        let component = output.component_view().expect("migrated say turn");
+        let crate::ComponentView::Say(view) = component else {
+            panic!("a say turn yields its Say component; got {component:?}")
+        };
+        assert_eq!(
+            view.vm.program.lines,
+            vec!["(say \"hi\")".to_string()],
+            "the component snapshot carries the retained program source"
+        );
+        assert!(
+            output.say_turn_view().is_some(),
+            "the say_turn_view hook stays for the consolidated-source pairing helper \
+             and the disclosure-direction read"
+        );
+    }
 
     #[test]
     fn say_turn_snapshot_carries_the_vm_and_full_resolution_elapsed() {

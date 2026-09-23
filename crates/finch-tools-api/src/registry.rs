@@ -159,13 +159,9 @@ impl ToolRegistry {
     }
 
     /// Number of registered tools
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.tools.len()
-    }
-
-    /// Check if registry is empty
-    pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
     }
 }
 

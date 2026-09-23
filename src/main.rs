@@ -47,14 +47,14 @@ struct Args {
     #[arg(long = "no-tui")]
     no_tui: bool,
 
-    /// Direct mode - talk directly to teacher API, bypass daemon
+    /// Direct mode - talk directly to the cloud provider API, bypass daemon
     #[arg(long = "direct")]
     direct: bool,
 
-    /// Cloud-only mode - skip local model entirely, use teacher API directly.
-    /// No model download, no daemon. Great for machines without much RAM,
-    /// or when you only have a cloud API key (e.g. Grok via X Premium+).
-    #[arg(long = "cloud-only", alias = "teacher-only")]
+    /// Cloud-only mode - skip local model entirely, use the cloud provider
+    /// API directly. No model download, no daemon. Great for machines without
+    /// much RAM, or when you only have a cloud API key (e.g. Grok via X Premium+).
+    #[arg(long = "cloud-only")]
     cloud_only: bool,
 
     /// Evaluate a typed Co-Forth expression directly through the shared VM
@@ -355,10 +355,11 @@ enum LicenseCommand {
     Remove,
 }
 
-/// Build a teacher list from well-known environment variables and config files.
-/// Collects ALL available keys so every provider the user has configured is available.
-fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
-    let mut teachers: Vec<finch::config::TeacherEntry> = Vec::new();
+/// Build a cloud provider list from well-known environment variables and
+/// config files. Collects ALL available keys so every provider the user has
+/// configured is available.
+fn build_cloud_providers_from_env() -> Vec<finch::config::ProviderEntry> {
+    let mut providers: Vec<finch::config::ProviderEntry> = Vec::new();
     let mut seen_providers = std::collections::HashSet::new();
 
     let mut add = |provider: &str, key: &str| {
@@ -366,13 +367,13 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
             return;
         }
         seen_providers.insert(provider.to_string());
-        teachers.push(finch::config::TeacherEntry {
-            provider: provider.to_string(),
-            api_key: key.trim().to_string(),
-            model: None,
-            base_url: None,
-            name: None,
-        });
+        providers.push(finch::config::ProviderEntry::from_provider_fields(
+            provider,
+            key.trim().to_string(),
+            None,
+            None,
+            None,
+        ));
     };
 
     // 1. Claude Code config file (~/.claude/settings.json)
@@ -408,7 +409,7 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
         }
     }
 
-    teachers
+    providers
 }
 
 fn first_run_setup_cancelled() -> anyhow::Error {
@@ -451,7 +452,7 @@ where
 
 /// Create a ClaudeClient with the configured provider
 ///
-/// This function creates a provider based on the teacher configuration
+/// This function creates a provider from the configured cloud providers
 /// and wraps it in a ClaudeClient for backwards compatibility.
 fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
     let graph = finch::providers::create_provider_graph_from_config(config)?;
@@ -728,7 +729,7 @@ mod script_tests {
     }
 
     #[test]
-    fn daemon_and_teacher_one_shot_paths_share_the_vm_wire_contract() {
+    fn daemon_and_cloud_one_shot_paths_share_the_vm_wire_contract() {
         let prompt = vm_wire_system_prompt();
         assert!(prompt.contains("complete body of every text response is one"));
         assert!(prompt.contains("`ProgramSubmission`"));
@@ -1102,7 +1103,6 @@ async fn main() -> Result<()> {
     use finch::cli::{set_global_output, set_global_status};
     use finch::cli::{OutputManager, StatusBar};
     use finch::config::ColorScheme;
-    use finch::models::ModelProgress;
 
     let output_manager = Arc::new(OutputManager::new(ColorScheme::default()));
     let status_bar = Arc::new(StatusBar::new());
@@ -1113,7 +1113,6 @@ async fn main() -> Result<()> {
     // Set as global BEFORE init_tracing() to prevent lazy initialization
     set_global_output(output_manager.clone());
     set_global_status(status_bar.clone());
-    finch::models::install_model_progress(output_manager.clone() as Arc<dyn ModelProgress>);
 
     // Check if debug logging is enabled in config (before init_tracing)
     // This allows the debug_logging feature flag to control log verbosity
@@ -1158,10 +1157,12 @@ async fn main() -> Result<()> {
 
                 // Before showing the wizard, try to auto-detect API keys.
                 // If any exist (env vars, Claude Code config, etc.) just start immediately.
-                let auto_teachers = build_teachers_from_env();
-                if !auto_teachers.is_empty() {
-                    let names: Vec<&str> =
-                        auto_teachers.iter().map(|t| t.provider.as_str()).collect();
+                let auto_providers = build_cloud_providers_from_env();
+                if !auto_providers.is_empty() {
+                    let names: Vec<&str> = auto_providers
+                        .iter()
+                        .map(|entry| entry.provider_type())
+                        .collect();
                     use crossterm::style::Stylize as _;
                     eprintln!(
                         "\n{}",
@@ -1173,7 +1174,7 @@ async fn main() -> Result<()> {
                         "{}\n",
                         "  Run `finch setup` any time to change settings.".yellow()
                     );
-                    let cfg = Config::new(auto_teachers);
+                    let cfg = Config::new(auto_providers);
                     cfg.save().ok();
                     cfg
                 } else {
@@ -1216,13 +1217,13 @@ async fn main() -> Result<()> {
         output_manager.enable_stdout();
     }
 
-    // --cloud-only / --teacher-only: skip local model and daemon entirely
+    // --cloud-only: skip local model and daemon entirely
     if args.cloud_only {
         config.backend.enabled = false;
     }
 
     // Check for --direct or --cloud-only flags (both bypass daemon)
-    // In direct/cloud-only mode: no daemon connection, talk directly to teacher API
+    // In direct/cloud-only mode: no daemon connection, talk directly to the cloud provider API
     let use_daemon = !args.direct && !args.cloud_only;
 
     // Load or create threshold router
@@ -1802,20 +1803,6 @@ async fn run_train_setup() -> Result<()> {
     Ok(())
 }
 
-/// Install the host progress sink used by daemon model load and download.
-///
-/// Interactive `main` installs after the `Command::Daemon` early return, so the
-/// process that actually calls `BootstrapLoader::load_generator_async` must
-/// install here. Uses the same `GLOBAL_OUTPUT` host `output_progress!` already
-/// writes to (origin/main download attached `ProgressMessage` there).
-fn install_daemon_model_progress() -> Arc<finch::cli::OutputManager> {
-    use finch::cli::global_output;
-    use finch::models::ModelProgress;
-    let output = global_output();
-    finch::models::install_model_progress(Arc::clone(&output) as Arc<dyn ModelProgress>);
-    output
-}
-
 async fn run_daemon(bind_address: String) -> Result<()> {
     use finch::daemon::DaemonLifecycle;
     use finch::local::LocalGenerator;
@@ -1971,11 +1958,11 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Initialize BootstrapLoader for progressive Qwen model loading
     output_progress!("⏳ Initializing Qwen model (background)...");
     let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
-    let model_progress = install_daemon_model_progress();
-    let bootstrap_loader = Arc::new(BootstrapLoader::new(
-        Arc::clone(&generator_state),
-        Some(model_progress as Arc<dyn finch::models::ModelProgress>),
-    ));
+    let model_progress: Arc<dyn finch::models::ModelProgress> = finch::cli::global_output();
+    let bootstrap_loader = Arc::new(
+        BootstrapLoader::new(Arc::clone(&generator_state), Some(model_progress))
+            .with_huggingface_token(config.huggingface_token.clone()),
+    );
 
     // Start background model loading (unless backend is disabled for proxy-only mode)
     if config.backend.enabled {
@@ -1987,6 +1974,8 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         let device = config.backend.execution_target;
         let coreml = config.backend.coreml;
         let model_repo = config.backend.model_repo.clone();
+        let model_path = config.backend.model_path.clone();
+        let managed_artifact = config.backend.managed_artifact.clone();
         tokio::spawn(async move {
             if let Err(e) = loader_clone
                 .load_generator_async(
@@ -1996,11 +1985,13 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                     device,
                     coreml,
                     model_repo,
+                    model_path,
+                    managed_artifact,
                 )
                 .await
             {
                 output_status!("⚠️  Model loading failed: {}", e);
-                output_status!("   Will forward all queries to teacher APIs");
+                output_status!("   Will forward all queries to cloud provider APIs");
                 let mut state = state_clone.write().await;
                 *state = GeneratorState::Failed {
                     error: format!("{}", e),
@@ -2010,7 +2001,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     } else {
         // Proxy-only mode: Skip model loading
         output_status!("🔌 Proxy-only mode enabled (no local model)");
-        output_status!("   All queries will be forwarded to teacher APIs");
+        output_status!("   All queries will be forwarded to cloud provider APIs");
         let mut state = generator_state.write().await;
         *state = GeneratorState::NotAvailable;
     }
@@ -2170,6 +2161,11 @@ async fn run_daemon(bind_address: String) -> Result<()> {
             }
         }
     }
+
+    // Stop an in-flight managed transfer before tearing down the runtimes. The
+    // verified final file is never published on cancellation; its partial is
+    // retained for the next daemon start to resume.
+    server.bootstrap_loader().cancel_download();
 
     // The IPC accept loop runs in a dedicated current-thread runtime. It must
     // observe cancellation and finish before the PID/instance lock is released;
@@ -2411,7 +2407,7 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     // defeating the flag, that startup attempt can consume the whole caller
     // timeout and makes direct-provider smoke tests look hung.
     if cloud_only {
-        return run_query_teacher_only(
+        return run_query_cloud_only(
             query,
             &config,
             executor,
@@ -2425,8 +2421,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     // Ensure daemon is running (auto-spawn if needed)
     if let Err(e) = ensure_daemon_running(Some(&config.client.daemon_address)).await {
         eprintln!("⚠️  Daemon failed to start: {}", e);
-        eprintln!("   Using teacher API directly (no local model)");
-        return run_query_teacher_only(
+        eprintln!("   Using the cloud provider API directly (no local model)");
+        return run_query_cloud_only(
             query,
             &config,
             executor,
@@ -2577,8 +2573,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     Ok(())
 }
 
-/// Run query using teacher API only (fallback when daemon fails), with tool support
-async fn run_query_teacher_only(
+/// Run query using the cloud provider API only (fallback when daemon fails), with tool support
+async fn run_query_cloud_only(
     query: &str,
     config: &Config,
     executor: Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
@@ -2589,7 +2585,7 @@ async fn run_query_teacher_only(
     use finch::claude::MessageRequest;
     use finch::providers::{ContentBlock, Message};
 
-    eprintln!("⚠️  Running in teacher-only mode (no local model)");
+    eprintln!("⚠️  Running in cloud-only mode (no local model)");
 
     let claude_client = create_claude_client_with_provider(config)?;
     let model = config
@@ -2601,7 +2597,7 @@ async fn run_query_teacher_only(
         .cloud_providers()
         .first()
         .map(|provider| provider.provider_type().to_string())
-        .unwrap_or_else(|| "teacher".to_string());
+        .unwrap_or_else(|| "cloud".to_string());
     let wire_metrics = default_wire_metrics_logger();
     let mut wire_metric =
         finch::metrics::WireAdherenceMetric::first_pass(&provider, model.clone(), "one_shot");
@@ -3028,7 +3024,7 @@ fn command_cancellation() -> tokio_util::sync::CancellationToken {
     cancel
 }
 
-fn current_node_capabilities(has_teacher_api: bool) -> finch::node::NodeCapabilities {
+fn current_node_capabilities(has_cloud_provider: bool) -> finch::node::NodeCapabilities {
     use finch::models::{ModelSelection, ModelSelector};
 
     let ram_gb = ModelSelector::get_total_ram_gb();
@@ -3036,7 +3032,7 @@ fn current_node_capabilities(has_teacher_api: bool) -> finch::node::NodeCapabili
         Ok(ModelSelection::Local(size)) => Some(size.description().to_string()),
         _ => None,
     };
-    finch::node::NodeCapabilities::for_current_host(ram_gb, local_model, has_teacher_api)
+    finch::node::NodeCapabilities::for_current_host(ram_gb, local_model, has_cloud_provider)
 }
 
 /// Show this node's identity and capabilities
@@ -3044,8 +3040,8 @@ async fn run_node_info() -> Result<()> {
     use finch::node::NodeInfo;
 
     let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
-    let has_teacher = !config.cloud_providers().is_empty();
-    let info = NodeInfo::load(current_node_capabilities(has_teacher))?;
+    let has_cloud_provider = !config.cloud_providers().is_empty();
+    let info = NodeInfo::load(current_node_capabilities(has_cloud_provider))?;
 
     println!("╔══════════════════════════════════════╗");
     println!("║           finch node info            ║");
@@ -3058,11 +3054,11 @@ async fn run_node_info() -> Result<()> {
     if let Some(model) = &info.capabilities.local_model {
         println!("  Model    : {}", model);
     } else {
-        println!("  Model    : cloud-only (teacher API)");
+        println!("  Model    : cloud-only (cloud provider API)");
     }
     println!(
-        "  Teacher  : {}",
-        if info.capabilities.has_teacher_api {
+        "  Cloud    : {}",
+        if info.capabilities.has_cloud_provider {
             "configured"
         } else {
             "none"
@@ -3253,8 +3249,8 @@ async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
     use finch::node::NodeInfo;
 
     let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
-    let has_teacher = !config.cloud_providers().is_empty();
-    let info = NodeInfo::load(current_node_capabilities(has_teacher))?;
+    let has_cloud_provider = !config.cloud_providers().is_empty();
+    let info = NodeInfo::load(current_node_capabilities(has_cloud_provider))?;
 
     // Always show node identity when starting as worker
     println!("╔══════════════════════════════════════╗");
@@ -3266,7 +3262,7 @@ async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
     if let Some(model) = &info.capabilities.local_model {
         println!("  Model    : {} (loading in background)", model);
     } else {
-        println!("  Model    : cloud-only — forwarding to teacher API");
+        println!("  Model    : cloud-only — forwarding to the cloud provider API");
     }
     println!("  Bind     : {}", bind_address);
     println!();
@@ -3362,20 +3358,20 @@ async fn run_agent(
 ) -> Result<()> {
     use finch::agent::{AgentConfig, AgentLoop};
 
-    // Load config (needs teacher API for the agentic loop)
+    // Load config (needs a cloud provider for the agentic loop)
     let config = match load_config() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error loading config: {}", e);
-            eprintln!("Run `finch setup` to configure a teacher API key.");
+            eprintln!("Run `finch setup` to configure a cloud provider API key.");
             return Err(e);
         }
     };
 
     if config.cloud_providers().is_empty() {
         anyhow::bail!(
-            "No teacher API configured.\n\
-             Agent mode requires a teacher API (Claude, GPT-4, etc.).\n\
+            "No cloud provider configured.\n\
+             Agent mode requires a cloud provider API (Claude, GPT-4, etc.).\n\
              Run `finch setup` to add one."
         );
     }
@@ -3689,83 +3685,6 @@ mod tests {
             Some(value) => std::env::set_var("ORT_LOGGING_LEVEL", value),
             None => std::env::remove_var("ORT_LOGGING_LEVEL"),
         }
-    }
-
-    #[test]
-    fn run_daemon_installs_model_progress_before_loading() {
-        let source = include_str!("main.rs");
-        let start = source
-            .find("async fn run_daemon(")
-            .expect("run_daemon must exist");
-        let body = &source[start..];
-        let install_at = body
-            .find("install_daemon_model_progress")
-            .unwrap_or(usize::MAX);
-        let load_at = body
-            .find("load_generator_async")
-            .expect("run_daemon must call load_generator_async");
-        let bootstrap_at = body
-            .find("BootstrapLoader::new")
-            .expect("run_daemon must construct BootstrapLoader");
-        assert!(
-            install_at < bootstrap_at && install_at < load_at,
-            "run_daemon must call install_daemon_model_progress before BootstrapLoader::new \
-             and load_generator_async (install {install_at}, new {bootstrap_at}, load {load_at})"
-        );
-
-        let helper_start = source
-            .find("fn install_daemon_model_progress(")
-            .expect("daemon composition helper must exist");
-        let helper_end = source[helper_start..]
-            .find("\nasync fn ")
-            .map(|rel| helper_start + rel)
-            .unwrap_or(source.len());
-        let helper = &source[helper_start..helper_end];
-        let install_model = ["install_model", "_progress"].concat();
-        let global_output = ["global_", "output"].concat();
-        assert!(
-            helper.contains(&install_model),
-            "install_daemon_model_progress must call install_model_progress"
-        );
-        assert!(
-            helper.contains(&global_output),
-            "install_daemon_model_progress must use GLOBAL_OUTPUT, the host origin/main download used"
-        );
-
-        let new_end = body[bootstrap_at..]
-            .find(';')
-            .map(|rel| bootstrap_at + rel)
-            .unwrap_or(body.len());
-        let new_call = &body[bootstrap_at..new_end];
-        assert!(
-            new_call.contains("Some(") && new_call.contains("model_progress"),
-            "run_daemon must pass the installed sink into BootstrapLoader::new, found: {new_call}"
-        );
-        assert!(
-            !new_call.contains("None"),
-            "run_daemon must not drop bootstrap progress with None, found: {new_call}"
-        );
-    }
-
-    #[test]
-    fn daemon_model_progress_helper_installs_a_reporting_sink() {
-        let output = super::install_daemon_model_progress();
-        output.disable_stdout();
-        assert!(
-            finch::models::installed_model_progress().is_some(),
-            "install_daemon_model_progress must latch a host sink; otherwise \
-             ModelDownloader uses SilentModelProgress in the daemon process"
-        );
-        let before = output.len();
-        let handle = finch::models::installed_model_progress()
-            .expect("daemon helper installed a sink")
-            .start_download_progress("Downloading test-repo".into(), 100);
-        assert!(
-            output.len() > before,
-            "daemon progress sink must attach a determinate download item, \
-             matching origin/main ProgressMessage via global_output()"
-        );
-        handle.complete();
     }
 
     /// The printed instructions must compile against the real runtime.

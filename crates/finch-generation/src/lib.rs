@@ -25,14 +25,11 @@ pub use event::{
     Allowance, GenerationEvent, GenerationId, GenerationMetadata, ReasoningKind, TerminalOutcome,
     ToolCall, ToolResult, Usage,
 };
-pub use identity::{
-    validate_model_id, BackendKind, BackendRef, GenerationIdentity, RejectedBackend, RouteDecision,
-};
+pub use identity::{BackendKind, BackendRef, GenerationIdentity, RejectedBackend, RouteDecision};
 pub use ports::{
-    ArtifactCache, BlockingScheduler, ControllableSleeper, EmptyCache, FrozenMonotonicClock,
-    GenerationPorts, GenerationTelemetry, HardwareDiscovery, HardwareSnapshot, InlineScheduler,
-    InstantSleeper, ModelLoader, MonotonicClock, ProgressSink, ReadyLoader, Sleeper,
-    SystemMonotonicClock, TokioSleeper, TracingProgress, TracingTelemetry, UnknownHardware,
+    ArtifactCache, BlockingScheduler, ControllableSleeper, FrozenMonotonicClock, GenerationPorts,
+    GenerationTelemetry, HardwareDiscovery, HardwareSnapshot, ModelLoader, MonotonicClock,
+    ProgressSink, Sleeper, SystemMonotonicClock, TokioSleeper,
 };
 pub use provider::ProviderGenerationBackend;
 pub use readiness::{LoadPhase, Readiness, ReadinessReport, ResourceMetadata};

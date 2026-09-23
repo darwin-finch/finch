@@ -62,11 +62,20 @@ pub struct DaemonClient {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalModelStatus {
     Initializing,
-    Downloading(String),
+    Downloading(LocalModelDownloadStatus),
     Loading(String),
     Ready(String),
     Failed(String),
     NotAvailable,
+}
+
+/// Byte-accurate daemon-local model download state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalModelDownloadStatus {
+    pub model: String,
+    pub file_name: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
 }
 
 fn first_model_profile(models: &serde_json::Value) -> Option<&str> {
@@ -77,6 +86,54 @@ fn first_model_profile(models: &serde_json::Value) -> Option<&str> {
         .get("id")?
         .as_str()
         .filter(|id| !id.trim().is_empty())
+}
+
+fn parse_local_model_status(value: &serde_json::Value) -> Result<LocalModelStatus> {
+    let generator = value
+        .get("generator")
+        .ok_or_else(|| anyhow::anyhow!("Daemon status omitted generator state"))?;
+    let state = generator
+        .get("state")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Daemon returned an invalid generator state"))?;
+    let model = || {
+        generator
+            .get("model_size")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("Daemon {state} state omitted model_size"))
+    };
+
+    match state {
+        "initializing" => Ok(LocalModelStatus::Initializing),
+        "downloading" => Ok(LocalModelStatus::Downloading(LocalModelDownloadStatus {
+            model: model()?,
+            file_name: generator
+                .get("file_name")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("Daemon download state omitted file_name"))?,
+            downloaded_bytes: generator
+                .get("downloaded_bytes")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("Daemon download state omitted downloaded_bytes"))?,
+            total_bytes: generator
+                .get("total_bytes")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("Daemon download state omitted total_bytes"))?,
+        })),
+        "loading" => Ok(LocalModelStatus::Loading(model()?)),
+        "ready" => Ok(LocalModelStatus::Ready(model()?)),
+        "failed" => Ok(LocalModelStatus::Failed(
+            generator
+                .get("error")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("Daemon failed state omitted error"))?,
+        )),
+        "not_available" => Ok(LocalModelStatus::NotAvailable),
+        other => anyhow::bail!("Unknown local model state: {other}"),
+    }
 }
 
 impl DaemonClient {
@@ -336,36 +393,7 @@ impl DaemonClient {
             .await
             .context("Failed to parse local model status")?;
 
-        let generator = value
-            .get("generator")
-            .ok_or_else(|| anyhow::anyhow!("Daemon status omitted generator state"))?;
-        let state = generator
-            .get("state")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Daemon returned an invalid generator state"))?;
-        let detail = || {
-            generator
-                .get("model_size")
-                .and_then(|value| value.as_str())
-                .unwrap_or("local model")
-                .to_string()
-        };
-
-        match state {
-            "initializing" => Ok(LocalModelStatus::Initializing),
-            "downloading" => Ok(LocalModelStatus::Downloading(detail())),
-            "loading" => Ok(LocalModelStatus::Loading(detail())),
-            "ready" => Ok(LocalModelStatus::Ready(detail())),
-            "failed" => Ok(LocalModelStatus::Failed(
-                generator
-                    .get("error")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown local model error")
-                    .to_string(),
-            )),
-            "not_available" => Ok(LocalModelStatus::NotAvailable),
-            other => anyhow::bail!("Unknown local model state: {other}"),
-        }
+        parse_local_model_status(&value)
     }
 
     /// Send a simple text query (convenience method)
@@ -1228,6 +1256,45 @@ mod tests {
             first_model_profile(&serde_json::json!({"data": [{"id": " "}]})),
             None
         );
+    }
+
+    #[test]
+    fn parses_byte_accurate_local_model_download_status() {
+        let status = parse_local_model_status(&serde_json::json!({
+            "generator": {
+                "state": "downloading",
+                "model_size": "Qwen 2.5 3B",
+                "file_name": "qwen.gguf",
+                "downloaded_bytes": 25,
+                "total_bytes": 100
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            status,
+            LocalModelStatus::Downloading(LocalModelDownloadStatus {
+                model: "Qwen 2.5 3B".into(),
+                file_name: "qwen.gguf".into(),
+                downloaded_bytes: 25,
+                total_bytes: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_download_status_instead_of_showing_fake_progress() {
+        let error = parse_local_model_status(&serde_json::json!({
+            "generator": {
+                "state": "downloading",
+                "model_size": "Qwen 2.5 3B",
+                "file_name": "qwen.gguf",
+                "downloaded_bytes": 25
+            }
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("total_bytes"));
     }
 
     #[test]

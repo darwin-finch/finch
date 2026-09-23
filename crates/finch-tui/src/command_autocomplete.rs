@@ -167,12 +167,6 @@ impl CommandRegistry {
                     category: CommandCategory::Model,
                 },
                 CommandSpec {
-                    name: "/teacher",
-                    params: None,
-                    description: "Compatibility alias for /provider",
-                    category: CommandCategory::Model,
-                },
-                CommandSpec {
                     name: "/local",
                     params: Some("<query>"),
                     description: "Query local model directly (bypass routing)",

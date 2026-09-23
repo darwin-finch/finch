@@ -28,15 +28,12 @@ pub(crate) use brain_runner::{
 pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
 };
-pub use feedback_handler::{handle_feedback, handle_training_status};
 #[cfg(test)]
 pub(crate) use handlers::{
     authorize_pending_remote_attachment, create_remote_brain_router,
     drop_next_remote_brain_reply_after_commit, execute_authorized_remote_initialization,
 };
-pub use handlers::{
-    create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
-};
+pub use handlers::{create_router, metrics_endpoint, AppError};
 #[cfg(unix)]
 pub use handlers::{handle_node_info_from_state_directory, handle_node_stats_from_state_directory};
 pub use ipc::start_ipc_server;

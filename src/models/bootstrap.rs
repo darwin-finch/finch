@@ -1,12 +1,13 @@
 // Progressive Bootstrap - Async model loading with instant startup
 // Enables REPL to start in <100ms while model loads in background
 
-use anyhow::{anyhow, Context, Result};
-use std::path::PathBuf;
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use super::generator_new::GeneratorModel;
+use super::gguf_download::{ManagedGgufArtifact, ManagedGgufDownloader};
 use super::progress::ModelProgress;
 use super::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize};
 use super::GeneratorConfig;
@@ -44,8 +45,8 @@ pub enum GeneratorState {
 #[derive(Debug, Clone)]
 pub struct DownloadProgressSnapshot {
     pub file_name: String,
-    pub current_file: usize,
-    pub total_files: usize,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
 }
 
 impl GeneratorState {
@@ -63,8 +64,8 @@ impl GeneratorState {
                 progress,
             } => {
                 format!(
-                    "Downloading {} ({}/{}): {}",
-                    model_name, progress.current_file, progress.total_files, progress.file_name
+                    "Downloading {} ({} / {} bytes): {}",
+                    model_name, progress.downloaded_bytes, progress.total_bytes, progress.file_name
                 )
             }
             GeneratorState::Loading { model_name } => {
@@ -85,12 +86,25 @@ impl GeneratorState {
 pub struct BootstrapLoader {
     state: Arc<RwLock<GeneratorState>>,
     output: Option<Arc<dyn ModelProgress>>,
+    download_cancellation: CancellationToken,
+    huggingface_token: Option<String>,
 }
 
 impl BootstrapLoader {
     /// Create new bootstrap loader with shared state
     pub fn new(state: Arc<RwLock<GeneratorState>>, output: Option<Arc<dyn ModelProgress>>) -> Self {
-        Self { state, output }
+        Self {
+            state,
+            output,
+            download_cancellation: CancellationToken::new(),
+            huggingface_token: None,
+        }
+    }
+
+    /// Inject the configured Hugging Face credential at the composition root.
+    pub fn with_huggingface_token(mut self, token: Option<String>) -> Self {
+        self.huggingface_token = token.filter(|value| !value.trim().is_empty());
+        self
     }
 
     /// Get reference to the generator state
@@ -98,44 +112,9 @@ impl BootstrapLoader {
         &self.state
     }
 
-    /// Check if HuggingFace token exists and is valid
-    fn check_hf_token() -> Result<()> {
-        let token_path = dirs::cache_dir()
-            .ok_or_else(|| anyhow!("Could not determine cache directory"))?
-            .join("huggingface")
-            .join("token");
-
-        if !token_path.exists() {
-            return Err(anyhow!(
-                "HuggingFace token not found at {:?}\n\
-                 \n\
-                 Shammah needs a HuggingFace token to download Qwen models.\n\
-                 \n\
-                 Please follow these steps:\n\
-                 1. Create a token at https://huggingface.co/settings/tokens\n\
-                 2. Save it: echo \"hf_YOUR_TOKEN\" > ~/.cache/huggingface/token\n\
-                 3. Restart Shammah\n\
-                 \n\
-                 See README.md for detailed instructions.",
-                token_path
-            ));
-        }
-
-        // Validate token format (should start with hf_)
-        let token = std::fs::read_to_string(&token_path)
-            .context("Failed to read HuggingFace token file")?;
-
-        let token = token.trim();
-        if !token.starts_with("hf_") {
-            return Err(anyhow!(
-                "Invalid HuggingFace token format in {:?}\n\
-                 Token should start with 'hf_'\n\
-                 Get a new token at https://huggingface.co/settings/tokens",
-                token_path
-            ));
-        }
-
-        Ok(())
+    /// Cancel an in-flight managed GGUF download.
+    pub fn cancel_download(&self) {
+        self.download_cancellation.cancel();
     }
 
     /// Load generator in background using UnifiedModelLoader
@@ -147,6 +126,8 @@ impl BootstrapLoader {
         execution_target: ExecutionTarget,
         coreml: crate::config::CoreMlConfig,
         model_repo: Option<String>,
+        model_path: Option<std::path::PathBuf>,
+        managed_artifact: Option<ManagedGgufArtifact>,
     ) -> Result<()> {
         // Step 1: Initializing
         *self.state.write().await = GeneratorState::Initializing;
@@ -181,6 +162,29 @@ impl BootstrapLoader {
             tracing::info!("Using custom repository: {}", repo);
         }
 
+        let model_path = match (model_path, managed_artifact.as_ref()) {
+            (Some(path), None) => Some(path),
+            (None, Some(artifact)) => {
+                let downloader =
+                    ManagedGgufDownloader::from_environment(self.huggingface_token.clone())?;
+                let (path, _) = downloader
+                    .ensure(
+                        artifact,
+                        &model_name,
+                        Arc::clone(&self.state),
+                        &self.download_cancellation,
+                    )
+                    .await?;
+                Some(path)
+            }
+            (Some(_), Some(_)) => anyhow::bail!(
+                "local chat config cannot select both a managed GGUF and a custom path"
+            ),
+            (None, None) => {
+                anyhow::bail!("local chat requires a managed GGUF or an explicit .gguf path")
+            }
+        };
+
         // Step 3: Create model load config
         let load_config = ModelLoadConfig {
             provider,
@@ -189,24 +193,16 @@ impl BootstrapLoader {
             target: execution_target,
             coreml,
             repo_override: model_repo.clone(),
+            model_path,
         };
 
-        // Step 4: Load using UnifiedModelLoader (handles download + loading)
+        // Step 4: Load the resolved local artifact using UnifiedModelLoader.
         *self.state.write().await = GeneratorState::Loading {
             model_name: model_name.clone(),
         };
 
         if let Some(output) = &self.output {
             output.write_progress(format!("⏳ Loading {}...", model_name));
-        }
-
-        // Check HF token before attempting (UnifiedModelLoader will download if needed)
-        if let Err(e) = Self::check_hf_token() {
-            tracing::warn!(
-                "HuggingFace token check failed: {}. Model must be cached.",
-                e
-            );
-            // Don't fail here - model might be cached
         }
 
         // Load in blocking task (model loading + potential download is CPU/IO intensive)
@@ -218,7 +214,7 @@ impl BootstrapLoader {
                 output.write_progress(format!("  └─ Initializing {}...", model_name_clone));
             }
 
-            // GeneratorModel::new() handles download + loading internally
+            // The loader remains path-only; managed download completed above.
             let config = GeneratorConfig::Pretrained(load_config);
             GeneratorModel::new(config)
         })
@@ -252,30 +248,6 @@ impl BootstrapLoader {
     pub async fn set_not_available(&self) {
         *self.state.write().await = GeneratorState::NotAvailable;
     }
-
-    /// Find snapshot directory within cache path
-    #[allow(dead_code)]
-    fn find_snapshot_dir(cache_path: &PathBuf) -> Result<PathBuf> {
-        // Check if cache_path itself is valid
-        if cache_path.join("config.json").exists() {
-            return Ok(cache_path.clone());
-        }
-
-        // Look for snapshot subdirectory
-        if let Ok(entries) = std::fs::read_dir(cache_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() && path.join("config.json").exists() {
-                    return Ok(path);
-                }
-            }
-        }
-
-        Err(anyhow::anyhow!(
-            "Could not find valid model snapshot in {:?}",
-            cache_path
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -303,12 +275,12 @@ mod tests {
     fn test_download_progress_snapshot() {
         let progress = DownloadProgressSnapshot {
             file_name: "config.json".to_string(),
-            current_file: 1,
-            total_files: 4,
+            downloaded_bytes: 1,
+            total_bytes: 4,
         };
 
         assert_eq!(progress.file_name, "config.json");
-        assert_eq!(progress.current_file, 1);
+        assert_eq!(progress.downloaded_bytes, 1);
     }
 
     #[tokio::test]

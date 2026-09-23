@@ -100,7 +100,6 @@ pub mod planning; // IMPCPD iterative plan refinement loop
 pub mod poset; // Co-Forth poset VM — partially-ordered task graph with 3D renderer
 pub mod program_registry; // Caller-owned adapter from programs onto memory's index
 pub mod providers; // Multi-provider LLM support
-pub mod registry; // Migration-only legacy Co-Forth peer registry
 pub mod review; // Local reviewed-changeset projection
 pub mod router;
 pub use finch_runtime as runtime; // Provider-neutral Forth/Lisp execution and capabilities

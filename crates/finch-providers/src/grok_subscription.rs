@@ -67,7 +67,7 @@ impl fmt::Display for SubscriptionApiCreditRejected {
 
 impl std::error::Error for SubscriptionApiCreditRejected {}
 
-pub struct GrokCredentialLease {
+pub(crate) struct GrokCredentialLease {
     access_token: String,
     account: String,
     generation: String,
@@ -80,7 +80,7 @@ impl fmt::Debug for GrokCredentialLease {
 }
 
 #[async_trait]
-pub trait GrokCredentialSource: Send + Sync {
+pub(crate) trait GrokCredentialSource: Send + Sync {
     async fn lease(&self, cancel: &CancellationToken) -> Result<GrokCredentialLease>;
     async fn refresh_after_unauthorized(
         &self,

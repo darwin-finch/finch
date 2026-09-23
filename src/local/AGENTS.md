@@ -19,6 +19,8 @@ generation methods mutate classifier/generator state. A missing or low-confidenc
 is not a successful turn: the caller decides whether to forward. Neural model handles are
 injected by the REPL or server after model loading; this module must not start loading or execute
 tools. A configured family name is an identity hint, not proof that a model is loaded or supported.
+The streaming path calls the injected model's `TextGeneration` port, not a concrete engine type;
+keep tokenization, callbacks, and final decode backend-neutral when extending it.
 
 **Extension rule:** keep family-specific request adaptation in `src/generators` and model loading
 in `src/models`. Add a flat facade entry only for a demonstrated caller need; do not expose

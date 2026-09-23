@@ -1,4 +1,4 @@
-# LocalModelAdapters vs TeacherProviders
+# LocalModelAdapters vs Cloud Providers
 
 > **Archived terminology note:** This predates the current unified provider configuration. It is
 > retained for implementation history and is not a current capability matrix.
@@ -52,7 +52,7 @@ let clean_output = adapter.clean_output(&raw_output);
 
 ---
 
-### 2. TeacherProvider (External API Services)
+### 2. Cloud Provider (External API Services)
 
 **Location**: `src/providers/`
 **Purpose**: Make HTTP requests to **external API services** for inference fallback
@@ -73,7 +73,7 @@ let clean_output = adapter.clean_output(&raw_output);
 
 **Code**:
 ```rust
-pub trait TeacherProvider: Send + Sync {
+pub trait CloudProvider: Send + Sync {
     async fn send_message(&self, messages: Vec<Message>) -> Result<String>;
     fn provider_name(&self) -> &str;
     fn supports_streaming(&self) -> bool;
@@ -82,11 +82,11 @@ pub trait TeacherProvider: Send + Sync {
 
 **Usage**:
 ```rust
-// Create teacher provider with API key
-let teacher = ClaudeProvider::new(api_key);
+// Create a cloud provider with an API key
+let cloud = ClaudeProvider::new(api_key);
 
 // Make async API call
-let response = teacher.send_message(messages).await?;
+let response = cloud.send_message(messages).await?;
 
 // Use the provider response; Finch does not collect it for training
 display(response);
@@ -96,7 +96,7 @@ display(response);
 
 ## Clear Distinction Table
 
-| Aspect | LocalModelAdapter | TeacherProvider |
+| Aspect | LocalModelAdapter | CloudProvider |
 |--------|-------------------|----------------|
 | **Location** | `src/models/adapters/` | `src/providers/` |
 | **Purpose** | Format prompts for local ONNX | Call external AI APIs |
@@ -133,7 +133,7 @@ display(response);
              │                         │
              v                         v
     ┌──────────────────┐      ┌──────────────────┐
-    │ LocalModelAdapter│      │ TeacherProvider  │
+    │ LocalModelAdapter│      │ CloudProvider    │
     │ (Formatting)     │      │ (API Call)       │
     └────────┬─────────┘      └────────┬─────────┘
              │                         │
@@ -161,7 +161,7 @@ display(response);
 - ✅ Getting model-specific token IDs
 - ✅ Switching between model families (Qwen → Llama)
 
-### Use TeacherProvider When:
+### Use a Cloud Provider When:
 - ✅ Forwarding complex queries to cloud APIs
 - ✅ Learning from high-quality API responses
 - ✅ Fallback when local model fails
@@ -192,7 +192,7 @@ if name_lower.contains("phi") {
 }
 ```
 
-### Add a New TeacherProvider:
+### Add a New Cloud Provider:
 
 ```rust
 // src/providers/cohere.rs
@@ -201,7 +201,7 @@ pub struct CohereProvider {
     client: reqwest::Client,
 }
 
-impl TeacherProvider for CohereProvider {
+impl CloudProvider for CohereProvider {
     async fn send_message(&self, messages: Vec<Message>) -> Result<String> {
         // Make HTTP request to Cohere API
         let response = self.client
@@ -228,7 +228,7 @@ impl TeacherProvider for CohereProvider {
 - **Deterministic**: Same input always produces same output
 - **Testable**: Easy to unit test with examples
 
-### TeacherProvider
+### CloudProvider
 - **Stateful**: Has API keys, HTTP clients
 - **Slow**: Network I/O, rate limits
 - **Variable**: May fail, timeout, rate limit
@@ -239,7 +239,7 @@ impl TeacherProvider for CohereProvider {
 ## Summary
 
 **LocalModelAdapter = Local ONNX behavior**
-**TeacherProvider = External API calls**
+**CloudProvider = External API calls**
 
 These are completely separate concerns with different responsibilities, interfaces, and use cases. The naming makes the distinction clear.
 
@@ -248,5 +248,5 @@ These are completely separate concerns with different responsibilities, interfac
 **Last Updated**: 2026-02-11
 **See Also**:
 - `src/models/adapters/mod.rs` - LocalModelAdapter trait
-- `src/providers/mod.rs` - TeacherProvider trait
+- `crates/finch-providers` - provider transport traits (`LlmProvider`)
 - `CLAUDE.md` - Overall architecture

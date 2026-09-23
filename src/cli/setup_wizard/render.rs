@@ -1419,53 +1419,72 @@ pub(super) fn add_provider_card(
         }
         // ── single-screen local model form ───────────────────────────────────
         AddProviderStep::ConfigureLocal {
-            inference_provider,
+            inference_provider: _,
             family,
             size,
+            quantization,
             execution,
+            model_path,
             focused_field,
+            editing_idx,
         } => {
-            let backend_name = match inference_provider {
-                InferenceProvider::Onnx => "ONNX Runtime",
-                #[cfg(feature = "candle")]
-                InferenceProvider::Candle => "Candle",
-            };
-            let mut family_name = family.name().to_string();
-            #[cfg(feature = "candle")]
-            if *inference_provider == InferenceProvider::Candle {
-                family_name = format!("{} (only)", family.name());
-            }
+            let backend_name = "llama.cpp (GGUF)";
+            let family_name = family.name().to_string();
             let size_name = model_size_display(size);
+            let quantization_name = quantization.name();
             let device_name = execution_target_display(*execution, coreml);
             let row = |label: &str, value: &str, focused: bool| {
                 remote_form_row(label, value, focused, false)
             };
-            let repo_preview = get_repository(*inference_provider, *family, *size)
-                .map(|repo| format!("→ {repo}"))
-                .unwrap_or_else(|| "(no model available for this combination)".to_string());
-            let ram_estimate = match size {
-                ModelSize::Small => "~2 GB RAM",
-                ModelSize::Medium => "~4 GB RAM",
-                ModelSize::Large => "~8 GB RAM",
-                ModelSize::XLarge => "~16 GB RAM",
-            };
-            let body = vec![
+            let managed = managed_gguf_artifact(*family, *size, *quantization);
+            let repo_preview = managed.as_ref().map_or_else(
+                || "No managed artifact for this combination".to_string(),
+                |artifact| format!("Managed: {}", artifact.repository),
+            );
+            let ram_estimate = managed.as_ref().map_or_else(
+                || "RAM depends on GGUF file".to_string(),
+                |artifact| format!("Download {:.1} GB", artifact.expected_size as f64 / 1e9),
+            );
+            let mut body = vec![
                 String::new(),
                 row("Backend", backend_name, *focused_field == 0),
                 row("Family", &family_name, *focused_field == 1),
                 row("Size", size_name, *focused_field == 2),
-                row("Device", &device_name, *focused_field == 3),
+                row("Quantization", quantization_name, *focused_field == 3),
+                row("Device", &device_name, *focused_field == 4),
+            ];
+            let path_display = if model_path.chars().count() > 34 {
+                let suffix: String = model_path.chars().rev().take(33).collect();
+                format!("…{}", suffix.chars().rev().collect::<String>())
+            } else {
+                model_path.clone()
+            };
+            body.push(remote_form_row(
+                "GGUF file (optional)",
+                &path_display,
+                *focused_field == 5,
+                true,
+            ));
+            body.extend([
                 String::new(),
                 format!(
                     "{}  {}",
                     wizard_line(&format!("{ram_estimate}  "), Color::Cyan),
                     wizard_line(&repo_preview, Color::DarkGray)
                 ),
-            ];
+            ]);
             WizardCard::new(
-                "Add Local Model",
+                if editing_idx.is_some() {
+                    "Edit Local Model"
+                } else {
+                    "Add Local Model"
+                },
                 body,
-                Some("↑↓ navigate · ←→ change · Enter to add · Esc back".to_string()),
+                Some(if editing_idx.is_some() {
+                    "↑↓ navigate · ←→ change · leave path blank to download · Enter to save · Esc back".to_string()
+                } else {
+                    "↑↓ navigate · ←→ change · leave path blank to download · Enter to add · Esc back".to_string()
+                }),
             )
         }
         // ── network scan path ────────────────────────────────────────────────

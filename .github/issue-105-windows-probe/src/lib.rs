@@ -5,7 +5,7 @@
 //! compiles. This probe depends on `finch-providers`, which now owns that
 //! store and the credential types.
 
-pub use finch_providers::oauth::FileOAuthCredentialStore;
+pub use finch_providers::FileOAuthCredentialStore;
 pub use finch_providers::{
     AudienceBinding, CredentialKind, CredentialProvider, ProviderCredential,
 };

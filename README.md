@@ -35,7 +35,7 @@ The long-term design combines:
 | Durable named Brains | One named conversation, event history, and persistent typed VM can survive frontend disconnects and daemon restarts. | Implemented foundations with experimental reconnect, background-work, and collaboration workflows. |
 | One capability boundary | Code tools, MCP tools, future skills, remote peers, and desktop automation are meant to share typed authority, approval, audit, and revocation rules. | Tool approval and MCP client paths exist; skills and wider automation integration remain planned work. |
 | Provider and account portability | Use cloud APIs, supported subscriptions, remote Finch nodes, or local models without changing the surrounding workflow or concealing which backend ran it. | Multiple profiles exist; subscription support, model-level conformance, and explicit fallback behavior remain active work. |
-| Local models and perception | Keep suitable generation, speech transcription, OCR, image description, and context compression on user-controlled hardware, with explicit cloud fallback when requested. | ONNX Runtime and Candle loaders exist experimentally; the compatible model matrix and local media pipeline are not yet established. |
+| Local models and perception | Keep suitable generation, speech transcription, OCR, image description, and context compression on user-controlled hardware, with explicit cloud fallback when requested. | Daemon chat accepts an explicit GGUF through llama.cpp; frontend memory owns its separate required model defaults and download. Broader media support is not established. |
 | Accessibility-native automation | Operate applications through semantic roles, labels, and domain identifiers so automation remains usable and auditable without pixel coordinates. | A design invariant and long-term integration target, not a complete personal-assistant feature today. |
 
 This direction is incremental. Current interfaces are described below; planned work belongs in the
@@ -113,7 +113,7 @@ Run `finch --help` and `finch <command> --help` for the full generated CLI refer
 `/help` shows the slash commands present in that build. `/model` overlays a model on the active
 Brain (same credentials). `/provider <name>` binds that Brain to a configured provider entry.
 `/status` inspects the effective identity. `--model` is one-shot for this invocation and does not
-persist; `/model` does. `/teacher` remains a `/provider` compatibility alias.
+persist; `/model` does.
 
 Typing `@` at a token boundary opens a keyboard-navigable file picker. Selecting a file or
 directory inserts a visible `@path` mention and attaches a snapshot of its contents to the
@@ -176,12 +176,25 @@ authentication must not be inferred from OpenAI API-key support.
 
 ### Local inference
 
-The source contains ONNX Runtime and Candle loaders plus local profiles for several model families.
-Local artifacts can be large and may require Hugging Face access. A configured local profile does
+Daemon local chat loads either a Finch-managed, pinned Hugging Face GGUF or a user-selected GGUF
+file through llama.cpp. Managed downloads are resumed, size/checksum verified, and shown as one
+temporary status-bar entry. ONNX and Candle are not chat
+providers; old entries direct the user through `finch setup` migration. Local artifacts can be
+large. A configured local profile does
 not currently guarantee that a query is routed locally; local bootstrap, selection, and provider
 parity remain experimental under [#74](https://github.com/darwin-finch/finch/issues/74) and
-[#98](https://github.com/darwin-finch/finch/issues/98). Use `--cloud-only` when you need to avoid a
-local download attempt.
+[#98](https://github.com/darwin-finch/finch/issues/98). Use `--cloud-only` when you need to disable
+daemon local-chat loading.
+
+The removed ONNX and Candle local-chat implementations were last available in commit
+[`0607ccfad8ba790a236f701aa7d25f77488332d7`](https://github.com/darwin-finch/finch/tree/0607ccfad8ba790a236f701aa7d25f77488332d7).
+They were retired on 2026-09-22 because neither path provided a reliable supported chat runtime:
+ONNX/CoreML repeatedly crashed the daemon during Qwen session construction, while Candle's Metal
+path lacked kernels required by the supported model families and produced wrong, absent, or
+impractically slow output. The replacement llama.cpp/GGUF path had completed real buffered,
+streamed, and CPU generation on the target MacBook before the cutover. The historical commit is
+for source archaeology, not a supported installation recommendation. Frontend memory's separately
+owned ONNX embedder is unaffected by this chat-provider decision.
 
 ### HTTP daemon
 

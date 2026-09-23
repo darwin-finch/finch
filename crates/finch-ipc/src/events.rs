@@ -1,4 +1,4 @@
-//! Named Cap'n Proto event bus with continuation support.
+//! Crate-local event-bus test harness with continuation support.
 //!
 //! # Model
 //!
@@ -13,20 +13,6 @@
 //! - `Some(e)` — continuation; `e` is re-queued with the same `id` so the
 //!   caller can correlate the chain.
 //!
-//! # Example
-//!
-//! ```rust,ignore
-//! let mut bus = EventBus::new();
-//!
-//! bus.register("peer.join", |ev| Box::pin(async move {
-//!     println!("peer joined: {}", ev.payload);
-//!     None
-//! }));
-//!
-//! bus.send(QueuedEvent::new("peer.join", serde_json::json!({ "addr": "127.0.0.1" })));
-//! bus.run().await;
-//! ```
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -41,17 +27,17 @@ use uuid::Uuid;
 
 /// A single event on the bus.
 #[derive(Debug, Clone)]
-pub struct QueuedEvent {
+struct QueuedEvent {
     /// Dispatch key — matches a registered handler name.
-    pub name: String,
+    name: String,
     /// Stable ID across the continuation chain.
-    pub id: String,
+    id: String,
     /// Payload — free-form JSON until callers are wired to the capnp schema.
-    pub payload: serde_json::Value,
+    payload: serde_json::Value,
 }
 
 impl QueuedEvent {
-    pub fn new(name: impl Into<String>, payload: serde_json::Value) -> Self {
+    fn new(name: impl Into<String>, payload: serde_json::Value) -> Self {
         Self {
             name: name.into(),
             id: Uuid::new_v4().to_string(),
@@ -60,7 +46,7 @@ impl QueuedEvent {
     }
 
     /// Produce a continuation event: same `id`, new `name` and `payload`.
-    pub fn continue_as(&self, name: impl Into<String>, payload: serde_json::Value) -> Self {
+    fn continue_as(&self, name: impl Into<String>, payload: serde_json::Value) -> Self {
         Self {
             name: name.into(),
             id: self.id.clone(),
@@ -81,14 +67,14 @@ type HandlerFn = Arc<dyn Fn(QueuedEvent) -> HandlerFuture + Send + Sync>;
 // ---------------------------------------------------------------------------
 
 /// Named async event bus with continuation support.
-pub struct EventBus {
+struct EventBus {
     tx: mpsc::UnboundedSender<QueuedEvent>,
     rx: mpsc::UnboundedReceiver<QueuedEvent>,
     handlers: HashMap<String, HandlerFn>,
 }
 
 impl EventBus {
-    pub fn new() -> Self {
+    fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             tx,
@@ -98,7 +84,7 @@ impl EventBus {
     }
 
     /// Register an async handler for events with the given name.
-    pub fn register<F, Fut>(&mut self, name: impl Into<String>, handler: F)
+    fn register<F, Fut>(&mut self, name: impl Into<String>, handler: F)
     where
         F: Fn(QueuedEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Option<QueuedEvent>> + Send + 'static,
@@ -108,29 +94,14 @@ impl EventBus {
     }
 
     /// Enqueue an event.
-    pub fn send(&self, event: QueuedEvent) {
+    fn send(&self, event: QueuedEvent) {
         let _ = self.tx.send(event);
     }
 
-    /// Return a sender that can enqueue events from other tasks.
-    pub fn sender(&self) -> mpsc::UnboundedSender<QueuedEvent> {
-        self.tx.clone()
-    }
-
-    /// Drain the queue until it is empty or the channel is closed.
-    ///
-    /// Continuations (handlers returning `Some(e)`) are re-queued immediately
-    /// and processed in the same `run` call.
-    pub async fn run(&mut self) {
-        while let Some(event) = self.rx.recv().await {
-            self.dispatch(event).await;
-        }
-    }
-
     /// Process all currently queued events (non-blocking once the queue is
-    /// empty).  Awaits each spawned handler before returning so continuations
+    /// empty). Awaits each handler before returning so continuations
     /// are fully resolved.  Useful in tests.
-    pub async fn flush(&mut self) {
+    async fn flush(&mut self) {
         loop {
             match self.rx.try_recv() {
                 Ok(event) => {
@@ -144,21 +115,6 @@ impl EventBus {
                 }
                 Err(_) => break,
             }
-        }
-    }
-
-    /// Process a single event, re-queuing any continuation.
-    async fn dispatch(&self, event: QueuedEvent) {
-        if let Some(handler) = self.handlers.get(&event.name) {
-            let handler = Arc::clone(handler);
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                if let Some(continuation) = handler(event).await {
-                    let _ = tx.send(continuation);
-                }
-            });
-        } else {
-            tracing::debug!("[event-bus] no handler for {:?}", event.name);
         }
     }
 }
@@ -184,9 +140,10 @@ mod tests {
         let c = Arc::clone(&counter);
 
         let mut bus = EventBus::new();
-        bus.register("ping", move |_ev| {
+        bus.register("ping", move |ev| {
             let c = Arc::clone(&c);
             Box::pin(async move {
+                assert_eq!(ev.payload, serde_json::Value::Null, "ping payload");
                 c.fetch_add(1, Ordering::SeqCst);
                 None
             })

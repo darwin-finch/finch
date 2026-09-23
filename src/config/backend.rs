@@ -6,15 +6,13 @@ use std::path::PathBuf;
 
 /// Execution target for inference (hardware where code runs)
 ///
-/// All targets use ONNX Runtime as the inference provider.
-/// The target determines which ONNX Runtime execution provider is used:
-/// - CoreML: Uses the requested CoreML compute-unit policy on Apple platforms
-/// - CPU: Uses CPU execution provider (universal fallback)
-/// - CUDA: Uses CUDA execution provider for NVIDIA GPUs
+/// The active llama.cpp chat path accepts `Auto` (allow GPU offload) or `Cpu`.
+/// CoreML and CUDA values remain deserializable so setup can migrate old chat
+/// configurations; they are rejected by the llama.cpp loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionTarget {
-    /// CoreML execution provider (macOS only, ONNX Runtime)
+    /// Legacy CoreML target retained so old chat configuration can be migrated.
     #[cfg(target_os = "macos")]
     #[serde(rename = "coreml")]
     CoreML,
@@ -64,8 +62,7 @@ impl ExecutionTarget {
 
     /// Check if this execution target is available on the current system
     ///
-    /// Simplified: assumes platform support = availability
-    /// ONNX Runtime will handle actual device detection at runtime
+    /// Simplified legacy compatibility query; this is not llama.cpp capability detection.
     pub fn is_available(&self) -> bool {
         match self {
             #[cfg(target_os = "macos")]
@@ -171,12 +168,11 @@ pub struct CoreMlConfig {
 /// Backend configuration for model inference
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
-    /// Enable local model inference (default: true)
-    /// Set to false for proxy-only mode (no local model, teacher APIs only)
+    /// Enable local chat inference after the user configures a GGUF (default: false).
     #[serde(default = "default_backend_enabled")]
     pub enabled: bool,
 
-    /// Inference provider (ONNX Runtime or Candle)
+    /// Chat inference provider. New configurations use llama.cpp.
     #[serde(default = "default_inference_provider")]
     pub inference_provider: crate::models::InferenceProvider,
 
@@ -196,12 +192,15 @@ pub struct BackendConfig {
     #[serde(default = "default_model_size")]
     pub model_size: ModelSize,
 
-    /// Model repository (optional override)
-    /// If not specified, automatically selected from compatibility matrix
+    /// Legacy repository override retained only for migration diagnostics.
     pub model_repo: Option<String>,
 
-    /// Path to downloaded model
+    /// Existing absolute GGUF path for a custom local chat model.
     pub model_path: Option<PathBuf>,
+
+    /// Immutable Hugging Face GGUF selected and managed by Finch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_artifact: Option<crate::models::ManagedGgufArtifact>,
 
     /// Fallback execution target chain
     #[serde(
@@ -217,11 +216,11 @@ pub struct BackendConfig {
 }
 
 fn default_backend_enabled() -> bool {
-    true
+    false
 }
 
 fn default_inference_provider() -> crate::models::InferenceProvider {
-    crate::models::InferenceProvider::Onnx // ONNX Runtime is the default
+    crate::models::InferenceProvider::LlamaCpp
 }
 
 fn default_model_family() -> ModelFamily {
@@ -298,6 +297,7 @@ impl Default for BackendConfig {
             model_size: default_model_size(),
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             fallback_chain: default_fallback_chain(),
             #[allow(deprecated)]
             device: None,
@@ -319,7 +319,7 @@ impl BackendConfig {
     /// Create new backend config with execution target
     pub fn with_target(target: ExecutionTarget) -> Self {
         Self {
-            enabled: default_backend_enabled(),
+            enabled: true,
             inference_provider: default_inference_provider(),
             execution_target: target,
             coreml: CoreMlConfig::default(),
@@ -327,6 +327,7 @@ impl BackendConfig {
             model_size: default_model_size(),
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             fallback_chain: default_fallback_chain(),
             #[allow(deprecated)]
             device: None,
@@ -342,7 +343,7 @@ impl BackendConfig {
     /// Create new backend config with model family and size
     pub fn with_model(target: ExecutionTarget, family: ModelFamily, size: ModelSize) -> Self {
         Self {
-            enabled: default_backend_enabled(),
+            enabled: true,
             inference_provider: default_inference_provider(),
             execution_target: target,
             coreml: CoreMlConfig::default(),
@@ -350,6 +351,7 @@ impl BackendConfig {
             model_size: size,
             model_repo: None,
             model_path: None,
+            managed_artifact: None,
             fallback_chain: default_fallback_chain(),
             #[allow(deprecated)]
             device: None,
@@ -358,18 +360,9 @@ impl BackendConfig {
 
     /// Get the model repository for the selected target and model size
     ///
-    /// Uses compatibility matrix to resolve repository automatically
+    /// Legacy repository accessor retained for config callers during migration.
     pub fn get_model_repo(&self, _model_size: &str) -> String {
-        if let Some(repo) = &self.model_repo {
-            return repo.clone();
-        }
-
-        // Use compatibility matrix to get repository
-        crate::models::get_repository(self.inference_provider, self.model_family, self.model_size)
-            .unwrap_or_else(|| {
-                // Fallback for compatibility
-                "onnx-community/Qwen2.5-1.5B-Instruct".to_string()
-            })
+        self.model_repo.clone().unwrap_or_default()
     }
 
     /// Get the effective execution target (resolve Auto to concrete target)
@@ -396,6 +389,19 @@ impl BackendConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_local_chat_is_disabled_until_a_user_configures_it() {
+        let config = BackendConfig::default();
+        assert!(
+            !config.enabled && config.model_path.is_none(),
+            "a fresh config must not attempt to load an unspecified local chat model: {config:?}"
+        );
+        assert_eq!(
+            config.inference_provider,
+            crate::models::InferenceProvider::LlamaCpp
+        );
+    }
 
     #[test]
     fn test_execution_target_cpu_always_available() {

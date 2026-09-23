@@ -293,7 +293,7 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
             (
                 api_key.clone(),
                 false,
-                InferenceProvider::Onnx,
+                InferenceProvider::LlamaCpp,
                 ExecutionTarget::Cpu, // Placeholder
                 ModelFamily::Qwen2,   // Placeholder
                 ModelSize::Medium,    // Placeholder
@@ -301,76 +301,8 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         }
     };
 
-    // Build teachers list from primary + tool models
-    let mut teachers: Vec<TeacherEntry> = Vec::new();
-
-    // Primary model as first teacher (if remote)
-    if let ModelConfig::Remote {
-        provider,
-        name,
-        api_key,
-        model,
-        ..
-    } = &primary_model
-    {
-        teachers.push(TeacherEntry {
-            provider: provider.clone(),
-            api_key: api_key.clone(),
-            model: if model.is_empty() {
-                None
-            } else {
-                Some(model.clone())
-            },
-            base_url: None,
-            name: Some(name.clone()),
-        });
-    }
-
-    // Tool models as additional teachers
-    for tool_model in &tool_models {
-        if let ModelConfig::Remote {
-            provider,
-            name,
-            api_key,
-            model,
-            enabled,
-            ..
-        } = tool_model
-        {
-            if *enabled {
-                teachers.push(TeacherEntry {
-                    provider: provider.clone(),
-                    api_key: api_key.clone(),
-                    model: if model.is_empty() {
-                        None
-                    } else {
-                        Some(model.clone())
-                    },
-                    base_url: None,
-                    name: Some(name.clone()),
-                });
-            }
-        }
-    }
-
-    // A profile name is the stable `/model <name>` selector. Keep generated
-    // names unique even when the same provider/model is added more than once.
-    let mut used_names: HashMap<String, usize> = HashMap::new();
-    for teacher in &mut teachers {
-        let base = teacher
-            .name
-            .clone()
-            .unwrap_or_else(|| teacher.provider.clone());
-        let count = used_names.entry(base.to_ascii_lowercase()).or_default();
-        *count += 1;
-        if *count > 1 {
-            teacher.name = Some(format!("{}-{}", base, count));
-        }
-    }
-
-    // Rebuild the unified provider list in the exact order shown. Remote
-    // models have already been normalized in `teachers`; local models must be
-    // emitted directly because they have no teacher representation.
+    // Build the unified provider list in the exact order shown. Remote
+    // models are emitted as cloud entries; local models are emitted directly.
     let providers: Vec<ProviderEntry> = std::iter::once(&primary_model)
         .chain(tool_models.iter())
         .enumerate()
@@ -395,16 +327,26 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                 size,
                 execution,
                 inference_provider,
+                model_path: configured_path,
+                managed_artifact: configured_artifact,
                 enabled,
                 persisted,
             } => {
-                let (name, model_repo, model_path) = match persisted {
+                let (name, model_repo, legacy_artifact_changed) = match persisted {
                     Some(ProviderEntry::Local {
                         name,
                         model_repo,
-                        model_path,
+                        inference_provider: old_provider,
+                        model_family: old_family,
+                        model_size: old_size,
                         ..
-                    }) => (name.clone(), model_repo.clone(), model_path.clone()),
+                    }) => (
+                        name.clone(),
+                        model_repo.clone(),
+                        old_provider != inference_provider
+                            || old_family != family
+                            || old_size != size,
+                    ),
                     _ => (
                         Some(format!(
                             "local-{}-{}",
@@ -414,8 +356,19 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                                 .replace(' ', "-")
                         )),
                         None,
-                        None,
+                        false,
                     ),
+                };
+                let gguf_selected = *inference_provider == InferenceProvider::LlamaCpp;
+                let model_repo = if gguf_selected || legacy_artifact_changed {
+                    None
+                } else {
+                    model_repo
+                };
+                let model_path = if !gguf_selected && legacy_artifact_changed {
+                    None
+                } else {
+                    configured_path.clone()
                 };
                 Some(ProviderEntry::Local {
                     inference_provider: *inference_provider,
@@ -424,6 +377,7 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                     model_size: *size,
                     model_repo,
                     model_path,
+                    managed_artifact: configured_artifact.clone(),
                     enabled: *enabled,
                     name,
                 })
@@ -446,7 +400,6 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         model_family,
         model_size,
         custom_model_repo: None,
-        teachers,
         finch_api_key: finch_api_key_val,
         default_persona,
         custom_system_prompt,

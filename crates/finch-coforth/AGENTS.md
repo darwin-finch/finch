@@ -14,6 +14,14 @@ shared certify pipeline.
 public methods without a generated catalog. Applications use the compatible `finch-vm` facade
 rather than depending on this unpublished compiler crate directly.
 
+**Surface:** the facade (`src/lib.rs`) exports `compile_forth`, `compile_forth_with_functions`,
+`read_forth_source`, and the reader lexicon (`forth_lexicon`, `ForthLexicon`,
+`ForthStringOpener`). `forth_lexicon` stays public for the compact-wire grammar generator in
+`finch-language` (`src/wire.rs`); `ForthLexicon`/`ForthStringOpener` are public solely as its
+return shape — no consumer names them, and they cannot narrow while the constructor is public.
+The token loop helper `forth_word_terminator` is `pub(crate)`. There is no generated catalog;
+rustdoc on the facade types is the method reference.
+
 **Dependencies:** `finch-coforth` depends only on [`finch-vm-core`](../finch-vm-core/AGENTS.md)
 inside the workspace. Shared type-spelling grammar comes from core's restricted compiler-support
 seam; Co-Forth never depends on CoLisp or `finch-vm`.

@@ -365,7 +365,7 @@ async fn test_switch_drops_stale_backend_completion() {
 #[tokio::test]
 async fn test_explicit_fallback_records_rejection_and_keeps_identity() {
     let requested = test_ref("local", "missing");
-    let ready = test_ref("cloud", "teacher");
+    let ready = test_ref("cloud", "cloud-primary");
     let loading = Arc::new(ScriptedBackend::with_readiness(
         requested.clone(),
         GenerationStrategy::CausalAutoregressive,
@@ -380,10 +380,10 @@ async fn test_explicit_fallback_records_rejection_and_keeps_identity() {
         ),
         vec![],
     ));
-    let teacher = Arc::new(ScriptedBackend::ready(
+    let cloud = Arc::new(ScriptedBackend::ready(
         ready.clone(),
         GenerationStrategy::CausalAutoregressive,
-        vec![text_delta(&ready, "teacher", 1)],
+        vec![text_delta(&ready, "cloud-primary", 1)],
     ));
     let request = GenerationRequest::new(
         Vec::new(),
@@ -392,7 +392,7 @@ async fn test_explicit_fallback_records_rejection_and_keeps_identity() {
     )
     .with_fallback();
     let (selected, decision) =
-        select_backend(&request, &[loading, teacher.clone()]).expect("fallback");
+        select_backend(&request, &[loading, cloud.clone()]).expect("fallback");
     assert_eq!(selected.identity(), ready);
     assert!(
         decision.reason.contains("explicit fallback"),
@@ -432,14 +432,14 @@ async fn test_explicit_fallback_records_rejection_and_keeps_identity() {
 #[test]
 fn test_select_backend_does_not_fallback_without_explicit_policy() {
     let requested = test_ref("local", "missing");
-    let ready = test_ref("cloud", "teacher");
+    let ready = test_ref("cloud", "cloud-primary");
     let loading = Arc::new(ScriptedBackend::with_readiness(
         requested.clone(),
         GenerationStrategy::CausalAutoregressive,
         ReadinessReport::not_loaded(),
         vec![],
     ));
-    let teacher = Arc::new(ScriptedBackend::ready(
+    let cloud = Arc::new(ScriptedBackend::ready(
         ready,
         GenerationStrategy::CausalAutoregressive,
         vec![],
@@ -449,7 +449,7 @@ fn test_select_backend_does_not_fallback_without_explicit_policy() {
         requested,
         GenerationStrategy::CausalAutoregressive,
     );
-    let error = select_backend(&request, &[loading, teacher])
+    let error = select_backend(&request, &[loading, cloud])
         .err()
         .expect("implicit fallback must fail")
         .to_string();

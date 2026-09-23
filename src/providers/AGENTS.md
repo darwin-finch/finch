@@ -12,7 +12,7 @@ dialects, wire types, dispatch, and adapter tests live in
 outside this directory use `crate::providers::Item`. Do not recreate a signature catalog.
 
 **Dependencies:** `finch-providers` (transports and contracts), `config` (application
-`Config` / `ProviderEntry` / `TeacherEntry`). Do not add Brain, TUI, daemon, or tool
+`Config` / `ProviderEntry`). Do not add Brain, TUI, daemon, or tool
 execution here.
 
 **Owns the compatibility path** `crate::providers::Message` for the universal wire

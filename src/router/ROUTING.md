@@ -1,6 +1,6 @@
 # Router
 
-**Purpose:** Route queries to local model or teacher API based on model readiness.
+**Purpose:** Route queries to the local model or a cloud provider API based on model readiness.
 
 ## Primary decision
 
@@ -16,7 +16,7 @@ A threshold-based statistics router (`src/models/threshold_router.rs`) handles r
 
 | Reason | When |
 |--------|------|
-| `ModelNotReady` | Model still loading; forward to teacher if configured |
+| `ModelNotReady` | Model still loading; forward to a cloud provider if configured |
 | `NoMatch` | Threshold router below confidence |
 | `LowConfidence` | Stats below threshold |
 

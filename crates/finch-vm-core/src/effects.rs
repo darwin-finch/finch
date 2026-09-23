@@ -391,7 +391,7 @@ impl FileSelector {
 
     /// Returns true only when containment is proven by the restricted selector
     /// algebra. False may mean either disjoint or not provable.
-    pub fn contains_selector(&self, requested: &Self) -> bool {
+    pub(crate) fn contains_selector(&self, requested: &Self) -> bool {
         if self.root != requested.root {
             return false;
         }
@@ -408,6 +408,7 @@ impl FileSelector {
                 .is_some_and(|suffix| suffix.starts_with('/'))
     }
 
+    #[cfg(test)]
     pub fn intersection(&self, other: &Self) -> Result<Self, SelectorError> {
         if self.root != other.root {
             return Err(SelectorError::DifferentRoots);

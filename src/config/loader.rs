@@ -89,6 +89,34 @@ pub(crate) fn load_config_from_path(config_path: &std::path::Path) -> Result<Con
     load_config_from_path_with_factory(config_path, Config::with_providers)
 }
 
+/// One legacy `[[teachers]]` row from a pre-`[[providers]]` config file.
+///
+/// This shim exists only so unmigrated config files still load; it is never
+/// written or documented. Field mapping is 1:1 with the row's provider fields.
+#[derive(serde::Deserialize)]
+struct LegacyTeacherEntry {
+    provider: String,
+    api_key: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Map one legacy row onto a cloud `ProviderEntry` (1:1 field mapping;
+/// unknown provider names fall back to Claude).
+fn legacy_teacher_entry_to_provider(entry: &LegacyTeacherEntry) -> ProviderEntry {
+    ProviderEntry::from_provider_fields(
+        &entry.provider,
+        entry.api_key.clone(),
+        entry.model.clone(),
+        entry.base_url.clone(),
+        entry.name.clone(),
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn load_config_from_path_with_paths(
     config_path: &std::path::Path,
@@ -108,7 +136,7 @@ where
     F: FnOnce(Vec<ProviderEntry>) -> Config,
 {
     use super::backend::BackendConfig;
-    use super::settings::{ClientConfig, FeaturesConfig, ServerConfig, TeacherEntry};
+    use super::settings::{ClientConfig, FeaturesConfig, ServerConfig};
     use crate::theme::ColorScheme;
 
     let contents = fs::read_to_string(config_path).map_err(|_e| {
@@ -142,7 +170,7 @@ where
         #[serde(default)]
         server: Option<ServerConfig>,
         #[serde(default)]
-        teachers: Vec<TeacherEntry>,
+        teachers: Vec<LegacyTeacherEntry>,
         #[serde(default)]
         colors: Option<ColorScheme>,
         #[serde(default)]
@@ -177,7 +205,7 @@ where
         let mut providers: Vec<ProviderEntry> = toml_config
             .teachers
             .iter()
-            .map(ProviderEntry::from_teacher_entry)
+            .map(legacy_teacher_entry_to_provider)
             .collect();
         if let Some(ref backend) = toml_config.backend {
             if backend.enabled {
@@ -186,7 +214,7 @@ where
         }
         providers
     } else {
-        bail!("Config has no providers or teachers. Please run 'finch setup' to configure.");
+        bail!("Config has no providers configured. Please run 'finch setup' to configure.");
     };
 
     if providers.is_empty() {
@@ -335,6 +363,105 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(&config_path).is_ok(),
             "failed inspection must preserve the link"
+        );
+    }
+
+    /// A config written before `[[providers]]` existed still loads: the
+    /// `[[teachers]]` rows migrate 1:1 onto cloud provider entries and an
+    /// enabled `[backend]` becomes the local entry.
+    #[test]
+    fn test_legacy_teachers_config_still_loads_and_migrates_to_providers() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[teachers]]
+provider = "claude"
+api_key = "sk-ant-legacy-key-1234567890"
+model = "claude-sonnet-4-5"
+name = "Legacy Claude"
+
+[[teachers]]
+provider = "openai"
+api_key = "sk-legacy-openai"
+base_url = "https://example.invalid/v1"
+
+[[teachers]]
+provider = "some_removed_provider"
+api_key = "sk-ant-unknown-name-1234567890"
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_config_from_path_with_factory(&config_path, |providers| {
+            Config::with_providers_and_paths(providers, directory.path().join("metrics"), None)
+        })
+        .expect("a legacy [[teachers]] config must still load");
+
+        assert_eq!(
+            loaded.providers.len(),
+            3,
+            "every legacy teacher row must become one provider entry: {:?}",
+            loaded.providers
+        );
+        assert!(
+            loaded.providers.iter().all(|entry| !entry.is_local()),
+            "no local backend was enabled, so every migrated entry is cloud: {:?}",
+            loaded.providers
+        );
+
+        let first = &loaded.providers[0];
+        assert_eq!(first.provider_type(), "claude", "{first:?}");
+        assert_eq!(first.api_key(), Some("sk-ant-legacy-key-1234567890"));
+        assert_eq!(first.profile_name(), "Legacy Claude");
+        assert_eq!(first.model(), Some("claude-sonnet-4-5"));
+
+        let second = &loaded.providers[1];
+        assert_eq!(second.provider_type(), "openai", "{second:?}");
+
+        // Unknown provider names map to Claude — the safest fallback the
+        // removed conversion used — instead of failing the load.
+        let third = &loaded.providers[2];
+        assert_eq!(
+            third.provider_type(),
+            "claude",
+            "unknown legacy provider names must fall back to Claude: {third:?}"
+        );
+        assert_eq!(third.api_key(), Some("sk-ant-unknown-name-1234567890"));
+    }
+
+    /// Saving a loaded legacy config writes the unified `[[providers]]` format
+    /// and no longer mentions the removed table.
+    #[test]
+    fn test_legacy_teachers_config_saves_as_providers_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[teachers]]
+provider = "claude"
+api_key = "sk-ant-legacy-key-1234567890"
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_config_from_path_with_factory(&config_path, |providers| {
+            Config::with_providers_and_paths(providers, directory.path().join("metrics"), None)
+        })
+        .expect("a legacy [[teachers]] config must still load");
+
+        let saved_path = directory.path().join("saved.toml");
+        loaded.save_to(&saved_path).unwrap();
+        let saved = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved.contains("[[providers]]"),
+            "the save must use the unified provider format, file was:\n{saved}"
+        );
+        assert!(
+            !saved.contains("teachers"),
+            "the removed table must not be written back, file was:\n{saved}"
         );
     }
 }

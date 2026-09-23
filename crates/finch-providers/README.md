@@ -20,5 +20,5 @@ conformance.
 
 Read [AGENTS.md](AGENTS.md) for dependency and security rules, [src/lib.rs](src/lib.rs) for the
 crate facade, and `cargo doc -p finch-providers --no-deps --open` for signatures. The OAuth
-state machine has its own [capsule](src/oauth/AGENTS.md). Its currently public `oauth` module
-path is a facade exception still to be evaluated before flattening external call sites.
+state machine has its own [capsule](src/oauth/AGENTS.md); its contract is re-exported flat from
+the crate facade, and external callers never name the `oauth` module path (issue #958).

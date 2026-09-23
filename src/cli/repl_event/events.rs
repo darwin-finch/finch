@@ -244,7 +244,17 @@ pub enum ReplEvent {
     /// Cancel one exact ProgramRun currently owned by this frontend.
     NamedBrainRunCancelRequested(crate::server::RunnerCancelRequest),
     /// Release frontend-local cancellation state after a delegated program ends.
-    NamedBrainProgramFinished(crate::brain::RunId),
+    ///
+    /// The completion carries the locally rendered say card's outcome so the
+    /// runner console can settle the card and register the local projection
+    /// that suppresses the daemon's terminal run events (#978). A delegated
+    /// program otherwise leaves its run group painting the legacy rows beside
+    /// nothing.
+    NamedBrainProgramFinished {
+        run_id: crate::brain::RunId,
+        output: String,
+        error: Option<String>,
+    },
 
     /// The daemon has durably committed the exact named-Brain turn that
     /// requested this frontend replacement. It is now safe to leave the

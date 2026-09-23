@@ -15,7 +15,7 @@ use crate::tool_contract::{ToolDefinition, ToolInputSchema};
 use crate::types::{ToolAuthority, ToolCompilePolicy, WireProtocol};
 
 /// Upper bound on advertised tools for every current wire protocol.
-pub const MAX_ADVERTISED_TOOLS: usize = 256;
+pub(crate) const MAX_ADVERTISED_TOOLS: usize = 256;
 
 /// Where a tool identity comes from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,7 +35,7 @@ pub enum ToolOrigin {
 /// How a tool result is written back on this protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ResultEncoding {
+pub(crate) enum ResultEncoding {
     AnthropicToolResult,
     OpenAiToolMessage,
     ChatGptFunctionCallOutput,
@@ -45,14 +45,14 @@ pub enum ResultEncoding {
 /// Wire-level kind advertised to the provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WireToolKind {
+pub(crate) enum WireToolKind {
     Function,
     ProviderNative,
 }
 
 /// Collision-free identity on one provider wire.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WireToolIdentity {
+pub(crate) struct WireToolIdentity {
     /// Name sent to the provider.
     pub name: String,
     /// Namespace when the protocol has one (`functions`, `collaboration`).
@@ -129,7 +129,7 @@ impl SemanticTool {
 
 /// One compiled row of a binding table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BoundTool {
+pub(crate) struct BoundTool {
     /// Finch semantic identity.
     pub semantic: String,
     /// Provider wire identity.
@@ -148,7 +148,7 @@ pub struct BoundTool {
 
 impl BoundTool {
     /// Anthropic Messages tool definition using the compiled wire name.
-    pub fn anthropic_tool(&self) -> ToolDefinition {
+    pub(crate) fn anthropic_tool(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.wire.name.clone(),
             description: self.description.clone(),
@@ -156,34 +156,13 @@ impl BoundTool {
         }
     }
 
-    /// OpenAI chat-completions `tools[]` function entry.
-    pub fn openai_tool(&self) -> Value {
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": self.wire.name,
-                "description": self.description,
-                "parameters": self.wire_schema,
-            }
-        })
-    }
-
     /// ChatGPT Responses-Lite function tool inside the `functions` namespace.
-    pub fn chatgpt_function(&self) -> Value {
+    pub(crate) fn chatgpt_function(&self) -> Value {
         serde_json::json!({
             "type": "function",
             "name": self.wire.name,
             "description": self.description,
             "strict": false,
-            "parameters": self.wire_schema,
-        })
-    }
-
-    /// Gemini `functionDeclarations` entry.
-    pub fn gemini_declaration(&self) -> Value {
-        serde_json::json!({
-            "name": self.wire.name,
-            "description": self.description,
             "parameters": self.wire_schema,
         })
     }
@@ -203,7 +182,7 @@ pub struct ToolBindingTable {
 
 impl ToolBindingTable {
     /// Empty table for a request that advertised no tools.
-    pub fn empty(
+    pub(crate) fn empty(
         protocol: WireProtocol,
         provider: impl Into<String>,
         model: impl Into<String>,
@@ -218,38 +197,23 @@ impl ToolBindingTable {
         }
     }
 
-    /// Wire protocol this table was compiled for.
-    pub fn protocol(&self) -> WireProtocol {
-        self.protocol
-    }
-
-    /// Provider identity recorded at compile time.
-    pub fn provider(&self) -> &str {
-        &self.provider
-    }
-
-    /// Model identity recorded at compile time.
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
     /// Compiled rows in advertisement order.
-    pub fn entries(&self) -> &[BoundTool] {
+    pub(crate) fn entries(&self) -> &[BoundTool] {
         &self.entries
     }
 
     /// True when no tools were advertised.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Number of advertised tools.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Look up the binding for a semantic Finch identity.
-    pub fn encode_semantic(&self, identity: &str) -> Result<&BoundTool, ToolBindingError> {
+    pub(crate) fn encode_semantic(&self, identity: &str) -> Result<&BoundTool, ToolBindingError> {
         self.local_to_index
             .get(identity)
             .map(|&index| &self.entries[index])
@@ -263,7 +227,7 @@ impl ToolBindingTable {
     /// functions namespace; `collaboration` is accepted only as an equivalent
     /// projection of a Finch agent alias, never as the provider's native
     /// collaboration schema.
-    pub fn decode_wire_call(
+    pub(crate) fn decode_wire_call(
         &self,
         name: &str,
         namespace: Option<&str>,
@@ -308,7 +272,7 @@ impl ToolBindingTable {
 
 /// Why compilation or decode failed. Always fail-closed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ToolBindingError {
+pub(crate) enum ToolBindingError {
     #[error("duplicate semantic tool identity '{0}'")]
     DuplicateLocalIdentity(String),
     #[error("duplicate wire tool identity '{name}' in namespace '{namespace}'")]
@@ -341,13 +305,14 @@ pub enum ToolBindingError {
     #[error("provider-native tool '{0}' has no authority grant")]
     NativeToolWithoutGrant(String),
     #[error("cannot compile tool bindings: wire protocol is unknown")]
+    #[cfg(test)]
     UnknownWireProtocol,
     #[error("request advertised too many tools ({0}; max {MAX_ADVERTISED_TOOLS})")]
     TooManyTools(usize),
 }
 
 /// Compile semantic tools into an immutable bijective binding table.
-pub fn compile_tool_bindings(
+pub(crate) fn compile_tool_bindings(
     protocol: WireProtocol,
     provider: impl Into<String>,
     model: impl Into<String>,
@@ -430,7 +395,7 @@ pub fn compile_tool_bindings(
 }
 
 /// Compile `ToolDefinition`s plus an optional Finch policy into a table.
-pub fn compile_from_definitions(
+pub(crate) fn compile_from_definitions(
     protocol: WireProtocol,
     provider: &str,
     model: &str,
