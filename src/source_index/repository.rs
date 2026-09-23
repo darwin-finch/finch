@@ -435,9 +435,10 @@ impl RepositoryCache {
         #[cfg(unix)]
         {
             // `open_dir_nofollow` may use Linux O_PATH. That descriptor is
-            // sufficient for capability-relative traversal but fsync returns
-            // EBADF. Reopen only `.` beneath the held capability with read
-            // authority so the published rename can be durably synced.
+            // sufficient for capability-relative traversal and fstat (which is
+            // why open-time metadata checks succeed), but fsync returns EBADF.
+            // Reopen only `.` beneath the held capability with read authority
+            // so the published rename can be durably synced.
             let mut options = OpenOptions::new();
             options.read(true).follow(FollowSymlinks::No);
             return self
@@ -2090,6 +2091,63 @@ mod tests {
             published.file("notes.md").unwrap().outline.records[0].name,
             "Durable candidate"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_traversal_descriptor_is_not_fsync_able_on_linux() {
+        let root = committed_workspace();
+        let state = tempfile::tempdir().expect("state directory");
+        let indexer = indexer(root.path(), state.path());
+
+        // Mechanism pin for the Linux CI EBADF: the capability descriptor that
+        // `open_dir_nofollow` returns is O_PATH, which Linux rejects for fsync
+        // while still permitting fstat. Publication must therefore fsync a
+        // freshly reopened read-only descriptor, never this handle. If
+        // cap-std ever stops opening O_PATH here, this assertion fails and the
+        // reopen in `sync_directory` should be re-evaluated, not silently
+        // simplified away.
+        let traversal = indexer
+            .cache
+            .directory
+            .try_clone()
+            .expect("traversal descriptor clone")
+            .into_std_file();
+        let error = traversal
+            .sync_all()
+            .expect_err("fsync of the O_PATH traversal descriptor must fail on Linux");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(9),
+            "directory traversal descriptor fsync must fail with EBADF (9), got {error:?}"
+        );
+
+        // The reopened descriptor publication actually syncs must be a real,
+        // fsync-able directory descriptor, and a real publication must still
+        // succeed end to end.
+        indexer
+            .cache
+            .sync_directory()
+            .expect("reopened descriptor must be fsync-able");
+        indexer
+            .build()
+            .expect("publication with directory sync confirmation");
+    }
+
+    #[test]
+    fn publish_confirms_durability_through_a_reopened_descriptor() {
+        let root = committed_workspace();
+        let state = tempfile::tempdir().expect("state directory");
+        let indexer = indexer(root.path(), state.path());
+        indexer.build().expect("initial build");
+
+        // The descriptor publication syncs is reopened beneath the held
+        // capability rather than being the traversal handle, and it must stay
+        // fsync-able on a cache that already holds published state.
+        indexer
+            .cache
+            .sync_directory()
+            .expect("reopened descriptor must stay fsync-able after publication");
     }
 
     #[test]
