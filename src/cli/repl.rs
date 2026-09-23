@@ -1024,24 +1024,48 @@ impl Repl {
                     if config.memory.use_neural_embeddings
                         && crate::models::NeuralEmbeddingEngine::find_in_cache().is_none()
                     {
-                        let progress = global_output() as Arc<dyn crate::models::ModelProgress>;
+                        // A dedicated state, not the chat model's own
+                        // `generator_state` a few hundred lines below: that
+                        // one enum slot represents one model at a time, and
+                        // conflating the embedding download with whatever
+                        // the chat model is doing would make them fight
+                        // over it if both happened concurrently.
+                        let embedding_download_state =
+                            Arc::new(RwLock::new(GeneratorState::Initializing));
                         tokio::spawn(async move {
-                            // hf_hub's sync client has no byte-level progress
-                            // callback, so this is a single indeterminate
-                            // status-bar line rather than
-                            // `update_download_progress`'s percentage bar --
-                            // still real, live visibility in the same
-                            // DownloadProgress slot the GGUF chat model
-                            // download already uses, not just a scrollback
-                            // line.
                             let status_bar = global_status();
-                            status_bar.update_line(
-                                crate::cli::status_bar::StatusLineType::DownloadProgress,
-                                "Downloading memory embedding model...".to_string(),
-                            );
-                            let result =
-                                crate::models::NeuralEmbeddingEngine::ensure_downloaded(progress)
-                                    .await;
+                            let mut download =
+                                Box::pin(crate::models::NeuralEmbeddingEngine::ensure_downloaded(
+                                    Arc::clone(&embedding_download_state),
+                                ));
+                            // Races the download against a poll interval so
+                            // the status bar gets ManagedGgufDownloader's
+                            // real byte-level progress (it updates the
+                            // shared state every ~100ms) rather than a
+                            // single indeterminate line.
+                            let result = loop {
+                                tokio::select! {
+                                    result = &mut download => break result,
+                                    _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
+                                        if let GeneratorState::Downloading { progress, .. } =
+                                            &*embedding_download_state.read().await
+                                        {
+                                            let percentage = if progress.total_bytes == 0 {
+                                                0.0
+                                            } else {
+                                                progress.downloaded_bytes as f64
+                                                    / progress.total_bytes as f64
+                                            };
+                                            status_bar.update_download_progress(
+                                                "memory embeddings",
+                                                percentage,
+                                                progress.downloaded_bytes,
+                                                progress.total_bytes,
+                                            );
+                                        }
+                                    }
+                                }
+                            };
                             status_bar.clear_download_progress();
                             match result {
                                 Ok(_) => tracing::info!(

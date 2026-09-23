@@ -258,7 +258,7 @@ fn local_helpers_section_lines(use_neural_embeddings: bool, width: usize) -> Vec
     lines.extend(wizard_boxed("Memory", &[item], Color::Blue, width));
 
     let detail = if use_neural_embeddings {
-        "On: all-MiniLM-L6-v2 (ONNX), downloaded once from Hugging Face on \
+        "On: bge-small-en-v1.5 (GGUF, via llama.cpp), downloaded once on \
          first use, then runs locally with no further network calls. Better \
          recall quality than the fallback below."
     } else {

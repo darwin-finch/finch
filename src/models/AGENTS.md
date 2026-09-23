@@ -10,7 +10,7 @@ row have their own ownership and are not part of this facade.
 **Facade:** child modules are private, so the deliberate `pub use` list in
 [`mod.rs`](mod.rs) is the callable public surface; rustdoc supplies method signatures.
 Callers outside this directory use `crate::models::Item`; they must not name `bootstrap`,
-`download`, `loaders`, `neural_embedding`, `unified_loader`, `adapters`, or any other child.
+`gguf_download`, `loaders`, `neural_embedding`, `unified_loader`, `adapters`, or any other child.
 
 **Dependencies:** `config` (`ExecutionTarget`, `CoreMlConfig`), `memory` (`EmbeddingEngine` for
 neural embeddings), and `tools` (prompt/parser types). Production code under `src/models/**`

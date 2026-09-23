@@ -74,8 +74,8 @@ pub(super) enum SectionState {
     /// themselves (currently: memory's embedding engine). Distinct from
     /// `Models`, which configures the primary chat provider.
     LocalHelpers {
-        /// Real neural embeddings (`all-MiniLM-L6-v2`, ONNX, downloaded once
-        /// from Hugging Face on first use) vs. the built-in TF-IDF fallback,
+        /// Real neural embeddings (`bge-small-en-v1.5`, GGUF via llama.cpp,
+        /// downloaded once on first use) vs. the built-in TF-IDF fallback,
         /// which needs no download and no network access at lower recall
         /// quality. Mirrors `finch_memory::MemoryConfig::use_neural_embeddings`.
         use_neural_embeddings: bool,

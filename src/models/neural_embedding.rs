@@ -1,362 +1,175 @@
-// Neural ONNX Embedding Engine
+// Neural GGUF Embedding Engine
 //
-// Implements EmbeddingEngine using a sentence transformer (all-MiniLM-L6-v2)
-// running via ONNX Runtime for 384-dimensional semantic embeddings.
+// Implements EmbeddingEngine using bge-small-en-v1.5 running through
+// llama.cpp's embeddings mode for 384-dimensional semantic embeddings.
 //
-// Model: sentence-transformers/all-MiniLM-L6-v2 (Apache 2.0 license)
-// ONNX conversion by Xenova/HuggingFace (also Apache 2.0)
+// This is the same in-process llama.cpp backend the chat-model loader
+// (src/models/loaders/llama_cpp.rs) already uses, including its real GPU
+// offload path on macOS -- not the ONNX+CoreML path memory embeddings used
+// before, which was never confirmed to place work on the GPU for generation
+// either (the deleted onnx.rs carried an elaborate CoreML compute-plan
+// profiling apparatus that only makes sense if placement was never actually
+// confirmed).
 //
-// Distribution: downloaded from HuggingFace (Xenova/all-MiniLM-L6-v2-ONNX)
-// ~23MB quantized ONNX model; cached in standard HF cache after first download.
+// Model: CompendiumLabs/bge-small-en-v1.5-gguf, revision
+// d32f8c040ea3b516330eeb75b72bcc2d3a780ab7, bge-small-en-v1.5-q8_0.gguf.
+// BERT architecture, CLS pooling (the GGUF's own metadata declares
+// bert.pooling_type=2), 384-dim -- confirmed directly from the file's GGUF
+// header, not assumed. Q8_0 (near-lossless) rather than the chat picker's
+// Q4KM/Q5KM: quantization error is proportionally larger on a 33M-parameter
+// model, and the absolute size cost of full fidelity here is trivial
+// (~37MB). Repository, revision, size, and sha256 were verified by
+// downloading the file and running `shasum -a 256` locally, not copied
+// from an unverified source.
 
 use anyhow::{anyhow, bail, Context, Result};
 use finch_memory::{EmbeddingEngine, TfIdfEmbedding};
-use ndarray::Array2;
-use ort::{
-    memory::MemoryInfo,
-    session::{builder::GraphOptimizationLevel, Session},
-    value::Value,
-};
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use once_cell::sync::OnceCell;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokenizers::Tokenizer;
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-/// Maximum sequence length for the embedding model.
-/// all-MiniLM-L6-v2 supports up to 512 tokens; we truncate at 256 for efficiency.
-const MAX_SEQ_LEN: usize = 256;
+use super::bootstrap::GeneratorState;
+use super::gguf_download::{
+    managed_gguf_cache_path, GgufQuantization, ManagedGgufArtifact, ManagedGgufDownloader,
+};
 
-/// Output embedding dimension for all-MiniLM-L6-v2.
+/// Output embedding dimension for bge-small-en-v1.5 -- confirmed from the
+/// GGUF's own `bert.embedding_length` metadata key, not assumed.
 const EMBEDDING_DIM: usize = 384;
 
-/// Reproducible facts needed before considering a CoreML policy for embeddings.
-/// This records the current boundary without claiming performance or placement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EmbeddingProviderEvaluationFixture {
-    model_repository: &'static str,
-    current_provider: &'static str,
-    batch_size: usize,
-    sequence_length_min: usize,
-    sequence_length_max: usize,
-    embedding_dimension: usize,
-    coreml_latency_observed: Option<u64>,
-    coreml_placement_observed: Option<bool>,
+// llama.cpp permits one initialized backend per process. The chat-model
+// loader (src/models/loaders/llama_cpp.rs) owns its own static for the same
+// reason and cannot be reused here: a `LlamaBackend` is not associated with
+// one model, but each module's own `OnceCell` only needs to be initialized
+// once regardless of which module reaches it first, so two independent
+// cells both calling `LlamaBackend::init()` would violate "one per process"
+// on whichever module initializes second. Real, disclosed gap: if both the
+// chat and embedding paths end up loaded in the same process, this needs a
+// single shared backend cell instead of one per module.
+static BACKEND: OnceCell<LlamaBackend> = OnceCell::new();
+
+fn backend() -> Result<&'static LlamaBackend> {
+    BACKEND.get_or_try_init(|| LlamaBackend::init().context("initialize llama.cpp backend"))
 }
 
-const EMBEDDING_PROVIDER_EVALUATION: EmbeddingProviderEvaluationFixture =
-    EmbeddingProviderEvaluationFixture {
-        model_repository: "Xenova/all-MiniLM-L6-v2-ONNX",
-        current_provider: "CPU (no execution provider registered)",
-        batch_size: 1,
-        sequence_length_min: 1,
-        sequence_length_max: MAX_SEQ_LEN,
-        embedding_dimension: EMBEDDING_DIM,
-        coreml_latency_observed: None,
-        coreml_placement_observed: None,
-    };
+/// The one fixed managed GGUF artifact backing memory's embedding engine.
+///
+/// Not part of `managed_gguf_artifact()`'s `ModelFamily`/`ModelSize`
+/// registry: that registry is a user-facing choice among interchangeable
+/// chat models. This is a single, specific support model finch-builtin
+/// functions use for themselves, with no equivalent choice to offer.
+fn memory_embedding_gguf_artifact() -> ManagedGgufArtifact {
+    ManagedGgufArtifact {
+        repository: "CompendiumLabs/bge-small-en-v1.5-gguf".to_string(),
+        revision: "d32f8c040ea3b516330eeb75b72bcc2d3a780ab7".to_string(),
+        filename: "bge-small-en-v1.5-q8_0.gguf".to_string(),
+        quantization: GgufQuantization::Q8_0,
+        expected_size: 36_806_944,
+        sha256: "ec38e8da142596baa913124ae50550de284b6916bf59577ef2f0cb9660c2f514".to_string(),
+    }
+}
 
-/// ONNX sentence transformer embedding engine.
+/// BERT-family sentence embedding engine running through llama.cpp.
 ///
-/// Produces 384-dimensional L2-normalized embeddings via mean pooling over the
-/// model's last_hidden_state output. Semantically much richer than the TF-IDF
-/// fallback — two phrases with the same meaning score near 1.0 even if they
-/// share no words.
-///
-/// The ONNX session is wrapped in a `Mutex` because `run_binding` requires
-/// `&mut Session` while `EmbeddingEngine::embed` takes `&self`.
+/// The context is built once with embeddings mode enabled
+/// (`LlamaContextParams::with_embeddings(true)`) and reused across calls,
+/// guarded by a `Mutex` because decoding requires `&mut LlamaContext` while
+/// `EmbeddingEngine::embed` takes `&self`.
 pub struct NeuralEmbeddingEngine {
-    session: Mutex<Session>,
-    tokenizer: Tokenizer,
-    /// Whether the ONNX model expects a token_type_ids input.
-    has_token_type_ids: bool,
+    model: LlamaModel,
+    context_state: Mutex<()>,
 }
 
+// SAFETY-shaped note, not an actual unsafe impl: `LlamaContext` borrows
+// `LlamaModel` for its lifetime, which is why the context is created fresh
+// per `embed()` call under the same mutex rather than stored -- storing a
+// context alongside its owning model in one struct needs a self-referential
+// lifetime this type does not attempt.
 impl NeuralEmbeddingEngine {
-    /// Load a pre-downloaded embedding model from a directory.
-    ///
-    /// `model_dir` must contain:
-    /// - `model_quantized.onnx` (preferred) or `model.onnx`
-    /// - `tokenizer.json`
-    pub fn load(model_dir: &Path) -> Result<Self> {
-        info!("Loading neural embedding model from: {:?}", model_dir);
-
-        // Find model file
-        let model_path = {
-            let quantized = model_dir.join("model_quantized.onnx");
-            let regular = model_dir.join("model.onnx");
-            if quantized.exists() {
-                quantized
-            } else if regular.exists() {
-                regular
-            } else {
-                bail!(
-                    "Embedding model not found in {:?}. Expected model_quantized.onnx or model.onnx",
-                    model_dir
-                );
-            }
-        };
-
-        // Load tokenizer
-        let tokenizer_path = model_dir.join("tokenizer.json");
-        if !tokenizer_path.exists() {
-            bail!("Tokenizer not found: {:?}", tokenizer_path);
+    /// Load a pre-downloaded GGUF embedding model from its exact file path.
+    pub fn load(model_path: &Path) -> Result<Self> {
+        if !model_path.is_file() {
+            bail!("embedding GGUF model file does not exist: {:?}", model_path);
         }
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
+        info!("Loading GGUF embedding model from: {:?}", model_path);
 
-        // Create an ONNX Runtime session without registering an execution
-        // provider. The evaluation fixture above records this CPU default;
-        // CoreML remains unselected until separately measured.
-        let session = Session::builder()
-            .map_err(|e| anyhow!("Failed to create ONNX session builder: {e}"))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow!("Failed to set optimization level: {e}"))?
-            .with_intra_threads(2)
-            .map_err(|e| anyhow!("Failed to set thread count: {e}"))?
-            .commit_from_file(&model_path)
-            .map_err(|e| anyhow!("Failed to load ONNX model from {:?}: {e}", model_path))?;
+        let backend = backend()?;
+        let params = LlamaModelParams::default();
+        let model = LlamaModel::load_from_file(backend, model_path, &params)
+            .with_context(|| format!("load GGUF embedding model from {:?}", model_path))?;
 
-        // Check which inputs the model expects
-        let has_token_type_ids = session
-            .inputs()
-            .iter()
-            .any(|i: &ort::value::Outlet| i.name() == "token_type_ids");
-
-        info!(
-            "Neural embedding model loaded: dim={}, token_type_ids={}",
-            EMBEDDING_DIM, has_token_type_ids
-        );
+        info!("GGUF embedding model loaded: dim={}", EMBEDDING_DIM);
 
         Ok(Self {
-            session: Mutex::new(session),
-            tokenizer,
-            has_token_type_ids,
+            model,
+            context_state: Mutex::new(()),
         })
     }
 
-    /// Download the embedding model, trying Hugging Face first and falling
-    /// back to the finch mirror (below) if that fails for any reason --
-    /// this is a default, automatic download, not something the user opted
-    /// into per use, so it must not have a single point of failure on one
-    /// external host's availability.
-    ///
-    /// `progress` reports bootstrap-style status lines (`ModelProgress` has
-    /// no determinate percentage API); pass `Arc::new(SilentModelProgress)`
-    /// where nothing should be reported.
-    ///
-    /// Returns the local directory containing model and tokenizer files.
-    /// This is a blocking operation; wrap in `spawn_blocking` for async contexts.
-    pub fn download_sync(progress: &Arc<dyn super::progress::ModelProgress>) -> Result<PathBuf> {
-        match Self::download_from_huggingface(progress) {
-            Ok(dir) => Ok(dir),
-            Err(hf_error) => {
-                progress.write_progress(format!(
-                    "Hugging Face download failed ({hf_error}); trying the finch mirror"
-                ));
-                Self::download_from_mirror(progress).map_err(|mirror_error| {
-                    anyhow!(
-                        "embedding model download failed from both sources -- \
-                         Hugging Face: {hf_error}; mirror: {mirror_error}"
-                    )
-                })
-            }
-        }
-    }
-
-    fn download_from_huggingface(
-        progress: &Arc<dyn super::progress::ModelProgress>,
-    ) -> Result<PathBuf> {
-        use hf_hub::{api::sync::Api, Repo, RepoType};
-
-        info!("Downloading neural embedding model (all-MiniLM-L6-v2) from Hugging Face...");
-        progress.write_progress("Downloading memory embedding model from Hugging Face...".into());
-
-        let api = Api::new().context("Failed to create HuggingFace Hub API")?;
-        let repo = api.repo(Repo::new(
-            "Xenova/all-MiniLM-L6-v2-ONNX".to_string(),
-            RepoType::Model,
-        ));
-
-        // Download model (tries quantized first, then regular)
-        let model_path = repo
-            .get("model_quantized.onnx")
-            .or_else(|_| repo.get("model.onnx"))
-            .context(
-                "Failed to download embedding model \
-                 (tried model_quantized.onnx and model.onnx)",
-            )?;
-
-        // Download tokenizer
-        repo.get("tokenizer.json")
-            .context("Failed to download tokenizer.json")?;
-
-        let dir = model_path
-            .parent()
-            .ok_or_else(|| anyhow!("Model path has no parent directory"))?
-            .to_path_buf();
-
-        progress.write_progress("Memory embedding model downloaded.".into());
-        info!("Neural embedding model downloaded to: {:?}", dir);
-        Ok(dir)
-    }
-
-    /// Fetch the model from a GitHub Release on this repo instead of Hugging
-    /// Face, into finch's own cache dir (not an HF snapshot, so it can't
-    /// share that directory shape).
-    ///
-    /// **Not yet load-bearing**: `MIRROR_BASE_URL` names a release that does
-    /// not exist yet -- publishing it (an actual GitHub release carrying the
-    /// two real binary assets below) is a real, out-of-band action this
-    /// change cannot perform from source code. Until that release exists,
-    /// every request here 404s and `download_sync` surfaces the original
-    /// Hugging Face error rather than a mirror-specific one. The fallback
-    /// path, cache lookup, and directory layout are real and tested now, so
-    /// publishing the release is the only thing left to make it load-bearing.
-    fn download_from_mirror(progress: &Arc<dyn super::progress::ModelProgress>) -> Result<PathBuf> {
-        let dir = mirror_cache_dir()
-            .ok_or_else(|| anyhow!("could not determine home directory for the mirror cache"))?;
-        std::fs::create_dir_all(&dir).context("Failed to create finch mirror cache directory")?;
-
-        info!("Downloading neural embedding model (all-MiniLM-L6-v2) from the finch mirror...");
-        progress
-            .write_progress("Downloading memory embedding model from the finch mirror...".into());
-
-        for file in ["model_quantized.onnx", "tokenizer.json"] {
-            let url = format!("{MIRROR_BASE_URL}/{file}");
-            let response = reqwest::blocking::get(&url)
-                .and_then(reqwest::blocking::Response::error_for_status)
-                .with_context(|| format!("mirror fetch failed for {file} from {url}"))?;
-            let bytes = response
-                .bytes()
-                .with_context(|| format!("failed to read mirror response body for {file}"))?;
-            std::fs::write(dir.join(file), &bytes)
-                .with_context(|| format!("failed to write {file} to mirror cache"))?;
-        }
-
-        progress.write_progress("Memory embedding model downloaded from the finch mirror.".into());
-        info!(
-            "Neural embedding model downloaded from mirror to: {:?}",
-            dir
-        );
-        Ok(dir)
-    }
-
-    /// Async version: download model using a blocking thread pool.
-    pub async fn ensure_downloaded(
-        progress: Arc<dyn super::progress::ModelProgress>,
-    ) -> Result<PathBuf> {
-        let for_blocking = Arc::clone(&progress);
-        tokio::task::spawn_blocking(move || Self::download_sync(&for_blocking))
+    /// Download the embedding model if it is not already cached, reporting
+    /// progress through `state` the same way the chat-model GGUF downloader
+    /// does (`ManagedGgufDownloader::ensure`) -- real byte-level progress,
+    /// resumable, sha256-verified.
+    pub async fn ensure_downloaded(state: Arc<RwLock<GeneratorState>>) -> Result<PathBuf> {
+        let downloader = ManagedGgufDownloader::from_environment(None)
+            .context("build managed GGUF downloader for the memory embedding model")?;
+        let artifact = memory_embedding_gguf_artifact();
+        let cancellation = CancellationToken::new();
+        let (path, _disposition) = downloader
+            .ensure(
+                &artifact,
+                "Memory embeddings (bge-small)",
+                state,
+                &cancellation,
+            )
             .await
-            .context("Embedding model download task panicked")??;
-
-        // Re-run synchronously to get the path (spawn_blocking result already dropped)
-        // Actually, re-run is cheap since files are already cached after the above
-        Self::download_sync(&progress)
+            .context("download memory embedding model")?;
+        Ok(path)
     }
 
-    /// Try to find the model without downloading: the Hugging Face cache
-    /// first (matching a normal successful download), then the finch mirror
-    /// cache (matching a mirror-fallback download).
-    ///
-    /// Returns `None` if the model is not yet cached anywhere (i.e., first run).
+    /// Try to find the model without downloading or verifying a checksum --
+    /// a cheap, sync, filesystem-only existence check at the exact path a
+    /// verified download commits to (`ManagedGgufDownloader::ensure`'s
+    /// atomic rename never leaves a partial or unverified file at the final
+    /// path). Returns `None` if the model is not yet cached (i.e., first run).
     pub fn find_in_cache() -> Option<PathBuf> {
-        Self::find_in_huggingface_cache().or_else(Self::find_in_mirror_cache)
-    }
-
-    fn find_in_huggingface_cache() -> Option<PathBuf> {
-        // HF hub caches models under: ~/.cache/huggingface/hub/
-        let cache_base = dirs::home_dir()?
-            .join(".cache")
-            .join("huggingface")
-            .join("hub");
-        let repo_dir = cache_base.join("models--Xenova--all-MiniLM-L6-v2-ONNX");
-
-        if !repo_dir.exists() {
-            debug!("Embedding model not in Hugging Face cache: {:?}", repo_dir);
-            return None;
-        }
-
-        // Find the latest snapshot
-        let snapshots_dir = repo_dir.join("snapshots");
-        if !snapshots_dir.exists() {
-            return None;
-        }
-
-        // Walk into snapshots and find a directory that has the model file
-        let entries = std::fs::read_dir(&snapshots_dir).ok()?;
-        for entry in entries.flatten() {
-            let snapshot = entry.path();
-            if snapshot.is_dir() {
-                let has_model = snapshot.join("model_quantized.onnx").exists()
-                    || snapshot.join("model.onnx").exists();
-                let has_tokenizer = snapshot.join("tokenizer.json").exists();
-                if has_model && has_tokenizer {
-                    debug!(
-                        "Found embedding model in Hugging Face cache: {:?}",
-                        snapshot
-                    );
-                    return Some(snapshot);
-                }
-            }
-        }
-
-        None
-    }
-
-    fn find_in_mirror_cache() -> Option<PathBuf> {
-        let dir = mirror_cache_dir()?;
-        if model_dir_is_complete(&dir) {
-            debug!("Found embedding model in finch mirror cache: {:?}", dir);
-            Some(dir)
+        let path = managed_gguf_cache_path(&memory_embedding_gguf_artifact()).ok()?;
+        if path.is_file() {
+            debug!("Found embedding model in managed GGUF cache: {:?}", path);
+            Some(path)
         } else {
+            debug!("Embedding model not in managed GGUF cache: {:?}", path);
             None
         }
     }
 }
 
-/// Finch-owned cache directory for the memory embedding model, used only by
-/// the mirror fallback: a mirror download isn't a Hugging Face snapshot, so
-/// it can't share that directory shape. Matches the `~/.finch/...`
-/// convention `src/models/lora.rs`'s adapter storage already uses.
-fn mirror_cache_dir() -> Option<PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".finch")
-            .join("models")
-            .join("all-MiniLM-L6-v2"),
-    )
-}
-
-/// Whether `dir` holds both files a loadable cached model needs. Shared by
-/// the mirror cache lookup; the Hugging Face lookup has its own version of
-/// this check because it also accepts the unquantized `model.onnx` name.
-fn model_dir_is_complete(dir: &Path) -> bool {
-    dir.join("model_quantized.onnx").exists() && dir.join("tokenizer.json").exists()
-}
-
-/// See `download_from_mirror`'s doc: this release does not exist yet.
-const MIRROR_BASE_URL: &str =
-    "https://github.com/darwin-finch/finch/releases/download/embedding-model-v1";
-
 /// Select the production memory embedding engine without downloading.
 ///
-/// Composition owns this choice. `MemorySystem` constructors must not probe the
-/// HuggingFace cache or start a download.
+/// Composition owns this choice. `MemorySystem` constructors must not probe
+/// the managed GGUF cache or start a download.
 pub fn select_memory_embedding_engine(use_neural_embeddings: bool) -> Arc<dyn EmbeddingEngine> {
     if use_neural_embeddings {
         match NeuralEmbeddingEngine::find_in_cache()
-            .and_then(|dir| NeuralEmbeddingEngine::load(&dir).ok())
+            .and_then(|path| NeuralEmbeddingEngine::load(&path).ok())
         {
             Some(neural) => {
-                debug!("Using neural ONNX embeddings (all-MiniLM-L6-v2)");
+                debug!("Using neural GGUF embeddings (bge-small-en-v1.5)");
                 Arc::new(neural)
             }
             None => {
                 debug!(
-                    "Neural embedding model not in cache — using TF-IDF fallback. \
-                     Run `finch memory download` or call \
-                     NeuralEmbeddingEngine::ensure_downloaded() to download."
+                    "Embedding model not in cache — using TF-IDF fallback until \
+                     NeuralEmbeddingEngine::ensure_downloaded() completes."
                 );
                 Arc::new(TfIdfEmbedding::new())
             }
@@ -366,154 +179,73 @@ pub fn select_memory_embedding_engine(use_neural_embeddings: bool) -> Arc<dyn Em
     }
 }
 
-impl NeuralEmbeddingEngine {
-    /// Encode text into input_ids and attention_mask, truncated at MAX_SEQ_LEN.
-    fn tokenize(&self, text: &str) -> Result<(Vec<i64>, Vec<i64>)> {
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
-
-        let ids: Vec<i64> = encoding
-            .get_ids()
-            .iter()
-            .take(MAX_SEQ_LEN)
-            .map(|&id| id as i64)
-            .collect();
-
-        let mask: Vec<i64> = encoding
-            .get_attention_mask()
-            .iter()
-            .take(MAX_SEQ_LEN)
-            .map(|&m| m as i64)
-            .collect();
-
-        Ok((ids, mask))
-    }
+fn context_params() -> LlamaContextParams {
+    LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(512))
+        .with_embeddings(true)
 }
 
 impl EmbeddingEngine for NeuralEmbeddingEngine {
     fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        let (input_ids, attention_mask) = self.tokenize(text)?;
-        let seq_len = input_ids.len();
-
-        if seq_len == 0 {
+        let tokens = self
+            .model
+            .str_to_token(text, AddBos::Always)
+            .context("tokenize embedding input")?;
+        if tokens.is_empty() {
             return Ok(vec![0.0; EMBEDDING_DIM]);
         }
 
-        // Build input tensors [1, seq_len]
-        let ids_arr = Array2::from_shape_vec((1, seq_len), input_ids)
-            .context("Failed to create input_ids ndarray")?;
-        let mask_arr = Array2::from_shape_vec((1, seq_len), attention_mask.clone())
-            .context("Failed to create attention_mask ndarray")?;
-
-        let ids_val = Value::from_array(ids_arr)
-            .context("Failed to create input_ids Value")?
-            .into_dyn();
-        let mask_val = Value::from_array(mask_arr)
-            .context("Failed to create attention_mask Value")?
-            .into_dyn();
-
-        // Acquire session lock (Mutex needed because run_binding requires &mut Session)
-        let mut session = self
-            .session
+        // The mutex is held for the whole decode+extract, not just context
+        // creation: `LlamaContext` borrows `self.model`, so it cannot
+        // outlive this guard anyway, and holding it the whole time keeps
+        // "one embed() in flight at a time" honest rather than implicit.
+        let _guard = self
+            .context_state
             .lock()
-            .map_err(|_| anyhow!("ONNX session mutex poisoned"))?;
+            .map_err(|_| anyhow!("embedding context mutex poisoned"))?;
 
-        // Build IoBinding
-        let mut binding = session
-            .create_binding()
-            .context("Failed to create IoBinding")?;
+        let backend = backend()?;
+        let mut context = self
+            .model
+            .new_context(backend, context_params())
+            .context("create llama.cpp embedding context")?;
 
-        binding
-            .bind_input("input_ids", &ids_val)
-            .context("Failed to bind input_ids")?;
-        binding
-            .bind_input("attention_mask", &mask_val)
-            .context("Failed to bind attention_mask")?;
-
-        // Some ONNX exports require token_type_ids (all zeros for single sentence)
-        let tti_val_holder;
-        if self.has_token_type_ids {
-            let tti_data = vec![0i64; seq_len];
-            let tti_arr = Array2::from_shape_vec((1, seq_len), tti_data)
-                .context("Failed to create token_type_ids ndarray")?;
-            tti_val_holder = Value::from_array(tti_arr)
-                .context("Failed to create token_type_ids Value")?
-                .into_dyn();
-            binding
-                .bind_input("token_type_ids", &tti_val_holder)
-                .context("Failed to bind token_type_ids")?;
+        let mut batch = LlamaBatch::new(tokens.len(), 1);
+        for (index, token) in tokens.iter().copied().enumerate() {
+            // Every token, not just the last: embedding extraction pools
+            // over the whole sequence's hidden states (the GGUF's own
+            // `bert.pooling_type=2` makes llama.cpp do this internally), so
+            // every position needs to actually run, unlike next-token
+            // generation where only the final position's logits matter.
+            batch
+                .add(token, index as i32, &[0], true)
+                .context("build embedding batch")?;
         }
+        context
+            .decode(&mut batch)
+            .context("decode embedding input")?;
 
-        // Bind last_hidden_state output
-        let mem_info = MemoryInfo::default();
-        binding
-            .bind_output_to_device("last_hidden_state", &mem_info)
-            .context("Failed to bind last_hidden_state output")?;
-
-        // Also bind any other outputs the model has (prevents IoBinding errors
-        // on models that require all outputs to be bound)
-        for out in session.outputs().iter() {
-            if out.name() != "last_hidden_state" {
-                let _ = binding.bind_output_to_device(out.name(), &mem_info);
-            }
-        }
-
-        // Run inference
-        let outputs = session
-            .run_binding(&binding)
-            .context("ONNX inference failed")?;
-
-        let lhs = outputs
-            .get("last_hidden_state")
-            .ok_or_else(|| anyhow!("Missing last_hidden_state in model outputs"))?;
-
-        // Shape: [1, seq_len, EMBEDDING_DIM]
-        let (shape, data) = lhs
-            .try_extract_tensor::<f32>()
-            .context("Failed to extract last_hidden_state tensor")?;
-
-        if shape.len() != 3 {
+        let raw = context
+            .embeddings_seq_ith(0)
+            .context("extract pooled embedding")?;
+        if raw.len() != EMBEDDING_DIM {
             bail!(
-                "Expected 3D last_hidden_state tensor, got shape {:?}",
-                shape
+                "embedding model returned {} dims, expected {EMBEDDING_DIM}",
+                raw.len()
             );
         }
-        let hidden_dim = shape[2] as usize;
-        let actual_seq = shape[1] as usize;
 
-        // Mean pool over sequence dimension, weighted by attention_mask
-        let mut pooled = vec![0.0f32; hidden_dim];
-        let mut count = 0.0f32;
-        for (i, &mask) in attention_mask
-            .iter()
-            .enumerate()
-            .take(actual_seq.min(attention_mask.len()))
-        {
-            if mask == 1 {
-                count += 1.0;
-                let offset = i * hidden_dim;
-                for j in 0..hidden_dim {
-                    pooled[j] += data[offset + j];
-                }
-            }
-        }
-        if count > 0.0 {
-            for v in &mut pooled {
-                *v /= count;
-            }
-        }
-
-        // L2 normalize
-        let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // L2 normalize -- bge-small-en-v1.5 is documented and used with
+        // normalized embeddings for cosine similarity, matching what the
+        // ONNX path this replaces also did.
+        let mut embedding = raw.to_vec();
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
-            for v in &mut pooled {
+            for v in &mut embedding {
                 *v /= norm;
             }
         }
-
-        Ok(pooled)
+        Ok(embedding)
     }
 
     fn dimension(&self) -> usize {
@@ -542,136 +274,83 @@ mod tests {
     }
 
     #[test]
-    fn test_mirror_cache_dir_is_finch_owned_not_the_huggingface_cache() {
-        let dir = mirror_cache_dir().expect("home dir must resolve on a test machine");
-        assert!(
-            dir.ends_with(std::path::Path::new(".finch/models/all-MiniLM-L6-v2")),
-            "mirror downloads must not land in the HF cache (a different \
-             directory shape -- no snapshots/commit-hash layer), got {dir:?}"
-        );
-    }
-
-    #[test]
-    fn test_model_dir_is_complete_requires_both_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert!(
-            !model_dir_is_complete(dir.path()),
-            "an empty directory must not read as a complete cached model"
-        );
-
-        std::fs::write(dir.path().join("model_quantized.onnx"), b"stub").unwrap();
-        assert!(
-            !model_dir_is_complete(dir.path()),
-            "the model file alone, without the tokenizer, must not read as complete"
-        );
-
-        std::fs::write(dir.path().join("tokenizer.json"), b"stub").unwrap();
-        assert!(
-            model_dir_is_complete(dir.path()),
-            "both files present must read as a complete cached model"
-        );
-    }
-
-    #[test]
-    fn test_find_in_mirror_cache_needs_both_files_present() {
-        // `find_in_mirror_cache` itself always reads the real
-        // `mirror_cache_dir()`, which this test cannot redirect without
-        // touching the real home directory -- so this pins the shared
-        // completeness check it actually depends on
-        // (`test_model_dir_is_complete_requires_both_files`) and, here,
-        // only that the lookup itself never panics when the directory is
-        // absent, matching this file's existing
-        // `test_find_in_cache_returns_none_when_absent` convention for
-        // filesystem-dependent cache probes.
-        let _ = NeuralEmbeddingEngine::find_in_mirror_cache();
-    }
-
-    #[test]
-    fn test_max_seq_len_constant() {
-        assert_eq!(MAX_SEQ_LEN, 256);
-    }
-
-    #[test]
-    fn test_embedding_provider_evaluation_records_unmeasured_coreml_candidate() {
-        let fixture = EMBEDDING_PROVIDER_EVALUATION;
+    fn test_memory_embedding_artifact_matches_independently_verified_values() {
+        let artifact = memory_embedding_gguf_artifact();
+        assert_eq!(artifact.repository, "CompendiumLabs/bge-small-en-v1.5-gguf");
+        assert_eq!(artifact.revision.len(), 40, "must be a full commit sha");
+        assert_eq!(artifact.filename, "bge-small-en-v1.5-q8_0.gguf");
+        assert_eq!(artifact.expected_size, 36_806_944);
         assert_eq!(
-            fixture.current_provider,
-            "CPU (no execution provider registered)"
+            artifact.sha256,
+            "ec38e8da142596baa913124ae50550de284b6916bf59577ef2f0cb9660c2f514"
         );
-        assert_eq!(fixture.batch_size, 1);
-        assert_eq!(
-            (fixture.sequence_length_min, fixture.sequence_length_max),
-            (1, 256)
+        assert_eq!(artifact.sha256.len(), 64, "sha256 must be 64 hex chars");
+        artifact
+            .validate()
+            .expect("artifact must pass its own validation");
+    }
+
+    #[test]
+    fn test_managed_gguf_cache_path_is_under_the_finch_gguf_cache() {
+        let path = managed_gguf_cache_path(&memory_embedding_gguf_artifact())
+            .expect("cache dir must resolve on a test machine");
+        assert!(
+            path.ends_with(std::path::Path::new(
+                "finch/gguf/CompendiumLabs--bge-small-en-v1.5-gguf/\
+                 d32f8c040ea3b516330eeb75b72bcc2d3a780ab7/bge-small-en-v1.5-q8_0.gguf"
+            )),
+            "got {path:?}"
         );
-        assert_eq!(fixture.embedding_dimension, 384);
-        assert_eq!(fixture.coreml_latency_observed, None);
-        assert_eq!(fixture.coreml_placement_observed, None);
-        assert_eq!(fixture.model_repository, "Xenova/all-MiniLM-L6-v2-ONNX");
     }
 
     /// Verify that find_in_cache does not panic and returns None when absent.
     #[test]
     fn test_find_in_cache_returns_none_when_absent() {
-        // This test is expected to return None in CI (no HF cache pre-seeded).
-        // It should never panic.
+        // This test is expected to return None in CI (nothing pre-seeded in
+        // the managed GGUF cache). It should never panic.
         let _result = NeuralEmbeddingEngine::find_in_cache();
-        // Just checking it doesn't panic
     }
 
-    /// Full load + inference requires the actual model files; mark as #[ignore]
-    /// so it runs only on developer machines with the model cached.
+    /// Full load + inference requires the actual model file; mark as
+    /// `#[ignore]` so it runs only on developer machines with the model
+    /// downloaded (set `FINCH_TEST_EMBEDDING_GGUF` to its path).
     #[test]
     #[ignore]
     fn test_neural_embed_dimensions() {
-        if let Some(model_dir) = NeuralEmbeddingEngine::find_in_cache() {
-            let engine = NeuralEmbeddingEngine::load(&model_dir).expect("Should load from cache");
-            assert_eq!(engine.dimension(), 384);
+        let Ok(path) = std::env::var("FINCH_TEST_EMBEDDING_GGUF") else {
+            return;
+        };
+        let engine = NeuralEmbeddingEngine::load(Path::new(&path)).expect("load from path");
+        assert_eq!(engine.dimension(), 384);
 
-            let emb = engine.embed("Hello world").unwrap();
-            assert_eq!(emb.len(), 384);
+        let emb = engine.embed("Hello world").unwrap();
+        assert_eq!(emb.len(), 384);
 
-            // Unit vector check
-            let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!(
-                (norm - 1.0).abs() < 0.01,
-                "Should be unit vector, norm={}",
-                norm
-            );
-        }
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "should be unit vector, norm={norm}"
+        );
     }
 
     #[test]
     #[ignore]
     fn test_neural_embed_semantic_similarity() {
-        if let Some(model_dir) = NeuralEmbeddingEngine::find_in_cache() {
-            let engine = NeuralEmbeddingEngine::load(&model_dir).unwrap();
+        let Ok(path) = std::env::var("FINCH_TEST_EMBEDDING_GGUF") else {
+            return;
+        };
+        let engine = NeuralEmbeddingEngine::load(Path::new(&path)).unwrap();
 
-            let e1 = engine.embed("Rust programming language").unwrap();
-            let e2 = engine.embed("Rust systems programming").unwrap();
-            let e3 = engine.embed("Python machine learning").unwrap();
+        let e1 = engine.embed("Rust programming language").unwrap();
+        let e2 = engine.embed("Rust systems programming").unwrap();
+        let e3 = engine.embed("Python machine learning").unwrap();
 
-            let sim_related = finch_memory::cosine_similarity(&e1, &e2);
-            let sim_unrelated = finch_memory::cosine_similarity(&e1, &e3);
+        let sim_related = finch_memory::cosine_similarity(&e1, &e2);
+        let sim_unrelated = finch_memory::cosine_similarity(&e1, &e3);
 
-            assert!(
-                sim_related > sim_unrelated,
-                "Related texts (sim={:.3}) should outscore unrelated (sim={:.3})",
-                sim_related,
-                sim_unrelated
-            );
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_neural_embed_empty_text() {
-        if let Some(model_dir) = NeuralEmbeddingEngine::find_in_cache() {
-            let engine = NeuralEmbeddingEngine::load(&model_dir).unwrap();
-            let emb = engine.embed("").unwrap();
-            assert_eq!(emb.len(), 384);
-            // Empty text → zero vector (no tokens to pool)
-            let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert_eq!(norm, 0.0, "Empty text should produce zero vector");
-        }
+        assert!(
+            sim_related > sim_unrelated,
+            "related texts (sim={sim_related:.3}) should outscore unrelated (sim={sim_unrelated:.3})"
+        );
     }
 }
