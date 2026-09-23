@@ -3937,10 +3937,6 @@ impl TuiRenderer {
         // Full-width horizontal rule used to separate sections.
         let rule = "─".repeat(box_width);
 
-        // Top rule
-        execute!(out, Print(&rule), Print("\r\n"))?;
-        rows += 1;
-
         // Title
         for line in wrap_text(&dialog.title, inner) {
             print_dialog_line(out, &line, None, false)?;
@@ -9590,7 +9586,6 @@ mod tests {
                 let rule = "─".repeat(width);
                 let mut expected = vec![
                     "──  ~/repos/finch  jade-river ──".to_string(),
-                    rule.clone(),
                     format!("  {title}"),
                     rule.clone(),
                     "    ☐ Keep".to_string(),
@@ -11011,8 +11006,9 @@ mod draw_dialog_tests {
     #[test]
     fn test_dialog_is_borderless_and_full_width() {
         // Regression: dialogs/prompts must span the full terminal width with no
-        // left/right borders. The top and bottom lines are full-width horizontal
-        // rules; no rendered line may contain a vertical border char.
+        // left/right borders. Dialogs render directly after the session divider
+        // (which provides the top boundary), so the bottom line is a full-width
+        // horizontal rule; no rendered line may contain a vertical border char.
         let dialog = Dialog::select(
             "Pick one",
             vec![DialogOption::new("Alpha"), DialogOption::new("Beta")],
@@ -11020,18 +11016,18 @@ mod draw_dialog_tests {
         let lines = render_lines(&dialog);
         assert!(!lines.is_empty());
 
-        // First line is a full-width rule of exactly box_width `─` chars.
-        let first = strip_ansi(&lines[0]);
+        // Last line is a full-width rule of exactly box_width `─` chars.
+        let last = strip_ansi(&lines[lines.len() - 1]);
         assert_eq!(
-            first.chars().count(),
+            last.chars().count(),
             72,
-            "top rule must span the full width (72): {:?}",
-            first
+            "bottom rule must span the full width (72): {:?}",
+            last
         );
         assert!(
-            first.chars().all(|c| c == '─'),
-            "top line must be a pure horizontal rule, got: {:?}",
-            first
+            last.chars().all(|c| c == '─'),
+            "bottom line must be a pure horizontal rule, got: {:?}",
+            last
         );
 
         // No line may contain a vertical border character.
