@@ -6973,6 +6973,90 @@ async fn test_auto_accept_tool_presenter_approves_once_without_dialog() {
         .await;
 }
 
+/// Regression for #899: three tool-approval requests land in
+/// `pending_approvals` for three different query_ids (a subagent's own tool
+/// approval racing the parent turn's is the real-world shape). Only the
+/// third dialog shown is what the user can actually see and answer; the
+/// answer must resolve exactly that query_id, not an arbitrary HashMap
+/// entry, and the other two must remain pending rather than being silently
+/// dropped or wrongly resolved.
+#[tokio::test]
+async fn test_dialog_result_resolves_the_actually_shown_tool_approval_not_an_arbitrary_one() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+            // Default mode is Normal -- real dialogs, no AutoAccept short-circuit.
+
+            let mut receivers = Vec::new();
+            for name in ["read", "glob", "grep"] {
+                let query_id = uuid::Uuid::new_v4();
+                let tool_use = crate::tools::ToolUse::new(name.to_string(), serde_json::json!({}));
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                event_loop
+                    .handle_tool_approval_request(query_id, tool_use, Vec::new(), response_tx)
+                    .await
+                    .expect("tool approval request must be accepted");
+                receivers.push((query_id, response_rx));
+            }
+
+            assert_eq!(
+                event_loop.pending_approvals.read().await.len(),
+                3,
+                "all three approval requests must remain pending until answered"
+            );
+            let (last_query_id, _) = receivers[2];
+            assert_eq!(
+                event_loop.active_tool_approval,
+                Some(last_query_id),
+                "the most recently shown dialog's query_id must be tracked as active"
+            );
+
+            // The user answers the dialog they can actually see (index 0 == "Yes").
+            event_loop
+                .resolve_dialog_result(crate::cli::tui::DialogResult::Selected(0))
+                .await
+                .expect("resolving the dialog result must succeed");
+
+            for (i, (query_id, mut response_rx)) in receivers.into_iter().enumerate() {
+                if i == 2 {
+                    let confirmation = response_rx.await.expect(
+                        "the query_id whose dialog was actually shown must receive the answer",
+                    );
+                    assert!(
+                        matches!(
+                            confirmation,
+                            crate::cli::repl_event::events::ConfirmationResult::ApproveOnce
+                        ),
+                        "expected ApproveOnce for the answered dialog; got {confirmation:?}"
+                    );
+                    assert!(
+                        !event_loop
+                            .pending_approvals
+                            .read()
+                            .await
+                            .contains_key(&query_id),
+                        "the answered approval must be removed from pending_approvals"
+                    );
+                } else {
+                    assert!(
+                        response_rx.try_recv().is_err(),
+                        "query {query_id} was never shown its dialog and must not have been \
+                         resolved by an answer meant for a different approval (#899)"
+                    );
+                    assert!(
+                        event_loop
+                            .pending_approvals
+                            .read()
+                            .await
+                            .contains_key(&query_id),
+                        "an unanswered approval must remain pending, not be silently dropped"
+                    );
+                }
+            }
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn test_auto_accept_does_not_waive_permission_deny() {
     use crate::cli::repl::ReplMode;

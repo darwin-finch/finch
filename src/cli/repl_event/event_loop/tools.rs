@@ -494,6 +494,14 @@ impl EventLoop {
         }
         drop(tui);
 
+        // Record which query's dialog is now on screen so the DialogResult
+        // handler resolves exactly this entry, not an arbitrary pending one
+        // (#899). A second concurrent request overwrites both this and
+        // `tui.active_dialog` together, keeping them in sync; the entry it
+        // displaces stays queued in `pending_approvals` until something
+        // re-shows it.
+        self.active_tool_approval = Some(query_id);
+
         // Store the response channel and tool_use for when dialog completes
         // We'll check pending_dialog_result in the event loop and send the response then
         self.pending_approvals.write().await.insert(
