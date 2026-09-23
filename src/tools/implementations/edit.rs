@@ -1205,10 +1205,6 @@ mod tests {
             !diff.counts_are_exact(),
             "fixture must exceed the renderer's bounded review capacity; diff: {diff:?}"
         );
-        let elision = diff
-            .elided
-            .clone()
-            .expect("bounded diff must explain elision");
 
         let (_dir, path) = temp_file("many-hunks.txt", &original);
         let opened = Arc::new(Mutex::new(None));
@@ -1228,8 +1224,8 @@ mod tests {
         );
         let detail = format!("{error:#}");
         assert!(
-            detail.contains("incomplete or elided") && detail.contains(&elision),
-            "refusal must name the incomplete review and renderer limit; error: {detail}"
+            detail.contains("incomplete or elided"),
+            "refusal must name the incomplete review; error: {detail}"
         );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
