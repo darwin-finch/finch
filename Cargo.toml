@@ -136,6 +136,7 @@ toml = "0.8"
 # Error handling
 anyhow = "1.0"
 cap-std = "4.0"
+cap-fs-ext = "4.0"
 thiserror = "1.0"
 
 # Clipboard access (for image paste support)

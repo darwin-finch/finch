@@ -6,9 +6,15 @@
 
 mod identity;
 mod outline;
+mod repository;
 
 pub use identity::{SourceIdentity, SourceResolver};
 pub use outline::{
     OutlineRecord, OutlineResult, RetrievalMethod, RetrievalProvenance, RetrievalProvenanceClass,
     SourceExcerpt, SourceSpan,
+};
+pub use repository::{
+    AgentLead, DirectoryChild, DirectoryChildKind, DirectoryRecord, IndexedOutline,
+    RepositoryBuild, RepositoryBuildStats, RepositoryCache, RepositoryIndexError,
+    RepositoryIndexer, RepositorySnapshot,
 };
