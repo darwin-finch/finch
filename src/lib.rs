@@ -107,6 +107,7 @@ pub mod samples; // Sample spreadsheet generator (finch samples)
 pub mod scheduler; // Child-agent orchestration: chooses providers and models, runs tasks
 pub mod server; // HTTP daemon mode (Phase 1)
 pub mod service; // Service discovery (Phase 3)
+pub mod source_index; // Bounded, revision-aware source outlines and retrieval envelopes
 pub mod startup; // Startup phase timing: #364, instrument and reduce
                  // interactive TUI time-to-ready
 pub mod theme; // Colour scheme and semantic bands: what a renderer needs, with no config format

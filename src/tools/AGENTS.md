@@ -37,7 +37,9 @@ carry zero `crate::` imports (the former knot metric).
 may depend on any composition-root subsystem, and each of those may import `tools` back — that
 reverse edge is why implementations stay here. The shared surface they implement
 (`finch-tools-api`) depends on nothing in the root crate; add no new dependency from the API
-crate to any `src/` subsystem, and add no new authority surface outside it.
+crate to any `src/` subsystem, and add no new authority surface outside it. `code_outline` is a
+thin adapter over the one-way `tools -> source_index` dependency: source identity, parsing,
+provenance, and stale-result semantics remain owned by that capsule.
 
 **Permissions are authority.** Peer and constitutional rules — defined in the
 `finch-tools-api` crate, re-exported here — are invariants, not defaults to relax. Facade changes
@@ -54,6 +56,9 @@ before Allow, peer silent-allow, or pattern match. Escape is one-shot AskUser; a
 pattern can never satisfy it. `invocation_runs_autonomously` is the auto-approve
 predicate so WorkspaceRead cannot skip the escape dialog. `PathSlot::WorkspaceContained`
 means “any path under the workspace root”, not “any string”. Bash has no path slot.
+`code_outline.path` is a discrete path slot and receives the same containment decision as
+`read.file_path`; `ToolExecutor::new` rejects any path-bound tool whose declared execution root
+differs from the permission root, and the implementation capability-opens beneath that same root.
 `test_dotdot_escape_is_ask_user_not_allow`, `test_symlink_escape_is_ask_user_live_and_dangling`,
 `test_escaped_path_is_not_pattern_admissible_through_approval_path`, and
 `test_star_pattern_does_not_match_escaped_path` pin this.

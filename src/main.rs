@@ -2206,14 +2206,19 @@ async fn build_query_tool_executor(
     Arc<finch::runtime::ProgramRuntime>,
 )> {
     use finch::tools::{
-        BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
+        BashTool, CodeOutlineTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool,
+        WriteTool,
     };
     use finch::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 
     let mut registry = ToolRegistry::new();
+    let tool_workspace_root = finch::tools::resolve_workspace_root(
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    );
     registry.register(Box::new(ReadTool));
     registry.register(Box::new(GlobTool));
     registry.register(Box::new(GrepTool));
+    registry.register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
     registry.register(Box::new(WebFetchTool::new()));
     registry.register(Box::new(BashTool));
     registry.register(Box::new(EditTool));
@@ -2224,7 +2229,9 @@ async fn build_query_tool_executor(
     register_query_vm_tools(&mut registry, Arc::clone(&program_runtime));
 
     // Auto-approve everything in non-interactive mode
-    let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
+    let permissions = PermissionManager::new()
+        .with_workspace_root(tool_workspace_root)
+        .with_default_rule(PermissionRule::Allow);
     let patterns_path = dirs::home_dir()
         .map(|h| h.join(".finch").join("tool_patterns.json"))
         .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json"));

@@ -240,6 +240,17 @@ impl ToolExecutor {
         permissions: PermissionManager,
         patterns_path: PathBuf,
     ) -> Result<Self> {
+        for tool in registry.get_all_tools() {
+            if let Some(tool_root) = tool.workspace_root() {
+                anyhow::ensure!(
+                    tool_root == permissions.workspace_root(),
+                    "tool '{}' workspace root {} differs from permission root {}",
+                    tool.name(),
+                    tool_root.display(),
+                    permissions.workspace_root().display()
+                );
+            }
+        }
         Ok(Self {
             registry,
             permissions,
