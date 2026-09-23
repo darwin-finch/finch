@@ -375,12 +375,12 @@ impl StatusBar {
         let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(empty));
 
         let content = format!(
-            "Downloading {}: {} {:.0}% ({:.1}GB/{:.1}GB)",
+            "Downloading {}: {} {:.1}% ({}/{})",
             model_name,
             bar,
             percentage * 100.0,
-            downloaded as f64 / 1_000_000_000.0,
-            total as f64 / 1_000_000_000.0
+            format_download_bytes(downloaded),
+            format_download_bytes(total)
         );
 
         self.update_line(StatusLineType::DownloadProgress, content);
@@ -487,6 +487,14 @@ impl StatusBar {
                 usage.reported_attempts, usage.started_attempts
             ),
         );
+    }
+}
+
+fn format_download_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1}GB", bytes as f64 / 1_000_000_000.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / 1_000_000.0)
     }
 }
 
@@ -848,9 +856,20 @@ mod tests {
         let lines = status.get_lines();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].content.contains("Downloading Qwen-2.5-3B"));
-        assert!(lines[0].content.contains("80%"));
+        assert!(lines[0].content.contains("80.0%"));
         assert!(lines[0].content.contains("2.1GB"));
         assert!(lines[0].content.contains("2.6GB"));
+    }
+
+    #[test]
+    fn test_download_progress_keeps_early_bytes_visible() {
+        let status = StatusBar::new();
+
+        status.update_download_progress("Qwen-2.5-3B", 0.014, 30_277_128, 2_104_932_768);
+
+        let content = &status.get_lines()[0].content;
+        assert!(content.contains("1.4%"), "content={content:?}");
+        assert!(content.contains("30.3MB/2.1GB"), "content={content:?}");
     }
 
     #[test]
