@@ -117,6 +117,7 @@ struct RouteAttempt {
 }
 
 /// Routes a question to a bounded set of exact source spans without returning bodies.
+#[derive(Clone)]
 pub struct CodeHopTool {
     workspace_root: PathBuf,
     state_directory: PathBuf,
@@ -168,8 +169,8 @@ impl CodeHopTool {
     ) -> Result<(SourceResolver, RepositorySnapshot)> {
         let deadline = std::time::Instant::now() + INDEX_WORK_TIMEOUT;
         let resolver = SourceResolver::new(&workspace_root)?;
-        let cache = RepositoryCache::prepare(&state_directory, &resolver)?;
-        let cached = match cache.load() {
+        let cache = RepositoryCache::prepare_bounded(&state_directory, &resolver, deadline)?;
+        let cached = match cache.load_with_deadline(deadline) {
             Ok(cached) => cached,
             Err(RepositoryIndexError::IncompatibleCache { .. }) => {
                 let indexer = RepositoryIndexer::new(resolver, cache)?;
@@ -204,7 +205,7 @@ impl CodeHopTool {
     async fn execute_query(&self, query: &str) -> Result<CodeHopResult> {
         for attempt in 0..2 {
             let (resolver, snapshot) = self.snapshot(attempt == 1).await?;
-            let routed = self.route(query, &resolver, &snapshot).await?;
+            let routed = self.route_off_thread(query.to_string(), snapshot).await?;
             let mut stale = false;
             for (source, span) in &routed.selected {
                 if resolver.read_span(source, span).is_err() {
@@ -217,6 +218,22 @@ impl CodeHopTool {
             }
         }
         bail!("source generation changed during both code_hop routing attempts")
+    }
+
+    async fn route_off_thread(
+        &self,
+        query: String,
+        snapshot: RepositorySnapshot,
+    ) -> Result<RouteAttempt> {
+        let tool = self.clone();
+        let workspace_root = self.workspace_root.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let resolver = SourceResolver::new(workspace_root)?;
+            runtime.block_on(tool.route(&query, &resolver, &snapshot))
+        })
+        .await
+        .context("code_hop routing worker failed")?
     }
 
     async fn route(
@@ -434,24 +451,6 @@ impl CodeHopTool {
             .take(MAX_DISAMBIGUATION_CANDIDATES)
             .cloned()
             .collect::<Vec<_>>();
-        let request = DisambiguationRequest {
-            query: query.to_string(),
-            candidates: offered
-                .iter()
-                .map(|candidate| DisambiguationCandidate {
-                    id: candidate.id.clone(),
-                    name: candidate.name.clone(),
-                    kind: candidate.kind.clone(),
-                    lead: candidate.lead.clone(),
-                })
-                .collect(),
-        };
-        let request_bytes = serde_json::to_vec(&request)?;
-        if request_bytes.len() > MAX_DISAMBIGUATION_BYTES {
-            bail!("code_hop sibling payload exceeds {MAX_DISAMBIGUATION_BYTES} bytes")
-        }
-        metrics.disambiguation_input_bytes += request_bytes.len();
-        metrics.routing_context_bytes += request_bytes.len();
         let confident = offered.len() == 1
             || (offered[0].score >= CONFIDENT_SCORE_FLOOR
                 && offered[0].score - offered[1].score >= CONFIDENT_MARGIN);
@@ -464,9 +463,27 @@ impl CodeHopTool {
         }
 
         if let Some(disambiguator) = &self.disambiguator {
+            let request = DisambiguationRequest {
+                query: query.to_string(),
+                candidates: offered
+                    .iter()
+                    .map(|candidate| DisambiguationCandidate {
+                        id: candidate.id.clone(),
+                        name: candidate.name.clone(),
+                        kind: candidate.kind.clone(),
+                        lead: candidate.lead.clone(),
+                    })
+                    .collect(),
+            };
+            let request_bytes = serde_json::to_vec(&request)?;
+            if request_bytes.len() > MAX_DISAMBIGUATION_BYTES {
+                bail!("code_hop sibling payload exceeds {MAX_DISAMBIGUATION_BYTES} bytes")
+            }
             if metrics.disambiguation_calls >= MAX_DISAMBIGUATION_CALLS {
                 bail!("code_hop exceeded {MAX_DISAMBIGUATION_CALLS} disambiguation calls")
             }
+            metrics.disambiguation_input_bytes += request_bytes.len();
+            metrics.routing_context_bytes += request_bytes.len();
             metrics.disambiguation_calls += 1;
             #[cfg(not(test))]
             let timeout = DISAMBIGUATION_TIMEOUT;
@@ -1188,6 +1205,18 @@ mod tests {
         }
     }
 
+    fn file_list_pick<'a>(snapshot: &'a RepositorySnapshot, query: &str) -> Option<&'a str> {
+        snapshot
+            .files
+            .iter()
+            .map(|file| file.outline.source.path.as_str())
+            .max_by(|left, right| {
+                lexical_score(query, left)
+                    .total_cmp(&lexical_score(query, right))
+                    .then_with(|| right.as_bytes().cmp(left.as_bytes()))
+            })
+    }
+
     fn file_list_baseline(snapshot: &RepositorySnapshot) -> BaselineMetrics {
         let context_bytes = serde_json::to_vec(
             &snapshot
@@ -1198,11 +1227,16 @@ mod tests {
         )
         .expect("file-list JSON")
         .len();
+        let task_success =
+            file_list_pick(snapshot, "where does claim admission live?") == Some("src/claim.rs");
+        let unsupported_language_success =
+            file_list_pick(snapshot, "where are unusual widgets calibrated?")
+                == Some("fallback.txt");
         BaselineMetrics {
-            task_success: false,
+            task_success,
             context_bytes,
             files_read: 0,
-            unsupported_language_success: false,
+            unsupported_language_success,
         }
     }
 
@@ -1514,8 +1548,15 @@ mod tests {
         assert!(naive.unsupported_language_success);
         assert_eq!(naive.files_read, snapshot.files.len());
         assert!(naive.context_bytes > 0);
-        assert!(!file_list.task_success);
-        assert!(!file_list.unsupported_language_success);
+        assert_eq!(
+            file_list.task_success,
+            file_list_pick(&snapshot, "where does claim admission live?") == Some("src/claim.rs")
+        );
+        assert_eq!(
+            file_list.unsupported_language_success,
+            file_list_pick(&snapshot, "where are unusual widgets calibrated?")
+                == Some("fallback.txt")
+        );
         assert_eq!(file_list.files_read, 0);
         assert!(file_list.context_bytes > 0);
         assert!(unsupported
@@ -1651,6 +1692,8 @@ mod tests {
             "warnings: {:?}",
             result.warnings
         );
+        assert_eq!(result.metrics.disambiguation_calls, 0);
+        assert_eq!(result.metrics.disambiguation_input_bytes, 0);
     }
 
     #[tokio::test]

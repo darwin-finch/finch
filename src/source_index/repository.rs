@@ -178,7 +178,22 @@ impl RepositoryCache {
         state_directory: impl AsRef<Path>,
         resolver: &SourceResolver,
     ) -> IndexResult<Self> {
-        let state_directory = state_directory.as_ref();
+        Self::prepare_inner(state_directory.as_ref(), resolver, None)
+    }
+
+    pub(crate) fn prepare_bounded(
+        state_directory: impl AsRef<Path>,
+        resolver: &SourceResolver,
+        deadline: Instant,
+    ) -> IndexResult<Self> {
+        Self::prepare_inner(state_directory.as_ref(), resolver, Some(deadline))
+    }
+
+    fn prepare_inner(
+        state_directory: &Path,
+        resolver: &SourceResolver,
+        deadline: Option<Instant>,
+    ) -> IndexResult<Self> {
         let leaf = state_directory.file_name().context(
             "source-index state path must name a directory rather than a filesystem root",
         )?;
@@ -241,8 +256,7 @@ impl RepositoryCache {
         }
         let cache = Self::open(state_directory, resolver)?;
         let state_lock = cache.open_named_lock(STATE_LOCK_LEAF, "source-index state lock")?;
-        FileExt::lock_exclusive(&state_lock)
-            .context("failed to take source-index state quota lock")?;
+        lock_exclusive_bounded(&state_lock, deadline, "source-index state quota lock")?;
         cache.ensure_state_quota()?;
         FileExt::unlock(&state_lock).context("failed to release source-index state quota lock")?;
         Ok(cache)
@@ -299,8 +313,19 @@ impl RepositoryCache {
 
     /// Read the last complete compatible snapshot, if one exists.
     pub fn load(&self) -> IndexResult<Option<RepositorySnapshot>> {
+        self.load_bounded(None)
+    }
+
+    pub(crate) fn load_with_deadline(
+        &self,
+        deadline: Instant,
+    ) -> IndexResult<Option<RepositorySnapshot>> {
+        self.load_bounded(Some(deadline))
+    }
+
+    fn load_bounded(&self, deadline: Option<Instant>) -> IndexResult<Option<RepositorySnapshot>> {
         let lock = self.open_lock()?;
-        FileExt::lock_shared(&lock).context("failed to take source-index read lock")?;
+        lock_shared_bounded(&lock, deadline, "source-index read lock")?;
         let image = self.read_image()?;
         FileExt::unlock(&lock).context("failed to release source-index read lock")?;
         Ok(image.map(|image| image.snapshot))
@@ -461,7 +486,7 @@ impl RepositoryCache {
         Ok(Some(image))
     }
 
-    fn publish_image(&self, image: &CacheImage) -> IndexResult<()> {
+    fn publish_image(&self, image: &CacheImage, deadline: Option<Instant>) -> IndexResult<()> {
         let bytes = serde_json::to_vec(image).context("failed to encode source-index cache")?;
         if bytes.len() as u64 > MAX_CACHE_BYTES {
             return Err(anyhow::anyhow!(
@@ -471,8 +496,7 @@ impl RepositoryCache {
             .into());
         }
         let state_lock = self.open_named_lock(STATE_LOCK_LEAF, "source-index state lock")?;
-        FileExt::lock_exclusive(&state_lock)
-            .context("failed to take source-index state publication lock")?;
+        lock_exclusive_bounded(&state_lock, deadline, "source-index state publication lock")?;
         let result = self.publish_image_under_state_lock(&bytes);
         FileExt::unlock(&state_lock)
             .context("failed to release source-index state publication lock")?;
@@ -492,7 +516,9 @@ impl RepositoryCache {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if name == self.cache_leaf || name == self.temporary_leaf {
+            // The old image and the complete temporary replacement coexist
+            // until rename, so peak quota accounting must retain the old image.
+            if name == self.temporary_leaf {
                 continue;
             }
             if !name.starts_with("source-index-")
@@ -547,6 +573,53 @@ impl RepositoryCache {
             .and_then(|directory| directory.into_std_file().sync_all())
             .map_err(|source| RepositoryIndexError::PublishedButNotDurable { source })?;
         Ok(())
+    }
+}
+
+fn lock_exclusive_bounded(
+    file: &std::fs::File,
+    deadline: Option<Instant>,
+    label: &str,
+) -> Result<()> {
+    let Some(deadline) = deadline else {
+        FileExt::lock_exclusive(file).with_context(|| format!("failed to take {label}"))?;
+        return Ok(());
+    };
+    lock_bounded(file, deadline, label, |file| {
+        FileExt::try_lock_exclusive(file)
+    })
+}
+
+fn lock_shared_bounded(file: &std::fs::File, deadline: Option<Instant>, label: &str) -> Result<()> {
+    let Some(deadline) = deadline else {
+        FileExt::lock_shared(file).with_context(|| format!("failed to take {label}"))?;
+        return Ok(());
+    };
+    lock_bounded(file, deadline, label, |file| FileExt::try_lock_shared(file))
+}
+
+fn lock_bounded(
+    file: &std::fs::File,
+    deadline: Instant,
+    label: &str,
+    try_lock: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    loop {
+        match try_lock(file) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline {
+                    bail!("deadline expired while waiting for {label}");
+                }
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(std::time::Duration::from_millis(10)),
+                );
+            }
+            Err(error) => return Err(error).with_context(|| format!("failed to take {label}")),
+        }
     }
 }
 
@@ -653,7 +726,8 @@ impl RepositoryIndexer {
         budget: Option<(Instant, u64)>,
     ) -> IndexResult<RepositoryBuild> {
         let lock = self.cache.open_lock()?;
-        FileExt::lock_exclusive(&lock).context("failed to take source-index build lock")?;
+        let deadline = budget.map(|(deadline, _)| deadline);
+        lock_exclusive_bounded(&lock, deadline, "source-index build lock")?;
         let previous = match self.cache.read_image() {
             Ok(image) => image,
             Err(RepositoryIndexError::IncompatibleCache { .. }) if ignore_incompatible => None,
@@ -667,7 +741,7 @@ impl RepositoryIndexer {
             snapshot: result.snapshot.clone(),
             parse_entries: result.parse_entries,
         };
-        self.cache.publish_image(&image)?;
+        self.cache.publish_image(&image, deadline)?;
         FileExt::unlock(&lock).context("failed to release source-index build lock")?;
         Ok(RepositoryBuild {
             snapshot: result.snapshot,
@@ -699,7 +773,11 @@ impl RepositoryIndexer {
                 .read_indexable(Path::new(path), &manifest.revision)?
             {
                 SourceReadOutcome::Text(source) => source,
-                SourceReadOutcome::Skipped(reason) => {
+                SourceReadOutcome::Skipped { reason, bytes_read } => {
+                    consumed_source_bytes = consumed_source_bytes
+                        .checked_add(bytes_read)
+                        .context("source-index work byte count overflowed")?;
+                    check_repository_work_budget(budget, consumed_source_bytes)?;
                     entry_generations.push(RepositoryEntryGeneration::skipped(path, &reason));
                     skipped_non_text_files += 1;
                     continue;
@@ -940,7 +1018,11 @@ fn capture_generation_sha256_bounded(
                     &source.identity.content_sha256,
                 ));
             }
-            SourceReadOutcome::Skipped(reason) => {
+            SourceReadOutcome::Skipped { reason, bytes_read } => {
+                *consumed_source_bytes = consumed_source_bytes
+                    .checked_add(bytes_read)
+                    .context("source-index work byte count overflowed")?;
+                check_repository_work_budget(budget, *consumed_source_bytes)?;
                 entries.push(RepositoryEntryGeneration::skipped(path, &reason))
             }
         }
@@ -2315,6 +2397,83 @@ mod tests {
         assert!(
             error.to_string().contains("state exceeds"),
             "unexpected quota error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn publication_quota_counts_old_and_temporary_images_at_peak() {
+        let workspace = committed_workspace();
+        let state = tempfile::tempdir().expect("state directory");
+        let indexer = indexer(workspace.path(), state.path());
+        fs::File::create(state.path().join(&indexer.cache.cache_leaf))
+            .expect("old cache image")
+            .set_len(1_024)
+            .expect("old cache length");
+        fs::File::create(
+            state
+                .path()
+                .join(format!("source-index-{}.json", "f".repeat(64))),
+        )
+        .expect("other cache image")
+        .set_len(MAX_STATE_BYTES - 1_024)
+        .expect("other cache length");
+
+        let error = indexer
+            .cache
+            .publish_image_under_state_lock(&[0])
+            .expect_err("old and temporary images must both count at publication peak");
+        assert!(
+            error.to_string().contains("publication would exceed"),
+            "unexpected quota error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn bounded_build_charges_non_utf8_bytes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        run_git(workspace.path(), &["init", "-q"]);
+        fs::write(workspace.path().join("binary.dat"), [0xff; 8]).expect("binary fixture");
+        run_git(workspace.path(), &["add", "."]);
+        run_git(
+            workspace.path(),
+            &[
+                "-c",
+                "user.name=Finch Test",
+                "-c",
+                "user.email=finch-test@example.invalid",
+                "commit",
+                "-qm",
+                "binary fixture",
+            ],
+        );
+        let state = tempfile::tempdir().expect("state directory");
+        let indexer = indexer(workspace.path(), state.path());
+
+        let error = indexer
+            .build_bounded(Instant::now() + std::time::Duration::from_secs(1), 7)
+            .expect_err("non-UTF-8 source reads must consume the aggregate byte budget");
+        assert!(
+            error.to_string().contains("aggregate source bytes"),
+            "unexpected budget error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn bounded_cache_read_stops_waiting_for_a_held_lock() {
+        let workspace = committed_workspace();
+        let state = tempfile::tempdir().expect("state directory");
+        let indexer = indexer(workspace.path(), state.path());
+        let held = indexer.cache.open_lock().expect("held lock");
+        FileExt::lock_exclusive(&held).expect("take held lock");
+
+        let error = indexer
+            .cache
+            .load_with_deadline(Instant::now() + std::time::Duration::from_millis(20))
+            .expect_err("bounded read must not wait indefinitely");
+        FileExt::unlock(&held).expect("release held lock");
+        assert!(
+            error.to_string().contains("deadline expired"),
+            "unexpected lock error: {error:#}"
         );
     }
 

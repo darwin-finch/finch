@@ -68,15 +68,24 @@ impl SourceResolver {
     pub(crate) fn read(&self, requested: impl AsRef<Path>) -> Result<ResolvedSource> {
         match self.read_outcome(requested.as_ref(), true, None)? {
             SourceReadOutcome::Text(source) => Ok(source),
-            SourceReadOutcome::Skipped(SourceSkipReason::Oversized { bytes }) => bail!(
+            SourceReadOutcome::Skipped {
+                reason: SourceSkipReason::Oversized { bytes },
+                ..
+            } => bail!(
                 "source file is {} bytes; code_outline limit is {} bytes",
                 bytes,
                 MAX_SOURCE_BYTES
             ),
-            SourceReadOutcome::Skipped(SourceSkipReason::NonUtf8) => {
+            SourceReadOutcome::Skipped {
+                reason: SourceSkipReason::NonUtf8,
+                ..
+            } => {
                 bail!("source file is not UTF-8: {}", requested.as_ref().display())
             }
-            SourceReadOutcome::Skipped(SourceSkipReason::Symlink) => {
+            SourceReadOutcome::Skipped {
+                reason: SourceSkipReason::Symlink,
+                ..
+            } => {
                 bail!("source path is a symlink: {}", requested.as_ref().display())
             }
         }
@@ -155,7 +164,10 @@ impl SourceResolver {
                     format!("failed to inspect source path {}", requested.display())
                 })?;
             if metadata.file_type().is_symlink() {
-                return Ok(SourceReadOutcome::Skipped(SourceSkipReason::Symlink));
+                return Ok(SourceReadOutcome::Skipped {
+                    reason: SourceSkipReason::Symlink,
+                    bytes_read: 0,
+                });
             }
         }
         let mut options = OpenOptions::new();
@@ -179,9 +191,12 @@ impl SourceResolver {
             bail!("source path is not a file: {}", requested.display());
         }
         if metadata.len() > MAX_SOURCE_BYTES {
-            return Ok(SourceReadOutcome::Skipped(SourceSkipReason::Oversized {
-                bytes: metadata.len(),
-            }));
+            return Ok(SourceReadOutcome::Skipped {
+                reason: SourceSkipReason::Oversized {
+                    bytes: metadata.len(),
+                },
+                bytes_read: 0,
+            });
         }
         let mut bytes = Vec::new();
         file.by_ref()
@@ -189,12 +204,18 @@ impl SourceResolver {
             .read_to_end(&mut bytes)
             .with_context(|| format!("failed to read source file {}", requested.display()))?;
         if bytes.len() as u64 > MAX_SOURCE_BYTES {
-            return Ok(SourceReadOutcome::Skipped(SourceSkipReason::Oversized {
-                bytes: bytes.len() as u64,
-            }));
+            return Ok(SourceReadOutcome::Skipped {
+                reason: SourceSkipReason::Oversized {
+                    bytes: bytes.len() as u64,
+                },
+                bytes_read: bytes.len() as u64,
+            });
         }
         let Ok(text) = String::from_utf8(bytes.clone()) else {
-            return Ok(SourceReadOutcome::Skipped(SourceSkipReason::NonUtf8));
+            return Ok(SourceReadOutcome::Skipped {
+                reason: SourceSkipReason::NonUtf8,
+                bytes_read: bytes.len() as u64,
+            });
         };
         let relative = normalized
             .to_str()
@@ -298,7 +319,10 @@ impl SourceResolver {
 #[derive(Debug)]
 pub(super) enum SourceReadOutcome {
     Text(ResolvedSource),
-    Skipped(SourceSkipReason),
+    Skipped {
+        reason: SourceSkipReason,
+        bytes_read: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
