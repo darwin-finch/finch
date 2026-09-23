@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
-use cap_std::fs::Dir;
+use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -10,7 +11,7 @@ use std::process::Command;
 #[cfg(test)]
 use std::sync::Arc;
 
-const MAX_SOURCE_BYTES: u64 = 1_048_576;
+pub(super) const MAX_SOURCE_BYTES: u64 = 1_048_576;
 
 /// Immutable identity for the exact source bytes used to produce a result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,7 +66,49 @@ impl SourceResolver {
 
     /// Resolve and read a UTF-8 source file within the workspace size bound.
     pub(crate) fn read(&self, requested: impl AsRef<Path>) -> Result<ResolvedSource> {
-        let requested = requested.as_ref();
+        match self.read_outcome(requested.as_ref(), true, None)? {
+            SourceReadOutcome::Text(source) => Ok(source),
+            SourceReadOutcome::Skipped(SourceSkipReason::Oversized { bytes }) => bail!(
+                "source file is {} bytes; code_outline limit is {} bytes",
+                bytes,
+                MAX_SOURCE_BYTES
+            ),
+            SourceReadOutcome::Skipped(SourceSkipReason::NonUtf8) => {
+                bail!("source file is not UTF-8: {}", requested.as_ref().display())
+            }
+            SourceReadOutcome::Skipped(SourceSkipReason::Symlink) => {
+                bail!("source path is a symlink: {}", requested.as_ref().display())
+            }
+        }
+    }
+
+    pub(super) fn read_indexable(
+        &self,
+        requested: &Path,
+        repository_revision: &str,
+    ) -> Result<SourceReadOutcome> {
+        self.read_outcome(requested, true, Some(repository_revision))
+    }
+
+    pub(super) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    pub(super) fn repository_revision(&self) -> Option<String> {
+        git_head(&self.workspace_root)
+    }
+
+    pub(super) fn workspace_namespace_sha256(&self) -> &str {
+        &self.workspace_namespace_sha256
+    }
+
+    fn read_outcome(
+        &self,
+        requested: &Path,
+        reject_symlink: bool,
+        repository_revision: Option<&str>,
+    ) -> Result<SourceReadOutcome> {
+        let requested = requested;
         let relative = if requested.is_absolute() {
             let canonical_requested = requested.canonicalize().with_context(|| {
                 format!("failed to resolve source path {}", requested.display())
@@ -104,12 +147,31 @@ impl SourceResolver {
         if let Some(hook) = &self.before_open {
             hook();
         }
-        let mut file = self.workspace.open(&normalized).with_context(|| {
-            format!(
-                "failed to open workspace-contained source path {}",
-                requested.display()
-            )
-        })?;
+        if reject_symlink {
+            let metadata = self
+                .workspace
+                .symlink_metadata(&normalized)
+                .with_context(|| {
+                    format!("failed to inspect source path {}", requested.display())
+                })?;
+            if metadata.file_type().is_symlink() {
+                return Ok(SourceReadOutcome::Skipped(SourceSkipReason::Symlink));
+            }
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        if reject_symlink {
+            options.follow(FollowSymlinks::No);
+        }
+        let mut file = self
+            .workspace
+            .open_with(&normalized, &options)
+            .with_context(|| {
+                format!(
+                    "failed to open workspace-contained source path {}",
+                    requested.display()
+                )
+            })?;
         let metadata = file
             .metadata()
             .with_context(|| format!("failed to inspect source path {}", requested.display()))?;
@@ -117,11 +179,9 @@ impl SourceResolver {
             bail!("source path is not a file: {}", requested.display());
         }
         if metadata.len() > MAX_SOURCE_BYTES {
-            bail!(
-                "source file is {} bytes; code_outline limit is {} bytes",
-                metadata.len(),
-                MAX_SOURCE_BYTES
-            );
+            return Ok(SourceReadOutcome::Skipped(SourceSkipReason::Oversized {
+                bytes: metadata.len(),
+            }));
         }
         let mut bytes = Vec::new();
         file.by_ref()
@@ -129,14 +189,13 @@ impl SourceResolver {
             .read_to_end(&mut bytes)
             .with_context(|| format!("failed to read source file {}", requested.display()))?;
         if bytes.len() as u64 > MAX_SOURCE_BYTES {
-            bail!(
-                "source file is {} bytes; code_outline limit is {} bytes",
-                bytes.len(),
-                MAX_SOURCE_BYTES
-            );
+            return Ok(SourceReadOutcome::Skipped(SourceSkipReason::Oversized {
+                bytes: bytes.len() as u64,
+            }));
         }
-        let text = String::from_utf8(bytes.clone())
-            .with_context(|| format!("source file is not UTF-8: {}", requested.display()))?;
+        let Ok(text) = String::from_utf8(bytes.clone()) else {
+            return Ok(SourceReadOutcome::Skipped(SourceSkipReason::NonUtf8));
+        };
         let relative = normalized
             .to_str()
             .context("source path is not valid UTF-8")?
@@ -144,15 +203,82 @@ impl SourceResolver {
         let identity = SourceIdentity {
             workspace_namespace_sha256: self.workspace_namespace_sha256.clone(),
             path: relative,
-            repository_revision: git_head(&self.workspace_root),
+            repository_revision: repository_revision
+                .map(str::to_string)
+                .or_else(|| git_head(&self.workspace_root)),
             content_sha256: sha256_hex(&bytes),
             byte_len: bytes.len(),
         };
-        Ok(ResolvedSource {
+        Ok(SourceReadOutcome::Text(ResolvedSource {
             canonical: self.workspace_root.join(&identity.path),
             text,
             identity,
-        })
+        }))
+    }
+
+    pub(super) fn manifest_entry_is_regular(&self, requested: &Path) -> Result<bool> {
+        let metadata = self
+            .workspace
+            .symlink_metadata(requested)
+            .with_context(|| {
+                format!("failed to inspect repository path {}", requested.display())
+            })?;
+        Ok(metadata.is_file() && !metadata.file_type().is_symlink())
+    }
+
+    pub(super) fn control_file_sha256(
+        &self,
+        requested: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        let metadata = match self.workspace.symlink_metadata(requested) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect repository control {}",
+                        requested.display()
+                    )
+                })
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Ok(None);
+        }
+        if metadata.len() > max_bytes {
+            bail!(
+                "repository control {} exceeds its {} byte bound",
+                requested.display(),
+                max_bytes
+            );
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = self
+            .workspace
+            .open_with(requested, &options)
+            .with_context(|| {
+                format!(
+                    "failed to open repository control {} without following symlinks",
+                    requested.display()
+                )
+            })?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.by_ref()
+            .take(max_bytes + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| {
+                format!("failed to read repository control {}", requested.display())
+            })?;
+        if bytes.len() as u64 > max_bytes {
+            bail!(
+                "repository control {} exceeds its {} byte bound",
+                requested.display(),
+                max_bytes
+            );
+        }
+        Ok(Some(sha256_hex(&bytes)))
     }
 
     /// Return true only while the source still resolves inside this workspace
@@ -167,6 +293,19 @@ impl SourceResolver {
         self.before_open = Some(Arc::new(hook));
         self
     }
+}
+
+#[derive(Debug)]
+pub(super) enum SourceReadOutcome {
+    Text(ResolvedSource),
+    Skipped(SourceSkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum SourceSkipReason {
+    Oversized { bytes: u64 },
+    NonUtf8,
+    Symlink,
 }
 
 #[derive(Debug)]
@@ -315,10 +454,7 @@ mod tests {
         let resolver = SourceResolver::new(root.path()).expect("resolver");
 
         let error = resolver.read("escape.rs").expect_err("escape must fail");
-        assert!(
-            error.to_string().contains("workspace-contained"),
-            "{error:#}"
-        );
+        assert!(error.to_string().contains("symlink"), "{error:#}");
     }
 
     #[cfg(unix)]
@@ -346,10 +482,7 @@ mod tests {
         let error = resolver
             .read("inside/target.rs")
             .expect_err("capability open must reject raced symlink escape");
-        assert!(
-            error.to_string().contains("workspace-contained"),
-            "{error:#}"
-        );
+        assert!(format!("{error:#}").contains("outside"), "{error:#}");
     }
 
     #[test]

@@ -7,8 +7,8 @@ use std::path::Path;
 use tree_sitter::Language;
 use tree_sitter_tags::{TagsConfiguration, TagsContext};
 
-const MAX_OUTLINE_RECORDS: usize = 200;
-const MAX_LABEL_BYTES: usize = 256;
+pub(super) const MAX_OUTLINE_RECORDS: usize = 200;
+pub(super) const MAX_LABEL_BYTES: usize = 256;
 const FALLBACK_WINDOW_LINES: usize = 80;
 
 /// A source range using zero-based, half-open UTF-8 byte offsets and
@@ -92,20 +92,7 @@ impl SourceResolver {
     /// Produce a deterministic, bounded outline for one workspace file.
     pub fn outline(&self, requested: impl AsRef<Path>) -> Result<OutlineResult> {
         let source = self.read(requested)?;
-        let extension = source
-            .canonical
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-
-        if matches!(extension.as_str(), "md" | "markdown") {
-            return Ok(markdown_outline(source));
-        }
-        if let Some(language) = LanguageSpec::for_extension(&extension) {
-            return tree_sitter_outline(source, language);
-        }
-        Ok(fallback_outline(source))
+        outline_source(source)
     }
 
     /// Consume a recorded span only if the same source generation is still
@@ -138,6 +125,23 @@ impl SourceResolver {
             text: source.text[span.start_byte..span.end_byte].to_string(),
         })
     }
+}
+
+pub(super) fn outline_source(source: ResolvedSource) -> Result<OutlineResult> {
+    let extension = source
+        .canonical
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if matches!(extension.as_str(), "md" | "markdown") {
+        return Ok(markdown_outline(source));
+    }
+    if let Some(language) = LanguageSpec::for_extension(&extension) {
+        return tree_sitter_outline(source, language);
+    }
+    Ok(fallback_outline(source))
 }
 
 struct LanguageSpec {
@@ -369,7 +373,11 @@ fn bounded_label(label: &str) -> (String, bool) {
     (label[..end].to_string(), true)
 }
 
-fn span_line_coordinates(text: &str, start_byte: usize, end_byte: usize) -> (usize, usize) {
+pub(super) fn span_line_coordinates(
+    text: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> (usize, usize) {
     let start_line = text.as_bytes()[..start_byte]
         .iter()
         .filter(|byte| **byte == b'\n')
