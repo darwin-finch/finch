@@ -2602,7 +2602,9 @@ impl finch_memory::EmbeddingEngine for ClusteredTestEmbedding {
             h.finish()
         };
         for value in embedding.iter_mut() {
-            jitter_seed = jitter_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            jitter_seed = jitter_seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
             let unit = (jitter_seed >> 40) as f32 / (1u32 << 24) as f32;
             *value += (unit - 0.5) * 0.3;
         }

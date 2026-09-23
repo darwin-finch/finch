@@ -1,7 +1,9 @@
 // Integration tests for Phase 4: Hierarchical Memory System
 
 use anyhow::Result;
-use finch_memory::{cosine_similarity, EmbeddingEngine, MemoryConfig, MemorySystem, TfIdfEmbedding};
+use finch_memory::{
+    cosine_similarity, EmbeddingEngine, MemoryConfig, MemorySystem, TfIdfEmbedding,
+};
 use tempfile::NamedTempFile;
 
 #[tokio::test]

@@ -212,15 +212,14 @@ impl NeuralEmbeddingEngine {
     /// Hugging Face error rather than a mirror-specific one. The fallback
     /// path, cache lookup, and directory layout are real and tested now, so
     /// publishing the release is the only thing left to make it load-bearing.
-    fn download_from_mirror(
-        progress: &Arc<dyn super::progress::ModelProgress>,
-    ) -> Result<PathBuf> {
+    fn download_from_mirror(progress: &Arc<dyn super::progress::ModelProgress>) -> Result<PathBuf> {
         let dir = mirror_cache_dir()
             .ok_or_else(|| anyhow!("could not determine home directory for the mirror cache"))?;
         std::fs::create_dir_all(&dir).context("Failed to create finch mirror cache directory")?;
 
         info!("Downloading neural embedding model (all-MiniLM-L6-v2) from the finch mirror...");
-        progress.write_progress("Downloading memory embedding model from the finch mirror...".into());
+        progress
+            .write_progress("Downloading memory embedding model from the finch mirror...".into());
 
         for file in ["model_quantized.onnx", "tokenizer.json"] {
             let url = format!("{MIRROR_BASE_URL}/{file}");
@@ -235,7 +234,10 @@ impl NeuralEmbeddingEngine {
         }
 
         progress.write_progress("Memory embedding model downloaded from the finch mirror.".into());
-        info!("Neural embedding model downloaded from mirror to: {:?}", dir);
+        info!(
+            "Neural embedding model downloaded from mirror to: {:?}",
+            dir
+        );
         Ok(dir)
     }
 
@@ -290,7 +292,10 @@ impl NeuralEmbeddingEngine {
                     || snapshot.join("model.onnx").exists();
                 let has_tokenizer = snapshot.join("tokenizer.json").exists();
                 if has_model && has_tokenizer {
-                    debug!("Found embedding model in Hugging Face cache: {:?}", snapshot);
+                    debug!(
+                        "Found embedding model in Hugging Face cache: {:?}",
+                        snapshot
+                    );
                     return Some(snapshot);
                 }
             }

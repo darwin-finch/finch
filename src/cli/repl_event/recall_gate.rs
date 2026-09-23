@@ -218,7 +218,8 @@ mod tests {
 
     #[test]
     fn test_highly_redundant_text_is_summarized() {
-        let line = "Retry attempt failed with a transient network error, backing off and retrying. ";
+        let line =
+            "Retry attempt failed with a transient network error, backing off and retrying. ";
         let text = line.repeat(30);
         assert!(
             text.len() >= MIN_LENGTH_FOR_GATE,
@@ -275,7 +276,9 @@ mod tests {
                      so the UI can disclose what was actually trimmed"
                 );
             }
-            other => panic!("fixture must summarize for this assertion to mean anything: {other:?}"),
+            other => {
+                panic!("fixture must summarize for this assertion to mean anything: {other:?}")
+            }
         }
     }
 

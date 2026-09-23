@@ -20,9 +20,10 @@ modules, including `memory_status`, are private.
 - `src/routing_tree.rs` is a real, tested, standalone binary routing tree (candidate-selected PCA
   axes via successive Hotelling deflation, dual-insert, stability-gated splitting, incrementally
   maintained real centroids, adaptive/beam/backtrack search, a verified removal primitive) plus its
-  own `routing_tree/persistence.rs` (save/load against `routing_points`/`routing_nodes`/
-  `routing_leaf_membership`, the sole memory-index schema — it replaced `tree_nodes`/`MemTree`
-  outright, not additively). Ported from a sibling research repo's validated D reference
+  own `routing_tree/persistence.rs` for save/load. The schema it persists to (`schema.sql`:
+  routing_points, routing_nodes, routing_leaf_membership) is the sole memory-index schema — it
+  replaced tree_nodes/MemTree outright, not additively. Ported from a sibling research repo's
+  validated D reference
   (`fractal-corpus-curation`'s `BUILD_ARCHITECTURE.md`/`EXPERIMENT_LOG.md` §29-§56) and **wired
   into `MemorySystem` via the `RoutingMemTree` facade** (`src/routing_memory.rs`) as the sole
   routing mechanism; `MemTree` and its `tree_nodes` schema no longer exist in this crate. A learned

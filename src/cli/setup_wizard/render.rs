@@ -1550,10 +1550,9 @@ pub(super) fn wizard_view_with_permission_target(
         }
         Some(SectionState::LocalHelpers {
             use_neural_embeddings,
-        }) => WizardSectionContent::plain(local_helpers_section_lines(
-            *use_neural_embeddings,
-            width,
-        )),
+        }) => {
+            WizardSectionContent::plain(local_helpers_section_lines(*use_neural_embeddings, width))
+        }
         Some(SectionState::Models {
             primary_model,
             tool_models,

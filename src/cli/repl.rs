@@ -1024,14 +1024,26 @@ impl Repl {
                     if config.memory.use_neural_embeddings
                         && crate::models::NeuralEmbeddingEngine::find_in_cache().is_none()
                     {
-                        let progress =
-                            global_output() as Arc<dyn crate::models::ModelProgress>;
+                        let progress = global_output() as Arc<dyn crate::models::ModelProgress>;
                         tokio::spawn(async move {
-                            match crate::models::NeuralEmbeddingEngine::ensure_downloaded(
-                                progress,
-                            )
-                            .await
-                            {
+                            // hf_hub's sync client has no byte-level progress
+                            // callback, so this is a single indeterminate
+                            // status-bar line rather than
+                            // `update_download_progress`'s percentage bar --
+                            // still real, live visibility in the same
+                            // DownloadProgress slot the GGUF chat model
+                            // download already uses, not just a scrollback
+                            // line.
+                            let status_bar = global_status();
+                            status_bar.update_line(
+                                crate::cli::status_bar::StatusLineType::DownloadProgress,
+                                "Downloading memory embedding model...".to_string(),
+                            );
+                            let result =
+                                crate::models::NeuralEmbeddingEngine::ensure_downloaded(progress)
+                                    .await;
+                            status_bar.clear_download_progress();
+                            match result {
                                 Ok(_) => tracing::info!(
                                     "Neural embedding model downloaded in the background; \
                                      available from the next restart"
