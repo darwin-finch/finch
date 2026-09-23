@@ -8,12 +8,14 @@
 mod embeddings;
 mod memory_status;
 mod memtree;
+mod parent_summary;
 mod program_registry;
 mod quality;
 
 pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
 pub use memory_status::{caveat, count_qualifier, observed, Recall};
 pub use memtree::{MemTree, NodeId, TreeNode};
+pub use parent_summary::ParentSummarizer;
 pub use program_registry::{ProgramIndexRecord, ProgramIndexRef};
 pub use quality::{MemoryClassifier, MemoryImportance};
 
@@ -737,6 +739,19 @@ pub struct MemorySystem {
     /// racing when the daemon retries one completed Brain run.
     insert_lock: Arc<Mutex<()>>,
     embedding_engine: Arc<dyn EmbeddingEngine>,
+    /// The `compress` role: writer of MemTree parent summaries. Never called
+    /// from the insert/write path -- only from
+    /// [`Self::refresh_pending_summaries`], which callers drive lazily
+    /// (read/close), never from `insert_conversation` or its callees.
+    /// `None` when unbound (no production implementation is wired yet, or a
+    /// composition root has chosen not to bind one): parent labels then keep
+    /// their last-known text instead of a generated one, and no cloud
+    /// provider is ever substituted.
+    compress: Option<Arc<dyn ParentSummarizer>>,
+    /// Set once `refresh_pending_summaries` has warned that `compress` is
+    /// unbound, so a store with no bound summarizer logs the gap once per
+    /// process rather than once per turn.
+    compress_unbound_warned: Arc<AtomicBool>,
     config: MemoryConfig,
     hydration: Arc<HydrationState>,
     /// Whether a pending-projection sweep is still owed.
@@ -1052,7 +1067,9 @@ impl MemorySystem {
     /// Create a memory system that embeds with the caller-supplied engine.
     ///
     /// The engine's dimension parameterizes the MemTree. Constructors never
-    /// probe the HuggingFace cache or download a model.
+    /// probe the HuggingFace cache or download a model. The `compress` role
+    /// (MemTree parent-summary writer) is unbound; use
+    /// [`Self::new_with_engine_and_compress`] to inject one.
     ///
     /// Opens `config.db_path` itself; a caller that already holds (or wants
     /// to control the lifetime of) the SQLite connection should call
@@ -1061,8 +1078,33 @@ impl MemorySystem {
         config: MemoryConfig,
         embedding_engine: Arc<dyn EmbeddingEngine>,
     ) -> Result<Self> {
+        Self::new_with_engine_and_compress(config, embedding_engine, None)
+    }
+
+    /// Create a memory system with both the embedding engine and the
+    /// `compress` role (MemTree parent-summary writer) supplied by the
+    /// composition root.
+    ///
+    /// `compress` is never selected or downloaded here -- same rule as
+    /// `embedding_engine`. Pass `None` when no implementation is bound;
+    /// parent labels then keep their last-known text
+    /// (`refresh_pending_summaries` documents the fallback).
+    ///
+    /// Opens `config.db_path` itself; a caller that already holds (or wants
+    /// to control the lifetime of) the SQLite connection should call
+    /// [`Self::new_with_connection_and_compress`] instead.
+    pub fn new_with_engine_and_compress(
+        config: MemoryConfig,
+        embedding_engine: Arc<dyn EmbeddingEngine>,
+        compress: Option<Arc<dyn ParentSummarizer>>,
+    ) -> Result<Self> {
         let conn = Self::open_connection(&config.db_path)?;
-        Self::new_with_connection(Arc::new(Mutex::new(conn)), config, embedding_engine)
+        Self::new_with_connection_and_compress(
+            Arc::new(Mutex::new(conn)),
+            config,
+            embedding_engine,
+            compress,
+        )
     }
 
     /// Create a memory system against an already-open connection.
@@ -1080,10 +1122,28 @@ impl MemorySystem {
     /// hydration path. A caller sharing the same `Arc<Mutex<Connection>>`
     /// with something else that might be holding the lock at this moment
     /// gets a clean `Err`, not a panic.
+    ///
+    /// The `compress` role (MemTree parent-summary writer) is unbound; use
+    /// [`Self::new_with_connection_and_compress`] to inject one.
     pub fn new_with_connection(
         db: Arc<Mutex<Connection>>,
         config: MemoryConfig,
         embedding_engine: Arc<dyn EmbeddingEngine>,
+    ) -> Result<Self> {
+        Self::new_with_connection_and_compress(db, config, embedding_engine, None)
+    }
+
+    /// Create a memory system against an already-open connection, with both
+    /// the embedding engine and the `compress` role (MemTree parent-summary
+    /// writer) supplied by the composition root.
+    ///
+    /// See [`Self::new_with_connection`] for the connection-injection
+    /// contract this shares.
+    pub fn new_with_connection_and_compress(
+        db: Arc<Mutex<Connection>>,
+        config: MemoryConfig,
+        embedding_engine: Arc<dyn EmbeddingEngine>,
+        compress: Option<Arc<dyn ParentSummarizer>>,
     ) -> Result<Self> {
         let (node_count, max_node_id) = {
             let conn = db.try_lock().context(
@@ -1366,6 +1426,8 @@ impl MemorySystem {
             hydration_task,
             insert_lock,
             embedding_engine,
+            compress,
+            compress_unbound_warned: Arc::new(AtomicBool::new(false)),
             config,
         })
     }
@@ -2907,20 +2969,39 @@ impl MemorySystem {
         let mut lines = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        for window in windows.iter().take(windows.len().saturating_sub(1)) {
-            let count = (*window).min(embeddings.len());
-            let window_embeddings: Vec<&Vec<f32>> = embeddings[..count].iter().collect();
-            let centroid = average_embeddings(&window_embeddings);
-            let representative = embeddings[..count]
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| {
-                    cosine_similarity(a, &centroid)
-                        .partial_cmp(&cosine_similarity(b, &centroid))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(index, _)| truncate_str(&turns[index], 70));
-            if let Some(text) = representative {
+        {
+            // Held once across every non-"now" window rather than per-window,
+            // since `parent_label_for_leaf_text` is a cheap in-memory lookup
+            // and windows are few (`depth` is a handful of footer lines).
+            let tree = self.tree.lock().await;
+            for window in windows.iter().take(windows.len().saturating_sub(1)) {
+                let count = (*window).min(embeddings.len());
+                let window_embeddings: Vec<&Vec<f32>> = embeddings[..count].iter().collect();
+                let centroid = average_embeddings(&window_embeddings);
+                let representative_index = embeddings[..count]
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| {
+                        cosine_similarity(a, &centroid)
+                            .partial_cmp(&cosine_similarity(b, &centroid))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(index, _)| index);
+                let Some(index) = representative_index else {
+                    continue;
+                };
+                // Prefer the representative leaf's MemTree parent label (the
+                // `compress` role's generated summary, once one exists) over
+                // the raw truncated turn. This only ever engages when the
+                // turn's exact text also lives in the tree as a leaf -- the
+                // classifier-transformed content the tree stores does not
+                // always match the raw `conversations` row verbatim, so a
+                // miss here falls back to today's behavior rather than
+                // showing nothing.
+                let text = tree
+                    .parent_label_for_leaf_text(&turns[index])
+                    .map(|summary| truncate_str(&summary, 70))
+                    .unwrap_or_else(|| truncate_str(&turns[index], 70));
                 if text != now_text && seen.insert(text.clone()) {
                     lines.push(text);
                 }
@@ -2933,7 +3014,125 @@ impl MemorySystem {
 
         Ok(ConversationSummaryLines { lines })
     }
+
+    /// Lazily catch MemTree parent labels up with the `compress` role: the
+    /// read/close-driven counterpart to `promote_leaf`'s provisional labels.
+    ///
+    /// **Never called from the insert/write path.** Callers drive this from
+    /// wherever the footer is about to be read (`refresh_context_strip`) or a
+    /// session/Brain is closing -- never from `insert_conversation` or
+    /// anything it calls. Regenerating a label costs a real model call, so
+    /// running it on every insert would put a local-inference stall on every
+    /// turn instead of only the turns that actually change a cluster's
+    /// membership.
+    ///
+    /// Bounded to [`MAX_SUMMARIES_PER_REFRESH`] nodes per call so a backlog
+    /// (many clusters changed since the last read) cannot turn one footer
+    /// refresh into an unbounded run of sequential model calls; the rest stay
+    /// queued for the next call.
+    ///
+    /// Returns the number of labels actually regenerated. `Ok(0)` covers
+    /// three different, deliberately indistinguishable-to-the-caller cases:
+    /// nothing was stale, `compress` is unbound, or every attempted
+    /// generation failed -- in all three the node's last-known label stands
+    /// and nothing here escalates to the caller, matching "keep last-known
+    /// summaries ... with a warning" rather than surfacing an error the
+    /// footer would have no useful way to show.
+    pub async fn refresh_pending_summaries(&self) -> Result<usize> {
+        let stale = {
+            let tree = self.tree.lock().await;
+            tree.stale_summary_nodes()
+        };
+        if stale.is_empty() {
+            return Ok(0);
+        }
+
+        let Some(compress) = self.compress.clone() else {
+            if !self.compress_unbound_warned.swap(true, Ordering::SeqCst) {
+                tracing::warn!(
+                    stale_nodes = stale.len(),
+                    "memory: compress role has no bound model; MemTree \
+                     parent summaries keep their last-known (or still \
+                     provisional) label instead of a generated one. This is \
+                     never worked around with a cloud model."
+                );
+            }
+            return Ok(0);
+        };
+
+        let mut refreshed = 0usize;
+        for node_id in stale.into_iter().take(MAX_SUMMARIES_PER_REFRESH) {
+            let children = {
+                let tree = self.tree.lock().await;
+                tree.children_texts(node_id)
+            };
+            let Some(children) = children else {
+                // The node was removed or lost its children by the time this
+                // ran (concurrent restructuring); nothing left to summarize.
+                let mut tree = self.tree.lock().await;
+                tree.skip_summary(node_id);
+                continue;
+            };
+
+            let engine = Arc::clone(&compress);
+            let outcome =
+                tokio::task::spawn_blocking(move || engine.summarize_parent(&children)).await;
+
+            match outcome {
+                Ok(Ok(summary)) if !summary.trim().is_empty() => {
+                    let mut tree = self.tree.lock().await;
+                    tree.apply_summary(node_id, summary)?;
+                    refreshed += 1;
+                }
+                Ok(Ok(_empty)) => {
+                    tracing::warn!(
+                        node_id,
+                        "memory: compress returned an empty parent summary; \
+                         keeping the last-known label"
+                    );
+                    let mut tree = self.tree.lock().await;
+                    tree.skip_summary(node_id);
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        node_id,
+                        %error,
+                        "memory: compress failed to generate a parent summary; \
+                         keeping the last-known label"
+                    );
+                    let mut tree = self.tree.lock().await;
+                    tree.skip_summary(node_id);
+                }
+                Err(join_error) => {
+                    tracing::warn!(
+                        node_id,
+                        %join_error,
+                        "memory: compress task did not complete; keeping the \
+                         last-known label"
+                    );
+                    let mut tree = self.tree.lock().await;
+                    tree.skip_summary(node_id);
+                }
+            }
+        }
+
+        if refreshed > 0 {
+            Self::save_all_nodes_to_db(&self.db, &self.tree, None, None).await?;
+        }
+
+        Ok(refreshed)
+    }
 }
+
+/// Upper bound on how many stale MemTree parent labels one
+/// `refresh_pending_summaries` call will regenerate.
+///
+/// Each regeneration is a real local-model call (`compress`), so an
+/// unbounded backlog run inline on a footer refresh would turn one read into
+/// several sequential inferences. Small and fixed rather than configurable:
+/// this is a latency bound, not a tuning knob, and the remainder simply waits
+/// for the next call.
+const MAX_SUMMARIES_PER_REFRESH: usize = 3;
 
 /// Summary of conversation topics derived from MemTree centroid queries.
 #[derive(Debug, Clone, Default)]
@@ -3588,6 +3787,254 @@ mod tests {
              conversation"
         );
 
+        Ok(())
+    }
+
+    // ── compress role: MemTree parent-summary writer ────────────────────────
+    //
+    // Fixture shared with `test_promotion_moves_provenance_to_the_leaf_holding_the_text`
+    // above: two `substantive()` variants sit below `NEAR_IDENTICAL_SIMILARITY`
+    // but close enough to promote under TF-IDF, so inserting them always
+    // produces exactly one promoted (stale-summary) node.
+
+    /// Returns the `NamedTempFile` guard alongside the store: it deletes its
+    /// backing file on drop, so the caller must keep it alive for as long as
+    /// `MemorySystem` is used.
+    async fn memory_with_forced_promotion(
+        compress: Option<Arc<dyn ParentSummarizer>>,
+    ) -> Result<(MemorySystem, NamedTempFile)> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new_with_engine_and_compress(
+            config,
+            Arc::new(TfIdfEmbedding::new()),
+            compress,
+        )?;
+
+        memory
+            .insert_conversation("system", &substantive("production"), None, None)
+            .await?;
+        memory
+            .insert_conversation("system", &substantive("staging"), None, None)
+            .await?;
+
+        let (_, depth, _) = memory.index_shape().await;
+        assert!(
+            depth > 1,
+            "the fixture must actually promote a leaf, or these tests cover nothing"
+        );
+        Ok((memory, temp))
+    }
+
+    #[tokio::test]
+    async fn test_insert_conversation_never_calls_compress() -> Result<()> {
+        // The behavioral contract this exists to protect: summarization is
+        // lazy (read/close-driven), never on the insert/write path. If this
+        // regresses to eager summarization, every turn pays a local-model
+        // stall instead of only a footer read.
+        let summarizer = Arc::new(crate::parent_summary::RecordingSummarizer::new("unused"));
+        let (memory, _temp) = memory_with_forced_promotion(Some(summarizer.clone())).await?;
+
+        assert_eq!(
+            summarizer.calls(),
+            0,
+            "insert_conversation (and the promotion it triggered) must never \
+             call the compress role"
+        );
+
+        let stale = {
+            let tree = memory.tree.lock().await;
+            tree.stale_summary_nodes()
+        };
+        assert_eq!(
+            stale.len(),
+            1,
+            "the promotion must leave exactly one node queued for a lazy \
+             summary; got {stale:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_refresh_pending_summaries_generates_a_real_summary_distinct_from_children(
+    ) -> Result<()> {
+        let summarizer = Arc::new(crate::parent_summary::RecordingSummarizer::new(
+            "deploy key location across environments",
+        ));
+        let (memory, _temp) = memory_with_forced_promotion(Some(summarizer.clone())).await?;
+
+        let refreshed = memory.refresh_pending_summaries().await?;
+
+        assert_eq!(refreshed, 1, "exactly the one stale node must be refreshed");
+        assert_eq!(
+            summarizer.calls(),
+            1,
+            "refresh_pending_summaries is the only caller of compress"
+        );
+
+        let stale = {
+            let tree = memory.tree.lock().await;
+            tree.stale_summary_nodes()
+        };
+        assert!(
+            stale.is_empty(),
+            "a successful generation must clear the node from the stale queue"
+        );
+
+        let promoted_text = {
+            let tree = memory.tree.lock().await;
+            tree.all_nodes()
+                .values()
+                .find(|node| node.id != 0 && !node.children.is_empty())
+                .map(|node| node.text.clone())
+        };
+        let promoted_text =
+            promoted_text.expect("the promotion fixture must leave one internal node");
+        assert_eq!(
+            promoted_text, "deploy key location across environments",
+            "the promoted node's label must become compress's generated output"
+        );
+        assert_ne!(
+            promoted_text,
+            substantive("production"),
+            "a real summary must replace the provisional child-copy label, not \
+             merely coexist with it"
+        );
+        assert_ne!(promoted_text, substantive("staging"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_refresh_pending_summaries_without_compress_bound_keeps_last_known_label(
+    ) -> Result<()> {
+        let (memory, _temp) = memory_with_forced_promotion(None).await?;
+
+        let text_before = {
+            let tree = memory.tree.lock().await;
+            tree.all_nodes()
+                .values()
+                .find(|node| node.id != 0 && !node.children.is_empty())
+                .map(|node| node.text.clone())
+        };
+
+        let refreshed = memory.refresh_pending_summaries().await?;
+        assert_eq!(
+            refreshed, 0,
+            "with no compress model bound, nothing can be generated"
+        );
+
+        let text_after = {
+            let tree = memory.tree.lock().await;
+            tree.all_nodes()
+                .values()
+                .find(|node| node.id != 0 && !node.children.is_empty())
+                .map(|node| node.text.clone())
+        };
+        assert_eq!(
+            text_before, text_after,
+            "the unbound fallback must keep the last-known (or provisional) \
+             label untouched -- never substitute a cloud call, never blank it"
+        );
+
+        // Stays queued: if `compress` is bound later in the same process
+        // (e.g. a composition-root reconfiguration mid-session), the node
+        // must still be eligible for a real summary rather than permanently
+        // stuck because an earlier attempt found nothing bound.
+        let stale = {
+            let tree = memory.tree.lock().await;
+            tree.stale_summary_nodes()
+        };
+        assert_eq!(
+            stale.len(),
+            1,
+            "an unbound refresh must not drop the node from the queue"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_refresh_pending_summaries_skips_a_failed_generation_without_retry_storm(
+    ) -> Result<()> {
+        let summarizer = Arc::new(crate::parent_summary::RecordingSummarizer::new("unused"));
+        summarizer.set_failing(true);
+        let (memory, _temp) = memory_with_forced_promotion(Some(summarizer.clone())).await?;
+
+        let refreshed = memory.refresh_pending_summaries().await?;
+        assert_eq!(refreshed, 0, "a failed generation refreshes nothing");
+        assert_eq!(summarizer.calls(), 1, "exactly one attempt must be made");
+
+        let stale = {
+            let tree = memory.tree.lock().await;
+            tree.stale_summary_nodes()
+        };
+        assert!(
+            stale.is_empty(),
+            "a failed attempt must not stay queued for immediate retry -- \
+             that would hammer the model every refresh call until the \
+             cluster's children next change; got {stale:?}"
+        );
+
+        // A second refresh call must not attempt it again: nothing is stale.
+        let refreshed_again = memory.refresh_pending_summaries().await?;
+        assert_eq!(refreshed_again, 0);
+        assert_eq!(
+            summarizer.calls(),
+            1,
+            "a second refresh with nothing newly stale must not call compress again"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_summary_for_session_prefers_generated_parent_summary() -> Result<()>
+    {
+        let summarizer = Arc::new(crate::parent_summary::RecordingSummarizer::new(
+            "deploy key location across environments",
+        ));
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new_with_engine_and_compress(
+            config,
+            Arc::new(TfIdfEmbedding::new()),
+            Some(summarizer.clone()),
+        )?;
+
+        let session = "footer-test-session";
+        memory
+            .insert_conversation("system", &substantive("production"), None, Some(session))
+            .await?;
+        memory
+            .insert_conversation("system", &substantive("staging"), None, Some(session))
+            .await?;
+
+        let (_, depth, _) = memory.index_shape().await;
+        assert!(
+            depth > 1,
+            "fixture must promote, or this test covers nothing"
+        );
+
+        let refreshed = memory.refresh_pending_summaries().await?;
+        assert_eq!(
+            refreshed, 1,
+            "the fixture's one promotion must be summarized"
+        );
+
+        let summary = memory.conversation_summary_for_session(session, 2).await?;
+        assert!(
+            summary
+                .lines
+                .iter()
+                .any(|line| line.contains("deploy key location across environments")),
+            "the footer must show the generated parent summary once one \
+             exists, not the raw truncated turn text; got {:?}",
+            summary.lines
+        );
         Ok(())
     }
 

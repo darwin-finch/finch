@@ -692,6 +692,20 @@ pub(super) async fn refresh_context_strip(
     context_lines: usize,
 ) {
     let depth = context_lines.saturating_sub(1); // 🧠 takes one slot
+
+    // Lazy `compress` trigger: a footer read is the read-driven half of
+    // "summarize only when a parent actually needs a new label, then refresh
+    // the strip." This is a no-op whenever nothing is stale -- the common
+    // case, and today the only case, since no composition root binds a
+    // `ParentSummarizer` yet -- and bounded when it is not, so an occasional
+    // footer refresh absorbs at most a few local-model calls rather than an
+    // unbounded backlog. A failure here must not hide the footer entirely,
+    // so it is logged (inside `refresh_pending_summaries`) rather than
+    // propagated.
+    if let Err(error) = memory_system.refresh_pending_summaries().await {
+        tracing::warn!(%error, "memory: failed to refresh MemTree parent summaries");
+    }
+
     let Ok(summary) = memory_system
         .conversation_summary_for_session(session_label, depth)
         .await

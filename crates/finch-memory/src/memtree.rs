@@ -109,6 +109,17 @@ pub struct MemTree {
     root: NodeId,
     nodes: HashMap<NodeId, TreeNode>,
     next_id: NodeId,
+    /// Internal (non-root) nodes whose children changed since their label was
+    /// last computed by the `compress` role.
+    ///
+    /// **In-memory only, deliberately never persisted.** Unlike `dirty`,
+    /// losing this set is not data loss: the node's `text` column already
+    /// holds its last-known label (real summary or still-provisional child
+    /// copy), which stays valid until the next structural change re-marks
+    /// it. A summary is derived and regenerable from the children that are
+    /// its source of truth, so under-tracking staleness across a restart
+    /// costs one missed refresh, never a wrong or corrupt label.
+    needs_summary: HashSet<NodeId>,
 }
 
 impl MemTree {
@@ -147,7 +158,15 @@ impl MemTree {
             // the table before any child does: `parent_id` is a
             // self-referential foreign key and SQLite enforces it immediately.
             dirty: HashSet::from([root_id]),
+            needs_summary: HashSet::new(),
         }
+    }
+
+    /// The synthetic root's id. Never a real memory, never summarized -- a
+    /// caller walking up from a leaf to find its nearest summarized ancestor
+    /// must stop here.
+    pub fn root_id(&self) -> NodeId {
+        self.root
     }
 
     /// Similarity a child must reach to be descended into at `depth`.
@@ -372,6 +391,15 @@ impl MemTree {
         // about to rewrite its embedding, and that marks it.
         parent.children.push(new_id);
 
+        // A new sibling joined this parent's cluster, so whatever label it
+        // holds -- generated or still the provisional copy from its own
+        // promotion -- no longer describes everything beneath it. The root
+        // holds no label a caller ever displays, so marking it would only
+        // queue compress calls nobody reads.
+        if parent_id != self.root {
+            self.needs_summary.insert(parent_id);
+        }
+
         self.update_parent_aggregation(parent_id)?;
         Ok(new_id)
     }
@@ -450,6 +478,14 @@ impl MemTree {
             .ok_or_else(|| anyhow::anyhow!("memtree: leaf {} not found", leaf_id))?;
         promoted.children.push(moved_id);
         promoted.children.push(inserted_id);
+
+        // `leaf_id` just became a parent. Its text is still the leaf's own
+        // original wording (see the doc comment above) -- a provisional
+        // label until the `compress` role replaces it with a real summary of
+        // its new children.
+        if leaf_id != self.root {
+            self.needs_summary.insert(leaf_id);
+        }
 
         self.update_parent_aggregation(leaf_id)?;
         Ok((inserted_id, moved_id))
@@ -667,6 +703,76 @@ impl MemTree {
     pub(crate) fn clear_dirty(&mut self) {
         self.dirty.clear();
         self.dirty.insert(self.root);
+    }
+
+    /// Internal nodes whose label the `compress` role has not caught up
+    /// with, ascending. Ascending so repeated calls with a caller-side cap
+    /// make deterministic progress through a large backlog instead of
+    /// re-picking whichever node a `HashSet` iterates first.
+    pub(crate) fn stale_summary_nodes(&self) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self.needs_summary.iter().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The direct children's own text, in tree order -- exactly what
+    /// `ParentSummarizer::summarize_parent` consumes. `None` if `node_id`
+    /// does not exist or has no children (nothing to summarize).
+    pub(crate) fn children_texts(&self, node_id: NodeId) -> Option<Vec<String>> {
+        let node = self.nodes.get(&node_id)?;
+        if node.children.is_empty() {
+            return None;
+        }
+        Some(
+            node.children
+                .iter()
+                .filter_map(|id| self.nodes.get(id))
+                .map(|child| child.text.clone())
+                .collect(),
+        )
+    }
+
+    /// Replace `node_id`'s label with a freshly generated summary, and mark
+    /// it both no-longer-stale and persisted-dirty -- a summary is just the
+    /// node's `text` column, so it rides the same dirty-then-persist path as
+    /// every other `TreeNode` mutation; no separate storage or schema exists
+    /// for it.
+    pub(crate) fn apply_summary(&mut self, node_id: NodeId, summary: String) -> Result<()> {
+        let node = self.nodes.get_mut(&node_id).ok_or_else(|| {
+            anyhow::anyhow!("memtree: node {node_id} not found while applying a summary")
+        })?;
+        node.text = summary;
+        self.dirty.insert(node_id);
+        self.needs_summary.remove(&node_id);
+        Ok(())
+    }
+
+    /// Drop `node_id` from the stale-summary queue without changing its
+    /// text -- used when `compress` has no bound model, or a generation
+    /// attempt failed or returned nothing usable. The node's last-known (or
+    /// still-provisional) label stands; it is retried the next time this
+    /// node's children actually change, not on every refresh call.
+    pub(crate) fn skip_summary(&mut self, node_id: NodeId) {
+        self.needs_summary.remove(&node_id);
+    }
+
+    /// The nearest ancestor's label for a leaf holding exactly `leaf_text`,
+    /// if that ancestor is not the synthetic root.
+    ///
+    /// This is the footer's read side of the `compress` role: once a parent
+    /// has a real generated summary, `text` here is that summary; until then
+    /// it is still the provisional copy `promote_leaf` seeded it with, which
+    /// is no worse than the raw text a caller would otherwise show. `None`
+    /// when no leaf matches (nothing has been inserted with this exact
+    /// text) or the leaf sits directly under the root (no cluster to
+    /// summarize).
+    pub(crate) fn parent_label_for_leaf_text(&self, leaf_text: &str) -> Option<String> {
+        let leaf_id = self.find_leaf_by_text(leaf_text)?;
+        let parent_id = self.nodes.get(&leaf_id)?.parent?;
+        if parent_id == self.root {
+            return None;
+        }
+        self.nodes.get(&parent_id).map(|node| node.text.clone())
     }
 
     /// Set the next_id counter (used after loading from disk to avoid ID collisions).
@@ -1521,5 +1627,272 @@ mod tests {
             "Discard nodes must not appear in retrieval: {:?}",
             results
         );
+    }
+
+    // ── compress-role staleness tracking (MemTree footer parent summaries) ─
+
+    #[test]
+    fn test_promote_leaf_marks_the_new_parent_stale() {
+        let mut tree = MemTree::new_with_dim(8);
+        let first = tree
+            .insert("first memory".to_string(), vec_on(0, 8, 0.0), 1)
+            .unwrap();
+        assert!(
+            tree.stale_summary_nodes().is_empty(),
+            "a lone leaf has nothing to summarize yet"
+        );
+
+        // Close enough to promote `first` into a parent of two siblings.
+        tree.insert("second memory".to_string(), vec_on(0, 8, 0.2), 1)
+            .unwrap();
+
+        assert_eq!(
+            tree.stale_summary_nodes(),
+            vec![first],
+            "promoting a leaf to a parent must queue it for a real summary; \
+             got {:?}",
+            tree.stale_summary_nodes()
+        );
+    }
+
+    fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+        v
+    }
+
+    /// A unit vector positioned to attach directly under an existing
+    /// two-child cluster's head rather than redescending into either child.
+    ///
+    /// `threshold_at_depth` grows only slightly with depth (the root's
+    /// threshold and a depth-1 child's threshold differ by a few percent),
+    /// so a vector merely "somewhere between" `a` and `b` almost always ends
+    /// up *more* similar to whichever child it leans toward than to their
+    /// average -- and lands one level deeper via another promotion instead
+    /// of attaching to the cluster head. This constructs one that does not:
+    /// `bisector` is the exact direction of `average_embeddings([a, b])`
+    /// (same direction `update_parent_aggregation` gives the cluster head),
+    /// and `orthogonal` is a unit vector both `a` and `b` are exactly
+    /// perpendicular to (built from two dimensions `a`/`b` weight equally,
+    /// so their difference cancels out of both dot products). Blending the
+    /// two by `bisector_weight` gives, by construction,
+    /// `cos(result, a) == cos(result, b) == bisector_weight * cos(bisector, a)`,
+    /// strictly smaller than `cos(result, bisector) == bisector_weight` since
+    /// `cos(bisector, a) < 1` whenever `a != b` -- so there is always a
+    /// `bisector_weight` window that clears the parent-level threshold while
+    /// staying under the child-level one, for any two non-identical `a`/`b`.
+    fn attach_point_for_cluster(a: &[f32], b: &[f32], bisector_weight: f32) -> Vec<f32> {
+        let bisector = normalize(a.iter().zip(b).map(|(x, y)| x + y).collect());
+        let mut orthogonal = vec![0.0f32; a.len()];
+        orthogonal[1] = 1.0;
+        orthogonal[2] = -1.0;
+        let orthogonal = normalize(orthogonal);
+        let orthogonal_weight = (1.0 - bisector_weight * bisector_weight).sqrt();
+        normalize(
+            bisector
+                .iter()
+                .zip(orthogonal.iter())
+                .map(|(u, w)| bisector_weight * u + orthogonal_weight * w)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_attach_child_marks_an_existing_cluster_head_stale_again() {
+        let mut tree = MemTree::new_with_dim(8);
+        let a = vec_on(0, 8, 0.0);
+        let b = vec_on(0, 8, 0.2);
+        let first = tree
+            .insert("first memory".to_string(), a.clone(), 1)
+            .unwrap();
+        tree.insert("second memory".to_string(), b.clone(), 1)
+            .unwrap();
+
+        // Consume the promotion's staleness as if compress had already run.
+        tree.apply_summary(first, "generated summary".to_string())
+            .unwrap();
+        assert!(tree.stale_summary_nodes().is_empty());
+
+        // A third memory joins the same cluster -- correlated with the
+        // cluster's aggregate direction (clears the parent-level threshold
+        // at the root) but not with either individual leaf specifically
+        // (stays under the child-level threshold one level down), so it
+        // attaches directly to the promoted head rather than triggering
+        // another promotion under one specific leaf.
+        let third = attach_point_for_cluster(&a, &b, 0.42);
+        tree.insert("third memory".to_string(), third, 1).unwrap();
+
+        assert_eq!(
+            tree.stale_summary_nodes(),
+            vec![first],
+            "a new sibling joining an already-summarized cluster must \
+             re-queue the cluster head, or the label goes stale silently"
+        );
+    }
+
+    #[test]
+    fn test_attach_directly_under_root_does_not_queue_the_root() {
+        let mut tree = MemTree::new_with_dim(8);
+        // Orthogonal content: both attach straight under the root, no
+        // promotion, no cluster.
+        tree.insert("topic a".to_string(), vec_on(0, 8, 0.0), 1)
+            .unwrap();
+        tree.insert("topic b".to_string(), vec_on(1, 8, 0.0), 1)
+            .unwrap();
+
+        assert!(
+            tree.stale_summary_nodes().is_empty(),
+            "the synthetic root must never be queued for a summary a \
+             caller would display; got {:?}",
+            tree.stale_summary_nodes()
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_overwrites_text_and_clears_staleness() {
+        let mut tree = MemTree::new_with_dim(8);
+        let first = tree
+            .insert("first memory".to_string(), vec_on(0, 8, 0.0), 1)
+            .unwrap();
+        tree.insert("second memory".to_string(), vec_on(0, 8, 0.2), 1)
+            .unwrap();
+        assert_eq!(tree.stale_summary_nodes(), vec![first]);
+
+        tree.apply_summary(first, "both memories, summarized".to_string())
+            .unwrap();
+
+        assert_eq!(
+            tree.get_node(first).unwrap().text,
+            "both memories, summarized",
+            "apply_summary must overwrite the provisional label"
+        );
+        assert!(
+            tree.stale_summary_nodes().is_empty(),
+            "apply_summary must clear the node from the stale queue"
+        );
+        assert!(
+            tree.dirty_nodes().contains(&first),
+            "the new label must be marked for persistence like any other \
+             TreeNode mutation, or it never reaches disk"
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_on_unknown_node_is_an_error_not_a_panic() {
+        let mut tree = MemTree::new_with_dim(8);
+        let error = tree
+            .apply_summary(9999, "orphaned summary".to_string())
+            .expect_err("applying a summary to a node that does not exist must error");
+        assert!(
+            error.to_string().contains("9999"),
+            "the error must name the missing node; got {error}"
+        );
+    }
+
+    #[test]
+    fn test_skip_summary_clears_staleness_without_touching_text() {
+        let mut tree = MemTree::new_with_dim(8);
+        let first = tree
+            .insert("first memory".to_string(), vec_on(0, 8, 0.0), 1)
+            .unwrap();
+        tree.insert("second memory".to_string(), vec_on(0, 8, 0.2), 1)
+            .unwrap();
+        let text_before = tree.get_node(first).unwrap().text.clone();
+        // `first`'s embedding was already re-aggregated (and so already
+        // marked dirty) by the promotion above -- `dirty` tracks persisted
+        // columns generally, not summary staleness specifically. The
+        // invariant this test checks is that `skip_summary` does not ADD to
+        // that set, not that the set is empty.
+        let dirty_before = tree.dirty_nodes();
+
+        tree.skip_summary(first);
+
+        assert_eq!(
+            tree.get_node(first).unwrap().text,
+            text_before,
+            "skip_summary must leave the last-known label untouched"
+        );
+        assert!(tree.stale_summary_nodes().is_empty());
+        assert_eq!(
+            tree.dirty_nodes(),
+            dirty_before,
+            "skip_summary must not change the persistence-dirty set; nothing \
+             about the node's persisted columns changed"
+        );
+    }
+
+    #[test]
+    fn test_children_texts_returns_direct_children_in_tree_order() {
+        let mut tree = MemTree::new_with_dim(8);
+        let first = tree
+            .insert("first memory".to_string(), vec_on(0, 8, 0.0), 1)
+            .unwrap();
+        tree.insert("second memory".to_string(), vec_on(0, 8, 0.2), 1)
+            .unwrap();
+
+        let texts = tree
+            .children_texts(first)
+            .expect("a promoted node has two children");
+        assert_eq!(
+            texts,
+            vec!["first memory".to_string(), "second memory".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_children_texts_none_for_a_leaf() {
+        let mut tree = MemTree::new_with_dim(8);
+        let leaf = tree
+            .insert("lone memory".to_string(), vec_on(0, 8, 0.0), 1)
+            .unwrap();
+        assert!(
+            tree.children_texts(leaf).is_none(),
+            "a childless leaf has nothing for compress to summarize"
+        );
+    }
+
+    #[test]
+    fn test_parent_label_for_leaf_text_finds_the_generated_summary() {
+        let mut tree = MemTree::new_with_dim(8);
+        let first = tree
+            .insert("first memory".to_string(), vec_on(0, 8, 0.0), 1)
+            .unwrap();
+        tree.insert("second memory".to_string(), vec_on(0, 8, 0.2), 1)
+            .unwrap();
+        tree.apply_summary(first, "both memories, summarized".to_string())
+            .unwrap();
+
+        assert_eq!(
+            tree.parent_label_for_leaf_text("second memory"),
+            Some("both memories, summarized".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parent_label_for_leaf_text_none_when_leaf_is_directly_under_root() {
+        let mut tree = MemTree::new_with_dim(8);
+        tree.insert("standalone topic".to_string(), vec_on(0, 8, 0.0), 1)
+            .unwrap();
+
+        assert_eq!(
+            tree.parent_label_for_leaf_text("standalone topic"),
+            None,
+            "a leaf with no cluster (parent is the root) has no summary to show"
+        );
+    }
+
+    #[test]
+    fn test_parent_label_for_leaf_text_none_when_no_leaf_matches() {
+        let tree = MemTree::new_with_dim(8);
+        assert_eq!(tree.parent_label_for_leaf_text("never inserted"), None);
+    }
+
+    #[test]
+    fn test_root_id_is_stable_and_never_summarized() {
+        let tree = MemTree::new_with_dim(8);
+        assert_eq!(tree.root_id(), 0);
+        assert!(!tree.stale_summary_nodes().contains(&tree.root_id()));
     }
 }

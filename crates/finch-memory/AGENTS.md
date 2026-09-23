@@ -10,6 +10,15 @@ modules, including `memory_status`, are private.
 - This crate owns MemTree storage and retrieval, SQLite schema and hydration, TF-IDF fallback,
   and opaque `ProgramIndexRecord` rows. It has no production dependency on another Finch crate.
   Callers inject an `EmbeddingEngine`; `src/models/neural_embedding.rs` owns neural model loading.
+- Callers may also inject a `ParentSummarizer` (the `compress` role that writes MemTree parent
+  summaries in place of `promote_leaf`'s provisional first-child label). `MemorySystem`
+  constructors never select, bind, or download a model for it, same as `EmbeddingEngine`. No
+  production implementation exists yet: the ONNX generator loader (`OnnxLoader`/`LoadedOnnxModel`)
+  an earlier attempt at this was built against was removed when the model backend migrated to
+  llama.cpp/GGUF, and a replacement bundled-model loader is unbuilt follow-up work. Every current
+  caller passes `None`; `MemorySystem::refresh_pending_summaries` keeps parent labels at their
+  last-known (or still-provisional) text in that case and warns once, never substituting a cloud
+  call.
 - The root [`src/program_registry.rs`](../../src/program_registry.rs) maps program definitions to
   memory's opaque rows and owns canonical authored source files and VM manifests. Brain event
   journals belong to `finch-brain`, not this crate.
