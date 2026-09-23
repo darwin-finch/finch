@@ -65,7 +65,9 @@ differs from the permission root, and the implementation capability-opens beneat
 the already capability-bounded index; omitting it searches only the workspace injected at
 construction. Its `WorkspaceRead` authority includes publication of disposable, bounded derived
 index bytes under the separately injected application-state capability; it cannot mutate source,
-conversation, provider, or approval state. Current roots bind no disambiguator, so ambiguity never
+conversation, provider, or approval state. One-shot query mode fails closed and the REPL omits this
+tool when no home-backed application-state root is available; neither falls back to a workspace
+cache. Current roots bind no disambiguator, so ambiguity never
 reconstructs or calls a provider. Index freshness/build work runs off the async worker thread and
 cooperatively fails after 20 seconds or 256 MiB of aggregate source reads, including validation.
 `test_dotdot_escape_is_ask_user_not_allow`, `test_symlink_escape_is_ask_user_live_and_dangling`,

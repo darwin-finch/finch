@@ -17,17 +17,12 @@ use serde_json::json;
 use std::path::PathBuf;
 
 #[test]
-fn fallback_find_code_state_is_derived_from_fallback_persistence_root() {
-    let primary = PathBuf::from("/home/example/.finch/tool_patterns.json");
-    let fallback = PathBuf::from("/tmp/finch_patterns_fallback.json");
+fn find_code_state_requires_an_explicit_home_root() {
     assert_eq!(
-        super::source_index_state_path(&primary, "source-index"),
-        PathBuf::from("/home/example/.finch/source-index")
+        super::source_index_state_for_home(Some(std::path::Path::new("/home/example"))),
+        Some(PathBuf::from("/home/example/.finch/source-index"))
     );
-    assert_eq!(
-        super::source_index_state_path(&fallback, "finch-source-index-fallback"),
-        PathBuf::from("/tmp/finch-source-index-fallback")
-    );
+    assert_eq!(super::source_index_state_for_home(None), None);
 }
 use std::sync::Arc;
 

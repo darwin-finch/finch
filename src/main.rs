@@ -2196,6 +2196,16 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     Ok(())
 }
 
+fn query_tool_state_paths(home: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
+    let state_root = home
+        .context("Could not determine an application-state root for query tools")?
+        .join(".finch");
+    Ok((
+        state_root.join("tool_patterns.json"),
+        state_root.join("source-index"),
+    ))
+}
+
 /// Build the standard tool registry + executor used for non-interactive query mode.
 /// Auto-approves all tools (no interactive prompting in non-interactive mode).
 async fn build_query_tool_executor(
@@ -2215,13 +2225,7 @@ async fn build_query_tool_executor(
     let tool_workspace_root = finch::tools::resolve_workspace_root(
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
-    let patterns_path = dirs::home_dir()
-        .map(|h| h.join(".finch").join("tool_patterns.json"))
-        .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json"));
-    let source_index_state = patterns_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("source-index");
+    let (patterns_path, source_index_state) = query_tool_state_paths(dirs::home_dir())?;
     registry.register(Box::new(ReadTool));
     registry.register(Box::new(GlobTool));
     registry.register(Box::new(GrepTool));
@@ -3662,12 +3666,24 @@ fn remove_named_brain(
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_brain_command, finish_first_run_setup, register_query_vm_tools,
-        reject_retired_session_flags, resolve_brain_name, suppress_ort_logs_unless_overridden,
-        Args, AuthCommand, BrainCommand, Command,
+        execute_brain_command, finish_first_run_setup, query_tool_state_paths,
+        register_query_vm_tools, reject_retired_session_flags, resolve_brain_name,
+        suppress_ort_logs_unless_overridden, Args, AuthCommand, BrainCommand, Command,
     };
     use clap::{CommandFactory, Parser};
     use std::sync::Arc;
+
+    #[test]
+    fn query_code_search_fails_closed_without_an_application_state_root() {
+        assert!(query_tool_state_paths(None).is_err());
+        assert_eq!(
+            query_tool_state_paths(Some(std::path::PathBuf::from("/home/example"))).unwrap(),
+            (
+                std::path::PathBuf::from("/home/example/.finch/tool_patterns.json"),
+                std::path::PathBuf::from("/home/example/.finch/source-index"),
+            )
+        );
+    }
 
     /// #223: the daemon and interactive-mode call sites used to hardcode
     /// `ORT_LOGGING_LEVEL=3` unconditionally, so an operator setting it

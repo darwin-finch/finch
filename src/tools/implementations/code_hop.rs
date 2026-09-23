@@ -858,6 +858,8 @@ fn compact_response(result: CodeHopResult) -> FindCodeResponse {
             "partial"
         } else if warning.contains("suffix matched multiple") {
             "ambiguous path"
+        } else if warning.contains("unbound") {
+            "ambiguous"
         } else if warning.contains("disambiguator") {
             "local disambiguation failed"
         } else {
@@ -874,7 +876,7 @@ fn mechanical_route(
     snapshot: &RepositorySnapshot,
     require_structural_match: bool,
 ) -> Result<(Option<RouteAttempt>, Option<String>)> {
-    if looks_like_path(query) {
+    if !is_quoted_literal(query) && looks_like_path(query) {
         let normalized = query.trim_matches(['\'', '"']).trim_start_matches("./");
         let mut files = snapshot
             .files
@@ -1325,10 +1327,7 @@ fn validate_disambiguation(
 
 fn mechanical_term(query: &str) -> Option<String> {
     let trimmed = query.trim();
-    if trimmed.len() >= 2
-        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
-    {
+    if is_quoted_literal(trimmed) {
         let literal = &trimmed[1..trimmed.len() - 1];
         return (!literal.is_empty()).then(|| literal.to_string());
     }
@@ -1339,8 +1338,15 @@ fn mechanical_term(query: &str) -> Option<String> {
     .then(|| trimmed.to_string())
 }
 
+fn is_quoted_literal(query: &str) -> bool {
+    let trimmed = query.trim();
+    trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+}
+
 fn looks_like_path(query: &str) -> bool {
-    let query = query.trim_matches(['\'', '"']);
+    let query = query.trim();
     query.contains('/') || Path::new(query).extension().is_some()
 }
 
@@ -1450,7 +1456,7 @@ mod tests {
         .expect("claim source");
         fs::write(
             root.path().join("src/distractor.rs"),
-            "// DISTRACTOR_SECRET_MUST_NOT_ROUTE\npub fn render_status() {}\n",
+            "// DISTRACTOR_SECRET_MUST_NOT_ROUTE\npub const CLAIM_PATH: &str = \"src/claim.rs\";\npub fn render_status() {}\n",
         )
         .expect("distractor source");
         fs::write(
@@ -1503,19 +1509,21 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct BaselineMetrics {
+    struct ComparisonMetrics {
         task_success: bool,
-        context_bytes: usize,
+        serialized_response_bytes: usize,
         files_read: usize,
+        source_body_bytes_disclosed: usize,
         unsupported_language_success: bool,
     }
 
     fn naive_grep_read_baseline(
         resolver: &SourceResolver,
         snapshot: &RepositorySnapshot,
-    ) -> BaselineMetrics {
+    ) -> ComparisonMetrics {
         let mut files_read = 0;
         let mut returned = Vec::new();
+        let mut source_body_bytes_disclosed = 0;
         let mut task_success = false;
         let mut unsupported_language_success = false;
         for file in &snapshot.files {
@@ -1524,6 +1532,7 @@ mod tests {
                 .expect("baseline read");
             files_read += 1;
             if source.text.contains("admit_claim") {
+                source_body_bytes_disclosed += source.text.len();
                 returned.push((file.outline.source.path.clone(), source.text.clone()));
                 task_success = file.outline.source.path == "src/claim.rs"
                     && file
@@ -1533,17 +1542,19 @@ mod tests {
                         .any(|record| record.name == "admit_claim");
             }
             if source.text.contains("unusual widgets") {
+                source_body_bytes_disclosed += source.text.len();
                 returned.push((file.outline.source.path.clone(), source.text.clone()));
                 unsupported_language_success = file.outline.source.path == "fallback.txt";
             }
         }
-        let context_bytes = serde_json::to_vec(&returned)
+        let serialized_response_bytes = serde_json::to_vec(&returned)
             .expect("naive grep/read response")
             .len();
-        BaselineMetrics {
+        ComparisonMetrics {
             task_success,
-            context_bytes,
+            serialized_response_bytes,
             files_read,
+            source_body_bytes_disclosed,
             unsupported_language_success,
         }
     }
@@ -1560,8 +1571,8 @@ mod tests {
             })
     }
 
-    fn file_list_baseline(snapshot: &RepositorySnapshot) -> BaselineMetrics {
-        let context_bytes = serde_json::to_vec(
+    fn file_list_baseline(snapshot: &RepositorySnapshot) -> ComparisonMetrics {
+        let serialized_response_bytes = serde_json::to_vec(
             &snapshot
                 .files
                 .iter()
@@ -1575,11 +1586,35 @@ mod tests {
         let unsupported_language_success =
             file_list_pick(snapshot, "where are unusual widgets calibrated?")
                 == Some("fallback.txt");
-        BaselineMetrics {
+        ComparisonMetrics {
             task_success,
-            context_bytes,
+            serialized_response_bytes,
             files_read: 0,
+            source_body_bytes_disclosed: 0,
             unsupported_language_success,
+        }
+    }
+
+    fn find_code_comparison(
+        snapshot: &RepositorySnapshot,
+        primary: &CodeHopResult,
+        unsupported: &CodeHopResult,
+    ) -> ComparisonMetrics {
+        ComparisonMetrics {
+            task_success: primary.spans.iter().any(|span| {
+                span.path == "src/claim.rs" && span.symbol.as_deref() == Some("admit_claim")
+            }),
+            serialized_response_bytes: serde_json::to_vec(&compact_response(primary.clone()))
+                .expect("complete find_code response")
+                .len(),
+            // A current cached query hashes each indexed source once, then
+            // generation-validates each returned span before exposing it.
+            files_read: snapshot.files.len() + primary.spans.len(),
+            source_body_bytes_disclosed: primary.metrics.body_bytes_disclosed,
+            unsupported_language_success: unsupported
+                .spans
+                .iter()
+                .any(|span| span.path == "fallback.txt"),
         }
     }
 
@@ -1738,6 +1773,27 @@ mod tests {
             "spans: {:?}",
             literal.spans
         );
+
+        let path_shaped_literal = tool
+            .execute_query("\"src/claim.rs\"")
+            .await
+            .expect("path-shaped quoted literal route");
+        assert!(
+            path_shaped_literal
+                .spans
+                .iter()
+                .any(|span| span.path == "src/distractor.rs"),
+            "spans: {:?}",
+            path_shaped_literal.spans
+        );
+        assert!(
+            path_shaped_literal
+                .spans
+                .iter()
+                .all(|span| span.match_kind == "literal"),
+            "spans: {:?}",
+            path_shaped_literal.spans
+        );
         assert!(
             literal
                 .spans
@@ -1891,9 +1947,15 @@ mod tests {
             .execute_query("where are unusual widgets calibrated?")
             .await
             .expect("unsupported-language route");
+        let find_code = find_code_comparison(&snapshot, &first, &unsupported);
 
-        assert!(first.spans.iter().any(|span| span.path == "src/claim.rs"));
-        assert_eq!(first.metrics.body_bytes_disclosed, 0);
+        assert!(find_code.task_success);
+        assert_eq!(find_code.source_body_bytes_disclosed, 0);
+        assert_eq!(find_code.serialized_response_bytes, response.len());
+        assert_eq!(
+            find_code.files_read,
+            snapshot.files.len() + first.spans.len()
+        );
         assert_eq!(first.metrics.selected_files, 1);
         assert_eq!(
             first.metrics.routing_context_bytes,
@@ -1907,7 +1969,8 @@ mod tests {
         assert!(naive.task_success);
         assert!(naive.unsupported_language_success);
         assert_eq!(naive.files_read, snapshot.files.len());
-        assert!(naive.context_bytes > 0);
+        assert!(naive.serialized_response_bytes > 0);
+        assert!(naive.source_body_bytes_disclosed > 0);
         assert_eq!(
             file_list.task_success,
             file_list_pick(&snapshot, "where does claim admission live?") == Some("src/claim.rs")
@@ -1918,12 +1981,13 @@ mod tests {
                 == Some("fallback.txt")
         );
         assert_eq!(file_list.files_read, 0);
-        assert!(file_list.context_bytes > 0);
-        assert!(response.len() < naive.context_bytes, "{response_text}");
-        assert!(unsupported
-            .spans
-            .iter()
-            .any(|span| span.path == "fallback.txt"));
+        assert_eq!(file_list.source_body_bytes_disclosed, 0);
+        assert!(file_list.serialized_response_bytes > 0);
+        assert!(
+            find_code.serialized_response_bytes < naive.serialized_response_bytes,
+            "{response_text}"
+        );
+        assert!(find_code.unsupported_language_success);
     }
 
     #[tokio::test]
@@ -2107,6 +2171,24 @@ mod tests {
             assert!(!result.content.contains(internal), "{}", result.content);
         }
         assert!(result.content.len() < 128, "{}", result.content);
+
+        let ambiguous = executor
+            .execute_tool(
+                &ToolUse::new(
+                    "find_code".to_string(),
+                    serde_json::json!({"query": "where does claim admission live?"}),
+                ),
+                None::<fn() -> anyhow::Result<()>>,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("ambiguous lexical result");
+        let value: Value =
+            serde_json::from_str(&ambiguous.content).expect("compact ambiguous response");
+        assert_eq!(value["warnings"], serde_json::json!(["ambiguous"]));
     }
 
     #[tokio::test]
@@ -2256,15 +2338,17 @@ mod tests {
         let file_list_elapsed = start.elapsed();
         let naive = naive_grep_read_baseline(&resolver, &snapshot);
         let file_list = file_list_baseline(&snapshot);
-        let response_bytes = serde_json::to_vec(&compact_response(
-            tool.execute_query(query)
-                .await
-                .expect("final find_code route"),
-        ))
-        .expect("complete response")
-        .len();
+        let final_find_code = tool
+            .execute_query(query)
+            .await
+            .expect("final find_code route");
+        let unsupported = tool
+            .execute_query("where are unusual widgets calibrated?")
+            .await
+            .expect("unsupported-language route");
+        let find_code = find_code_comparison(&snapshot, &final_find_code, &unsupported);
         eprintln!(
-            "{ITERATIONS} iterations: find_code={find_code_elapsed:?} response_bytes={response_bytes}, naive_grep_read={naive_scan_elapsed:?} {naive:?}, file_list={file_list_elapsed:?} {file_list:?}"
+            "{ITERATIONS} iterations: find_code={find_code_elapsed:?} {find_code:?}, naive_grep_read={naive_scan_elapsed:?} {naive:?}, file_list={file_list_elapsed:?} {file_list:?}"
         );
     }
 }

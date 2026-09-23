@@ -327,6 +327,7 @@ mod disabled_training_tests {
             })),
             models_dir: Some(temp.path().join("models")),
             patterns_path: temp.path().join("tool-patterns.json"),
+            source_index_state: Some(temp.path().join("source-index")),
             conversation_log_path: temp.path().join("unused-conversations.jsonl"),
             active_persona: crate::config::Persona::load_builtin("default"),
             workspace_root,
@@ -696,17 +697,15 @@ struct ReplInitialization {
     input_handler_factory: Option<Box<dyn FnOnce() -> Result<InputHandler>>>,
     models_dir: Option<PathBuf>,
     patterns_path: PathBuf,
+    source_index_state: Option<PathBuf>,
     conversation_log_path: PathBuf,
     active_persona: Result<crate::config::Persona>,
     workspace_root: PathBuf,
     project_program_root: Option<PathBuf>,
 }
 
-fn source_index_state_path(patterns_path: &Path, leaf: &str) -> PathBuf {
-    patterns_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(leaf)
+fn source_index_state_for_home(home: Option<&Path>) -> Option<PathBuf> {
+    home.map(|root| root.join(".finch/source-index"))
 }
 
 impl ReplInitialization {
@@ -723,6 +722,7 @@ impl ReplInitialization {
                 .as_ref()
                 .map(|root| root.join(".finch/tool_patterns.json"))
                 .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json")),
+            source_index_state: source_index_state_for_home(home.as_deref()),
             conversation_log_path: home
                 .map(|root| root.join(".finch/conversations.jsonl"))
                 .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl")),
@@ -920,13 +920,13 @@ impl Repl {
             input_handler_factory,
             models_dir,
             patterns_path,
+            source_index_state,
             conversation_log_path,
             active_persona,
             workspace_root,
             project_program_root,
         } = initialization;
         let tool_workspace_root = resolve_workspace_root(&workspace_root);
-        let source_index_state = source_index_state_path(&patterns_path, "source-index");
         let mention_port = crate::cli::mention_session::MentionSession::new(workspace_root.clone())
             as Arc<dyn crate::cli::tui::MentionPort>;
 
@@ -1080,10 +1080,12 @@ impl Repl {
         tool_registry.register(Box::new(GlobTool));
         tool_registry.register(Box::new(GrepTool));
         tool_registry.register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
-        tool_registry.register(Box::new(FindCodeTool::new(
-            tool_workspace_root.clone(),
-            source_index_state.clone(),
-        )));
+        if let Some(source_index_state) = &source_index_state {
+            tool_registry.register(Box::new(FindCodeTool::new(
+                tool_workspace_root.clone(),
+                source_index_state.clone(),
+            )));
+        }
         tool_registry.register(Box::new(WebFetchTool::new()));
         tool_registry.register(Box::new(BashTool));
         // Background command lifecycle (#754): one manager per session, so
@@ -1246,12 +1248,12 @@ impl Repl {
                     .register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
                 let fallback_patterns_path =
                     std::env::temp_dir().join("finch_patterns_fallback.json");
-                let fallback_source_index_state =
-                    source_index_state_path(&fallback_patterns_path, "finch-source-index-fallback");
-                fallback_registry.register(Box::new(FindCodeTool::new(
-                    tool_workspace_root.clone(),
-                    fallback_source_index_state,
-                )));
+                if let Some(source_index_state) = &source_index_state {
+                    fallback_registry.register(Box::new(FindCodeTool::new(
+                        tool_workspace_root.clone(),
+                        source_index_state.clone(),
+                    )));
+                }
                 fallback_registry.register(Box::new(WebFetchTool::new()));
                 fallback_registry.register(Box::new(BashTool));
                 let background_tasks = Arc::new(crate::brain::BackgroundTaskManager::new());
