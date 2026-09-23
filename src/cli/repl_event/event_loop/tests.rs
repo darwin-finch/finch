@@ -5125,7 +5125,7 @@ fn test_tool_approval_dialog_summary_edit_is_one_line() {
     );
 }
 
-// ── dialog_result_to_confirmation (3-option Claude Code style) ───────────
+// ── dialog_result_to_confirmation (4-option Claude Code style, #902) ──────
 
 #[test]
 fn test_dialog_result_selected_0_approve_once() {
@@ -5162,16 +5162,44 @@ fn test_dialog_result_selected_1_approve_pattern_session() {
 }
 
 #[test]
-fn test_dialog_result_selected_2_deny() {
-    // Option "3. No" → Deny
-    let tool = make_tool_use("bash", serde_json::json!({"command": "rm -rf /"}));
+fn test_dialog_result_selected_2_approve_pattern_persistent() {
+    // Option "3. Yes, and always allow bash:*" → ApprovePatternPersistent (#902).
+    // The tool-execution path routes this variant through
+    // `approve_pattern_persistent` + `save_patterns()`, which writes the
+    // disk-backed store that survives restart.
+    let tool = make_tool_use("bash", serde_json::json!({"command": "cargo fmt"}));
     let result = dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(2), &tool);
+    match result {
+        crate::cli::repl_event::events::ConfirmationResult::ApprovePatternPersistent(p) => {
+            assert_eq!(
+                p.tool_name, "bash",
+                "persistent pattern tool_name should match ToolUse.name"
+            );
+            assert_eq!(
+                p.pattern, "*",
+                "persistent grant is the same wildcard shape"
+            );
+            assert!(
+                p.description.contains("persistent"),
+                "description must mark the grant persistent: {}",
+                p.description
+            );
+        }
+        other => panic!("expected ApprovePatternPersistent, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_dialog_result_selected_3_deny() {
+    // Option "4. No" → Deny
+    let tool = make_tool_use("bash", serde_json::json!({"command": "rm -rf /"}));
+    let result = dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(3), &tool);
     assert!(
         matches!(
             result,
             crate::cli::repl_event::events::ConfirmationResult::Deny
         ),
-        "index 2 (No) should be Deny, got {:?}",
+        "index 3 (No) should be Deny, got {:?}",
         result
     );
 }
@@ -5258,16 +5286,15 @@ fn test_pattern_session_tool_name_matches_tool_use() {
 
 #[test]
 fn test_pattern_persistent_tool_name_matches_tool_use() {
-    // Persistent approval is no longer in the 3-option dialog.
-    // Index 2 → Deny; index 99 → Deny. Just verify nothing panics.
+    // Index 3 ("4. No") → Deny; index 99 → Deny. Nothing panics.
     let tool = make_tool_use("read", serde_json::json!({"file_path": "src/lib.rs"}));
-    let result = dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(2), &tool);
+    let result = dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(3), &tool);
     assert!(
         matches!(
             result,
             crate::cli::repl_event::events::ConfirmationResult::Deny
         ),
-        "index 2 is No/Deny in 3-option dialog, got {:?}",
+        "index 3 is No/Deny in 4-option dialog, got {:?}",
         result
     );
 }

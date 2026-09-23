@@ -33,6 +33,9 @@ from `src/tools/permissions.rs`. The pure policy tests live beside them in
 `src/permissions.rs`. The tests that exercise real registered tool implementations remain at the
 composition root (`src/tools/permissions/tests.rs`), at their original
 `tools::permissions::tests::*` module path, because only there can the real tools be constructed.
+Tools that resolve paths against a fixed workspace expose that root through `Tool::workspace_root`;
+the application executor must reject a registry whose tool root differs from
+`PermissionManager::workspace_root`.
 
 **Surface tiers (issue #962 audit).** The `pub use` list in [`src/lib.rs`](src/lib.rs) is the
 cross-crate contract; everything below it is tiered so implementation detail cannot leak back in:
@@ -46,8 +49,8 @@ cross-crate contract; everything below it is tiered so implementation detail can
   `PermissionManager::new`/`for_peer`, never set by callers),
   `ExactApproval::{matches, increment_match}`, `RejectReason::typed_message`.
 - **Test-only (`#[cfg(test)]`):** `PersistentPatternStore::{get_pattern, find_by_id,
-  find_by_id_mut}`, `ToolPattern::new_structured`, `PermissionManager::workspace_root`,
-  `ToolRegistry::{len, dispatch_names}`, `ToolCatalog::new`,
+  find_by_id_mut}`, `ToolPattern::new_structured`, `ToolRegistry::{len, dispatch_names}`,
+  `ToolCatalog::new`,
   `ToolLoop::{identity, execution_starts, results_appended}`, and the five `ContentBlock`
   accessors (`is_text`, `is_tool_use`, `is_tool_result`, `as_text`, `as_tool_use` — callers
   match on the enum).

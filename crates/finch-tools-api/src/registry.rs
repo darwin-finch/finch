@@ -8,6 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Tool trait - all tools must implement this
 #[async_trait]
@@ -40,6 +41,13 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with given input and context
     async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String>;
+
+    /// Canonical workspace authority this tool uses for path resolution, when
+    /// execution is bound to one. Executors reject a root that differs from
+    /// their permission manager's root before accepting the registry.
+    fn workspace_root(&self) -> Option<&Path> {
+        None
+    }
 
     /// Dispatch-only spellings for this tool.
     ///

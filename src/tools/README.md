@@ -4,7 +4,8 @@ This module connects Finch's shared tool contract to application-owned execution
 executor, concrete local and GUI tools, task-list and post-edit diagnostic adapters, and the
 wiring for external MCP tools. The `Tool` contract, registry, typed calls/results, permission
 policy, and tool-round protocol live in `finch-tools-api`; named-Brain background task records
-live in `finch-brain`. This module does not own either contract or durable Brain state.
+live in `finch-brain`; source identity and structural outlines live in `source_index`. This module
+does not own those contracts or durable Brain state.
 
 Two callers show how those pieces meet:
 
@@ -18,6 +19,10 @@ Two callers show how those pieces meet:
    directly for each provider tool use and returns result blocks to the provider. This legacy
    path does not currently use `ToolLoop`; do not infer the REPL's round-admission guarantees
    for it from the shared executor alone.
+
+The `code_outline` implementation is an adapter: it supplies the session workspace root to the
+source-index facade and returns its bounded JSON envelope. Corpus structure, source generations,
+and parser selection do not belong in the executor.
 
 Use the [agent contract](AGENTS.md) for authority and dependency rules, [`mod.rs`](mod.rs) for
 the flat root-package facade, and the [MCP guide](mcp/README.md) for external connections.

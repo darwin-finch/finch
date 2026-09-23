@@ -5275,10 +5275,17 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::ToolUse) -> String 
 
 /// Convert a dialog selection to a `ConfirmationResult` for tool approval.
 ///
-/// 3-option mapping (Claude Code style):
-///   - `Selected(0)` → `ApproveOnce`            ("1. Yes")
-///   - `Selected(1)` → `ApprovePatternSession`   ("2. Yes, and don't ask again for: tool:*")
-///   - `Selected(2+)` / `Cancelled` → `Deny`     ("3. No")
+/// 4-option mapping (Claude Code style, #902):
+///   - `Selected(0)` → `ApproveOnce`              ("1. Yes")
+///   - `Selected(1)` → `ApprovePatternSession`    ("2. Yes, and don't ask again for: tool:*")
+///   - `Selected(2)` → `ApprovePatternPersistent` ("3. Yes, and always allow tool:*")
+///   - `Selected(3+)` / `Cancelled` → `Deny`      ("4. No")
+///
+/// The persistent variant is routed by the caller (`tool_execution.rs`) through
+/// `approve_pattern_persistent` + `save_patterns()`, the same disk-backed store
+/// the pattern-matching security gates (workspace containment, never-widen,
+/// constitutional denylist) check at match time. File-mutating tools arrive
+/// with the "Edit in $EDITOR" index already shifted out by the call sites.
 ///
 /// Exported `pub(crate)` so it can be unit-tested directly.
 pub(crate) fn dialog_result_to_confirmation(
@@ -5300,7 +5307,20 @@ pub(crate) fn dialog_result_to_confirmation(
                 );
                 ConfirmationResult::ApprovePatternSession(pattern)
             }
-            _ => ConfirmationResult::Deny, // "3. No" or anything beyond
+            2 => {
+                // Durable wildcard: always allow this tool, persisted to disk
+                // (#902). Still gated by the pattern security checks at match time.
+                let pattern = ToolPattern::new(
+                    "*".to_string(),
+                    tool_use.name.clone(),
+                    format!(
+                        "Allow all {} calls (persistent, always allow)",
+                        tool_use.name
+                    ),
+                );
+                ConfirmationResult::ApprovePatternPersistent(pattern)
+            }
+            _ => ConfirmationResult::Deny, // "4. No" or anything beyond
         },
         _ => ConfirmationResult::Deny,
     }

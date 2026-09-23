@@ -30,12 +30,15 @@ use crate::tools::ToolPattern;
 use crate::tools::ToolPermissionConfig;
 use crate::tools::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::{
-    AnsibleTool, AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool,
-    HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool, WebFetchTool, WriteTool,
+    resolve_workspace_root, PermissionManager, PermissionRule, ToolExecutor, ToolRegistry,
+};
+use crate::tools::{
+    AnsibleTool, AskUserQuestionTool, BashTool, CodeOutlineTool, EditTool, EnterPlanModeTool,
+    GlobTool, GrepTool, HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool,
+    WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 use crate::tools::{GuiClickTool, GuiInspectTool, GuiTypeTool};
-use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 use crate::tools::{ToolDefinition, ToolUse};
 use crate::training::batch_trainer::BatchTrainer;
 
@@ -80,6 +83,7 @@ pub(crate) const REPL_ALWAYS_ALLOW_TOOLS: &[&str] = &[
     "read",
     "glob",
     "grep",
+    "code_outline",
     "web_fetch",
     "search_memory",
     "inspect_memory",
@@ -913,6 +917,7 @@ impl Repl {
             workspace_root,
             project_program_root,
         } = initialization;
+        let tool_workspace_root = resolve_workspace_root(&workspace_root);
         let mention_port = crate::cli::mention_session::MentionSession::new(workspace_root.clone())
             as Arc<dyn crate::cli::tui::MentionPort>;
 
@@ -1113,7 +1118,7 @@ impl Repl {
                         false
                     }
                 },
-                workspace_root,
+                workspace_root.clone(),
             ),
         );
         #[cfg(target_os = "macos")]
@@ -1136,6 +1141,7 @@ impl Repl {
         tool_registry.register(Box::new(ReadTool));
         tool_registry.register(Box::new(GlobTool));
         tool_registry.register(Box::new(GrepTool));
+        tool_registry.register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
         tool_registry.register(Box::new(WebFetchTool::new()));
         tool_registry.register(Box::new(BashTool));
         // Background command lifecycle (#754): one manager per session, so
@@ -1278,7 +1284,9 @@ impl Repl {
         } else {
             PermissionRule::Ask
         };
-        let mut permissions = PermissionManager::new().with_default_rule(default_rule);
+        let mut permissions = PermissionManager::new()
+            .with_workspace_root(tool_workspace_root.clone())
+            .with_default_rule(default_rule);
         apply_repl_always_allow_tools(&mut permissions);
 
         // Determine patterns path
@@ -1292,6 +1300,8 @@ impl Repl {
                 fallback_registry.register(Box::new(ReadTool));
                 fallback_registry.register(Box::new(GlobTool));
                 fallback_registry.register(Box::new(GrepTool));
+                fallback_registry
+                    .register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
                 fallback_registry.register(Box::new(WebFetchTool::new()));
                 fallback_registry.register(Box::new(BashTool));
                 let background_tasks = Arc::new(crate::brain::BackgroundTaskManager::new());
@@ -1328,7 +1338,9 @@ impl Repl {
                 register_repl_tool_aliases(&mut fallback_registry);
                 ToolExecutor::new(
                     fallback_registry,
-                    PermissionManager::new().with_default_rule(PermissionRule::Allow),
+                    PermissionManager::new()
+                        .with_workspace_root(tool_workspace_root.clone())
+                        .with_default_rule(PermissionRule::Allow),
                     std::env::temp_dir().join("finch_patterns_fallback.json"),
                 )
                 .expect("Failed to create fallback tool executor")
