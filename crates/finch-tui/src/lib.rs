@@ -71,7 +71,7 @@ mod widgets;
 use accordion::{
     AccordionState, ClaimedDisclosureRect, RenderedTranscriptLine, TranscriptHitRegion,
 };
-use scroll_view::{scroll_window_split, TranscriptScrollView};
+use scroll_view::TranscriptScrollView;
 use tool_viewport::{
     is_left_click, wheel_delta, ExpandedToolView, ToolViewportState, DEFAULT_TOOL_OUTPUT_ROWS,
     PAGE_STEP_LINES,
@@ -1952,6 +1952,19 @@ impl TuiRenderer {
             .unwrap_or_else(|| self.session_label.clone());
         let live_messages = self.find_live_messages();
         let live_rendered = self.projected_lines(live_messages, term_width);
+        // While scrolled (#897) the live suffix is part of the scroll window:
+        // the newest rows of the union are hidden below the viewport, so the
+        // live area renders only the suffix's lines above the hidden tail and
+        // the reader sees one contiguous window over the projected union.
+        // Follow mode (offset 0) clips nothing and stays byte-identical.
+        let live_rendered = if self.transcript_scroll.offset() == 0 {
+            live_rendered
+        } else {
+            let (union, live_start) = self.projected_scroll_union(term_width);
+            let (split, _skipped) = self.transcript_scroll.derive_window(&union, term_width);
+            let visible_end = split.max(live_start).min(union.len());
+            union[live_start..visible_end].to_vec()
+        };
         LiveFrameSources {
             input_cursor: self.input_textarea.cursor(),
             ghost_text: self.ghost_text.clone(),
@@ -2091,17 +2104,6 @@ fn say_turn_consolidated_source_ids(messages: &[MessageRef]) -> HashSet<MessageI
         }
     }
     suppressed
-}
-
-fn visible_printed_messages(
-    messages: &[MessageRef],
-    printed_ids: &HashSet<MessageId>,
-) -> Vec<MessageRef> {
-    messages
-        .iter()
-        .filter(|message| printed_ids.contains(&message.id()))
-        .cloned()
-        .collect()
 }
 
 struct CanonicalCommitPlan {
@@ -2461,7 +2463,7 @@ impl TuiRenderer {
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
             let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
-            let committed_rows = match commit_complete_messages(
+            match commit_complete_messages(
                 &mut stdout,
                 &plan.emit,
                 &mut self.accordion,
@@ -2470,17 +2472,18 @@ impl TuiRenderer {
                 usize::from(term_height),
                 usize::from(term_width),
             ) {
-                Ok(rows) => rows,
+                Ok(_committed_rows) => {}
                 Err(error) => {
                     let _ = execute!(stdout, EndSynchronizedUpdate);
                     return Err(error);
                 }
             };
             // A reader scrolled into history must not be dragged by content
-            // arriving at the bottom (#806): the committed rows are hidden
-            // below the window now, so the offset grows by the same amount.
-            // Follow mode (offset 0) keeps tracking the newest content.
-            self.transcript_scroll.anchor_committed_rows(committed_rows);
+            // arriving at the bottom (#806, #897): the next window derivation
+            // anchors the offset against the projected union's growth, so the
+            // committed rows trade places with the live suffix below the
+            // window while the same older content stays in view. Follow mode
+            // (offset 0) keeps tracking the newest content.
             self.pending_viewport_size = Some((term_width, term_height));
             self.viewport_invalidated = true;
             self.redraw_full_viewport_inner(true)?;
@@ -2819,6 +2822,53 @@ impl TuiRenderer {
         rendered
     }
 
+    /// The projected transcript union the conversation ScrollView reads
+    /// (#897): every message retained by the output port — the
+    /// canonical-committed prefix and the live uncommitted suffix — in
+    /// conversation order, projected by the same component-owned projection
+    /// the viewport paints, with say-turn consolidation applied over the
+    /// whole union. Returns the union and the line index where the live
+    /// suffix begins. `printed_ids` never filters scroll content; it only
+    /// marks the committed/live boundary, and stays the canonical-commit
+    /// exactly-once record.
+    fn projected_scroll_union(&mut self, width: usize) -> (Vec<RenderedTranscriptLine>, usize) {
+        let messages = self.output_manager.get_messages();
+        let consolidated = say_turn_consolidated_source_ids(&messages);
+        let mut union: Vec<RenderedTranscriptLine> = Vec::new();
+        let mut live_start = usize::MAX;
+        for message in &messages {
+            if live_start == usize::MAX && !self.printed_ids.contains(&message.id()) {
+                live_start = union.len();
+            }
+            if consolidated.contains(&message.id()) {
+                continue;
+            }
+            union.extend(self.projected_message_lines(message, width));
+            union.push(RenderedTranscriptLine {
+                ..RenderedTranscriptLine::default()
+            });
+        }
+        if live_start == usize::MAX {
+            // No live suffix: every retained line is committed.
+            live_start = union.len();
+        }
+        (union, live_start)
+    }
+
+    /// The committed portion of the conversation scroll window (#897): the
+    /// union above the hidden tail, cut at the live boundary. The transcript
+    /// region (full-viewport repaint and the retained hit-region rebuild)
+    /// paints the tail of this; the live suffix's lines above the hidden tail
+    /// render in the live area instead, so a scrolled reader sees one
+    /// contiguous window over the union. Deriving the window also anchors
+    /// the offset against content growth while scrolled.
+    fn scroll_window_committed_source(&mut self, width: usize) -> Vec<RenderedTranscriptLine> {
+        let (union, live_start) = self.projected_scroll_union(width);
+        let (split, _skipped) = self.transcript_scroll.derive_window(&union, width);
+        let committed_end = split.min(live_start);
+        union[..committed_end].to_vec()
+    }
+
     fn rebuild_transcript_hit_regions(
         &mut self,
         frame: &LiveFrame,
@@ -2831,18 +2881,13 @@ impl TuiRenderer {
         // chrome (#806). A dialog or tiny frame claims nothing.
         self.transcript_scroll.set_claim(frame.rects.transcript);
         let transcript_budget = height.saturating_sub(live_rows);
-        let messages = self.output_manager.get_messages();
-        let printed = visible_printed_messages(&messages, &self.printed_ids);
-        let projected = self.projected_lines(printed, width);
-        // The scroll window is derived at paint time (#806): the same split
-        // the full repaint paints, so hit regions stay aligned with the
-        // visible rows while the conversation is scrolled. The quantised
-        // skip also bounds the offset when content shrank.
-        let (prefix, skipped) =
-            scroll_window_split(&projected, width, self.transcript_scroll.offset());
-        self.transcript_scroll.set_offset(skipped);
-        let transcript =
-            viewport_tail_rendered_lines(&projected[..prefix], width, transcript_budget);
+        // The scroll window is derived at paint time from the projected
+        // live + retained union (#897): the same committed source the full
+        // repaint paints, so hit regions stay aligned with the visible rows
+        // while the conversation is scrolled. The derivation also anchors
+        // and bounds the offset.
+        let source = self.scroll_window_committed_source(width);
+        let transcript = viewport_tail_rendered_lines(&source, width, transcript_budget);
         let transcript_rows = transcript
             .iter()
             .map(|line| shadow_buffer::physical_rows(&line.text, width.max(1)))
@@ -3073,11 +3118,15 @@ impl TuiRenderer {
             // The conversation ScrollView owns everything above the bottom
             // chrome (#806). Chrome rows below the transcript claim belong to
             // nobody, so a wheel there is claimed by neither the ScrollView
-            // nor a tool viewport.
+            // nor a tool viewport. The transcript scrolls by its own step
+            // (#897), never the tool viewport's one-row tick.
             if !self.transcript_scroll.owns(mouse.column, mouse.row) {
                 return false;
             }
-            self.scroll_transcript_view(delta)
+            let Some(transcript_delta) = scroll_view::transcript_wheel_delta(mouse.kind) else {
+                return false;
+            };
+            self.scroll_transcript_view(transcript_delta)
         } else {
             self.handle_accordion_mouse(mouse)
         }
@@ -3086,11 +3135,13 @@ impl TuiRenderer {
     /// Page keys scroll the conversation ScrollView when nothing more
     /// specific claims them (#806): no dialog, no expanded tool surface, and
     /// no focused tool-output row — those callers return earlier. Up/Down stay
-    /// with history navigation and the composer.
+    /// with history navigation and the composer. A page is the visible
+    /// conversation pane's height, the ScrollView's own step (#897).
     fn handle_transcript_scroll_key(&mut self, key: KeyEvent) -> bool {
+        let page = self.transcript_scroll.page_step() as isize;
         let delta = match key.code {
-            KeyCode::PageUp => -(PAGE_STEP_LINES as isize),
-            KeyCode::PageDown => PAGE_STEP_LINES as isize,
+            KeyCode::PageUp => -page,
+            KeyCode::PageDown => page,
             _ => return false,
         };
         self.scroll_transcript_view(delta)
@@ -3370,18 +3421,13 @@ impl TuiRenderer {
             .min(term_height);
         let transcript_budget = term_height.saturating_sub(live_rows);
 
-        let messages = self.output_manager.get_messages();
-        let projected = self.projected_lines(
-            visible_printed_messages(&messages, &self.printed_ids),
-            term_width,
-        );
-        // The conversation ScrollView's window (#806): derive the split at
-        // paint time from the same projection the hit regions use, and keep
+        // The conversation ScrollView's window (#806, #897): derive the
+        // committed portion of the projected live + retained union at paint
+        // time from the same projection the hit regions use. The derivation
+        // anchors the offset against content growth while scrolled and keeps
         // the quantised offset honest.
-        let (prefix, skipped) =
-            scroll_window_split(&projected, term_width, self.transcript_scroll.offset());
-        self.transcript_scroll.set_offset(skipped);
-        let transcript = projected[..prefix]
+        let source = self.scroll_window_committed_source(term_width);
+        let transcript = source
             .iter()
             .map(|line| line.text.clone())
             .collect::<Vec<_>>();
@@ -4594,6 +4640,22 @@ mod tests {
     use finch_messages::{Message, MessageId, MessageRef, StaticMessage, WorkUnit};
     use finch_theme::ColorTheme;
 
+    /// The messages already committed to native scrollback, in order. Tests
+    /// use this to reconstruct the canonical-commit reader's projection; the
+    /// conversation ScrollView reads the projected live + retained union
+    /// instead (#897), so production code never filters scroll content by
+    /// `printed_ids`.
+    fn visible_printed_messages(
+        messages: &[MessageRef],
+        printed_ids: &HashSet<MessageId>,
+    ) -> Vec<MessageRef> {
+        messages
+            .iter()
+            .filter(|message| printed_ids.contains(&message.id()))
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn renderer_owns_render_failure_recovery_state() {
         let mut renderer = headless_renderer();
@@ -4924,9 +4986,10 @@ mod tests {
         );
         assert_eq!(
             renderer.transcript_scroll.offset(),
-            tool_viewport::WHEEL_STEP_LINES,
-            "INVARIANT: the wheel moved the conversation window up by one row; \
-             offset was {:?}",
+            scroll_view::TRANSCRIPT_WHEEL_STEP_LINES,
+            "INVARIANT: the wheel moved the conversation window up by the \
+             ScrollView's own step, never the tool viewport's one-row tick \
+             (#897); offset was {:?}",
             renderer.transcript_scroll.offset()
         );
         assert_eq!(
@@ -5276,27 +5339,24 @@ mod tests {
         renderer.is_active = false;
     }
 
-    /// INVARIANT (#806): while the reader is scrolled into history, content
-    /// committing at the bottom must not drag the window — the anchor grows
-    /// the offset by exactly the committed rows, so the same older content
-    /// stays in view. Follow mode keeps tracking the newest content.
+    /// INVARIANT (#806, #897): while the reader is scrolled into history,
+    /// content committing at the bottom must not drag the window — the next
+    /// derived window anchors the offset against the projected union's
+    /// growth, so the same older content stays in view. Follow mode keeps
+    /// tracking the newest content.
     #[test]
     fn test_commit_anchor_keeps_the_scrolled_window_on_the_same_content() {
         let (mut renderer, _) = committed_tool_result_renderer(40);
         let width = 80;
-        let projected = |renderer: &mut TuiRenderer| {
-            renderer.projected_lines(
-                visible_printed_messages(
-                    &renderer.output_manager.get_messages(),
-                    &renderer.printed_ids,
-                ),
-                width,
-            )
+        // Derive the window over the projected live + retained union exactly
+        // as every paint does (#897) — this records the anchor baseline.
+        let derived_prefix = |renderer: &mut TuiRenderer| {
+            let (union, _) = renderer.projected_scroll_union(width);
+            let (split, _) = renderer.transcript_scroll.derive_window(&union, width);
+            (union, split)
         };
         renderer.transcript_scroll.scroll(-6);
-        let before = projected(&mut renderer);
-        let (prefix_before, _) =
-            scroll_window_split(&before, width, renderer.transcript_scroll.offset());
+        let (before, prefix_before) = derived_prefix(&mut renderer);
 
         let second = Arc::new(WorkUnit::new("response"));
         second.set_response("a brand new completed turn");
@@ -5320,11 +5380,8 @@ mod tests {
             rows > 0,
             "precondition: committing a turn reports its physical row count"
         );
-        renderer.transcript_scroll.anchor_committed_rows(rows);
 
-        let after = projected(&mut renderer);
-        let (prefix_after, _) =
-            scroll_window_split(&after, width, renderer.transcript_scroll.offset());
+        let (after, prefix_after) = derived_prefix(&mut renderer);
         assert_eq!(
             before[prefix_before - 1].text,
             after[prefix_after - 1].text,
@@ -5349,16 +5406,26 @@ mod tests {
             renderer.mouse_tracking = tracking;
             let frame = plan_frame_for_test(80, 24, &[]);
             renderer.transcript_scroll.set_claim(frame.rects.transcript);
+            assert_ne!(
+                frame.rects.transcript.height,
+                tool_viewport::PAGE_STEP_LINES,
+                "precondition (#897): the conversation pane's height is not the \
+                 bounded tool viewport's page step; claim was {:?}",
+                frame.rects.transcript
+            );
             assert!(
                 renderer.handle_accordion_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
                 "PageUp must scroll the conversation when nothing more specific claims it"
             );
             assert_eq!(
                 renderer.transcript_scroll.offset(),
-                tool_viewport::PAGE_STEP_LINES,
-                "INVARIANT: PageUp moved the conversation up by one page from follow \
-                 mode; offset was {:?}, tracking {tracking:?}",
-                renderer.transcript_scroll.offset()
+                renderer.transcript_scroll.page_step(),
+                "INVARIANT: PageUp moved the conversation up by one page of the \
+                 visible pane — the ScrollView's own step, not the tool \
+                 viewport's (#897); offset was {:?}, claim {:?}, tracking \
+                 {tracking:?}",
+                renderer.transcript_scroll.offset(),
+                frame.rects.transcript
             );
             assert!(
                 renderer.handle_accordion_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
@@ -5372,6 +5439,135 @@ mod tests {
             );
             renderer.is_active = false;
         }
+    }
+
+    /// The bottom-most non-empty live transcript line the live area would
+    /// paint, planned exactly as `draw_live_area_to` plans it: the real
+    /// ViewModel sources (including the scrolled live clip, #897) through the
+    /// real claiming pass.
+    fn bottom_visible_live_line(renderer: &mut TuiRenderer, width: usize, height: usize) -> String {
+        let sources = renderer.live_frame_sources(width);
+        let vm = live_view_model(&sources, width, height, None, None);
+        let mut autocomplete = renderer.autocomplete_state.clone();
+        let frame = plan_live_frame(&vm, &mut autocomplete);
+        frame
+            .visible_live
+            .iter()
+            .rev()
+            .find(|line| !line.text.is_empty())
+            .map(|line| line.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// INVARIANT (#897): the conversation ScrollView scrolls the LIVE
+    /// projected transcript, not only canonical-committed text. With almost
+    /// the whole conversation in the uncommitted live suffix — the reported
+    /// repro — a wheel tick must reveal older live content, exactly the
+    /// ScrollView's own step, asserted at the claiming boundary the paints
+    /// use.
+    #[test]
+    fn test_wheel_up_reveals_older_content_with_transcript_taller_than_viewport() {
+        let (mut renderer, _) = committed_tool_result_renderer(2);
+        let live = Arc::new(WorkUnit::new("streaming"));
+        let response = (0..12)
+            .map(|n| format!("live line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        live.set_response(response);
+        // The unit stays InProgress, so the whole visible conversation is the
+        // uncommitted live suffix — exactly the reported #897 scenario where
+        // `printed_ids` held almost nothing and the window could not move.
+        assert!(
+            matches!(live.status(), finch_messages::MessageStatus::InProgress),
+            "precondition: the streaming turn is uncommitted"
+        );
+        renderer.add_trait_message(live);
+
+        let width = 80usize;
+        let height = 24usize;
+        // One real paint: the claiming boundary — the live frame plans from
+        // the real sources and the hit regions rebuild from the real
+        // projection, storing the wheel hitbox.
+        let mut sink = Vec::new();
+        renderer
+            .draw_live_area_to(&mut sink)
+            .expect("live area paints");
+        assert!(
+            renderer.transcript_scroll.claim().height > 0,
+            "precondition: the frame claimed a transcript pane; claim was {:?}",
+            renderer.transcript_scroll.claim()
+        );
+        assert!(
+            bottom_visible_live_line(&mut renderer, width, height).contains("live line 11"),
+            "precondition: follow mode shows the newest streamed line; live \
+             area painted {:?}",
+            renderer
+                .live_frame_sources(width)
+                .live_rendered
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let mut bytes = Vec::new();
+        assert!(
+            renderer.handle_mouse_to(wheel_up(), &mut bytes),
+            "a wheel over the transcript claim is consumed by the ScrollView"
+        );
+        assert_eq!(
+            renderer.transcript_scroll.offset(),
+            scroll_view::TRANSCRIPT_WHEEL_STEP_LINES,
+            "the wheel moved by the ScrollView's own step (#897); offset was {:?}",
+            renderer.transcript_scroll.offset()
+        );
+        // Each of the newest three union rows is one physical row at this
+        // width, so one tick hides the separator blank, "live line 11" and
+        // "live line 10" — the window's bottom lands exactly on "live line 9".
+        let revealed = bottom_visible_live_line(&mut renderer, width, height);
+        let step = scroll_view::TRANSCRIPT_WHEEL_STEP_LINES;
+        assert_eq!(
+            revealed.trim(),
+            "live line 9",
+            "INVARIANT (#897): one wheel tick must reveal older LIVE content — the \
+             live area must end exactly {step} union rows higher instead of \
+             staying pinned to the newest line; bottom was {revealed:?}"
+        );
+        renderer.is_active = false;
+    }
+
+    /// INVARIANT (#897): follow mode sticks to the bottom while streaming —
+    /// appends to the live transcript keep the newest line in view and the
+    /// offset never accumulates.
+    #[test]
+    fn test_follow_mode_sticks_to_bottom_while_streaming() {
+        let (mut renderer, _) = committed_tool_result_renderer(2);
+        let live = Arc::new(WorkUnit::new("streaming"));
+        live.set_response("live line 0");
+        renderer.add_trait_message(live.clone());
+
+        let width = 80usize;
+        let height = 24usize;
+        assert!(
+            bottom_visible_live_line(&mut renderer, width, height).contains("live line 0"),
+            "precondition: follow mode shows the newest streamed line"
+        );
+
+        // Streaming appends arrive between paints.
+        live.append_response("\nlive line 1\nlive line 2");
+        let revealed = bottom_visible_live_line(&mut renderer, width, height);
+        assert_eq!(
+            revealed.trim(),
+            "live line 2",
+            "INVARIANT: follow mode tracks the newest streamed content — the live \
+             area's bottom line must be the newest appended line, not an older \
+             one; bottom was {revealed:?}"
+        );
+        assert_eq!(
+            renderer.transcript_scroll.offset(),
+            0,
+            "INVARIANT: follow mode never accumulates an offset while streaming"
+        );
+        renderer.is_active = false;
     }
 
     /// INVARIANT: clicking a tool result's compact window opens the focused
@@ -9900,19 +10096,11 @@ mod tests {
                 .unwrap()
                 .0;
             let transcript_budget = height.saturating_sub(live_rows);
-            let projected = renderer.projected_lines(
-                visible_printed_messages(
-                    &renderer.output_manager.get_messages(),
-                    &renderer.printed_ids,
-                ),
-                width,
-            );
-            let (prefix, _) =
-                scroll_window_split(&projected, width, renderer.transcript_scroll.offset());
-            let transcript: Vec<String> = projected[..prefix]
-                .iter()
-                .map(|line| line.text.clone())
-                .collect();
+            // The scroll window reads the projected live + retained union
+            // (#897): the transcript region paints the committed portion
+            // above the hidden tail, exactly as the full repaint does.
+            let source = renderer.scroll_window_committed_source(width);
+            let transcript: Vec<String> = source.iter().map(|line| line.text.clone()).collect();
             let transcript = viewport_tail_lines(&transcript, width, transcript_budget);
             let plan = viewport_redraw_plan(height, live_rows, transcript.len());
             let sources = renderer.live_frame_sources(width);
@@ -9944,8 +10132,8 @@ mod tests {
                 find("──"),
             ];
             // The furniture rows sit in the live frame — below the transcript
-            // window and above the session separator — on the same frame slots
-            // at every offset.
+            // window and above the session separator — never riding the
+            // scrollable content, at every offset.
             for slot in slots.iter().take(4) {
                 assert!(
                     *slot >= live_frame_start && *slot < live_frame_start + frame.lines.len(),
@@ -9960,19 +10148,27 @@ mod tests {
                 "INVARIANT: the separator paints below the tracked row at scroll \
                  {label}; slots {slots:?}"
             );
-            let frame_slots: Vec<usize> = slots[..4]
+            // The furniture sits a fixed distance above the composer: the
+            // live frame is bottom-anchored, so the furniture's composer-
+            // anchored slots are stable at every scroll position (#966).
+            // The frame-top-relative slots vary with the scrolled live clip
+            // (#897): the live suffix's lines above the hidden tail shrink
+            // the frame's viewport content while the composer never moves.
+            let frame_len = frame.lines.len();
+            let composer_slots: Vec<usize> = slots[..4]
                 .iter()
-                .map(|slot| slot - live_frame_start)
+                .map(|slot| frame_len - (slot - live_frame_start))
                 .collect();
             if let Some(previous) = &furniture_slots {
                 assert_eq!(
-                    previous, &frame_slots,
-                    "INVARIANT: the furniture rows must hold the same live-frame \
-                     slots at every scroll position; bottom was {previous:?}, \
-                     {label} was {frame_slots:?}"
+                    previous, &composer_slots,
+                    "INVARIANT: the furniture rows must hold the same \
+                     composer-anchored live-frame slots at every scroll \
+                     position; bottom was {previous:?}, \
+                     {label} was {composer_slots:?}"
                 );
             }
-            furniture_slots = Some(frame_slots);
+            furniture_slots = Some(composer_slots);
             assert!(
                 frame.physical_rows(width) + transcript.len() <= height,
                 "INVARIANT: the composed screen must fit the terminal at scroll \

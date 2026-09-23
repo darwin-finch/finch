@@ -122,17 +122,34 @@ enters it. Code-block bodies stay whitespace-exact in both targets; the fence li
 visible text (dimmed in the viewport), so no-color reading relies on characters, not color.
 Malformed input and outside-the-subset constructs pass through literally without panicking.
 
-## The conversation ScrollView owns reading (#806)
+## The conversation ScrollView owns reading (#806, #897)
 
 The transcript region — the root column's `Flex` `TRANSCRIPT` claim, the leftover frame
 under the bottom chrome — is an in-app scroll view (`scroll_view.rs`). Renderer state is one
-offset from the bottom of the retained transcript (0 = follow mode); the window is derived
-at paint time by `scroll_window_split`, shared by the full-viewport repaint and the
-retained hit-region rebuild. Wheel ticks land on the ScrollView inside the claim, on a
-nested tool-result control inside its rect, and on nothing over the bottom chrome; the
-claim is the wheel hitbox, stored from `frame.rects` by the same rebuild that rebuilds the
-accordion regions. PageUp/PageDown scroll it from the keyboard, independent of mouse
-tracking. Mouse tracking is held by default (`mouse_capture.rs`) — the #441
+offset from the bottom of the scroll content (0 = follow mode). The scroll content is the
+**projected rendered-line union** (#897): every message retained by the output port — the
+canonical-committed prefix **and** the live uncommitted suffix — projected at paint time by
+the same component-owned projection the viewport paints (`projected_lines`, say-turn
+consolidation included); `printed_ids` never filters scroll content and stays the
+canonical-commit exactly-once record. The window is derived at paint time by
+`TranscriptScrollView::derive_window` (which also anchors the offset against content
+growth while scrolled, so streaming appends and commits never drag a scrolled reader, and
+stores the quantised honest offset), shared by the full-viewport repaint, the retained
+hit-region rebuild, and the live frame's clip. The two painted surfaces divide the window
+at the committed/live boundary: the transcript region paints the tail of the union's
+committed portion above the hidden tail, and the live area paints only the suffix's lines
+above the hidden tail (`union[live_start..split]`), so a scrolled reader sees one
+contiguous window and the live suffix scrolls away like native scrollback; in follow mode
+(offset 0) nothing is clipped and frames are byte-identical to the unscrolled shape.
+Wheel ticks land on the ScrollView inside the claim, on a nested tool-result control
+inside its rect, and on nothing over the bottom chrome; the claim is the wheel hitbox,
+stored from `frame.rects` by the same rebuild that rebuilds the accordion regions.
+Step sizes are the ScrollView's own (#897): a wheel tick moves `TRANSCRIPT_WHEEL_STEP_LINES`
+(3) rows and PageUp/PageDown move one page of the visible pane
+(`TranscriptScrollView::page_step`), independent of the bounded tool-result viewport's
+`WHEEL_STEP_LINES` (1) and `PAGE_STEP_LINES` (4), which keep serving the tool viewport and
+the expanded surface only. PageUp/PageDown scroll it from the keyboard, independent of
+mouse tracking. Mouse tracking is held by default (`mouse_capture.rs`) — the #441
 release-on-first-wheel hybrid is retired, native history stays the copyable record via
 `canonical_commit`, and while scrolled up a commit anchors the window instead of dragging
 the reader.

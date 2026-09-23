@@ -4,26 +4,57 @@
 //! `TRANSCRIPT` claim, the leftover frame under the bottom chrome — is a
 //! scroll view over the conversation (#806). The state is presentation-only,
 //! like the accordion's open set and the tool viewports' offsets: one offset
-//! counted in physical terminal rows from the bottom of the retained
-//! transcript, where `0` is follow mode (the newest content stays in view).
+//! counted in physical terminal rows from the bottom of the scroll content,
+//! where `0` is follow mode (the newest content stays in view).
 //!
-//! The window is derived, never stored: every paint projects the retained
-//! transcript from the output port, splits off the newest `offset` rows,
-//! and paints the bottom window of what remains. Resize, reflow, and
-//! disclosure changes therefore never desynchronize the view from the content.
+//! The scroll content is the **projected rendered-line union** (#897): every
+//! message retained by the output port — the canonical-committed prefix and
+//! the live uncommitted suffix — projected at paint time by the same
+//! component-owned projection the viewport paints. The window is derived,
+//! never stored: every paint splits the union at the scrolled offset and the
+//! two painted surfaces divide it at the committed/live boundary (the
+//! transcript region takes the committed portion, the live area the suffix's
+//! lines above the hidden tail). Resize, reflow, and disclosure changes
+//! therefore never desynchronize the view from the content.
+//!
+//! Step sizes are the ScrollView's own (#897): a wheel tick moves a few rows
+//! and a PageUp/PageDown moves a page of the visible pane — never the bounded
+//! tool-result viewport's one-row tick or four-row page.
 
 use super::accordion::RenderedTranscriptLine;
 use super::shadow_buffer;
 use super::widgets::Rect;
+use crossterm::event::MouseEventKind;
+
+/// Rows one wheel tick moves the conversation transcript (#897).
+///
+/// A full transcript pane scrolls a few rows per tick; the bounded
+/// tool-result viewport keeps its own one-row tick
+/// (`tool_viewport::WHEEL_STEP_LINES`) and the two never mix.
+pub(crate) const TRANSCRIPT_WHEEL_STEP_LINES: usize = 3;
+
+/// The transcript's own wheel delta (#897): negative toward older content.
+/// A horizontal wheel has no vertical scroll owner and stays unclaimed.
+pub(crate) fn transcript_wheel_delta(kind: MouseEventKind) -> Option<isize> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(-(TRANSCRIPT_WHEEL_STEP_LINES as isize)),
+        MouseEventKind::ScrollDown => Some(TRANSCRIPT_WHEEL_STEP_LINES as isize),
+        _ => None,
+    }
+}
 
 /// Scroll state for the conversation transcript.
 ///
-/// `offset_from_bottom` is how many physical rows of the newest retained
-/// transcript are hidden below the viewport. Zero is follow mode; painting
-/// never scrolls on the renderer's behalf — only input moves the offset.
+/// `offset_from_bottom` is how many physical rows of the newest projected
+/// union are hidden below the viewport. Zero is follow mode; painting never
+/// scrolls on the renderer's behalf — only input moves the offset.
 #[derive(Debug, Default)]
 pub(crate) struct TranscriptScrollView {
     offset_from_bottom: usize,
+    /// The scroll content's physical row count as of the last derived
+    /// window (#897): the anchor reads the growth since that derivation so
+    /// commits and streaming appends never drag a scrolled reader.
+    content_rows: usize,
     /// The transcript region claimed by the last painted frame, in terminal
     /// rows — the 805 `TRANSCRIPT` Flex claim (the leftover frame under the
     /// bottom chrome). Wheels inside it scroll the conversation.
@@ -59,14 +90,25 @@ impl TranscriptScrollView {
         self.claim
     }
 
-    /// How far the view is scrolled up from the newest retained row.
+    /// How far the view is scrolled up from the newest projected row.
     pub(crate) fn offset(&self) -> usize {
         self.offset_from_bottom
     }
 
+    /// Rows one PageUp/PageDown moves (#897): a page of the conversation
+    /// pane — the transcript claim of the last painted frame — at least one
+    /// row. The bounded tool-result viewport keeps its own four-row page.
+    pub(crate) fn page_step(&self) -> usize {
+        self.claim.height.max(1)
+    }
+
     /// Store the quantised offset a paint derived: the split hides whole
     /// lines only, so this is at most the requested offset and also bounds
-    /// the state when content shrank since the last paint.
+    /// the state when content shrank since the last paint. Production code
+    /// positions the reader only through [`Self::scroll`] and
+    /// [`Self::derive_window`]; tests use this to place the reader at an
+    /// absolute offset.
+    #[cfg(test)]
     pub(crate) fn set_offset(&mut self, offset: usize) {
         self.offset_from_bottom = offset;
     }
@@ -75,8 +117,9 @@ impl TranscriptScrollView {
     /// positive back toward the bottom. Returns whether the window moved.
     ///
     /// The upper bound is not known without projecting the content, so it is
-    /// clamped at paint time (see [`scroll_window_split`]); this method only
-    /// clamps the bottom at follow mode.
+    /// clamped at paint time (see [`scroll_window_split`] and
+    /// [`Self::derive_window`]); this method only clamps the bottom at follow
+    /// mode.
     pub(crate) fn scroll(&mut self, delta: isize) -> bool {
         let next = if delta < 0 {
             self.offset_from_bottom.saturating_add(delta.unsigned_abs())
@@ -92,18 +135,42 @@ impl TranscriptScrollView {
         true
     }
 
-    /// Anchor the window while scrolled up: `rows` physical rows were just
-    /// committed to the retained transcript, so the same older content stays
-    /// in view instead of sliding down. Follow mode stays at zero.
-    pub(crate) fn anchor_committed_rows(&mut self, rows: usize) {
-        if self.offset_from_bottom > 0 {
-            self.offset_from_bottom += rows;
+    /// Derive the paint-time window over the projected union (#806, #897).
+    ///
+    /// While scrolled (offset above follow mode), the offset is first
+    /// anchored against the content's growth since the last derived window:
+    /// rows appended at the bottom of the union — streaming appends, a turn
+    /// committing — must not drag the reader, so the same older content stays
+    /// in view. Follow mode (offset 0) keeps tracking the newest content and
+    /// records the content size without anchoring.
+    ///
+    /// Returns `(split, skipped)`: `union[..split]` is the prefix above the
+    /// window's hidden tail, and `skipped <= offset` counts the whole lines
+    /// actually hidden (the split never cuts a wrapped line in half). The
+    /// quantised `skipped` is stored back as the honest offset, which also
+    /// bounds the state when content shrank since the last paint.
+    pub(crate) fn derive_window(
+        &mut self,
+        union: &[RenderedTranscriptLine],
+        width: usize,
+    ) -> (usize, usize) {
+        let total_rows: usize = union
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(&line.text, width.max(1)))
+            .sum();
+        if self.offset_from_bottom > 0 && self.content_rows > 0 {
+            let growth = total_rows.saturating_sub(self.content_rows);
+            self.offset_from_bottom = self.offset_from_bottom.saturating_add(growth);
         }
+        self.content_rows = total_rows;
+        let (split, skipped) = scroll_window_split(union, width, self.offset_from_bottom);
+        self.offset_from_bottom = skipped;
+        (split, skipped)
     }
 }
 
-/// Split the projected retained transcript so the newest `offset` physical
-/// rows are excluded.
+/// Split the projected scroll content (the live + retained union, #897) so
+/// the newest `offset` physical rows are excluded.
 ///
 /// Returns `(split_index, skipped_rows)`: `lines[..split_index]` is the
 /// prefix to window over, and `skipped_rows <= offset` counts the whole lines
@@ -213,25 +280,115 @@ mod tests {
     }
 
     #[test]
-    fn test_anchor_keeps_the_window_still_while_streaming_commits() {
-        // INVARIANT (#806): a reader scrolled into history must not be dragged
-        // by content arriving at the bottom of the conversation. Only follow
-        // mode (offset 0) tracks the newest content.
+    fn test_derived_window_anchors_growth_so_appends_do_not_drag_the_reader() {
+        // INVARIANT (#806, #897): a reader scrolled into history must not be
+        // dragged by content arriving at the bottom of the projected union —
+        // streaming appends and commits alike. Only follow mode (offset 0)
+        // tracks the newest content.
         let mut view = TranscriptScrollView::new();
-        view.scroll(-10);
-        view.anchor_committed_rows(7);
+        view.scroll(-4);
+        let all = lines(&["one", "two", "three", "four", "five"]);
+        let (split, skipped) = view.derive_window(&all, 80);
         assert_eq!(
-            view.offset(),
-            17,
-            "committed rows push the hidden-from-bottom count up by the same amount, \
-             keeping the window anchored to the same older content"
+            (split, skipped),
+            (1, 4),
+            "the first derivation over five rows hides the newest four; \
+             split was {split}, skipped {skipped}"
         );
-        let mut following = TranscriptScrollView::new();
-        following.anchor_committed_rows(7);
+        // Three rows stream in at the bottom: the same older content stays
+        // in view because the offset grows by the growth.
+        let grown = lines(&[
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ]);
+        let (split, skipped) = view.derive_window(&grown, 80);
         assert_eq!(
-            following.offset(),
-            0,
-            "follow mode stays pinned to the newest content"
+            (split, skipped),
+            (1, 7),
+            "the hidden tail grew to include the appended rows, keeping the \
+             window on the same older content; split was {split}, skipped {skipped}"
+        );
+        let visible: Vec<&str> = grown[..split]
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(
+            visible,
+            ["one"],
+            "the window still ends at the same oldest row after the append"
+        );
+        // Scrolling back to follow mode tracks the newest content again.
+        view.scroll(grown.len() as isize);
+        assert_eq!(view.offset(), 0, "returning to the bottom is follow mode");
+        let (split, skipped) = view.derive_window(&grown, 80);
+        assert_eq!(
+            (split, skipped),
+            (grown.len(), 0),
+            "follow mode hides nothing; split was {split}, skipped {skipped}"
+        );
+        // And a follow-mode append does not grow the offset.
+        let (split, _) = view.derive_window(&lines(&["one", "two"]), 80);
+        assert_eq!(
+            split, 2,
+            "follow mode keeps the whole (smaller) content in the window"
+        );
+        assert_eq!(view.offset(), 0, "follow mode never accumulates an offset");
+    }
+
+    #[test]
+    fn test_transcript_wheel_step_is_its_own_few_lines_per_tick() {
+        // INVARIANT (#897): the conversation ScrollView's wheel step is its
+        // own constant, never the bounded tool-result viewport's one-row
+        // tick — a full transcript pane scrolls a few rows per tick.
+        assert_ne!(
+            TRANSCRIPT_WHEEL_STEP_LINES,
+            super::super::tool_viewport::WHEEL_STEP_LINES,
+            "the transcript wheel step must differ from the tool viewport's; \
+             transcript {TRANSCRIPT_WHEEL_STEP_LINES}, tool {}",
+            super::super::tool_viewport::WHEEL_STEP_LINES
+        );
+        assert_eq!(
+            transcript_wheel_delta(crossterm::event::MouseEventKind::ScrollUp),
+            Some(-(TRANSCRIPT_WHEEL_STEP_LINES as isize)),
+            "a wheel tick toward older content moves TRANSCRIPT_WHEEL_STEP_LINES rows"
+        );
+        assert_eq!(
+            transcript_wheel_delta(crossterm::event::MouseEventKind::ScrollDown),
+            Some(TRANSCRIPT_WHEEL_STEP_LINES as isize),
+            "a wheel tick toward the bottom moves TRANSCRIPT_WHEEL_STEP_LINES rows"
+        );
+        assert_eq!(
+            transcript_wheel_delta(crossterm::event::MouseEventKind::ScrollLeft),
+            None,
+            "a horizontal wheel has no vertical scroll owner"
+        );
+    }
+
+    #[test]
+    fn test_transcript_page_step_is_the_visible_pane_not_the_tool_page() {
+        // INVARIANT (#897): PageUp/PageDown move a page of the conversation
+        // pane — the last painted transcript claim — never the bounded
+        // tool-result viewport's four-row page.
+        let mut view = TranscriptScrollView::new();
+        view.set_claim(Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 17,
+        });
+        assert_eq!(view.page_step(), 17, "a page is the claimed pane height");
+        assert_ne!(
+            view.page_step(),
+            super::super::tool_viewport::PAGE_STEP_LINES,
+            "the transcript page step must differ from the tool viewport's; \
+             transcript {}, tool {}",
+            view.page_step(),
+            super::super::tool_viewport::PAGE_STEP_LINES
+        );
+        view.set_claim(Rect::default());
+        assert_eq!(
+            view.page_step(),
+            1,
+            "a frame with no transcript claim still moves at least one row"
         );
     }
 
