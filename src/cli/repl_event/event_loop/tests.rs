@@ -6380,6 +6380,83 @@ async fn test_cancel_does_not_refire_queued_turn_out_of_order() {
         .await;
 }
 
+/// #463: CancelQuery must clear a stale `pending_dialog_tx`, or the next
+/// unrelated dialog answer gets silently routed into it (a receiver nobody
+/// awaits anymore, since handle_present_plan's own select! already resolved
+/// via cancellation) instead of the request it was actually meant for --
+/// leaving that request's own `response_rx.await` waiting forever.
+#[tokio::test]
+async fn test_cancel_clears_stale_pending_dialog_tx_so_the_next_answer_is_not_swallowed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut event_loop, _tempdir) = auto_accept_event_loop();
+
+            // Query A: simulate handle_present_plan's ShowDialog having been
+            // processed -- pending_dialog_tx now holds a real, still-alive sender.
+            let query_a = event_loop.query_states.create_query(Vec::new()).await;
+            *event_loop.active_query_id.write().await = Some(query_a);
+            let (dialog_tx, mut dialog_rx) = tokio::sync::oneshot::channel();
+            let dialog =
+                crate::cli::tui::Dialog::select_with_custom("plan?".to_string(), Vec::new());
+            event_loop
+                .handle_event(super::ReplEvent::ShowDialog {
+                    dialog,
+                    response_tx: dialog_tx,
+                })
+                .await
+                .expect("ShowDialog must dispatch");
+            assert!(
+                event_loop.pending_dialog_tx.is_some(),
+                "test setup: pending_dialog_tx must be populated before cancel"
+            );
+
+            // Cancel query A -- must clear the stale sender, not just drop the
+            // query's own tracked state.
+            event_loop
+                .handle_event(super::ReplEvent::CancelQuery)
+                .await
+                .expect("CancelQuery must dispatch");
+            assert!(
+                event_loop.pending_dialog_tx.is_none(),
+                "CancelQuery must clear pending_dialog_tx (#463)"
+            );
+            assert!(
+                dialog_rx.try_recv().is_err(),
+                "the cancelled dialog's own receiver must not have been answered"
+            );
+
+            // Query B: an unrelated tool approval shown AFTER the cancel. Before
+            // the fix, a stale pending_dialog_tx would have intercepted this
+            // dialog's real answer at priority 0 in resolve_dialog_result,
+            // leaving query B's response_rx waiting forever.
+            let query_b = uuid::Uuid::new_v4();
+            let tool_use = crate::tools::ToolUse::new("read".to_string(), serde_json::json!({}));
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            event_loop
+                .handle_tool_approval_request(query_b, tool_use, Vec::new(), response_tx)
+                .await
+                .expect("tool approval request must be accepted");
+
+            event_loop
+                .resolve_dialog_result(crate::cli::tui::DialogResult::Selected(0))
+                .await
+                .expect("resolving the dialog result must succeed");
+
+            let confirmation = response_rx.await.expect(
+                "query B's tool-approval answer must reach it, not be swallowed by a stale \
+                 pending_dialog_tx left over from the cancelled query A (#463)",
+            );
+            assert!(
+                matches!(
+                    confirmation,
+                    crate::cli::repl_event::events::ConfirmationResult::ApproveOnce
+                ),
+                "expected ApproveOnce for the answered dialog; got {confirmation:?}"
+            );
+        })
+        .await;
+}
+
 fn completed_execution_outcome(output: &str) -> crate::runtime::ExecutionOutcome {
     crate::runtime::ExecutionOutcome {
         execution_id: uuid::Uuid::new_v4(),

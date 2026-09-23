@@ -780,6 +780,18 @@ impl EventLoop {
                     // Drop the oneshot so a pending changeset is denied as a unit
                     // instead of applying after the user has cancelled.
                     self.pending_approvals.write().await.remove(&qid);
+                    // Drop a stale ShowDialog response channel too (#463). Left in
+                    // place, it would sit at priority 0 in resolve_dialog_result and
+                    // silently swallow the NEXT unrelated dialog answer -- sent into
+                    // a receiver nobody is awaiting anymore (handle_present_plan's own
+                    // select! already resolved via cancellation), so the answer never
+                    // reaches whatever it was actually for (a VM/remote-brain/tool
+                    // approval), and that request's own response_rx.await waits
+                    // forever. Reachable via the remote named-Brain cancel path, which
+                    // fires this event without going through the keyboard (the
+                    // keyboard path can't reach CancelQuery while a dialog owns the
+                    // key: dialog_owns_key routes it to the dialog instead).
+                    self.pending_dialog_tx = None;
                     self.conversation.write().await.abort_staged(qid);
                     self.close_active_tool_rows(qid, "cancelled").await;
                     let named_turn =

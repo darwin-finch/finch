@@ -341,7 +341,19 @@ impl ToolExecutionCoordinator {
                     return;
                 }
 
-                // Wait for approval response (blocks only THIS task)
+                // Wait for approval response (blocks only THIS task). Unbounded
+                // deliberately, not an oversight: `response_tx` always fires
+                // eventually. Either the user answers and resolve_dialog_result's
+                // tool-approval branch (event_loop.rs) sends the real confirmation,
+                // or this query is cancelled and CancelQuery removes this exact
+                // entry from `pending_approvals` (event_loop/dispatch.rs), dropping
+                // `response_tx` so this resolves with Err immediately. That
+                // guarantee depended on CancelQuery also clearing a stale
+                // `pending_dialog_tx` (#463): left dangling, it sat at priority 0 in
+                // resolve_dialog_result and could swallow a LATER, unrelated tool
+                // approval's real answer before this branch was ever reached,
+                // leaving `response_tx` alive but never sent -- the one shape this
+                // wait was not actually safe against, now closed.
                 match response_rx.await {
                     Ok(confirmation) => {
                         // Process approval result
