@@ -9476,7 +9476,6 @@ mod tests {
                 let rule = "─".repeat(width);
                 let mut expected = vec![
                     "──  ~/repos/finch  jade-river ──".to_string(),
-                    rule.clone(),
                     format!("  {title}"),
                     rule.clone(),
                     "    ☐ Keep".to_string(),
