@@ -431,6 +431,25 @@ impl RepositoryCache {
             .map(cap_std::fs::File::into_std)
     }
 
+    fn sync_directory(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            // `open_dir_nofollow` may use Linux O_PATH. That descriptor is
+            // sufficient for capability-relative traversal but fsync returns
+            // EBADF. Reopen only `.` beneath the held capability with read
+            // authority so the published rename can be durably synced.
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            return self
+                .directory
+                .open_with(".", &options)
+                .map(cap_std::fs::File::into_std)?
+                .sync_all();
+        }
+        #[cfg(not(unix))]
+        self.directory.try_clone()?.into_std_file().sync_all()
+    }
+
     fn read_image(&self) -> IndexResult<Option<CacheImage>> {
         let file = match self.open_private_leaf(&self.cache_leaf, false, false) {
             Ok(file) => file,
@@ -568,9 +587,7 @@ impl RepositoryCache {
                 source: std::io::Error::other("injected directory sync failure"),
             });
         }
-        self.directory
-            .try_clone()
-            .and_then(|directory| directory.into_std_file().sync_all())
+        self.sync_directory()
             .map_err(|source| RepositoryIndexError::PublishedButNotDurable { source })?;
         Ok(())
     }
