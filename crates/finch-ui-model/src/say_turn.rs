@@ -129,6 +129,7 @@ fn fmt_elapsed(secs: u64) -> String {
 fn body_line(text: String) -> RenderedTranscriptLine {
     RenderedTranscriptLine {
         text,
+        spans: Vec::new(),
         row_id: None,
         row_expanded: None,
         role: Some(NodeRole::Output),
@@ -143,6 +144,7 @@ fn body_line(text: String) -> RenderedTranscriptLine {
 fn toggle_line(text: String, target: &RowId, show_program: bool) -> RenderedTranscriptLine {
     RenderedTranscriptLine {
         text,
+        spans: Vec::new(),
         row_id: Some(target.clone()),
         row_expanded: Some(show_program),
         role: Some(NodeRole::Output),
