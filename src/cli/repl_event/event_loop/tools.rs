@@ -464,7 +464,9 @@ impl EventLoop {
             return Ok(());
         }
 
-        // Create approval dialog — compact 3-option style matching Claude Code UX.
+        // Create approval dialog — compact 4-option style matching Claude Code UX
+        // (Yes / session / persistent always-allow / No, #902; file-mutating tools
+        // insert the $EDITOR choice at index 1).
         // Consecutive write/edit/patch calls share one Yes/No changeset dialog.
         let mut summary = if batch.len() > 1 {
             super::super::changeset::changeset_approval_summary(&batch)
