@@ -50,6 +50,7 @@ mod autocomplete_widget;
 mod command_autocomplete;
 mod dialog;
 mod dialog_widget;
+mod dom_manifest;
 #[cfg(test)]
 mod isolation;
 mod mouse_capture;
@@ -203,6 +204,14 @@ pub fn emergency_restore_terminal() {
 }
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
+// The DOM manifest (#1141 part 2): the versioned wire contract the Tauri
+// client will consume over the daemon IPC (#808). The lowerings are engine
+// render modes; components never write HTML.
+pub use dom_manifest::{
+    component_manifest, component_ui_manifest, manifest_path_id, manifest_row_id,
+    manifest_spans, say_card_manifest, ui_manifest, widget_manifest, widget_ui_manifest,
+    DynamicUiNode, ManifestColor, ManifestSpan, UiManifest, MANIFEST_VERSION,
+};
 // The root setup wizard uses this named widget-host surface; keep the child
 // module private so the crate facade remains the only external path.
 pub use wizard_host::{
