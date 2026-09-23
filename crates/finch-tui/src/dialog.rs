@@ -214,19 +214,27 @@ impl Dialog {
         let tool_name = finch_diff::sanitize_terminal(tool_name);
         let summary = finch_diff::sanitize_multiline(summary);
         let is_file_mutating = matches!(tool_name.to_lowercase().as_str(), "write" | "edit");
+        // Options for the non-mutating layout; the file-mutating layout inserts
+        // "Edit in $EDITOR" at index 1 and shifts the rest.
+        let base = vec![
+            DialogOption::new("1. Yes"),
+            DialogOption::new(format!("2. Yes, and don't ask again for: {}:*", tool_name)),
+            DialogOption::new(format!("3. Yes, and always allow {}:*", tool_name)),
+            DialogOption::new("4. No"),
+        ];
         let options = if is_file_mutating {
-            vec![
-                DialogOption::new("1. Yes"),
-                DialogOption::new("2. Edit in $EDITOR"),
-                DialogOption::new(format!("3. Yes, and don't ask again for: {}:*", tool_name)),
-                DialogOption::new("4. No"),
-            ]
+            let mut shifted = vec![base[0].clone(), DialogOption::new("2. Edit in $EDITOR")];
+            for option in &base[1..] {
+                let label = option.label.replacen(
+                    |c: char| c.is_ascii_digit(),
+                    &(shifted.len() + 1).to_string(),
+                    1,
+                );
+                shifted.push(DialogOption::new(label));
+            }
+            shifted
         } else {
-            vec![
-                DialogOption::new("1. Yes"),
-                DialogOption::new(format!("2. Yes, and don't ask again for: {}:*", tool_name)),
-                DialogOption::new("3. No"),
-            ]
+            base
         };
         Dialog::select(format!("{}\n{}", tool_name, summary), options)
     }
@@ -1959,28 +1967,49 @@ mod tests {
     // ── tool_approval factory ──────────────────────────────────────────────────
 
     #[test]
-    fn test_tool_approval_non_mutating_has_three_options() {
+    fn test_tool_approval_non_mutating_has_four_options() {
+        // #902: the persistent "always allow" option is back in the TUI dialog.
         let dialog = Dialog::tool_approval("Read", "Read src/lib.rs");
         if let DialogType::Select { options, .. } = &dialog.dialog_type {
-            assert_eq!(options.len(), 3);
-            assert!(options[0].label.contains("Yes"));
+            assert_eq!(options.len(), 4);
+            assert!(options[0].label.contains("Yes"), "labels: {:?}", options);
             assert!(options[1].label.contains("don't ask again"));
             assert!(options[1].label.contains("Read:*"));
-            assert!(options[2].label.contains("No"));
+            assert!(
+                options[2].label.contains("always allow") && options[2].label.contains("Read:*"),
+                "option 3 must be the persistent always-allow: {:?}",
+                options[2].label
+            );
+            assert!(options[3].label.contains("No"));
         } else {
             panic!("expected Select dialog");
         }
     }
 
     #[test]
-    fn test_tool_approval_file_mutating_has_four_options() {
+    fn test_tool_approval_file_mutating_has_five_options() {
         for name in &["write", "Write", "edit", "Edit"] {
             let dialog = Dialog::tool_approval(name, "summary");
             if let DialogType::Select { options, .. } = &dialog.dialog_type {
-                assert_eq!(options.len(), 4, "tool '{}' should have 4 options", name);
+                assert_eq!(options.len(), 5, "tool '{}' should have 5 options", name);
                 assert!(
                     options[1].label.contains("$EDITOR"),
                     "tool '{}': option 2 should be Edit in $EDITOR",
+                    name
+                );
+                assert!(
+                    options[2].label.contains("don't ask again"),
+                    "tool '{}': option 3 should be session-scoped",
+                    name
+                );
+                assert!(
+                    options[3].label.contains("always allow"),
+                    "tool '{}': option 4 should be persistent always-allow",
+                    name
+                );
+                assert!(
+                    options[4].label.contains("No"),
+                    "tool '{}': option 5 should be No",
                     name
                 );
             } else {
@@ -2319,7 +2348,7 @@ mod tests {
              frame={width}x{height}"
         );
         assert!(
-            card_text.contains("1. Yes") && card_text.contains("4. No"),
+            card_text.contains("1. Yes") && card_text.contains("5. No"),
             "Yes/No must be inside the card's claimed rect: card={card:?}\n{card_text}"
         );
         assert!(
@@ -2369,17 +2398,19 @@ mod tests {
     }
 
     /// The exact-fit budget the overlay guaranteed at tiny terminals carries
-    /// over to the card: on an 8-row frame the card keeps Yes/No visible.
+    /// over to the card: on a 9-row frame the card keeps Yes/No visible.
+    /// (9, not 8: the approval suffix gained the persistent always-allow
+    /// option row in #902.)
     #[test]
     fn test_dialog_card_keeps_approval_controls_on_a_tiny_frame() {
         let (dialog, payload_bytes) = huge_html_write_dialog();
         let width = 80;
-        let height = 8;
+        let height = 9;
         let frame = plan_approval_frame(&dialog, width, height);
         let card = frame.rects.dialog_card;
         let card_text = plain_text(&card_lines_of(&frame, width));
         assert!(
-            card_text.contains("1. Yes") && card_text.contains("4. No"),
+            card_text.contains("1. Yes") && card_text.contains("5. No"),
             "an exact-fit card must keep approve/deny on an 8-row frame: card={card:?} \
              payload_bytes={payload_bytes}\n{card_text}"
         );
@@ -2496,8 +2527,8 @@ mod tests {
              {scrolled_text}",
             dialog.body_scroll_offset
         );
-        let no_top = control_row(&top, "4. No");
-        let no_scrolled = control_row(&scrolled, "4. No");
+        let no_top = control_row(&top, "5. No");
+        let no_scrolled = control_row(&scrolled, "5. No");
         assert_eq!(
             yes_top.map(|row| top.len() - row),
             yes_scrolled.map(|row| scrolled.len() - row),
@@ -2540,15 +2571,16 @@ mod tests {
 
     #[test]
     fn test_exact_fit_viewport_keeps_approval_controls_visible() {
-        // Write-approval suffix is 8 painted rows at width 80 (options divider,
-        // four options, buttons divider, Cancel, bottom rule). plan_live_frame
-        // spends one row on the session separator, so an 8-row terminal gives
-        // the dialog 7 rows. Pin must keep Yes/No even when chrome is one row
-        // over, not top-clip to a marker.
+        // Write-approval suffix is 9 painted rows at width 80 (options divider,
+        // five options — #902 added persistent always-allow — buttons divider,
+        // Cancel, bottom rule). plan_live_frame spends one row on the session
+        // separator, so a 9-row terminal gives the dialog 8 rows. Pin must
+        // keep Yes/No even when chrome is one row over, not top-clip to a
+        // marker.
         let (dialog, payload_bytes) = huge_html_write_dialog();
         let width = 80;
-        let height = 8;
-        let dialog_budget = 7;
+        let height = 9;
+        let dialog_budget = 8;
 
         let lines = super::super::TuiRenderer::dialog_lines(&dialog, width, dialog_budget);
         let painted: usize = lines
@@ -2557,7 +2589,7 @@ mod tests {
             .sum();
         let visible = visible_dialog_text(&lines);
         let yes_row = control_row(&lines, "1. Yes");
-        let no_row = control_row(&lines, "4. No");
+        let no_row = control_row(&lines, "5. No");
         assert!(
             yes_row.is_some() && no_row.is_some() && painted <= dialog_budget,
             "exact-fit pin must keep approve/deny: max_rows={dialog_budget} painted={painted} \
@@ -2573,7 +2605,7 @@ mod tests {
         let frame_painted = frame.physical_rows(width);
         let frame_text = visible_dialog_text(&frame.lines);
         let frame_yes = control_row(&frame.lines, "1. Yes");
-        let frame_no = control_row(&frame.lines, "4. No");
+        let frame_no = control_row(&frame.lines, "5. No");
         assert!(
             frame_yes.is_some() && frame_no.is_some() && frame_painted <= height,
             "plan_live_frame 80x8 must keep approve/deny: painted={frame_painted} \
@@ -2605,7 +2637,7 @@ mod tests {
             .map(|line| super::super::shadow_buffer::physical_rows(line, width))
             .sum();
         let visible = visible_dialog_text(&lines);
-        let no_row = control_row(&lines, "4. No");
+        let no_row = control_row(&lines, "5. No");
         let cancel_row = control_row(&lines, "[ Cancel ]");
         assert!(
             no_row.is_some() && cancel_row.is_some() && painted <= height,

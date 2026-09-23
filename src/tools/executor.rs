@@ -1570,6 +1570,71 @@ mod tests {
         let _keep = workspace;
     }
 
+    #[test]
+    fn test_dialog_minted_persistent_grant_round_trips_across_restart() {
+        // #902: the persistent always-allow the TUI dialog mints must survive
+        // restart. The dialog's Selected(2) produces
+        // ConfirmationResult::ApprovePatternPersistent; tool_execution.rs then
+        // calls approve_pattern_persistent + save_patterns(). Reproduce that
+        // exact sequence, then reload the same store path into a fresh executor
+        // (the restart) and assert the grant still matches.
+        let (workspace, root) = isolated_workspace();
+        let tempdir = tempfile::tempdir().expect("pattern store");
+        let store_path = tempdir.path().join("patterns.json");
+
+        let make = || {
+            let mut registry = crate::tools::ToolRegistry::new();
+            registry.register(Box::new(crate::tools::ReadTool));
+            ToolExecutor::new(
+                registry,
+                crate::tools::PermissionManager::new().with_workspace_root(root.clone()),
+                store_path.clone(),
+            )
+            .expect("executor")
+        };
+
+        // Session 1: user picks "3. Yes, and always allow read:*".
+        let mut first = make();
+        let minted = crate::tools::ToolPattern::new(
+            "*".to_string(),
+            "read".to_string(),
+            "Allow all read calls (persistent, always allow)".to_string(),
+        );
+        first.approve_pattern_persistent(minted);
+        first
+            .save_patterns()
+            .expect("persistent approval must write to disk immediately");
+        assert!(
+            store_path.exists(),
+            "save_patterns must create the store file at {}",
+            store_path.display()
+        );
+
+        // Session 2 (restart): a fresh executor loads the same path.
+        let mut restarted = make();
+        let inside = root.join("ok.txt");
+        std::fs::write(&inside, "ok").expect("seed");
+        let tool_use = ToolUse::new(
+            "read".to_string(),
+            json!({"file_path": inside.to_string_lossy()}),
+        );
+        let sig = generate_tool_signature(&tool_use, &root);
+        assert!(
+            sig.path_in_workspace,
+            "control: fixture path must be workspace-contained; root={root:?}"
+        );
+        assert!(
+            matches!(
+                restarted.is_approved(&sig),
+                ApprovalSource::PersistentPattern(_)
+            ),
+            "the grant minted in the previous session must still approve after \
+             restart; got {:?}",
+            restarted.is_approved(&sig)
+        );
+        let _keep = workspace;
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_symlink_escape_is_not_pattern_admissible_through_approval_path() {
