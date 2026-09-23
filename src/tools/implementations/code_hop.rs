@@ -33,6 +33,8 @@ const MAX_MECHANICAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MECHANICAL_MATCHES: usize = 100;
 const MAX_MECHANICAL_METADATA_BYTES: usize = 64 * 1024;
 const EXACT_PATH_WINDOW_LINES: usize = 80;
+const MAX_INDEX_WORK_BYTES: u64 = 256 * 1024 * 1024;
+const INDEX_WORK_TIMEOUT: Duration = Duration::from_secs(20);
 const CONFIDENT_SCORE_FLOOR: f64 = 1.0;
 const CONFIDENT_MARGIN: f64 = 0.75;
 
@@ -66,6 +68,7 @@ struct RankedCandidate {
     target: String,
     lead: Option<String>,
     score: f64,
+    ranking_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +93,8 @@ struct CodeHopMetrics {
     menus_considered: usize,
     candidates_considered: usize,
     routing_context_bytes: usize,
+    ranker_input_bytes: usize,
+    disambiguation_input_bytes: usize,
     mechanical_files_examined: usize,
     mechanical_source_bytes_examined: usize,
     selected_files: usize,
@@ -116,6 +121,8 @@ pub struct CodeHopTool {
     workspace_root: PathBuf,
     state_directory: PathBuf,
     disambiguator: Option<Arc<dyn CodeHopDisambiguator>>,
+    #[cfg(test)]
+    disambiguation_timeout: Duration,
 }
 
 impl CodeHopTool {
@@ -125,6 +132,8 @@ impl CodeHopTool {
             workspace_root: finch_tools_api::resolve_workspace_root(&workspace_root),
             state_directory: state_directory.into(),
             disambiguator: None,
+            #[cfg(test)]
+            disambiguation_timeout: DISAMBIGUATION_TIMEOUT,
         }
     }
 
@@ -134,36 +143,67 @@ impl CodeHopTool {
         self
     }
 
-    fn snapshot(&self, force_rebuild: bool) -> Result<(SourceResolver, RepositorySnapshot)> {
-        let resolver = SourceResolver::new(&self.workspace_root)?;
-        let cache = RepositoryCache::prepare(&self.state_directory, &resolver)?;
+    #[cfg(test)]
+    fn with_disambiguation_timeout(mut self, timeout: Duration) -> Self {
+        self.disambiguation_timeout = timeout;
+        self
+    }
+
+    async fn snapshot(&self, force_rebuild: bool) -> Result<(SourceResolver, RepositorySnapshot)> {
+        let workspace_root = self.workspace_root.clone();
+        let state_directory = self.state_directory.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            Self::snapshot_blocking(workspace_root, state_directory, force_rebuild)
+        });
+        tokio::time::timeout(INDEX_WORK_TIMEOUT + Duration::from_secs(1), task)
+            .await
+            .context("source-index work exceeded the code_hop deadline")?
+            .context("source-index worker task failed")?
+    }
+
+    fn snapshot_blocking(
+        workspace_root: PathBuf,
+        state_directory: PathBuf,
+        force_rebuild: bool,
+    ) -> Result<(SourceResolver, RepositorySnapshot)> {
+        let deadline = std::time::Instant::now() + INDEX_WORK_TIMEOUT;
+        let resolver = SourceResolver::new(&workspace_root)?;
+        let cache = RepositoryCache::prepare(&state_directory, &resolver)?;
         let cached = match cache.load() {
             Ok(cached) => cached,
             Err(RepositoryIndexError::IncompatibleCache { .. }) => {
                 let indexer = RepositoryIndexer::new(resolver, cache)?;
-                let snapshot = indexer.rebuild()?.snapshot;
-                return Ok((SourceResolver::new(&self.workspace_root)?, snapshot));
+                let snapshot = indexer
+                    .rebuild_bounded(deadline, MAX_INDEX_WORK_BYTES)?
+                    .snapshot;
+                return Ok((SourceResolver::new(&workspace_root)?, snapshot));
             }
             Err(error) => return Err(error.into()),
         };
         let indexer = RepositoryIndexer::new(resolver, cache)?;
         let snapshot = if force_rebuild {
-            indexer.rebuild()?.snapshot
+            indexer
+                .rebuild_bounded(deadline, MAX_INDEX_WORK_BYTES)?
+                .snapshot
         } else if let Some(snapshot) = cached {
-            if indexer.is_snapshot_current(&snapshot)? {
+            if indexer.is_snapshot_current_with_budget(&snapshot, deadline, MAX_INDEX_WORK_BYTES)? {
                 snapshot
             } else {
-                indexer.build()?.snapshot
+                indexer
+                    .build_bounded(deadline, MAX_INDEX_WORK_BYTES)?
+                    .snapshot
             }
         } else {
-            indexer.build()?.snapshot
+            indexer
+                .build_bounded(deadline, MAX_INDEX_WORK_BYTES)?
+                .snapshot
         };
-        Ok((SourceResolver::new(&self.workspace_root)?, snapshot))
+        Ok((SourceResolver::new(&workspace_root)?, snapshot))
     }
 
     async fn execute_query(&self, query: &str) -> Result<CodeHopResult> {
         for attempt in 0..2 {
-            let (resolver, snapshot) = self.snapshot(attempt == 1)?;
+            let (resolver, snapshot) = self.snapshot(attempt == 1).await?;
             let routed = self.route(query, &resolver, &snapshot).await?;
             let mut stale = false;
             for (source, span) in &routed.selected {
@@ -266,6 +306,7 @@ impl CodeHopTool {
                         target,
                         lead,
                         score: lexical_score(query, &rank_text),
+                        ranking_bytes: serialized_ranker_input_bytes(query, &rank_text),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -340,9 +381,7 @@ impl CodeHopTool {
                     break;
                 }
             }
-            if final_hops.is_empty() {
-                final_hops = path_steps;
-            }
+            final_hops.extend(path_steps);
         }
         metrics.selected_files = selected
             .iter()
@@ -384,6 +423,12 @@ impl CodeHopTool {
         candidates.sort_by(rank_order);
         metrics.menus_considered += 1;
         metrics.candidates_considered += candidates.len();
+        let ranker_bytes = candidates
+            .iter()
+            .map(|candidate| candidate.ranking_bytes)
+            .sum::<usize>();
+        metrics.ranker_input_bytes += ranker_bytes;
+        metrics.routing_context_bytes += ranker_bytes;
         let offered = candidates
             .iter()
             .take(MAX_DISAMBIGUATION_CANDIDATES)
@@ -405,6 +450,7 @@ impl CodeHopTool {
         if request_bytes.len() > MAX_DISAMBIGUATION_BYTES {
             bail!("code_hop sibling payload exceeds {MAX_DISAMBIGUATION_BYTES} bytes")
         }
+        metrics.disambiguation_input_bytes += request_bytes.len();
         metrics.routing_context_bytes += request_bytes.len();
         let confident = offered.len() == 1
             || (offered[0].score >= CONFIDENT_SCORE_FLOOR
@@ -422,8 +468,11 @@ impl CodeHopTool {
                 bail!("code_hop exceeded {MAX_DISAMBIGUATION_CALLS} disambiguation calls")
             }
             metrics.disambiguation_calls += 1;
-            let response =
-                tokio::time::timeout(DISAMBIGUATION_TIMEOUT, disambiguator.choose(&request)).await;
+            #[cfg(not(test))]
+            let timeout = DISAMBIGUATION_TIMEOUT;
+            #[cfg(test)]
+            let timeout = self.disambiguation_timeout;
+            let response = tokio::time::timeout(timeout, disambiguator.choose(&request)).await;
             match response {
                 Ok(Ok(ids)) => {
                     if let Some(selected) = validate_disambiguation(&offered, &ids) {
@@ -528,9 +577,40 @@ fn mechanical_route(
             })
             .collect::<Vec<_>>();
         files.sort_by(|left, right| left.outline.source.path.cmp(&right.outline.source.path));
-        if let Some(file) = files.first() {
+        if let Some(file) = files
+            .iter()
+            .copied()
+            .find(|file| file.outline.source.path == normalized)
+        {
             return Ok((
                 Some(mechanical_file_result(resolver, file, "exact path match")?),
+                None,
+            ));
+        }
+        if files.len() > 1 {
+            let mut attempts = files.into_iter();
+            let first = attempts
+                .next()
+                .expect("multiple suffix matches have a first");
+            let mut combined = mechanical_file_result(resolver, first, "suffix path match")?;
+            for file in attempts {
+                merge_route_attempts(
+                    &mut combined,
+                    mechanical_file_result(resolver, file, "suffix path match")?,
+                );
+                if combined.result.spans.len() == MAX_RETURNED_SPANS {
+                    break;
+                }
+            }
+            push_warning_once(
+                &mut combined.result.warnings,
+                "path suffix matched multiple files; returning bounded deterministic matches",
+            );
+            return Ok((Some(combined), None));
+        }
+        if let Some(file) = files.first() {
+            return Ok((
+                Some(mechanical_file_result(resolver, file, "suffix path match")?),
                 None,
             ));
         }
@@ -660,6 +740,9 @@ fn merge_route_attempts(primary: &mut RouteAttempt, secondary: RouteAttempt) {
     primary.result.metrics.menus_considered += secondary.result.metrics.menus_considered;
     primary.result.metrics.candidates_considered += secondary.result.metrics.candidates_considered;
     primary.result.metrics.routing_context_bytes += secondary.result.metrics.routing_context_bytes;
+    primary.result.metrics.ranker_input_bytes += secondary.result.metrics.ranker_input_bytes;
+    primary.result.metrics.disambiguation_input_bytes +=
+        secondary.result.metrics.disambiguation_input_bytes;
     primary.result.metrics.disambiguation_calls += secondary.result.metrics.disambiguation_calls;
     primary.result.metrics.selected_files = primary
         .selected
@@ -760,6 +843,7 @@ fn rank_file_records(
                 target: index.to_string(),
                 lead: None,
                 score: lexical_score(query, rank_text),
+                ranking_bytes: serialized_ranker_input_bytes(query, rank_text),
             }
         })
         .collect())
@@ -789,12 +873,29 @@ fn subtree_rank_text(
             text.push(' ');
             text.push_str(&record.kind);
             if text.len() >= 16 * 1024 {
-                text.truncate(16 * 1024);
+                truncate_utf8(&mut text, 16 * 1024);
                 return text;
             }
         }
     }
     text
+}
+
+fn truncate_utf8(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
+fn serialized_ranker_input_bytes(query: &str, candidate: &str) -> usize {
+    serde_json::to_vec(&serde_json::json!({"query": query, "candidate": candidate}))
+        .expect("strings always serialize to JSON")
+        .len()
 }
 
 fn lexical_score(query: &str, candidate: &str) -> f64 {
@@ -977,6 +1078,8 @@ mod tests {
         let root = tempfile::tempdir().expect("workspace");
         run_git(root.path(), &["init", "-q"]);
         fs::create_dir(root.path().join("src")).expect("src");
+        fs::create_dir(root.path().join("left")).expect("left");
+        fs::create_dir(root.path().join("right")).expect("right");
         fs::write(root.path().join("AGENTS.md"), "Repository map.\n").expect("root agents");
         fs::write(
             root.path().join("src/AGENTS.md"),
@@ -1008,6 +1111,13 @@ mod tests {
             "introductory prose without a heading\nsecond line\n",
         )
         .expect("headingless Markdown");
+        fs::write(root.path().join("left/mod.rs"), "pub fn route_left() {}\n")
+            .expect("left module");
+        fs::write(
+            root.path().join("right/mod.rs"),
+            "pub fn route_right() {}\n",
+        )
+        .expect("right module");
         run_git(root.path(), &["add", "."]);
         run_git(
             root.path(),
@@ -1033,6 +1143,67 @@ mod tests {
                 .expect("private state parent");
         }
         state
+    }
+
+    #[derive(Debug)]
+    struct BaselineMetrics {
+        task_success: bool,
+        context_bytes: usize,
+        files_read: usize,
+        unsupported_language_success: bool,
+    }
+
+    fn naive_grep_read_baseline(
+        resolver: &SourceResolver,
+        snapshot: &RepositorySnapshot,
+    ) -> BaselineMetrics {
+        let mut files_read = 0;
+        let mut context_bytes = 0;
+        let mut task_success = false;
+        let mut unsupported_language_success = false;
+        for file in &snapshot.files {
+            let source = resolver
+                .read(&file.outline.source.path)
+                .expect("baseline read");
+            files_read += 1;
+            if source.text.contains("admit_claim") {
+                context_bytes += source.text.len();
+                task_success = file.outline.source.path == "src/claim.rs"
+                    && file
+                        .outline
+                        .records
+                        .iter()
+                        .any(|record| record.name == "admit_claim");
+            }
+            if source.text.contains("unusual widgets") {
+                context_bytes += source.text.len();
+                unsupported_language_success = file.outline.source.path == "fallback.txt";
+            }
+        }
+        BaselineMetrics {
+            task_success,
+            context_bytes,
+            files_read,
+            unsupported_language_success,
+        }
+    }
+
+    fn file_list_baseline(snapshot: &RepositorySnapshot) -> BaselineMetrics {
+        let context_bytes = serde_json::to_vec(
+            &snapshot
+                .files
+                .iter()
+                .map(|file| file.outline.source.path.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .expect("file-list JSON")
+        .len();
+        BaselineMetrics {
+            task_success: false,
+            context_bytes,
+            files_read: 0,
+            unsupported_language_success: false,
+        }
     }
 
     #[tokio::test]
@@ -1080,6 +1251,15 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct AlwaysMutatingDisambiguator {
+        source: PathBuf,
+        calls: AtomicUsize,
+    }
+
+    struct FailingDisambiguator;
+
+    struct PendingDisambiguator;
+
     #[async_trait]
     impl CodeHopDisambiguator for MutatingDisambiguator {
         async fn choose(&self, request: &DisambiguationRequest) -> Result<Vec<String>> {
@@ -1095,6 +1275,37 @@ mod tests {
                 .first()
                 .map(|candidate| vec![candidate.id.clone()])
                 .unwrap_or_default())
+        }
+    }
+
+    #[async_trait]
+    impl CodeHopDisambiguator for AlwaysMutatingDisambiguator {
+        async fn choose(&self, request: &DisambiguationRequest) -> Result<Vec<String>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            fs::write(
+                &self.source,
+                format!("pub fn alpha_route() {{}}\npub fn beta_route() {{}}\n// race {call}\n"),
+            )
+            .expect("mutate selected source on every route");
+            Ok(request
+                .candidates
+                .first()
+                .map(|candidate| vec![candidate.id.clone()])
+                .unwrap_or_default())
+        }
+    }
+
+    #[async_trait]
+    impl CodeHopDisambiguator for FailingDisambiguator {
+        async fn choose(&self, _request: &DisambiguationRequest) -> Result<Vec<String>> {
+            bail!("injected disambiguator failure")
+        }
+    }
+
+    #[async_trait]
+    impl CodeHopDisambiguator for PendingDisambiguator {
+        async fn choose(&self, _request: &DisambiguationRequest) -> Result<Vec<String>> {
+            std::future::pending().await
         }
     }
 
@@ -1193,6 +1404,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_second_selected_leaf_race_returns_one_error_without_partial_result() {
+        let root = fixture();
+        let state = state_parent();
+        let disambiguator = Arc::new(AlwaysMutatingDisambiguator {
+            source: root.path().join("src/ambiguous.rs"),
+            calls: AtomicUsize::new(0),
+        });
+        let error = CodeHopTool::new(root.path(), state.path().join("source-index"))
+            .with_disambiguator(disambiguator.clone())
+            .execute_query("alpha beta")
+            .await
+            .err()
+            .expect("second race must fail closed");
+
+        assert!(error.to_string().contains("both code_hop routing attempts"));
+        assert!(disambiguator.calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_ambiguous_suffix_path_returns_each_bounded_branch_and_trace() {
+        let root = fixture();
+        let state = state_parent();
+        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+            .execute_query("mod.rs")
+            .await
+            .expect("suffix path route");
+
+        assert!(result.spans.iter().any(|span| span.path == "left/mod.rs"));
+        assert!(result.spans.iter().any(|span| span.path == "right/mod.rs"));
+        assert!(result
+            .hop_path
+            .iter()
+            .flat_map(|step| &step.picks)
+            .any(|pick| pick == "left/mod.rs"));
+        assert!(result
+            .hop_path
+            .iter()
+            .flat_map(|step| &step.picks)
+            .any(|pick| pick == "right/mod.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_ambiguous_natural_route_preserves_every_returned_branch_trace() {
+        let root = fixture();
+        let state = state_parent();
+        let result = CodeHopTool::new(root.path(), state.path().join("source-index"))
+            .execute_query("left right modules?")
+            .await
+            .expect("ambiguous natural route");
+        let returned_paths = result
+            .spans
+            .iter()
+            .map(|span| span.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let traced_files = result
+            .hop_path
+            .iter()
+            .map(|step| step.directory.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(returned_paths.len() > 1, "spans: {:?}", result.spans);
+        for path in returned_paths {
+            assert!(
+                traced_files.contains(path),
+                "missing branch trace for {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_repeat_route_is_byte_deterministic_and_records_comparative_metrics() {
         let root = fixture();
         let state = state_parent();
@@ -1215,28 +1495,33 @@ mod tests {
         let cache =
             RepositoryCache::prepare(state.path().join("source-index"), &resolver).expect("cache");
         let snapshot = cache.load().expect("load cache").expect("snapshot");
-        let naive_files = snapshot.files.len();
-        let naive_body_bytes = snapshot
-            .files
-            .iter()
-            .map(|file| file.outline.source.byte_len)
-            .sum::<usize>();
-        let file_list_bytes = serde_json::to_vec(
-            &snapshot
-                .files
-                .iter()
-                .map(|file| file.outline.source.path.as_str())
-                .collect::<Vec<_>>(),
-        )
-        .expect("file-list JSON")
-        .len();
+        let naive = naive_grep_read_baseline(&resolver, &snapshot);
+        let file_list = file_list_baseline(&snapshot);
+        let unsupported = tool
+            .execute_query("where are unusual widgets calibrated?")
+            .await
+            .expect("unsupported-language route");
 
+        assert!(first.spans.iter().any(|span| span.path == "src/claim.rs"));
         assert_eq!(first.metrics.body_bytes_disclosed, 0);
         assert_eq!(first.metrics.selected_files, 1);
-        assert!(naive_files > first.metrics.selected_files);
-        assert!(naive_body_bytes > 0);
-        assert!(file_list_bytes > 0);
+        assert_eq!(
+            first.metrics.routing_context_bytes,
+            first.metrics.ranker_input_bytes + first.metrics.disambiguation_input_bytes
+        );
         assert!(first.metrics.routing_context_bytes > 0);
+        assert!(naive.task_success);
+        assert!(naive.unsupported_language_success);
+        assert_eq!(naive.files_read, snapshot.files.len());
+        assert!(naive.context_bytes > 0);
+        assert!(!file_list.task_success);
+        assert!(!file_list.unsupported_language_success);
+        assert_eq!(file_list.files_read, 0);
+        assert!(file_list.context_bytes > 0);
+        assert!(unsupported
+            .spans
+            .iter()
+            .any(|span| span.path == "fallback.txt"));
     }
 
     #[tokio::test]
@@ -1264,6 +1549,85 @@ mod tests {
             result.warnings
         );
         assert_eq!(result.provenance.method, RetrievalMethod::Grep);
+    }
+
+    #[test]
+    fn test_disambiguator_rejects_duplicate_and_excessive_ids() {
+        let offered = (0..4)
+            .map(|index| RankedCandidate {
+                id: format!("id-{index}"),
+                name: format!("candidate-{index}"),
+                kind: "file".to_string(),
+                target: index.to_string(),
+                lead: None,
+                score: 0.0,
+                ranking_bytes: 0,
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_disambiguation(&offered, &["id-0".into(), "id-0".into()]).is_none());
+        assert!(validate_disambiguation(
+            &offered,
+            &["id-0".into(), "id-1".into(), "id-2".into(), "id-3".into()]
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_disambiguator_error_and_timeout_fall_back_with_warnings() {
+        let root = fixture();
+        let error_state = state_parent();
+        let failed = CodeHopTool::new(root.path(), error_state.path().join("source-index"))
+            .with_disambiguator(Arc::new(FailingDisambiguator))
+            .execute_query("alpha beta")
+            .await
+            .expect("error fallback");
+        assert!(failed
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("failed")));
+
+        let timeout_state = state_parent();
+        let timed_out = CodeHopTool::new(root.path(), timeout_state.path().join("source-index"))
+            .with_disambiguator(Arc::new(PendingDisambiguator))
+            .with_disambiguation_timeout(Duration::from_millis(1))
+            .execute_query("alpha beta")
+            .await
+            .expect("timeout fallback");
+        assert!(timed_out
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("timed out")));
+    }
+
+    #[tokio::test]
+    async fn test_directory_and_symbol_near_ties_use_the_same_disambiguation_rule() {
+        let root = fixture();
+        let state = state_parent();
+        let recorder = Arc::new(RecordingDisambiguator {
+            calls: AtomicUsize::new(0),
+            payloads: Mutex::new(Vec::new()),
+            preferred_name: "left".to_string(),
+            invalid: false,
+        });
+        let tool = CodeHopTool::new(root.path(), state.path().join("source-index"))
+            .with_disambiguator(recorder.clone());
+        tool.execute_query("left right modules?")
+            .await
+            .expect("directory near tie");
+        tool.execute_query("alpha beta")
+            .await
+            .expect("symbol near tie");
+        let payload = recorder.payloads.lock().expect("payload lock").join("\n");
+        assert!(payload.contains("\"kind\":\"directory\""), "{payload}");
+        assert!(payload.contains("alpha_route"), "{payload}");
+    }
+
+    #[test]
+    fn test_utf8_truncation_stops_at_a_character_boundary() {
+        let mut text = format!("{}é", "a".repeat(16 * 1024 - 1));
+        truncate_utf8(&mut text, 16 * 1024);
+        assert_eq!(text.len(), 16 * 1024 - 1);
+        assert!(text.is_char_boundary(text.len()));
     }
 
     #[tokio::test]
@@ -1341,6 +1705,7 @@ mod tests {
                 target: "beta".to_string(),
                 lead: None,
                 score: 1.0,
+                ranking_bytes: 1,
             },
             RankedCandidate {
                 id: "a".to_string(),
@@ -1349,6 +1714,7 @@ mod tests {
                 target: "alpha".to_string(),
                 lead: None,
                 score: 1.0,
+                ranking_bytes: 1,
             },
         ];
         candidates.sort_by(rank_order);
@@ -1379,31 +1745,19 @@ mod tests {
         let snapshot = cache.load().expect("load cache").expect("snapshot");
         let start = std::time::Instant::now();
         for _ in 0..ITERATIONS {
-            for file in &snapshot.files {
-                let source = resolver
-                    .read(&file.outline.source.path)
-                    .expect("naive read");
-                std::hint::black_box(source.text.contains("claim admission"));
-            }
+            std::hint::black_box(naive_grep_read_baseline(&resolver, &snapshot));
         }
         let naive_scan_elapsed = start.elapsed();
 
         let start = std::time::Instant::now();
         for _ in 0..ITERATIONS {
-            std::hint::black_box(
-                serde_json::to_vec(
-                    &snapshot
-                        .files
-                        .iter()
-                        .map(|file| file.outline.source.path.as_str())
-                        .collect::<Vec<_>>(),
-                )
-                .expect("file list JSON"),
-            );
+            std::hint::black_box(file_list_baseline(&snapshot));
         }
         let file_list_elapsed = start.elapsed();
+        let naive = naive_grep_read_baseline(&resolver, &snapshot);
+        let file_list = file_list_baseline(&snapshot);
         eprintln!(
-            "{ITERATIONS} iterations: code_hop={code_hop_elapsed:?}, naive_full_scan={naive_scan_elapsed:?}, file_list_serialization={file_list_elapsed:?}"
+            "{ITERATIONS} iterations: code_hop={code_hop_elapsed:?}, naive_grep_read={naive_scan_elapsed:?} {naive:?}, file_list={file_list_elapsed:?} {file_list:?}"
         );
     }
 }

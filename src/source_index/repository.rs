@@ -21,6 +21,7 @@ use std::path::Path;
 use std::process::Command;
 #[cfg(test)]
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 
 const STORAGE_SCHEMA_VERSION: u32 = 1;
@@ -36,6 +37,7 @@ const MAX_IGNORE_CONTROL_BYTES: u64 = 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_STATE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_WORKSPACE_CACHES: usize = 8;
+const STATE_LOCK_LEAF: &str = "source-index-state.lock";
 
 /// A body-free outline stored in a repository snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,7 +240,11 @@ impl RepositoryCache {
             }
         }
         let cache = Self::open(state_directory, resolver)?;
+        let state_lock = cache.open_named_lock(STATE_LOCK_LEAF, "source-index state lock")?;
+        FileExt::lock_exclusive(&state_lock)
+            .context("failed to take source-index state quota lock")?;
         cache.ensure_state_quota()?;
+        FileExt::unlock(&state_lock).context("failed to release source-index state quota lock")?;
         Ok(cache)
     }
 
@@ -301,14 +307,18 @@ impl RepositoryCache {
     }
 
     fn open_lock(&self) -> Result<std::fs::File> {
+        self.open_named_lock(&self.lock_leaf, "source-index lock")
+    }
+
+    fn open_named_lock(&self, leaf: &str, label: &str) -> Result<std::fs::File> {
         // `cap-fs-ext` implements create-with-no-follow with a checked open;
         // two first creators can make one checked attempt observe ENOENT.
         // Retrying the same bounded leaf closes that harmless creation race.
         let mut last_error = None;
         for _ in 0..3 {
-            match self.open_private_leaf(&self.lock_leaf, true, false) {
+            match self.open_private_leaf(leaf, true, false) {
                 Ok(file) => {
-                    ensure_private_file(&file, "source-index lock")?;
+                    ensure_private_file(&file, label)?;
                     return Ok(file);
                 }
                 Err(error)
@@ -460,6 +470,17 @@ impl RepositoryCache {
             )
             .into());
         }
+        let state_lock = self.open_named_lock(STATE_LOCK_LEAF, "source-index state lock")?;
+        FileExt::lock_exclusive(&state_lock)
+            .context("failed to take source-index state publication lock")?;
+        let result = self.publish_image_under_state_lock(&bytes);
+        FileExt::unlock(&state_lock)
+            .context("failed to release source-index state publication lock")?;
+        result
+    }
+
+    fn publish_image_under_state_lock(&self, bytes: &[u8]) -> IndexResult<()> {
+        self.ensure_state_quota()?;
         let mut projected_state_bytes = bytes.len() as u64;
         for entry in self
             .directory
@@ -563,12 +584,45 @@ impl RepositoryIndexer {
         self.build_inner(true)
     }
 
+    pub(crate) fn build_bounded(
+        &self,
+        deadline: Instant,
+        max_source_bytes: u64,
+    ) -> IndexResult<RepositoryBuild> {
+        self.build_inner_bounded(false, Some((deadline, max_source_bytes)))
+    }
+
+    pub(crate) fn rebuild_bounded(
+        &self,
+        deadline: Instant,
+        max_source_bytes: u64,
+    ) -> IndexResult<RepositoryBuild> {
+        self.build_inner_bounded(true, Some((deadline, max_source_bytes)))
+    }
+
     /// Check whether paths, ignore controls, dispositions, and bytes still match.
     ///
     /// A false result requires rebuilding before routing. A true result is only
     /// an optimistic observation; selected leaves still require a
     /// generation-bound `SourceResolver::read_span` call.
     pub fn is_snapshot_current(&self, snapshot: &RepositorySnapshot) -> IndexResult<bool> {
+        self.is_snapshot_current_bounded(snapshot, None)
+    }
+
+    pub(crate) fn is_snapshot_current_with_budget(
+        &self,
+        snapshot: &RepositorySnapshot,
+        deadline: Instant,
+        max_source_bytes: u64,
+    ) -> IndexResult<bool> {
+        self.is_snapshot_current_bounded(snapshot, Some((deadline, max_source_bytes)))
+    }
+
+    fn is_snapshot_current_bounded(
+        &self,
+        snapshot: &RepositorySnapshot,
+        budget: Option<(Instant, u64)>,
+    ) -> IndexResult<bool> {
         if snapshot.workspace_namespace_sha256 != self.resolver.workspace_namespace_sha256() {
             return Ok(false);
         }
@@ -576,7 +630,11 @@ impl RepositoryIndexer {
         if manifest.revision != snapshot.repository_revision {
             return Ok(false);
         }
-        Ok(capture_generation_sha256(&self.resolver, &manifest)? == snapshot.manifest_sha256)
+        let mut consumed = 0u64;
+        Ok(
+            capture_generation_sha256_bounded(&self.resolver, &manifest, budget, &mut consumed)?
+                == snapshot.manifest_sha256,
+        )
     }
 
     #[cfg(test)]
@@ -586,6 +644,14 @@ impl RepositoryIndexer {
     }
 
     fn build_inner(&self, ignore_incompatible: bool) -> IndexResult<RepositoryBuild> {
+        self.build_inner_bounded(ignore_incompatible, None)
+    }
+
+    fn build_inner_bounded(
+        &self,
+        ignore_incompatible: bool,
+        budget: Option<(Instant, u64)>,
+    ) -> IndexResult<RepositoryBuild> {
         let lock = self.cache.open_lock()?;
         FileExt::lock_exclusive(&lock).context("failed to take source-index build lock")?;
         let previous = match self.cache.read_image() {
@@ -593,7 +659,7 @@ impl RepositoryIndexer {
             Err(RepositoryIndexError::IncompatibleCache { .. }) if ignore_incompatible => None,
             Err(error) => return Err(error),
         };
-        let result = self.build_locked(previous.as_ref())?;
+        let result = self.build_locked(previous.as_ref(), budget)?;
         let image = CacheImage {
             storage_schema_version: STORAGE_SCHEMA_VERSION,
             outline_serialization_version: OUTLINE_SERIALIZATION_VERSION,
@@ -609,7 +675,11 @@ impl RepositoryIndexer {
         })
     }
 
-    fn build_locked(&self, previous: Option<&CacheImage>) -> IndexResult<PendingBuild> {
+    fn build_locked(
+        &self,
+        previous: Option<&CacheImage>,
+        budget: Option<(Instant, u64)>,
+    ) -> IndexResult<PendingBuild> {
         let manifest = RepositoryManifest::capture(&self.resolver)?;
         ensure_file_count(manifest.paths.len())?;
         let mut files = Vec::new();
@@ -620,8 +690,10 @@ impl RepositoryIndexer {
         let mut skipped_non_text_files = 0;
         let mut total_records = 0;
         let mut entry_generations = Vec::with_capacity(manifest.paths.len());
+        let mut consumed_source_bytes = 0u64;
 
         for path in &manifest.paths {
+            check_repository_work_budget(budget, consumed_source_bytes)?;
             let source = match self
                 .resolver
                 .read_indexable(Path::new(path), &manifest.revision)?
@@ -633,6 +705,10 @@ impl RepositoryIndexer {
                     continue;
                 }
             };
+            consumed_source_bytes = consumed_source_bytes
+                .checked_add(source.identity.byte_len as u64)
+                .context("source-index work byte count overflowed")?;
+            check_repository_work_budget(budget, consumed_source_bytes)?;
             entry_generations.push(RepositoryEntryGeneration::text(
                 path,
                 &source.identity.content_sha256,
@@ -681,8 +757,12 @@ impl RepositoryIndexer {
                 anyhow::anyhow!("repository manifest changed during source-index build").into(),
             );
         }
-        if capture_generation_sha256(&self.resolver, &validation_manifest)?
-            != snapshot.manifest_sha256
+        if capture_generation_sha256_bounded(
+            &self.resolver,
+            &validation_manifest,
+            budget,
+            &mut consumed_source_bytes,
+        )? != snapshot.manifest_sha256
         {
             return Err(anyhow::anyhow!(
                 "repository source generation changed during source-index build"
@@ -840,23 +920,45 @@ impl RepositoryEntryGeneration {
     }
 }
 
-fn capture_generation_sha256(
+fn capture_generation_sha256_bounded(
     resolver: &SourceResolver,
     manifest: &RepositoryManifest,
+    budget: Option<(Instant, u64)>,
+    consumed_source_bytes: &mut u64,
 ) -> Result<String> {
     let mut entries = Vec::with_capacity(manifest.paths.len());
     for path in &manifest.paths {
+        check_repository_work_budget(budget, *consumed_source_bytes)?;
         match resolver.read_indexable(Path::new(path), &manifest.revision)? {
-            SourceReadOutcome::Text(source) => entries.push(RepositoryEntryGeneration::text(
-                path,
-                &source.identity.content_sha256,
-            )),
+            SourceReadOutcome::Text(source) => {
+                *consumed_source_bytes = consumed_source_bytes
+                    .checked_add(source.identity.byte_len as u64)
+                    .context("source-index work byte count overflowed")?;
+                check_repository_work_budget(budget, *consumed_source_bytes)?;
+                entries.push(RepositoryEntryGeneration::text(
+                    path,
+                    &source.identity.content_sha256,
+                ));
+            }
             SourceReadOutcome::Skipped(reason) => {
                 entries.push(RepositoryEntryGeneration::skipped(path, &reason))
             }
         }
     }
     Ok(generation_sha256(manifest, &entries))
+}
+
+fn check_repository_work_budget(budget: Option<(Instant, u64)>, consumed: u64) -> Result<()> {
+    let Some((deadline, max_source_bytes)) = budget else {
+        return Ok(());
+    };
+    if Instant::now() >= deadline {
+        bail!("source-index work deadline expired");
+    }
+    if consumed > max_source_bytes {
+        bail!("source-index work exceeds {max_source_bytes} aggregate source bytes");
+    }
+    Ok(())
 }
 
 fn generation_sha256(
@@ -1511,6 +1613,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Barrier;
 
     fn run_git(root: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -2213,5 +2316,78 @@ mod tests {
             error.to_string().contains("state exceeds"),
             "unexpected quota error: {error:#}"
         );
+    }
+
+    #[test]
+    fn concurrent_workspaces_cannot_exceed_shared_cache_image_quota() {
+        let parent = tempfile::tempdir().expect("state parent");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700))
+                .expect("private parent");
+        }
+        let state = parent.path().join("source-index");
+        fs::create_dir(&state).expect("state directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("private state");
+        }
+        for index in 0..MAX_WORKSPACE_CACHES - 1 {
+            fs::write(state.join(format!("source-index-{index:064x}.json")), [])
+                .expect("existing cache image");
+        }
+
+        let first_root = committed_workspace();
+        let second_root = committed_workspace();
+        let barrier = Arc::new(Barrier::new(2));
+        let first = indexer(first_root.path(), &state).with_before_validation_hook({
+            let barrier = Arc::clone(&barrier);
+            move || {
+                barrier.wait();
+            }
+        });
+        let second = indexer(second_root.path(), &state).with_before_validation_hook({
+            let barrier = Arc::clone(&barrier);
+            move || {
+                barrier.wait();
+            }
+        });
+        let first_thread = std::thread::spawn(move || first.build());
+        let second_thread = std::thread::spawn(move || second.build());
+        let outcomes = [
+            first_thread.join().expect("first builder"),
+            second_thread.join().expect("second builder"),
+        ];
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|result| result.is_err()).count(), 1);
+        let image_count = fs::read_dir(&state)
+            .expect("state entries")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("source-index-") && name.ends_with(".json")
+                })
+            })
+            .count();
+        assert_eq!(image_count, MAX_WORKSPACE_CACHES);
+    }
+
+    #[test]
+    fn bounded_build_fails_on_aggregate_bytes_and_expired_deadline() {
+        let root = committed_workspace();
+        let state = tempfile::tempdir().expect("state directory");
+        let byte_error = indexer(root.path(), state.path())
+            .build_bounded(Instant::now() + std::time::Duration::from_secs(5), 1)
+            .err()
+            .expect("aggregate byte budget");
+        assert!(byte_error.to_string().contains("aggregate source bytes"));
+
+        let deadline_error = indexer(root.path(), state.path())
+            .build_bounded(Instant::now(), MAX_INDEX_FILES as u64 * MAX_SOURCE_BYTES)
+            .err()
+            .expect("expired deadline");
+        assert!(deadline_error.to_string().contains("deadline expired"));
     }
 }

@@ -27,7 +27,9 @@ symbol menus with deterministic lexical scoring. It returns exact spans for a la
 source bodies. Ambiguous hops stay ranker-only with a warning today; a future local `compress`
 adapter may receive only opaque candidate ids, labels, and the documented bounded `AGENTS.md` lead.
 Corpus structure, source generations, parser selection, and cache format do not belong in the
-executor.
+executor. Result metrics separately count exact serialized ranker-input and disambiguation-input
+bytes; the ignored benchmark compares end-to-end routing with task-scored grep/read and file-list
+baselines rather than treating timing as a correctness assertion.
 
 Use the [agent contract](AGENTS.md) for authority and dependency rules, [`mod.rs`](mod.rs) for
 the flat root-package facade, and the [MCP guide](mcp/README.md) for external connections.

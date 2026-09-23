@@ -9,7 +9,7 @@ use crossterm::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -702,6 +702,13 @@ struct ReplInitialization {
     project_program_root: Option<PathBuf>,
 }
 
+fn source_index_state_path(patterns_path: &Path, leaf: &str) -> PathBuf {
+    patterns_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(leaf)
+}
+
 impl ReplInitialization {
     fn from_user_environment(config: &Config) -> Self {
         let home = dirs::home_dir();
@@ -919,10 +926,7 @@ impl Repl {
             project_program_root,
         } = initialization;
         let tool_workspace_root = resolve_workspace_root(&workspace_root);
-        let source_index_state = patterns_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("source-index");
+        let source_index_state = source_index_state_path(&patterns_path, "source-index");
         let mention_port = crate::cli::mention_session::MentionSession::new(workspace_root.clone())
             as Arc<dyn crate::cli::tui::MentionPort>;
 
@@ -1240,9 +1244,13 @@ impl Repl {
                 fallback_registry.register(Box::new(GrepTool));
                 fallback_registry
                     .register(Box::new(CodeOutlineTool::new(tool_workspace_root.clone())));
+                let fallback_patterns_path =
+                    std::env::temp_dir().join("finch_patterns_fallback.json");
+                let fallback_source_index_state =
+                    source_index_state_path(&fallback_patterns_path, "finch-source-index-fallback");
                 fallback_registry.register(Box::new(CodeHopTool::new(
                     tool_workspace_root.clone(),
-                    source_index_state.clone(),
+                    fallback_source_index_state,
                 )));
                 fallback_registry.register(Box::new(WebFetchTool::new()));
                 fallback_registry.register(Box::new(BashTool));
@@ -1283,7 +1291,7 @@ impl Repl {
                     PermissionManager::new()
                         .with_workspace_root(tool_workspace_root.clone())
                         .with_default_rule(PermissionRule::Allow),
-                    std::env::temp_dir().join("finch_patterns_fallback.json"),
+                    fallback_patterns_path,
                 )
                 .expect("Failed to create fallback tool executor")
             });

@@ -34,6 +34,9 @@ the only body text persisted for routing. Tree-sitter parse errors are reported 
 The state capability may create its own final directory leaf with Unix mode 0700. It admits at
 most eight workspace cache images and 512 MiB of regular cache/lock/temporary leaves, rejects
 matching symlink or non-regular leaves, and never deletes another workspace's image automatically.
+A fixed private state lock serializes shared-quota accounting with publication across workspaces.
+Bounded callers may additionally impose one aggregate source-byte budget and cooperative deadline
+across initial parsing plus generation validation.
 
 **Extension rules:** add a grammar only with deterministic fixtures proving definitions and spans.
 Change storage schema, serialized-outline, and outline algorithm versions independently. Keep cache records body-free;

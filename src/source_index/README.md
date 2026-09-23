@@ -16,7 +16,8 @@ snapshot stale before source is returned.
 The shared state directory holds at most eight workspace images and 512 MiB. It never deletes an
 older workspace on its own: when that quota is full, the application reports the derived-cache
 directory for explicit cleanup. Each workspace image retains its independent 128 MiB bound and
-fixed lock/temporary leaves.
+fixed lock/temporary leaves. A state-wide lock makes quota rechecking and atomic publication one
+serialized operation even when different workspaces build concurrently.
 
 Repository consistency is optimistic rather than an atomic filesystem snapshot. A routing caller
 rebuilds whenever generation validation fails, then validates each selected leaf again by consuming

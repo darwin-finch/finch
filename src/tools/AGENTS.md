@@ -65,7 +65,8 @@ differs from the permission root, and the implementation capability-opens beneat
 at construction. Its `WorkspaceRead` authority includes publication of disposable, bounded derived
 index bytes under the separately injected application-state capability; it cannot mutate source,
 conversation, provider, or approval state. Current roots bind no disambiguator, so ambiguity never
-reconstructs or calls a provider.
+reconstructs or calls a provider. Index freshness/build work runs off the async worker thread and
+cooperatively fails after 20 seconds or 256 MiB of aggregate source reads, including validation.
 `test_dotdot_escape_is_ask_user_not_allow`, `test_symlink_escape_is_ask_user_live_and_dangling`,
 `test_escaped_path_is_not_pattern_admissible_through_approval_path`, and
 `test_star_pattern_does_not_match_escaped_path` pin this.
