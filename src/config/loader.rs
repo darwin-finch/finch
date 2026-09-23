@@ -439,10 +439,8 @@ model_size = "Medium"
             .expect_err("removed local chat values must require explicit migration")
             .to_string();
         assert!(error.contains("Back up the file"), "{error}");
-        assert!(
-            error.contains("remove only the affected [[providers]] local block"),
-            "{error}"
-        );
+        assert!(error.contains("remove only the affected local"), "{error}");
+        assert!(error.contains("[[providers]] block"), "{error}");
         assert!(error.contains("finch setup"), "{error}");
     }
 
