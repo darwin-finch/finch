@@ -1,4 +1,5 @@
 CARGO_SLOT := .agents/skills/finch-backlog/scripts/with-cargo-slot
+CARGO_INSTALL_FLAGS ?=
 
 .PHONY: all build install test clean
 
@@ -11,7 +12,7 @@ build:
 	$(CARGO_SLOT) cargo build --bin finch
 
 install:
-	$(CARGO_SLOT) cargo install --path=./
+	$(CARGO_SLOT) cargo install --path=./ --locked $(CARGO_INSTALL_FLAGS)
 
 # scripts/test_brains.sh re-execs itself through with-cargo-slot when not
 # already inside a held slot, so it does not need CARGO_SLOT in front of it
