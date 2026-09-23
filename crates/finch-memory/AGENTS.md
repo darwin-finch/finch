@@ -19,6 +19,13 @@ modules, including `memory_status`, are private.
 
 ## Invariants and lifetimes
 
+- The turn-level injection gate (#1134) is decided before the per-result
+  floor: when `MemoryConfig::min_turn_relevance_score` is set (default `None`,
+  off) and even the best retrieved weighted score falls strictly below it,
+  `query_with_sources` returns an empty set for the turn and logs the skip at
+  `info` with the floor, the best score, and the candidate count. The
+  per-result `min_relevance_score` floor still applies whenever injection
+  happens; the gate does not change retrieval ordering.
 - Retrieval may proceed while the tree hydrates, but every caller must report the coverage of
   the index it actually read. Sample hydration before and after a read and use `observed`; never
   upgrade a partial read to `Ready` because hydration completed afterward.
@@ -36,8 +43,15 @@ modules, including `memory_status`, are private.
 
 ```bash
 .agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-memory --lib
+.agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test -p finch-memory --test gate_observability_test
 .agents/skills/finch-backlog/scripts/with-cargo-slot ./scripts/test_brains.sh cargo test --test memory_integration_test
 ```
+
+The gate's log-observability proof lives in its own integration binary
+(`gate_observability_test`) because tracing caches per-callsite interest
+globally within a process; a `with_default` capture running beside parallel
+tests that exercise the same callsites can lose the asserted line to a
+concurrent no-dispatcher cache recompute.
 
 For facade or schema changes, run the supervised workspace suite. The proposed
 `scripts/check_subsystems.py` is absent; use `scripts/seam_cost.py` for dependency evidence.

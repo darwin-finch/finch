@@ -5,6 +5,13 @@ can hydrate in the background while a query proceeds. It owns retrieval coverage
 opaque program-index rows. It does not choose a neural embedding model, interpret programs,
 write canonical program source, or own named-Brain event journals.
 
+Recall applies two filters in order: a turn-level injection gate
+(`MemoryConfig::min_turn_relevance_score`, default off) first decides whether anything is
+injected at all -- a turn whose best retrieved weighted score falls strictly below the floor
+injects nothing and logs why -- and then the per-result `min_relevance_score` floor drops
+individual weak matches from the turns that are allowed. Neither filter changes retrieval
+ordering; both are uncalibrated starting points pending real score distributions.
+
 Two callers show the ownership boundary:
 
 1. The [interactive REPL](../../src/cli/repl.rs) chooses an embedding engine from application
