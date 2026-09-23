@@ -56,6 +56,31 @@ pub(super) fn handle_themes_input(
     Ok(false)
 }
 
+pub(super) fn handle_local_helpers_input(
+    state: &mut WizardState,
+    key: crossterm::event::KeyEvent,
+) -> Result<bool> {
+    if let Some(SectionState::LocalHelpers {
+        use_neural_embeddings,
+    }) = state.sections.get_mut(&WizardSection::LocalHelpers)
+    {
+        match key.code {
+            KeyCode::Char(' ') => {
+                *use_neural_embeddings = !*use_neural_embeddings;
+            }
+            KeyCode::Enter => {
+                state.mark_completed(WizardSection::LocalHelpers);
+                state.next_section();
+            }
+            KeyCode::Esc => {
+                state.prev_section();
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 /// The named credential a confirmed ChatGPT provider binds to: the persisted
 /// reference when one exists, otherwise the wizard default for fresh adds.
 fn chatgpt_persisted_reference(persisted: Option<&ProviderEntry>) -> String {

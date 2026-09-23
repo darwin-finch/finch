@@ -1024,6 +1024,77 @@ impl Repl {
                         ),
                     );
                     drop(sync_phase);
+
+                    // Download the neural embedding model in the background,
+                    // for the *next* restart, not this session: it's already
+                    // been chosen (`engine`, above) and a store this session
+                    // opens against TF-IDF cannot switch representations
+                    // mid-session without re-embedding everything already
+                    // written -- TF-IDF and neural embeddings live in
+                    // different vector spaces, so mixing them would silently
+                    // corrupt retrieval, not merely miss an upgrade. Prompt-
+                    // first startup (#242) is never blocked on this either
+                    // way: `tokio::spawn`, not awaited.
+                    if config.memory.use_neural_embeddings
+                        && crate::models::NeuralEmbeddingEngine::find_in_cache().is_none()
+                    {
+                        // A dedicated state, not the chat model's own
+                        // `generator_state` a few hundred lines below: that
+                        // one enum slot represents one model at a time, and
+                        // conflating the embedding download with whatever
+                        // the chat model is doing would make them fight
+                        // over it if both happened concurrently.
+                        let embedding_download_state =
+                            Arc::new(RwLock::new(GeneratorState::Initializing));
+                        tokio::spawn(async move {
+                            let status_bar = global_status();
+                            let mut download =
+                                Box::pin(crate::models::NeuralEmbeddingEngine::ensure_downloaded(
+                                    Arc::clone(&embedding_download_state),
+                                ));
+                            // Races the download against a poll interval so
+                            // the status bar gets ManagedGgufDownloader's
+                            // real byte-level progress (it updates the
+                            // shared state every ~100ms) rather than a
+                            // single indeterminate line.
+                            let result = loop {
+                                tokio::select! {
+                                    result = &mut download => break result,
+                                    _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
+                                        if let GeneratorState::Downloading { progress, .. } =
+                                            &*embedding_download_state.read().await
+                                        {
+                                            let percentage = if progress.total_bytes == 0 {
+                                                0.0
+                                            } else {
+                                                progress.downloaded_bytes as f64
+                                                    / progress.total_bytes as f64
+                                            };
+                                            status_bar.update_download_progress(
+                                                "memory embeddings",
+                                                percentage,
+                                                progress.downloaded_bytes,
+                                                progress.total_bytes,
+                                            );
+                                        }
+                                    }
+                                }
+                            };
+                            status_bar.clear_download_progress();
+                            match result {
+                                Ok(_) => tracing::info!(
+                                    "Neural embedding model downloaded in the background; \
+                                     available from the next restart"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "Background neural embedding model download failed; \
+                                     continuing on the TF-IDF fallback"
+                                ),
+                            }
+                        });
+                    }
+
                     Some(system)
                 }
                 Err(e) => {
@@ -4727,7 +4798,7 @@ impl Repl {
                 "Conversations stored: {}",
                 stats.conversation_count
             ));
-            self.output_status(format!("MemTree nodes: {}", stats.tree_node_count));
+            self.output_status(format!("Memory points: {}", stats.tree_node_count));
             // `tree_node_count` is the size of the in-memory tree, so during
             // hydration it is a count of what has loaded, not of what the user
             // has stored -- a flatly wrong number about their own data, shown

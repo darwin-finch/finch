@@ -350,6 +350,7 @@ pub(super) fn handle_section_input(
     match state.current_section {
         WizardSection::Themes => handle_themes_input(state, key),
         WizardSection::Models => handle_models_input(state, key),
+        WizardSection::LocalHelpers => handle_local_helpers_input(state, key),
         WizardSection::Personas => handle_personas_input(state, key),
         WizardSection::Features => handle_features_input(state, key),
         WizardSection::Review => handle_review_input(state, key),

@@ -2567,12 +2567,91 @@ fn failed_authority_sink_rolls_back_policy_and_its_revocations() {
         .is_active(unix_time_ms()));
 }
 
+/// A deterministic, low-dimensional `EmbeddingEngine` for tests that need a
+/// real, structurally valid `RoutingTree` rather than an empty or hand-faked
+/// one.
+///
+/// `RoutingTree`'s persistence round-trip needs real geometric consistency
+/// (frozen split axes, leaf membership that actually replay-descends
+/// correctly) that hand-crafted SQL rows cannot safely fake, so seeding for
+/// these tests goes through genuine `MemorySystem::insert_conversation`
+/// calls rather than raw SQL. The real `TfIdfEmbedding` engine's ~2048-dim
+/// vectors make that prohibitively slow for hundreds+ of points in an
+/// unoptimized debug test binary (`crates/finch-memory/src/lib.rs`'s own
+/// `SEEDED_STORE_SIZE` doc comment records the same finding); this engine's
+/// small dimension keeps genuine seeding fast while still producing points
+/// clustered enough that `RoutingTree`'s discrimination gate actually
+/// accepts splits, rather than degrading into the same reject-every-split
+/// cost cliff a purely random embedding hits.
+#[derive(Default)]
+struct ClusteredTestEmbedding;
+
+impl finch_memory::EmbeddingEngine for ClusteredTestEmbedding {
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        const DIM: usize = 16;
+        const CLUSTERS: u64 = 8;
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        let cluster = (hasher.finish() % CLUSTERS) as usize;
+        let mut embedding = vec![0.0f32; DIM];
+        embedding[cluster % DIM] = 3.0;
+
+        let mut jitter_seed = {
+            let mut h = DefaultHasher::new();
+            (text, "jitter").hash(&mut h);
+            h.finish()
+        };
+        for value in embedding.iter_mut() {
+            jitter_seed = jitter_seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
+            let unit = (jitter_seed >> 40) as f32 / (1u32 << 24) as f32;
+            *value += (unit - 0.5) * 0.3;
+        }
+        Ok(embedding)
+    }
+
+    fn dimension(&self) -> usize {
+        16
+    }
+}
+
+/// Build a store of `count` real, distinct `RoutingTree` points, through
+/// genuine `insert_conversation` calls against `ClusteredTestEmbedding`, then
+/// close it. See `ClusteredTestEmbedding`'s doc for why this goes through
+/// real inserts rather than raw SQL.
+async fn seed_real_memory_points(db_path: &std::path::Path, count: usize) {
+    let memory = finch_memory::MemorySystem::new_with_engine(
+        finch_memory::MemoryConfig {
+            db_path: db_path.to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        },
+        Arc::new(ClusteredTestEmbedding),
+    )
+    .expect("schema");
+    for id in 0..count {
+        memory
+            .insert_conversation(
+                "user",
+                &format!(
+                    "seeded memory content number {id}, long enough to clear the \
+                     quality classifier's floor and carrying no ack or greeting shape"
+                ),
+                None,
+                None,
+            )
+            .await
+            .expect("seed");
+    }
+}
+
 /// The production path for #276's `mem-store` deadlock, on the runtime
 /// shape that would expose it: one worker.
 ///
 /// `block_on_host` blocks its calling thread, so if that thread were a
-/// runtime worker the write would wait for the MemTree loader while holding
-/// the only thread the loader could run on. It is not a worker: both
+/// runtime worker the write would wait for the loader while holding the
+/// only thread the loader could run on. It is not a worker: both
 /// `TypedHostHandler` drive sites go through `tokio::task::spawn_blocking`,
 /// and this pins that the hop stays.
 ///
@@ -2596,42 +2675,24 @@ fn typed_mem_store_completes_on_a_single_worker_runtime() {
     // and the test passes whether or not the deadlock is possible — which
     // is exactly what the first version of it did.
     {
-        finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
-            db_path: path.clone(),
-            use_neural_embeddings: false,
-            ..Default::default()
-        })
-        .expect("schema");
-        let conn = rusqlite::Connection::open(&path).expect("open");
-        let embedding: Vec<u8> = 0.5f32.to_le_bytes().repeat(8);
-        let tx = conn.unchecked_transaction().expect("tx");
-        for id in 0..2048i64 {
-            tx.execute(
-                "INSERT OR REPLACE INTO tree_nodes
-                     (node_id, parent_id, text, embedding, level, created_at, importance)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-                rusqlite::params![
-                    id,
-                    if id == 0 { None } else { Some(0i64) },
-                    format!("seeded node {id}"),
-                    embedding,
-                    if id == 0 { 0i64 } else { 1i64 },
-                    id,
-                ],
-            )
-            .expect("seed");
-        }
-        tx.commit().expect("commit");
+        let seed_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("seed runtime");
+        seed_runtime.block_on(seed_real_memory_points(&path, 512));
     }
 
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     runtime.spawn(async move {
         let memory = Arc::new(
-            finch_memory::MemorySystem::new(finch_memory::MemoryConfig {
-                db_path: path,
-                use_neural_embeddings: false,
-                ..Default::default()
-            })
+            finch_memory::MemorySystem::new_with_engine(
+                finch_memory::MemoryConfig {
+                    db_path: path,
+                    use_neural_embeddings: false,
+                    ..Default::default()
+                },
+                Arc::new(ClusteredTestEmbedding),
+            )
             .expect("memory"),
         );
         let program_runtime = ProgramRuntime::new();
@@ -2729,12 +2790,16 @@ async fn typed_mem_recall_refuses_an_unusable_index_instead_of_reporting_absence
             .await
             .unwrap();
     }
-    // `level` is read as an i64, and non-numeric TEXT keeps its type under
-    // INTEGER affinity, so no row parses and the index reaches `Failed`
-    // with the memory still on disk.
+    // `text` is read as a String, and invalid UTF-8 fails that read, so no
+    // row parses and the index reaches `Failed` with the memory still on
+    // disk. The same corruption `crates/finch-memory/src/lib.rs`'s own
+    // `test_an_unreadable_store_on_the_synchronous_arm_refuses_writes` uses.
     rusqlite::Connection::open(&db_path)
         .unwrap()
-        .execute("UPDATE tree_nodes SET level = 'unreadable'", [])
+        .execute(
+            "UPDATE routing_points SET text = ?1",
+            rusqlite::params![vec![0xffu8, 0xfeu8]],
+        )
         .unwrap();
 
     let memory = Arc::new(
@@ -2879,85 +2944,30 @@ fn test_memory_index_status_projects_every_hydration_state() {
     }
 }
 
-/// A still-hydrating index reports itself incomplete, through `submit`.
-///
-/// This is the literal case #295 names -- "during startup it can run
-/// against a fraction of the MemTree" -- and it is reached by holding the
-/// production loader mid-hydration rather than by constructing a status,
-/// so a change that stopped deriving `Loading` from the loader would fail
-/// here rather than pass.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn typed_mem_index_status_reports_a_still_loading_index_as_incomplete() {
-    let temp = tempfile::NamedTempFile::new().unwrap();
-    let db_path = temp.path().to_path_buf();
-    let config = finch_memory::MemoryConfig {
-        db_path: db_path.clone(),
-        use_neural_embeddings: false,
-        ..Default::default()
-    };
-    drop(finch_memory::MemorySystem::new(config.clone()).unwrap());
-    seed_nodes(&db_path, 4 * finch_memory::HYDRATION_BATCH as i64, None);
-
-    // The loader itself announces that it has committed the first batch
-    // and then waits. Polling the tree size cannot establish this window:
-    // on a fast runner every batch can land before a polling task is
-    // scheduled once.
-    let (_registration, mut batch_reached, release) = finch_memory::register_hydration_batch_pause(
-        db_path.clone(),
-        finch_memory::HYDRATION_BATCH,
-    );
-    let memory = Arc::new(finch_memory::MemorySystem::new(config).unwrap());
-    let hydrating = {
-        let memory = Arc::clone(&memory);
-        tokio::spawn(async move { memory.ensure_hydrated().await })
-    };
-
-    if !*batch_reached.borrow_and_update() {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                batch_reached
-                    .changed()
-                    .await
-                    .expect("the hydration pause sender disappeared");
-                if *batch_reached.borrow_and_update() {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("the loader never reached the first batch");
-    }
-
-    let status = ask(&runtime_reading(Arc::clone(&memory)), "(mem-index-status)").await;
-    assert_eq!(
-        status_field(&status, "state"),
-        &ProgramValue::String("loading".into()),
-        "the loader is held mid-hydration: {status:?}"
-    );
-    assert_eq!(
-        status_field(&status, "complete"),
-        &ProgramValue::Bool(false),
-        "a still-loading index must not report itself complete -- this is \
-             the state #295 is about: {status:?}"
-    );
-    let (ProgramValue::Option(Some(loaded)), ProgramValue::Option(Some(total))) = (
-        status_field(&status, "loaded"),
-        status_field(&status, "total"),
-    ) else {
-        panic!("a loading index knows its counts: {status:?}");
-    };
-    let (ProgramValue::Int(loaded), ProgramValue::Int(total)) = (loaded.as_ref(), total.as_ref())
-    else {
-        panic!("counts must be integers: {status:?}");
-    };
-    assert!(
-        *loaded > 0 && loaded < total,
-        "held after one batch, so some but not all of {total} is loaded, got {loaded}"
-    );
-
-    let _ = release.send(true);
-    let _ = hydrating.await;
-}
+// A test previously lived here (`typed_mem_index_status_reports_a_still_
+// loading_index_as_incomplete`) verifying, end to end through `submit`, that
+// a still-hydrating index reports itself incomplete (#295's literal case:
+// "during startup it can run against a fraction of the MemTree"). It worked
+// by holding the production loader deterministically mid-hydration --
+// `register_hydration_batch_pause`, which froze the loader right after a
+// chosen batch committed, with `loaded` and `total` both real, distinct
+// counts at that point.
+//
+// RoutingTree hydration is atomic (`hydrate_in_background`'s own doc): one
+// `RoutingMemTree::load` call, no batch boundary, so there is nothing left
+// to freeze deterministically partway through, and `loaded` no longer takes
+// on an intermediate value at all -- it is 0 until the single load finishes,
+// then jumps straight to the final count. `test_memory_index_status_
+// projects_every_hydration_state` above still pins the record projection
+// for `Loading` directly; what is lost here is the end-to-end proof that a
+// real, in-flight hydration is what produces it, and there is no
+// replacement seam that reaches it without either reintroducing a batch
+// boundary RoutingTree does not have, or racing a timing-dependent poll
+// against however fast the atomic load happens to run -- exactly the
+// flakiness `register_hydration_batch_pause`'s own comment ("polling the
+// tree size cannot establish this window") already ruled out for MemTree.
+// Real, disclosed follow-up work if this coverage is wanted back, not a
+// silent regression: noted in `crates/finch-memory/AGENTS.md`.
 
 /// Read one field out of the `mem-index-status` record.
 fn status_field<'a>(record: &'a ProgramValue, name: &str) -> &'a ProgramValue {
@@ -2971,66 +2981,31 @@ fn status_field<'a>(record: &'a ProgramValue, name: &str) -> &'a ProgramValue {
         .unwrap_or_else(|| panic!("no `{name}` field in mem-index-status: {fields:?}"))
 }
 
-/// Write `count` linked nodes straight into the store, optionally leaving
-/// invalid UTF-8 in one of them so its batch fails to read.
-fn seed_nodes(db_path: &std::path::Path, count: i64, corrupt: Option<i64>) {
-    let conn = rusqlite::Connection::open(db_path).unwrap();
-    let embedding: Vec<u8> = 0.5f32.to_le_bytes().repeat(8);
-    let tx = conn.unchecked_transaction().unwrap();
-    for id in 0..count {
-        tx.execute(
-            "INSERT OR REPLACE INTO tree_nodes
-                 (node_id, parent_id, text, embedding, level, created_at, importance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-            rusqlite::params![
-                id,
-                if id == 0 { None } else { Some(0i64) },
-                format!("seeded node {id}"),
-                embedding,
-                if id == 0 { 0i64 } else { 1i64 },
-                id,
-            ],
-        )
-        .unwrap();
-    }
-    if let Some(id) = corrupt {
-        tx.execute(
-            "UPDATE tree_nodes SET text = ?1 WHERE node_id = ?2",
-            rusqlite::params![vec![0xffu8, 0xfeu8], id],
-        )
-        .unwrap();
-    }
-    tx.commit().unwrap();
-}
-
-/// Build a memory whose hydration stops early but leaves what loaded
-/// coherent, by way of the loader rather than by setting the flag.
+/// Build a memory flagged `Degraded` via direct test-support injection.
 ///
-/// An unreadable text blob in the second batch is the production route to
-/// `Degraded`: the first batch lands, the second errors, and the tree that
-/// remains is linked but incomplete. Reaching in and marking the status
-/// directly would let a collapse of `Degraded` into `Ready` at the batch
-/// arm keep this passing.
+/// Used to be built by way of the production loader: an unreadable text blob
+/// seeded into the store's *second* hydration batch, so the first batch had
+/// already committed by the time the read failed -- the real production
+/// route to `Degraded` under MemTree's batched loader. RoutingTree hydration
+/// is atomic (`hydrate_in_background`'s own doc): the same load either fully
+/// succeeds or is `Failed` outright, so there is no batch boundary left to
+/// stop partway through with what loaded so far still coherent, and
+/// `Degraded` is no longer reachable through the loader at all -- not here,
+/// not anywhere in production. `MemorySystem::force_degraded_for_test`
+/// constructs the state directly instead, the same technique
+/// `crates/finch-memory/src/lib.rs`'s own
+/// `test_a_degraded_index_accepts_writes_and_a_broken_one_does_not` uses
+/// from inside that crate's own `cfg(test)`; exposed here because this
+/// crate's integration tests cannot reach `HydrationState` at all.
 async fn degraded_memory(db_path: std::path::PathBuf) -> Arc<finch_memory::MemorySystem> {
     let config = finch_memory::MemoryConfig {
-        db_path: db_path.clone(),
+        db_path,
         use_neural_embeddings: false,
         ..Default::default()
     };
-    drop(finch_memory::MemorySystem::new(config.clone()).unwrap());
-
-    // Invalid UTF-8 in a node belonging to the *second* batch, so the first
-    // has already committed when the read fails. That ordering is what
-    // separates `Degraded` from `Failed`, and writing the id relative to
-    // the batch size keeps it true if the batch size changes.
-    seed_nodes(
-        &db_path,
-        2 * finch_memory::HYDRATION_BATCH as i64,
-        Some(finch_memory::HYDRATION_BATCH as i64 + 4),
-    );
-
     let memory = Arc::new(finch_memory::MemorySystem::new(config).unwrap());
     memory.ensure_hydrated().await.ok();
+    memory.force_degraded_for_test(4, 11, "a batch would not read".to_string());
     assert!(
         matches!(
             memory.hydration_status(),
@@ -3226,12 +3201,14 @@ async fn typed_mem_index_status_reports_a_failed_index_without_inventing_counts(
             .await
             .unwrap();
     }
-    // Same route as the `mem-recall` refusal test: `level` is read as an
-    // i64 and non-numeric TEXT keeps its type under INTEGER affinity, so
-    // no row parses and the index reaches `Failed`.
+    // Same route as the `mem-recall` refusal test: invalid UTF-8 in `text`
+    // fails that row's read, so no row parses and the index reaches `Failed`.
     rusqlite::Connection::open(&db_path)
         .unwrap()
-        .execute("UPDATE tree_nodes SET level = 'unreadable'", [])
+        .execute(
+            "UPDATE routing_points SET text = ?1",
+            rusqlite::params![vec![0xffu8, 0xfeu8]],
+        )
         .unwrap();
 
     let memory = Arc::new(

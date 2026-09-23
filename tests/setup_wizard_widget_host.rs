@@ -234,8 +234,9 @@ fn test_setup_wizard_drives_provider_list_and_confirm_through_the_widget_host() 
         "the unconfigured primary provider row must be visible; terminal was:\n{transcript}"
     );
 
-    // Drive to the Finish tab: the confirm screen.
-    for _ in 0..3 {
+    // Drive to the Finish tab: the confirm screen. From Models, that's
+    // Local Helpers, Style, Settings, Finish -- four tabs.
+    for _ in 0..4 {
         run.send("\t");
         std::thread::sleep(Duration::from_millis(120));
     }
@@ -530,7 +531,14 @@ fn test_wizard_tab_labels_are_visible_on_the_first_frame_of_every_section() {
         "the tab block was drawn on the widget host",
     );
 
-    let sections = ["Look & Feel", "Model Setup", "Style", "Settings", "Finish"];
+    let sections = [
+        "Look & Feel",
+        "Model Setup",
+        "Local Helpers",
+        "Style",
+        "Settings",
+        "Finish",
+    ];
     for (step, expected_section) in sections.iter().enumerate() {
         if step > 0 {
             run.send("\t");
@@ -538,6 +546,7 @@ fn test_wizard_tab_labels_are_visible_on_the_first_frame_of_every_section() {
             // the screen replay observes that section's first painted frame.
             let section_marker = match *expected_section {
                 "Model Setup" => "AI Providers",
+                "Local Helpers" => "Local Helper Models",
                 "Style" => "Choose a Style",
                 "Settings" => "Options",
                 "Finish" => "Ready to go!",

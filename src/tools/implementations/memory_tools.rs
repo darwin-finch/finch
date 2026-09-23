@@ -442,13 +442,16 @@ mod tests {
 
     /// Corrupt a store so hydration cannot read it.
     ///
-    /// `level` is read as an i64, and TEXT that does not look numeric keeps its
-    /// type under INTEGER affinity, so every row fails to parse. The migrations
-    /// leave it alone: migration A only drops `tree_nodes` when `node_id` is
-    /// absent, and `schema.sql` is `CREATE TABLE IF NOT EXISTS`.
+    /// `text` is read as a String, and invalid UTF-8 fails that read, so every
+    /// row fails to parse. The same corruption
+    /// `crates/finch-memory/src/lib.rs`'s own
+    /// `test_an_unreadable_store_on_the_synchronous_arm_refuses_writes` uses.
     fn break_hydration(db_path: &std::path::Path) -> Result<()> {
         let conn = rusqlite::Connection::open(db_path)?;
-        conn.execute("UPDATE tree_nodes SET level = 'unreadable'", [])?;
+        conn.execute(
+            "UPDATE routing_points SET text = ?1",
+            rusqlite::params![vec![0xffu8, 0xfeu8]],
+        )?;
         Ok(())
     }
 

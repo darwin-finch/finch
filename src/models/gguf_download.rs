@@ -20,7 +20,7 @@ const HUGGING_FACE_ENDPOINT: &str = "https://huggingface.co";
 // marker is this young so a same-tick overwrite cannot inherit its identity.
 const VERIFICATION_MARKER_SETTLE_TIME: Duration = Duration::from_secs(2);
 
-/// Quantizations offered for Finch-managed chat artifacts.
+/// Quantizations offered for Finch-managed GGUF artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GgufQuantization {
@@ -29,6 +29,12 @@ pub enum GgufQuantization {
     Q4KM,
     /// Five-bit K-quant with medium mixed precision.
     Q5KM,
+    /// Eight-bit round-to-nearest -- near-lossless. Not offered in the chat
+    /// model picker (too large relative to the quality gain on multi-billion
+    /// parameter models), but the right choice for the ~33M-parameter memory
+    /// embedding model, where quantization error is proportionally larger
+    /// and the absolute size cost of full fidelity is trivial (~37MB).
+    Q8_0,
 }
 
 impl GgufQuantization {
@@ -37,6 +43,7 @@ impl GgufQuantization {
         match self {
             Self::Q4KM => "Q4_K_M",
             Self::Q5KM => "Q5_K_M",
+            Self::Q8_0 => "Q8_0",
         }
     }
 }
@@ -70,7 +77,7 @@ struct VerificationMarker {
 }
 
 impl ManagedGgufArtifact {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let repository_parts = self.repository.split('/').collect::<Vec<_>>();
         if repository_parts.len() != 2
             || repository_parts
@@ -206,6 +213,10 @@ pub fn managed_gguf_artifact(
     let (filename, expected_size, sha256) = match quantization {
         GgufQuantization::Q4KM => q4,
         GgufQuantization::Q5KM => q5,
+        // Not offered for chat models -- reserved for the fixed memory
+        // embedding artifact (src/models/neural_embedding.rs), which is
+        // constructed directly, not through this family/size picker.
+        GgufQuantization::Q8_0 => return None,
     };
     Some(ManagedGgufArtifact {
         repository: repository.to_string(),
@@ -221,6 +232,24 @@ pub fn managed_gguf_artifact(
 pub(crate) enum DownloadDisposition {
     CacheHit,
     Downloaded,
+}
+
+/// Where `artifact` would land in the managed GGUF cache, without touching
+/// the filesystem or the network -- the same `cache_dir/repo--revision/
+/// filename` layout `ManagedGgufDownloader::ensure` commits a verified
+/// download to. For a cheap "is this already usable" check that must not
+/// probe the network or re-verify a checksum on every call (the ONNX
+/// embedding engine this replaced had the same constraint on its own
+/// cache lookup).
+pub(crate) fn managed_gguf_cache_path(artifact: &ManagedGgufArtifact) -> Result<PathBuf> {
+    let cache_dir = dirs::cache_dir()
+        .context("Could not determine the user cache directory")?
+        .join("finch")
+        .join("gguf");
+    Ok(cache_dir
+        .join(artifact.repository.replace('/', "--"))
+        .join(&artifact.revision)
+        .join(&artifact.filename))
 }
 
 pub(crate) struct ManagedGgufDownloader {

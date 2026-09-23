@@ -99,6 +99,7 @@ pub(super) fn apply_setup_result_to_config(
     };
     new_config.server.advertise = result.mdns_discovery;
     new_config.client.auto_discover = result.auto_discover;
+    new_config.memory.use_neural_embeddings = result.use_neural_embeddings;
     #[allow(deprecated)]
     {
         new_config.streaming_enabled = new_config.features.streaming_enabled;
@@ -141,6 +142,16 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         (primary_model.clone(), tool_models.clone())
     } else {
         anyhow::bail!("Models not configured");
+    };
+
+    // Extract local helper models
+    let use_neural_embeddings = if let Some(SectionState::LocalHelpers {
+        use_neural_embeddings,
+    }) = state.sections.get(&WizardSection::LocalHelpers)
+    {
+        *use_neural_embeddings
+    } else {
+        true
     };
 
     // Extract persona
@@ -381,5 +392,6 @@ pub(super) fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         mdns_discovery: mdns,
         auto_discover: auto_disc,
         memory_context_lines: memory_ctx_lines,
+        use_neural_embeddings,
     })
 }

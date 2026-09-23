@@ -39,6 +39,7 @@ mod parts;
 mod plan_handler;
 mod query_processor;
 mod query_state;
+mod recall_gate;
 mod runner_recovery;
 mod tool_display;
 mod tool_execution;

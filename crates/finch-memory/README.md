@@ -1,9 +1,9 @@
 # Finch memory
 
-`finch-memory` stores and retrieves the local MemTree, maintaining a SQLite-backed index that
-can hydrate in the background while a query proceeds. It owns retrieval coverage reporting and
-opaque program-index rows. It does not choose a neural embedding model, interpret programs,
-write canonical program source, or own named-Brain event journals.
+`finch-memory` stores and retrieves the local semantic index (`RoutingTree`), maintaining a
+SQLite-backed store that can hydrate in the background while a query proceeds. It owns retrieval
+coverage reporting and opaque program-index rows. It does not choose a neural embedding model,
+interpret programs, write canonical program source, or own named-Brain event journals.
 
 Recall applies two filters in order: a turn-level injection gate
 (`MemoryConfig::min_turn_relevance_score`, default off) first decides whether anything is
@@ -17,7 +17,7 @@ Two callers show the ownership boundary:
 1. The [interactive REPL](../../src/cli/repl.rs) chooses an embedding engine from application
    configuration, calls `MemorySystem::open_connection`, and injects that connection into
    `MemorySystem::new_with_connection`. It then asks the application `ProgramRegistry` to index
-   selected authored roots. Memory owns the SQLite/MemTree mechanics; the REPL owns model
+   selected authored roots. Memory owns the SQLite/`RoutingTree` mechanics; the REPL owns model
    selection, startup timing, and which roots to synchronize.
 2. The [program registry](../../src/program_registry.rs) writes canonical authored source and
    converts `ProgramDefinition` values into opaque `ProgramIndexRecord` rows for
@@ -26,3 +26,14 @@ Two callers show the ownership boundary:
 
 The [agent contract](AGENTS.md) covers dependency, hydration, and persistence rules. The
 [flat facade](src/lib.rs) and `cargo doc -p finch-memory --no-deps --open` provide the public API.
+
+## Why MemTree's routing was replaced
+
+MemTree's own retrieval was a flat, exhaustive cosine scan over every leaf — exact, but O(n) per
+query, a real ceiling as stored memories grow. [`src/routing_tree.rs`](src/routing_tree.rs) is its
+replacement, now the sole routing mechanism behind `MemorySystem`: a binary tree with genuinely
+fitted split axes (candidate-selected PCA via successive Hotelling deflation, not MemTree's
+similarity-threshold promotion) and sub-linear adaptive/beam search, ported from a sibling research
+repo's validated design (see the module's own doc comment for provenance and what was deliberately
+deferred). `MemTree` and its `tree_nodes` schema are gone; the [agent contract](AGENTS.md) has the
+current invariants and the disclosed regressions the port carries.

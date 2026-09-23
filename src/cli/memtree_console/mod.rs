@@ -5,5 +5,5 @@
 mod console;
 mod event_handler;
 
-pub use console::{ConsoleNode, ConsoleNodeType, MemTreeConsole};
+pub use console::{ConsoleNode, ConsoleNodeType, MemTreeConsole, NodeId};
 pub use event_handler::EventHandler;

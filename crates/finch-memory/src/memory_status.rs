@@ -197,9 +197,12 @@ pub fn count_qualifier(status: &HydrationStatus) -> Option<&'static str> {
 
 /// The TUI status-strip line: what was recalled, and out of how much.
 ///
-/// `entries` rather than `memories` on purpose. The counts are `tree_nodes`
-/// rows, which include the synthetic root and every internal aggregation node,
-/// so they are not the number of things the user would call a memory.
+/// `entries` rather than `memories` on purpose, kept from when the counts
+/// were `tree_nodes` rows and included the synthetic root and every internal
+/// aggregation node. RoutingTree's counts are `routing_points` -- real
+/// content points only, never a synthetic root or internal aggregate -- so
+/// that distinction no longer applies, but "entries" is kept as the still-true
+/// generic word rather than churning this wording for its own sake.
 pub(crate) fn status_line(recalled: usize, status: &HydrationStatus) -> String {
     match status {
         HydrationStatus::Ready { .. } => format!("🧠 recalled {recalled}"),

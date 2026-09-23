@@ -99,7 +99,7 @@ futures = "0.3"
 once_cell = "1.19"
 similar = "2.7"
 
-# HTTP client for Claude API
+# HTTP client for Claude API.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # HTTP server + WebSocket (session transport)
@@ -183,18 +183,26 @@ tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 
+# Compressed-size ratio as a cheap redundancy signal for the memory-recall
+# summarization gate (#8: raw vs. extractive-summary at injection time).
+# Pure-Rust DEFLATE backend -- no C toolchain dependency for a signal this
+# small.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # Terminal display-cell widths for the component width vocabulary (#934);
 # the same tables the test-only vt_oracle terminal model uses.
 unicode-width = "0.2"
 
-# Machine learning used by the separate frontend memory subsystem.
-ort = { version = "=2.0.0-rc.13", features = ["download-binaries", "ndarray"] }
-ndarray = "0.17"  # Memory embedding tensor creation
+# Machine learning: llama.cpp backs both chat generation and, via its own
+# embeddings mode, memory's embedding engine (bge-small-en-v1.5 GGUF) -- the
+# same in-process backend and GPU offload path for both, not the separate
+# ONNX+CoreML path memory embeddings used before, which was never confirmed
+# to place work on the GPU either.
 llama-cpp-2 = { version = "=0.1.156", default-features = false, features = ["common"] }
 # Shared dependencies
 sysinfo = "0.32"  # System RAM detection for model selection
-tokenizers = "0.23"  # Memory embedding and retained training configuration
-hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }  # Frontend memory model autodownload
+tokenizers = "0.23"  # Retained training configuration (src/models/lora.rs)
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }  # Managed GGUF artifact resolution (src/models/gguf_download.rs)
 indicatif = "0.17"  # Progress bars for download tracking
 rand = { version = "0.8", features = ["small_rng"] }  # Random number generation for sampling
 
@@ -216,12 +224,6 @@ glob = "0.3"
 walkdir = "2.4"
 ignore = "0.4"
 fs2 = "0.4"  # File locking for concurrent weight updates
-
-# CoreML/Metal support (macOS only)
-[target.'cfg(target_os = "macos")'.dependencies]
-# Frontend memory ONNX fallback uses CoreML execution provider.
-ort = { version = "=2.0.0-rc.13", features = ["coreml"] }
-# GUI automation (Phase 3: Accessibility tools)
 
 # Unix signal handling (for daemon process checks)
 [target.'cfg(unix)'.dependencies]

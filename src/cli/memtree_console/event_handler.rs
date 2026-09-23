@@ -6,9 +6,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::cli::memtree_console::MemTreeConsole;
+use crate::cli::memtree_console::{MemTreeConsole, NodeId};
 use crate::cli::repl_event::ReplEvent;
-use finch_memory::NodeId;
 
 /// Maps query IDs to their corresponding tree nodes
 pub struct EventHandler {
@@ -289,14 +288,10 @@ fn format_tool_description(tool_use: &crate::tools::ToolUse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use finch_memory::MemTree;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
 
     #[test]
     fn test_user_input_creates_node() {
-        let tree = Arc::new(RwLock::new(MemTree::new()));
-        let mut console = MemTreeConsole::new(tree);
+        let mut console = MemTreeConsole::new();
         let mut handler = EventHandler::new();
 
         let event = ReplEvent::UserInput {
@@ -312,8 +307,7 @@ mod tests {
 
     #[test]
     fn test_query_complete_adds_response() {
-        let tree = Arc::new(RwLock::new(MemTree::new()));
-        let mut console = MemTreeConsole::new(tree);
+        let mut console = MemTreeConsole::new();
         let mut handler = EventHandler::new();
 
         let query_id = Uuid::new_v4();

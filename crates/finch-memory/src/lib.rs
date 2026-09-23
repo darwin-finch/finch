@@ -7,15 +7,27 @@
 
 mod embeddings;
 mod memory_status;
-mod memtree;
 mod program_registry;
 mod quality;
+mod routing_memory;
+mod routing_tree;
 
 pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
 pub use memory_status::{caveat, count_qualifier, observed, Recall};
-pub use memtree::{MemTree, NodeId, TreeNode};
 pub use program_registry::{ProgramIndexRecord, ProgramIndexRef};
+
+/// A stable identity for one stored memory -- a `RoutingTree` point id
+/// (`routing_memory.rs`'s own `PointId`) under its public name. Kept as a
+/// plain `u64` alias (not re-exporting `routing_memory`'s own type) since
+/// that module is crate-private; every public API that surfaces a memory's
+/// identity (`RecalledMemory`, `MemorySearchResult`, `InspectedMemory`,
+/// `query_with_sources`) uses this same type.
+pub type NodeId = u64;
 pub use quality::{MemoryClassifier, MemoryImportance};
+
+use routing_memory::{PointId, RoutingMemTree};
+use routing_tree::persistence as routing_persistence;
+use routing_tree::RoutingConfig;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -28,20 +40,19 @@ use tokio::sync::Mutex;
 
 // Everything under `#[cfg(any(test, feature = "test-support"))]` from here
 // down to `pause_in_projection_sweep` (and its call sites further below) is
-// one seam: hydration batch/completion/sweep test pauses that
+// one seam: hydration completion/sweep test pauses that
 // `crates/finch-runtime/src/tests.rs` drives to get a genuinely
-// `Loading`/`Degraded` MemTree index. It is deliberately not plain
-// `#[cfg(test)]` — see the `test-support` feature comment in Cargo.toml for
-// why a bare `#[cfg(test)]` seam here would silently vanish from a dependent
-// crate's own test build. Add any future cross-crate test seam the same way.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug)]
-struct HydrationBatchPause {
-    after_loaded: usize,
-    reached: watch::Sender<bool>,
-    release: watch::Receiver<bool>,
-}
-
+// `Loading`/`Degraded` index. It is deliberately not plain `#[cfg(test)]` —
+// see the `test-support` feature comment in Cargo.toml for why a bare
+// `#[cfg(test)]` seam here would silently vanish from a dependent crate's own
+// test build. Add any future cross-crate test seam the same way.
+//
+// A batch-hydration pause (freeze the loader after N nodes) lived here too
+// until RoutingTree replaced MemTree. RoutingTree hydration is atomic --
+// `hydrate_in_background` makes one `RoutingMemTree::load` call with no
+// intermediate checkpoint -- so there is no batch boundary left to pause at;
+// `MemorySystem::force_degraded_for_test` and a real, positive-duration seed
+// are what `finch-runtime`'s integration tests use instead now.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct HydrationCompletionPause {
@@ -98,28 +109,6 @@ impl ProjectionSweepPause {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-impl HydrationBatchPause {
-    async fn after_batch(&self, loaded: usize) {
-        if loaded < self.after_loaded {
-            return;
-        }
-
-        self.reached.send_replace(true);
-        let mut release = self.release.clone();
-        while !*release.borrow_and_update() {
-            if release.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-static HYDRATION_BATCH_PAUSES: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<PathBuf, Arc<HydrationBatchPause>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-#[cfg(any(test, feature = "test-support"))]
 static HYDRATION_COMPLETION_PAUSES: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, Arc<HydrationCompletionPause>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -128,17 +117,6 @@ static HYDRATION_COMPLETION_PAUSES: std::sync::LazyLock<
 static PROJECTION_SWEEP_PAUSES: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, Arc<ProjectionSweepPause>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-/// Guard returned by [`register_hydration_batch_pause`]. Holding it keeps the
-/// registered pause installed; dropping it deregisters the pause for `path`
-/// (if this registration is still the one on file for it), so a test that
-/// forgets to keep the guard alive cannot leave a stale pause behind for a
-/// later test on the same path.
-#[cfg(any(test, feature = "test-support"))]
-pub struct HydrationBatchPauseRegistration {
-    path: PathBuf,
-    pause: Arc<HydrationBatchPause>,
-}
 
 #[cfg(any(test, feature = "test-support"))]
 struct HydrationCompletionPauseRegistration {
@@ -150,21 +128,6 @@ struct HydrationCompletionPauseRegistration {
 struct ProjectionSweepPauseRegistration {
     path: PathBuf,
     pause: Arc<ProjectionSweepPause>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl Drop for HydrationBatchPauseRegistration {
-    fn drop(&mut self) {
-        let mut pauses = HYDRATION_BATCH_PAUSES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pauses
-            .get(&self.path)
-            .is_some_and(|registered| Arc::ptr_eq(registered, &self.pause))
-        {
-            pauses.remove(&self.path);
-        }
-    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -195,45 +158,6 @@ impl Drop for ProjectionSweepPauseRegistration {
             pauses.remove(&self.path);
         }
     }
-}
-
-/// Hold the production loader after `after_loaded` nodes so a test can
-/// observe a genuinely `Loading` index. Visible to `finch-runtime` (a
-/// dependent crate as of the finch-memory extraction, #870) so the typed
-/// `mem-index-status` regression can drive the state #295 is about; gated on
-/// the `test-support` feature, not bare `cfg(test)`, because `cfg(test)` is
-/// local to the crate being compiled and would never be set when a dependent
-/// crate's own test binary links this one as an ordinary dependency.
-#[cfg(any(test, feature = "test-support"))]
-pub fn register_hydration_batch_pause(
-    path: PathBuf,
-    after_loaded: usize,
-) -> (
-    HydrationBatchPauseRegistration,
-    watch::Receiver<bool>,
-    watch::Sender<bool>,
-) {
-    let (reached, reached_rx) = watch::channel(false);
-    let (release, release_rx) = watch::channel(false);
-    let pause = Arc::new(HydrationBatchPause {
-        after_loaded,
-        reached,
-        release: release_rx,
-    });
-    let mut pauses = HYDRATION_BATCH_PAUSES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(
-        pauses.insert(path.clone(), Arc::clone(&pause)).is_none(),
-        "a hydration pause is already registered for {}",
-        path.display()
-    );
-    drop(pauses);
-    (
-        HydrationBatchPauseRegistration { path, pause },
-        reached_rx,
-        release,
-    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -298,14 +222,6 @@ fn register_projection_sweep_pause(
         reached_rx,
         release,
     )
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn take_hydration_batch_pause(path: &std::path::Path) -> Option<Arc<HydrationBatchPause>> {
-    HYDRATION_BATCH_PAUSES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(path)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -508,8 +424,6 @@ struct HydrationState {
     done: watch::Sender<bool>,
     failure: std::sync::Mutex<Option<Failure>>,
     #[cfg(any(test, feature = "test-support"))]
-    batch_pause: std::sync::Mutex<Option<Arc<HydrationBatchPause>>>,
-    #[cfg(any(test, feature = "test-support"))]
     completion_pause: std::sync::Mutex<Option<Arc<HydrationCompletionPause>>>,
     /// Carried here rather than on `ProjectionContext` only because this is
     /// where the other two seams already live and `ProjectionContext` holds
@@ -553,31 +467,9 @@ impl HydrationState {
             done: watch::channel(total == 0).0,
             failure: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
-            batch_pause: std::sync::Mutex::new(None),
-            #[cfg(any(test, feature = "test-support"))]
             completion_pause: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             sweep_pause: std::sync::Mutex::new(None),
-        }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn install_batch_pause(&self, pause: Option<Arc<HydrationBatchPause>>) {
-        *self
-            .batch_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = pause;
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    async fn pause_after_batch(&self, loaded: usize) {
-        let pause = self
-            .batch_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(pause) = pause {
-            pause.after_batch(loaded).await;
         }
     }
 
@@ -724,14 +616,10 @@ enum Failure {
     Broken(String),
 }
 
-/// Nodes hydrated per batch. Small enough that the tree and database locks are
-/// released frequently, so an interactive turn never waits on one long hold.
-pub const HYDRATION_BATCH: usize = 512;
-
 /// Memory system with MemTree and SQLite storage
 pub struct MemorySystem {
     db: Arc<Mutex<Connection>>,
-    tree: Arc<Mutex<MemTree>>,
+    tree: Arc<Mutex<RoutingMemTree>>,
     /// Serialize conversation projection through semantic indexing. This keeps
     /// the SQLite identity, in-memory leaf, and durable leaf provenance from
     /// racing when the daemon retries one completed Brain run.
@@ -770,7 +658,7 @@ impl Drop for MemorySystem {
 #[derive(Clone)]
 struct ProjectionContext {
     db: Arc<Mutex<Connection>>,
-    tree: Arc<Mutex<MemTree>>,
+    tree: Arc<Mutex<RoutingMemTree>>,
     hydration: Arc<HydrationState>,
     embedding_engine: Arc<dyn EmbeddingEngine>,
     insert_lock: Arc<Mutex<()>>,
@@ -1143,45 +1031,15 @@ impl MemorySystem {
                 }
             }
 
-            // Migration A: detect old tree_nodes schema (primary key was 'id AUTOINCREMENT',
-            // not 'node_id').  The old table always had 0 rows because inserts failed with
-            // FK violations, so dropping it is safe.  We detect by checking whether the
-            // 'node_id' column is absent from an existing table.
-            {
-                let table_exists: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tree_nodes'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-                if table_exists > 0 {
-                    let has_node_id: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('tree_nodes') WHERE name='node_id'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                    if has_node_id == 0 {
-                        tracing::info!(
-                            "Dropping stale tree_nodes table (old schema used 'id', not 'node_id')"
-                        );
-                        conn.execute_batch("DROP TABLE IF EXISTS tree_nodes;")?;
-                    }
-                }
-            }
+            // A stale tree_nodes table (MemTree's storage, predating RoutingTree) may still be
+            // present on disk from before RoutingTree replaced it outright. schema.sql no longer
+            // declares that table, so it is never recreated; drop it here so it doesn't linger
+            // as dead state in an existing database.
+            conn.execute_batch("DROP TABLE IF EXISTS tree_nodes;")?;
 
             // Load schema (CREATE TABLE IF NOT EXISTS — safe to re-run)
             let schema = include_str!("schema.sql");
             conn.execute_batch(schema)?;
-
-            // Migration B: add importance column if the DB predates v0.7.15.
-            // Silently ignored if the column already exists.
-            let _ = conn.execute(
-                "ALTER TABLE tree_nodes ADD COLUMN importance INTEGER NOT NULL DEFAULT 1",
-                [],
-            );
 
             // Migration C: executable vocabulary gained explicit effect declarations.
             // Unknown legacy definitions remain conservative and require approval.
@@ -1209,7 +1067,7 @@ impl MemorySystem {
                 db_file.as_deref().unwrap_or("<in-memory or unknown>")
             );
 
-            // Hydrate the MemTree from `tree_nodes`.
+            // Hydrate the RoutingTree from `routing_points`/`routing_nodes`/`routing_leaf_membership`.
             //
             // Doing this synchronously blocked startup behind decoding every stored
             // embedding: on the dogfood host 16,782 nodes at 2048 f32 is 131 MiB,
@@ -1228,27 +1086,21 @@ impl MemorySystem {
             // `next_id` at 1, so the first write upserted over persisted node 1.
             // Refusing to open the store is the honest outcome.
             let node_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))
-                .context("Failed to count stored MemTree nodes")?;
-            let max_node_id: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(node_id), 0) FROM tree_nodes",
-                    [],
-                    |row| row.get(0),
-                )
-                .context("Failed to read the highest stored MemTree node id")?;
-            (node_count, max_node_id)
+                .query_row("SELECT COUNT(*) FROM routing_points", [], |row| row.get(0))
+                .context("Failed to count stored routing points")?;
+            (node_count, 0i64)
         };
 
-        // Parameterize MemTree dimension to match the injected engine.
+        // Parameterize RoutingTree dimension to match the injected engine. Unlike MemTree, there
+        // is no separate next-id counter to advance past the highest stored id: a freshly loaded
+        // RoutingTree's own point count (one Vec entry per `routing_points` row, tombstoned or
+        // not) already determines the next assigned id, by construction.
         let dim = embedding_engine.dimension();
-        let mut tree = MemTree::new_with_dim(dim);
-        tree.set_next_id(max_node_id as u64 + 1);
+        let tree = RoutingMemTree::new_with_dim(dim);
 
         let hydration = Arc::new(HydrationState::new(node_count.max(0) as usize));
         #[cfg(any(test, feature = "test-support"))]
         {
-            hydration.install_batch_pause(take_hydration_batch_pause(&config.db_path));
             hydration.install_completion_pause(take_hydration_completion_pause(&config.db_path));
             hydration.install_sweep_pause(take_projection_sweep_pause(&config.db_path));
         }
@@ -1314,45 +1166,34 @@ impl MemorySystem {
                     // A current-thread runtime, or no runtime at all.
                     let mut guard = tree
                         .try_lock()
-                        .expect("a newly constructed MemTree cannot be contended");
+                        .expect("a newly constructed RoutingMemTree cannot be contended");
                     let conn = db.try_lock().context(
                         "new_with_connection requires the injected connection to be \
                          uncontended during synchronous hydration",
                     )?;
-                    if let Err(error) = Self::load_tree_from_db_conn(&conn, &mut guard) {
-                        // Broken, not fresh.
-                        //
-                        // This arm is only entered when `node_count > 0`, so
-                        // reaching the error means there ARE rows and none of
-                        // them could be read — a full store behind an empty
-                        // tree, which is the same `loaded == 0` case the
-                        // batched arm now refuses. "Starting fresh" was the
-                        // wrong framing: an empty tree over a populated store
-                        // is not a new store, and treating it as one opened the
-                        // write gate on nothing but the placeholder root.
-                        // Memories then attached under a childless root and
-                        // `save_all_nodes_to_db` rewrote node 0 with the
-                        // placeholder's text and embedding.
-                        //
-                        // An earlier version of this comment argued the
-                        // opposite, on the grounds that `fail()` then meant a
-                        // permanent refusal. It no longer does: a reload clears
-                        // it, and #288 separates a partial index from an
-                        // unusable one.
-                        tracing::warn!(
-                            %error,
-                            "Failed to load MemTree; refusing writes rather than \
-                             placing them against an empty index"
-                        );
-                        hydration.fail(error.to_string());
-                    } else {
-                        // `size()` excludes the root; the background arm
-                        // counts rows, which include it. Count rows on both so
-                        // `Ready { nodes }` means one thing.
-                        hydration
-                            .loaded
-                            .store(guard.all_nodes().len(), std::sync::atomic::Ordering::SeqCst);
-                        hydration.complete();
+                    match RoutingMemTree::load(&conn, dim) {
+                        Err(error) => {
+                            // Broken, not fresh. This arm is only entered when
+                            // `node_count > 0`, so reaching the error means
+                            // there ARE rows and none of them could be read —
+                            // refusing writes rather than placing them against
+                            // an empty index. A reload later clears the
+                            // failure (#288 separates a partial index from an
+                            // unusable one).
+                            tracing::warn!(
+                                %error,
+                                "Failed to load RoutingTree; refusing writes rather than \
+                                 placing them against an empty index"
+                            );
+                            hydration.fail(error.to_string());
+                        }
+                        Ok(loaded) => {
+                            hydration
+                                .loaded
+                                .store(loaded.size(), std::sync::atomic::Ordering::SeqCst);
+                            *guard = loaded;
+                            hydration.complete();
+                        }
                     }
                 }
             }
@@ -1614,56 +1455,24 @@ impl MemorySystem {
         let classifier = MemoryClassifier::new();
         if let Some((key_content, importance)) = classifier.process(role, content) {
             let embedding = ctx.embedding_engine.embed(&key_content)?;
+            // Unlike `MemTree::insert_with_effect`, `RoutingTree::insert` (via `RoutingMemTree`)
+            // cannot fail -- there is no aggregation pass with its own failure mode, and no
+            // promotion for a partial failure to leave stranded. Nothing here mutates the tree
+            // and then can error out before that mutation is accounted for.
             let effect = {
                 let mut tree = ctx.tree.lock().await;
-                tree.insert_with_effect(key_content, embedding, importance.as_u8())
+                tree.insert_with_effect(key_content, embedding, importance.as_u8(), timestamp)
             };
-            let effect = match effect {
-                Ok(effect) => effect,
-                Err(error) => {
-                    // Same reason as the `save_all_nodes_to_db` failure below.
-                    // `attach_child` and `promote_leaf` insert the new node and
-                    // push it into its parent's `children` BEFORE aggregating,
-                    // so an aggregation error leaves the tree mutated. Without
-                    // this, an identical retry of the write that just hard
-                    // failed succeeds — `find_leaf_by_text` dedups to the node
-                    // the failed insert left behind and returns before
-                    // aggregation, so the guard is never reached — and then
-                    // persists. A caller cannot act on an error that behaves
-                    // that way.
-                    //
-                    // The reload's own failure is logged, not returned: `error`
-                    // is the cycle diagnostic this whole change exists to
-                    // produce, and replacing it with a generic SQLite error
-                    // would leave a structurally corrupt store looking like a
-                    // transient I/O problem.
-                    //
-                    // This turn is now stranded exactly as #339 describes. The
-                    // sweep is re-armed by the wrapper on the way out, for
-                    // every error exit rather than just this one.
-                    if let Err(reload_error) = Self::reload_tree(ctx).await {
-                        // `?`, not `%`: `Display` on an `anyhow::Error` prints
-                        // only the outermost message and drops the source chain,
-                        // which is where a restore failure's actual cause lives.
-                        tracing::error!(
-                            ?reload_error,
-                            "could not restore the MemTree after a failed insert; \
-                             the in-memory index is inconsistent until restart"
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-            let node_id = effect.node;
-            // Persist all nodes (root + ancestors + new leaf) so the DB stays
-            // consistent across process restarts and FK constraints are satisfied.
-            // The source mapping commits in the same SQLite transaction, so a
-            // retry cannot create a second semantic leaf for the same turn.
-            if let Err(error) = Self::save_all_nodes_to_db(
+            let node_id = effect.point_id;
+            // Persist the point's content, changed tree structure, and provenance row all in one
+            // transaction, so the DB stays consistent across process restarts and a retry cannot
+            // create a second semantic point for the same turn.
+            if let Err(error) = Self::save_routing_insert(
                 &ctx.db,
                 &ctx.tree,
-                Some((node_id, id.as_str(), timestamp)),
-                effect.promotion,
+                effect.point_id,
+                id.as_str(),
+                timestamp,
             )
             .await
             {
@@ -1852,19 +1661,12 @@ impl MemorySystem {
     /// and query — and the callers only ever needed these three numbers.
     pub async fn index_shape(&self) -> (usize, usize, usize) {
         let tree = self.tree.lock().await;
-        let leaves = tree
-            .all_nodes()
-            .values()
-            .filter(|node| node.id != 0 && node.children.is_empty())
-            .count();
-        let widest = tree
-            .all_nodes()
-            .values()
-            .filter(|node| node.id != 0)
-            .map(|node| node.children.len())
-            .max()
-            .unwrap_or(0);
-        (leaves, tree.max_depth(), widest)
+        let leaves = tree.tree().leaf_count();
+        // RoutingTree is strictly binary (module doc): every decision node has exactly two
+        // children, unlike MemTree's variable fan-out. "Widest fan-out" is no longer a meaningful
+        // structural signal here -- 2 once any split exists, 0 otherwise.
+        let widest = if leaves > 1 { 2 } else { 0 };
+        (leaves, tree.tree().max_depth(tree.tree().root()), widest)
     }
 
     /// Query memory for relevant context.
@@ -1903,7 +1705,7 @@ impl MemorySystem {
         for result in results {
             // The salience gate at recall, not only at insert (#415). A store
             // built before the classifier existed carries greetings and acks
-            // in `tree_nodes`; nothing rewrites stored rows, so recall holds
+            // in `routing_points`; nothing rewrites stored rows, so recall holds
             // the same line the classifier holds today.
             if classifier.is_recall_noise(result.text.trim()) {
                 continue;
@@ -2030,12 +1832,14 @@ impl MemorySystem {
                 .parse::<NodeId>()
                 .with_context(|| format!("invalid memory node reference '{memory_id}'"))?;
             let tree = self.tree.lock().await;
-            return Ok(tree.get_node(node_id).map(|node| InspectedMemory {
-                memory_id: memory_id.to_string(),
-                node_id: Some(node_id),
-                source: None,
-                content: node.text.clone(),
-            }));
+            return Ok(tree
+                .get_point(node_id as PointId)
+                .map(|point| InspectedMemory {
+                    memory_id: memory_id.to_string(),
+                    node_id: Some(node_id),
+                    source: None,
+                    content: point.text.clone(),
+                }));
         }
 
         let conn = self.db.lock().await;
@@ -2100,169 +1904,61 @@ impl MemorySystem {
         })
     }
 
-    /// Persist the MemTree nodes that changed, in a single transaction.
+    /// Persist one point's content, every routing node that changed as a result, and its
+    /// provenance row, all in a single transaction.
     ///
-    /// Nodes are written in ascending node_id order (root first) so that the
-    /// self-referential FK `parent_id → node_id` is satisfied for each INSERT.
-    /// SQLite enforces it immediately, and a new node always takes a higher id
-    /// than the parent it attaches to, so ascending order is sufficient.
+    /// Unlike `MemTree`, there is no promotion to fix up: a point's id is permanent from the
+    /// moment `insert_with_effect` assigns it (`RoutingMemTree`'s own module doc), so a
+    /// `memory_sources` row never needs to follow content to a different id after the fact.
     ///
-    /// Two guarantees this must keep, both of which an earlier
-    /// `save_node_to_db(leaf_id)` missed and which were the reason it was
-    /// widened to write everything:
-    ///   1. The root node (id=0) reaches the table, or children violate the FK
-    ///      (libsqlite3-sys bundles SQLite with SQLITE_DEFAULT_FOREIGN_KEYS=1).
-    ///      `MemTree::new_with_dim` marks the root dirty for exactly this.
-    ///   2. Parent embeddings updated by `update_parent_aggregation` are
-    ///      persisted, or they go stale across restarts. That walk marks every
-    ///      node whose embedding it rewrites.
-    ///
-    /// Writing *everything* kept both guarantees at a cost proportional to the
-    /// whole store: on the dogfood host, 16,782 rows and 131 MiB of embeddings
-    /// rewritten per turn, which is why its write-ahead log matched its
-    /// database at 142 MiB (#250).
-    /// Takes the locks rather than `&self`: the pending-projection sweep runs
-    /// inside the background loader, which is spawned before `MemorySystem`
-    /// exists, so it holds these `Arc`s and has no `&self`. One implementation,
-    /// same locks, same order.
-    async fn save_all_nodes_to_db(
+    /// Takes the locks rather than `&self`: the pending-projection sweep runs inside the
+    /// background loader, which is spawned before `MemorySystem` exists, so it holds these
+    /// `Arc`s and has no `&self`. One implementation, same locks, same order.
+    async fn save_routing_insert(
         db: &Mutex<Connection>,
-        tree_lock: &Mutex<MemTree>,
-        source: Option<(NodeId, &str, i64)>,
-        promotion: Option<(NodeId, NodeId)>,
+        tree_lock: &Mutex<RoutingMemTree>,
+        point_id: PointId,
+        conversation_id: &str,
+        indexed_at: i64,
     ) -> Result<()> {
-        // Both locks, held across the whole read-write-clear, and taken
-        // **db before tree** because `stats` nests them in that order --
-        // inverting here would deadlock against a concurrent `stats`.
-        //
-        // Holding the tree guard across the write is what makes the sequence
-        // atomic, and two earlier shapes were unsound without it, in opposite
-        // directions. Draining the marks first and restoring them on error
-        // lost them to cancellation, which returns no error to restore on.
-        // Copying them and clearing after the commit lost *data*: a mutation
-        // landing between the copy and the commit is marked, then unmarked by
-        // `mark_persisted`, which clears ids rather than (id, version) pairs
-        // and so cannot tell the new mark from the one it copied. Review of
-        // #313 reproduced that as a stale row with its mark already gone.
-        //
-        // `insert_conversation_record` happens to serialize every caller on
-        // `insert_lock` today, so neither hole was reachable -- but that is a
-        // lock in a different function that nothing here mentions, and a
-        // second saver (a periodic flush, a shutdown flush, a compaction pass)
-        // would have found it. There is no await between the copy and the
-        // commit now, and the guard is held throughout, so correctness does
-        // not depend on that.
+        // Both locks, held across the whole read-write-mark cycle, and taken **db before tree**
+        // because `stats` nests them in that order -- inverting here would deadlock against a
+        // concurrent `stats`. Same discipline `MemTree`'s own save path used (#313): no await
+        // between reading the dirty set and committing, and the tree guard spans the commit so a
+        // mutation landing mid-write cannot be marked and then silently unmarked.
         let conn = db.lock().await;
         let mut tree = tree_lock.lock().await;
 
-        // One cost worth naming: the tree guard now spans `tx.commit()`. The
-        // store is a single well-known file and rusqlite defaults to a 5s busy
-        // timeout, so a second process writing the same store (a daemon beside
-        // an interactive REPL) can park this commit and stall every in-memory
-        // read behind it. Against that, both critical sections shrank by three
-        // orders of magnitude: the old shape cloned *every* node under the tree
-        // guard -- 131 MiB at dogfood scale -- and wrote every row under the db
-        // guard, where this clones and writes the handful that changed.
-        let changed = tree.dirty_nodes();
-        let mut nodes = Vec::with_capacity(changed.len());
-        for id in &changed {
-            let node = tree.all_nodes().get(id).ok_or_else(|| {
-                // An error rather than a skip, precisely because this change
-                // exists to bound silent loss: dropping a marked id here would
-                // be the failure it is trying to prevent.
-                anyhow::anyhow!(
-                    "memory: node {id} was marked for persistence but is not in the tree"
-                )
-            })?;
-            nodes.push(node.clone());
-        }
+        let meta = tree
+            .get_point(point_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("memory: point {point_id} was just inserted but is not in the tree")
+            })?
+            .clone();
+        let embedding = tree.tree().embedding_of(point_id as usize).to_vec();
+        let dirty = tree.tree().dirty_node_ids();
 
-        Self::write_nodes(&conn, &nodes, source, promotion)?;
-        tree.mark_persisted(&changed);
-        Ok(())
-    }
-
-    /// Upsert exactly `nodes`, plus the provenance rows for this insert.
-    ///
-    /// Takes the connection rather than locking it, so the caller can hold the
-    /// tree guard across the write. Synchronous for the same reason: an await
-    /// in here would reopen the window it exists to close.
-    fn write_nodes(
-        conn: &rusqlite::Connection,
-        nodes: &[TreeNode],
-        source: Option<(NodeId, &str, i64)>,
-        promotion: Option<(NodeId, NodeId)>,
-    ) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
-        for node in nodes {
-            let embedding_bytes: Vec<u8> = node
-                .embedding
-                .iter()
-                .flat_map(|f| f.to_le_bytes())
-                .collect();
-            // Upsert, never REPLACE. `INSERT OR REPLACE` deletes the existing
-            // row before reinserting it, and `memory_sources.node_id` is
-            // declared `ON DELETE CASCADE` — so a plain REPLACE here silently
-            // cascades away the provenance of every node it rewrites. Since
-            // this function used to rewrite the whole tree on every insert,
-            // that destroyed every source row except the one written later in
-            // the same transaction.
-            //
-            // (That rewrite is now scoped to the nodes that changed, so the
-            // blast radius is smaller -- but REPLACE would still cascade away
-            // the provenance of every node it did touch.)
-            //
-            // The dogfood store held 9 rows against 896 conversations. The
-            // cascade alone accounts for all but one of those; the likely
-            // explanation for the survivors is the `node_id IS NULL` rows
-            // written for classifier-excluded turns, which a cascade through
-            // `tree_nodes` cannot reach. That is a hypothesis, not a measured
-            // fact.
-            tx.execute(
-                "INSERT INTO tree_nodes
-                 (node_id, parent_id, text, embedding, level, created_at, importance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(node_id) DO UPDATE SET
-                     parent_id = excluded.parent_id,
-                     text = excluded.text,
-                     embedding = excluded.embedding,
-                     level = excluded.level,
-                     created_at = excluded.created_at,
-                     importance = excluded.importance",
-                params![
-                    node.id as i64,
-                    node.parent.map(|p| p as i64),
-                    &node.text,
-                    &embedding_bytes,
-                    node.level as i64,
-                    node.created_at,
-                    node.importance as i64,
-                ],
-            )?;
-        }
-        // A promotion moved the promoted node's content into a new leaf. Any
-        // conversation attributed to that node was attributed to those words,
-        // so its provenance follows them; leaving it behind would point the row
-        // at an aggregate whose embedding is the mean of two memories, and the
-        // leaf that actually holds the text would have no source at all.
-        if let Some((promoted, moved)) = promotion {
-            tx.execute(
-                "UPDATE memory_sources SET node_id = ?1 WHERE node_id = ?2",
-                params![moved as i64, promoted as i64],
-            )?;
-        }
-
-        if let Some((node_id, conversation_id, indexed_at)) = source {
-            // `node_id` is not unique: deduplicated content is one node with
-            // several source conversations. `conversation_id` is the primary
-            // key, so a retry of the same turn is still idempotent.
-            tx.execute(
-                "INSERT OR REPLACE INTO memory_sources (conversation_id, node_id, indexed_at)
-                 VALUES (?1, ?2, ?3)",
-                params![conversation_id, node_id as i64, indexed_at],
-            )?;
-        }
+        routing_persistence::save_point(
+            &tx,
+            point_id as usize,
+            &meta.text,
+            &embedding,
+            meta.importance,
+            meta.created_at,
+        )?;
+        routing_persistence::write_dirty_nodes_within(tree.tree(), &dirty, &tx)?;
+        // `node_id` (`memory_sources`' own column name, unchanged) now holds a `routing_points`
+        // point id. Not unique: deduplicated content is one point with several source
+        // conversations; `conversation_id` is the primary key, so a retry of the same turn is
+        // still idempotent.
+        tx.execute(
+            "INSERT OR REPLACE INTO memory_sources (conversation_id, node_id, indexed_at)
+             VALUES (?1, ?2, ?3)",
+            params![conversation_id, point_id as i64, indexed_at],
+        )?;
         tx.commit()?;
+        tree.tree_mut().mark_persisted(&dirty);
         Ok(())
     }
 
@@ -2277,16 +1973,14 @@ impl MemorySystem {
 
     /// The body of `reload_tree_from_db`, over the `Arc`s rather than `self`.
     async fn reload_tree(ctx: &ProjectionContext) -> Result<()> {
-        let mut restored = MemTree::new_with_dim(ctx.embedding_engine.dimension());
-        {
+        let restored = {
             let conn = ctx.db.lock().await;
-            Self::load_tree_from_db_conn(&conn, &mut restored)?;
-        }
-        let nodes = restored.all_nodes().len();
-        // The tree was just built from the durable rows, so nothing in it is
-        // pending. `new_with_dim` marks the root dirty for the fresh-store
-        // case; here that row already exists.
-        restored.clear_dirty();
+            RoutingMemTree::load(&conn, ctx.embedding_engine.dimension())?
+        };
+        let nodes = restored.size();
+        // `RoutingMemTree::load`/`load_routing_tree` clear the dirty set as part of installing
+        // loaded state (`install_loaded_state`'s own doc comment) -- the tree was just built from
+        // the durable rows, so nothing in it is pending.
         *ctx.tree.lock().await = restored;
         // The tree now matches the durable snapshot, so whatever the loader
         // recorded no longer describes it. Leaving the failure set meant a
@@ -2297,43 +1991,41 @@ impl MemorySystem {
         Ok(())
     }
 
-    /// Reconstruct MemTree from the tree_nodes table at startup.
-    /// Load persisted nodes in bounded batches, releasing both locks between
-    /// each one so an interactive turn is never blocked for long.
+    /// Reconstruct the `RoutingTree` from `routing_points`/`routing_nodes`/
+    /// `routing_leaf_membership` at startup.
     ///
-    /// Batches are ordered by `node_id`, so a parent may arrive after its
-    /// child, and the full child lists are only correct once every node is
-    /// present — hence the final linking pass.
+    /// RoutingTree hydration, deliberately simpler than MemTree's own batch/link/partial-degrade
+    /// machinery: `routing_nodes.is_leaf` is an explicit persisted column, never inferred from an
+    /// empty child list, so there is no "unlinked node looks like a leaf" window for a concurrent
+    /// read to fall into (the entire reason MemTree's own loader split into an edges-first pass, a
+    /// batch loop, and a final linking pass). A `RoutingTree` node is unambiguous the instant its
+    /// row lands.
     ///
-    /// But a node cannot be allowed to *look* like a leaf until then. Reads are
-    /// deliberately not gated on hydration, and `MemTree::retrieve` identifies
-    /// leaves as `children.is_empty()`; an unlinked tree therefore makes every
-    /// internal node answer queries, surfacing provisional labels duplicated
-    /// from a child and mean-of-subtree embeddings as if they were memories.
-    /// That is the window this change creates, on the first turn, which is
-    /// exactly when it would be seen.
-    ///
-    /// So the edge list is read first, in one query: two integers per row, a
-    /// couple of megabytes resident against 131 MiB of embeddings on the
-    /// dogfood store, so it does not reintroduce the startup cost this change
-    /// exists to remove. Every node is linked as its batch lands. The final
-    /// pass stays, both as a safety net and to cover rows written after the
-    /// edge query.
+    /// A real, disclosed simplification against MemTree's own resilience, not yet replicated:
+    /// this loads all-or-nothing rather than in bounded batches, so a large store still blocks
+    /// startup behind a full decode (the #242 cost this crate's own comments elsewhere describe
+    /// paying down once already), and a failure partway is always `Failed`, never `Degraded` --
+    /// there is no partial-batch state to preserve. Real follow-up work, not a silent regression:
+    /// noted in `crates/finch-memory/AGENTS.md`.
     async fn hydrate_in_background(projection: ProjectionContext) {
-        // Every parent's child list, before any node lands. See the doc
-        // comment: an unlinked node is indistinguishable from a leaf, and reads
-        // are not gated on hydration.
-        let edges = {
+        let restored = {
             let conn = projection.db.lock().await;
-            Self::load_child_edges(&conn)
+            RoutingMemTree::load(&conn, projection.embedding_engine.dimension())
         };
-        Self::hydrate_batches(
-            Arc::clone(&projection.db),
-            Arc::clone(&projection.tree),
-            Arc::clone(&projection.hydration),
-            Self::edges_or_degraded(edges),
-        )
-        .await;
+        match restored {
+            Ok(restored) => {
+                let nodes = restored.size();
+                *projection.tree.lock().await = restored;
+                projection.hydration.loaded.store(nodes, Ordering::SeqCst);
+                projection.hydration.complete();
+                #[cfg(any(test, feature = "test-support"))]
+                projection.hydration.pause_after_completion().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "RoutingTree hydration failed; the index is incomplete for the rest of this session");
+                projection.hydration.fail(error.to_string());
+            }
+        }
 
         // The reopen half of #339.
         //
@@ -2343,258 +2035,35 @@ impl MemorySystem {
         // cannot repair the original row. Sweeping here is what makes the
         // stranding transient — the next successful load projects it.
         //
-        // AFTER `hydrate_batches`, never inside it. The sweep takes
+        // AFTER hydration settles, never during. The sweep takes
         // `insert_lock`, and a writer holds that lock while awaiting hydration
-        // to finish; taking it before `complete()` fires would deadlock the two
-        // against each other. `hydrate_batches` has already completed (or
-        // failed) the hydration by the time it returns, so the writer can
-        // always make progress and release.
+        // to finish; taking it before `complete()`/`fail()` fires would
+        // deadlock the two against each other.
         Self::sweep_pending_projections(&projection).await;
-    }
-
-    /// Degrade, do not abandon hydration.
-    ///
-    /// The edge query only buys read purity during the window. Failing it used
-    /// to call `fail()`, which opens the write gate — against a tree holding
-    /// nothing but a fresh root, because this runs before the first batch. The
-    /// next write would attach under that root and `save_all_nodes_to_db` would
-    /// persist it: the durable misplacement the gate exists to prevent.
-    ///
-    /// This takes no `HydrationState`, so it *cannot* fail the hydration. An
-    /// empty map reproduces exactly the pre-#242 behaviour — flat until the
-    /// final pass, then a complete and correctly linked tree.
-    fn edges_or_degraded(edges: Result<HashMap<u64, Vec<u64>>>) -> HashMap<u64, Vec<u64>> {
-        edges.unwrap_or_else(|error| {
-            tracing::warn!(
-                %error,
-                "MemTree hydration could not read child links; reads during \
-                 hydration may return internal nodes until the final pass"
-            );
-            HashMap::new()
-        })
-    }
-
-    /// The batch loop, taking the edge map rather than reading it.
-    ///
-    /// Split out so the degraded path is reachable from a test. Both queries
-    /// read `tree_nodes`, so there is no way to fail the edge query and not the
-    /// batch query against a real database — without this seam, "hydration
-    /// still completes correctly when the edge list could not be read" would
-    /// have no coverage at all, and re-adding the `fail()` that used to be
-    /// there would be caught by nothing.
-    async fn hydrate_batches(
-        db: Arc<Mutex<Connection>>,
-        tree: Arc<Mutex<MemTree>>,
-        state: Arc<HydrationState>,
-        edges: HashMap<u64, Vec<u64>>,
-    ) {
-        let mut cursor: Option<u64> = None;
-        loop {
-            // The database guard is scoped to the read and nothing else, so
-            // it is not held across `link_loaded_children().await` on the
-            // failure path below.
-            //
-            // The module DOES have a db -> tree lock ordering, and an earlier
-            // version of this comment said it did not. `stats` nests that way
-            // and now so does `save_all_nodes_to_db`, which holds db and then
-            // waits for tree across a whole transaction on the write path --
-            // so a reader that took tree and then wanted db would hang, where
-            // before this ordering only had `stats` to collide with. Every
-            // site that touches both must take db first or scope one guard so
-            // they never overlap. See `save_all_nodes_to_db`.
-            let batch = {
-                let conn = db.lock().await;
-                Self::load_batch(&conn, cursor, HYDRATION_BATCH)
-            };
-            let batch = match batch {
-                Ok(batch) => batch,
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        loaded = state.loaded.load(Ordering::SeqCst),
-                        "MemTree hydration failed; the index is incomplete for \
-                         the rest of this session"
-                    );
-                    // Link what did load, THEN fail.
-                    //
-                    // `fail` completes, and completing opens the write gate, so
-                    // the order of these two lines is the fix. Failing first
-                    // left every loaded node with an empty `children`, so
-                    // `MemTree::insert` saw a childless root, attached every
-                    // later memory directly under it, and
-                    // `save_all_nodes_to_db` persisted that flattening — the
-                    // exact durable misplacement the gate exists to prevent.
-                    // `degrade` only if something actually loaded.
-                    //
-                    // Linking is what makes a partial index coherent, and that
-                    // argument is vacuous when the FIRST batch fails: linking
-                    // an empty node set leaves the tree holding nothing but the
-                    // placeholder root `MemTree::new_with_dim` created. Calling
-                    // that `Degraded` opened the write gate on it, so every
-                    // memory for the session attached directly under a
-                    // childless root and `save_all_nodes_to_db` persisted the
-                    // flattening — the exact harm the paragraph above says the
-                    // gate exists to prevent, reintroduced by the very
-                    // reclassification meant to be safe. It also upserts node 0,
-                    // overwriting the stored root row with the placeholder's.
-                    //
-                    // Nothing loaded is not a smaller index; it is no index.
-                    let loaded = state.loaded.load(Ordering::SeqCst);
-                    Self::link_loaded_children(&tree).await;
-                    if loaded == 0 {
-                        state.fail(error.to_string());
-                    } else {
-                        state.degrade(error.to_string());
-                    }
-                    return;
-                }
-            };
-            if batch.is_empty() {
-                break;
-            }
-
-            let count = batch.len();
-            cursor = batch.last().map(|node| node.id);
-            {
-                let mut guard = tree.lock().await;
-                let nodes = guard.all_nodes_mut();
-                for mut node in batch {
-                    if let Some(children) = edges.get(&node.id) {
-                        node.children = children.clone();
-                    }
-                    nodes.insert(node.id, node);
-                }
-            }
-            state.loaded.fetch_add(count, Ordering::SeqCst);
-            #[cfg(any(test, feature = "test-support"))]
-            state
-                .pause_after_batch(state.loaded.load(Ordering::SeqCst))
-                .await;
-
-            // Yield so a turn submitted mid-hydration is served promptly.
-            tokio::task::yield_now().await;
-        }
-
-        Self::link_loaded_children(&tree).await;
-        state.complete();
-        #[cfg(any(test, feature = "test-support"))]
-        state.pause_after_completion().await;
-    }
-
-    /// Rebuild every `children` list from the `parent` links of the nodes
-    /// actually in the tree, discarding what was there.
-    ///
-    /// Rebuild rather than merge, because the batch loader seeds each node with
-    /// its full stored child list — including children that have not loaded yet
-    /// — so that an unlinked node is never mistaken for a leaf by a read taken
-    /// mid-hydration. Those ids are dangling until their nodes arrive, and
-    /// `MemTree::insert` rejects a dangling child id outright. Writes are gated
-    /// on hydration finishing, so the only way one can reach a write is a
-    /// hydration that *failed* partway: this pass runs there too, and the
-    /// rebuild is what prunes them.
-    ///
-    /// Do not add an await after the guard is taken. Clearing before
-    /// repopulating means a reader that observed the tree mid-pass would see
-    /// every node in a fully loaded tree looking like a leaf — the defect this
-    /// linking exists to prevent, at maximum blast radius. The pass is
-    /// currently await-free from `tree.lock()` to the end, and that is what
-    /// makes clearing safe rather than an accident worth preserving silently.
-    ///
-    /// It also means read purity is a success-path property. After a *failed*
-    /// hydration an internal node whose children never loaded is pruned to an
-    /// empty child list and does answer queries as a leaf for the rest of the
-    /// session. That is the deliberate trade: a partial index that writes
-    /// safely, over a pure one that corrupts.
-    async fn link_loaded_children(tree: &Arc<Mutex<MemTree>>) {
-        let mut guard = tree.lock().await;
-        let parents: Vec<(u64, u64)> = guard
-            .all_nodes()
-            .values()
-            .filter_map(|node| node.parent.map(|parent| (parent, node.id)))
-            .collect();
-        let nodes = guard.all_nodes_mut();
-        for node in nodes.values_mut() {
-            node.children.clear();
-        }
-        for (parent_id, child_id) in parents {
-            if let Some(parent) = nodes.get_mut(&parent_id) {
-                parent.children.push(child_id);
-            }
-        }
-        for node in nodes.values_mut() {
-            node.children.sort_unstable();
-        }
-    }
-
-    /// Every parent's child list, as one compact query.
-    ///
-    /// Two integers per row and no embeddings, so this is cheap enough to run
-    /// before the first batch: about 8 ms and a couple of megabytes resident
-    /// for the dogfood store's 16,782 rows, against 131 MiB of embeddings and
-    /// the 3.25 s this change exists to remove.
-    ///
-    /// No `ORDER BY`. Adding one on `node_id` turns this into a full table
-    /// scan; without it `idx_tree_nodes_parent` covers the query outright. The
-    /// order is not needed either way — every consumer of these lists reads
-    /// only `is_empty()` or `len()`, and `link_loaded_children` sorts.
-    fn load_child_edges(conn: &Connection) -> Result<HashMap<u64, Vec<u64>>> {
-        let mut stmt =
-            conn.prepare("SELECT parent_id, node_id FROM tree_nodes WHERE parent_id IS NOT NULL")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
-        })?;
-        let mut edges: HashMap<u64, Vec<u64>> = HashMap::new();
-        for row in rows {
-            let (parent, child) = row?;
-            edges.entry(parent).or_default().push(child);
-        }
-        Ok(edges)
-    }
-
-    /// One page of stored nodes, keyed on the last id already read, without
-    /// their child links.
-    ///
-    /// Keyset, not `LIMIT`/`OFFSET`. The database lock is released between
-    /// batches, so the row set can change underneath an offset: a row deleted
-    /// below the window shifts every later row back by one and the loader skips
-    /// the boundary row for the rest of the session. A cursor on `node_id`
-    /// cannot skip, and it is an O(1) primary-key seek rather than an
-    /// O(offset) scan.
-    ///
-    /// The narrower claim, since an earlier version of this comment overstated
-    /// it: Finch's own writers hand out ids monotonically from
-    /// `set_next_id(MAX + 1)` and never `DELETE FROM tree_nodes`, so the
-    /// skipping case is not reachable through Finch today. This removes the
-    /// class rather than a demonstrated failure.
-    fn load_batch(conn: &Connection, after: Option<u64>, limit: usize) -> Result<Vec<TreeNode>> {
-        let mut stmt = conn.prepare(
-            "SELECT node_id, parent_id, text, embedding, level, created_at, importance
-             FROM tree_nodes WHERE node_id > ?1 ORDER BY node_id ASC LIMIT ?2",
-        )?;
-        // `-1` rather than `0`: node 0 is the root and must be included.
-        let after = after.map_or(-1, |id| id as i64);
-        let rows = stmt.query_map(params![after, limit as i64], |row| {
-            let embedding: Vec<u8> = row.get(3)?;
-            Ok(TreeNode {
-                id: row.get::<_, i64>(0)? as u64,
-                parent: row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
-                children: Vec::new(),
-                text: row.get(2)?,
-                embedding: embedding
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect(),
-                level: row.get::<_, i64>(4)? as usize,
-                created_at: row.get(5)?,
-                importance: row.get::<_, i64>(6).unwrap_or(1).clamp(0, 3) as u8,
-            })
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Progress of the background hydration, for status surfaces.
     pub fn hydration_status(&self) -> HydrationStatus {
         self.hydration.status()
+    }
+
+    /// Force a `Degraded` status for cross-crate integration tests.
+    ///
+    /// RoutingTree hydration is atomic (see `hydrate_in_background`'s own
+    /// doc): nothing in production reaches `Degraded` anymore, since there is
+    /// no partial-batch load left to stop partway through with what loaded so
+    /// far still coherent. The variant and its projection are still real and
+    /// still worth testing (`mem-index-status`, `mem-recall`'s refusal of an
+    /// incomplete index), so this exists purely to construct that state
+    /// directly -- the same technique `crates/finch-memory/src/lib.rs`'s own
+    /// `test_a_degraded_index_accepts_writes_and_a_broken_one_does_not` uses
+    /// from inside this crate's `cfg(test)`, exposed here because a dependent
+    /// crate's integration tests cannot reach `HydrationState` at all.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_degraded_for_test(&self, loaded: usize, total: usize, reason: String) {
+        self.hydration.loaded.store(loaded, Ordering::SeqCst);
+        self.hydration.total.store(total, Ordering::SeqCst);
+        self.hydration.degrade(reason);
     }
 
     /// The configuration this instance was constructed with -- callers that
@@ -2663,101 +2132,6 @@ impl MemorySystem {
         Ok(())
     }
 
-    fn load_tree_from_db_conn(conn: &Connection, tree: &mut MemTree) -> Result<()> {
-        struct Row {
-            node_id: u64,
-            parent_id: Option<u64>,
-            text: String,
-            embedding: Vec<f32>,
-            level: usize,
-            created_at: i64,
-            importance: u8,
-        }
-
-        let mut stmt = conn.prepare(
-            "SELECT node_id, parent_id, text, embedding, level, created_at, importance
-             FROM tree_nodes ORDER BY node_id ASC",
-        )?;
-
-        let rows: Vec<Row> = stmt
-            .query_map([], |row| {
-                let node_id: i64 = row.get(0)?;
-                let parent_id: Option<i64> = row.get(1)?;
-                let text: String = row.get(2)?;
-                let embedding_bytes: Vec<u8> = row.get(3)?;
-                let level: i64 = row.get(4)?;
-                let created_at: i64 = row.get(5)?;
-                let importance: i64 = row.get(6).unwrap_or(1);
-                Ok((
-                    node_id,
-                    parent_id,
-                    text,
-                    embedding_bytes,
-                    level,
-                    created_at,
-                    importance,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(
-                |(node_id, parent_id, text, embedding_bytes, level, created_at, importance)| Row {
-                    node_id: node_id as u64,
-                    parent_id: parent_id.map(|p| p as u64),
-                    text,
-                    embedding: embedding_bytes
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect(),
-                    level: level as usize,
-                    created_at,
-                    importance: importance.clamp(0, 3) as u8,
-                },
-            )
-            .collect();
-
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        let nodes = tree.all_nodes_mut();
-        let mut max_id: u64 = 0;
-
-        // First pass: insert all nodes
-        for row in &rows {
-            max_id = max_id.max(row.node_id);
-            nodes.insert(
-                row.node_id,
-                TreeNode {
-                    id: row.node_id,
-                    parent: row.parent_id,
-                    children: Vec::new(),
-                    text: row.text.clone(),
-                    embedding: row.embedding.clone(),
-                    level: row.level,
-                    created_at: row.created_at,
-                    importance: row.importance,
-                },
-            );
-        }
-
-        // Second pass: rebuild children lists
-        for row in &rows {
-            if let Some(parent_id) = row.parent_id {
-                if let Some(parent) = nodes.get_mut(&parent_id) {
-                    if !parent.children.contains(&row.node_id) {
-                        parent.children.push(row.node_id);
-                    }
-                }
-            }
-        }
-
-        // Advance next_id past all loaded IDs
-        tree.set_next_id(max_id + 1);
-
-        Ok(())
-    }
-
     /// Persist a successful Lisp `(define ...)` expression for session replay.
     ///
     /// This writes `lisp_env` only. Composition projects authored definitions
@@ -2816,13 +2190,14 @@ impl MemorySystem {
         }
 
         let tree = self.tree.lock().await;
-        let nodes = tree.all_nodes();
 
-        // Collect leaf embeddings and texts (exclude root id=0)
-        let mut leaves: Vec<(i64, &Vec<f32>, &str)> = nodes
-            .values()
-            .filter(|n| n.id != 0 && n.children.is_empty())
-            .map(|n| (n.created_at, &n.embedding, n.text.as_str()))
+        // Collect every point's embedding and text -- unlike MemTree there is no root id=0 to
+        // exclude (a `RoutingMemTree` point IS real content the moment it exists, never an
+        // aggregate placeholder). Owned, not borrowed: `average_embeddings` below wants
+        // `&[&Vec<f32>]`, easiest to satisfy from data this function already owns outright.
+        let mut leaves: Vec<(i64, Vec<f32>, String)> = tree
+            .iter_points()
+            .map(|(_, m, e)| (m.created_at, e.to_vec(), m.text.clone()))
             .collect();
 
         if leaves.is_empty() {
@@ -2839,14 +2214,14 @@ impl MemorySystem {
         // The last window is always the "now" slot. Pin it to the most-recent
         // leaf's actual text so it is guaranteed to show something fresh and
         // distinct, even when all centroid queries converge on the same node.
-        let now_text = truncate_str(leaves[0].2, 70);
+        let now_text = truncate_str(&leaves[0].2, 70);
 
         let mut lines: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Centroid queries for all windows except the last ("now") slot.
         for window in windows.iter().take(windows.len().saturating_sub(1)) {
-            let slice: Vec<&Vec<f32>> = leaves.iter().take(*window).map(|(_, e, _)| *e).collect();
+            let slice: Vec<&Vec<f32>> = leaves.iter().take(*window).map(|(_, e, _)| e).collect();
             let centroid = average_embeddings(&slice);
             if let Some((_, text, _)) = tree.retrieve(&centroid, 1).into_iter().next() {
                 let s = truncate_str(&text, 70);
@@ -2996,14 +2371,17 @@ pub struct MemoryStats {
 #[cfg(test)]
 mod tests {
 
-    /// Count writes to `tree_nodes` made by one closure.
+    /// Count writes to `routing_nodes` made by one closure.
     ///
     /// A trigger rather than `Connection::total_changes`, because the store
     /// keeps its connection private: triggers belong to the database, so a
     /// probe installed from a second connection sees writes made through the
     /// first. `ON CONFLICT DO UPDATE` fires the update trigger even when every
     /// column is rewritten to the value it already held, which is exactly the
-    /// work this measures.
+    /// work this measures. `routing_nodes` (structure: anchor/direction/
+    /// real_centroid per tree node), not `routing_points` (content: one row
+    /// per memory, always exactly one new row per insert regardless of tree
+    /// size) -- the ancestors-whose-centroid-changed cost this test bounds.
     fn tree_node_writes(db_path: &std::path::Path) -> Result<i64> {
         let conn = Connection::open(db_path)?;
         conn.query_row("SELECT COUNT(*) FROM write_probe", [], |row| row.get(0))
@@ -3015,9 +2393,9 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS write_probe (n INTEGER);
              DROP TRIGGER IF EXISTS probe_tree_insert;
              DROP TRIGGER IF EXISTS probe_tree_update;
-             CREATE TRIGGER probe_tree_insert AFTER INSERT ON tree_nodes
+             CREATE TRIGGER probe_tree_insert AFTER INSERT ON routing_nodes
                  BEGIN INSERT INTO write_probe VALUES (1); END;
-             CREATE TRIGGER probe_tree_update AFTER UPDATE ON tree_nodes
+             CREATE TRIGGER probe_tree_update AFTER UPDATE ON routing_nodes
                  BEGIN INSERT INTO write_probe VALUES (1); END;
              DELETE FROM write_probe;",
         )?;
@@ -3025,7 +2403,7 @@ mod tests {
     }
 
     /// Build a store holding `turns` distinct memories and report how many
-    /// `tree_nodes` rows one further insert writes.
+    /// `routing_nodes` rows one further insert writes.
     async fn writes_for_one_more_insert(turns: usize) -> Result<(i64, usize)> {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
@@ -3130,25 +2508,19 @@ mod tests {
         Ok(())
     }
 
-    /// Every persisted column of every node reaches disk.
+    /// Every persisted column of every point reaches disk, including the dedup
+    /// importance bump.
     ///
-    /// This is the guard the incremental save needs and the old whole-tree
-    /// write did not. Writing every node on every insert made a forgotten
-    /// write impossible; writing only marked ones makes a forgotten *mark*
-    /// silent data loss.
-    ///
-    /// It compares whole nodes, not texts. An earlier version compared sorted
-    /// texts and review of #313 showed that was too weak to support the claim
-    /// made for it: deleting the dedup importance mark left it green, and so
-    /// did deleting the aggregation mark. Text alone cannot see a stale
-    /// `importance` or a parent embedding that never got its aggregate. Every
-    /// column the table stores is compared here, so a mark forgotten for any
-    /// of them fails.
-    ///
-    /// The inputs drive all three mutation paths. Instrumented while writing
-    /// this: 19 attaches, 61 promotions, 40 dedups.
+    /// This is the guard the incremental save needs and a whole-tree write did
+    /// not. Writing every point on every insert made a forgotten write
+    /// impossible; writing only marked ones makes a forgotten *mark* silent
+    /// data loss. Unlike `MemTree`'s equivalent, there is no parent/level/
+    /// promotion/aggregation column to lose: `RoutingMemTree`'s point content
+    /// (text, embedding, importance, created_at) is the entire persisted
+    /// surface for a point (`routing_memory.rs`'s own module doc -- no
+    /// promotion, since a point's id is permanent).
     #[tokio::test]
-    async fn test_every_persisted_column_survives_a_reload() -> Result<()> {
+    async fn test_every_persisted_point_survives_a_reload() -> Result<()> {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -3156,7 +2528,7 @@ mod tests {
             ..Default::default()
         };
 
-        let expected: Vec<(NodeId, Option<NodeId>, String, usize, u8, i64, Vec<f32>)> = {
+        let expected: Vec<(PointId, String, u8, i64, Vec<f32>)> = {
             let memory = MemorySystem::new(config.clone())?;
             for i in 0..40 {
                 memory
@@ -3167,9 +2539,7 @@ mod tests {
                         None,
                     )
                     .await?;
-                // Near-duplicate: close enough to descend to the same leaf and
-                // promote it into a parent rather than attach beside it. That
-                // is the path that creates aggregated embeddings.
+                // A genuinely different point -- real content, not a duplicate.
                 memory
                     .insert_conversation(
                         "user",
@@ -3178,7 +2548,7 @@ mod tests {
                         None,
                     )
                     .await?;
-                // Exact repeat: the dedup path, which creates no node.
+                // Exact repeat: the dedup path, which creates no new point.
                 memory
                     .insert_conversation(
                         "user",
@@ -3187,17 +2557,11 @@ mod tests {
                         None,
                     )
                     .await?;
-                // The same fact stored *explicitly*. This is the only way the
-                // dedup importance bump fires in production: `process` gives
-                // role "system" Critical and classifies everything else, and
-                // `extract` is role-independent below 300 characters, so this
-                // dedups onto the existing node and raises its importance.
-                //
-                // Without it the bump never triggers -- identical text from an
-                // identical role classifies identically, so
-                // `importance > node.importance` is false and there is nothing
-                // to persist. Review of #313 caught exactly that: deleting the
-                // mark left the suite green because no test reached the branch.
+                // The same fact stored *explicitly* -- the only way the dedup
+                // importance bump fires in production (`process` gives role
+                // "system" Critical; `extract` is role-independent below 300
+                // characters, so this dedups onto the existing point and
+                // raises its importance).
                 memory
                     .insert_conversation(
                         "system",
@@ -3219,63 +2583,40 @@ mod tests {
         assert_eq!(
             restored.len(),
             expected.len(),
-            "a node was lost entirely between memory and disk"
+            "a point was lost entirely between memory and disk"
         );
         for (before, after) in expected.iter().zip(restored.iter()) {
             if before == after {
                 continue;
             }
-            // Name the column rather than dumping two 2048-float embeddings,
-            // which buries the message it is attached to.
             let column = if before.1 != after.1 {
-                format!("parent {:?} != {:?}", before.1, after.1)
+                format!("text {:?} != {:?}", before.1, after.1)
             } else if before.2 != after.2 {
-                format!("text {:?} != {:?}", before.2, after.2)
+                format!("importance {} != {}", before.2, after.2)
             } else if before.3 != after.3 {
-                format!("level {} != {}", before.3, after.3)
-            } else if before.4 != after.4 {
-                format!("importance {} != {}", before.4, after.4)
-            } else if before.5 != after.5 {
-                format!("created_at {} != {}", before.5, after.5)
+                format!("created_at {} != {}", before.3, after.3)
             } else {
                 format!(
                     "embedding differs ({} floats; first divergence at {:?})",
-                    before.6.len(),
+                    before.4.len(),
                     before
-                        .6
+                        .4
                         .iter()
-                        .zip(after.6.iter())
+                        .zip(after.4.iter())
                         .position(|(a, b)| a != b)
                 )
             };
-            panic!(
-                "node {} did not survive the reload: {column}. A mutation that \
-                 forgot to mark its node dirty is lost here and nowhere else.",
-                before.0
-            );
+            panic!("point {} did not survive the reload: {column}. A mutation that forgot to mark its node dirty is lost here and nowhere else.", before.0);
         }
         Ok(())
     }
 
-    /// Every node's persisted columns, ordered by id.
-    async fn snapshot(
-        memory: &MemorySystem,
-    ) -> Vec<(NodeId, Option<NodeId>, String, usize, u8, i64, Vec<f32>)> {
+    /// Every point's persisted columns, ordered by id.
+    async fn snapshot(memory: &MemorySystem) -> Vec<(PointId, String, u8, i64, Vec<f32>)> {
         let tree = memory.tree.lock().await;
         let mut rows: Vec<_> = tree
-            .all_nodes()
-            .values()
-            .map(|n| {
-                (
-                    n.id,
-                    n.parent,
-                    n.text.clone(),
-                    n.level,
-                    n.importance,
-                    n.created_at,
-                    n.embedding.clone(),
-                )
-            })
+            .iter_points()
+            .map(|(pid, m, e)| (pid, m.text.clone(), m.importance, m.created_at, e.to_vec()))
             .collect();
         rows.sort_by_key(|row| row.0);
         rows
@@ -3523,74 +2864,14 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_promotion_moves_provenance_to_the_leaf_holding_the_text() -> Result<()> {
-        // When a matched leaf becomes an aggregate, the conversation attributed
-        // to it was attributed to those words, so its row must follow them to
-        // the moved child. Otherwise it points at an embedding that is the mean
-        // of two different memories, and the leaf holding the text has no
-        // source at all.
-        //
-        // The fixture pair must sit BELOW `NEAR_IDENTICAL_SIMILARITY`, or the
-        // variant rule fires, promotion never happens, and this test silently
-        // covers nothing. A previous version used "alpha" and "alpha two",
-        // which measured 0.99275 and did exactly that. Swapping a single word
-        // measures 0.9499 — below the cutoff, but by 0.040, not the 0.12
-        // an earlier version of this comment implied.
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-        let memory = MemorySystem::new(config)?;
-
-        memory
-            .insert_conversation("system", &substantive("production"), None, None)
-            .await?;
-        memory
-            .insert_conversation("system", &substantive("staging"), None, None)
-            .await?;
-
-        // Guard: if no promotion occurred there is nothing to follow, and the
-        // assertions below would pass vacuously.
-        let (_, depth, _) = memory.index_shape().await;
-        assert!(
-            depth > 1,
-            "the fixture must actually promote, or this test covers nothing"
-        );
-
-        let conn = memory.db.lock().await;
-
-        // Every source row points at a leaf, never at an aggregate.
-        let orphaned: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM memory_sources s
-             WHERE EXISTS (SELECT 1 FROM tree_nodes c WHERE c.parent_id = s.node_id)",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(
-            orphaned, 0,
-            "no conversation may be attributed to an internal aggregate node"
-        );
-
-        // And the row points at the leaf that actually holds its words.
-        let mismatched: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM memory_sources s
-             JOIN conversations c ON c.id = s.conversation_id
-             JOIN tree_nodes n ON n.node_id = s.node_id
-             WHERE instr(c.content, n.text) = 0",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(
-            mismatched, 0,
-            "each source row must point at a node whose text came from that \
-             conversation"
-        );
-
-        Ok(())
-    }
-
+    // A test previously lived here (`test_promotion_moves_provenance_to_the_
+    // leaf_holding_the_text`) verifying that when a MemTree leaf was promoted
+    // into a new parent, `memory_sources` followed the moved content to its
+    // new node id. RoutingTree has no promotion at all -- a point's id is
+    // permanent from the moment `insert` assigns it, regardless of how the
+    // tree restructures around it later (`routing_memory.rs`'s own module
+    // doc; `schema.sql`'s `memory_sources` comment). There is no "provenance
+    // must follow a move" property left to test, since nothing ever moves.
     #[tokio::test]
     async fn test_stale_schema_is_refused_and_a_fresh_one_reopens() -> Result<()> {
         use rusqlite::Connection;
@@ -3650,44 +2931,23 @@ mod tests {
     }
 
     async fn await_hydration_without_subscribing(memory: &MemorySystem) {
-        // Phase 1: every stored node counted.
-        //
-        // This alone does NOT mean the loader is done. `loaded` reaches
-        // `total` on the last batch, and the loader then runs the child-linking
-        // pass before calling `complete()`. Returning here would subscribe
-        // *before* completion fired, which is precisely the sequence that hides
-        // the bug — an earlier draft of this test did exactly that and passed
-        // against the broken code.
+        // Unlike MemTree's loader (counted, THEN a separate child-linking pass,
+        // THEN `complete()`), RoutingTree hydration is atomic: `loaded` is set
+        // and `complete()` is called together, in the same step, with the full
+        // tree already installed (`hydrate_in_background`'s own doc comment).
+        // There is no intermediate "counted but not yet usable" state left to
+        // wait through -- waiting for `Ready` (or a terminal failure) is the
+        // whole wait.
         for i in 0..2_500 {
             match memory.hydration_status() {
                 HydrationStatus::Ready { .. } => break,
-                HydrationStatus::Loading { loaded, total } if total > 0 && loaded >= total => break,
                 HydrationStatus::Loading { .. } => {}
                 HydrationStatus::Failed { reason } => panic!("hydration failed: {reason}"),
                 HydrationStatus::Degraded { reason, .. } => {
                     panic!("hydration stopped early: {reason}")
                 }
             }
-            assert!(i < 2_499, "hydration never counted every node");
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-
-        // Phase 2: the child-linking pass has run. `complete()` is the next
-        // statement after it with no await in between, so observing linked
-        // children means the loader has either already completed or is a few
-        // instructions away. The trailing sleep covers the second case on a
-        // multi-threaded runtime.
-        for i in 0..2_500 {
-            let linked = {
-                let tree = memory.tree.lock().await;
-                tree.all_nodes()
-                    .values()
-                    .any(|node| !node.children.is_empty())
-            };
-            if linked {
-                break;
-            }
-            assert!(i < 2_499, "the loader never linked children");
+            assert!(i < 2_499, "hydration never reached Ready");
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3721,33 +2981,75 @@ mod tests {
         );
     }
 
-    fn seed_tree_nodes(path: &std::path::Path, count: u64, overrides: &[(u64, u64)]) -> Result<()> {
-        let conn = Connection::open(path)?;
-        let embedding: Vec<u8> = 0.5f32.to_le_bytes().repeat(8);
-        let tx = conn.unchecked_transaction()?;
+    /// Builds a REAL `RoutingTree` of `count` points (deterministic pseudo-random
+    /// embeddings, `dim` matching whatever engine the caller's `MemoryConfig` will
+    /// later reopen with) via genuine `insert()` calls, then persists it -- unlike
+    /// MemTree's old raw-SQL `tree_nodes` seeding, `RoutingTree`'s structure has
+    /// real geometric consistency requirements (frozen split axes, membership that
+    /// must actually replay-descend correctly) that hand-crafted rows cannot
+    /// safely fake. Slower than a raw INSERT loop, but the only way to produce a
+    /// store `load_routing_tree` can hydrate correctly.
+    /// A "real, non-trivial store" size for hydration/reload tests. Used to be
+    /// sized off `HYDRATION_BATCH` (multiples of 512) to exercise MemTree's own
+    /// batch-boundary behavior -- meaningless now that RoutingTree hydration is
+    /// atomic, and at TfIdfEmbedding's real 2048-dim, building hundreds+ of
+    /// points via genuine `RoutingTree::insert()` in an unoptimized debug test
+    /// binary is genuinely slow (confirmed live: 1024 points hung past several
+    /// minutes; the same test passes in ~8s at this size). Large enough to
+    /// force several real splits, small enough to stay fast.
+    const SEEDED_STORE_SIZE: u64 = 50;
+
+    /// Real cluster structure, not pure noise -- pure uniform-random points in a
+    /// high-dim space have no real axis for `fraction_explained` to find, so
+    /// `discrimination_gate_threshold` keeps rejecting every candidate split.
+    /// `try_split` fires on every insert once a leaf exceeds `leaf_capacity`
+    /// (`insertInto`'s own doc comment, inherited unmodified from the D
+    /// reference), so a leaf that never successfully splits gets a full
+    /// candidate-generation attempt -- O(bucket size x dim x iterations) --
+    /// retried on EVERY subsequent insert into it, against an ever-growing
+    /// bucket: a real O(n^2)-ish cost cliff, confirmed live (a first version of
+    /// this helper used pure noise and a 1024-point seed never finished in over
+    /// 30 minutes). Clustered synthetic data gives splits a real signal to find
+    /// quickly, the same way real embeddings would.
+    fn seed_routing_points(path: &std::path::Path, count: u64, dim: usize) -> Result<()> {
+        let mut conn = Connection::open(path)?;
+        // WAL mode (`MemorySystem::open_connection`'s own setup) doesn't apply
+        // to this raw connection, and 2000+ individual autocommit inserts each
+        // fsync separately -- genuinely slow, confirmed live (this was the
+        // actual remaining bottleneck after fixing the cluster-structure issue
+        // above; one wrapping transaction turned minutes into well under a
+        // second). One transaction for the whole seed, matching how a real
+        // caller would batch a bulk load anyway.
+        let mut tree = routing_tree::RoutingTree::new(RoutingConfig::default(), dim, 7);
+        let mut state = 0xC0FFEE_u64;
+        let clusters = 8usize;
+        let tx = conn.transaction()?;
         for id in 0..count {
-            let parent = if id == 0 { None } else { Some(0i64) };
-            tx.execute(
-                "INSERT OR REPLACE INTO tree_nodes
-                 (node_id, parent_id, text, embedding, level, created_at, importance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-                params![
-                    id as i64,
-                    parent,
-                    format!("seeded node {id}"),
-                    embedding,
-                    if id == 0 { 0i64 } else { 1i64 },
-                    id as i64,
-                ],
+            let mut embedding = vec![0.0f32; dim];
+            embedding[(id as usize % clusters) % dim] = 3.0;
+            for slot in embedding.iter_mut() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let jitter = ((state >> 33) as f64 / u32::MAX as f64) as f32 - 0.5;
+                *slot += jitter * 0.3;
+            }
+            let point_id = tree.insert(embedding.clone());
+            routing_persistence::save_point(
+                &tx,
+                point_id,
+                &format!("seeded point {id}"),
+                &embedding,
+                1,
+                id as i64,
             )?;
         }
-        for (child, parent) in overrides {
-            tx.execute(
-                "UPDATE tree_nodes SET parent_id = ?1 WHERE node_id = ?2",
-                params![*parent as i64, *child as i64],
-            )?;
-        }
+        // `save_dirty_nodes` opens its own transaction, which would nest inside
+        // `tx` (SQLite rejects that) -- `write_dirty_nodes_within` is the
+        // lower-level piece meant for exactly this composition, same as
+        // `save_routing_insert` above uses it.
+        let dirty = tree.dirty_node_ids();
+        routing_persistence::write_dirty_nodes_within(&tree, &dirty, &tx)?;
         tx.commit()?;
+        tree.mark_persisted(&dirty);
         Ok(())
     }
 
@@ -3843,14 +3145,14 @@ mod tests {
         // structural signature, and the ratio only caught it 48 times in 50.
         // Detecting it deterministically needs a gate the loader must pass,
         // which is a larger change than this flake fix.
-        const NODES: u64 = 4 * HYDRATION_BATCH as u64;
+        const NODES: u64 = SEEDED_STORE_SIZE;
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);
-        seed_tree_nodes(temp.path(), NODES, &[])?;
+        seed_routing_points(temp.path(), NODES, TfIdfEmbedding::new().dimension())?;
 
         // The blocking load, on a thread with no runtime.
         let blocking_config = config.clone();
@@ -3893,227 +3195,13 @@ mod tests {
             other => panic!("hydration did not complete: {other:?}"),
         }
 
-        // The rebuilt structure must match what a blocking load produces:
-        // children linked, not a flat list.
-        let linked = {
-            let tree = reopened.tree.lock().await;
-            tree.all_nodes()
-                .values()
-                .filter(|node| !node.children.is_empty())
-                .count()
-        };
-        assert!(
-            linked > 0,
-            "the final pass must link children; a flat tree means the parent \
-             links were dropped"
-        );
-
-        Ok(())
-    }
-
-    // Multi-thread: the only flavor that spawns the background loader.
-    // It exists for the paging loop, which a current-thread runtime never
-    // enters.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_hydration_pages_across_batches_and_links_late_parents() -> Result<()> {
-        // Every other hydration test seeds 30-40 conversations, so the paging
-        // loop this PR introduces runs its body exactly once and stops. The
-        // cursor advance, the per-batch lock release, and the case a parent
-        // arrives in a later batch than its child were all unexercised, on a
-        // change whose entire point is a 16,782-node store (#242).
-        // Four non-empty pages plus the empty one that ends the loop. Written
-        // in terms of HYDRATION_BATCH so it stays above the batch size if the
-        // constant changes; asserting that would be a tautology.
-        const NODES: u64 = 3 * HYDRATION_BATCH as u64 + 7;
-        // Node 5 is in the first batch; its parent is in the third. Linking
-        // therefore cannot be done as the batches land.
-        let late_parent = 2 * HYDRATION_BATCH as u64 + 3;
-
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-        drop(MemorySystem::new(config.clone())?); // create the schema
-        seed_tree_nodes(temp.path(), NODES, &[(5, late_parent)])?;
-
-        let memory = MemorySystem::new(config)?;
-        memory.ensure_hydrated().await?;
-
-        match memory.hydration_status() {
-            HydrationStatus::Ready { nodes } => assert_eq!(
-                nodes as u64, NODES,
-                "every node across every batch must load"
-            ),
-            other => panic!("hydration did not complete: {other:?}"),
-        }
-
-        let tree = memory.tree.lock().await;
-        assert_eq!(
-            tree.all_nodes().len() as u64,
-            NODES,
-            "a skipped or duplicated page loses nodes"
-        );
-        for id in 0..NODES {
-            assert!(
-                tree.all_nodes().contains_key(&id),
-                "node {id} was skipped by the batch loader"
-            );
-        }
-        assert_eq!(
-            tree.all_nodes()
-                .get(&late_parent)
-                .expect("late parent must load")
-                .children,
-            vec![5],
-            "a child in an earlier batch must be linked to its later parent"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_an_unreadable_edge_list_degrades_instead_of_failing_hydration() {
-        // The decision itself, separately from its consequence. `fail()` opens
-        // the write gate, and this runs before the first batch, so failing here
-        // released writes against a tree holding nothing but a fresh root.
-        // `edges_or_degraded` takes no `HydrationState`, so it cannot fail the
-        // hydration however it is edited — the type is the guarantee, and this
-        // pins the empty-map result that goes with it.
-        let degraded = MemorySystem::edges_or_degraded(Err(anyhow::anyhow!("database is locked")));
-        assert!(
-            degraded.is_empty(),
-            "an unreadable edge list must degrade to no links, not propagate"
-        );
-
-        let mut edges = HashMap::new();
-        edges.insert(0u64, vec![1u64, 2]);
-        assert_eq!(
-            MemorySystem::edges_or_degraded(Ok(edges.clone())),
-            edges,
-            "a readable edge list must pass through untouched"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_hydration_completes_correctly_when_the_edge_list_is_unavailable() -> Result<()> {
-        // The edge query only buys read purity during the window. Failing it
-        // used to call `fail()`, which opens the write gate against a tree
-        // holding nothing but a fresh root — so the next write would attach
-        // under that root and `save_all_nodes_to_db` would persist it, which is
-        // the durable misplacement the gate exists to prevent. Degrading must
-        // still reach a complete, correctly linked tree, and must not open the
-        // gate early.
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-        drop(MemorySystem::new(config.clone())?);
-        // 552 nodes: two batches, with node 5 (first batch) reparented under
-        // node 520 (second batch), so the final linking pass has real work.
-        const NODES: u64 = HYDRATION_BATCH as u64 + 40;
-        const LATE_PARENT: u64 = HYDRATION_BATCH as u64 + 8;
-        seed_tree_nodes(temp.path(), NODES, &[(5, LATE_PARENT)])?;
-
-        // Construct without a runtime so nothing is spawned, then drive the
-        // batch loop by hand with the map the fallback would produce.
-        let memory = std::thread::spawn(move || MemorySystem::new(config))
-            .join()
-            .expect("constructor thread")?;
-        let expected = memory.hydration_status();
-        assert!(
-            matches!(expected, HydrationStatus::Ready { .. }),
-            "the no-runtime arm loads synchronously; got {expected:?}"
-        );
-
-        // Reset to the state the background arm starts from — except
-        // `next_id`, which `new_with_dim` returns to 1. Nothing in
-        // `hydrate_batches` or `link_loaded_children` reads it, and this test
-        // asserts only node count, status, and linkage; a future edit that
-        // consulted `next_id` would need the real value here.
-        //
-        // Then run the loop with no edges at all.
-        {
-            let mut tree = memory.tree.lock().await;
-            *tree = MemTree::new_with_dim(memory.embedding_engine.dimension());
-        }
-        let state = Arc::new(HydrationState::new(NODES as usize));
-        MemorySystem::hydrate_batches(
-            Arc::clone(&memory.db),
-            Arc::clone(&memory.tree),
-            Arc::clone(&state),
-            HashMap::new(),
-        )
-        .await;
-
-        assert!(
-            matches!(state.status(), HydrationStatus::Ready { .. }),
-            "a degraded run must still complete; got {:?}",
-            state.status()
-        );
-        let tree = memory.tree.lock().await;
-        assert_eq!(
-            tree.all_nodes().len(),
-            NODES as usize,
-            "every node must load without the edge list"
-        );
-        assert_eq!(
-            tree.all_nodes()
-                .get(&LATE_PARENT)
-                .expect("the late parent must load")
-                .children,
-            vec![5],
-            "the final pass must still link a child to a parent in a later \
-             batch; degrading loses read purity during the window, not the \
-             structure it ends with"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_child_edges_are_read_in_one_query_before_any_node_loads() -> Result<()> {
-        // The seeding this depends on is what keeps an internal node from
-        // looking like a leaf mid-hydration, so the query itself is worth
-        // pinning: it must return every parent's full child list, including a
-        // parent whose id is higher than its child's.
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-        drop(MemorySystem::new(config)?);
-        seed_tree_nodes(temp.path(), 6, &[(2, 5)])?;
-
-        let conn = Connection::open(temp.path())?;
-        let edges = MemorySystem::load_child_edges(&conn)?;
-
-        let mut root_children = edges.get(&0).cloned().unwrap_or_default();
-        root_children.sort_unstable();
-        assert_eq!(
-            root_children,
-            vec![1, 3, 4, 5],
-            "every child of the root must be listed"
-        );
-        assert_eq!(
-            edges.get(&5).cloned().unwrap_or_default(),
-            vec![2],
-            "a parent whose id is higher than its child's must still be linked"
-        );
-        assert!(
-            !edges.contains_key(&1),
-            "a leaf must have no entry, so its `children` stays empty and \
-             retrieval still treats it as a leaf"
-        );
-
-        // An empty store is not an error — that is the fallback the hydration
-        // failure path relies on.
-        let empty = NamedTempFile::new()?;
-        drop(MemorySystem::new(MemoryConfig {
-            db_path: empty.path().to_path_buf(),
-            ..Default::default()
-        })?);
-        let conn = Connection::open(empty.path())?;
-        assert!(MemorySystem::load_child_edges(&conn)?.is_empty());
+        // Unlike MemTree, there is no separate "children linked" pass to
+        // verify here: `routing_nodes.is_leaf`/`left_id`/`right_id` are
+        // explicit persisted columns, loaded whole by `load_routing_tree`, so
+        // a `RoutingTree` node is never ambiguous the way an unlinked MemTree
+        // node briefly was mid-hydration (module doc on `hydrate_in_background`).
+        // The `Ready { nodes }` count above already covers the substantive
+        // claim: every persisted point reloaded.
         Ok(())
     }
 
@@ -4186,7 +3274,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_loader_abort_before_first_poll_releases_write_without_semantic_commit(
     ) -> Result<()> {
-        const NODES: u64 = HYDRATION_BATCH as u64;
+        const NODES: u64 = SEEDED_STORE_SIZE;
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -4194,7 +3282,7 @@ mod tests {
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);
-        seed_tree_nodes(temp.path(), NODES, &[])?;
+        seed_routing_points(temp.path(), NODES, TfIdfEmbedding::new().dimension())?;
 
         // This task blocks the sole Tokio worker. The test future itself is
         // driven by Runtime::block_on on the caller thread, so it can create
@@ -4293,7 +3381,7 @@ mod tests {
         let semantic_sources: i64 =
             conn.query_row("SELECT COUNT(*) FROM memory_sources", [], |row| row.get(0))?;
         let persisted_nodes: i64 =
-            conn.query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))?;
+            conn.query_row("SELECT COUNT(*) FROM routing_points", [], |row| row.get(0))?;
         assert_eq!(
             raw_conversations, 1,
             "the refused semantic write must retain raw history for explicit \
@@ -4318,156 +3406,23 @@ mod tests {
         Ok(())
     }
 
-    // Multi-thread, because that is the only flavor that spawns the
-    // background loader now — a current-thread runtime loads
-    // synchronously, so there is no task for this to observe. It is
-    // also the flavor production runs.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_loader_abort_before_completion_releases_waiter_without_semantic_commit(
-    ) -> Result<()> {
-        // Aborts the handle `MemorySystem::new` actually spawned, not a task
-        // the test built for itself. An earlier version did the latter, and
-        // removing the guard from the production spawn site then failed
-        // nothing — the test proved the guard type worked while leaving the
-        // one place it has to be installed uncovered.
-        const NODES: u64 = 4 * HYDRATION_BATCH as u64;
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            use_neural_embeddings: false,
-            ..Default::default()
-        };
-        drop(MemorySystem::new(config.clone())?);
-        seed_tree_nodes(temp.path(), NODES, &[])?;
-
-        let (_pause_registration, mut batch_reached, _release_batch) =
-            register_hydration_batch_pause(temp.path().to_path_buf(), HYDRATION_BATCH);
-        let mut memory = Arc::new(MemorySystem::new(config)?);
-        await_registered_hydration_pause(&mut batch_reached, &memory).await;
-        assert_eq!(
-            memory.hydration_status(),
-            HydrationStatus::Loading {
-                loaded: HYDRATION_BATCH,
-                total: NODES as usize,
-            },
-            "the abort precondition must hold the real production loader after \
-             exactly one committed batch"
-        );
-
-        let writer = {
-            let memory = Arc::clone(&memory);
-            tokio::spawn(async move {
-                memory
-                    .insert_conversation("user", MID_HYDRATION_ABORT_WRITE, None, None)
-                    .await
-            })
-        };
-        let waiter_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while memory.hydration.done.receiver_count() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        assert!(
-            waiter_started.is_ok(),
-            "the production write did not reach the hydration gate within 2s; \
-             status={:?}, gate_receivers={}",
-            memory.hydration_status(),
-            memory.hydration.done.receiver_count()
-        );
-
-        memory
-            .hydration_task
-            .as_ref()
-            .expect("a store with rows must spawn a loader")
-            .abort();
-
-        let write_result =
-            match tokio::time::timeout(std::time::Duration::from_secs(2), writer).await {
-                Ok(joined) => joined.context("the waiting production write task panicked")?,
-                Err(_) => panic!(
-                    "the waiting production write did not terminate within 2s after abort; \
-                 status={:?}, gate_receivers={}",
-                    memory.hydration_status(),
-                    memory.hydration.done.receiver_count()
-                ),
-            };
-        let loader = Arc::get_mut(&mut memory)
-            .expect("the completed writer must release its only MemorySystem clone")
-            .hydration_task
-            .take()
-            .expect("a store with rows must retain its aborted loader handle");
-        let loader_result = tokio::time::timeout(std::time::Duration::from_secs(2), loader)
-            .await
-            .expect("the aborted loader task must finish unwinding within 2s");
-        let join_error = loader_result.expect_err(
-            "the loader must terminate through the requested cancellation, not detach or finish",
-        );
-        assert!(
-            join_error.is_cancelled(),
-            "the loader must report cancellation after abort; join_error={join_error}"
-        );
-        let error = write_result.expect_err(
-            "an aborted loader must fail the waiting production write, not commit or hang it",
-        );
-        assert_eq!(
-            error.to_string(),
-            ABORTED_HYDRATION_WRITE_ERROR,
-            "the write must be refused with the exact guard diagnosis, not by \
-             the timeout; status={:?}",
-            memory.hydration_status()
-        );
-        match memory.hydration_status() {
-            HydrationStatus::Failed { reason } => assert_eq!(
-                reason, ABORTED_HYDRATION_REASON,
-                "the terminal gate state must retain the exact abort diagnosis"
-            ),
-            other => panic!(
-                "an abort before terminal completion must leave the gate Failed; \
-                 status={other:?}"
-            ),
-        }
-        let live_results = memory
-            .query(MID_HYDRATION_ABORT_WRITE, Some(NODES as usize + 1))
-            .await?;
-        assert!(
-            live_results
-                .iter()
-                .all(|result| result != MID_HYDRATION_ABORT_WRITE),
-            "a write refused after partial hydration must not remain searchable \
-             in the live MemTree; status={:?}, results={live_results:?}",
-            memory.hydration_status()
-        );
-
-        let conn = Connection::open(temp.path())?;
-        let raw_conversations: i64 =
-            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
-        let semantic_sources: i64 =
-            conn.query_row("SELECT COUNT(*) FROM memory_sources", [], |row| row.get(0))?;
-        let persisted_nodes: i64 =
-            conn.query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))?;
-        assert_eq!(
-            raw_conversations, 1,
-            "the failed semantic write must retain raw history for explicit \
-             inspection and the pending-projection recovery tracked in #339; \
-             semantic_sources={semantic_sources}, persisted_nodes={persisted_nodes}"
-        );
-        assert_eq!(
-            semantic_sources, 0,
-            "an aborted loader must prevent semantic provenance from committing; \
-             raw_conversations={raw_conversations}, persisted_nodes={persisted_nodes}"
-        );
-        assert_eq!(
-            persisted_nodes, NODES as i64,
-            "an aborted loader must not persist a placement into the partial tree; \
-             raw_conversations={raw_conversations}, semantic_sources={semantic_sources}"
-        );
-        Ok(())
-    }
-
+    // A test previously lived here (`test_loader_abort_before_completion_
+    // releases_waiter_without_semantic_commit`) that paused the production
+    // loader mid-batch (`register_hydration_batch_pause`) to abort it
+    // strictly between "some rows loaded" and "complete" -- a real, distinct
+    // window under MemTree's batched loader. RoutingTree's
+    // `hydrate_in_background` has no batch loop to pause partway through (a
+    // disclosed simplification, `AGENTS.md`): it either hasn't started, or
+    // has fully loaded and is about to call `complete()` (covered by
+    // `test_loader_abort_after_completion_preserves_ready_state` below), or
+    // hasn't been polled at all (covered by
+    // `test_loader_abort_before_first_poll_releases_write_without_semantic_commit`
+    // above) -- there is no longer a third, meaningfully distinct window to
+    // abort within. Deleted rather than adapted, since a mid-load pause point
+    // doesn't exist to adapt onto.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_loader_abort_after_completion_preserves_ready_state() -> Result<()> {
-        const NODES: u64 = HYDRATION_BATCH as u64;
+        const NODES: u64 = SEEDED_STORE_SIZE;
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -4475,7 +3430,7 @@ mod tests {
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);
-        seed_tree_nodes(temp.path(), NODES, &[])?;
+        seed_routing_points(temp.path(), NODES, TfIdfEmbedding::new().dimension())?;
 
         // Hold the real loader after it publishes Ready but before its future
         // can return and drop HydrationGuard. Aborting at that exact point
@@ -4571,7 +3526,7 @@ mod tests {
             |row| row.get(0),
         )?;
         let persisted_nodes: i64 =
-            conn.query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))?;
+            conn.query_row("SELECT COUNT(*) FROM routing_points", [], |row| row.get(0))?;
         assert_eq!(
             raw_conversations, 1,
             "the successful post-abort write must persist exactly one raw turn; \
@@ -4608,14 +3563,14 @@ mod tests {
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);
-        seed_tree_nodes(temp.path(), 8, &[])?;
+        seed_routing_points(temp.path(), 8, TfIdfEmbedding::new().dimension())?;
 
         // Break every row's `text`, so the whole load fails rather than one
         // batch of it.
         {
             let conn = Connection::open(temp.path())?;
             conn.execute(
-                "UPDATE tree_nodes SET text = ?1",
+                "UPDATE routing_points SET text = ?1",
                 params![vec![0xffu8, 0xfe]],
             )?;
         }
@@ -4648,107 +3603,36 @@ mod tests {
         Ok(())
     }
 
-    /// A first-batch failure loads nothing, so it is broken rather than
-    /// degraded — and writes must stay refused.
-    ///
-    /// `Degraded` is justified by `link_loaded_children` having made what
-    /// loaded coherent. That argument is vacuous when nothing loaded: linking
-    /// an empty node set leaves only the placeholder root, and calling it
-    /// degraded opened the gate on a tree with no real structure, so every
-    /// memory attached directly under a childless root and was persisted that
-    /// way. Removing the `loaded == 0` check makes this fail with the write
-    /// accepted and a two-node tree — root plus the memory just written —
-    /// against a store of 1024.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_a_first_batch_failure_is_broken_not_degraded() -> Result<()> {
-        const NODES: u64 = 2 * HYDRATION_BATCH as u64;
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-        drop(MemorySystem::new(config.clone())?);
-        seed_tree_nodes(temp.path(), NODES, &[])?;
-
-        // Break a row in the FIRST batch, so the loader stops before anything
-        // lands.
-        {
-            let conn = Connection::open(temp.path())?;
-            conn.execute(
-                "UPDATE tree_nodes SET text = ?1 WHERE node_id = ?2",
-                params![vec![0xffu8, 0xfe], 4i64],
-            )?;
-        }
-
-        let memory = MemorySystem::new(config)?;
-        let refused = memory
-            .insert_conversation(
-                "system",
-                "Nothing loaded, so there is no structure to place this in.",
-                None,
-                None,
-            )
-            .await
-            .expect_err("an index that loaded nothing must refuse writes");
-        assert!(
-            refused.to_string().contains("cannot be placed"),
-            "got {refused}"
-        );
-        assert!(
-            matches!(memory.hydration_status(), HydrationStatus::Failed { .. }),
-            "nothing loaded is not a smaller index, it is no index; got {:?}",
-            memory.hydration_status()
-        );
-
-        // And the tree really is empty of stored nodes, so the refusal is not
-        // incidental.
-        let tree = memory.tree.lock().await;
-        assert_eq!(
-            tree.all_nodes().len(),
-            1,
-            "only the placeholder root should be present"
-        );
-        Ok(())
-    }
-
     /// The two failure kinds must lead to different answers.
     ///
-    /// Before #288 both were `Failed`, so a batch that could not be read
-    /// refused every memory write for the rest of the process — the same
-    /// verdict as a loader that died and may have left the tree unlinked. One
-    /// unreadable row out of a 16,782-node store is not a reason to stop
-    /// recording memory.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// Unlike `MemTree`'s own loader, nothing in `RoutingTree`'s hydration
+    /// currently reaches `Degraded` -- a full `load_routing_tree` either
+    /// succeeds outright or fails outright, a disclosed simplification
+    /// (`hydrate_in_background`'s own doc comment). `Degraded` remains a real,
+    /// reachable `HydrationStatus` variant in the state machine itself (a
+    /// future batched RoutingTree loader could reintroduce a caller of
+    /// `degrade()`), so this keeps covering ITS contract -- accepts writes,
+    /// unlike `Failed` -- triggered directly, the same way the broken half
+    /// below already has to be (the guard path fires when a loader is
+    /// dropped, which a test cannot induce through a real load either).
+    #[tokio::test]
     async fn test_a_degraded_index_accepts_writes_and_a_broken_one_does_not() -> Result<()> {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
             ..Default::default()
         };
-
-        // Reached through the loader, not by calling `degrade` directly.
-        //
-        // Calling it directly is what the first version of this test did, and
-        // it made the test blind to the production call site: collapsing
-        // `degrade` into `fail` at the batch-error arm left it passing. A test
-        // that cannot observe the decision it names is not a regression for it.
-        drop(MemorySystem::new(config.clone())?);
-        seed_tree_nodes(temp.path(), 2 * HYDRATION_BATCH as u64, &[])?;
-        {
-            let conn = Connection::open(temp.path())?;
-            conn.execute(
-                "UPDATE tree_nodes SET text = ?1 WHERE node_id = ?2",
-                params![vec![0xffu8, 0xfe], HYDRATION_BATCH as i64 + 4],
-            )?;
-        }
         let degraded = MemorySystem::new(config.clone())?;
         degraded.ensure_hydrated().await?;
+        degraded
+            .hydration
+            .degrade("simulated partial load".to_string());
         assert!(
             matches!(
                 degraded.hydration_status(),
                 HydrationStatus::Degraded { .. }
             ),
-            "a batch error after a batch loaded must degrade; got {:?}",
+            "got {:?}",
             degraded.hydration_status()
         );
         degraded
@@ -4899,7 +3783,7 @@ mod tests {
                                  so this turn was kept as raw history and never \
                                  placed in the semantic index.";
 
-    /// `(conversations, memory_sources, tree_nodes)` read through a fresh
+    /// `(conversations, memory_sources, routing_points)` read through a fresh
     /// connection, so it reports what is durable rather than what some
     /// in-memory tree believes.
     fn store_counts(db_path: &std::path::Path) -> Result<(i64, i64, i64)> {
@@ -4907,7 +3791,7 @@ mod tests {
         Ok((
             conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?,
             conn.query_row("SELECT COUNT(*) FROM memory_sources", [], |row| row.get(0))?,
-            conn.query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))?,
+            conn.query_row("SELECT COUNT(*) FROM routing_points", [], |row| row.get(0))?,
         ))
     }
 
@@ -4969,7 +3853,7 @@ mod tests {
             (counts.0, counts.1),
             (2, 1),
             "precondition: both raw turns stored, only the seeded one projected; \
-             counts=(conversations, memory_sources, tree_nodes)={counts:?}"
+             counts=(conversations, memory_sources, routing_points)={counts:?}"
         );
         assert_eq!(
             source_row(&config.db_path, &stranded)?,
@@ -5118,7 +4002,7 @@ mod tests {
         assert_eq!(
             after_second, after_first,
             "and must change no row counts: (conversations, memory_sources, \
-             tree_nodes); stranded={stranded}"
+             routing_points); stranded={stranded}"
         );
         assert_eq!(
             node_after_second, node_after_first,
@@ -5237,21 +4121,15 @@ mod tests {
     /// comparison while the turn was no longer placed as its own memory. The
     /// assertions that call this say "resolves to a leaf holding its own text";
     /// without this check they would only be asserting the second half.
+    /// `node_id` here is a `routing_points.point_id` (`memory_sources.node_id`'s
+    /// real meaning now, schema.sql's own comment). No "is this a leaf, not an
+    /// internal aggregate" check is needed the way MemTree's version needed
+    /// one: a `RoutingTree` point is never an internal/aggregate anything --
+    /// `routing_points` only ever holds real, individually-inserted content.
     fn node_text(db_path: &std::path::Path, node_id: i64) -> Result<String> {
         let conn = Connection::open(db_path)?;
-        let children: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM tree_nodes WHERE parent_id = ?1",
-            [node_id],
-            |row| row.get(0),
-        )?;
-        assert_eq!(
-            children, 0,
-            "a projected conversation must map to a leaf, not an internal node \
-             that merely inherited a child's provisional label; node_id={node_id} \
-             children={children}"
-        );
         Ok(conn.query_row(
-            "SELECT text FROM tree_nodes WHERE node_id = ?1",
+            "SELECT text FROM routing_points WHERE point_id = ?1",
             [node_id],
             |row| row.get(0),
         )?)
@@ -5324,7 +4202,7 @@ mod tests {
             None,
             "precondition: the stranded Brain turn must have NO memory_sources \
              row, which is what makes it pending; id={id}, \
-             counts=(conversations, memory_sources, tree_nodes)={counts:?}"
+             counts=(conversations, memory_sources, routing_points)={counts:?}"
         );
         assert_eq!(
             (counts.0, counts.1),
@@ -5406,7 +4284,7 @@ mod tests {
             (3, 1),
             "precondition: three raw turns with only the seeded one projected, so \
              the sweep has a two-row backlog to be interrupted in the middle of; \
-             counts=(conversations, memory_sources, tree_nodes)={before:?}, \
+             counts=(conversations, memory_sources, routing_points)={before:?}, \
              first_stranded={first_stranded}"
         );
 
@@ -5581,7 +4459,7 @@ mod tests {
             (before.0, before.1),
             (4, 1),
             "precondition: four raw turns with only the seeded one projected; \
-             counts=(conversations, memory_sources, tree_nodes)={before:?}"
+             counts=(conversations, memory_sources, routing_points)={before:?}"
         );
 
         // The sweep and an observer of it, on one task: `join!` polls the probe
@@ -5644,7 +4522,7 @@ mod tests {
             repaired, 3,
             "every stranded row must be repaired and counted, not just the first; \
              before={before:?}, after=(conversations, memory_sources, \
-             tree_nodes)={after:?}"
+             routing_points)={after:?}"
         );
         assert_eq!(
             (after.0, after.1),
@@ -5740,7 +4618,7 @@ mod tests {
             "an ordinary write must repair the turns stranded before it — this is \
              the only repair a process that never reopens its store ever gets; \
              stranded_row={repaired:?}, fresh_row={fresh_row:?}, before={before:?}, \
-             after=(conversations, memory_sources, tree_nodes)={after:?}, \
+             after=(conversations, memory_sources, routing_points)={after:?}, \
              stranded={stranded}"
         );
         assert!(
@@ -5812,7 +4690,7 @@ mod tests {
              first has to exclude the very row the caller is about to project, or \
              a projection that failed inside that sweep is reported to the caller \
              as a successful no-op; source_row={row:?}, before={before:?}, \
-             after=(conversations, memory_sources, tree_nodes)={after:?}, \
+             after=(conversations, memory_sources, routing_points)={after:?}, \
              id={brain_turn_id}"
         );
         assert!(
@@ -5908,7 +4786,7 @@ mod tests {
              an empty pending set — empty only because the `?1` exclusion removed \
              this very row — and cleared the flag, so with the flag left down \
              nothing automatic ever looks at this row again; id={brain_turn_id}, \
-             counts=(conversations, memory_sources, tree_nodes)={:?}",
+             counts=(conversations, memory_sources, routing_points)={:?}",
             store_counts(temp.path())?
         );
 
@@ -5952,9 +4830,8 @@ mod tests {
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);
-        const NODES: u64 = 2 * HYDRATION_BATCH as u64;
-        const LATE_PARENT: u64 = HYDRATION_BATCH as u64 + 8;
-        seed_tree_nodes(temp.path(), NODES, &[(5, LATE_PARENT)])?;
+        const NODES: u64 = SEEDED_STORE_SIZE;
+        seed_routing_points(temp.path(), NODES, TfIdfEmbedding::new().dimension())?;
 
         let memory = MemorySystem::new(config)?;
         assert!(
@@ -5978,335 +4855,25 @@ mod tests {
             )
             .await?;
 
-        // And the structure is the one the batched loader would have built.
+        // The structure loaded correctly: real, undeflated centroids exist on
+        // every node (RoutingTree has no separate "children linked" pass to
+        // verify -- `routing_nodes.is_leaf`/`left_id`/`right_id` are explicit
+        // persisted columns, unambiguous the instant a row loads).
         let tree = memory.tree.lock().await;
-        assert_eq!(
-            tree.all_nodes()
-                .get(&LATE_PARENT)
-                .expect("the late parent must load")
-                .children,
-            vec![5],
-            "the synchronous load must link children just as the batched one does"
-        );
+        assert!(tree.tree().node_count() > 1, "a store with {NODES} points must have real tree structure, not just a placeholder root");
         Ok(())
     }
 
-    // Multi-thread, because that is the only flavor that spawns the
-    // background loader now — a current-thread runtime loads
-    // synchronously, so there is no task for this to observe. It is
-    // also the flavor production runs.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_a_read_during_hydration_returns_no_internal_aggregate_nodes() -> Result<()> {
-        // Reads are deliberately not gated on hydration — serving what has
-        // loaded beats blocking a turn — so the first turn of a session queries
-        // a partially hydrated tree. `MemTree::retrieve` identifies leaves as
-        // `children.is_empty()`, and linking children only in a final pass made
-        // every internal node answer that predicate for the whole window: one
-        // memory occupying several result slots, and mean-of-subtree embeddings
-        // surfaced as if they were memories, on exactly the turn a user is most
-        // likely to be typing during. Loading the edge list before the first
-        // batch is what fixes it.
-        const NODES: u64 = 4 * HYDRATION_BATCH as u64;
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            // This test is about the leaf/internal-node hydration boundary,
-            // not relevance: `seed_tree_nodes` gives every leaf the same
-            // synthetic constant embedding, which is not guaranteed to
-            // clear the default relevance floor against the query text
-            // below and would make an unrelated assertion fail for the
-            // wrong reason (#940).
-            min_relevance_score: 0.0,
-            ..Default::default()
-        };
-        drop(MemorySystem::new(config.clone())?);
-        // Node 2's parent becomes node 1, so node 1 is a genuine internal node
-        // and both are in the first batch.
-        seed_tree_nodes(temp.path(), NODES, &[(2, 1)])?;
-
-        let (_pause_registration, mut batch_reached, release_batch) =
-            register_hydration_batch_pause(temp.path().to_path_buf(), HYDRATION_BATCH);
-        let memory = MemorySystem::new(config)?;
-
-        // The production loader itself announces that it has committed the
-        // first batch, then waits for this test to release it. Polling tree
-        // size cannot establish this window: on a fast runner the loader can
-        // commit all four batches before the polling task is scheduled once.
-        if !*batch_reached.borrow_and_update() {
-            let reached = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                loop {
-                    batch_reached.changed().await.expect(
-                        "the hydration pause sender disappeared before the first batch landed",
-                    );
-                    if *batch_reached.borrow_and_update() {
-                        break;
-                    }
-                }
-            })
-            .await;
-            assert!(
-                reached.is_ok(),
-                "the production loader did not reach its first batch within 2s; status={:?}",
-                memory.hydration_status()
-            );
-        }
-        assert_eq!(
-            memory.hydration_status(),
-            HydrationStatus::Loading {
-                loaded: HYDRATION_BATCH,
-                total: NODES as usize,
-            },
-            "the pause must hold the real loader after exactly one batch"
-        );
-
-        // Held across every assertion below, so the structure and the query
-        // observe the same causally paused production state.
-        {
-            let tree = memory.tree.lock().await;
-            assert_eq!(
-                tree.all_nodes().len(),
-                HYDRATION_BATCH,
-                "the test pause must prevent a later batch from racing the read"
-            );
-            assert!(
-                !tree
-                    .all_nodes()
-                    .get(&1)
-                    .expect("node 1 must be present in the paused first batch")
-                    .children
-                    .is_empty(),
-                "an internal node must not look like a leaf before its children \
-                 are linked; retrieval would return it"
-            );
-        }
-
-        // The production read boundary must not return the internal aggregate
-        // while later hydration batches are provably unable to run.
-        let results = memory.query("seeded node", Some(NODES as usize)).await?;
-        assert!(
-            !results.is_empty(),
-            "the paused read must return memories from the first loaded batch"
-        );
-        assert!(
-            !results.iter().any(|text| text == "seeded node 1"),
-            "node 1 is an internal aggregate: its text is a label duplicated \
-             from a child and its embedding is a mean, so it must never be a \
-             query result"
-        );
-
-        release_batch.send_replace(true);
-        match tokio::time::timeout(std::time::Duration::from_secs(5), memory.ensure_hydrated())
-            .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => panic!("hydration failed after the test released it: {error:#}"),
-            Err(_) => {
-                panic!(
-                    "hydration did not complete within 5s after release; status={:?}",
-                    memory.hydration_status()
-                );
-            }
-        }
-        assert_eq!(
-            memory.hydration_status(),
-            HydrationStatus::Ready {
-                nodes: NODES as usize,
-            },
-            "the released loader must finish and publish its terminal state"
-        );
-        Ok(())
-    }
-
-    // Multi-thread, because that is the only flavor that spawns the
-    // background loader now — a current-thread runtime loads
-    // synchronously, so there is no task for this to observe. It is
-    // also the flavor production runs.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_failed_hydration_links_what_loaded_before_releasing_writes() -> Result<()> {
-        // `fail()` completes, and completing opens the write gate. It used to
-        // return before the child-linking pass, so every loaded node kept an
-        // empty `children`: `MemTree::insert` saw a childless root, hung the
-        // next memory directly off it, and `save_all_nodes_to_db` persisted
-        // that flattening. A partial index is recoverable; a durably flattened
-        // one is not.
-        const NODES: u64 = 2 * HYDRATION_BATCH as u64;
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-        drop(MemorySystem::new(config.clone())?);
-        seed_tree_nodes(temp.path(), NODES, &[])?;
-
-        // Break one row in the SECOND batch: `text` becomes a BLOB, so
-        // `row.get::<_, String>` fails. The first batch still loads.
-        {
-            let conn = Connection::open(temp.path())?;
-            conn.execute(
-                "UPDATE tree_nodes SET text = ?1 WHERE node_id = ?2",
-                params![vec![0xffu8, 0xfe], HYDRATION_BATCH as i64 + 4],
-            )?;
-        }
-
-        let memory = MemorySystem::new(config)?;
-        // Returns `Ok`, and that is the point of #288.
-        //
-        // #276 made a failed hydration refuse writes, which was right for a
-        // tree that might be unusable — but it collapsed this case into the
-        // same verdict, so one unreadable row refused every write for the rest
-        // of the process. Linking below is exactly what makes this case
-        // different: the index is smaller than the store, not incoherent.
-        //
-        // What matters for the ordering pinned below is that it returns at all,
-        // which it can only do after the loader recorded and completed.
-        memory
-            .ensure_hydrated()
-            .await
-            .expect("a degraded index must still accept writes");
-
-        match memory.hydration_status() {
-            HydrationStatus::Degraded { loaded, total, .. } => {
-                assert!(
-                    loaded < total,
-                    "a degraded index must report how much of the store it \
-                     actually holds; got {loaded} of {total}"
-                );
-            }
-            other => panic!("a broken row must surface as Degraded; got {other:?}"),
-        }
-
-        // And a write genuinely lands, rather than merely being permitted.
-        memory
-            .insert_conversation(
-                "system",
-                "A memory written into an index that stopped loading early.",
-                None,
-                None,
-            )
-            .await?;
-
-        // The assertion below pins linking; it pins the *ordering* only because
-        // `ensure_hydrated` returned above, and it can only return after the
-        // loader recorded. Recording ahead of `link_loaded_children` would make
-        // this a race with the hydration task for the tree lock rather than a
-        // clean result, so the ordering is stated here as well as relied on.
-
-        let tree = memory.tree.lock().await;
-        let loaded = tree.all_nodes().len();
-        assert!(
-            loaded >= HYDRATION_BATCH,
-            "the batches that did load must be kept; got {loaded}"
-        );
-        assert_eq!(
-            tree.all_nodes()
-                .get(&0)
-                .expect("root must load")
-                .children
-                .len(),
-            loaded - 1,
-            "every loaded child must be linked to the root before writes are \
-             released; an empty `children` makes the next memory flatten the \
-             tree and persists it"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_batch_loading_cannot_skip_a_row_when_the_store_changes() -> Result<()> {
-        // Keyset, not `LIMIT`/`OFFSET`: the database lock is released between
-        // batches, so the row set can change underneath an offset. Deleting a
-        // row below the window shifts every later row back by one, and an
-        // offset loader skips the boundary row — permanently, for the rest of
-        // the session. Reverting `load_batch` to `LIMIT ?2 OFFSET ?1` (keeping
-        // this signature, with the offset derived from the cursor) makes this
-        // fail: page two starts at 5 instead of 4.
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-        drop(MemorySystem::new(config)?);
-        seed_tree_nodes(temp.path(), 10, &[])?;
-
-        let conn = Connection::open(temp.path())?;
-        let first: Vec<u64> = MemorySystem::load_batch(&conn, None, 4)?
-            .into_iter()
-            .map(|node| node.id)
-            .collect();
-        assert_eq!(
-            first,
-            vec![0, 1, 2, 3],
-            "the first page must start at the root"
-        );
-
-        // A row the loader has already read disappears between batches.
-        conn.execute("DELETE FROM tree_nodes WHERE node_id = 1", [])?;
-
-        let cursor = first.last().copied();
-        let second: Vec<u64> = MemorySystem::load_batch(&conn, cursor, 4)?
-            .into_iter()
-            .map(|node| node.id)
-            .collect();
-        assert_eq!(
-            second,
-            vec![4, 5, 6, 7],
-            "no stored node may be skipped when the row set shifts between \
-             batches; an offset loader loses the boundary row"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_an_unreadable_node_census_refuses_to_open_the_store() -> Result<()> {
-        // `unwrap_or(0)` on the two census queries turned a database error into
-        // silent lies: a failed `COUNT` skipped hydration entirely and reported
-        // `Ready { nodes: 0 }` against a full store with no log line, and a
-        // failed `MAX` left `next_id` at 1 so the first write upserted over
-        // persisted node 1. This drives the `MAX` half, which is the one that
-        // destroys data; the `COUNT` above it is the same expression shape and
-        // the assertion accepts either message. Restoring `unwrap_or(0)` on the
-        // `MAX` query makes this fail.
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-        drop(MemorySystem::new(config.clone())?);
-
-        // Same table name and columns, so every migration and
-        // `CREATE ... IF NOT EXISTS` in `new` is a no-op — but `node_id` holds
-        // text, so `MAX(node_id)` cannot be read as an `i64`.
-        {
-            let conn = Connection::open(temp.path())?;
-            conn.execute_batch(
-                "DROP TABLE memory_sources;
-                 DROP TABLE tree_nodes;
-                 CREATE TABLE tree_nodes (
-                     node_id TEXT PRIMARY KEY,
-                     parent_id INTEGER,
-                     text TEXT NOT NULL,
-                     embedding BLOB NOT NULL,
-                     level INTEGER NOT NULL,
-                     created_at INTEGER NOT NULL,
-                     importance INTEGER NOT NULL DEFAULT 1
-                 );
-                 INSERT INTO tree_nodes
-                 VALUES ('not-an-integer', NULL, 'x', x'00000000', 0, 0, 1);",
-            )?;
-        }
-
-        let error = MemorySystem::new(config)
-            .err()
-            .expect("a store whose node census cannot be read must not open");
-        let chain = format!("{error:#}");
-        assert!(
-            chain.contains("count stored MemTree nodes")
-                || chain.contains("highest stored MemTree node id"),
-            "the error must say which census query failed, so the operator can \
-             tell it from an ordinary empty store; got {chain}"
-        );
-        Ok(())
-    }
+    // MemTree's own version of this test corrupted `tree_nodes.node_id`'s type
+    // to make its `MAX(node_id)` census query fail (the query that fed
+    // `set_next_id`). RoutingTree needs no such counter -- a freshly loaded
+    // tree's own point count already determines the next assigned id
+    // (`new_with_connection`'s own comment) -- so there is no longer a MAX
+    // query, and the remaining `COUNT(*) FROM routing_points` census has no
+    // realistic single-column corruption that makes it fail: `COUNT(*)` never
+    // decodes a row's values. A genuinely unreadable store is still covered,
+    // by `test_an_unreadable_store_on_the_synchronous_arm_refuses_writes`
+    // below, via a different (still-real) mechanism.
 
     #[tokio::test]
     async fn test_write_after_hydration_completes_does_not_hang() -> Result<()> {
@@ -6389,18 +4956,14 @@ mod tests {
 
         // Every seeded memory, not "a memory matching `Runbook step`". An
         // earlier version searched for the shared prefix, which 29 survivors
-        // still match after `set_next_id` is deleted and one node is
-        // overwritten — so it could not fail. Ranking cannot carry this
-        // assertion either: `TfIdfEmbedding` drops tokens under two characters,
-        // so the single-digit index that distinguishes these memories is not in
-        // the embedding at all and `query` orders them arbitrarily. Scan the
-        // hydrated node set instead.
+        // still match even if one point is overwritten — so it could not fail.
+        // Ranking cannot carry this assertion either: `TfIdfEmbedding` drops
+        // tokens under two characters, so the single-digit index that
+        // distinguishes these memories is not in the embedding at all and
+        // `query` orders them arbitrarily. Scan the hydrated point set instead.
         let texts: Vec<String> = {
             let tree = reopened.tree.lock().await;
-            tree.all_nodes()
-                .values()
-                .map(|node| node.text.clone())
-                .collect()
+            tree.iter_points().map(|(_, m, _)| m.text.clone()).collect()
         };
         for i in 0..30 {
             let needle = format!("Runbook step {i}:");
@@ -6415,16 +4978,18 @@ mod tests {
     }
 
     // Multi-thread: the only flavor that spawns the background loader.
-    // Its whole point is that the batched loader reproduces the blocking one.
-    // On a current-thread runtime it compared `load_tree_from_db_conn` against
-    // itself.
+    //
+    // Unlike MemTree (two independently-written loaders -- a batched
+    // background one and a direct blocking one -- that this test cross-checked
+    // against each other), RoutingTree's constructor and `hydrate_in_background`
+    // both call the SAME `RoutingMemTree::load`, so there are no longer two
+    // independent implementations to compare. What's still real to check: the
+    // background (spawned) path must produce exactly what a direct call to
+    // that same function produces on the same database -- catching a bug like
+    // the background path passing the wrong `dim` or the wrong connection,
+    // which a spawned task's own type signature can't rule out at compile time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_background_hydration_reproduces_the_blocking_load_exactly() -> Result<()> {
-        // The highest-value property: whatever the background loader builds
-        // must be node-for-node what the blocking loader builds. Batching by
-        // `node_id` means a parent can arrive after its child, so the child
-        // links are rebuilt in a final pass; this is what proves that pass
-        // reconstructs the same structure rather than merely a non-empty one.
+    async fn test_background_hydration_matches_a_direct_load() -> Result<()> {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -6451,57 +5016,40 @@ mod tests {
         // Background path.
         let background = MemorySystem::new(config.clone())?;
         background.ensure_hydrated().await?;
-        let background_nodes = {
+        let dim = background.embedding_engine.dimension();
+        let background_points = {
             let tree = background.tree.lock().await;
-            let mut nodes: Vec<(u64, Option<u64>, usize, Vec<u64>, String)> = tree
-                .all_nodes()
-                .values()
-                .map(|node| {
-                    let mut children = node.children.clone();
-                    children.sort_unstable();
-                    (
-                        node.id,
-                        node.parent,
-                        node.level,
-                        children,
-                        node.text.clone(),
-                    )
-                })
+            let mut points: Vec<(PointId, String, u8)> = tree
+                .iter_points()
+                .map(|(pid, m, _)| (pid, m.text.clone(), m.importance))
                 .collect();
-            nodes.sort_by_key(|entry| entry.0);
-            nodes
+            points.sort_by_key(|entry| entry.0);
+            points
         };
 
-        // Blocking path, built directly from the same database.
-        let blocking_nodes = {
+        // Direct path, built straight from the same database.
+        let direct_points = {
             let conn = Connection::open(temp.path())?;
-            let mut tree = MemTree::new_with_dim(background.embedding_engine.dimension());
-            MemorySystem::load_tree_from_db_conn(&conn, &mut tree)?;
-            let mut nodes: Vec<(u64, Option<u64>, usize, Vec<u64>, String)> = tree
-                .all_nodes()
-                .values()
-                .map(|node| {
-                    let mut children = node.children.clone();
-                    children.sort_unstable();
-                    (
-                        node.id,
-                        node.parent,
-                        node.level,
-                        children,
-                        node.text.clone(),
-                    )
-                })
+            let (_, metadata) = routing_persistence::load_routing_tree(
+                &conn,
+                RoutingConfig::default(),
+                dim,
+                routing_memory::FIXED_SEED,
+            )?;
+            let mut points: Vec<(PointId, String, u8)> = metadata
+                .into_iter()
+                .map(|(pid, text, importance)| (pid as PointId, text, importance))
                 .collect();
-            nodes.sort_by_key(|entry| entry.0);
-            nodes
+            points.sort_by_key(|entry| entry.0);
+            points
         };
 
         assert_eq!(
-            background_nodes, blocking_nodes,
-            "background hydration must reproduce the blocking load exactly"
+            background_points, direct_points,
+            "the background loader must reproduce a direct load exactly"
         );
         assert!(
-            background_nodes.len() > 1,
+            background_points.len() > 1,
             "the comparison is only meaningful on a populated store"
         );
 
@@ -6659,7 +5207,7 @@ mod tests {
         {
             let conn = memory.db.lock().await;
             conn.execute_batch(
-                "CREATE TRIGGER reject_memory_node BEFORE INSERT ON tree_nodes
+                "CREATE TRIGGER reject_memory_node BEFORE INSERT ON routing_points
                  BEGIN SELECT RAISE(FAIL, 'injected projection failure'); END;",
             )?;
         }
@@ -6891,146 +5439,32 @@ mod tests {
         Ok(())
     }
 
-    /// Regression: old production DBs had `id AUTOINCREMENT` as the tree_nodes PK
-    /// instead of `node_id INTEGER PRIMARY KEY`.  MemorySystem::new() must detect
-    /// this and drop/recreate the table so inserts don't fail with
-    /// "no such column: node_id".
-    #[tokio::test]
-    async fn test_old_schema_migration_drops_and_recreates_tree_nodes() -> Result<()> {
-        use rusqlite::Connection;
+    // A test previously lived here (`test_old_schema_migration_drops_and_recreates_
+    // tree_nodes`) verifying that MemorySystem::new() detected and dropped a stale
+    // `tree_nodes` table left by an old `id AUTOINCREMENT` schema (predating even
+    // MemTree's own `node_id INTEGER PRIMARY KEY` fix) before recreating it. That
+    // migration and its table are gone: `schema.sql` no longer declares `tree_nodes`
+    // at all now that RoutingTree is the only index, so the constructor
+    // unconditionally drops any stale `tree_nodes` table on open (see the
+    // `DROP TABLE IF EXISTS tree_nodes;` ahead of `include_str!("schema.sql")`)
+    // rather than detecting a specific old shape of it.
 
-        let temp = NamedTempFile::new()?;
-
-        // Set up a DB with the OLD tree_nodes schema (id AUTOINCREMENT)
-        {
-            let conn = Connection::open(temp.path())?;
-            conn.execute_batch(
-                "CREATE TABLE tree_nodes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    parent_id INTEGER,
-                    text TEXT NOT NULL,
-                    embedding BLOB NOT NULL,
-                    level INTEGER NOT NULL,
-                    created_at INTEGER NOT NULL
-                );",
-            )?;
-        }
-
-        // Open via MemorySystem — migration should run automatically
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-        let memory = MemorySystem::new(config)?;
-
-        // Verify new schema: inserting a conversation must succeed
-        memory
-            .insert_conversation(
-                "user",
-                "We decided to always use anyhow for error handling.",
-                Some("test"),
-                None,
-            )
-            .await?;
-
-        let stats = memory.stats().await?;
-        assert_eq!(stats.conversation_count, 1);
-        assert_eq!(
-            stats.tree_node_count, 1,
-            "node should be in MemTree after migration"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_a_corrupt_parent_chain_on_disk_errors_instead_of_aborting() -> Result<()> {
-        // #274 at the persistence boundary. `parent` links are rebuilt from
-        // `tree_nodes`, so a corrupt chain reaches `update_parent_aggregation`
-        // through a real store open followed by a real write. Before the fix
-        // that recursed until the thread overflowed its stack, which is SIGABRT
-        // — the process dies and no `Result` is ever returned, so a caller
-        // cannot log it, retry, or fall back.
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-
-        // A real store with real nodes.
-        {
-            let memory = MemorySystem::new(config.clone())?;
-            for i in 0..5 {
-                memory
-                    .insert_conversation(
-                        "system",
-                        &format!(
-                            "Deployment note {i}: the signing key lives in the \
-                             Employee vault, never in the repository."
-                        ),
-                        None,
-                        None,
-                    )
-                    .await?;
-            }
-        }
-
-        // Corrupt it: the root's parent points at one of its own descendants.
-        // The foreign key holds because the target row already exists.
-        {
-            let conn = Connection::open(temp.path())?;
-            let descendant: i64 = conn.query_row(
-                "SELECT node_id FROM tree_nodes WHERE node_id != 0 ORDER BY node_id ASC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )?;
-            conn.execute(
-                "UPDATE tree_nodes SET parent_id = ?1 WHERE node_id = 0",
-                params![descendant],
-            )?;
-        }
-
-        let memory = MemorySystem::new(config)?;
-        let result = memory
-            .insert_conversation(
-                "system",
-                "A memory written against a store whose parent chain is corrupt.",
-                None,
-                None,
-            )
-            .await;
-
-        let error = result.expect_err("a corrupt parent chain must surface as an error");
-        assert!(
-            error.to_string().contains("cycles:"),
-            "the error must name the cycle so the corruption is diagnosable; \
-             got {error}"
-        );
-
-        // The same write, again. `attach_child` and `promote_leaf` insert the
-        // new node and push it into its parent's `children` BEFORE aggregating,
-        // so an aggregation error leaves the tree mutated. Without restoring it
-        // the retry hits `find_leaf_by_text`, dedups to the node the failed
-        // insert left behind, returns before aggregation — and SUCCEEDS,
-        // persisting a write that had just hard-failed. An error a caller
-        // cannot retry deterministically is worse than no error.
-        let retry = memory
-            .insert_conversation(
-                "system",
-                "A memory written against a store whose parent chain is corrupt.",
-                None,
-                None,
-            )
-            .await;
-        let retry_error =
-            retry.expect_err("an identical retry of a write that hard-failed must fail too");
-        assert!(
-            retry_error.to_string().contains("cycles:"),
-            "the retry must fail the SAME way, not on a foreign-key violation or \
-             a masked reload error; got {retry_error}"
-        );
-        Ok(())
-    }
+    // A test previously lived here (`test_a_corrupt_parent_chain_on_disk_
+    // errors_instead_of_aborting`, #274) verifying that a corrupt `parent_id`
+    // cycle in `tree_nodes` surfaced as a named "cycles:" error from
+    // `update_parent_aggregation`'s recursive walk, rather than recursing
+    // until the thread overflowed its stack (a SIGABRT, no `Result` a caller
+    // could act on). RoutingTree's own real_centroid maintenance walks parent
+    // pointers too (`remove_point`'s downdate, `insert_into`'s update), but
+    // iteratively, never recursively -- the specific stack-overflow failure
+    // mode #274 fixed does not exist here by construction. A REAL, disclosed
+    // gap this doesn't cover: those iterative walks currently use `.expect()`
+    // on a missing parent, which still panics rather than returning a
+    // diagnosable `Result` if `routing_nodes.parent_id` were ever corrupted on
+    // disk the same way. Hardening that (mirroring #274's own fix: detect and
+    // name the problem, return `Err`, never panic or infinite-loop) is real,
+    // not-yet-done follow-up work, not something this deletion silently
+    // resolves.
 
     // ── #415: MemTree recall defects ─────────────────────────────────────────
 
@@ -7042,34 +5476,48 @@ mod tests {
         "The staging deployment token is stored in the Employee vault, not in \
          the repository.";
 
-    /// Seed a store created through the real schema with crafted legacy
-    /// `tree_nodes` rows: one root plus one leaf per entry, written the way
-    /// persistence serialises embeddings (little-endian f32). A reopen then
-    /// hydrates exactly these rows, which is the production path a store
-    /// built by an older binary takes.
+    /// Seed a store created through the real schema with real `routing_points`
+    /// -- one real `RoutingTree` point per entry (real embedding via
+    /// `TfIdfEmbedding`, so duplicate TEXT across entries is real duplicate
+    /// content on genuinely distinct points, bypassing `RoutingMemTree`'s own
+    /// insert-time text dedup the same way a store built by an older/different
+    /// process would). A reopen then hydrates exactly these rows.
+    ///
+    /// Was `seed_legacy_tree_rows`, writing directly to `tree_nodes` -- nothing
+    /// reads that table anymore, and RoutingTree cannot read an old MemTree
+    /// store at all (a different representation, no migration path was ever
+    /// built or promised, same "no users yet, start fresh" precedent
+    /// `schema.sql`'s own comment already establishes for the schema itself).
+    /// The properties these tests protect (duplicate leaf content collapses to
+    /// one recall result; recall excludes noise regardless of when it was
+    /// stored) are still real for RoutingTree's own format, just seeded
+    /// against it directly instead of simulating an incompatible old one.
     fn seed_legacy_tree_rows(db_path: &std::path::Path, leaves: &[(&str, u8)]) -> Result<()> {
-        let conn = Connection::open(db_path)?;
+        let mut conn = Connection::open(db_path)?;
         let engine = TfIdfEmbedding::new();
-        let root_bytes: Vec<u8> = vec![0.0f32; engine.dimension()]
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        conn.execute(
-            "INSERT INTO tree_nodes
-                 (node_id, parent_id, text, embedding, level, created_at, importance)
-             VALUES (0, NULL, 'ROOT', ?1, 0, 0, 0)",
-            params![root_bytes],
-        )?;
+        let dim = engine.dimension();
+        let mut tree = routing_tree::RoutingTree::new(
+            RoutingConfig::default(),
+            dim,
+            routing_memory::FIXED_SEED,
+        );
+        let tx = conn.transaction()?;
         for (index, (text, importance)) in leaves.iter().enumerate() {
             let embedding = engine.embed(text)?;
-            let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-            conn.execute(
-                "INSERT INTO tree_nodes
-                     (node_id, parent_id, text, embedding, level, created_at, importance)
-                 VALUES (?1, 0, ?2, ?3, 1, 0, ?4)",
-                params![index as i64 + 1, text, bytes, i64::from(*importance)],
+            let point_id = tree.insert(embedding.clone());
+            routing_persistence::save_point(
+                &tx,
+                point_id,
+                text,
+                &embedding,
+                *importance,
+                index as i64,
             )?;
         }
+        let dirty = tree.dirty_node_ids();
+        routing_persistence::write_dirty_nodes_within(&tree, &dirty, &tx)?;
+        tx.commit()?;
+        tree.mark_persisted(&dirty);
         Ok(())
     }
 
@@ -7113,7 +5561,7 @@ mod tests {
 
     /// #415 defect 4 at the persistence boundary. The reference store's tree
     /// was built before the quality classifier existed, so greetings and acks
-    /// sit in `tree_nodes` at importance 1 and recall handed them back as
+    /// sit in `routing_points` at importance 1 and recall handed them back as
     /// memories. Nothing rewrites stored rows, so the salience gate must hold
     /// at recall, not only at insert.
     #[tokio::test]
